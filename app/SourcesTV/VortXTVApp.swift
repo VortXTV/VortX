@@ -95,6 +95,9 @@ struct VortXTVApp: App {
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
         // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
         Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
+        // Publish whether the user has their own usenet provider configured, so bare-NZB rows are tappable
+        // from launch (before the Settings screen is ever opened). One Keychain read; no-op if unset.
+        UsenetProviderStore.refreshAvailability()
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
         // event loop). The schema-version log is an end-to-end smoke check of the Rust⇄Swift FFI.
         CoreBridge.shared.start()

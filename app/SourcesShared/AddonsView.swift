@@ -289,6 +289,16 @@ struct AddonsView: View {
     }
 
     private func install() {
+        // A pasted /configure PAGE is not an installable manifest: the add-on mints a per-user manifest only
+        // after you sign in on that page and enter your debrid key. Installing the bare /configure link used to
+        // silently add a DEAD add-on that returned no sources on every title (owner-reported Lumio / AllDebrid
+        // case). Guide the user to finish configuration and paste the personalized link instead of installing a
+        // dead copy. CoreBridge repeats this guard as a backstop; here it also avoids the wasted fetch.
+        if isAddonConfigurationPageURL(newAddonURL) {
+            installFailed = true
+            installMessage = CoreBridge.addonNeedsConfigurationMessage
+            return
+        }
         // Already installed? Offer to UPDATE (re-fetch the manifest) instead of erroring (owner request).
         if let normalized = core.normalizedAddonURL(newAddonURL),
            core.addons.contains(where: { $0.transportUrl == normalized }) {

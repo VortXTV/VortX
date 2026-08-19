@@ -247,8 +247,12 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     // episode later, ranked by the remembered pick - the exact "it switched my source again" report. `seriesId`
     // is the show id, the same key `pin` above uses, and this whole function is series-only by construction
     // (`loadMeta(type: "series", …)`). @MainActor, so reading the main-actor store here needs no snapshot.
+    // Launch (Continue-Watching resume) / advance lane: the remembered pick must YIELD to a MATERIALLY better
+    // source for THIS episode (a higher source-type tier or a cache hit) rather than sticking to a hand-picked
+    // source over a better debrid/usenet on a later episode. Soft sticky still floats the pick among
+    // near-identical releases, so a binge stays consistent without thrashing for marginal gains (diag-21).
     guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
-                                        sticky: sticky,
+                                        sticky: sticky, stickyAuthoritative: false,
                                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                         debridCachedHashes: cachedHashes) else { return nil }
     let targetSeason = v.season ?? defaultSeason
@@ -4571,9 +4575,11 @@ struct iOSEpisodeStreams: View {
         guard sourceList.isSettled, let best = sourceList.best,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
         let sticky = SeriesSourceSticky.preference(for: meta.id)
+        // Page auto-Watch launch pick: soft sticky so it re-ranks to the best available source for this
+        // episode and only leans on the remembered pick to break ties between near-identical releases.
         let candidates = StreamRanking.rankedCandidates(
             groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
-            sticky: sticky,
+            sticky: sticky, stickyAuthoritative: false,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
             debridCachedHashes: debridCache.cachedHashes
         )
@@ -4840,8 +4846,13 @@ struct iOSEpisodeStreams: View {
             }
         }
         guard !Task.isCancelled else { return nil }
+        // In-player episode navigation (Next / Prev / list / binge auto-next) is always an ADVANCE, so sticky is
+        // SOFT for BOTH the launch (`refreshedVideo == nil`) and the refreshed-successor (`refreshedVideo != nil`)
+        // paths: the remembered pick yields to a materially better tier/cache for the new episode and only holds
+        // among near-identical releases so a binge stays consistent (diag-21). A genuine in-episode manual source
+        // pick stays authoritative through the player's own switch/failover path, not here.
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
-                                            sticky: sticky, stickyAuthoritative: refreshedVideo != nil,
+                                            sticky: sticky, stickyAuthoritative: false,
                                             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                             debridCachedHashes: debridCache.cachedHashes) else { return nil }
         let targetSeason = v.season ?? season
@@ -4977,12 +4988,14 @@ struct iOSEpisodeStreams: View {
         )
         clearAuxiliaryPublications()
         let displayGroups = iOSDisplayGroups(groups)
+        // Preload of the NEXT episode is an ADVANCE, so sticky is SOFT here exactly as in `loadEpisodeStream`.
+        // The two MUST match, or the warm would prepare a different source than the advance then picks.
         guard let best = StreamRanking.best(
             displayGroups,
             continuity: rememberedQuality,
             binge: lastBinge,
             pin: sourcePin,
-            sticky: sticky,
+            sticky: sticky, stickyAuthoritative: false,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
             debridCachedHashes: debridCache.cachedHashes
         ) else { return nil }

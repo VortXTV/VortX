@@ -195,9 +195,13 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     // whole function is series-only by construction (`loadMeta(type: "series", …)`). @MainActor, so reading the
     // main-actor store here needs no snapshot.
     let sticky = SeriesSourceSticky.preference(for: seriesId)
+    // Launch / advance lane: the remembered pick must YIELD to a MATERIALLY better source for THIS episode
+    // (a higher source-type tier or a cache hit), not stick over a better debrid/usenet on later episodes.
+    // Soft sticky still floats the pick among near-identical releases, so a binge stays consistent without
+    // thrashing for marginal gains (diag-21). Authoritative sticky is reserved for the same-episode failover.
     let candidates = StreamRanking.rankedCandidates(
         groups, continuity: continuity, binge: binge, pin: pin,
-        sticky: sticky,
+        sticky: sticky, stickyAuthoritative: false,
         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
     )
     var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?

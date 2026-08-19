@@ -622,6 +622,7 @@ struct iOSSettingsView: View {
             NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
+            NavigationLink("Usenet provider") { UsenetProviderView() }
             NavigationLink("Your debrid cloud") { DebridLibraryView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
             NavigationLink("Live TV (IPTV playlists)") { IPTVSettingsView() }

@@ -93,6 +93,30 @@ struct TrickplayFrameDiskStore {
         try? Data(contentsOf: fileURL(mediaKey: mediaKey, bucket: bucket))
     }
 
+    /// The stored frame whose bucket is CLOSEST to `targetBucket` in either direction, for this media only.
+    /// A last-resort scrub fallback: when no frame sits within the primary at-or-before lookback (a scrub past
+    /// what has been captured, or into a gap wider than that window), the nearest captured frame still gives an
+    /// approximate preview instead of "unavailable". Enumerates this media's files once; nil when it has none.
+    /// Runs off the main thread (called only from the cache's ioQueue).
+    func nearest(mediaKey: String, targetBucket: Int) -> (bucket: Int, data: Data)? {
+        let prefix = filePrefix(mediaKey) + "-"
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) else { return nil }
+        var bestBucket: Int?
+        var bestDistance = Int.max
+        for file in files {
+            let name = file.lastPathComponent
+            guard name.hasPrefix(prefix), name.hasSuffix(".jpg") else { continue }
+            let middle = name.dropFirst(prefix.count).dropLast(4)   // strip "<prefix>-" and ".jpg" -> bucket digits
+            guard let bucket = Int(middle) else { continue }
+            let distance = abs(bucket - targetBucket)
+            if distance < bestDistance { bestDistance = distance; bestBucket = bucket }
+        }
+        guard let bestBucket, let data = data(mediaKey: mediaKey, bucket: bestBucket) else { return nil }
+        return (bestBucket, data)
+    }
+
     private func fileURL(mediaKey: String, bucket: Int) -> URL {
         directory.appendingPathComponent(
             "\(filePrefix(mediaKey))-\(bucket).jpg"

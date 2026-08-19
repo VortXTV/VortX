@@ -204,10 +204,22 @@ final class MPVMetalViewController: PlatformViewController {
     private var cacheReadaheadRampGeneration: UInt64 = 0
     private var cacheReadaheadRampAppliedSecs = 0
     private var cacheReadaheadRampLastFrameDrop = 0
+    /// The rung the ramp started at (loadFile), so a drop-burst back-off never sinks the forward depth below the
+    /// opening cache-secs. Stored per file alongside the applied depth.
+    private var cacheReadaheadRampStartSecs = 0
     private static let diskCacheReadaheadRampStepSecs = 60      // cache-secs added per stable rung
     private static let diskCacheReadaheadRampIntervalSecs: TimeInterval = 15   // wall time between rungs
     private static let diskCacheRampReadaheadFloorSecs = 30     // demuxer-readahead-secs during the ramp (< start)
     private static let diskCacheReadaheadRampDropTolerance = 2  // output drops since last rung that still count as steady
+    /// A REAL output-drop burst since the last rung (well past the jitter tolerance): the disk-offload fill is
+    /// starving the Metal present thread NOW, so the ramp backs OFF one rung instead of merely holding, then
+    /// resumes climbing once a clean rung passes. Tuned above the tolerance so ordinary jitter still only holds.
+    private static let diskCacheReadaheadRampBurstDropThreshold = 6
+    /// Bitrate-aware depth guard. A very-high-bitrate stream (UHD remux, ~80 Mbit/s+) tops out below the 900s
+    /// ceiling so the forward payload the disk cache commits never over-fills; the byte budget is generous
+    /// enough that ordinary 4K (well under it) keeps the FULL configured depth. Never trims below the floor.
+    private static let diskCacheReadaheadRampMaxReadaheadBytes: Int64 = 8 << 30   // 8 GiB forward-payload budget
+    private static let diskCacheReadaheadRampBitrateFloorSecs = 300               // never trim the ceiling below 5 min
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
     /// colorspace, and on tvOS the display mode), or nil = "unknown, force a fresh apply". Reset to nil on
     /// every file load and teardown so the FIRST re-evaluation of a new file always applies (the guard
@@ -1181,6 +1193,7 @@ final class MPVMetalViewController: PlatformViewController {
         cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
         cacheReadaheadRampGeneration &+= 1
 #if os(tvOS)
+        cancelSeekRefillWatchdog()   // no pending reseek may fire after teardown
         // Hand the TV back its default display mode; the view can already be
         // detached here, so HDRDisplayMode falls back to the app's window.
         // Ambient hero previews (#44, startMuted) never requested a mode, and their teardown runs on
@@ -1635,6 +1648,7 @@ final class MPVMetalViewController: PlatformViewController {
         cacheReadaheadRampGeneration &+= 1
         cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
         cacheReadaheadRampAppliedSecs = start
+        cacheReadaheadRampStartSecs = start
         cacheReadaheadRampLastFrameDrop = diagnosticInt(MPVProperty.frameDropCount) ?? 0
         setString("demuxer-readahead-secs", String(Self.diskCacheRampReadaheadFloorSecs))
         setString("cache-secs", String(start))
@@ -1643,27 +1657,54 @@ final class MPVMetalViewController: PlatformViewController {
         scheduleDiskCacheReadaheadRampStep(generation: cacheReadaheadRampGeneration, ceiling: ceiling)
     }
 
+    /// The ramp ceiling re-derived from the live stream bitrate. An extreme-bitrate stream (UHD remux) tops out
+    /// below the configured 900s so the offloaded forward payload never over-commits; an unknown or ordinary
+    /// bitrate keeps the FULL configured ceiling (the byte budget is generous, so normal 4K is unaffected). Only
+    /// ever lowers, and never below the floor.
+    private func bitrateBoundedRampCeiling(configured: Int) -> Int {
+        let videoBits = max(0, diagnosticDouble("video-bitrate") ?? 0)
+        let audioBits = max(0, diagnosticDouble("audio-bitrate") ?? 0)
+        let bytesPerSec = (videoBits + audioBits) / 8
+        guard bytesPerSec > 0 else { return configured }
+        let budgetSecs = Int(Double(Self.diskCacheReadaheadRampMaxReadaheadBytes) / bytesPerSec)
+        // Reduce toward the bitrate budget but never above the configured ceiling, and never below the floor -
+        // with the floor itself capped at the configured ceiling so a small remote ceiling is never exceeded.
+        let bounded = min(configured, budgetSecs)
+        return max(bounded, min(configured, Self.diskCacheReadaheadRampBitrateFloorSecs))
+    }
+
     private func scheduleDiskCacheReadaheadRampStep(generation: UInt64, ceiling: Int) {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mpv != nil,
                   self.cacheReadaheadRampGeneration == generation else { return }
-            // Hold this rung while the present is not stable: a cache stall, or a fresh burst of output drops
-            // since the last rung, means the device is already behind, so do not add read pressure this tick. The
-            // rung retries next interval, so the climb self-pauses and resumes without ever forcing a drop.
+            // Re-derive the ceiling from the live bitrate: a very-high-bitrate stream tops out lower so the disk
+            // offload never over-fills; ordinary 4K keeps the full depth (see bitrateBoundedRampCeiling).
+            let effectiveCeiling = self.bitrateBoundedRampCeiling(configured: ceiling)
             let dropCount = self.diagnosticInt(MPVProperty.frameDropCount) ?? self.cacheReadaheadRampLastFrameDrop
             let stalled = self.diagnosticFlag(MPVProperty.pausedForCache) ?? false
-            let steady = !stalled
-                && dropCount <= self.cacheReadaheadRampLastFrameDrop + Self.diskCacheReadaheadRampDropTolerance
+            let dropDelta = dropCount - self.cacheReadaheadRampLastFrameDrop
             self.cacheReadaheadRampLastFrameDrop = dropCount
-            if steady {
-                let next = min(self.cacheReadaheadRampAppliedSecs + Self.diskCacheReadaheadRampStepSecs, ceiling)
+            let floor = max(1, self.cacheReadaheadRampStartSecs)
+            if dropDelta > Self.diskCacheReadaheadRampBurstDropThreshold {
+                // A REAL burst: the fill is starving the present thread now. Back OFF one rung (never below the
+                // opening depth) to relieve read pressure; the climb resumes on the next clean rung.
+                let next = max(floor, self.cacheReadaheadRampAppliedSecs - Self.diskCacheReadaheadRampStepSecs)
                 if next != self.cacheReadaheadRampAppliedSecs {
+                    self.cacheReadaheadRampAppliedSecs = next
+                    self.setString("cache-secs", String(next))
+                    self.mpvLog.log("disk cache readahead ramp backed off to \(next, privacy: .public)s (drop burst \(dropDelta, privacy: .public))")
+                }
+            } else if !stalled, dropDelta <= Self.diskCacheReadaheadRampDropTolerance {
+                // Steady: no burst and no cache stall, so add one rung toward the (bitrate-bounded) ceiling.
+                let next = min(self.cacheReadaheadRampAppliedSecs + Self.diskCacheReadaheadRampStepSecs, effectiveCeiling)
+                if next > self.cacheReadaheadRampAppliedSecs {
                     self.cacheReadaheadRampAppliedSecs = next
                     self.setString("cache-secs", String(next))
                 }
             }
-            guard self.cacheReadaheadRampAppliedSecs < ceiling else {
-                self.mpvLog.log("disk cache readahead ramp reached ceiling \(ceiling, privacy: .public)s")
+            // else: minor jitter (tolerance < delta <= burst) or a cache stall -> HOLD this rung.
+            guard self.cacheReadaheadRampAppliedSecs < effectiveCeiling else {
+                self.mpvLog.log("disk cache readahead ramp reached ceiling \(effectiveCeiling, privacy: .public)s")
                 return
             }
             self.scheduleDiskCacheReadaheadRampStep(generation: generation, ceiling: ceiling)
@@ -2659,6 +2700,8 @@ final class MPVMetalViewController: PlatformViewController {
         // remote/aiostreams sources).
         if seekTargetOutsideCache(seconds) {
             armSeekCacheHold()   // out-of-window jump empties the forward cache; hold so the AO resumes once on a refilled cache
+            lastOutOfWindowSeekTarget = seconds
+            armSeekRefillWatchdog()   // recover a wedged cold-range refill fast (bounded reseek) instead of waiting on the stall reload
         }
         #endif
         command("seek", args: [String(seconds), "absolute"])
@@ -2676,6 +2719,21 @@ final class MPVMetalViewController: PlatformViewController {
     /// Main-thread only: armed from the UI's seek/track calls, released via a main hop from the
     /// event drain (mirroring pausedStateChanged).
     private var seekCacheHoldArmed = false
+
+    /// Bounded, progress-aware watchdog for the OUT-OF-WINDOW scrub refill. An out-of-window jump empties the
+    /// forward cache and then refills from a cold mid-file range read; on some sources (slow debrid CDN edges)
+    /// that read resyncs slowly or wedges outright - paused-for-cache never clears and the vo never draws again
+    /// (the scrub-back/forth stall). This retries the SAME seek a bounded number of times when the refill shows
+    /// no forward-cache growth across a wedge window, so a wedged refill recovers in seconds instead of waiting
+    /// on the ~30s mid-play stall reload. Same one-shot lifetime as the cache hold: armed by the out-of-window
+    /// seek, cancelled on the pausedForCache=false release edge / loadFile / teardown. Main-thread only.
+    private var seekRefillWatchdogWork: DispatchWorkItem?
+    private var seekRefillWatchdogGeneration: UInt64 = 0
+    private var lastOutOfWindowSeekTarget: Double?
+    private var seekRefillRecoveriesThisSeek = 0
+    private static let seekRefillWedgeWindowSecs: TimeInterval = 4   // no cache growth + still paused-for-cache => wedged
+    private static let seekRefillProgressEpsilonSecs = 0.10          // buffered-ahead growth that proves the refill is live
+    private static let seekRefillMaxRecoveries = 2                   // reseeks before deferring to the mid-play stall reload
 
     /// Conservative back window (seconds) still expected in the demuxer back-buffer: demuxer-max-back-bytes is
     /// small on tvOS (a handful of seconds at 4K bitrates), so a small back-scrub within this stays in cache and
@@ -2718,9 +2776,63 @@ final class MPVMetalViewController: PlatformViewController {
     private func releaseSeekCacheHoldIfArmed() {
         guard seekCacheHoldArmed else { return }
         seekCacheHoldArmed = false
+        cancelSeekRefillWatchdog()   // the refill reached cache-pause-wait and playback resumed: the wedge net is done
         guard mpv != nil else { return }
         setString("cache-pause-initial", "no")
         setString("cache-pause-wait", "1")
+    }
+
+    /// Arm the bounded refill watchdog for the out-of-window seek just issued. Cancels any prior arm (a new
+    /// scrub supersedes the old refill), resets the recovery budget, and starts the progress-aware poll.
+    private func armSeekRefillWatchdog() {
+        guard !startMuted, mpv != nil else { return }
+        seekRefillWatchdogGeneration &+= 1
+        seekRefillWatchdogWork?.cancel(); seekRefillWatchdogWork = nil
+        seekRefillRecoveriesThisSeek = 0
+        scheduleSeekRefillWatchdogCheck(
+            generation: seekRefillWatchdogGeneration,
+            lastCacheSample: diagnosticDouble("demuxer-cache-duration") ?? 0
+        )
+    }
+
+    private func cancelSeekRefillWatchdog() {
+        seekRefillWatchdogWork?.cancel(); seekRefillWatchdogWork = nil
+        seekRefillWatchdogGeneration &+= 1
+    }
+
+    private func scheduleSeekRefillWatchdogCheck(generation: UInt64, lastCacheSample: Double) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.mpv != nil,
+                  self.seekRefillWatchdogGeneration == generation,
+                  self.seekCacheHoldArmed else { return }   // hold released => refill succeeded, the watchdog is done
+            let stillBuffering = self.diagnosticFlag(MPVProperty.pausedForCache) ?? false
+            let forwardCache = self.diagnosticDouble("demuxer-cache-duration") ?? 0
+            // A live refill is pulling bytes: the buffered-ahead edge grows. Only a genuine wedge - still
+            // paused-for-cache AND no forward-cache growth across the whole window - is retried, so a healthy but
+            // slow refill is never clobbered (mirrors the progress-aware start watchdog).
+            let progressed = forwardCache > lastCacheSample + Self.seekRefillProgressEpsilonSecs
+            if !stillBuffering || progressed {
+                self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: forwardCache)
+                return
+            }
+            guard self.seekRefillRecoveriesThisSeek < Self.seekRefillMaxRecoveries,
+                  let target = self.lastOutOfWindowSeekTarget else {
+                self.mpvLog.log("seek refill watchdog: wedged refill not recovered (budget spent); deferring to stall reload")
+                return
+            }
+            self.seekRefillRecoveriesThisSeek += 1
+            self.mpvLog.log("seek refill watchdog: refill wedged at \(String(format: "%.2f", forwardCache), privacy: .public)s buffered; reseek #\(self.seekRefillRecoveriesThisSeek, privacy: .public) to \(Int(target), privacy: .public)s")
+            // Re-issue the SAME absolute seek: a fresh demuxer seek drops the stuck cold-range read and reopens
+            // it, which is what unsticks a slow-resyncing mid-file range. Bounded; the mid-play stall watchdog
+            // remains the ultimate backstop.
+            self.command("seek", args: [String(target), "absolute"])
+            self.scheduleSeekRefillWatchdogCheck(
+                generation: generation,
+                lastCacheSample: self.diagnosticDouble("demuxer-cache-duration") ?? 0
+            )
+        }
+        seekRefillWatchdogWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.seekRefillWedgeWindowSecs, execute: work)
     }
     #endif
 

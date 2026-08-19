@@ -460,6 +460,10 @@ struct SettingsView: View {
                     Label("Debrid services", systemImage: "bolt.horizontal.circle")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { UsenetProviderView() } label: {
+                    Label("Usenet provider", systemImage: "network")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { XRDBSettingsView() } label: {
                     Label("Poster artwork (ERDB, ratings)", systemImage: "star.circle")
                 }

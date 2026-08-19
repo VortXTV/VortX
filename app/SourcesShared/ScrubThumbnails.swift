@@ -288,6 +288,15 @@ final class ScrubThumbnailsStore: ObservableObject {
         if let cached = Self.localFrameCache.memoryImage(for: key, time: time) {
             image = cached; previewState = .ready; return
         }
+        // Past what has been captured (a forward drag into not-yet-watched territory), or a gap wider than the
+        // at-or-before lookback: the nearest RESIDENT frame in either direction still gives an instant
+        // approximate preview - no disk I/O, and no "unavailable" flash while the async read runs. Bounded so
+        // the main-actor probe stays cheap; farther frames fall through to the off-main read below.
+        if let nearest = Self.localFrameCache.nearestResidentImage(
+            for: key, time: time, maxRadius: Self.localFrameCache.syncNearestRadius
+        ) {
+            image = nearest; previewState = .ready; return
+        }
         previewState = .loading
         // Cache miss: read + decode off the main thread, then assign on the MainActor if still current.
         let token = showToken
@@ -616,6 +625,10 @@ final class ScrubThumbnailsStore: ObservableObject {
 private final class LocalTrickplayFrameCache {
     private let bucketSeconds: Double = 2
     private let maxLookbackBuckets = 180        // ~6 min back at 2 s per bucket
+    /// Radius for the last-resort BIDIRECTIONAL nearest search (both the resident scan and the disk scan below),
+    /// well beyond the at-or-before lookback so a scrub anywhere in a feature-length title still resolves to the
+    /// nearest captured frame. ~4.5 h at 2 s per bucket; the whole retained timeline sits far inside it.
+    private let maxNearestBuckets = 8100
     private let ttl: TimeInterval = 48 * 3600
     private let maxDiskBytes: Int64 = 256 * 1024 * 1024
     private let ioQueue = DispatchQueue(label: "com.stremiox.trickplay.localcache", qos: .utility)
@@ -672,18 +685,57 @@ private final class LocalTrickplayFrameCache {
         return nil
     }
 
+    /// Synchronous BIDIRECTIONAL nearest-resident lookup, no disk: the closest already-decoded thumbnail in
+    /// EITHER direction, searched by expanding radius so the first hit is the nearest by time. This is what
+    /// serves a preview when the scrub is PAST what has been captured (a forward drag into not-yet-watched
+    /// territory, where the closest capture sits just behind the playhead and is still resident) or in a gap
+    /// wider than the at-or-before lookback. NSCache is thread-safe, so this is callable from the main actor
+    /// (instant warm path, bounded radius) and from `ioQueue` (full range). Returns nil when nothing for this
+    /// media is resident within `maxRadius` buckets of the scrub position.
+    func nearestResidentImage(for key: String, time: Double, maxRadius: Int) -> ScrubImage? {
+        let target = bucketFor(time)
+        if let hit = memory.object(forKey: memKey(key, target)) { return hit }
+        var radius = 1
+        while radius <= maxRadius {
+            if let hit = memory.object(forKey: memKey(key, target + radius)) { return hit }
+            let low = target - radius
+            if low >= 0, let hit = memory.object(forKey: memKey(key, low)) { return hit }
+            radius += 1
+        }
+        return nil
+    }
+
+    /// Bounded radius for the SYNCHRONOUS (main-thread) resident scan in `ScrubThumbnailsStore.show`, so a busy
+    /// scrub cannot spend more than a bounded handful of cache probes on the main actor even when nothing is
+    /// resident. Anything farther is left to the off-main `imageAsync` fallback (full range + disk). ~24 min.
+    var syncNearestRadius: Int { maxLookbackBuckets * 4 }
+
     /// Off-main-thread read + JPEG decode of the nearest stored frame. Runs on the private `ioQueue` and calls
     /// `completion` (also on `ioQueue`) with the decoded image or nil. Kept async so scrubbing never blocks the
     /// main thread on a disk read + decode; the in-memory fast path is `memoryImage(for:)` above.
     func imageAsync(for key: String, time: Double, completion: @escaping (ScrubImage?) -> Void) {
         let target = bucketFor(time)
         ioQueue.async {
+            // 1) At-or-before within the primary lookback: the accurate trickplay frame for this position.
             let minBucket = max(0, target - self.maxLookbackBuckets)
             for bucket in stride(from: target, through: minBucket, by: -1) {
                 if let cached = self.memory.object(forKey: self.memKey(key, bucket)) { completion(cached); return }
                 guard let data = self.diskStore.data(mediaKey: key, bucket: bucket),
                       let decoded = ScrubImage(data: data) else { continue }
                 self.memory.setObject(decoded, forKey: self.memKey(key, bucket))
+                completion(decoded)
+                return
+            }
+            // 2) FALLBACK: no frame at-or-before within the lookback, so serve the NEAREST captured frame in
+            //    either direction rather than "unavailable" (a scrub past what has been captured, or into a
+            //    gap). Try the resident set first (cheap, no I/O), then a one-shot directory scan for the
+            //    nearest frame that was evicted from memory but is still on disk.
+            if let resident = self.nearestResidentImage(for: key, time: time, maxRadius: self.maxNearestBuckets) {
+                completion(resident); return
+            }
+            if let hit = self.diskStore.nearest(mediaKey: key, targetBucket: target),
+               let decoded = ScrubImage(data: hit.data) {
+                self.memory.setObject(decoded, forKey: self.memKey(key, hit.bucket))
                 completion(decoded)
                 return
             }

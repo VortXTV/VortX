@@ -94,6 +94,9 @@ struct VortXiOSApp: App {
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
         // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
         Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
+        // Publish whether the user has their own usenet provider configured, so bare-NZB rows are tappable
+        // from launch (before the Settings screen is ever opened). One Keychain read; no-op if unset.
+        UsenetProviderStore.refreshAvailability()
         CoreBridge.shared.start()
         NSLog("%@", "[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }

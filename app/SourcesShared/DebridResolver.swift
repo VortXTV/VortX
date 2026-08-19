@@ -1511,6 +1511,26 @@ extension DebridCoordinator {
         // exactly as today (no playable link). NOT a torrent: the minted URL is a plain direct stream (no
         // infoHash carried).
         if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
+            // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet provider, resolve
+            // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
+            // TorBox EXCEPT when TorBox already has this source confirmed-cached (an instant direct link that
+            // should win the auto-pick race), so a dual-configured user still plays a cached TorBox usenet
+            // source instantly. Fail-soft: any failure falls through to the TorBox usenet path below, so a
+            // user with only TorBox is byte-for-byte unaffected and a user with neither still gets the honest
+            // "no resolver" nil. Compiled out on Lite (no embedded server), which stays TorBox-only.
+            #if !VORTX_NO_EMBEDDED_SERVER
+            let torBoxHasItCached = confirmedUsenetURLs?.contains(nzb) ?? false
+            if !torBoxHasItCached, let usenetCreds = UsenetProviderStore.loadCredentials() {
+                if let localURL = try? await UsenetLocalResolver.resolve(nzbUrl: nzb, credentials: usenetCreds) {
+                    DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
+                    // A loopback stream: no infoHash / torrentId to carry (no reresolve fast path), and the
+                    // service tag is inert here (the url alone drives playback), matching the usenet ref shape.
+                    return DebridPlaybackRef(url: localURL, service: .torBox, infoHash: "",
+                                             torrentId: nil, fileId: nil, fileIdx: stream.fileIdx)
+                }
+                DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP unavailable -> trying TorBox usenet path")
+            }
+            #endif
             guard await hasUsenetResolver else { return nil }
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through

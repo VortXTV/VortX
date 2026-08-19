@@ -34,13 +34,17 @@ enum StreamRanking {
     /// order (the anti-regression invariant documented in `computeScore`).
     static let stickyWeight = 6000
 
-    /// Soft sticky weight for FRESH plays / Continue-Watching resumes, where the remembered pick must not
-    /// override a MATERIALLY better source (it played a worse source over the amazing debrids). Sized below the
-    /// smallest labelled-resolution step (720 -> 1080 = 360), the DV bonus (45), the cached bonus (8000) and
-    /// every 15000 source-type tier step, so a better resolution, a cache hit, or a higher source type always
-    /// wins; it only floats the remembered source among otherwise near-identical releases. Still a bonus, never
-    /// a filter (MIS-260731-03). `stickyWeight` stays the default, so auto-NEXT within a binge keeps re-picking
-    /// the chosen provider.
+    /// Soft sticky weight for every AUTO-PICK lane that must YIELD to a MATERIALLY better source: FRESH plays,
+    /// Continue-Watching launches, AND binge auto-advance (with its preload). The remembered pick must not keep
+    /// beating an amazing cached debrid / usenet on a LATER episode - the CEO's "after I hand-pick a source it
+    /// sticks to that choice over a better debrid or usenet on later episodes" report. Sized below the smallest
+    /// labelled-resolution step (720 -> 1080 = 360), the DV bonus (45), the cached bonus (8000) and every 15000
+    /// source-type tier step, so a better resolution, a cache hit, DV, or a higher source type always wins; it
+    /// only floats the remembered source among otherwise near-identical releases (size/audio-level differences),
+    /// so a binge does NOT thrash sources for a marginal gain - the diag-21 binge-consistency invariant. Still a
+    /// bonus, never a filter (MIS-260731-03). `stickyWeight` (the default) stays AUTHORITATIVE only for the
+    /// in-episode context - the same-episode failover among the remaining untried sources - so a source
+    /// hand-picked for THIS episode holds within it.
     static let stickySoftWeight = 40
 
     // MARK: - Caches

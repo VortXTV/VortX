@@ -6811,10 +6811,13 @@ struct TVPlayerView: View {
                 }
                 if settled {
                     // Same sticky + provider-health terms the preload ranks with, so the fallback lane cannot
-                    // quietly pick a different provider than the preload would have for the same episode.
+                    // quietly pick a different provider than the preload would have for the same episode. This
+                    // is an ADVANCE, so sticky is SOFT: it yields to a materially better tier/cache for the new
+                    // episode instead of sticking to the hand-picked source, and only holds among near-identical
+                    // releases so a binge stays consistent (diag-21). Keep this in lockstep with resolvePreloadedEpisode.
                     let candidates = StreamRanking.rankedCandidates(
                         groups, continuity: curHint, binge: curBinge, pin: sourcePin,
-                        sticky: seriesSticky,
+                        sticky: seriesSticky, stickyAuthoritative: false,
                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
                     )
                     let hint = episodeHint(for: newMeta)
@@ -7343,13 +7346,16 @@ struct TVPlayerView: View {
         let allStreams = groups.flatMap(\.streams)
         // `sticky` is the source the viewer chose BY HAND for this show and `providerPenalty` demotes an add-on
         // that just failed. Both are what stop the preload drifting to whichever provider answers fastest -
-        // the drift the "wanted binge=X got=Y" line has been reporting.
+        // the drift the "wanted binge=X got=Y" line has been reporting. Preload of the NEXT episode is an
+        // ADVANCE, so sticky is SOFT here exactly as in `play(episode:)`: it yields to a materially better
+        // tier/cache and otherwise holds among near-identical releases (diag-21). The two MUST match so the
+        // preload cannot warm a different source than the advance would then pick.
         let candidates = StreamRanking.rankedCandidates(
             groups,
             continuity: continuityHint,
             binge: bingeGroup,
             pin: pin,
-            sticky: sticky,
+            sticky: sticky, stickyAuthoritative: false,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
         )
         let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
@@ -7550,6 +7556,17 @@ struct TVPlayerView: View {
         }
     }
 
+    /// Prefix the libmpv-lane warm reads from the next-episode source. 32 MiB (was 16) so the warmed CDN-edge
+    /// window covers what libmpv actually reads at a COLD open of a high-bitrate 4K stream - the container header
+    /// PLUS `find_stream_info`'s analyzeduration probe, which on a ~40-80 Mbit/s source runs well past the first
+    /// 16 MiB. The AVPlayer/remux lane (DV + debrid) does not use this: it pre-STARTS a real transport
+    /// (prepareRemuxTransport) that is adopted at admission, so its jump is already near-instant. The plain
+    /// libmpv lane cannot pre-open its demuxer without a second mpv core, which is deliberately not built (a
+    /// jetsam-bound tvOS process cannot afford a second 4K pipeline, and a playlist-prefetch mount would bypass
+    /// the resume-seek / first-frame-commit / Continue-Watching handoff); warming the edge across the real cold
+    /// read window is the lightweight lever that removes most of the remaining gap.
+    private static let nextEpisodeLibmpvWarmPrefixBytes = 32 << 20
+
     /// One ranged read of the chosen next-episode source shortly before the
     /// credits, so the provider has the file hot when auto-advance opens it; the
     /// cold start there is what used to cost 30 to 60 seconds. Torrents start
@@ -7563,7 +7580,7 @@ struct TVPlayerView: View {
         guard preloadPolicy.isReady(for: target) else { return }
         warmedID = pre.episodeID
         var request = URLRequest(url: url)
-        request.setValue("bytes=0-16777215", forHTTPHeaderField: "Range")   // first 16 MB
+        request.setValue("bytes=0-\(Self.nextEpisodeLibmpvWarmPrefixBytes - 1)", forHTTPHeaderField: "Range")   // cover libmpv's cold open+probe read window
         for (name, value) in pre.stream.requestHeaders ?? [:] where name.lowercased() != "range" {
             request.setValue(value, forHTTPHeaderField: name)
         }

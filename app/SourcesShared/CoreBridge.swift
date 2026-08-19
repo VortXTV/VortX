@@ -351,6 +351,14 @@ final class CoreBridge: ObservableObject {
     /// intact when the new manifest never confirms.
     @MainActor
     func installAddonConfirmed(urlString: String, replacingExisting: Bool = false) async -> AddonInstallOutcome {
+        // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
+        // debrid key). Normalizing it to /configure/manifest.json fetches a valid-shaped but DEAD default from
+        // the add-on SDK router, so the install would "succeed" yet return no sources. Refuse it here at the
+        // install boundary with configuration guidance; canonicalAddonIdentity is left unchanged (QR dedupe
+        // shares it), this is an install-time gate only.
+        if isAddonConfigurationPageURL(urlString) {
+            return .failed(retryable: false, message: Self.addonNeedsConfigurationMessage)
+        }
         guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
             return .failed(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
         }
@@ -368,6 +376,12 @@ final class CoreBridge: ObservableObject {
             case .failure(let rejection):
                 return .failed(retryable: Self.isRetryable(rejection), message: rejection.message)
             case .success(let (data, finalURL)):
+                // Secondary net: a manifest URL that 3xx-redirects to a /configure page, or returns an HTML
+                // page instead of a JSON manifest, is the same dead-instance trap. Guide the user to configure
+                // rather than installing a dead copy (or falling through to a generic parse error).
+                if isAddonConfigurationPageURL(finalURL.absoluteString) || Self.looksLikeHTMLBody(data) {
+                    return .failed(retryable: false, message: Self.addonNeedsConfigurationMessage)
+                }
                 guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                       Self.hasNonEmptyIdentity(parsed) else {
                     return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
@@ -416,6 +430,11 @@ final class CoreBridge: ObservableObject {
     /// following install, while the legacy optional facade below preserves existing callers' behavior.
     @MainActor
     func previewAddonManifestResult(urlString: String) async -> AddonPreviewOutcome {
+        // Same install-boundary configuration-page guard as installAddonConfirmed, so a /configure link relayed
+        // through QR previews as needs-configuration instead of resolving a dead default manifest.
+        if isAddonConfigurationPageURL(urlString) {
+            return .rejected(retryable: false, message: Self.addonNeedsConfigurationMessage)
+        }
         guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
             return .rejected(retryable: false, message: "Enter a valid add-on URL (https://…/manifest.json).")
         }
@@ -423,6 +442,9 @@ final class CoreBridge: ObservableObject {
         case .failure(let rejection):
             return .rejected(retryable: Self.isRetryable(rejection), message: rejection.message)
         case .success(let (data, finalURL)):
+            if isAddonConfigurationPageURL(finalURL.absoluteString) || Self.looksLikeHTMLBody(data) {
+                return .rejected(retryable: false, message: Self.addonNeedsConfigurationMessage)
+            }
             guard let manifest = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
                   let name = manifest["name"] as? String, !name.isEmpty,
                   Self.hasNonEmptyIdentity(manifest) else {
@@ -454,6 +476,24 @@ final class CoreBridge: ObservableObject {
         guard let id = manifest["id"] as? String, !id.isEmpty,
               let name = manifest["name"] as? String, !name.isEmpty else { return false }
         return true
+    }
+
+    /// Shown when a pasted link is a configuration page rather than an installable manifest. The user must
+    /// finish setup on the add-on's own page and paste the personalized manifest link it then mints.
+    static let addonNeedsConfigurationMessage = String(localized: "This add-on needs to be set up first. Open its configuration page in a browser, sign in and enter your debrid key, then copy the personalized add-on link it gives you (it ends in /manifest.json, not /configure) and paste that here.")
+
+    /// True when a fetched body is an HTML document rather than a JSON manifest. A `/configure` page commonly
+    /// serves HTML; a manifest URL that returns HTML is a landing/config page, not an add-on, so we treat it as
+    /// needs-configuration instead of a generic parse failure. Checks only the leading non-whitespace bytes, so
+    /// it is cheap and never misreads a real JSON manifest (which starts with `{`).
+    private static func looksLikeHTMLBody(_ data: Data) -> Bool {
+        let prefix = data.prefix(512)
+        guard !prefix.isEmpty else { return false }
+        var scalars = String(decoding: prefix, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if scalars.hasPrefix("\u{FEFF}") { scalars.removeFirst() }   // strip a leading BOM
+        return scalars.hasPrefix("<!doctype html") || scalars.hasPrefix("<html")
     }
 
     @MainActor

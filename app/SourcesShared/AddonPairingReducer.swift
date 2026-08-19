@@ -31,6 +31,31 @@ func canonicalAddonIdentity(_ raw: String) -> String? {
     return components.url?.absoluteString
 }
 
+/// Detect a pasted URL that is an add-on's CONFIGURE PAGE, not an installable manifest. Add-ons such as Lumio
+/// mint a per-user manifest (`https://host/<profileId>/manifest.json`) only AFTER the user opens the add-on's
+/// `/configure` web page, signs in, and enters their debrid key. Pasting the bare `/configure` link used to be
+/// normalized to `https://host/configure/manifest.json`, which the Stremio add-on SDK router (`/:config?/manifest.json`)
+/// answers with a VALID-SHAPED but DEAD default manifest (real id + name, no key): the install "succeeded" yet
+/// every stream query returned no sources. This flags that case at the install boundary so callers can guide the
+/// user instead of installing a dead instance. The test is on the PATH only (a query/fragment is never part of an
+/// add-on identity), and it also catches a hand-appended `/configure/manifest.json`, which the same router treats
+/// as the identical dead config token. It deliberately does NOT touch `canonicalAddonIdentity` (QR dedupe shares
+/// that rule); it is a separate, purely additive predicate.
+func isAddonConfigurationPageURL(_ raw: String) -> Bool {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let components = URLComponents(string: trimmed),
+          let scheme = components.scheme?.lowercased(),
+          scheme == "http" || scheme == "https",
+          let host = components.host, !host.isEmpty else { return false }
+    // Non-empty segments so a trailing or doubled slash cannot hide the meaningful last one.
+    var segments = components.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+    // A configure page with a manually appended manifest suffix is the SAME dead token; peel it and test the
+    // segment before it. A legitimate per-user manifest is `/<profileId>/manifest.json`, whose peeled last
+    // segment is the profile id, never the literal "configure", so this stays zero-regression for real add-ons.
+    if segments.last?.lowercased() == "manifest.json" { segments.removeLast() }
+    return segments.last?.lowercased() == "configure"
+}
+
 /// Convert a remote revision to a bounded, non-negative integer without allowing NaN, infinity, or an
 /// out-of-range value to trap the app. Missing, negative, and non-finite values are treated as revision 0.
 func safeRevision(_ value: Double?) -> Int {

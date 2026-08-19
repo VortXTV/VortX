@@ -1397,12 +1397,15 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// episode torrents require an explicit file selector so a season-pack hash can never default to file 0.
     func playableURL(isEpisode: Bool) -> URL? {
         if let url, let parsed = URL(string: url) { return parsed }
-        // USENET: playable only when a TorBox key can resolve it. The play path
-        // (`DebridCoordinator.resolvedPlaybackRef`) turns the nzb into a direct https link BEFORE the
-        // player sees any URL; the nzb link here only makes the row tappable / identifies it. Without
-        // this, every usenet row rendered as a dead disabled label (every row gate keys on this
-        // property). No TorBox key -> nil, the pre-usenet behavior. Deliberately NOT behind the
-        // torrents gate: usenet resolves to a remote link, no embedded server needed (Lite plays it).
+        // USENET: playable when a usenet source can be resolved, i.e. the user has a TorBox key OR (on a
+        // full target) their own usenet provider configured (`DebridPlaybackAvailability.canResolveUsenet`).
+        // The play path (`DebridCoordinator.resolvedPlaybackRef`) turns the nzb into a playable URL BEFORE
+        // the player sees any URL - a TorBox direct https link, or a loopback stream from the embedded NNTP
+        // engine for the built-in provider path; the nzb link here only makes the row tappable / identifies
+        // it. Without this, every usenet row rendered as a dead disabled label (every row gate keys on this
+        // property). Neither configured -> nil, the pre-usenet behavior. Deliberately NOT behind the torrents
+        // gate: the TorBox path resolves to a remote link (Lite plays it); the built-in path is full-target
+        // only and gated inside `canResolveUsenet`.
         if isUsenet, DebridPlaybackAvailability.shared.canResolveUsenet,
            let nzb = nzbUrl, let parsed = URL(string: nzb) {
             return parsed
