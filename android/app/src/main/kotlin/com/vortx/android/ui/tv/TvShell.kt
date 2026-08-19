@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,8 +37,10 @@ import androidx.tv.material3.Surface
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
@@ -52,6 +55,7 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 enum class TvDestination(val label: String, val icon: ImageVector) {
     HOME("Home", com.vortx.android.ui.theme.VortXIcons.home),
     DISCOVER("Discover", com.vortx.android.ui.theme.VortXIcons.discover),
+    LIVE("Live TV", com.vortx.android.ui.theme.VortXIcons.live),
     LIBRARY("Library", com.vortx.android.ui.theme.VortXIcons.library),
     SEARCH("Search", com.vortx.android.ui.theme.VortXIcons.search),
     SETTINGS("Settings", com.vortx.android.ui.theme.VortXIcons.settings),
@@ -80,6 +84,19 @@ fun TvShell(
     val appContext = LocalContext.current.applicationContext
     var destination by remember { mutableStateOf(TvDestination.HOME) }
 
+    // The Live TV tab honors the SAME cross-platform "Show Live TV tab" preference the phone shell reads
+    // (TabBarPrefs, key `vortx.tabs.hide.live`): hidden -> the destination drops from the rail, and if it
+    // was the active surface the shell falls back to Home. The other destinations are always shown on TV
+    // (their per-tab hide toggles are a broader TV parity item, unchanged here).
+    val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
+    val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
+    val destinations = remember(hiddenTabs.hideLive) {
+        TvDestination.entries.filter { it != TvDestination.LIVE || !hiddenTabs.hideLive }
+    }
+    LaunchedEffect(destinations) {
+        if (destination !in destinations) destination = TvDestination.HOME
+    }
+
     // SD-8: Discover and Search gate on a sign-in. On TV the available signal is the engine's Stremio
     // auth state (the VortX-primary sign-in surface is a separate TV parity item); a signed-out set sees
     // the sign-in prompt on those two tabs instead of empty add-on results.
@@ -103,7 +120,7 @@ fun TvShell(
     )
 
     Row(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
-        TvNavRail(selected = destination, onSelect = { destination = it })
+        TvNavRail(destinations = destinations, selected = destination, onSelect = { destination = it })
         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
             // Only the selected destination's ViewModel is instantiated (lazily inside the branch); each is
             // retained in the Activity's ViewModelStore by its default class key, so switching tabs keeps a
@@ -113,6 +130,8 @@ fun TvShell(
                     TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem)
                 TvDestination.DISCOVER ->
                     TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, signedIn = signedIn)
+                TvDestination.LIVE ->
+                    TvLiveScreen(viewModel<LiveViewModel>(factory = factory), onItem)
                 TvDestination.LIBRARY ->
                     TvLibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem)
                 TvDestination.SEARCH ->
@@ -130,7 +149,11 @@ fun TvShell(
 /// so passing focus THROUGH the rail toward the content never yanks the whole surface out from under the
 /// viewer.
 @Composable
-private fun TvNavRail(selected: TvDestination, onSelect: (TvDestination) -> Unit) {
+private fun TvNavRail(
+    destinations: List<TvDestination>,
+    selected: TvDestination,
+    onSelect: (TvDestination) -> Unit,
+) {
     val colors = VortXTheme.colors
     Column(
         modifier = Modifier
@@ -140,7 +163,7 @@ private fun TvNavRail(selected: TvDestination, onSelect: (TvDestination) -> Unit
             .padding(vertical = TvDimens.edge, horizontal = VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
-        TvDestination.entries.forEach { dest ->
+        destinations.forEach { dest ->
             TvNavItem(
                 destination = dest,
                 selected = dest == selected,

@@ -56,7 +56,7 @@ fun TabBarScreen(
                 ToggleRow("Show Discover tab", null, !tabs.hideDiscover, prefs::setDiscoverVisible)
                 ToggleRow(
                     "Show Live TV tab",
-                    "Saved now and applied when the Android Live tab lands.",
+                    "Channels from your installed Live TV add-ons.",
                     !tabs.hideLive,
                     prefs::setLiveVisible,
                 )

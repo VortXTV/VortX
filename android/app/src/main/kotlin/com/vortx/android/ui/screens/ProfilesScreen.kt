@@ -40,6 +40,9 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.screens.profiles.ProfileAccentSection
+import com.vortx.android.ui.screens.profiles.ProfileBackgroundSection
+import com.vortx.android.ui.screens.profiles.ProfileCustomAvatarField
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
@@ -324,6 +327,13 @@ private fun ProfileEditor(
 ) {
     var name by remember { mutableStateOf(original.name) }
     var avatar by remember { mutableStateOf(original.avatar) }
+    // "Type your own" avatar text is hoisted so tapping a grid emoji clears it (Apple sets customAvatar = "").
+    var customAvatar by remember { mutableStateOf("") }
+    // Per-profile appearance (Apple `ProfileAccentPicker` / `ProfileBackgroundPicker`). Written back into the
+    // same `accentID` / `oled` roster fields Apple + web carry, so the color/background follows the profile
+    // across devices; for the active profile the shells repaint live off `ProfileStore.activeProfile`.
+    var accentId by remember { mutableStateOf(original.accentID) }
+    var oled by remember { mutableStateOf(original.oled) }
     var isKids by remember { mutableStateOf(original.isKids) }
     // The PIN field only ever takes a NEW pin (stored pins are salted hashes, never shown). Empty + no
     // explicit remove = keep the existing pin, exactly like Apple's editor.
@@ -339,6 +349,8 @@ private fun ProfileEditor(
         var draft = original.copy(
             name = trimmed,
             avatar = avatar,
+            accentID = accentId,
+            oled = oled,
             // The owner is the account's main profile; it can never be a Kids profile (guarded here as well
             // as by hiding the row below).
             isKids = if (original.isOwner) false else isKids,
@@ -393,10 +405,20 @@ private fun ProfileEditor(
                     verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
                 ) {
                     AVATARS.forEach { emoji ->
-                        Chip(label = emoji, selected = emoji == avatar, onClick = { avatar = emoji })
+                        Chip(label = emoji, selected = emoji == avatar, onClick = { avatar = emoji; customAvatar = "" })
                     }
                 }
+                ProfileCustomAvatarField(
+                    text = customAvatar,
+                    currentAvatar = avatar,
+                    onTextChange = { customAvatar = it },
+                    onAvatarPicked = { avatar = it },
+                )
             }
+
+            ProfileAccentSection(selectedId = accentId, onSelect = { accentId = it })
+
+            ProfileBackgroundSection(oled = oled, onOled = { oled = it })
 
             if (!original.isOwner) {
                 SettingsSection(

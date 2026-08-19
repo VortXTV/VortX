@@ -38,6 +38,7 @@ import com.vortx.android.profile.UserProfile
 import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
+import com.vortx.android.sync.AccountLibrarySync
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -50,6 +51,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.channelFlow
@@ -59,6 +62,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
@@ -1140,6 +1144,7 @@ class EngineStremioRepository(
         homePagination.onBoardEvent(
             total = EngineState.boardCatalogCount(state),
             rows = EngineState.parseCatalogs(state),
+            settled = !EngineState.boardHasLoadingPages(state),
         )
         currentHomeSnapshot().rows
     } }
@@ -1155,7 +1160,31 @@ class EngineStremioRepository(
     /// instead of hanging forever -- and the `onEvent` logcat lines (see [onEngineEvent]) tell us
     /// whether the events actually flowed. distinctUntilChanged suppresses the no-change poll spam.
     /// This stream is deliberately not conflated: an authoritative clear must precede the new rows.
-    override fun homeUpdates(): Flow<HomeUpdate> = channelFlow {
+    ///
+    /// HOT + SHARED (single producer): [HomeViewModel], [LiveViewModel], and the Search suggestions all
+    /// observe this SAME stream, and each is long-lived. If the producer were a cold [channelFlow], every
+    /// new subscriber would re-run [homeUpdatesProducer] -- and its first act is [dispatchHomeLoad], which
+    /// calls [HomePaginationState.reset] -- so merely opening the Live tab would RESET Home's already-paged
+    /// board window and re-fetch every catalog under Home's feet. Sharing it via [shareIn] with
+    /// [SharingStarted.WhileSubscribed] and `replay = 1` means ONE producer regardless of subscriber count:
+    /// a second subscriber attaches to the running producer (and immediately gets the last snapshot from the
+    /// replay cache) instead of triggering a fresh dispatch/reset. Each subscriber keeps its own
+    /// [HomeUpdateReducer], so shared ordered emissions are reduced independently and safely.
+    override fun homeUpdates(): Flow<HomeUpdate> = sharedHomeUpdates
+
+    /// The single shared home-update producer (see [homeUpdates]). Built once and reused for the process,
+    /// scoped to the repository's own [engineScope]; [SharingStarted.WhileSubscribed] keeps the producer
+    /// alive across brief tab/config transitions and stops it only after every subscriber has been gone for
+    /// [HOME_SHARE_STOP_TIMEOUT_MS], so ordinary navigation never restarts (and re-resets) the board.
+    private val sharedHomeUpdates: SharedFlow<HomeUpdate> by lazy {
+        homeUpdatesProducer().shareIn(
+            scope = engineScope,
+            started = SharingStarted.WhileSubscribed(stopTimeoutMillis = HOME_SHARE_STOP_TIMEOUT_MS),
+            replay = 1,
+        )
+    }
+
+    private fun homeUpdatesProducer(): Flow<HomeUpdate> = channelFlow {
         val publicationLock = Any()
         val initialPermit = homePrivacyFence.capture()
         var announcedGeneration = initialPermit.generation
@@ -1299,6 +1328,22 @@ class EngineStremioRepository(
         }
     }
 
+    /// Widen the board to EVERY catalog so live catalogs (ordered after an add-on's movie/series catalogs)
+    /// hydrate for the Live surface -- the Android twin of Apple `ensureLiveCatalogsLoaded`. Returns
+    /// whether the board is fully loaded (true) or a widen was just dispatched (false), so the Live
+    /// ViewModel shows its "install a Live TV add-on" nudge only once the whole board has settled, never
+    /// mid-load. A settled homeUpdates snapshot then re-derives the now-wider board on the next tick.
+    override suspend fun ensureLiveCatalogsLoaded(): Result<Boolean> = withContext(Dispatchers.Default) {
+        val rows = homePagination.claimFullBoard()
+            ?: return@withContext Result.success(homePagination.isBoardFullyLoaded())
+        runCatching {
+            StremioCoreNative.dispatch(EngineActions.loadBoardRange(rows))
+            false
+        }.onFailure {
+            homePagination.abortMoreRows()
+        }
+    }
+
     /// The Group-1 reactivity primitive (see [CatalogRepository.ctxUpdates]'s doc comment): a
     /// continuous tick every time a ctx-shaped broadcast lands -- covers AddToLibrary/RemoveFromLibrary,
     /// InstallAddon/UninstallAddon, and sign-in/sign-out, all of which dispatch with `field = null` (see
@@ -1346,6 +1391,7 @@ class EngineStremioRepository(
             homePagination.onBoardEvent(
                 total = EngineState.boardCatalogCount(boardJson),
                 rows = parsedBoardRows,
+                settled = !EngineState.boardHasLoadingPages(boardJson),
             )
         }
         val pagedBoardRows = parsedBoardRows.map { row ->
@@ -1518,14 +1564,20 @@ class EngineStremioRepository(
                         poster = item.poster,
                     )
                 }
-                HistoryRoute.Engine -> StremioCoreNative.dispatch(
-                    EngineActions.addToLibrary(
-                        id = item.id,
-                        type = item.type.id,
-                        name = item.name,
-                        poster = item.poster,
-                    ),
-                )
+                HistoryRoute.Engine -> {
+                    StremioCoreNative.dispatch(
+                        EngineActions.addToLibrary(
+                            id = item.id,
+                            type = item.type.id,
+                            name = item.name,
+                            poster = item.poster,
+                        ),
+                    )
+                    // Mirror the ACCOUNT-library add out to the connected Trakt/SIMKL watchlists. This
+                    // Engine branch is the account path (an overlay profile takes HistoryRoute.Overlay and
+                    // never reaches here), so the mirror is main-profile-only by construction. Fire-and-forget.
+                    AccountLibrarySync.onLibraryAdded(appContext, item.type, item.id)
+                }
             }
         }
     }
@@ -1536,7 +1588,12 @@ class EngineStremioRepository(
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.removeWatchEntry(id)
                 }
-                HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                HistoryRoute.Engine -> {
+                    StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                    // Bare-id remove: the type is unknown here, so the Trakt remove targets both arrays
+                    // (see TitleRef). SIMKL has no watchlist-remove, so it is a no-op there.
+                    AccountLibrarySync.onLibraryRemoved(appContext, id, type = null)
+                }
             }
         }
     }
@@ -2242,9 +2299,13 @@ class EngineStremioRepository(
                     is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                         overlay.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
                     }
-                    HistoryRoute.Engine -> StremioCoreNative.dispatch(
-                        EngineActions.addToLibrary(id, type.id, name, poster),
-                    )
+                    HistoryRoute.Engine -> {
+                        StremioCoreNative.dispatch(
+                            EngineActions.addToLibrary(id, type.id, name, poster),
+                        )
+                        // Mirror the account-library add to Trakt/SIMKL watchlists (account path only).
+                        AccountLibrarySync.onLibraryAdded(appContext, type, id)
+                    }
                 }
                 currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
                     ?: throw IllegalStateException("Couldn't add this title to your library.")
@@ -2257,7 +2318,11 @@ class EngineStremioRepository(
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.removeWatchEntry(id)
                 }
-                HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                HistoryRoute.Engine -> {
+                    StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                    // Mirror the account-library remove to the Trakt watchlist (typed; SIMKL has no remove).
+                    AccountLibrarySync.onLibraryRemoved(appContext, id, type)
+                }
             }
             currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
                 ?: throw IllegalStateException("Couldn't remove this title from your library.")
@@ -2401,6 +2466,11 @@ class EngineStremioRepository(
         /// Safety-net poll cadence for [homeUpdates]. Each tick is a cheap local getState + parse;
         /// distinctUntilChanged means an unchanged snapshot never reaches the UI.
         const val HOME_POLL_MS = 3_000L
+
+        /// How long the shared [homeUpdates] producer keeps running after its last subscriber leaves
+        /// ([SharingStarted.WhileSubscribed] grace). Long enough to bridge a tab switch / config change so
+        /// navigation never restarts the producer (which would re-dispatch the board and reset pagination).
+        const val HOME_SHARE_STOP_TIMEOUT_MS = 5_000L
 
         /** Resident meta-details poll interval while a remembered series provider is outstanding. */
         const val STREAM_SETTLEMENT_POLL_MS = 250L

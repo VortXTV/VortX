@@ -141,6 +141,13 @@ fun PlayerChrome(
     /// [PlayerScreen]'s PiP handle). Null hides the control entirely: devices/hosts without PiP
     /// support (no system feature, an activity that does not declare it) never show a dead button.
     onEnterPip: (() -> Unit)? = null,
+    /// Google Cast control slot (the CAST lane), supplied by the host and rendered in the top control
+    /// cluster next to Picture-in-Picture. Null (the default) draws nothing, keeping the chrome usable in
+    /// isolation and on hosts/devices with no Cast subsystem. The host gates the slot on the stream being
+    /// castable (a direct/HLS/debrid URL, never a loopback torrent) AND the Cast framework being available;
+    /// the composable it passes self-hides further when no receivers are on the network. This is the
+    /// Android analogue of the Apple in-player AirPlay route-picker button.
+    castButton: (@Composable () -> Unit)? = null,
     /// External subtitles offered by the installed subtitle add-ons for THIS title (the Apple
     /// `SubtitleAddons` union, fetched by the host once per load). Listed in the subtitle sheet
     /// under the file's embedded tracks; picking one mounts + selects it on the live engine via
@@ -288,6 +295,10 @@ fun PlayerChrome(
                 ) { onInteraction(); openSheet = ControlSheet.VIDEO }
                 // Player settings overflow: sleep timer, decoder, playback info, and the engine switch.
                 ChromeIcon(Icons.Filled.Settings, "Player settings") { onInteraction(); openSheet = ControlSheet.PLAYER_SETTINGS }
+                // Google Cast (the CAST lane), when the host supplies it for a castable stream. Drawn as a
+                // host slot so ALL cast logic stays in com.vortx.android.cast; the slot itself self-hides
+                // when no receivers are reachable. Placed before PiP/lock in the cluster.
+                castButton?.invoke()
                 // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
                 // therefore most protected-from-fat-finger) position.
                 onEnterPip?.let { pip ->

@@ -167,6 +167,11 @@ data class MetaItem(
 }
 
 /// A named row of items, e.g. "Continue Watching" or an add-on catalog like "Cinemeta - Popular".
+/// [type] is the catalog's declared content type (`request.path.type`, e.g. "movie" / "series" / "tv" /
+/// "channel"), mirroring Apple `CoreBoardRow.type`. It is the classifier the Live surface filters on
+/// (`LiveTypes.contains(type)`), so a live-TV / channel / events catalog can be separated from the VOD
+/// rails without inspecting each item. Null for a row with no engine request behind it (Continue
+/// Watching, the client-side personalized rails), which the Live filter treats as non-live.
 data class Catalog(
     val id: String,
     val title: String,
@@ -176,6 +181,7 @@ data class Catalog(
     val engineIndex: Int? = null,
     val hasNextPage: Boolean = false,
     val pageLoading: Boolean = false,
+    val type: String? = null,
 )
 
 /// One episode of a series, mirroring the engine's `CoreVideo`. [season]/[episode] drive the season

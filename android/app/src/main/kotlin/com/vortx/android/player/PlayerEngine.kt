@@ -135,6 +135,13 @@ interface PlayerEngine {
     /// overlay. Both engines override with what their API exposes. Mirrors Apple `playbackStats`.
     fun playbackStats(): List<Pair<String, String>> = emptyList()
 
+    /// The live source's frame rate + pixel size for the Match-Frame-Rate display switch ([AfrController]),
+    /// or null when the engine has not decoded enough to know its own rate yet. Both concrete engines
+    /// override (mpv `container-fps` + `video-params/w`/`h`; ExoPlayer `videoFormat`); the default null is
+    /// safe for any future engine. Read on the caller's thread (AFR polls the main looper, matching the
+    /// engines' own state-read thread).
+    fun videoFrameProfile(): VideoFrameProfile? = null
+
     /// Grab the CURRENT video frame as JPEG bytes, downscaled so its width is at most [maxWidth]. This is
     /// the capture primitive the community-trickplay pipeline feeds
     /// ([com.vortx.android.trickplay.TrickplaySession]); it is the Android analogue of Apple's

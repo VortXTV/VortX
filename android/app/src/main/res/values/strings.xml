@@ -77,6 +77,22 @@
     <string name="player_current_selection">Current selection</string>
     <string name="player_chapters">Chapters</string>
     <string name="player_chapters_action_description">Open chapters</string>
+
+    <!-- Google Cast lane (com.vortx.android.cast). The Cast button in the player chrome, the device chooser,
+         and the "Casting to X" overlay. Shown only for castable direct/HLS/debrid streams (torrents never
+         cast). Android's equivalent of the Apple AirPlay route. -->
+    <string name="cast_action">Cast</string>
+    <string name="cast_choose_device">Cast to a device</string>
+    <string name="cast_searching">Searching for devices…</string>
+    <string name="cast_casting_to">Casting to %1$s</string>
+    <string name="cast_device_generic">your device</string>
+    <string name="cast_buffering">Buffering…</string>
+    <string name="cast_stop">Stop casting</string>
+    <string name="cast_back">Back</string>
+    <string name="cast_play">Play</string>
+    <string name="cast_pause">Pause</string>
+    <string name="cast_seek_back_10">Back 10 seconds</string>
+    <string name="cast_seek_forward_10">Forward 10 seconds</string>
     <string name="player_subtitle_settings">Subtitle settings</string>
     <string name="player_subtitle_sync_unavailable">Sync unavailable. External subtitles only.</string>
     <string name="player_subtitle_sync">Sync</string>

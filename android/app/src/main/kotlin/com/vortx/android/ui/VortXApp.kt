@@ -91,10 +91,12 @@ import com.vortx.android.ui.screens.CustomizeHomeScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
+import com.vortx.android.ui.screens.DownloadQueueScreen
 import com.vortx.android.ui.screens.DownloadsScreen
 import com.vortx.android.ui.screens.HomeDiscoverSettingsScreen
 import com.vortx.android.ui.screens.HomeScreen
 import com.vortx.android.ui.screens.IntegrationsScreen
+import com.vortx.android.ui.screens.LiveScreen
 import com.vortx.android.ui.screens.LibraryScreen
 import com.vortx.android.ui.screens.LibraryTransferScreen
 import com.vortx.android.ui.screens.MediaServersScreen
@@ -105,10 +107,12 @@ import com.vortx.android.ui.screens.SearchScreen
 import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
+import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.ui.screens.UnifiedSignInScreen
 import com.vortx.android.ui.screens.WhatsNewScreen
 import com.vortx.android.ui.screens.WhosWatchingScreen
+import com.vortx.android.sync.AccountLibrarySync
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
@@ -147,6 +151,7 @@ private enum class Tab(
 ) {
     HOME("Home", VortXIcons.home, TabSlot.HOME),
     DISCOVER("Discover", VortXIcons.discover, TabSlot.DISCOVER),
+    LIVE("Live TV", VortXIcons.live, TabSlot.LIVE),
     LIBRARY("Library", VortXIcons.library, TabSlot.LIBRARY),
     SEARCH("Search", VortXIcons.search, TabSlot.SEARCH),
     SETTINGS("Settings", VortXIcons.settings, TabSlot.SETTINGS),
@@ -194,6 +199,9 @@ fun VortXApp(
 
     LaunchedEffect(activeProfile) {
         appearancePrefs.applyProfile(activeProfile)
+        // Drain any offline Trakt/SIMKL watchlist pushes that failed earlier. No-ops for an overlay
+        // profile and when the queue is empty; runs on the main profile at launch and on each switch back.
+        AccountLibrarySync.drainPending(appContext)
     }
 
     val accentId = activeProfile?.accentID ?: appearance.accentId
@@ -240,6 +248,9 @@ fun VortXApp(
         var showIntegrations by remember { mutableStateOf(false) }
         var showMediaServers by remember { mutableStateOf(false) }
         var showDownloads by remember { mutableStateOf(false) }
+        // Nested under Downloads: the queue manager (reorder / concurrency / storage). Checked BEFORE the
+        // showDownloads overlay so it renders on top, and cleared on Back to reveal Downloads underneath.
+        var showDownloadQueue by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
         var showMetadataKeys by remember { mutableStateOf(false) }
@@ -272,6 +283,7 @@ fun VortXApp(
             showIntegrations = false
             showMediaServers = false
             showDownloads = false
+            showDownloadQueue = false
             showPlayback = false
             showSources = false
             showMetadataKeys = false
@@ -712,6 +724,16 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showDownloadQueue) {
+            // Settings > Downloads > Manage queue: the download QUEUE manager (reorder / pause / retry /
+            // concurrency cap / storage), Android port of Apple's `DownloadQueueView`. Checked BEFORE the
+            // showDownloads overlay so it renders on top; Back clears it and reveals Downloads underneath.
+            // Self-contained like Downloads (drives the DownloadManager / DownloadStore singletons directly).
+            BackHandler { showDownloadQueue = false }
+            DownloadQueueScreen(onBack = { showDownloadQueue = false })
+            return@VortXTheme
+        }
+
         if (showDownloads) {
             // Settings > Downloads: the device's offline downloads. Self-contained like Integrations and Media
             // servers (it drives the DownloadManager / DownloadStore singletons directly), so it needs no
@@ -724,6 +746,7 @@ fun VortXApp(
                 // identity: clear the binding rather than let the previous play's meta ride along. Auto-add
                 // then skips this play (Apple's `let m = curMeta` skip).
                 onPlay = { playing = it; playingMeta = null },
+                onManageQueue = { showDownloadQueue = true },
             )
             return@VortXTheme
         }
@@ -905,6 +928,7 @@ fun VortXApp(
                     content,
                     signedIn = accountSignedIn,
                 )
+                Tab.LIVE -> LiveScreen(viewModel<LiveViewModel>(factory = factory), onItem, content)
                 Tab.LIBRARY -> LibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem, content)
                 Tab.SEARCH -> SearchScreen(
                     viewModel<SearchViewModel>(factory = factory),

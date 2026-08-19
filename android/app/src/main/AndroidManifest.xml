@@ -4,6 +4,11 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Read whether the active network is METERED so the adaptive-tuning link-speed sweep
+         (com.vortx.android.player.tuning.AdaptiveTuning) only runs on an unmetered connection and never
+         spends the viewer's mobile data. Normal permission, granted at install, no runtime prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Offline downloads (Round 5). A multi-GB media transfer must run as a foreground service or the OS
          suspends it the moment the app leaves the screen; this is the Android cost of what Apple gets from a
          `.background` URLSession for free.
@@ -40,6 +45,15 @@
         android:theme="@style/Theme.VortX"
         android:fullBackupContent="@xml/backup_rules"
         android:dataExtractionRules="@xml/data_extraction_rules">
+
+        <!-- Google Cast (the CAST lane). The Cast framework reads this fully-qualified OptionsProvider class
+             name on first CastContext.getSharedInstance() and calls it to register the receiver id. Without
+             this meta-data the framework throws; with it, casting is available in BOTH flavors (the SDK is
+             GPL-free, so the play build carries it too). On a device without Google Play services the manager
+             fail-softs (getSharedInstance is caught) and no cast affordance ever appears. -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.vortx.android.cast.CastOptionsProvider" />
 
         <!-- PHONE / touch entry. MainActivity keeps the ordinary MAIN + LAUNCHER filter (the touch shell,
              com.vortx.android.ui.VortXApp). It NO LONGER carries LEANBACK_LAUNCHER: the 10-foot D-pad

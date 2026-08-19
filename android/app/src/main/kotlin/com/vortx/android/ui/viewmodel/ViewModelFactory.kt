@@ -17,6 +17,7 @@ import com.vortx.android.home.ImportedCatalogs
 import com.vortx.android.home.CollectionsHubModel
 import com.vortx.android.home.CollectionsHubProviderPolicy
 import com.vortx.android.integrations.ScrobbleService
+import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.sync.VortXSyncManager
 
@@ -65,6 +66,7 @@ class StremioXViewModelFactory(
             appContext?.let(CatalogPreferencesStore::shared) ?: CatalogPreferencesStore.inMemory(),
         ) as T
         modelClass.isAssignableFrom(LibraryViewModel::class.java) -> LibraryViewModel(repo) as T
+        modelClass.isAssignableFrom(LiveViewModel::class.java) -> LiveViewModel(repo) as T
         modelClass.isAssignableFrom(SearchViewModel::class.java) -> {
             val context = requireNotNull(appContext) { "SearchViewModel requires an app Context (for SearchHistoryStore)" }
             SearchViewModel(repo, SearchHistoryStore(context)) as T

@@ -95,6 +95,24 @@ work = "2.10.0"
 # dependency first-party instead of leaning on a transitive. 4.12.0 also predates Kotlin 2.3.0 (it is
 # built on Kotlin 1.8/1.9-era metadata), so the pinned 2.2.10 compiler reads it with wide margin.
 okhttp = "4.12.0"
+# Google Cast (the CAST lane: send the current stream to a Cast receiver -- Android's AirPlay equivalent).
+# play-services-cast-framework is a plain Google/AndroidX AAR with NO GPL native code (unlike libmpv), so
+# it is a licensing-boundary-SAFE plain `implementation` carried in BOTH the `full` and `play` flavors and
+# introduces no libmpv into the Play build. It is a Java library with no Kotlin metadata, so the
+# forward-metadata-compat rule the rest of this catalog follows (composeBom/coil/work) does not apply -- any
+# version is compiler-safe against the pinned Kotlin 2.2.10 (same as tvProvider/zxing). 21.5.0 is a stable,
+# widely-deployed release chosen over the newest 22.x to keep its transitive AndroidX floor (appcompat,
+# mediarouter, fragment) conservative; targetSdk 36 / minSdk 26 are well within its support window.
+playServicesCast = "21.5.0"
+# androidx.mediarouter: the Cast device-discovery + route-selection API the custom Compose device chooser
+# uses (this app is AppCompat-free and Compose-only, so it drives MediaRouter directly instead of the SDK's
+# View-based MediaRouteButton/chooser dialog, which need an AppCompat/MediaRouter theme this app does not
+# carry). play-services-cast-framework 21.5.0 already resolves mediarouter transitively (1.6.0-beta01 floor);
+# it is declared EXPLICITLY here because cast code imports androidx.mediarouter.media.* directly (the
+# first-party-declares-its-direct-deps rule the okhttp/tink pins follow), pinned to the stable 1.7.0 (>= the
+# transitive floor, so Gradle selects it with no downgrade). A plain Java/AndroidX artifact, no Kotlin
+# metadata, so it is compiler-safe like the cast framework above.
+mediarouter = "1.7.0"
 junit = "4.13.2"
 jsonJvm = "20240303"
 zxing = "3.5.4"
@@ -132,6 +150,11 @@ coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref 
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
 
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+
+# Google Cast lane (see the playServicesCast / mediarouter version notes above). Both are plain
+# `implementation` in BOTH flavors -- no GPL native code, so the `play` build stays GPL-clean.
+play-services-cast-framework = { group = "com.google.android.gms", name = "play-services-cast-framework", version.ref = "playServicesCast" }
+androidx-mediarouter = { group = "androidx.mediarouter", name = "mediarouter", version.ref = "mediarouter" }
 
 work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }

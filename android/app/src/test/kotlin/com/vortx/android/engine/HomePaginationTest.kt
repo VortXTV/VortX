@@ -52,11 +52,11 @@ class HomePaginationTest {
         assertEquals(12, state.reset())
         assertNull(state.claimMoreRows())
 
-        state.onBoardEvent(total = 31, rows = listOf(row(2)))
+        state.onBoardEvent(total = 31, rows = listOf(row(2)), settled = true)
         assertEquals(24, state.claimMoreRows())
         assertNull(state.claimMoreRows())
 
-        state.onBoardEvent(total = 31, rows = listOf(row(2)))
+        state.onBoardEvent(total = 31, rows = listOf(row(2)), settled = true)
         assertEquals(31, state.claimMoreRows())
         state.abortMoreRows()
         assertEquals(31, state.claimMoreRows())
@@ -68,20 +68,44 @@ class HomePaginationTest {
         state.reset()
         assertNull(state.claimNextPage(row(2)))
 
-        state.onBoardEvent(total = 4, rows = listOf(row(2)))
+        state.onBoardEvent(total = 4, rows = listOf(row(2)), settled = true)
         assertEquals(2, state.claimNextPage(row(2)))
         assertNull(state.claimNextPage(row(2)))
 
-        state.onBoardEvent(total = 4, rows = listOf(row(2, loading = true)))
+        state.onBoardEvent(total = 4, rows = listOf(row(2, loading = true)), settled = true)
         assertNull(state.claimNextPage(row(2)))
 
-        state.onBoardEvent(total = 4, rows = listOf(row(2, count = 3)))
+        state.onBoardEvent(total = 4, rows = listOf(row(2, count = 3)), settled = true)
         assertTrue(state.rowHasNextPage(2))
         assertEquals(2, state.claimNextPage(row(2, count = 3)))
 
-        state.onBoardEvent(total = 4, rows = listOf(row(2, count = 3)))
+        state.onBoardEvent(total = 4, rows = listOf(row(2, count = 3)), settled = true)
         assertFalse(state.rowHasNextPage(2))
         assertNull(state.claimNextPage(row(2, count = 3)))
+    }
+
+    @Test
+    fun `full board widen reports loaded only after a settled event confirms it`() {
+        val state = HomePaginationState(initialRows = 5, rowStep = 5)
+        state.reset()
+        // The initial window settles, but the board is wider than the window: not fully loaded yet.
+        state.onBoardEvent(total = 10, rows = listOf(row(0)), settled = true)
+        assertFalse(state.isBoardFullyLoaded())
+
+        // Live widens the window to the whole board.
+        assertEquals(10, state.claimFullBoard())
+        // A second ensure tick bails on the in-flight widen; it must NOT yet see the board as loaded,
+        // even though requestedRows already reached boardTotal (the premature-true nudge-flash bug).
+        assertNull(state.claimFullBoard())
+        assertFalse(state.isBoardFullyLoaded())
+
+        // A mid-widen event that still has loading pages does not confirm the widen.
+        state.onBoardEvent(total = 10, rows = listOf(row(0)), settled = false)
+        assertFalse(state.isBoardFullyLoaded())
+
+        // Only the settled event for the dispatched widen confirms it.
+        state.onBoardEvent(total = 10, rows = listOf(row(0)), settled = true)
+        assertTrue(state.isBoardFullyLoaded())
     }
 
     private fun row(index: Int, count: Int = 2, loading: Boolean = false) = Catalog(

@@ -3,6 +3,7 @@ package com.vortx.android.integrations
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import com.vortx.android.account.AccountSyncGate
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaRef
 import com.vortx.android.model.MediaType
@@ -124,6 +125,10 @@ object ScrobbleService {
     }
 
     private fun fanScrobble(ref: MediaRef, action: String, progress: Double) {
+        // PER-PROFILE GATE: only the engine-backed MAIN profile scrobbles as the account. An overlay
+        // profile (guest / kids) plays against the local overlay and must NEVER push a watch into the
+        // owner's Trakt history. Mirrors Apple `ScrobbleCoordinator.passesOwnerGate` (activeUsesEngineHistory).
+        if (!AccountSyncGate.activeProfileSyncsAccount()) return
         // Gate on connected + enabled so a configured-but-not-connected build makes zero calls (no
         // coroutine launched just to fail auth). validToken() below is still the authoritative refresh.
         if (!ref.hasUsableId || !TraktAuth.isSignedIn || !isTraktScrobbleEnabled()) return
@@ -134,6 +139,8 @@ object ScrobbleService {
     }
 
     private fun recordSimklWatched(ref: MediaRef) {
+        // Same per-profile gate as [fanScrobble]: an overlay profile never records a SIMKL watch as the account.
+        if (!AccountSyncGate.activeProfileSyncsAccount()) return
         if (!SIMKLAuth.isSignedIn || !isSimklScrobbleEnabled()) return
         scope.launch {
             runCatching { simklAddToHistory(ref) }

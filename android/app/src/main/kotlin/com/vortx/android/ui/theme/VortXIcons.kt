@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
@@ -87,6 +88,9 @@ object VortXIcons {
     val close: ImageVector = Icons.Filled.Close
     val home: ImageVector = Icons.Filled.Home
     val discover: ImageVector = Icons.Filled.Explore
+    /// SF `dot.radiowaves.left.and.right` (Apple's Live tab glyph) -> Material `LiveTv`, the closest
+    /// broadcast/live mark. Drives the Live TV tab on phone + TV.
+    val live: ImageVector = Icons.Filled.LiveTv
     val library: ImageVector = Icons.Filled.VideoLibrary
     val search: ImageVector = Icons.Filled.Search
     val settings: ImageVector = Icons.Filled.Settings

@@ -31,13 +31,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.home.HomeCatalogLayout
@@ -57,6 +53,9 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.homeCatalogItemKey
 import com.vortx.android.ui.normalizeHomeCatalogs
 import com.vortx.android.ui.normalizeHomeItems
+import androidx.compose.ui.platform.LocalContext
+import com.vortx.android.VortXApplication
+import com.vortx.android.player.warm.SourceWarmer
 import com.vortx.android.ui.components.PosterCardMenu
 import com.vortx.android.ui.components.posterMenuFor
 import com.vortx.android.ui.theme.VortXTheme
@@ -167,7 +166,9 @@ private fun TvHomeContent(
     }
 
     Column(modifier = modifier.fillMaxSize().background(colors.canvas)) {
-        TvHero(heroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
+        // Hook site: the living-backdrop cinematic hero (backdrop crossfade + Ken Burns + ambient trailer +
+        // metadata overlay) lives in TvAmbientHero.kt. It follows the same focus-driven `heroItem`.
+        TvAmbientHero(heroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
         if (catalogLayout == HomeCatalogLayout.WALL) {
             TvCatalogWall(
                 catalogs = visibleCatalogs,
@@ -252,70 +253,6 @@ private fun TvHomeContent(
     }
 }
 
-/// The featured hero band: the focused title's backdrop under a dual scrim (left fade for text legibility,
-/// bottom fade to canvas so the rows sit on solid), with the bottom-left title/meta block. The 10-foot
-/// analogue of the phone [com.vortx.android.ui.screens.HomeScreen]'s `HeroHeader`, but art-backed and
-/// focus-reactive rather than a flat placeholder.
-@Composable
-private fun TvHero(item: MetaItem?, modifier: Modifier) {
-    val colors = VortXTheme.colors
-    Box(modifier = modifier) {
-        TvBackdrop(
-            url = item?.background ?: item?.poster,
-            seed = item?.id ?: "vortx",
-            modifier = Modifier.fillMaxSize(),
-        )
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Brush.horizontalGradient(0f to colors.canvas, 0.6f to Color.Transparent)),
-        )
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Brush.verticalGradient(0.35f to Color.Transparent, 1f to colors.canvas)),
-        )
-        if (item != null) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .fillMaxWidth(0.6f)
-                    .padding(start = TvDimens.edge, end = TvDimens.edge, bottom = TvDimens.edge),
-            ) {
-                Text(text = item.type.label.uppercase(), style = VortXTheme.type.eyebrow)
-                Text(
-                    text = item.name,
-                    style = VortXTheme.type.hero,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = VortXTheme.spacing.xs),
-                )
-                val meta = listOfNotNull(
-                    item.caption ?: item.year,
-                    item.imdbRating?.let { "★ $it" },
-                    item.genres.firstOrNull(),
-                ).joinToString("   ·   ")
-                if (meta.isNotBlank()) {
-                    Text(
-                        text = meta,
-                        style = VortXTheme.type.label.copy(color = colors.textSecondary),
-                        modifier = Modifier.padding(top = VortXTheme.spacing.sm),
-                    )
-                }
-                item.description?.takeIf { it.isNotBlank() }?.let {
-                    Text(
-                        text = it,
-                        style = VortXTheme.type.body.copy(color = colors.textSecondary),
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(top = VortXTheme.spacing.sm),
-                    )
-                }
-            }
-        }
-    }
-}
-
 /// One titled focus row: the editorial header (Continue Watching gets the "Pick up where you left off"
 /// kicker, like tvOS) over a horizontally-scrolling [LazyRow] of [TvPosterCard]s. The D-pad moves focus
 /// left/right within the row and up/down between rows; the focused tile drives the hero via [onFocused].
@@ -338,6 +275,23 @@ private fun TvCatalogRow(
         onRowState(catalog.id, rowState)
         onDispose { onRowDisposed(catalog.id, rowState) }
     }
+
+    // WARM-THE-PICK-ON-FOCUS for the Continue Watching row: after ~500 ms of dwell on a focused CW card,
+    // resolve + rank its winning source and warm the direct connection so pressing play starts faster.
+    // The 500 ms delay is the dwell (arrowing quickly past cards never warms), and re-assigning the focused
+    // item cancels the prior dwell (only the settled card warms). Movie-only + direct/HTTP-only + never
+    // debrid is enforced inside [SourceWarmer]. Fail-soft: a missed warm just falls back to the tap search.
+    val warmContext = LocalContext.current
+    val isContinueWatchingRow = remember(catalog) { posterMenuFor(catalog) == PosterCardMenu.CONTINUE_WATCHING }
+    var focusedCwItem by remember { mutableStateOf<MetaItem?>(null) }
+    LaunchedEffect(focusedCwItem) {
+        val item = focusedCwItem ?: return@LaunchedEffect
+        if (!isContinueWatchingRow) return@LaunchedEffect
+        delay(500)
+        val repo = (warmContext.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
+        SourceWarmer.warmForContinueWatching(warmContext, repo, item.type, item.id)
+    }
+
     Column(modifier = Modifier.focusGroup()) {
         TvCatalogHeader(catalog)
         LazyRow(
@@ -356,7 +310,10 @@ private fun TvCatalogRow(
                 TvPosterCard(
                     item = item,
                     onClick = { onItem(item) },
-                    onFocused = { onFocused(item) },
+                    onFocused = {
+                        onFocused(item)
+                        if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
+                    },
                     focusRequester = when {
                         recovery?.key == focusKey -> recoveryFocus
                         firstCardFocus != null && i == 0 -> firstCardFocus

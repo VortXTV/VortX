@@ -117,6 +117,15 @@ interface CatalogRepository {
     /// Widen the Home board so catalog rows beyond the first window can hydrate.
     suspend fun loadMoreHomeRows(): Result<Unit> = Result.success(Unit)
 
+    /// Widen the Home board to load EVERY catalog, so the Live surface's live-TV / channel / events
+    /// catalogs (usually ordered after an add-on's movie/series catalogs, hence outside the default board
+    /// window) hydrate. The Android analogue of Apple `CoreBridge.ensureLiveCatalogsLoaded`. Returns true
+    /// when the board is (now or already) fully loaded with nothing more to widen, false when it just
+    /// dispatched a widen and more rows are still arriving. Cheap and idempotent: it no-ops once fully
+    /// widened. Default = fully loaded, so the offline preview (a fixed row set) reports "settled" and the
+    /// Live screen can render its empty nudge without waiting.
+    suspend fun ensureLiveCatalogsLoaded(): Result<Boolean> = Result.success(true)
+
     /// CONTINUOUS ctx/library change ticks -- the Group-1 reactivity primitive every other mutable
     /// surface (Library, Detail's Saved chip, Discover's current selection, the installed-addons list)
     /// is built on, mirroring [homeUpdates]'s pattern for the same class of bug: Add-to-Library,

@@ -305,6 +305,17 @@ dependencies {
     // not a licensing-boundary feature -- so this is a plain `implementation`, not flavor-scoped.
     implementation(libs.work.runtime.ktx)
 
+    // Google Cast (the CAST lane, com.vortx.android.cast.*): send the current direct/HLS/debrid stream to a
+    // Cast receiver, Android's equivalent of the Apple AirPlay route. play-services-cast-framework wraps the
+    // CastContext/SessionManager/RemoteMediaClient; androidx.mediarouter supplies the device-discovery API the
+    // Compose route chooser uses. Both are plain Google/AndroidX libraries with NO GPL native code (unlike
+    // libmpv, which is fullImplementation-only), so they are LICENSING-BOUNDARY-SAFE plain `implementation`
+    // dependencies compiled into BOTH the `full` and `play` flavors: the Play build stays GPL-clean and gains
+    // casting without any libmpv. Torrents are gated out of casting as loopback URLs (CastEligibility), so a
+    // remote receiver is only ever handed a stream it can actually reach.
+    implementation(libs.play.services.cast.framework)
+    implementation(libs.androidx.mediarouter)
+
     testImplementation(libs.junit)
     testImplementation(libs.json.jvm)
     testImplementation(libs.kotlinx.coroutines.test)

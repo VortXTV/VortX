@@ -31,6 +31,17 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Hardware or software decode.** When a device's hardware decoder produces green or garbled frames, you can now switch that title to software decoding from Player settings, and back. Hardware stays the default. Android, VortX player.
 
 **Stretch video size mode.** The aspect control is now a Fit / Fill / Stretch picker: Fit keeps the whole frame, Fill crops to the screen, and Stretch fills the screen by distorting the picture. Android.
+
+**Cast to a TV or speaker.** Send what you are watching to a Google Cast device straight from the player. A Cast button appears in the controls for direct, HLS, and debrid streams, hands the stream, its subtitles, and your position to the receiver, and gives you play, pause, seek, and stop from the app. When you disconnect, playback picks up locally where the cast left off, and your progress keeps saving to the right profile the whole time. Torrents stay on the device, since a Cast receiver cannot reach the built-in streaming server. Android phone and tablet.
+
+### Android player performance
+
+**Match Frame Rate.** On Android TV, the player can now switch the display to the source's own frame rate, so a 24p film runs at a 24Hz-family mode instead of being pulled to the panel's default and juddering in pans. It reverts to the panel's normal mode when you leave the player, and does nothing on a screen that has no matching mode. It uses the same setting as the Apple app. Android TV.
+
+**Buffering that fits the device and the network.** The player now sizes its buffer to the device's memory and, when you opt in on an unmetered connection, to a quick measurement of your real link speed, so a fast, stable link keeps a lean buffer and a weaker one gets more runway to ride out dips. A Fast start, Balanced, or Fewer stalls intent lets you choose where inside that budget to sit. Balanced with no measurement matches the previous behavior exactly. Android.
+
+**The pick is warmed before you press play.** Opening a title, or settling focus on a Continue Watching card on Android TV, now warms the connection to the source that would play, fetching its header and index ahead of the tap so playback starts faster. Only direct links are warmed; a debrid source is never touched until you actually play it. Android.
+
 ### Android settings
 
 **Match audio to your subtitle language, and hide tracks by name.** Playback settings on Android add a Match audio to subtitle languages switch, so picking a subtitle language also picks audio in that language, and a reject-terms field that keeps any track whose name contains a word you list (commentary, sdh) from being auto-selected. Android.
@@ -48,6 +59,8 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Compact source rows.** Sources settings add a Compact source rows switch that drops the raw release name from each source, leaving the quality, add-on, and size badges. Android.
 
 **Auto-delete watched downloads.** Downloads settings add an Auto-delete watched downloads switch, saved and synced across your devices. Android.
+
+**Manage the download queue.** The Downloads screen now opens a queue manager: pending downloads are grouped Downloading, Up next, Paused, and Failed, you can move a waiting item earlier or later, pause or resume or retry one, and set how many downloads run at once (raising the cap starts more right away, lowering it never interrupts one already in progress). It also shows where downloads are kept on the device and how much space they use. Android phone, tablet, and TV.
 
 ### Resume and buffering (build 218)
 
@@ -146,9 +159,13 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **Pick who is watching at launch.** On an account with more than one profile, the Android app now opens on a "Who's watching?" picker so you land in the right profile, with its own Continue Watching, library, and source ranking, from the first screen. A profile with a PIN is gated the same way it is in Settings, and the picker only appears when there is a real choice to make. Android.
 
+**Create, edit, and delete profiles.** Settings > Profiles now manages the whole roster: add a profile, rename it, delete it, and set its avatar from the emoji grid or by typing your own emoji or a letter. Each profile also picks its own accent color and a Warm or OLED Black background, applied straight away when it is the one you are using, and a profile can carry a 4-digit PIN and a Kids flag that hides adult and fake sources. A profile keeps its own Continue Watching and library, so managing one never touches another's history, and every choice syncs with the profile across your devices. Android.
+
 **One place to sign in.** Sign-in now lives on a single surface with your VortX account first, as the primary login that syncs your profiles and progress end to end encrypted, and the optional Stremio import below it. Both read exactly the same as before; they are just gathered into one screen with the right order. Android.
 
 **Continue Watching on the Android TV home screen.** Your Continue Watching titles now appear on the Android TV "Play Next" row on the home screen, so you can resume straight from there without opening the app first. Selecting one opens the title in VortX at your spot. It follows the active profile, updates as you watch, and can be turned off in Settings. Android TV.
+
+**A cinematic home hero on Android TV.** The Android TV home now leads with a full screen backdrop of the title you have focused, carrying its logo, year, rating, and a short synopsis, and it cross fades smoothly as you move between titles. When you rest on a title for a moment the backdrop comes alive, a slow drifting Ken Burns motion, or a muted trailer when one is readily available, and it settles back the instant you move on or start watching. It follows the Autoplay trailers setting and respects reduced motion. Android TV.
 
 **Back up your settings to a file.** A new Backup screen in Settings saves your syncable settings, profiles included, to a file, with no account needed, and imports one back. Device only settings such as the streaming cache size are left out, and importing merges a backup in without removing settings that are not in the file. Android.
 

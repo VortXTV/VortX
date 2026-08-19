@@ -61,6 +61,10 @@ internal object EngineState {
             val seenIds = mutableSetOf<String>()
             var title: String? = null
             var rowId: String? = null
+            // The catalog's declared content type (`request.path.type`), mirroring Apple `CoreBoardRow.type`.
+            // Carried onto the row so the Live surface can filter to `LiveTypes.contains(type)` catalogs
+            // (tv / channel / events) without inspecting each item.
+            var rowType: String? = null
             var pageLoading = false
             for (pageIdx in 0 until pages.length()) {
                 val page = pages.optJSONObject(pageIdx) ?: continue
@@ -68,6 +72,7 @@ internal object EngineState {
                     val request = page.optJSONObject("request")
                     rowId = catalogRowId(request, catalogIdx)
                     title = titleMap[rowId] ?: catalogTitle(request)
+                    rowType = request?.optJSONObject("path")?.optStringOrNull("type")
                 }
                 if (page.optJSONObject("content")?.optString("type") == "Loading") {
                     pageLoading = true
@@ -86,6 +91,7 @@ internal object EngineState {
                     engineIndex = catalogIdx,
                     hasNextPage = true,
                     pageLoading = pageLoading,
+                    type = rowType,
                 )
             }
         }
@@ -131,6 +137,24 @@ internal object EngineState {
     /// disabled, empty, failed, and not-yet-loaded catalogs still occupy stable engine indices.
     fun boardCatalogCount(json: String): Int =
         json.toJsonObjectOrNull()?.optJSONArray("catalogs")?.length() ?: 0
+
+    /// True while any board catalog page is still in the engine's `Loading` state (a request dispatched
+    /// but not yet answered). [parseCatalogs] drops a catalog that has no items yet, so a not-yet-answered
+    /// live catalog is INVISIBLE in its rows -- the Live surface therefore cannot tell "still widening"
+    /// apart from "genuinely empty" from the parsed rows alone. This raw scan gives it that signal, so the
+    /// "install a Live TV add-on" nudge only shows once the board has genuinely settled, never mid-widen.
+    /// Only actively-loading pages count: an unrequested catalog (content absent) is not "loading".
+    fun boardHasLoadingPages(json: String): Boolean {
+        val catalogs = json.toJsonObjectOrNull()?.optJSONArray("catalogs") ?: return false
+        for (catalogIdx in 0 until catalogs.length()) {
+            val pages = catalogs.optJSONArray(catalogIdx) ?: continue
+            for (pageIdx in 0 until pages.length()) {
+                val page = pages.optJSONObject(pageIdx) ?: continue
+                if (page.optJSONObject("content")?.optString("type") == "Loading") return true
+            }
+        }
+        return false
+    }
 
     /// Parse the `discover` field (a `CatalogWithFilters`) into UI [Catalog] rows. Unlike `board` (a
     /// `CatalogsWithExtra` whose `catalogs` is nested `[[page]]`), Discover is a SINGLE selectable rail:

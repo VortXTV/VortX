@@ -64,6 +64,9 @@ fun DownloadsScreen(
     onBack: () -> Unit,
     onPlay: (Playable) -> Unit,
     modifier: Modifier = Modifier,
+    // Opens the download QUEUE manager (reorder / pause / concurrency cap / storage), the Android port of
+    // Apple's `DownloadQueueView`. Additive default keeps every existing call site unchanged.
+    onManageQueue: () -> Unit = {},
 ) {
     val records by DownloadStore.records.collectAsStateWithLifecycle()
     // groupedDownloads() derives from the record list, so re-derive whenever it changes and not on every recomposition.
@@ -87,8 +90,14 @@ fun DownloadsScreen(
                             totalSize,
                             style = VortXTheme.type.label,
                             color = colors.textTertiary,
-                            modifier = Modifier.padding(end = VortXTheme.spacing.edge),
+                            modifier = Modifier.padding(end = VortXTheme.spacing.xs),
                         )
+                    }
+                    // Manage queue: reorder pending downloads, pause / retry, and cap how many run at once
+                    // (the DownloadQueueScreen). Always available so the concurrency + storage controls stay
+                    // reachable even with an empty list.
+                    IconButton(onClick = onManageQueue) {
+                        Icon(VortXIcons.chevronUpDown, contentDescription = "Manage download queue")
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(

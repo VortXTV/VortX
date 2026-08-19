@@ -29,6 +29,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.vortx.android.model.Playable
+import com.vortx.android.player.tuning.AdaptiveTuning
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -64,10 +65,13 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun buildPlayer(context: Context): ExoPlayer {
         val builder = ExoPlayer.Builder(context, DefaultRenderersFactory(context))
         if (BufferTuningSetting.isEnabled(context)) {
-            builder.setLoadControl(VortxExoLoadControl.create(context))
+            // Adaptive plan = merged RAM tier + viewer buffer intent + freshest link sweep. At the default
+            // BALANCED intent with no sweep it reproduces the merged RAM-tier LoadControl exactly.
+            builder.setLoadControl(VortxExoLoadControl.create(AdaptiveTuning.currentPlan(context)))
             builder.setBandwidthMeter(
                 DefaultBandwidthMeter.Builder(context)
-                    .setInitialBitrateEstimate(INITIAL_BITRATE_ESTIMATE_BPS)
+                    // Seed from the measured link when a sweep exists, else the conservative 50 Mbps default.
+                    .setInitialBitrateEstimate(AdaptiveTuning.initialBitrateEstimate(context))
                     .build(),
             )
         }
@@ -166,6 +170,10 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     override fun load(playable: Playable) {
         lastPlayable = playable
+
+        // Record this stream so the adaptive tuner can (when opted in, on an unmetered link) measure its
+        // host in the background for the NEXT play. Fail-soft and gated inside noteStream.
+        AdaptiveTuning.noteStream(appContext, playable.url, playable.headers)
 
         // yt-direct ADAPTIVE trailer: the InnerTube answer is a video-only leg + a separate audio-only leg
         // (not a single .mpd). Merge them with a [MergingMediaSource] of two [ProgressiveMediaSource]s over a
@@ -361,6 +369,15 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         return stats
     }
 
+    /// Source frame rate + pixel size for the Match-Frame-Rate display switch, from Media3's decoded
+    /// [Format]. Null until the video format is known (pre-first-frame). Read on the main looper, the same
+    /// thread this engine reads all its player state from.
+    override fun videoFrameProfile(): VideoFrameProfile? {
+        val v = player.videoFormat ?: return null
+        if (v.frameRate <= 0f) return null
+        return VideoFrameProfile(v.frameRate.toDouble(), v.width.coerceAtLeast(0), v.height.coerceAtLeast(0))
+    }
+
     /// Community-trickplay frame grab: a DOCUMENTED no-op on this engine, overridden explicitly rather
     /// than inherited so the gap is visible at the call site instead of hidden behind a default. Same
     /// shape as this engine's other honest no-ops ([setAudioDelay], [setAudioOutputMode]).
@@ -454,10 +471,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         const val POSITION_POLL_MS = 1_000L
         const val MIN_SPEED = 0.25f
         const val MAX_SPEED = 4.0f
-
-        // Seed the bandwidth meter at 50 Mbps so the first chunk of a fast 4K stream is not throttled by a
-        // cold, pessimistic estimate; the meter corrects itself from real throughput within a segment or two.
-        const val INITIAL_BITRATE_ESTIMATE_BPS = 50_000_000L
+        // The bandwidth-meter seed now comes from AdaptiveTuning.initialBitrateEstimate (measured link when
+        // known, else its own 50 Mbps default), so the constant that used to live here moved there.
     }
 }
 

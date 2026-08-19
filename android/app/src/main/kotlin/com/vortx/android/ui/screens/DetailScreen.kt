@@ -149,6 +149,16 @@ fun DetailScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // WARM-THE-PICK-ON-DETAIL-OPEN. Once the source groups for the current title/episode are in memory,
+    // warm the connection to the ranked direct winner (header + seek index) so a tap-to-play starts faster.
+    // Uses the groups already loaded here (no engine re-entry) and only ever warms a direct/HTTP source,
+    // never a debrid one. Keyed on the loaded groups + selected episode so it re-warms when either changes.
+    LaunchedEffect(streamsState, selectedEpisodeId) {
+        val groups = (streamsState as? UiState.Success)?.data ?: return@LaunchedEffect
+        val key = "detail:$title:${selectedEpisodeId ?: ""}"
+        com.vortx.android.player.warm.SourceWarmer.warmFromGroups(context, groups, key)
+    }
+
     // The download status line is a transient confirmation, not a persistent state: show it for a beat then
     // clear it (the live queue/progress lives on the Downloads screen). Keyed on the notice text so each new
     // message restarts the timer; a null notice cancels cleanly.

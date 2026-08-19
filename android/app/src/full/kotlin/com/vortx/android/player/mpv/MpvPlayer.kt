@@ -11,8 +11,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
-import com.vortx.android.player.BufferTuningSetting
-import com.vortx.android.player.DeviceMemoryTier
 import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.PlayerChapter
@@ -21,6 +19,7 @@ import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
+import com.vortx.android.player.tuning.AdaptiveTuning
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -216,20 +215,35 @@ class MpvPlayer private constructor(
         //     cache, so keep mpv's read-ahead tight; a remote debrid/CDN link keeps the larger buffer for
         //     network resilience; a constrained device stays tight even for remote (PerformanceMode hook).
         val reduced = PerformanceMode.isReduced(appContext)
+        val diskCache = DiskCacheSetting.diskCacheEnabled(appContext)
+        // Local == torrent/loopback/trailer/reduced: all keep the tight flat read-ahead (a trailer is a
+        // short clip; a torrent/loopback buffers in the streaming server's own cache; a reduced device
+        // stays clear of jetsam). Mirrors Apple loadFile's local vs remote split.
+        val localStream = playable.isTorrent || playable.viaStreamingServer || playable.isTrailer || reduced
+        // The capable remote debrid/CDN path is the ONE that takes the adaptive buffer.
+        val remoteAdaptive = !diskCache && !localStream
         val readAhead = when {
-            DiskCacheSetting.diskCacheEnabled(appContext) ->
-                DiskCacheSetting.resolvedMaxBytes(appContext, reduced).toString()
-            // A trailer is a short clip (proxied to 127.0.0.1, or the small remote worker host), so it takes
-            // the tight local read-ahead too -- the big remote buffer just wastes RAM on it. Mirrors Apple
-            // loadFile giving the trailer host the small read-ahead.
-            playable.isTorrent || playable.viaStreamingServer || playable.isTrailer -> READ_AHEAD_LOCAL
-            reduced -> READ_AHEAD_LOCAL
-            // A remote debrid/CDN link on a capable (non-reduced) device: size the forward read-ahead to
-            // this device's RAM tier so a 4K VBR peak is not starved, clamped by free disk and floored at
-            // the conservative flat cap. Behind the buffer-tuning flag; OFF keeps the flat cap.
-            else -> remoteReadAheadBytes(appContext).toString()
+            diskCache -> DiskCacheSetting.resolvedMaxBytes(appContext, reduced).toString()
+            localStream -> READ_AHEAD_LOCAL
+            // Remote debrid/CDN on a capable device: size the forward read-ahead to the device RAM tier
+            // scaled by the buffer-intent + measured-link plan, clamped by free disk and floored at the
+            // conservative flat cap. Behind the buffer-tuning flag; OFF keeps the flat cap.
+            else -> AdaptiveTuning.mpvRemoteReadAheadBytes(appContext).toString()
         }
         mpv.setPropertyString(OPT_DEMUXER_MAX_BYTES, readAhead)
+
+        // On the capable remote path, also match the forward read-ahead SECONDS and cache window to the
+        // adaptive plan (the mpv half of feeding the plan into demuxer-readahead-secs / cache-secs). The
+        // local / disk-cache paths keep the base-option values from [MpvConfig].
+        if (remoteAdaptive) {
+            val plan = AdaptiveTuning.currentPlan(appContext)
+            mpv.setPropertyString(OPT_DEMUXER_READAHEAD_SECS, plan.mpvReadaheadSecs.toString())
+            mpv.setPropertyString(OPT_CACHE_SECS, plan.mpvCacheSecs.toString())
+        }
+
+        // Record this stream so the adaptive tuner can measure its host in the background for the NEXT play
+        // (opt-in + unmetered gated inside noteStream). Fail-soft.
+        AdaptiveTuning.noteStream(appContext, playable.url, playable.headers)
 
         // loadfile as an argv array so a URL containing mpv's list/escape chars is one argument.
         mpv.command(arrayOf("loadfile", playable.url, "replace"))
@@ -353,6 +367,16 @@ class MpvPlayer private constructor(
         mpv.getPropertyString("audio-params/hr-channels")?.takeIf { it.isNotEmpty() }
             ?.let { stats += "Channels" to it }
         return stats
+    }
+
+    /// Source frame rate + pixel size for the Match-Frame-Rate display switch, from mpv's demuxer
+    /// properties. Null until the container rate is known (a beat after the first frames), which is the
+    /// signal [com.vortx.android.player.AfrController] polls for. Thread-safe: mpv property reads are.
+    override fun videoFrameProfile(): com.vortx.android.player.VideoFrameProfile? {
+        val fps = mpv.getPropertyDouble("container-fps")?.takeIf { it > 0 } ?: return null
+        val w = (mpv.getPropertyInt("video-params/w") ?: mpv.getPropertyInt("width") ?: 0).coerceAtLeast(0)
+        val h = (mpv.getPropertyInt("video-params/h") ?: mpv.getPropertyInt("height") ?: 0).coerceAtLeast(0)
+        return com.vortx.android.player.VideoFrameProfile(fps, w, h)
     }
 
     override fun onEnterBackground() {
@@ -578,6 +602,10 @@ class MpvPlayer private constructor(
         private const val PROP_SCREENSHOT_JPEG_QUALITY = "screenshot-jpeg-quality"
         private const val OPT_HTTP_HEADER_FIELDS = "http-header-fields"
         private const val OPT_DEMUXER_MAX_BYTES = "demuxer-max-bytes"
+        // Per-file adaptive read-ahead SECONDS + cache window on the capable remote path (the base values
+        // are pre-init options in [MpvConfig]; these override them from the adaptive plan).
+        private const val OPT_DEMUXER_READAHEAD_SECS = "demuxer-readahead-secs"
+        private const val OPT_CACHE_SECS = "cache-secs"
 
         /// Quality of mpv's full-resolution INTERMEDIATE grab. High on purpose: it is re-encoded below at
         /// [CAPTURE_JPEG_QUALITY] after downscaling, and compressing twice at the final quality would
@@ -590,29 +618,10 @@ class MpvPlayer private constructor(
 
         // Per-file read-ahead: local torrent/loopback vs remote debrid/CDN (mirrors Apple loadFile).
         // LOCAL stays a conservative flat cap (a torrent/loopback stream buffers in the streaming server's
-        // own cache, so mpv's read-ahead is kept tight). REMOTE is now sized to the device RAM tier per
-        // load (see [remoteReadAheadBytes]); [READ_AHEAD_REMOTE_BYTES] is the flag-off fallback and floor.
+        // own cache, so mpv's read-ahead is kept tight). The REMOTE path is now sized per load by the
+        // adaptive tuner (device RAM tier + buffer intent + measured link), see
+        // [com.vortx.android.player.tuning.AdaptiveTuning.mpvRemoteReadAheadBytes].
         private const val READ_AHEAD_LOCAL = "96MiB"
-        private const val READ_AHEAD_REMOTE_BYTES = 128L * 1024 * 1024 // 128 MiB
-        private const val BYTES_PER_MB = 1024L * 1024
-
-        /**
-         * Forward read-ahead (bytes) for a REMOTE stream on a capable (non-reduced) device. With the
-         * buffer-tuning flag ON, size it to this device's RAM tier ([DeviceMemoryTier.safeBufferMb]) so a
-         * 4K variable-bitrate peak is not starved, clamped by half of CURRENT free disk (the same clamp the
-         * on-disk cache uses) and never below the conservative flat [READ_AHEAD_REMOTE_BYTES] floor. With the
-         * flag OFF, the flat floor. FAIL-SOFT: an unreadable free-disk figure just skips the clamp, and an
-         * unknown RAM reads back as the 2 GB tier inside [DeviceMemoryTier]. Pure given the context, so the
-         * clamp math is inspectable at one site.
-         */
-        internal fun remoteReadAheadBytes(context: Context): Long {
-            if (!BufferTuningSetting.isEnabled(context)) return READ_AHEAD_REMOTE_BYTES
-            val ramBudget = DeviceMemoryTier.safeBufferMb(context).toLong() * BYTES_PER_MB
-            val freeClamp = DiskCacheSetting.freeDiskBytes(context)
-                ?.let { (it * DiskCacheSetting.FREE_DISK_FRACTION).toLong() }
-            val clamped = if (freeClamp != null) minOf(ramBudget, freeClamp) else ramBudget
-            return maxOf(clamped, READ_AHEAD_REMOTE_BYTES)
-        }
 
         /// Runtime HTTP-property writes for one file, in application order. The first two writes always clear
         /// the previous file's identity; later writes apply only this file's headers / trailer-bound UA.

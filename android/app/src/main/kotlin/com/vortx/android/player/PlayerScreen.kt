@@ -58,6 +58,11 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import com.vortx.android.VortXApplication
+import com.vortx.android.cast.CastButton
+import com.vortx.android.cast.CastEligibility
+import com.vortx.android.cast.CastOverlay
+import com.vortx.android.cast.CastRouteChooserSheet
+import com.vortx.android.cast.rememberCastManager
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
@@ -380,8 +385,68 @@ fun PlayerScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // MATCH FRAME RATE (AFR). When enabled, switch the display mode to match the source's frame rate once
+    // the engine reports it, and revert on player exit. The controller polls the live engine for the rate
+    // and is a fail-soft no-op on a panel that exposes no matching mode (phones), so this single hook is
+    // safe on every device. Keyed on the engine so a source/engine switch re-matches for the new stream.
+    // Mirrors the Apple TV HDRDisplayMode Match-Frame-Rate path; same preference key across all apps.
+    DisposableEffect(engine, hostActivity) {
+        val activity = hostActivity
+        val controller = if (activity != null && MatchFrameRateSetting.isEnabled(context)) {
+            AfrController(activity).also { it.start(engine) }
+        } else {
+            null
+        }
+        onDispose { controller?.stop() }
+    }
+
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
+
+    // GOOGLE CAST (the CAST lane, Android's AirPlay equivalent). Conceptually mirrors the Apple AirPlay
+    // handoff: while a receiver is connected the local engine YIELDS (pauses, so it stops decoding and
+    // consuming the source), the current stream (URL + subtitles + start position) plays on the receiver,
+    // and on disconnect local playback RESUMES where the receiver left off. Torrents are gated OUT of
+    // casting (loopback streaming-server URLs a receiver cannot reach), exactly as the router keeps them on
+    // libmpv. All cast machinery lives in com.vortx.android.cast; this host block is the minimal seam.
+    val castManager = rememberCastManager()
+    val castState by castManager.state.collectAsStateWithLifecycle()
+    var castChooserOpen by remember(playbackSessionKey) { mutableStateOf(false) }
+    val streamCastable = CastEligibility.isCastable(currentPlayable)
+    // Keep the manager aimed at the current stream with a LIVE position provider, so a session started from
+    // our chooser loads exactly where local playback is, and an in-player episode/source switch reloads the
+    // receiver. A non-castable stream clears it so nothing stale is ever cast.
+    LaunchedEffect(castManager, currentPlayable, streamCastable) {
+        castManager.setNowPlaying(if (streamCastable) currentPlayable else null) {
+            latestState.positionMs.coerceAtLeast(0L)
+        }
+    }
+    // Local playback yields to / resumes from the receiver. The [wasCasting] latch makes resume fire ONLY
+    // after an actual cast, so the initial (disconnected) composition never spuriously seeks or plays.
+    var wasCasting by remember(playbackSessionKey) { mutableStateOf(false) }
+    LaunchedEffect(castState.isConnected) {
+        if (castState.isConnected) {
+            wasCasting = true
+            engine.pause()
+        } else if (wasCasting) {
+            wasCasting = false
+            val resumeAt = castManager.lastKnownPositionMs
+            if (resumeAt > 0L) engine.seekTo(resumeAt)
+            engine.play()
+        }
+    }
+    // Record progress WHILE casting through the SAME per-profile onProgress path the local engine uses:
+    // casting must not bypass watch history. The local progress writer is dormant here (its engine is
+    // paused), so this is the only writer while connected, and it never runs for a trailer.
+    LaunchedEffect(castState.isConnected, currentPlayable.isTrailer) {
+        if (!castState.isConnected || currentPlayable.isTrailer) return@LaunchedEffect
+        while (isActive) {
+            val s = castManager.state.value
+            if (s.durationMs > 0L && !s.isPaused) currentOnProgress(s.positionMs, s.durationMs)
+            delay(CAST_PROGRESS_WRITEBACK_MS)
+        }
+    }
+
     // Keying the resolver job by the exact authority cancels it when the outer playback session or request
     // changes. The token check below is the authoritative defense if a resolver ignores cancellation.
     val pendingSourceSwitch = sourceSwitchState.pendingSwitch
@@ -1170,6 +1235,21 @@ fun PlayerScreen(
             } else {
                 null
             },
+            // Google Cast button (the CAST lane). Supplied ONLY when the Cast framework is available AND the
+            // current stream is castable (a direct/HLS/debrid URL, never a loopback torrent); the button
+            // itself further self-hides when no receivers are on the network. Opening it shows the device
+            // chooser. Withheld while locked or in PiP (the cluster is unreachable then anyway).
+            castButton = if (castManager.isEnabled && streamCastable) {
+                {
+                    CastButton(
+                        state = castState,
+                        emberAccent = emberAccent,
+                        onClick = { showControls(); castChooserOpen = true },
+                    )
+                }
+            } else {
+                null
+            },
             onLock = {
                 controlsLocked = true
                 controlsVisible = false
@@ -1287,6 +1367,27 @@ fun PlayerScreen(
                 )
             }
         }
+
+        // GOOGLE CAST overlay + device chooser (the CAST lane), drawn LAST so they sit above the chrome.
+        // The chooser is a dialog the cast button opens. The overlay takes over the surface while a receiver
+        // is connected (the local video is paused underneath), naming the device and hosting the cast
+        // transport (play/pause, +/-10s, seek, stop). Withheld in PiP, where the tiny window is video-only.
+        if (castManager.isEnabled) {
+            if (castChooserOpen) {
+                CastRouteChooserSheet(onDismiss = { castChooserOpen = false })
+            }
+            if (castState.isConnected && !pip.isInPip) {
+                CastOverlay(
+                    state = castState,
+                    emberAccent = emberAccent,
+                    onBack = currentOnBack,
+                    onTogglePlay = { castManager.togglePause() },
+                    onSeekBy = { castManager.seekBy(it) },
+                    onSeekTo = { castManager.seekTo(it) },
+                    onStop = { castManager.stopCasting() },
+                )
+            }
+        }
     }
 }
 
@@ -1396,6 +1497,11 @@ internal tailrec fun Context.findActivity(): Activity? = when (this) {
 
 /// The double-tap relative-seek step (ms). Matches the transport bar's Replay10/Forward10 buttons.
 private const val DOUBLE_TAP_SEEK_MS = 10_000L
+
+/// How often watch progress is written back while casting, matching the receiver's ~1s progress cadence
+/// closely enough for Continue Watching while staying light. Uses the SAME onProgress path as local
+/// playback so casting never bypasses per-profile watch history.
+private const val CAST_PROGRESS_WRITEBACK_MS = 5_000L
 
 /// How long the chrome stays up with no interaction while playback is rolling before it auto-hides.
 /// 3.5s sits in the standard mobile-player band (3-4s); paused/buffering/error states never hide.

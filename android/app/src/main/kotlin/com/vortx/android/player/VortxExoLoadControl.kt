@@ -6,6 +6,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.trackselection.ExoTrackSelection
 import androidx.media3.exoplayer.upstream.DefaultAllocator
+import com.vortx.android.player.tuning.AdaptiveBufferPlan
 
 /**
  * The ExoPlayer [androidx.media3.exoplayer.LoadControl] VortX runs instead of the stock default, tuned for
@@ -36,14 +37,20 @@ import androidx.media3.exoplayer.upstream.DefaultAllocator
 class VortxExoLoadControl private constructor(
     allocator: DefaultAllocator,
     private val targetBufferBytesOverride: Int,
+    minBufferMs: Int,
+    maxBufferMs: Int,
+    bufferForPlaybackMs: Int,
+    bufferForPlaybackAfterRebufferMs: Int,
 ) : DefaultLoadControl(
     allocator,
     // (streaming, local-playback) pairs; VortX uses the same value for both, matching the builder's
-    // behavior when only the generic setBufferDurationsMs is called.
-    MIN_BUFFER_MS, MIN_BUFFER_MS,
-    MAX_BUFFER_MS, MAX_BUFFER_MS,
-    BUFFER_FOR_PLAYBACK_MS, BUFFER_FOR_PLAYBACK_MS,
-    BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS, BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
+    // behavior when only the generic setBufferDurationsMs is called. The durations are constructor params
+    // now (defaulted by [create] to the merged RAM-tier values) so the adaptive planner can vary them per
+    // the viewer's buffer intent + measured link speed without a second LoadControl subclass.
+    minBufferMs, minBufferMs,
+    maxBufferMs, maxBufferMs,
+    bufferForPlaybackMs, bufferForPlaybackMs,
+    bufferForPlaybackAfterRebufferMs, bufferForPlaybackAfterRebufferMs,
     // targetBufferBytes: C.LENGTH_UNSET means "no fixed overwrite"; the override below supplies the value.
     C.LENGTH_UNSET,
     // prioritizeTimeOverSizeThresholds (streaming, local): false, so the size target is honored.
@@ -77,13 +84,41 @@ class VortxExoLoadControl private constructor(
         private const val BYTES_PER_MB = 1024 * 1024
 
         /**
-         * Build a [VortxExoLoadControl] sized to this device's RAM tier. The target-buffer bytes come from
-         * [DeviceMemoryTier.safeBufferMb], which is fail-soft (an unknown RAM reads back as the 2 GB tier).
+         * Build a [VortxExoLoadControl] sized to this device's RAM tier, with the merged buffer durations.
+         * The target-buffer bytes come from [DeviceMemoryTier.safeBufferMb], which is fail-soft (an unknown
+         * RAM reads back as the 2 GB tier). This is the RAM-tier baseline the adaptive [create] refines.
          */
         fun create(context: Context): VortxExoLoadControl {
             val allocator = DefaultAllocator(TRIM_ON_RESET, ALLOCATION_UNIT_BYTES)
             val targetBytes = DeviceMemoryTier.safeBufferMb(context) * BYTES_PER_MB
-            return VortxExoLoadControl(allocator, targetBytes)
+            return VortxExoLoadControl(
+                allocator,
+                targetBytes,
+                MIN_BUFFER_MS,
+                MAX_BUFFER_MS,
+                BUFFER_FOR_PLAYBACK_MS,
+                BUFFER_FOR_PLAYBACK_AFTER_REBUFFER_MS,
+            )
+        }
+
+        /**
+         * Build a [VortxExoLoadControl] from an [AdaptiveBufferPlan] (device RAM tier + viewer buffer
+         * intent + measured link speed). At [com.vortx.android.player.tuning.BufferIntentProfile.BALANCED]
+         * with no link measurement the plan reproduces the merged RAM-tier values exactly, so this is a
+         * superset of [create], never a behavior change until the viewer picks another profile or a sweep
+         * lands. The allocator + back-buffer are unchanged.
+         */
+        fun create(plan: AdaptiveBufferPlan): VortxExoLoadControl {
+            val allocator = DefaultAllocator(TRIM_ON_RESET, ALLOCATION_UNIT_BYTES)
+            // The plan's target is already clamped to this device's RAM budget by the planner.
+            return VortxExoLoadControl(
+                allocator,
+                plan.targetBufferBytes,
+                plan.minBufferMs,
+                plan.maxBufferMs,
+                plan.bufferForPlaybackMs,
+                plan.bufferForPlaybackMs,
+            )
         }
     }
 }
