@@ -281,6 +281,7 @@ final class ScrubThumbnailsStore: ObservableObject {
             image = crop; previewState = .ready; return
         }
         guard let key = localCacheKey else {
+            if let fallback = nearestCommunityFallback() { image = fallback; previewState = .ready; return }
             previewState = previewStateForRemoteState(); return
         }
         // In-memory hit resolves synchronously so a warm scrub is instant and never touches disk.
@@ -300,14 +301,28 @@ final class ScrubThumbnailsStore: ObservableObject {
                           currentToken: self.showToken,
                           currentMediaKey: self.localCacheKey
                       ), self.pendingLocalReadToken == token else { return }
-                self.pendingLocalReadToken = nil; self.image = resolved
-                self.previewState = resolved == nil ? self.previewStateForRemoteState() : .ready
+                self.pendingLocalReadToken = nil
+                if let resolved {
+                    self.image = resolved; self.previewState = .ready
+                } else if let fallback = self.nearestCommunityFallback() {
+                    self.image = fallback; self.previewState = .ready
+                } else {
+                    self.image = nil; self.previewState = self.previewStateForRemoteState()
+                }
             }
         }
     }
 
     func clear() {
         showToken &+= 1; activeScrubTime = nil; pendingLocalReadToken = nil; image = nil; previewState = .hidden
+    }
+
+    /// Last-resort preview when neither an exact community tile nor a local captured frame covers the scrub
+    /// position: serve the NEAREST community tile so scrubbing shows an approximate frame instead of
+    /// "Previews unavailable". nil only when this title has no downloaded community sheet.
+    private func nearestCommunityFallback() -> ScrubImage? {
+        guard let sheet = communitySheet, let time = activeScrubTime else { return nil }
+        return sheet.nearestCrop(at: time)
     }
 
     private func previewStateForRemoteState() -> PreviewState {

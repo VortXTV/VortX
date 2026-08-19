@@ -34,6 +34,15 @@ enum StreamRanking {
     /// order (the anti-regression invariant documented in `computeScore`).
     static let stickyWeight = 6000
 
+    /// Soft sticky weight for FRESH plays / Continue-Watching resumes, where the remembered pick must not
+    /// override a MATERIALLY better source (it played a worse source over the amazing debrids). Sized below the
+    /// smallest labelled-resolution step (720 -> 1080 = 360), the DV bonus (45), the cached bonus (8000) and
+    /// every 15000 source-type tier step, so a better resolution, a cache hit, or a higher source type always
+    /// wins; it only floats the remembered source among otherwise near-identical releases. Still a bonus, never
+    /// a filter (MIS-260731-03). `stickyWeight` stays the default, so auto-NEXT within a binge keeps re-picking
+    /// the chosen provider.
+    static let stickySoftWeight = 40
+
     // MARK: - Caches
 
     /// `String.range(of:options:.regularExpression)` recompiles the ICU pattern on EVERY call,
@@ -125,10 +134,12 @@ enum StreamRanking {
     /// carrying both is not paid twice; the point is "same source", not "how many ways it looks the same".
     /// Strictly a bonus: stickiness must never become a filter, or the episode the remembered add-on has
     /// nothing for strands the viewer (MIS-260731-03).
-    static func stickyBonus(_ s: CoreStream, addon: String, sticky: (addon: String?, bingeGroup: String?)?) -> Int {
+    static func stickyBonus(_ s: CoreStream, addon: String, sticky: (addon: String?, bingeGroup: String?)?,
+                            authoritative: Bool = true) -> Int {
         guard let sticky else { return 0 }
-        if let a = sticky.addon, !a.isEmpty, addon.caseInsensitiveCompare(a) == .orderedSame { return stickyWeight }
-        if let g = sticky.bingeGroup, !g.isEmpty, s.behaviorHints?.bingeGroup == g { return stickyWeight }
+        let weight = authoritative ? stickyWeight : stickySoftWeight
+        if let a = sticky.addon, !a.isEmpty, addon.caseInsensitiveCompare(a) == .orderedSame { return weight }
+        if let g = sticky.bingeGroup, !g.isEmpty, s.behaviorHints?.bingeGroup == g { return weight }
         return 0
     }
 
@@ -166,10 +177,11 @@ enum StreamRanking {
     /// clamping a sum that includes it would let the ceiling silently cancel a demotion - it is applied by the
     /// callers AFTER this, unclamped, so a penalized provider always loses exactly its `stickyWeight`.
     static func callerBonuses(_ s: CoreStream, addon: String, hint: String?, binge: String?,
-                              sticky: (addon: String?, bingeGroup: String?)?) -> Int {
+                              sticky: (addon: String?, bingeGroup: String?)?,
+                              stickyAuthoritative: Bool = true) -> Int {
         let sum = continuityBonus(s, hint: hint)
             + bingeBonus(s, group: binge)
-            + stickyBonus(s, addon: addon, sticky: sticky)
+            + stickyBonus(s, addon: addon, sticky: sticky, authoritative: stickyAuthoritative)
         return min(sum, callerBonusCeiling)
     }
 
@@ -195,6 +207,7 @@ enum StreamRanking {
     /// than one step of the user's source-type order.
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                      pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
+                     stickyAuthoritative: Bool = true,
                      providerPenalty: ((String) -> Bool)? = nil,
                      debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
@@ -215,11 +228,13 @@ enum StreamRanking {
         let candidates = playablePairs(groups)
         return candidates.max { lhs, rhs in
             (score(lhs.stream, debridCachedHashes: debridCachedHashes)
-                + callerBonuses(lhs.stream, addon: lhs.addon, hint: hint, binge: binge, sticky: sticky)
+                + callerBonuses(lhs.stream, addon: lhs.addon, hint: hint, binge: binge, sticky: sticky,
+                                stickyAuthoritative: stickyAuthoritative)
                 + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)
                 + healthPenalty(addon: lhs.addon, isUnhealthy: providerPenalty)) <
             (score(rhs.stream, debridCachedHashes: debridCachedHashes)
-                + callerBonuses(rhs.stream, addon: rhs.addon, hint: hint, binge: binge, sticky: sticky)
+                + callerBonuses(rhs.stream, addon: rhs.addon, hint: hint, binge: binge, sticky: sticky,
+                                stickyAuthoritative: stickyAuthoritative)
                 + pinBonus(rhs.stream, addon: rhs.addon, pin: pin)
                 + healthPenalty(addon: rhs.addon, isUnhealthy: providerPenalty))
         }?.stream
@@ -236,6 +251,7 @@ enum StreamRanking {
     /// candidates.first being exactly the stream best() would have auto-picked.
     static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                                  pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
+                                 stickyAuthoritative: Bool = true,
                                  providerPenalty: ((String) -> Bool)? = nil,
                                  debridCachedHashes: Set<String> = []) -> [CoreStream] {
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
@@ -256,7 +272,8 @@ enum StreamRanking {
                         stream: $0.element.stream,
                         score: score($0.element.stream, debridCachedHashes: debridCachedHashes)
                             + callerBonuses($0.element.stream, addon: $0.element.addon,
-                                            hint: hint, binge: binge, sticky: sticky)
+                                            hint: hint, binge: binge, sticky: sticky,
+                                            stickyAuthoritative: stickyAuthoritative)
                             + pinBonus($0.element.stream, addon: $0.element.addon, pin: pin)
                             + healthPenalty(addon: $0.element.addon, isUnhealthy: providerPenalty)) }
                 .sorted { $0.score != $1.score ? $0.score > $1.score : $0.offset < $1.offset }   // stable within ties

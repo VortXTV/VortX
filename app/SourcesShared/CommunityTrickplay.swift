@@ -295,6 +295,45 @@ enum TrickplayTimeline {
         )
     }
 
+    /// Nearest tile to `time` for a fallback preview: the tile whose coverage is closest when no tile
+    /// genuinely covers `time` (a gap, or an out-of-bounds scrub). Complements `cue(at:)`, which returns nil
+    /// there. Returns nil only when the sheet describes no usable tiles.
+    static func nearestCue(
+        at time: Double,
+        parsedCues: [TrickplayTimelineCue]?,
+        frameCount: Int,
+        legacyInterval: Double,
+        cols: Int,
+        tileW: Int,
+        tileH: Int
+    ) -> TrickplayTimelineCue? {
+        let clamped = (time.isFinite && time >= 0) ? time : 0
+        if let parsedCues {
+            guard !parsedCues.isEmpty else { return nil }
+            var best = parsedCues[0]
+            var bestDistance = Double.greatestFiniteMagnitude
+            for cue in parsedCues {
+                let distance = clamped < cue.start ? cue.start - clamped
+                    : (clamped >= cue.end ? clamped - cue.end : 0)
+                if distance < bestDistance { bestDistance = distance; best = cue }
+            }
+            return best
+        }
+        guard frameCount > 0, cols > 0, tileW > 0, tileH > 0,
+              legacyInterval.isFinite, legacyInterval > 0 else { return nil }
+        let rawIndex = Int((clamped / legacyInterval).rounded(.down))
+        let tileIndex = min(max(0, rawIndex), frameCount - 1)
+        return TrickplayTimelineCue(
+            start: Double(tileIndex) * legacyInterval,
+            end: Double(tileIndex + 1) * legacyInterval,
+            x: (tileIndex % cols) * tileW,
+            y: (tileIndex / cols) * tileH,
+            width: tileW,
+            height: tileH,
+            tileIndex: tileIndex
+        )
+    }
+
     private static func parseCoordinates(
         _ payload: String
     ) -> (x: Int, y: Int, width: Int, height: Int)? {
@@ -642,6 +681,29 @@ enum CommunityTrickplay {
         /// The cropped tile covering `time`, drawn from the sheet sub-rect. nil outside genuine VTT coverage.
         func crop(at time: Double) -> ScrubImage? {
             guard let cue = TrickplayTimeline.cue(
+                at: time,
+                parsedCues: cues,
+                frameCount: frameCount,
+                legacyInterval: intervalS,
+                cols: cols,
+                tileW: tileW,
+                tileH: tileH
+            ) else { return nil }
+            let rect = CGRect(x: cue.x, y: cue.y, width: cue.width, height: cue.height)
+            guard let sub = cgImage.cropping(to: rect) else { return nil }
+            #if canImport(AppKit)
+            return NSImage(cgImage: sub, size: NSSize(width: cue.width, height: cue.height))
+            #else
+            return UIImage(cgImage: sub)
+            #endif
+        }
+
+        /// The exact tile covering `time`, or when `time` lands in a gap or outside both bounds, the nearest
+        /// tile by time. Lets a scrub position always resolve to an approximate frame. nil only when the sheet
+        /// has no usable tiles.
+        func nearestCrop(at time: Double) -> ScrubImage? {
+            if let exact = crop(at: time) { return exact }
+            guard let cue = TrickplayTimeline.nearestCue(
                 at: time,
                 parsedCues: cues,
                 frameCount: frameCount,

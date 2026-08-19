@@ -196,6 +196,18 @@ final class MPVMetalViewController: PlatformViewController {
     /// in loadFile with the rest of the per-file cache state.
     private var restoreCyclesThisFile = 0
     #endif
+    /// True once setupMpv armed cache-on-disk against a WRITABLE dir (real payload offload, so `cache-secs` is
+    /// the binding forward lever). Gates the read-ahead ramp: the RAM-fallback path keeps demuxer-max-bytes/300s.
+    private var diskCacheOnDiskArmed = false
+    /// Forward read-ahead ramp state (disk-cache-armed remote VOD). See armDiskCacheReadaheadRamp.
+    private var cacheReadaheadRampWork: DispatchWorkItem?
+    private var cacheReadaheadRampGeneration: UInt64 = 0
+    private var cacheReadaheadRampAppliedSecs = 0
+    private var cacheReadaheadRampLastFrameDrop = 0
+    private static let diskCacheReadaheadRampStepSecs = 60      // cache-secs added per stable rung
+    private static let diskCacheReadaheadRampIntervalSecs: TimeInterval = 15   // wall time between rungs
+    private static let diskCacheRampReadaheadFloorSecs = 30     // demuxer-readahead-secs during the ramp (< start)
+    private static let diskCacheReadaheadRampDropTolerance = 2  // output drops since last rung that still count as steady
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
     /// colorspace, and on tvOS the display mode), or nil = "unknown, force a fresh apply". Reset to nil on
     /// every file load and teardown so the FIRST re-evaluation of a new file always applies (the guard
@@ -784,6 +796,7 @@ final class MPVMetalViewController: PlatformViewController {
         // accumulating, so the cache file tracks only the [back-buffer, cache-secs forward] window.
         if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
             checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
+            diskCacheOnDiskArmed = true
             // FIX: `cache-dir` was removed upstream; the current option is `demuxer-cache-dir`. Point it at the
             // app-tracked Caches subdir so payload offload actually engages (and the exit sweep can clear it).
             checkError(mpv_set_option_string(mpv, "demuxer-cache-dir", cacheDir))
@@ -1165,6 +1178,8 @@ final class MPVMetalViewController: PlatformViewController {
         invalidateLoadToken()
         NotificationCenter.default.removeObserver(self)
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
+        cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
+        cacheReadaheadRampGeneration &+= 1
 #if os(tvOS)
         // Hand the TV back its default display mode; the view can already be
         // detached here, so HDRDisplayMode falls back to the app's window.
@@ -1530,6 +1545,15 @@ final class MPVMetalViewController: PlatformViewController {
             mpv_set_property_string(mpv, "demuxer-max-bytes", appliedCap)
             activeReadAheadCap = appliedCap
             baselineReadAheadCap = appliedCap
+            // Pace the forward-cache fill for an offload-armed remote VOD: start cache-secs small and ramp to the
+            // 900s ceiling so the fill never bursts the present thread (climb-time output drops). Non-armed / live
+            // / local sources keep their existing single cap; cancel any stale ramp from a prior in-place source.
+            if diskCacheOnDiskArmed, !live, !isLocalStream {
+                armDiskCacheReadaheadRamp()
+            } else {
+                cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
+                cacheReadaheadRampGeneration &+= 1
+            }
             // Only an accepted replacement owns the new per-file cache lifecycle. A rejected command leaves
             // the current flight, cap bookkeeping, and paused state untouched so the old source can continue.
             pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
@@ -1597,6 +1621,57 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
     
+    /// Ramp the forward-cache DEPTH (`cache-secs`) from a small start to the RemoteConfig ceiling instead of
+    /// setting the ceiling at load. Under cache-on-disk `cache-secs` is the binding forward lever, and a fast
+    /// source fills it in one max-rate burst (network TLS + demux parse + disk writes) that contends with the
+    /// Metal present thread on the CPU-limited Apple TV, so frames miss their deadline WHILE the cache climbs
+    /// (diag 3/4: drops accrue only as cacheSeconds rises, none once it is steady). Stepping keeps the full 900s
+    /// depth but turns one long burst into short ones. demuxer-readahead-secs is dropped below the start because
+    /// mpv only lets cache-secs override it when LARGER, so a low cache-secs alone would be floored at setup's 300s.
+    private func armDiskCacheReadaheadRamp() {
+        guard mpv != nil else { return }
+        let ceiling = max(1, RemoteConfig.snapshot.diskCacheReadaheadSecs)
+        let start = min(RemoteConfigDefaults.diskCacheReadaheadStartSecs, ceiling)
+        cacheReadaheadRampGeneration &+= 1
+        cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil
+        cacheReadaheadRampAppliedSecs = start
+        cacheReadaheadRampLastFrameDrop = diagnosticInt(MPVProperty.frameDropCount) ?? 0
+        setString("demuxer-readahead-secs", String(Self.diskCacheRampReadaheadFloorSecs))
+        setString("cache-secs", String(start))
+        mpvLog.log("disk cache readahead ramp start=\(start, privacy: .public)s ceiling=\(ceiling, privacy: .public)s")
+        guard start < ceiling else { return }
+        scheduleDiskCacheReadaheadRampStep(generation: cacheReadaheadRampGeneration, ceiling: ceiling)
+    }
+
+    private func scheduleDiskCacheReadaheadRampStep(generation: UInt64, ceiling: Int) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.mpv != nil,
+                  self.cacheReadaheadRampGeneration == generation else { return }
+            // Hold this rung while the present is not stable: a cache stall, or a fresh burst of output drops
+            // since the last rung, means the device is already behind, so do not add read pressure this tick. The
+            // rung retries next interval, so the climb self-pauses and resumes without ever forcing a drop.
+            let dropCount = self.diagnosticInt(MPVProperty.frameDropCount) ?? self.cacheReadaheadRampLastFrameDrop
+            let stalled = self.diagnosticFlag(MPVProperty.pausedForCache) ?? false
+            let steady = !stalled
+                && dropCount <= self.cacheReadaheadRampLastFrameDrop + Self.diskCacheReadaheadRampDropTolerance
+            self.cacheReadaheadRampLastFrameDrop = dropCount
+            if steady {
+                let next = min(self.cacheReadaheadRampAppliedSecs + Self.diskCacheReadaheadRampStepSecs, ceiling)
+                if next != self.cacheReadaheadRampAppliedSecs {
+                    self.cacheReadaheadRampAppliedSecs = next
+                    self.setString("cache-secs", String(next))
+                }
+            }
+            guard self.cacheReadaheadRampAppliedSecs < ceiling else {
+                self.mpvLog.log("disk cache readahead ramp reached ceiling \(ceiling, privacy: .public)s")
+                return
+            }
+            self.scheduleDiskCacheReadaheadRampStep(generation: generation, ceiling: ceiling)
+        }
+        cacheReadaheadRampWork = work
+        queue.asyncAfter(deadline: .now() + Self.diskCacheReadaheadRampIntervalSecs, execute: work)
+    }
+
     func togglePause() {
         getFlag(MPVProperty.pause) ? play() : pause()
     }
@@ -2578,7 +2653,13 @@ final class MPVMetalViewController: PlatformViewController {
 
     func seek(to seconds: Double) {
         #if os(tvOS)
-        armSeekCacheHold()   // absolute jumps (scrub commits and friends) land outside the buffered window and empty the forward cache
+        // Only arm the cache-empty hold when the target lands OUTSIDE the currently buffered window. An in-window
+        // scrub (a short hop while the forward cache holds minutes) is a cheap in-cache seek: arming there would
+        // needlessly dump that buffer and stall ~2s refilling from the network (the scrub-forward stall, worst on
+        // remote/aiostreams sources).
+        if seekTargetOutsideCache(seconds) {
+            armSeekCacheHold()   // out-of-window jump empties the forward cache; hold so the AO resumes once on a refilled cache
+        }
         #endif
         command("seek", args: [String(seconds), "absolute"])
     }
@@ -2596,6 +2677,25 @@ final class MPVMetalViewController: PlatformViewController {
     /// event drain (mirroring pausedStateChanged).
     private var seekCacheHoldArmed = false
 
+    /// Conservative back window (seconds) still expected in the demuxer back-buffer: demuxer-max-back-bytes is
+    /// small on tvOS (a handful of seconds at 4K bitrates), so a small back-scrub within this stays in cache and
+    /// needs no hold.
+    private let seekBackInCacheGuardSecs = 5.0
+
+    /// True when an absolute seek target falls outside the demuxer's currently buffered window, so the seek
+    /// empties the forward cache and needs the post-seek hold. A target inside [pos - backGuard, pos +
+    /// forwardCached] is served from cache with no refill and must NOT arm the hold: that unnecessary dump is the
+    /// scrub-forward stall. No cache sampled -> treat as out-of-window (safe: keeps the hold).
+    private func seekTargetOutsideCache(_ target: Double) -> Bool {
+        guard mpv != nil else { return true }
+        let pos = getDouble(MPVProperty.timePos)
+        let forwardCached = getDouble("demuxer-cache-duration")   // seconds buffered ahead of the playhead
+        guard forwardCached > 0 else { return true }
+        let forwardEdge = pos + max(0, forwardCached - 2)         // leave the last ~2s so a near-edge landing still refills cleanly
+        let backEdge = pos - seekBackInCacheGuardSecs
+        return target > forwardEdge || target < backEdge
+    }
+
     /// Arm the post-seek cache hold for the seek about to be issued: hold playback in the normal
     /// buffering state until `cache-pause-wait` seconds are cached, so the avfoundation AO resumes
     /// ONCE on a refilled cache instead of stuttering through the refill (the crackly/distorted
@@ -2609,7 +2709,7 @@ final class MPVMetalViewController: PlatformViewController {
         guard !startMuted, mpv != nil else { return }
         seekCacheHoldArmed = true
         setString("cache-pause-initial", "yes")
-        setString("cache-pause-wait", "2")
+        setString("cache-pause-wait", "1.5")
     }
 
     /// Put the cache-pause options back to their fast defaults once the held seek's playback has

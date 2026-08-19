@@ -164,6 +164,7 @@ struct iOSSettingsView: View {
     /// guard and the binge-boundary guard in PlayerScreen (and TVPlayerView, same key), so playback never
     /// pauses to ask and auto-advance always proceeds straight through.
     @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
+    @AppStorage("vortx.stillWatchingAfterEpisodes") private var stillWatchingAfterEpisodes = 4
     /// Auto-delete watched downloads: when ON, a completed download whose title crosses the watched
     /// threshold is removed to reclaim space. Default OFF. Read by DownloadManager at its watched-state tick.
     @AppStorage(DownloadManager.autoDeleteWatchedDefaultsKey) private var autoDeleteWatched = false
@@ -744,6 +745,11 @@ struct iOSSettingsView: View {
                 .tint(Theme.Palette.accent)
             Text("Pauses and asks if you are still watching after a long idle stretch or many auto-played episodes. Turn off to keep playing.")
                 .font(.caption).foregroundStyle(.secondary)
+            if stillWatchingPromptEnabled {
+                Picker("Ask after this many episodes", selection: $stillWatchingAfterEpisodes) {
+                    ForEach([2, 3, 4, 5, 6, 8, 10], id: \.self) { Text("\($0)").tag($0) }
+                }
+            }
             #if os(iOS)
             Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
                 .tint(Theme.Palette.accent)

@@ -32,8 +32,8 @@ struct NextEpisodePreloadPolicy: Equatable {
         case stale
     }
 
-    static let halfwayFraction = 0.5
-    static let durationlessStartSeconds = 120.0
+    static let halfwayFraction = 0.4
+    static let durationlessStartSeconds = 90.0
     static let nearCreditsRemainingSeconds = 100.0
     static let durationlessNearCreditsSeconds = 300.0
     static let maxRegularAttempts = 3

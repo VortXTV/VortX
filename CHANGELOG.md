@@ -6,6 +6,22 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.14 (unreleased)
 
+### Resume and buffering (build 218)
+
+**Resuming a show no longer leaves a blank screen.** Continue Watching, jumping to a previous episode, or switching source mid-title resumes at your saved position, and on some streams that jump used to leave a black screen with a frozen timer and only sound, if anything, until you backed out and started over. A mid-file resume was applied as a jump issued before the picture had begun, which on a cold pipeline emptied the just-filled buffer and stalled on a re-read that never resynced, and nothing recovered it. The player now reaches its first frame before making that jump, the way an ordinary scrub already does, so a resume plays and lands at your spot; if a stream still cannot start there within a few seconds it falls back to playing from the beginning with your progress kept, rather than stranding you. Apple TV, iPhone, iPad, and Mac.
+
+**The Still watching prompt pauses the video, and you choose when it asks.** When the app checks whether you are still watching it now pauses playback while it waits, instead of letting the episode keep playing behind the question. You can turn the prompt off entirely in Settings, and choose how many back-to-back auto-played episodes go by before it asks. Apple TV, iPhone, iPad, and Mac.
+
+**Big files stay smooth while they buffer ahead.** On a fast source the player used to pull its whole fifteen-minute forward read-ahead in one max-rate burst the instant playback started, and that heavy read (network, demux, disk writes) contended with the frame-presentation thread on the Apple TV, dropping a frame or two a second while the cache filled (the drops tracked the cache climb and stopped once it was steady). The read-ahead now ramps: it starts small and steps up a minute at a time, and only while the picture is keeping up (it holds a rung whenever the device is behind), so you keep the full fifteen minutes of dip protection without the frames the burst used to cost. Apple TV, iPhone, iPad, and Mac.
+
+**The next episode is readier when you get there.** The next-episode prepare and warm now begin earlier in the current episode (preload from 40% or 90s in, warm across the last three minutes rather than the last 100s), so a binge that skips the outro and advances early no longer starts the next source cold. Apple TV, iPhone, iPad, and Mac.
+
+**Scrubbing previews show up far more often.** The scrub thumbnail used to report Previews unavailable whenever the position fell in a gap between captured tiles or past what had been captured; the lookup now falls back to the nearest available community tile, so a preview shows across the whole timeline. Apple TV, iPhone, iPad, and Mac.
+
+**Scrubbing back and forth no longer stalls.** An absolute seek unconditionally emptied the forward cache and held playback while it refilled, so even a short scrub inside the already-buffered window stalled a couple of seconds (worst on remote sources). The hold is now armed only when the target lands outside the buffered window; an in-window scrub is an instant in-cache seek, and a genuine out-of-window jump resumes sooner. Apple TV.
+
+**Source picking prefers the better source again.** After a hand-picked source, the remembered pick could outrank a materially better cached debrid or usenet source on later fresh plays and Continue Watching, because the sticky bonus was sized above the within-tier quality spread. A fresh play / Continue-Watching resume now uses a soft sticky that yields to any better resolution, cache hit, or source tier and only breaks ties among near-identical releases; binge auto-next keeps the strong sticky so it stays on your chosen provider. Apple TV, iPhone, iPad, and Mac.
+
 ### Dolby Vision
 
 **The Dolby Vision for MKV setting now tells the truth, and says what it costs.** On a device where you had never touched it, the row read Off while Dolby Vision was in fact playing. The setting defaults to on wherever your display can actually present Dolby Vision, but the row was written against the opposite default and reported a stored Off that was never there. So turning on a setting that was already on wrote a real Off, and Dolby Vision stopped for every MKV, fleet-silently, with nothing on screen explaining it. The row now renders the same answer playback uses, and it carries a plain line saying that Off forces HDR10 tone-mapping for every Dolby Vision MKV. Apple TV, iPhone, iPad, and Mac.

@@ -4841,7 +4841,7 @@ struct iOSEpisodeStreams: View {
         }
         guard !Task.isCancelled else { return nil }
         guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
-                                            sticky: sticky,
+                                            sticky: sticky, stickyAuthoritative: refreshedVideo != nil,
                                             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                             debridCachedHashes: debridCache.cachedHashes) else { return nil }
         let targetSeason = v.season ?? season

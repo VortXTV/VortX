@@ -94,9 +94,20 @@ enum RemoteConfigDefaults {
                                              // shipping-safe tvOS payload cap.
     static let diskCacheReadaheadSecs = 900  // `cache-secs` (15 min) applied when `cache-on-disk` is armed: the
                                              // REAL forward-depth lever once payloads live on disk, because
-                                             // demuxer-max-bytes no longer binds. mpv's default is ~10 hours,
-                                             // which is exactly the multi-hour runaway read-ahead that
+                                             // demuxer-max-bytes no longer binds. The full 15-min depth is kept
+                                             // on purpose (deep seek-ahead protection); the frame-drops-while-
+                                             // filling are addressed by PACING the fill (see cacheReadaheadRampSecs
+                                             // + the read-rate cap in MPVMetalViewController) rather than by
+                                             // shrinking the window. mpv's default is ~10 hours, which is exactly
+                                             // the runaway read-ahead that
                                              // jetsam-killed the 0.2.11 disk-cache experiment.
+    static let diskCacheReadaheadStartSecs = 45  // `cache-secs` the forward-cache ramp STARTS at (loadFile), then
+                                             // steps up to diskCacheReadaheadSecs (900) so the initial fill is a
+                                             // smooth trickle instead of one max-rate burst that starves the Metal
+                                             // present thread (the climb-time output frame drops). Baked, not
+                                             // remote-tunable in this cut; 900 stays the tunable ceiling. Must stay
+                                             // >= MPVMetalViewController.diskCacheRampReadaheadFloorSecs so cache-secs,
+                                             // not demuxer-readahead-secs, governs the forward depth from the start.
 
     // Timeouts (detail settle / debrid resolve). Present for future wiring; clamped in validate.
     //

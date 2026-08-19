@@ -121,6 +121,7 @@ struct SettingsView: View {
     /// guard and the binge-boundary guard in TVPlayerView (and PlayerScreen, same key), so playback never
     /// pauses to ask and auto-advance always proceeds straight through. SAME key iOS/Mac binds.
     @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
+    @AppStorage("vortx.stillWatchingAfterEpisodes") private var stillWatchingAfterEpisodes = 4
     // Default player volume 0-100 (D5): the level a new playback starts at. The in-player volume slider
     // writes this same key, so the last level persists; this picker sets it explicitly. SAME key as iOS/Mac.
     @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0
@@ -583,6 +584,12 @@ struct SettingsView: View {
                       selection: Binding(get: { stillWatchingPromptEnabled ? "1" : "0" }, set: { stillWatchingPromptEnabled = ($0 == "1") }))
             Text("Pauses and asks if you are still watching after a long idle stretch or many auto-played episodes. Turn off to keep playing.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            if stillWatchingPromptEnabled {
+                choiceRow(String(localized: "Ask after this many episodes"),
+                          [("2", "2"), ("3", "3"), ("4", "4"), ("5", "5"), ("6", "6"), ("8", "8"), ("10", "10")],
+                          selection: Binding(get: { String(max(1, stillWatchingAfterEpisodes)) },
+                                             set: { stillWatchingAfterEpisodes = Int($0) ?? 4 }))
+            }
         }
     }
 

@@ -404,7 +404,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
                     let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
                     let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
-                                                  sticky: sticky, providerPenalty: providerPenalty,
+                                                  sticky: sticky, stickyAuthoritative: false,
+                                                  providerPenalty: providerPenalty,
                                                   debridCachedHashes: cachedHashes)
                     return (groups, best, StreamRanking.tiers(groups), StreamRanking.resolutionOptions(groups))
                 }

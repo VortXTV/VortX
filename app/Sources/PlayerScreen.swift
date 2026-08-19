@@ -343,6 +343,10 @@ struct PlayerScreen: View {
     // Settings toggle (#200): default ON = current behavior. Off disables BOTH triggers below; playback then
     // runs uninterrupted (no idle pause, auto-advance proceeds without asking). SAME key TVPlayerView binds.
     @AppStorage("vortx.stillWatchingPrompt") private var stillWatchingPromptEnabled = true
+    // How many back-to-back auto-advances (zero input between them) before the binge guard asks "Still
+    // watching?". User-configurable in Settings; clamped to >= 1 at the comparison so a stray 0 can never
+    // disable the guard silently (the toggle above is the off switch).
+    @AppStorage("vortx.stillWatchingAfterEpisodes") private var stillWatchingAfterEpisodes = 4
     @State private var idleDeadline = Date.distantFuture    // wall-clock idle deadline; pushed forward on every interaction
     @State private var idleWatchTask: Task<Void, Never>?    // single poll loop; started on open, cancelled on teardown
     @State private var consecutiveAutoAdvances = 0          // back-to-back auto-advances with no interaction between them
@@ -388,6 +392,13 @@ struct PlayerScreen: View {
     // point here, so the periodic / exit progress writes refuse to REGRESS the account resume below it. Clears
     // once the playhead passes it. iOS port of TVPlayerView.suppressedResumeFloor.
     @State private var suppressedResumeFloor: Double?
+    // A libmpv resume seek stashed by the cold-pipeline resume paths (the initial-launch duration handler and
+    // nudgeResume) and applied at the first-frame commit instead of immediately. A pre-first-frame absolute seek
+    // on a cold libmpv pipeline arms mpv's cache-emptying hold and wedges video output (blank + frozen timer);
+    // deferring it until the first frame has rendered makes it an ordinary warm scrub, which is proven to render.
+    // Only set when hasStartedPlaying is false (a warm mid-play nudge seeks immediately). Cleared at every fresh
+    // mount / teardown so it can never leak onto the wrong mount. iOS port of TVPlayerView.pendingLibmpvResumeSeek.
+    @State private var pendingLibmpvResumeSeek: Double?
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var preparingEpisodeID: String?
     @State private var preparedEpisode: PlayerEpisodeStream?
@@ -1161,6 +1172,7 @@ struct PlayerScreen: View {
             #if os(iOS) || os(macOS)
             engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
             #endif
+            pendingLibmpvResumeSeek = nil   // teardown: drop any deferred resume seek so it cannot fire on a later mount
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Never
             // touches the player teardown below.
@@ -1636,6 +1648,13 @@ struct PlayerScreen: View {
                     srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
                     firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
+                    // Deferred libmpv resume seek: the pipeline is now warm (first frame rendered), so this lands
+                    // as an ordinary scrub instead of the cold pre-first-frame seek that wedged video output.
+                    // AVPlayer never stashes one (its resume is a pre-mount remux origin), so this is a no-op there.
+                    if let t = pendingLibmpvResumeSeek {
+                        pendingLibmpvResumeSeek = nil
+                        coordinator.player?.seek(to: t)
+                    }
                     midPlayFailureResume = nil   // a mount that is playing owns its own position again
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually
                     // rendered, so publish an in-flight advance NOW, before anything below
@@ -1815,7 +1834,16 @@ struct PlayerScreen: View {
                                 showEngineNotice("That resume point is unavailable for this source. Playing from the earliest available position.")
                             }
                         } else {
-                            coordinator.player?.seek(to: resumeSeconds)
+                            // A pre-first-frame absolute seek on a cold libmpv pipeline arms mpv's cache-emptying
+                            // hold and wedges video output (blank + frozen timer); defer it to the first-frame
+                            // commit so it lands as an ordinary warm scrub, which is proven to render. If the
+                            // pipeline is already warm (a deferred-duration re-injection at the first frame), seek
+                            // now - that is the normal scrub path.
+                            if hasStartedPlaying {
+                                coordinator.player?.seek(to: resumeSeconds)
+                            } else {
+                                pendingLibmpvResumeSeek = resumeSeconds
+                            }
                             currentTime = resumeSeconds
                             lastReported = resumeSeconds
                         }
@@ -2034,7 +2062,7 @@ struct PlayerScreen: View {
                 // "Still watching?" binge guard: after N back-to-back auto-advances with zero interaction,
                 // pause at this boundary and ask instead of rolling straight on (Continue resumes the roll).
                 consecutiveAutoAdvances += 1
-                if stillWatchingPromptEnabled, consecutiveAutoAdvances >= Self.idleAutoAdvanceLimit {
+                if stillWatchingPromptEnabled, consecutiveAutoAdvances >= max(1, stillWatchingAfterEpisodes) {
                     presentStillWatching(pendingNext: allEpisodeRefs[i + 1].id)
                 } else {
                     goToEpisode(allEpisodeRefs[i + 1].id, autoAdvance: true)
@@ -3330,7 +3358,7 @@ struct PlayerScreen: View {
         // The stalled mount already had a first frame; this reload earns its own. Without clearing it,
         // elapsedSinceFirstFrame (the playback-diagnostics receipt) keeps measuring from the ORIGINAL,
         // now-stale first frame across the reload instead of the fresh one this recovery is about to render.
-        firstFrameRenderedAt = nil
+        firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil   // fresh mount: no deferred resume seek from the outgoing mount
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(
             curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume
@@ -3412,7 +3440,7 @@ struct PlayerScreen: View {
         // The outgoing AVPlayer mount already had a first frame (or never got one); either way this fresh
         // mpv mount earns its own. Without clearing it, elapsedSinceFirstFrame keeps measuring from the
         // OUTGOING engine's stale timestamp instead of the incoming mpv leg's.
-        firstFrameRenderedAt = nil
+        firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil   // fresh mount: no deferred resume seek from the outgoing mount
         subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
         srcProbeLoadStart = Date()   // [src-probe] fresh mpv mount: re-anchor the elapsed clock
         // RE-BASELINE the first-buffer grace for the mpv leg (tvOS twin does the same). `handleStartTimeout`
@@ -3497,7 +3525,7 @@ struct PlayerScreen: View {
         buffering = true; loadFailed = false; loadErrorMsg = ""
         // Mirrors demoteAVPlayerToMPV: the outgoing engine's first frame belongs to a mount this session is
         // leaving, so elapsedSinceFirstFrame must not keep measuring from it once the new engine mounts.
-        firstFrameRenderedAt = nil
+        firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil   // fresh mount: no deferred resume seek from the outgoing mount
         srcProbeLoadStart = Date()
         startLoadTimeout()
         if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
@@ -3715,7 +3743,15 @@ struct PlayerScreen: View {
                 case .wait:
                     continue
                 case .seek(let target):
-                    coordinator.player?.seek(to: target)
+                    // A pre-first-frame absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold
+                    // and wedges video output (blank + frozen timer); defer it to the first-frame commit so it
+                    // lands as an ordinary warm scrub, which is proven to render. A mid-play nudge (a stall or
+                    // source-switch reload after the first frame) is already warm, so it seeks immediately.
+                    if hasStartedPlaying {
+                        coordinator.player?.seek(to: target)
+                    } else {
+                        pendingLibmpvResumeSeek = target
+                    }
                     currentTime = target
                 case .clear:
                     break
@@ -3896,7 +3932,7 @@ struct PlayerScreen: View {
         }
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false
         userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
-        pendingSubtitleReapply = nil; suppressedResumeFloor = nil
+        pendingSubtitleReapply = nil; suppressedResumeFloor = nil; pendingLibmpvResumeSeek = nil
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         midPlayFailureResume = nil   // consumed by this switch's resumeOverride; it must not leak to the next load
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
@@ -7694,7 +7730,9 @@ struct PlayerScreen: View {
     private func presentStillWatching(pendingNext: String? = nil) {
         guard !stillWatchingPrompt else { return }
         pendingStillWatchingEpisodeId = pendingNext
-        if pendingNext == nil, !isPaused { coordinator.player?.togglePause() }   // mid-title: pause; boundary: already ended
+        // Always pause whatever is on screen so the prompt never plays over a running video (a boundary whose
+        // file already ended pauses a no-op; a next episode that already began is stopped). Continue resumes.
+        if !isPaused { coordinator.player?.togglePause() }
         hideTask?.cancel()
         withAnimation(.easeInOut(duration: 0.2)) { stillWatchingPrompt = true }
     }
