@@ -3,6 +3,7 @@ package com.vortx.android.ui.tv
 import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PlaybackSessionToken
 import com.vortx.android.model.Playable
+import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -40,7 +41,9 @@ class TvPlaybackHistorySessionTest {
                 },
             )
             val trailer = TvPlaybackHistorySession(
-                playable = playable(title = "$residentKind trailer", isTrailer = true),
+                historyIdentity = PlayerEpisodeHistoryIdentity(
+                    playable(title = "$residentKind trailer", isTrailer = true),
+                ),
                 playbackSessions = lifecycle,
             )
 
@@ -88,11 +91,15 @@ class TvPlaybackHistorySessionTest {
             },
         )
         val first = TvPlaybackHistorySession(
-            playable = playable(title = "resident movie", isTrailer = false),
+            historyIdentity = PlayerEpisodeHistoryIdentity(
+                playable(title = "resident movie", isTrailer = false),
+            ),
             playbackSessions = lifecycle,
         )
         val replacement = TvPlaybackHistorySession(
-            playable = playable(title = "resident episode", isTrailer = false),
+            historyIdentity = PlayerEpisodeHistoryIdentity(
+                playable(title = "resident episode", isTrailer = false),
+            ),
             playbackSessions = lifecycle,
         )
 

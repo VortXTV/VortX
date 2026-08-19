@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.CatalogPreferencesStore
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
@@ -59,7 +60,10 @@ class StremioXViewModelFactory(
                 )
             },
         ) as T
-        modelClass.isAssignableFrom(DiscoverViewModel::class.java) -> DiscoverViewModel(repo) as T
+        modelClass.isAssignableFrom(DiscoverViewModel::class.java) -> DiscoverViewModel(
+            repo,
+            appContext?.let(CatalogPreferencesStore::shared) ?: CatalogPreferencesStore.inMemory(),
+        ) as T
         modelClass.isAssignableFrom(LibraryViewModel::class.java) -> LibraryViewModel(repo) as T
         modelClass.isAssignableFrom(SearchViewModel::class.java) -> {
             val context = requireNotNull(appContext) { "SearchViewModel requires an app Context (for SearchHistoryStore)" }

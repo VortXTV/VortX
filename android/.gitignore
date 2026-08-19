@@ -5,6 +5,14 @@
 # Per-machine Android SDK path; CI sets this via android-actions/setup-android, never commit a local one.
 local.properties
 
+# Release signing (W0-2). The upload keystore properties file and any keystore binary NEVER enter the
+# repo (the tree is public). keystore.properties holds VORTX_KEYSTORE_FILE/VORTX_KEYSTORE_PASSWORD/
+# VORTX_KEY_ALIAS/VORTX_KEY_PASSWORD on a dev box; CI supplies the same values from GitHub Actions
+# secrets and base64-decodes the keystore to a temp file at build time (see android/RELEASE-SIGNING.md).
+keystore.properties
+*.jks
+*.keystore
+
 # Android Studio / IntelliJ project files (regenerated).
 .idea/
 *.iml

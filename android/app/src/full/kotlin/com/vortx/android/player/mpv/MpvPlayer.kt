@@ -11,6 +11,8 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
+import com.vortx.android.player.BufferTuningSetting
+import com.vortx.android.player.DeviceMemoryTier
 import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.PlayerChapter
@@ -54,6 +56,15 @@ class MpvPlayer private constructor(
     override val subtitleDelayAvailable: Boolean = true
     override val audioDelayAvailable: Boolean = true
     override val audioOutputModeAvailable: Boolean = true
+    override val secondarySubtitleAvailable: Boolean = true
+    override val hardwareDecodingAvailable: Boolean = true
+
+    /// The live primary / secondary subtitle track ids, read from mpv (`sid` / `secondary-sid`). Both read
+    /// -1 when their slot is off (mpv reports the property as `no`, which [MPVLib.getPropertyInt] surfaces
+    /// as null). The chrome uses [primarySubtitleId] to key the primary checkmark once a second subtitle
+    /// makes mpv flag BOTH tracks `selected`. Mirrors Apple `primarySubtitleID` / `secondarySubtitleID`.
+    override val primarySubtitleId: Int get() = mpv.getPropertyInt(PROP_SID) ?: -1
+    override val secondarySubtitleId: Int get() = mpv.getPropertyInt(PROP_SECONDARY_SID) ?: -1
 
     /// Set true if attaching the render surface ever throws. The caller can consult it to fall back to
     /// ExoPlayer on a hard surface failure instead of showing a black frame.
@@ -213,7 +224,10 @@ class MpvPlayer private constructor(
             // loadFile giving the trailer host the small read-ahead.
             playable.isTorrent || playable.viaStreamingServer || playable.isTrailer -> READ_AHEAD_LOCAL
             reduced -> READ_AHEAD_LOCAL
-            else -> READ_AHEAD_REMOTE
+            // A remote debrid/CDN link on a capable (non-reduced) device: size the forward read-ahead to
+            // this device's RAM tier so a 4K VBR peak is not starved, clamped by free disk and floored at
+            // the conservative flat cap. Behind the buffer-tuning flag; OFF keeps the flat cap.
+            else -> remoteReadAheadBytes(appContext).toString()
         }
         mpv.setPropertyString(OPT_DEMUXER_MAX_BYTES, readAhead)
 
@@ -268,6 +282,21 @@ class MpvPlayer private constructor(
     override fun addExternalSubtitle(url: String) { mpv.command(arrayOf("sub-add", url)) }
 
     override fun setSubtitleDelay(seconds: Double) { mpv.setPropertyString(PROP_SUB_DELAY, seconds.toString()) }
+
+    /// Select / clear the SECOND simultaneous subtitle track via mpv `secondary-sid`. A negative / null id
+    /// clears it (`no`). Setting it makes mpv flag the second track `selected` in `track-list`, which
+    /// republishes [PlayerState.subtitleTracks] so the chrome re-reads [secondarySubtitleId]. Mirrors Apple
+    /// `setSecondarySubtitleTrack`.
+    override fun setSecondarySubtitleTrack(id: Int?) {
+        mpv.setPropertyString(PROP_SECONDARY_SID, id?.takeIf { it >= 0 }?.toString() ?: "no")
+    }
+
+    /// Force hardware (`mediacodec`, the DV/HDR passthrough default) or software (`no`) decode via mpv
+    /// `hwdec`. Software is the escape hatch for a device whose hardware codec emits green / garbled frames;
+    /// hardware stays the default. Mirrors Apple `setHardwareDecoding`.
+    override fun setHardwareDecoding(hardware: Boolean) {
+        mpv.setPropertyString(PROP_HWDEC, if (hardware) MpvConfig.HWDEC else "no")
+    }
 
     override fun setAudioDelay(seconds: Double) { mpv.setPropertyString(PROP_AUDIO_DELAY, seconds.toString()) }
 
@@ -498,10 +527,24 @@ class MpvPlayer private constructor(
                     })
                 }
             },
-            // Aspect/zoom toggle: FIT keeps the whole frame (panscan 0), ZOOM crops to fill (panscan 1).
-            // Re-applied on recompose so the chrome's toggle takes effect without rebuilding the surface.
+            // Aspect / zoom / stretch: FIT keeps the whole frame (keepaspect on, panscan 0), ZOOM crops to
+            // fill keeping aspect (panscan 1), STRETCH distorts to fill (keepaspect off). Re-applied on
+            // recompose so the chrome's aspect sheet takes effect without rebuilding the surface.
             update = {
-                mpv.setPropertyString(PROP_PANSCAN, if (scaleMode == VideoScaleMode.ZOOM) "1.0" else "0.0")
+                when (scaleMode) {
+                    VideoScaleMode.STRETCH -> {
+                        mpv.setPropertyString(PROP_KEEPASPECT, "no")
+                        mpv.setPropertyString(PROP_PANSCAN, "0.0")
+                    }
+                    VideoScaleMode.ZOOM -> {
+                        mpv.setPropertyString(PROP_KEEPASPECT, "yes")
+                        mpv.setPropertyString(PROP_PANSCAN, "1.0")
+                    }
+                    VideoScaleMode.FIT -> {
+                        mpv.setPropertyString(PROP_KEEPASPECT, "yes")
+                        mpv.setPropertyString(PROP_PANSCAN, "0.0")
+                    }
+                }
             },
         )
     }
@@ -517,11 +560,14 @@ class MpvPlayer private constructor(
         // Runtime property names.
         private const val PROP_AID = "aid"
         private const val PROP_SID = "sid"
+        private const val PROP_SECONDARY_SID = "secondary-sid"
         private const val PROP_SUB_DELAY = "sub-delay"
         private const val PROP_AUDIO_DELAY = "audio-delay"
+        private const val PROP_HWDEC = "hwdec"
         private const val PROP_VID = "vid"
         private const val PROP_SPEED = "speed"
         private const val PROP_PANSCAN = "panscan"
+        private const val PROP_KEEPASPECT = "keepaspect"
         /// The Android GL context's viewport size, written on every surfaceChanged (mpv-android contract).
         private const val PROP_ANDROID_SURFACE_SIZE = "android-surface-size"
         private const val PROP_VOLUME = "volume"
@@ -543,8 +589,30 @@ class MpvPlayer private constructor(
         private const val CAPTURE_JPEG_QUALITY = 70
 
         // Per-file read-ahead: local torrent/loopback vs remote debrid/CDN (mirrors Apple loadFile).
+        // LOCAL stays a conservative flat cap (a torrent/loopback stream buffers in the streaming server's
+        // own cache, so mpv's read-ahead is kept tight). REMOTE is now sized to the device RAM tier per
+        // load (see [remoteReadAheadBytes]); [READ_AHEAD_REMOTE_BYTES] is the flag-off fallback and floor.
         private const val READ_AHEAD_LOCAL = "96MiB"
-        private const val READ_AHEAD_REMOTE = "128MiB"
+        private const val READ_AHEAD_REMOTE_BYTES = 128L * 1024 * 1024 // 128 MiB
+        private const val BYTES_PER_MB = 1024L * 1024
+
+        /**
+         * Forward read-ahead (bytes) for a REMOTE stream on a capable (non-reduced) device. With the
+         * buffer-tuning flag ON, size it to this device's RAM tier ([DeviceMemoryTier.safeBufferMb]) so a
+         * 4K variable-bitrate peak is not starved, clamped by half of CURRENT free disk (the same clamp the
+         * on-disk cache uses) and never below the conservative flat [READ_AHEAD_REMOTE_BYTES] floor. With the
+         * flag OFF, the flat floor. FAIL-SOFT: an unreadable free-disk figure just skips the clamp, and an
+         * unknown RAM reads back as the 2 GB tier inside [DeviceMemoryTier]. Pure given the context, so the
+         * clamp math is inspectable at one site.
+         */
+        internal fun remoteReadAheadBytes(context: Context): Long {
+            if (!BufferTuningSetting.isEnabled(context)) return READ_AHEAD_REMOTE_BYTES
+            val ramBudget = DeviceMemoryTier.safeBufferMb(context).toLong() * BYTES_PER_MB
+            val freeClamp = DiskCacheSetting.freeDiskBytes(context)
+                ?.let { (it * DiskCacheSetting.FREE_DISK_FRACTION).toLong() }
+            val clamped = if (freeClamp != null) minOf(ramBudget, freeClamp) else ramBudget
+            return maxOf(clamped, READ_AHEAD_REMOTE_BYTES)
+        }
 
         /// Runtime HTTP-property writes for one file, in application order. The first two writes always clear
         /// the previous file's identity; later writes apply only this file's headers / trailer-bound UA.

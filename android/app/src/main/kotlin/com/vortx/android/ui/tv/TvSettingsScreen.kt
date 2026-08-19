@@ -54,6 +54,8 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.BuildConfig
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.vortx.android.data.CatalogRepository
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.model.TrackPreferencesStore
@@ -66,10 +68,14 @@ import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
+import com.vortx.android.tv.TopShelfSettings
+import com.vortx.android.tv.WatchNextPublisher
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.viewmodel.AddonsViewModel
+import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 
 /// TV Settings: a focusable 10-foot list surfacing the couch-relevant toggles PLUS the "Who's watching?"
 /// profile switcher. Every playback control writes through the EXACT SAME store the phone Settings and the
@@ -88,13 +94,13 @@ import com.vortx.android.ui.theme.VortXTheme
 ///
 /// SCOPE, honestly: this ships the primary 10-foot toggles a viewer changes from the couch plus profile
 /// SWITCHING. Creating / renaming / deleting a profile stays on the phone/tablet app for now (text entry is a
-/// touch job); debrid API keys have their own nested TV route, while the remaining deep phone-only surfaces
-/// (Account sign-in, Add-ons, Integrations, Media servers, advanced subtitle styling, Sources ranking,
+/// touch job); add-ons and debrid API keys have their own nested TV routes, while the remaining deep phone-only surfaces
+/// (Account sign-in, Integrations, Media servers, advanced subtitle styling, Sources ranking,
 /// Downloads, Library transfer) are named at the foot of the list rather than reproduced. Binding a profile
 /// to its own separate account is not wired on Android yet, so a
 /// [ProfileStore.select] returning `SwitchAccount` / `NeedsSignIn` is surfaced as a note.
 @Composable
-fun TvSettingsScreen(modifier: Modifier = Modifier) {
+fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
     val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
@@ -104,7 +110,9 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
     var route by remember { mutableStateOf(TvSettingsRoute.ROOT) }
     val settingsListState = rememberLazyListState()
     val debridServicesFocus = remember { FocusRequester() }
+    val addonsFocus = remember { FocusRequester() }
     var restoreFocusTarget by remember { mutableStateOf<TvDebridFocusTarget?>(null) }
+    var restoreAddonsFocus by remember { mutableStateOf(false) }
 
     // Seed each control from its store once; write through on every change. There is no reactive prefs stream
     // in these modules and none is needed -- the values are read at player load, so a write-through keeps the
@@ -119,6 +127,9 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
     var directLinksOnly by remember {
         mutableStateOf(PlaybackBehaviorSettings.directLinksOnly(appContext))
     }
+    // TV-2: the Play Next "Continue Watching" row Show/Hide toggle. Seeded from the same key the publisher
+    // reads; turning it off clears the published rows immediately (an on flip republishes on the next CW tick).
+    var showCwOnHome by remember { mutableStateOf(TopShelfSettings.showContinueWatching(appContext)) }
 
     val store = ProfileStore.sharedOrNull()
     // Bumped after a switch to force a fresh read of the plain (non-observable) store fields.
@@ -134,6 +145,25 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
     fun returnToSettingsRoot() {
         route = route.back()
         restoreFocusTarget = tvDebridFocusTarget(TvDebridFocusEvent.BACK_TO_SETTINGS)
+    }
+
+    fun returnFromAddons() {
+        route = route.back()
+        restoreAddonsFocus =
+            tvAddonsFocusTarget(TvAddonsFocusEvent.BACK_TO_SETTINGS) == TvAddonsFocusTarget.SETTINGS_ADDONS
+    }
+
+    if (route == TvSettingsRoute.ADDONS) {
+        BackHandler { returnFromAddons() }
+        val addonsVm: AddonsViewModel = viewModel<AddonsViewModel>(
+            factory = StremioXViewModelFactory(repo = repo),
+        )
+        TvAddonsScreen(
+            viewModel = addonsVm,
+            onBack = ::returnFromAddons,
+            modifier = modifier,
+        )
+        return
     }
 
     if (route == TvSettingsRoute.DEBRID) {
@@ -212,6 +242,18 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
                         detail = "Reorder or hide Home rows",
                         onClick = { route = TvSettingsRoute.CUSTOMIZE_HOME },
                     )
+                    TvToggleRow(
+                        label = "Continue Watching on the TV home screen",
+                        detail = "Show your Continue Watching titles on the Android TV Play Next row.",
+                        checked = showCwOnHome,
+                        onToggle = {
+                            val next = !showCwOnHome
+                            showCwOnHome = next
+                            TopShelfSettings.setShowContinueWatching(appContext, next)
+                            // Turning it off clears the rows now; turning it on lets the next CW update publish.
+                            if (!next) WatchNextPublisher.clearOwnedRows(appContext)
+                        },
+                    )
                 }
             }
 
@@ -242,6 +284,12 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
 
             item {
                 TvSettingsSection(stringResource(R.string.tv_settings_section_services)) {
+                    TvSettingsNavigationRow(
+                        label = stringResource(R.string.addons_title),
+                        detail = stringResource(R.string.addon_health_tv_navigation_description),
+                        onClick = { route = TvSettingsRoute.ADDONS },
+                        focusRequester = addonsFocus,
+                    )
                     TvSettingsNavigationRow(
                         label = stringResource(R.string.tv_debrid_services_title),
                         detail = stringResource(R.string.tv_debrid_services_navigation_description),
@@ -409,10 +457,24 @@ fun TvSettingsScreen(modifier: Modifier = Modifier) {
             if (restored) restoreFocusTarget = null
         }
     }
+
+    LaunchedEffect(restoreAddonsFocus) {
+        if (restoreAddonsFocus) {
+            var restored = false
+            repeat(3) {
+                if (!restored) {
+                    restored = runCatching { addonsFocus.requestFocus() }.getOrDefault(false)
+                    if (!restored) withFrameNanos { }
+                }
+            }
+            if (restored) restoreAddonsFocus = false
+        }
+    }
 }
 
 internal enum class TvSettingsRoute {
     ROOT,
+    ADDONS,
     DEBRID,
     WHATS_NEW,
     CUSTOMIZE_HOME;
@@ -800,7 +862,7 @@ private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = t
 @Composable
 private fun TvSettingsFootnote() {
     Text(
-        text = "Creating, renaming, and deleting profiles, plus account, add-ons, integrations, media " +
+        text = "Creating, renaming, and deleting profiles, plus account, integrations, media " +
             "servers, advanced subtitle styling, source ranking, and downloads, are managed in the VortX phone and " +
             "tablet app.",
         style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),

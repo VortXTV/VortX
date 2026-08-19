@@ -193,6 +193,14 @@ class SourcePreferencesStore(context: Context) {
         get() = prefs.getBoolean(ADDON_ORDER_KEY, DEFAULT_USE_ADDON_ORDER)
         set(value) { prefs.edit().putBoolean(ADDON_ORDER_KEY, value).apply() }
 
+    /// Compact source rows (Apple `vortx.streams.compactLabels`, iOSSettingsView.swift:1070). Display-only:
+    /// when ON the source row drops the raw release-title line, leaving the parsed badges + flavour + size.
+    /// DELIBERATELY not part of the ranking fingerprint (it changes no filtering or order), so toggling it
+    /// never invalidates the memoized scores; every reader gets it live off SharedPreferences.
+    var compactStreamLabels: Boolean
+        get() = prefs.getBoolean(COMPACT_LABELS_KEY, DEFAULT_COMPACT_LABELS)
+        set(value) { prefs.edit().putBoolean(COMPACT_LABELS_KEY, value).apply() }
+
     // ---- Keyword filters ----
 
     var excludeKeywords: String
@@ -391,6 +399,7 @@ class SourcePreferencesStore(context: Context) {
         // Apple's EXACT flat preference keys.
         const val ORDER_KEY = "stremiox.streaming.sourceTypeOrder"
         const val ADDON_ORDER_KEY = "stremiox.streaming.useAddonOrder"
+        const val COMPACT_LABELS_KEY = "vortx.streams.compactLabels"
         const val EXCLUDE_KEY = "stremiox.streaming.excludeKeywords"
         const val INCLUDE_KEY = "stremiox.streaming.includeKeywords"
         const val SAFETY_KEY = "stremiox.streaming.safetyMode"
@@ -425,6 +434,7 @@ class SourcePreferencesStore(context: Context) {
         const val DEFAULT_HIDE_UNKNOWN_RESOLUTION = false
         const val DEFAULT_PREFERRED_AUDIO_ONLY = false
         const val DEFAULT_USE_ADDON_ORDER = false
+        const val DEFAULT_COMPACT_LABELS = false
         const val DEFAULT_PREFER_KEYWORDS = ""
         const val DEFAULT_AVOID_BEHAVIOR = "hide"
         const val DEFAULT_AUTO_PICK_BEST = false

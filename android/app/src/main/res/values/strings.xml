@@ -11,6 +11,56 @@
 
     <string name="action_retry">Retry</string>
 
+    <!-- Search result grouping and honest idle versus settled-empty guidance, shared by phone and TV. -->
+    <string name="search_section_movies">Movies</string>
+    <string name="search_section_series">Series</string>
+    <string name="search_section_other">Other</string>
+    <string name="search_idle_guidance">Type at least 2 characters to search across your add-ons.</string>
+    <string name="search_no_matches">No matches.</string>
+
+    <!-- Signed-out empty state shown on Search and Discover (SD-8), gated on a Stremio or VortX sign-in. -->
+    <string name="account_signed_out_title">Sign in to get started</string>
+    <string name="account_signed_out_message">Sign in to load your library, catalogs, and add-ons. Sign in to VortX, or connect a Stremio account.</string>
+
+    <!-- Advanced Discover filters (client-side, field-present matching). Shared by phone and TV. -->
+    <string name="discover_filters">Filters</string>
+    <string name="discover_filters_count">Filters (%1$d)</string>
+    <string name="discover_clear">Clear</string>
+    <string name="discover_clear_all">Clear all</string>
+    <string name="discover_clear_filters">Clear filters</string>
+    <string name="discover_done">Done</string>
+    <string name="discover_genres">Genres</string>
+    <string name="discover_genre_caption">Tap to include, tap again to exclude.</string>
+    <string name="discover_genre_included">%1$s, Included</string>
+    <string name="discover_genre_excluded">%1$s, Excluded</string>
+    <string name="discover_release_years">Release years</string>
+    <string name="discover_year_caption">Pick a decade, or two to span a range. Upcoming keeps this year and later.</string>
+    <string name="discover_upcoming_only">Upcoming only</string>
+    <string name="discover_age_rating">Age rating</string>
+    <string name="discover_duration">Duration</string>
+    <string name="discover_seasons">Seasons</string>
+    <string name="discover_shown_count">%1$d shown</string>
+    <string name="discover_no_matches_title">No matches</string>
+    <string name="discover_no_matches_message">No results match your filters.</string>
+    <string name="discover_catalog_empty">No titles in this catalog yet.</string>
+    <string name="discover_load_more">Load more</string>
+    <string name="discover_decade_2020s">2020s</string>
+    <string name="discover_decade_2010s">2010s</string>
+    <string name="discover_decade_2000s">2000s</string>
+    <string name="discover_decade_1990s">1990s</string>
+    <string name="discover_decade_1980s">1980s</string>
+    <string name="discover_decade_1970s">1970s</string>
+    <string name="discover_decade_older">Older</string>
+    <string name="discover_duration_under_30">Under 30m</string>
+    <string name="discover_duration_30_60">30-60m</string>
+    <string name="discover_duration_60_90">60-90m</string>
+    <string name="discover_duration_90_120">90-120m</string>
+    <string name="discover_duration_over_2h">Over 2h</string>
+    <string name="discover_seasons_one">1 season</string>
+    <string name="discover_seasons_two_three">2-3</string>
+    <string name="discover_seasons_four_six">4-6</string>
+    <string name="discover_seasons_seven_plus">7+</string>
+
     <!-- Offline downloads (Round 5). The notification channel is user-visible in Settings > Apps > VortX >
          Notifications, so both of these are localizable copy, not identifiers. -->
     <string name="downloads_channel_name">Downloads</string>
@@ -58,6 +108,31 @@
     <string name="tv_debrid_status_set">Set</string>
     <string name="tv_debrid_status_cleared">Cleared</string>
     <string name="tv_debrid_status_storage_unavailable">Secure storage unavailable</string>
+
+    <!-- Installed add-on manifest health, shared by phone/tablet and Android TV. -->
+    <string name="addons_title">Add-ons</string>
+    <string name="addon_health_not_checked">Not checked</string>
+    <string name="addon_health_checking">Checking…</string>
+    <string name="addon_health_online_ms">Online %1$d ms</string>
+    <string name="addon_health_slow_ms">Slow %1$d ms</string>
+    <string name="addon_health_unreachable">Unreachable</string>
+    <string name="addon_health_recheck">Re-check status</string>
+    <string name="addon_health_tv_navigation_description">Installed add-ons and their live status</string>
+    <string name="addon_health_tv_description">Installed add-ons and the reachability of each manifest.</string>
+    <string name="addon_health_loading">Loading your add-ons…</string>
+    <string name="addon_health_empty">No add-ons installed.</string>
+    <string name="addon_health_try_again">Try again: %1$s</string>
+    <string name="addon_health_managed">Managed</string>
+    <string name="addon_health_turn_on">Press select to turn on</string>
+    <string name="addon_health_turn_off">Press select to turn off</string>
+    <string name="addon_state_off">Off</string>
+    <string name="addon_capability_streams">Streams</string>
+
+    <!-- Update-if-installed confirm (SRC-8): pasting an already-installed add-on URL. -->
+    <string name="addon_update_confirm_title">Add-on already installed</string>
+    <string name="addon_update_confirm_message">This add-on is already installed. Update it to its latest manifest?</string>
+    <string name="addon_update_confirm_button">Update</string>
+    <string name="addon_update_confirm_cancel">Cancel</string>
 
     <!-- Collections Hub. These strings are shared by the phone and TV presentations. -->
     <string name="collections_title">Collections</string>

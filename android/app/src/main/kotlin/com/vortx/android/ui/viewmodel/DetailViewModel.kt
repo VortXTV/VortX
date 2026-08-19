@@ -46,15 +46,45 @@ import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.torbox.TorBoxSearchSource
 import com.vortx.android.ui.UiState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+
+internal data class EpisodeSwitchSelectionLease(
+    val request: SourceRequestFence.Token,
+    val targetEpisodeId: String,
+    val previousEpisodeId: String?,
+    val previousSeason: Int?,
+) {
+    fun rollbackIfOwned(
+        currentRequest: SourceRequestFence.Token?,
+        selectedEpisodeId: String?,
+        restore: (episodeId: String?, season: Int?) -> Unit,
+    ): Boolean {
+        if (currentRequest != request || selectedEpisodeId != targetEpisodeId) return false
+        restore(previousEpisodeId, previousSeason)
+        return true
+    }
+}
+
+internal suspend fun <T> withEpisodeSwitchCancellationRollback(
+    rollbackIfOwned: () -> Unit,
+    block: suspend () -> T,
+): T = try {
+    block()
+} catch (cancelled: CancellationException) {
+    rollbackIfOwned()
+    throw cancelled
+}
 
 internal fun MetaDetail.episodeForResolve(selectedEpisodeId: String?): Episode? =
     videos.firstOrNull { it.id == selectedEpisodeId }
@@ -343,6 +373,12 @@ class DetailViewModel(
     /// Smart-Source episode tap, whose auto-pick stays exactly as it was.
     @Volatile private var pendingAdvanceHint: Pair<String?, String?>? = null
 
+    /// Next-episode PRELOAD cache (PLR-8): the pre-ranked best source for the next episode, keyed by its
+    /// episode id, populated off the live fence by [warmNextEpisode] and consumed once by [playNextEpisode]
+    /// so an accepted Up Next skips the source-assembly "Starting..." wait. Best-effort: a miss (never
+    /// warmed, superseded, or a different episode) falls straight through to the cold resolve.
+    @Volatile private var warmNextSourceByEpisode: Pair<String, StreamSource>? = null
+
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
     /// long-press elsewhere, another Detail instance in the backstack -- not only this ViewModel's own
@@ -456,6 +492,7 @@ class DetailViewModel(
         lastPlayedSource = null
         pendingAutoPick = false
         pendingAdvanceHint = null
+        warmNextSourceByEpisode = null
         failedHandlesByTarget.clear()
         _streams.value = UiState.Loading
         _playback.value = Playback.Idle
@@ -898,6 +935,117 @@ class DetailViewModel(
         }
     }
 
+    /**
+     * Resolve the viewer's in-player episode pick through the same target-scoped source assembly and
+     * owner fences as Detail playback. The mounted player stays alive while the target episode loads;
+     * [PlayerSourceSwitchResolution]'s commit seam publishes identity only after the player accepts its
+     * exact request authority. Mirrors [resolveSourceSwitch], scoped to a new episode target.
+     */
+    suspend fun resolveEpisodeSwitch(episodeId: String): Result<PlayerSourceSwitchResolution> {
+        if (type != MediaType.SERIES || _playback.value is Playback.Resolving) {
+            return Result.failure(IllegalStateException())
+        }
+        val detail = (_meta.value as? UiState.Success)?.data
+            ?: return Result.failure(IllegalStateException())
+        val target = detail.videos.firstOrNull { it.id == episodeId }
+            ?: return Result.failure(IllegalStateException())
+        val previousEpisodeId = _selectedEpisodeId.value
+        val previousSeason = _selectedSeason.value
+        _selectedEpisodeId.value = target.id
+        _selectedSeason.value = target.season
+        pendingAutoPick = false
+        pendingAdvanceHint = null
+        startSourceLoad(target.id)
+        val request = sourceRequestFence.currentToken()
+            ?: return Result.failure(IllegalStateException())
+        val selectionLease = EpisodeSwitchSelectionLease(
+            request = request,
+            targetEpisodeId = target.id,
+            previousEpisodeId = previousEpisodeId,
+            previousSeason = previousSeason,
+        )
+        fun restorePreviousTargetIfCurrent() {
+            selectionLease.rollbackIfOwned(
+                currentRequest = sourceRequestFence.currentToken(),
+                selectedEpisodeId = _selectedEpisodeId.value,
+            ) { restoreEpisodeId, restoreSeason ->
+                _selectedEpisodeId.value = restoreEpisodeId
+                _selectedSeason.value = restoreSeason
+                startSourceLoad(restoreEpisodeId)
+            }
+        }
+        return withEpisodeSwitchCancellationRollback(::restorePreviousTargetIfCurrent) {
+            val groups = withTimeoutOrNull(EPISODE_SWITCH_SOURCE_DEADLINE_MS) {
+                _streams.first { state ->
+                    sourceRequestFence.currentToken() == request &&
+                        state is UiState.Success && state.data.any { it.streams.isNotEmpty() }
+                } as UiState.Success
+            }?.data ?: run {
+                restorePreviousTargetIfCurrent()
+                return@withEpisodeSwitchCancellationRollback Result.failure(
+                    IllegalStateException("No playable source for this episode."),
+                )
+            }
+            val settled = sourceModel.awaitSettledTarget(
+                requestGeneration = request.generation,
+                streamId = target.id,
+                deadlineMs = EPISODE_SWITCH_ASSEMBLY_DEADLINE_MS,
+            )
+            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
+                return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException())
+            }
+            val source = settled?.best ?: StreamRanking.best(
+                groups = groups,
+                continuity = lastPlayedSource?.let(StreamRanking::signature),
+                binge = lastPlayedSource?.bingeGroup,
+                pin = currentPin(),
+                sticky = sourceSticky.preference(id),
+                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+                prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+            ) ?: run {
+                restorePreviousTargetIfCurrent()
+                return@withEpisodeSwitchCancellationRollback Result.failure(
+                    IllegalStateException("No playable source for this episode."),
+                )
+            }
+            val actionOwner = debridKeys.ownerToken()
+            val result = resolveForOwner(source, target, actionOwner)
+            if (
+                !isActionOwnerCurrent(actionOwner) ||
+                !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
+            ) {
+                return@withEpisodeSwitchCancellationRollback Result.failure(
+                    IllegalStateException(OWNER_CHANGED_MESSAGE),
+                )
+            }
+            val year = detail.releaseInfo?.take(4)?.toIntOrNull()
+            val mediaRef = buildMediaRef(type = type, metaId = id, episode = target, title = detail.name, year = year)
+            val resolution = result.mapCatching { resolved ->
+                if (resolved.url.isBlank()) throw IllegalStateException()
+                PlayerSourceSwitchResolution(
+                    playable = resolved.copy(
+                        startPositionMs = 0L,
+                        mediaRef = mediaRef,
+                        expectedDurationMs = expectedRuntimeMs(),
+                    ),
+                    resolvedSource = source,
+                    commitGate = sourceSwitchCommitGate,
+                    commitAuthorityIsCurrent = {
+                        isActionOwnerCurrent(actionOwner) &&
+                            sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
+                            _selectedEpisodeId.value == target.id
+                    },
+                    commitAccepted = {
+                        lastPlayedSource = source
+                        resumeRef = null
+                    },
+                )
+            }
+            if (resolution.isFailure) restorePreviousTargetIfCurrent()
+            resolution
+        }
+    }
+
     /// Save a chosen source for OFFLINE viewing. This is the download subsystem's create entry point (the one
     /// [DownloadManager.CREATE_PATH_WIRED] gates on): it resolves the source to a concrete URL through the SAME
     /// [repo.resolve] the play path uses -- so a debrid torrent is unlocked to its direct link and a direct /
@@ -1019,7 +1167,11 @@ class DetailViewModel(
     ///     fresh link is remembered for a later in-session resume.
     ///  3. FALLBACK: single-resolve the labeled best through the engine repo (a direct / media-server / single
     ///     debrid source, or the promised confirmed-cached best when the gate refused every lower-res winner).
-    fun playBest() {
+    /// [fromStart] (DET-14) plays the SAME best-ranked source from 0:00, ignoring the saved resume
+    /// point WITHOUT clearing it (the library `timeOffset` is left untouched, so the primary Resume
+    /// still seeks there next time). It only forces the player's start position to zero across all
+    /// three legs below by not reading [resumeOffsetMs]; nothing engine/account state is written.
+    fun playBest(fromStart: Boolean = false) {
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
@@ -1027,7 +1179,7 @@ class DetailViewModel(
         val best = bestSource() ?: return
         lastPlayedSource = best
         _playback.value = Playback.Resolving
-        val resumeMs = resumeOffsetMs()
+        val resumeMs = if (fromStart) 0L else resumeOffsetMs()
         val ref = currentMediaRef()
         val targetId = _selectedEpisodeId.value ?: id
         val episode = currentModelEpisode()
@@ -1215,6 +1367,11 @@ class DetailViewModel(
         return if (target == null || lib.videoId == null || lib.videoId == target) lib.timeOffsetMs else 0L
     }
 
+    /// Whether the source about to play has a saved resume position (DET-14): true only when
+    /// [resumeOffsetMs] would seek forward, so the "Play from start" secondary action is offered for a
+    /// resumed title and hidden for a fresh one. Read-only; mirrors Apple's `movieResumeSeconds != nil`.
+    fun resumeAvailable(): Boolean = resumeOffsetMs() > 0L
+
     fun clearPlayback() {
         _playback.value = Playback.Idle
     }
@@ -1246,9 +1403,58 @@ class DetailViewModel(
     /// so the ranking's continuity/binge bonuses keep the binge on the same release family. Resolution
     /// posts through [playback] exactly like a manual play; the shell's Up Next layer collects
     /// Ready/Failed from there. No-op when there is no next episode or a resolve is already running.
+    /**
+     * PLR-8 next-episode PRELOAD: pre-fetch and rank the NEXT episode's sources OFF the live playback fence,
+     * caching the best source by episode id so an eventual auto-advance skips the source-assembly wait.
+     *
+     * Non-disruptive by construction: it uses a direct [CatalogRepository.streams] fetch (a one-shot that
+     * returns its own result and never feeds the reactive [_streams] / [sourceRequestFence] the live episode
+     * owns) and writes ONLY the [warmNextSourceByEpisode] cache. It resolves nothing (no debrid unlock, no
+     * torrent warm-up), so it is cheap and cannot contend with the playing stream. Fail-soft and idempotent
+     * per episode. Returns true when a source was cached. Driven by the shell's [NextEpisodePreloadPolicy].
+     */
+    suspend fun warmNextEpisode(episodeId: String): Boolean {
+        if (type != MediaType.SERIES) return false
+        if (warmNextSourceByEpisode?.first == episodeId) return true
+        val detail = (_meta.value as? UiState.Success)?.data ?: return false
+        val target = detail.videos.firstOrNull { it.id == episodeId } ?: return false
+        val groups = repo.streams(
+            type = type,
+            id = id,
+            episodeId = target.id,
+            rememberedQuality = lastPlayedSource?.let(StreamRanking::qualityLabel),
+            wantedAddon = sourceSticky.preference(id)?.addon,
+        ).getOrNull()?.takeIf { list -> list.any { it.streams.isNotEmpty() } } ?: return false
+        val best = StreamRanking.best(
+            groups = groups,
+            continuity = lastPlayedSource?.let(StreamRanking::signature),
+            binge = lastPlayedSource?.bingeGroup,
+            pin = currentPin(),
+            sticky = sourceSticky.preference(id),
+            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+            prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+        ) ?: return false
+        warmNextSourceByEpisode = episodeId to best
+        return true
+    }
+
     fun playNextEpisode() {
         if (_playback.value is Playback.Resolving) return
         val next = nextEpisode() ?: return
+        // Consume a warm-cached best source for this episode (PLR-8): resolve the pre-ranked source right
+        // away and skip the source-assembly "Starting..." wait. Any miss falls through to the cold path
+        // below. The fence is (re)begun for the target so play()'s token + episode identity are correct;
+        // the reactive assembly still runs to populate the new episode's in-player source list, but playback
+        // no longer waits on it.
+        val warm = warmNextSourceByEpisode?.takeIf { it.first == next.id }?.second
+        warmNextSourceByEpisode = null
+        if (warm != null) {
+            _selectedSeason.value = next.season
+            _selectedEpisodeId.value = next.id
+            startSourceLoad(next.id)
+            playAutomatically(warm)
+            return
+        }
         pendingAdvanceHint = lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }
         // Keep the episode browser in step so backing out of the advanced play shows the RIGHT season.
         _selectedSeason.value = next.season
@@ -1320,6 +1526,18 @@ class DetailViewModel(
     /// so the overlay stays scannable. Empty before sources load (the shell then exits to Detail).
     fun playerSourceOptions(limit: Int = PLAYER_SOURCE_LIMIT): List<StreamSource> =
         rankedSourceOptions(limit)
+
+    /** Episodes offered inside the player: only the playing target's current season, in episode order. */
+    fun playerEpisodeOptions(): List<Episode> {
+        if (type != MediaType.SERIES) return emptyList()
+        val detail = (_meta.value as? UiState.Success)?.data ?: return emptyList()
+        val current = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value } ?: return emptyList()
+        return detail.videos
+            .asSequence()
+            .filter { it.season == current.season }
+            .sortedWith(compareBy<Episode> { it.episode }.thenBy { it.id })
+            .toList()
+    }
 
     /** Best stream per visible resolution bucket, using the current assembled target only. */
     fun playerQualityOptions(): List<Pair<String, StreamSource>> {
@@ -1534,6 +1752,12 @@ class DetailViewModel(
 
         /** Contributor settlement budget for an accepted Up Next action. Always bounded. */
         const val AUTO_NEXT_ASSEMBLY_DEADLINE_MS = 4_000L
+
+        /** Same bounded unified-source settlement used by an explicit in-player episode pick. */
+        const val EPISODE_SWITCH_ASSEMBLY_DEADLINE_MS = 4_000L
+
+        /** Maximum wait for the target episode's first non-empty add-on source wave. */
+        const val EPISODE_SWITCH_SOURCE_DEADLINE_MS = 15_000L
 
         /// The text marker folded into an account-cached source's description so the text-based [StreamRanking]
         /// lights the cache badge + applies the +cache bonus (it looks for a bolt / "cached").

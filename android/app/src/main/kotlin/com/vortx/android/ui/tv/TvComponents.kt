@@ -39,6 +39,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -57,6 +60,11 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCardMenu
 import com.vortx.android.ui.components.PosterQuickActionMenu
+import com.vortx.android.ui.search.SearchResultSection
+import com.vortx.android.ui.search.searchResultItemKey
+import com.vortx.android.ui.search.searchResultSectionHeaderKey
+import com.vortx.android.ui.search.searchResultSections
+import com.vortx.android.ui.search.titleResourceId
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -361,11 +369,21 @@ fun TvError(message: String, onRetry: () -> Unit, modifier: Modifier = Modifier)
 /// [com.vortx.android.ui.components.Chip], driven by the SAME option data.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-fun TvFilterChip(label: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun TvFilterChip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    stateDescription: String? = null,
+) {
     val colors = VortXTheme.colors
+    val accessibilityStateDescription = stateDescription
     Surface(
         onClick = onClick,
-        modifier = modifier,
+        modifier = modifier.semantics {
+            this.selected = selected
+            accessibilityStateDescription?.let { this.stateDescription = it }
+        },
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.pill),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = if (selected) colors.accent else colors.surface2,
@@ -414,7 +432,7 @@ fun TvChipRow(chips: List<TvChipModel>, onChipClick: (TvChipModel) -> Unit, modi
 /// The dense D-pad poster grid shared by TV Discover / Library / Search, the 10-foot analogue of the phone
 /// `PosterGrid`. Reuses the SAME [TvPosterCard] tile (width = null so it fills each cell) so there is one
 /// poster path across the whole TV surface. [footer] renders a full-width trailing row (Discover's
-/// "Load more"). Ids are de-duplicated defensively so a page-boundary duplicate can never collide the
+/// "Load more"). Typed identities are de-duplicated defensively so a page-boundary duplicate cannot collide the
 /// grid's `key`, matching the phone grid's belt-and-suspenders guard.
 @Composable
 fun TvPosterGrid(
@@ -422,13 +440,17 @@ fun TvPosterGrid(
     onItem: (MetaItem) -> Unit,
     emptyHint: String,
     modifier: Modifier = Modifier,
+    sectioned: Boolean = false,
     footer: (@Composable () -> Unit)? = null,
 ) {
     if (items.isEmpty()) {
         TvEmpty(emptyHint, modifier)
         return
     }
-    val deduped = remember(items) { items.distinctBy { it.id } }
+    val deduped = remember(items) { items.distinctBy(::searchResultItemKey) }
+    val sections = remember(deduped, sectioned) {
+        if (sectioned) searchResultSections(deduped) else listOf(SearchResultSection(null, deduped))
+    }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = TvDimens.posterWidth),
         modifier = modifier.fillMaxSize(),
@@ -436,8 +458,19 @@ fun TvPosterGrid(
         horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
         verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
     ) {
-        items(deduped, key = { it.id }) { item ->
-            TvPosterCard(item = item, onClick = { onItem(item) }, onFocused = {}, width = null)
+        sections.forEach { section ->
+            section.kind?.let { kind ->
+                item(key = searchResultSectionHeaderKey(kind), span = { GridItemSpan(maxLineSpan) }) {
+                    Text(
+                        text = stringResource(kind.titleResourceId),
+                        style = VortXTheme.type.sectionTitle,
+                        modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.sm),
+                    )
+                }
+            }
+            items(section.items, key = ::searchResultItemKey) { item ->
+                TvPosterCard(item = item, onClick = { onItem(item) }, onFocused = {}, width = null)
+            }
         }
         if (footer != null) {
             item(span = { GridItemSpan(maxLineSpan) }) { footer() }
@@ -452,6 +485,36 @@ fun TvEmpty(message: String, modifier: Modifier = Modifier) {
     Box(modifier = modifier.fillMaxSize().padding(TvDimens.edge), contentAlignment = Alignment.Center) {
         Text(
             text = message,
+            style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+/// The 10-foot signed-out prompt (SD-8), the couch analogue of the phone
+/// [com.vortx.android.ui.components.SignedOutState]: an account glyph, a title, and one line of guidance
+/// pointing at the two ways to sign in. Non-focusable, so a signed-out Search / Discover reads as a calm
+/// prompt rather than a dead panel; the Settings surface owns the actual sign-in flow.
+@Composable
+fun TvSignedOut(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.fillMaxSize().padding(TvDimens.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(
+            imageVector = VortXIcons.account,
+            contentDescription = null,
+            tint = VortXTheme.colors.accent,
+            modifier = Modifier.size(48.dp),
+        )
+        Text(
+            text = stringResource(R.string.account_signed_out_title),
+            style = VortXTheme.type.screenTitle,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            text = stringResource(R.string.account_signed_out_message),
             style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
             textAlign = TextAlign.Center,
         )

@@ -27,7 +27,9 @@ import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.BadSourceAutoRetrySetting
+import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
@@ -132,8 +134,13 @@ fun TvApp(
             null
         }
         if (playable != null) {
-            val playbackHistory = remember(playable) {
-                TvPlaybackHistorySession(playable, playbackSessions)
+            // History identity for the engine playback session; an in-player episode switch advances it so
+            // the finished episode's history session ends and the new episode's begins.
+            var historyIdentity by remember(playable) {
+                mutableStateOf(PlayerEpisodeHistoryIdentity(playable))
+            }
+            val playbackHistory = remember(historyIdentity) {
+                TvPlaybackHistorySession(historyIdentity, playbackSessions)
             }
             val playerSourceState = if (playerVm != null) {
                 playerVm.streams.collectAsStateWithLifecycle().value
@@ -145,6 +152,9 @@ fun TvApp(
             }
             val playerQualityOptions = remember(playerVm, playerSourceState) {
                 playerVm?.playerQualityOptions().orEmpty()
+            }
+            val playerEpisodeOptions = remember(playerVm, playerSourceState) {
+                playerVm?.playerEpisodeOptions().orEmpty()
             }
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
@@ -170,7 +180,7 @@ fun TvApp(
             }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
             BackHandler { playing = null }
-            DisposableEffect(playable) {
+            DisposableEffect(historyIdentity) {
                 playbackHistory.begin()
                 onDispose {
                     playbackHistory.end()
@@ -180,9 +190,20 @@ fun TvApp(
                 playable = playable,
                 sourceOptions = playerSourceOptions,
                 qualityOptions = playerQualityOptions,
+                episodeOptions = playerEpisodeOptions,
                 currentSource = playerVm?.currentPlayerSource(),
                 onSwitchSource = playerVm?.let { vm ->
                     { source -> vm.resolveSourceSwitch(source) }
+                },
+                onSwitchEpisode = playerVm?.let { vm ->
+                    { episodeId -> vm.resolveEpisodeSwitch(episodeId) }
+                },
+                onEpisodeSwitched = { replacement, acceptedRevision ->
+                    historyIdentity = advancePlayerEpisodeHistory(
+                        current = historyIdentity,
+                        replacement = replacement,
+                        acceptedRevision = acceptedRevision,
+                    )
                 },
                 onBack = { playing = null },
                 onError = { playing = null },
@@ -260,10 +281,10 @@ fun TvApp(
  * resident feature's history session. Ordinary playables retain the existing ordered lifecycle.
  */
 internal class TvPlaybackHistorySession(
-    playable: Playable,
+    historyIdentity: PlayerEpisodeHistoryIdentity,
     private val playbackSessions: PlaybackSessionLifecycle,
 ) {
-    private val handle = if (playable.isTrailer) null else playbackSessions.newHandle()
+    private val handle = if (historyIdentity.playable.isTrailer) null else playbackSessions.newHandle()
     private var lastPositionMs = 0L
     private var lastDurationMs = 0L
 

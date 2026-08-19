@@ -19,11 +19,14 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -97,7 +100,14 @@ fun DownloadsScreen(
         },
     ) { padding ->
         if (groups.isEmpty()) {
-            EmptyDownloads(Modifier.fillMaxSize().padding(padding))
+            // Keep the auto-delete policy reachable even with an empty list: enabling it can EMPTY the list,
+            // so hiding the toggle when empty would trap a viewer who wanted to turn it back off.
+            Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+                AutoDeleteWatchedToggle(
+                    Modifier.padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+                )
+                EmptyDownloads(Modifier.fillMaxSize())
+            }
             return@Scaffold
         }
         LazyColumn(
@@ -105,6 +115,7 @@ fun DownloadsScreen(
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = VortXTheme.spacing.sm),
         ) {
+            item { AutoDeleteWatchedToggle() }
             item {
                 // The eviction caption, always visible: Android reclaims app storage under pressure, so a saved
                 // download is not guaranteed to persist. Apple shows the same warning on tvOS for the same reason.
@@ -123,6 +134,31 @@ fun DownloadsScreen(
                     group.records.firstOrNull()?.let { DownloadRow(it, title = null, onPlay = onPlay) }
                 }
             }
+        }
+    }
+}
+
+/// Auto-delete watched downloads (SET-11, Apple `vortx.downloads.autoDeleteWatched`). A synced policy row.
+/// The reclaim sweep is a separate port (see [DownloadManager.AUTO_DELETE_WATCHED_KEY]); this persists the
+/// choice on Apple's exact key so it round-trips across devices and gates the sweep once that lands.
+@Composable
+private fun AutoDeleteWatchedToggle(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    var enabled by remember { mutableStateOf(DownloadManager.isAutoDeleteWatchedEnabled(context)) }
+    Column(modifier = modifier) {
+        SettingsSection(
+            title = "Storage",
+            footer = "When on, a title is removed from downloads once you have finished watching it, to free space.",
+        ) {
+            ToggleRow(
+                label = "Auto-delete watched downloads",
+                detail = null,
+                checked = enabled,
+                onCheckedChange = {
+                    enabled = it
+                    DownloadManager.setAutoDeleteWatchedEnabled(context, it)
+                },
+            )
         }
     }
 }

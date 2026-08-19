@@ -586,3 +586,34 @@ object BadSourceAutoRetrySetting {
         prefs(context).edit().putBoolean(KEY, enabled).apply()
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// BufferTuningSetting - kill switch for the RAM-sized playback buffering
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * Kill switch for the device-sized playback buffering (the buffer-tuning wave). DEFAULT ON.
+ *
+ * When ON:
+ *   - The ExoPlayer engine builds with [com.vortx.android.player.VortxExoLoadControl] (deeper, RAM-sized
+ *     buffer that does not starve a 4K VBR peak) and a bandwidth meter seeded with a high initial estimate,
+ *     so the first chunk of a fast stream is not throttled by a cold, pessimistic estimate.
+ *   - The libmpv engine sizes a REMOTE stream's forward read-ahead (`demuxer-max-bytes`) to this device's
+ *     RAM tier ([com.vortx.android.player.DeviceMemoryTier]), clamped by free disk, instead of a flat cap.
+ *
+ * When OFF: the ExoPlayer engine is the stock player (no custom LoadControl or bandwidth meter) and the
+ * libmpv remote read-ahead falls back to its conservative flat cap. A behavior change this material gets a
+ * settings-level kill that needs no new build, for the same reason [BadSourceAutoRetrySetting] does. The
+ * LOCAL / torrent / loopback / reduced-performance paths are unaffected either way (they stay tight).
+ */
+object BufferTuningSetting {
+    const val KEY = "vortx.player.bufferTuning"
+
+    /** Whether the RAM-sized buffering is armed. Read at player build / file load, per play. Defaults ON. */
+    fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY, true)
+
+    /** Persist the choice (no Settings UI yet; the key is flippable via the shared settings file). */
+    fun setEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY, enabled).apply()
+    }
+}

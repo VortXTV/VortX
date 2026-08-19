@@ -38,6 +38,15 @@ fun SourceRow(
     size: String? = null,
     enabled: Boolean = true,
     pinned: Boolean = false,
+    /// DET-8: a prominent "Cached" badge when the ranker marks this source instant-from-cache; the caller
+    /// drops the plain "Cached" flavour tag so a cached row reads as one badge. False by default (no badge).
+    cached: Boolean = false,
+    /// DET-8: the advertised seeder count for a torrent source, appended to the detail line ("N seeders").
+    /// Null (the default) omits it, for a non-torrent source or when no count was advertised.
+    seeders: Int? = null,
+    // Compact rows (Apple `vortx.streams.compactLabels`, #117): drop the raw release-title line, leaving the
+    // parsed badges + flavour tags + size. Additive default keeps every existing call site unchanged.
+    compact: Boolean = false,
     onLongClick: (() -> Unit)? = null,
 ) {
     val colors = VortXTheme.colors
@@ -66,19 +75,24 @@ fun SourceRow(
                 quality?.let { Badge(it) }
                 Badge(addon)
                 if (isTorrent) Badge("Torrent")
+                // DET-8: the instant-from-cache badge, prominent so it reads as the decisive signal.
+                if (cached) Badge("⚡ Cached", prominent = true)
             }
-            if (flavorTags.isNotEmpty() || size != null) {
+            val detailParts = flavorTags + listOfNotNull(size) + listOfNotNull(seeders?.let { "$it seeders" })
+            if (detailParts.isNotEmpty()) {
                 Text(
-                    text = (flavorTags + listOfNotNull(size)).joinToString(" · "),
+                    text = detailParts.joinToString(" · "),
                     style = VortXTheme.type.label.copy(color = colors.textTertiary),
                 )
             }
-            Text(
-                text = title,
-                style = VortXTheme.type.cardTitle.copy(color = if (enabled) colors.textPrimary else colors.textTertiary),
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+            if (!compact) {
+                Text(
+                    text = title,
+                    style = VortXTheme.type.cardTitle.copy(color = if (enabled) colors.textPrimary else colors.textTertiary),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }

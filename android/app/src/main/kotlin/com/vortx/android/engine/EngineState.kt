@@ -92,6 +92,41 @@ internal object EngineState {
         return rows
     }
 
+    /**
+     * Flatten one search snapshot in engine order and report whether any requested page is unsettled.
+     * Search uses a raw parser because [parseCatalogs] intentionally omits loading-only rows and
+     * de-duplicates each Home row by bare id. Search identity is `(type, id)`, first answer wins.
+     */
+    fun parseSearchUpdate(json: String, requestedEnd: Int): Pair<List<MetaItem>, Boolean> {
+        val root = json.toJsonObjectOrNull() ?: return emptyList<MetaItem>() to false
+        val selected = root.has("selected") && !root.isNull("selected")
+        val catalogs = root.optJSONArray("catalogs") ?: return emptyList<MetaItem>() to false
+        val items = mutableListOf<MetaItem>()
+        val seen = mutableSetOf<Pair<MediaType, String>>()
+        var hasLoadingPages = false
+
+        for (catalogIndex in 0 until catalogs.length()) {
+            val pages = catalogs.optJSONArray(catalogIndex) ?: continue
+            val wasRequested = catalogIndex <= requestedEnd
+            for (pageIndex in 0 until pages.length()) {
+                val page = pages.optJSONObject(pageIndex) ?: continue
+                val content = page.optJSONObject("content")
+                if (
+                    selected &&
+                    ((content == null && wasRequested) || content?.optString("type") == "Loading")
+                ) {
+                    hasLoadingPages = true
+                }
+                val ready = page.readyArray("content") ?: continue
+                for (metaIndex in 0 until ready.length()) {
+                    val item = ready.optJSONObject(metaIndex)?.let(::parseMetaPreview) ?: continue
+                    if (seen.add(item.type to item.id)) items += item
+                }
+            }
+        }
+        return items to (selected && hasLoadingPages)
+    }
+
     /// Number of raw catalog slots in the board. Visible rows are not a valid substitute because
     /// disabled, empty, failed, and not-yet-loaded catalogs still occupy stable engine indices.
     fun boardCatalogCount(json: String): Int =
@@ -722,6 +757,9 @@ internal object EngineState {
         background = obj.optStringOrNull("background"),
         imdbRating = parseImdbRating(obj),
         genres = parseGenres(obj),
+        certificationLabel = parseCertificationLabel(obj),
+        previewRuntimeMinutes = parsePreviewRuntimeMinutes(obj),
+        previewSeasonCount = parsePreviewSeasonCount(obj),
     )
 
     private fun parseLibraryItem(obj: JSONObject): MetaItem = MetaItem(
@@ -814,6 +852,42 @@ internal object EngineState {
             }
         }
         return genres
+    }
+
+    /** Best-effort age certification carried by a catalog preview link. */
+    private fun parseCertificationLabel(meta: JSONObject): String? = firstLinkName(
+        meta,
+        setOf("certification", "mpaa", "mpaa rating", "rated", "content rating", "age rating"),
+    )
+
+    /** Runtime links accept `92 min`, `1h 32m`, or a bare minute count, matching Apple. */
+    private fun parsePreviewRuntimeMinutes(meta: JSONObject): Int? {
+        val raw = firstLinkName(meta, setOf("runtime", "duration")) ?: return null
+        var total = 0
+        var matched = false
+        Regex("(\\d+)\\s*([A-Za-z]*)").findAll(raw).forEach { match ->
+            val amount = match.groupValues[1].toIntOrNull() ?: return@forEach
+            val unit = match.groupValues[2].lowercase()
+            total += if (unit.startsWith("h")) amount * 60 else amount
+            matched = true
+        }
+        return total.takeIf { matched && it > 0 }
+    }
+
+    private fun parsePreviewSeasonCount(meta: JSONObject): Int? =
+        firstLinkName(meta, setOf("season", "seasons"))
+            ?.let { Regex("\\d+").find(it)?.value?.toIntOrNull() }
+            ?.takeIf { it > 0 }
+
+    private fun firstLinkName(meta: JSONObject, categories: Set<String>): String? {
+        val links = meta.optJSONArray("links") ?: return null
+        for (index in 0 until links.length()) {
+            val link = links.optJSONObject(index) ?: continue
+            if (link.optString("category").lowercase() !in categories) continue
+            val name = link.optStringOrNull("name")?.trim().orEmpty()
+            if (name.isNotEmpty()) return name
+        }
+        return null
     }
 
     /// The IMDb rating, read from the first `links` entry categorized (case-insensitively) "imdb" whose

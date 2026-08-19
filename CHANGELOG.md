@@ -6,6 +6,49 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.14 (unreleased)
 
+### Android add-ons
+
+**Installed add-ons show whether each one is reachable.** The Add-ons list now checks every add-on's manifest when it opens and marks each row Online, Slow, or Unreachable, so a source that has gone dark is visible at a glance instead of only failing when you try to play. The checks are bounded and run in the background, and a Re-check status action forces a fresh pass. The same status rows and action are on Android TV. Android phone, tablet, and TV.
+
+**Re-adding an add-on you already have offers to update it.** Pasting the manifest URL of an add-on that is already installed used to silently reinstall it. It now asks first, and updating it to its latest manifest is a deliberate choice that reports Updated rather than Installed. Android phone, tablet, and TV.
+
+**An add-on you remove stays removed.** Removing an add-on is now remembered, so one that the engine re-seeds on its own, the way it restores its default optional add-ons after a reset, does not quietly come back. Installing the same add-on again clears that memory, and the essential built-in add-ons are never affected. Android phone, tablet, and TV.
+
+### Android player controls
+
+**Switch episodes without leaving the player.** A series now shows an episode picker in the player controls: the current season's episodes, the one you are watching highlighted, and tapping another switches to it in place and starts it from the beginning, without dropping back to the detail page. Android.
+
+**The next episode starts faster.** While an episode plays, the player now prepares the next one's best source ahead of time, so an auto-advance into the next episode no longer waits on a cold source search. If the preload does not land in time it falls back to the normal search, so nothing is ever stuck. Android.
+
+**A second subtitle at the same time.** For language study you can now show a second subtitle track alongside the first (top and bottom of the frame). It appears in the Subtitles panel when the file has more than one subtitle track, on the VortX player. Android.
+
+**Sleep timer.** Set playback to pause after 15, 30, 45, 60, or 90 minutes, or to stop at the end of the current episode instead of auto-advancing. Under Player settings. Android.
+
+**Switch the video player mid-title.** You can now switch between the VortX player and the Dolby Vision player from Player settings without leaving the film; it rebuilds at your current position. Hidden for torrents, where it does not apply. Android.
+
+**A playback info panel.** Player settings now includes a Playback Info panel showing what is playing, the source, and live details like resolution, codecs, and frame rate. Android.
+
+**Hardware or software decode.** When a device's hardware decoder produces green or garbled frames, you can now switch that title to software decoding from Player settings, and back. Hardware stays the default. Android, VortX player.
+
+**Stretch video size mode.** The aspect control is now a Fit / Fill / Stretch picker: Fit keeps the whole frame, Fill crops to the screen, and Stretch fills the screen by distorting the picture. Android.
+### Android settings
+
+**Match audio to your subtitle language, and hide tracks by name.** Playback settings on Android add a Match audio to subtitle languages switch, so picking a subtitle language also picks audio in that language, and a reject-terms field that keeps any track whose name contains a word you list (commentary, sdh) from being auto-selected. Android.
+
+**Autoplay trailers and a trailer language.** Playback settings add an Autoplay trailers switch and a Trailer language picker that chooses which language the trailer picker prefers. Android.
+
+**Pin the app to a language.** Appearance settings add an App language picker: choose a language instead of following the device, applied on Android 13 and later and saved to sync across your devices. Android.
+
+**Per-provider sync options for Trakt and SIMKL.** The Integrations screen shows the individual sync options for each connected service (import history, ratings, watchlist, and more), saved and synced across your devices. Android.
+
+**Metadata keys.** A new Metadata keys screen stores your own TMDB, MDBList, and fanart.tv keys securely and syncs them to your other devices. Android.
+
+**Home and Discover content settings.** A new Home & Discover settings screen collects the content toggles: editorial rows, Collections on Home and Discover, the collections refresh rate, Combine Discover and Search, budget and box office, spoiler-safe mode, and hide poster labels. Android.
+
+**Compact source rows.** Sources settings add a Compact source rows switch that drops the raw release name from each source, leaving the quality, add-on, and size badges. Android.
+
+**Auto-delete watched downloads.** Downloads settings add an Auto-delete watched downloads switch, saved and synced across your devices. Android.
+
 ### Resume and buffering (build 218)
 
 **Resuming a show no longer leaves a blank screen.** Continue Watching, jumping to a previous episode, or switching source mid-title resumes at your saved position, and on some streams that jump used to leave a black screen with a frozen timer and only sound, if anything, until you backed out and started over. A mid-file resume was applied as a jump issued before the picture had begun, which on a cold pipeline emptied the just-filled buffer and stalled on a re-read that never resynced, and nothing recovered it. The player now reaches its first frame before making that jump, the way an ordinary scrub already does, so a resume plays and lands at your spot; if a stream still cannot start there within a few seconds it falls back to playing from the beginning with your progress kept, rather than stranding you. Apple TV, iPhone, iPad, and Mac.
@@ -73,6 +116,41 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **TorBox sources degrade gracefully when their search service is unavailable.** For TorBox users VortX pulls extra usenet and torrent sources from TorBox's public search service, and that service went offline at its end. The app kept asking it on every title, got nothing back, and never eased off, so each title open fired repeated failing lookups at a service that could not answer. Now, when that service cannot be reached, VortX falls back to TorBox's own healthy account search so torrent sources still appear, stops retrying a persistently dead service after a few failed tries, and picks the feature back up on its own the moment the service returns. The whole feature can also be switched off from the backend with no app update if the service stays down. Apple TV, iPhone, iPad, and Mac.
 
 **Preview trailers stay inside VortX.** A trailer could be handed off to an external player such as Infuse instead of playing in the app's own built-in player (GitHub #192); trailers now always play in VortX. Apple TV.
+
+### Android detail page
+
+**The sources list groups by add-on and stays manageable on big titles.** A popular title's sources now fold into a collapsible section per add-on with its own count, a row of per-add-on filter chips (plus an "All" chip) to narrow to one provider, and a two-level Quality menu that steps from a resolution tier (4K, 1080p, 720p, Others) to the flavour variants inside it (Dolby Vision, Remux, HDR, Atmos) and plays the one you pick. Long lists load in a bounded window with a "Show more" control so a title returning thousands of sources never rebuilds them all at once, and a "Copy all links" action puts every playable link on the clipboard. Android phone.
+
+**Source rows show why the top pick was chosen and whether it is instant.** The recommended source now carries a one line reason (instant from cache, your preferred source type, or a preferred keyword), each cached source wears a prominent Cached badge, and a torrent row lists its seeder count alongside its size. Android phone.
+
+**More Like This and Where to Watch on the detail page.** A title's detail page now carries a More Like This rail of related titles that open straight into their own detail, and a Where to Watch rail of the legal streaming providers in your region. Both fill in quietly and hide themselves when there is nothing to show. Android phone.
+
+**Play from start, Share, and a foldable Cast and Crew.** A resumed title gains a Play from start action beside Resume that plays from the beginning without losing your saved spot, a Share action puts the title's IMDb link (or its name) into the system share sheet, and the Cast and Crew section folds away behind a chevron. Android phone and TV.
+
+### Android search and discover
+
+**Search fills in as each add-on answers.** Search used to fire one request and show whatever had arrived by the time it gave up, so a slow add-on's matches never appeared. It is now reactive: results stream in as each add-on responds, the loading state reflects whether any add-on is still working, and clearing the box unloads the search cleanly. Android phone and TV.
+
+**Search waits for a real query before saying there are no matches.** A single character no longer runs a search or shows a false "No matches"; below two characters the screen is a calm prompt to keep typing, and "No matches" appears only after a real query has fully settled with nothing found. Android phone and TV.
+
+**Search results are grouped.** Matches are split into Movies, Series, and Other, and an empty group is dropped, so a mixed result is easy to scan. Android phone and TV.
+
+**Search suggests as you type.** Titles from Continue Watching, the results so far, and your Home board surface as tap-to-fill suggestions under the field, matched without regard to accents and capped to a short list. Android phone and TV.
+
+**Discover keeps loading where there is more, and stops where there is not.** A catalog with no page cursor now loads a second page once and then stops instead of trying forever, while a catalog that reports more pages keeps paging, so infinite scroll behaves for both kinds. Android phone and TV.
+
+**Discover has an advanced filter panel.** Filter the current catalog by genre (tap to include, tap again to exclude), release decade, upcoming only, age rating, runtime, and season count. The active count shows on the Filters button, filters only narrow titles that actually carry the field, a strict filter pulls more pages to fill the grid, and your choices persist. Android phone and TV.
+
+**Search and Discover ask you to sign in when you are signed out.** With no VortX or Stremio sign-in, both tabs now show a clear sign-in prompt instead of an empty grid. Android phone and TV.
+### Android
+
+**Pick who is watching at launch.** On an account with more than one profile, the Android app now opens on a "Who's watching?" picker so you land in the right profile, with its own Continue Watching, library, and source ranking, from the first screen. A profile with a PIN is gated the same way it is in Settings, and the picker only appears when there is a real choice to make. Android.
+
+**One place to sign in.** Sign-in now lives on a single surface with your VortX account first, as the primary login that syncs your profiles and progress end to end encrypted, and the optional Stremio import below it. Both read exactly the same as before; they are just gathered into one screen with the right order. Android.
+
+**Continue Watching on the Android TV home screen.** Your Continue Watching titles now appear on the Android TV "Play Next" row on the home screen, so you can resume straight from there without opening the app first. Selecting one opens the title in VortX at your spot. It follows the active profile, updates as you watch, and can be turned off in Settings. Android TV.
+
+**Back up your settings to a file.** A new Backup screen in Settings saves your syncable settings, profiles included, to a file, with no account needed, and imports one back. Device only settings such as the streaming cache size are left out, and importing merges a backup in without removing settings that are not in the file. Android.
 
 ## 0.3.14 Beta 11 - 2026-07-31
 

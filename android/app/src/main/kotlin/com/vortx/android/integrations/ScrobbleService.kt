@@ -45,6 +45,19 @@ object ScrobbleService {
     const val KEY_TRAKT_SCROBBLE = "vortx.trakt.scrobble"
     const val KEY_SIMKL_SCROBBLE = "vortx.simkl.scrobble"
 
+    // Granular per-provider sync toggles (SET-4), on Apple's EXACT keys and defaults
+    // (ExternalScrobbleProvider.swift:100-143, ExternalSyncToggle.isOn). Persisted here so the choices ride
+    // the same cross-device carriage the Apple apps use. Each leg is inert until its sync path exists on
+    // Android; only the scrobble leg above runs today (see the doc on the render site in IntegrationsScreen).
+    const val KEY_TRAKT_IMPORT_WATCHED = "vortx.trakt.importWatched"   // default OFF
+    const val KEY_TRAKT_RATINGS = "vortx.trakt.ratings"               // default ON
+    const val KEY_TRAKT_WATCHLIST = "vortx.trakt.watchlist"          // default ON
+    const val KEY_TRAKT_CONTINUE_WATCHING = "vortx.trakt.continueWatching" // default OFF
+    const val KEY_TRAKT_CHECKIN = "vortx.trakt.checkin"             // default OFF
+    const val KEY_SIMKL_IMPORT_WATCHED = "vortx.simkl.importWatched"   // default OFF
+    const val KEY_SIMKL_RATINGS = "vortx.simkl.ratings"              // default ON
+    const val KEY_SIMKL_WATCHLIST = "vortx.simkl.watchlist"         // default ON
+
     /// Internal scope: a SupervisorJob so one provider's failure never cancels the others, on IO. Owned by
     /// the object (process-lifetime), which is exactly why a stop launched from a torn-down composable
     /// still runs to completion.
@@ -82,6 +95,16 @@ object ScrobbleService {
 
     fun setSimklScrobbleEnabled(enabled: Boolean) {
         togglePrefs?.edit()?.putBoolean(KEY_SIMKL_SCROBBLE, enabled)?.apply()
+    }
+
+    /// A granular sync toggle's value, returning [default] when the user has never set it. [default] MUST
+    /// match the key's Apple @AppStorage default so a never-touched switch and its runtime read agree.
+    /// Mirrors Apple `ExternalSyncToggle.isOn`.
+    fun isToggleOn(key: String, default: Boolean): Boolean =
+        togglePrefs?.getBoolean(key, default) ?: default
+
+    fun setToggle(key: String, enabled: Boolean) {
+        togglePrefs?.edit()?.putBoolean(key, enabled)?.apply()
     }
 
     // MARK: - Live transitions (fire-and-forget)

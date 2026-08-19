@@ -11,9 +11,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.search.searchEmptyMessage
+import com.vortx.android.ui.search.textResourceId
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.SearchViewModel
@@ -28,11 +31,24 @@ import com.vortx.android.ui.viewmodel.SearchViewModel
 /// for free. Scope note: this uses the platform IME rather than a bespoke on-screen keypad; on-device focus /
 /// IME tuning is a later 10-foot polish item (see the session report).
 @Composable
-fun TvSearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
-    val query by viewModel.query.collectAsStateWithLifecycle()
-    val state by viewModel.state.collectAsStateWithLifecycle()
+fun TvSearchScreen(
+    viewModel: SearchViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    signedIn: Boolean = true,
+) {
+    val searchState by viewModel.screenState.collectAsStateWithLifecycle()
     val history by viewModel.history.collectAsStateWithLifecycle()
+    val suggestions by viewModel.suggestions.collectAsStateWithLifecycle()
+    val query = searchState.query
+    val state = searchState.content
     val colors = VortXTheme.colors
+
+    // SD-8: a signed-out set sees a sign-in prompt, not empty add-on results.
+    if (!signedIn) {
+        TvSignedOut(modifier = modifier.fillMaxSize())
+        return
+    }
 
     // Open-to-record, like the phone: history is written when a result is actually opened, not on keystrokes.
     val openItem: (MetaItem) -> Unit = {
@@ -66,6 +82,16 @@ fun TvSearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modif
             )
         }
 
+        // SD-4: as-you-type suggestions as focusable chips. Selecting one runs that query. Cleared below
+        // two characters by the ViewModel, so this row is absent for a single-character query.
+        if (suggestions.isNotEmpty()) {
+            TvChipRow(
+                chips = suggestions.map { TvChipModel(it, false, it) },
+                onChipClick = { chip -> viewModel.onQueryChange(chip.value) },
+                modifier = Modifier.padding(top = VortXTheme.spacing.sm),
+            )
+        }
+
         when (val s = state) {
             is UiState.Loading -> TvEmpty("Searching your add-ons…")
             // No retry affordance: the flow re-runs on the next query change, so a bare message (not a Retry
@@ -74,7 +100,11 @@ fun TvSearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modif
             is UiState.Success -> TvPosterGrid(
                 items = s.data,
                 onItem = openItem,
-                emptyHint = if (query.isBlank()) "Type to search across your add-ons." else "No matches.",
+                emptyHint = when (val message = searchEmptyMessage(query, s)) {
+                    null -> ""
+                    else -> stringResource(message.textResourceId)
+                },
+                sectioned = true,
             )
         }
     }

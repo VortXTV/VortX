@@ -65,11 +65,6 @@ import com.vortx.android.ui.viewmodel.VortXQrJoinState
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, modifier: Modifier = Modifier) {
-    val sessionUiState by viewModel.sessionUiState.collectAsStateWithLifecycle()
-    val recoveryCode by viewModel.recoveryCode.collectAsStateWithLifecycle()
-    val showReconcile by viewModel.showReconcile.collectAsStateWithLifecycle()
-    val formState by viewModel.formState.collectAsStateWithLifecycle()
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -82,32 +77,49 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
             )
         },
     ) { padding ->
-        Column(
+        VortXAccountContent(
+            viewModel = viewModel,
             modifier = modifier
                 .fillMaxSize()
                 .padding(padding)
                 .verticalScroll(rememberScrollState())
                 .padding(VortXTheme.spacing.edge),
-            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
-        ) {
-            val code = recoveryCode
-            if (code != null) {
-                RecoveryCodeCard(
-                    code = code,
-                    warning = (formState as? VortXAccountFormState.Error)?.message,
-                    onSaved = viewModel::dismissRecoveryCode,
-                )
-            } else {
-                when (val session = sessionUiState) {
-                    VortXSyncManager.SessionUiState.UnknownOrUnavailable ->
-                        SessionUnavailableCard(viewModel::retrySessionRestore)
-                    VortXSyncManager.SessionUiState.SignedOut -> AuthCard(viewModel)
-                    is VortXSyncManager.SessionUiState.SignedIn -> {
-                        if (showReconcile) {
-                            ReconcileCard(viewModel)
-                        } else {
-                            SignedInCard(session.account, viewModel)
-                        }
+        )
+    }
+}
+
+/// The VortX-account card stack WITHOUT the screen chrome (no Scaffold/scroll of its own), so it can be the
+/// standalone [VortXAccountScreen] AND the primary block of the unified sign-in surface (ACC-8). The caller
+/// owns the scroll and padding. Renders exactly one of: the one-time recovery code, the session-unavailable
+/// retry, the signed-out auth card (with the QR joiner), the reconcile question, or the signed-in card.
+@Composable
+fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = Modifier) {
+    val sessionUiState by viewModel.sessionUiState.collectAsStateWithLifecycle()
+    val recoveryCode by viewModel.recoveryCode.collectAsStateWithLifecycle()
+    val showReconcile by viewModel.showReconcile.collectAsStateWithLifecycle()
+    val formState by viewModel.formState.collectAsStateWithLifecycle()
+
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+    ) {
+        val code = recoveryCode
+        if (code != null) {
+            RecoveryCodeCard(
+                code = code,
+                warning = (formState as? VortXAccountFormState.Error)?.message,
+                onSaved = viewModel::dismissRecoveryCode,
+            )
+        } else {
+            when (val session = sessionUiState) {
+                VortXSyncManager.SessionUiState.UnknownOrUnavailable ->
+                    SessionUnavailableCard(viewModel::retrySessionRestore)
+                VortXSyncManager.SessionUiState.SignedOut -> AuthCard(viewModel)
+                is VortXSyncManager.SessionUiState.SignedIn -> {
+                    if (showReconcile) {
+                        ReconcileCard(viewModel)
+                    } else {
+                        SignedInCard(session.account, viewModel)
                     }
                 }
             }

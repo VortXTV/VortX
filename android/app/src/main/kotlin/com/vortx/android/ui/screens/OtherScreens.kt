@@ -29,7 +29,9 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -38,9 +40,11 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.BuildConfig
+import com.vortx.android.R
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.model.AuthState
@@ -58,7 +62,15 @@ import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
+import com.vortx.android.ui.components.SignedOutState
 import com.vortx.android.ui.components.shimmer
+import com.vortx.android.ui.search.SearchResultSection
+import com.vortx.android.ui.search.textResourceId
+import com.vortx.android.ui.search.searchEmptyMessage
+import com.vortx.android.ui.search.searchResultItemKey
+import com.vortx.android.ui.search.searchResultSectionHeaderKey
+import com.vortx.android.ui.search.searchResultSections
+import com.vortx.android.ui.search.titleResourceId
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -72,26 +84,92 @@ import com.vortx.android.ui.viewmodel.SearchViewModel
 /// for the S03-era bug where every chip dispatched the identical default Load and nothing ever
 /// actually changed on tap.
 @Composable
-fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+fun DiscoverScreen(
+    viewModel: DiscoverViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    signedIn: Boolean = true,
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val loadingMore by viewModel.loadingMore.collectAsStateWithLifecycle()
+    val advancedFilters by viewModel.advancedFilters.collectAsStateWithLifecycle()
     val filters = (state as? UiState.Success<DiscoverResult>)?.data?.filters
+    var showAdvancedFilters by remember { mutableStateOf(false) }
+
+    // SD-8: without a Stremio or VortX sign-in there are no catalogs to pivot; show the sign-in prompt.
+    if (!signedIn) {
+        SignedOutState(modifier = modifier.fillMaxSize())
+        return
+    }
 
     Column(modifier = modifier.fillMaxSize()) {
+        if (filters != null) {
+            ChipScrollRow {
+                Chip(
+                    label = if (advancedFilters.isActive) {
+                        stringResource(R.string.discover_filters_count, advancedFilters.activeCount)
+                    } else {
+                        stringResource(R.string.discover_filters)
+                    },
+                    selected = advancedFilters.isActive,
+                    onClick = { showAdvancedFilters = true },
+                )
+                if (advancedFilters.isActive) {
+                    Chip(
+                        label = stringResource(R.string.discover_clear),
+                        selected = false,
+                        onClick = viewModel::clearAdvancedFilters,
+                    )
+                }
+            }
+        }
         DiscoverFilterChips(filters = filters, onSelect = { viewModel.select(it) })
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
-            is UiState.Success -> PosterGrid(
-                items = s.data.items,
-                onItem = onItem,
-                emptyHint = "No titles in this catalog yet.",
-                footer = if (s.data.filters.hasNextPage) {
-                    { LoadMoreFooter(loading = loadingMore, onClick = viewModel::loadMore) }
-                } else {
-                    null
-                },
-            )
+            is UiState.Success -> {
+                val shown = viewModel.filteredItems(s.data)
+                if (advancedFilters.isActive && s.data.items.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = VortXTheme.spacing.edge),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                    ) {
+                        Text(
+                            stringResource(R.string.discover_shown_count, shown.size),
+                            style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
+                        )
+                        Chip(
+                            label = stringResource(R.string.discover_clear_filters),
+                            selected = false,
+                            onClick = viewModel::clearAdvancedFilters,
+                        )
+                    }
+                }
+                PosterGrid(
+                    items = shown,
+                    onItem = onItem,
+                    emptyHint = if (advancedFilters.isActive && s.data.items.isNotEmpty()) {
+                        stringResource(R.string.discover_no_matches_message)
+                    } else {
+                        stringResource(R.string.discover_catalog_empty)
+                    },
+                    footer = if (s.data.filters.hasNextPage) {
+                        { LoadMoreFooter(loading = loadingMore, onClick = viewModel::loadMore) }
+                    } else {
+                        null
+                    },
+                )
+                if (showAdvancedFilters) {
+                    DiscoverFilterSheet(
+                        filters = advancedFilters,
+                        genreOptions = viewModel.advancedGenreOptions(s.data),
+                        showSeasons = viewModel.showsAdvancedSeasonFilters(s.data),
+                        onChange = viewModel::setAdvancedFilters,
+                        onDismiss = { showAdvancedFilters = false },
+                    )
+                }
+            }
         }
     }
 }
@@ -179,14 +257,27 @@ private fun LibraryFilterChips(filters: LibraryFilters?, onSelect: (String) -> U
 /// Search: a query field over a poster grid of matches across every installed add-on, with recent
 /// searches as chips when the query is empty (DESIGN-SYSTEM.md §4 "Discover / Search").
 @Composable
-fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
-    val query by viewModel.query.collectAsStateWithLifecycle()
-    val state by viewModel.state.collectAsStateWithLifecycle()
+fun SearchScreen(
+    viewModel: SearchViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    signedIn: Boolean = true,
+) {
+    val searchState by viewModel.screenState.collectAsStateWithLifecycle()
     val history by viewModel.history.collectAsStateWithLifecycle()
+    val suggestions by viewModel.suggestions.collectAsStateWithLifecycle()
+    val query = searchState.query
+    val state = searchState.content
     val colors = VortXTheme.colors
     val openItem: (MetaItem) -> Unit = {
         viewModel.recordHistory()
         onItem(it)
+    }
+
+    // SD-8: a signed-out device sees a sign-in prompt, not empty add-on results. Gate on either account.
+    if (!signedIn) {
+        SignedOutState(modifier = modifier.fillMaxSize())
+        return
     }
 
     Column(modifier = modifier.fillMaxSize()) {
@@ -211,13 +302,29 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
                 Chip(label = "Clear", selected = false, onClick = viewModel::clearHistory)
             }
         }
+        // SD-4: as-you-type suggestions under the field. Cleared below two characters by the ViewModel.
+        if (suggestions.isNotEmpty()) {
+            ChipScrollRow {
+                suggestions.forEach { suggestion ->
+                    Chip(
+                        label = suggestion,
+                        selected = false,
+                        onClick = { viewModel.onQueryChange(suggestion) },
+                    )
+                }
+            }
+        }
         when (val s = state) {
             is UiState.Loading -> EmptyState("Searching your add-ons…")
             is UiState.Error -> ErrorState(s.message)
             is UiState.Success -> PosterGrid(
                 items = s.data,
                 onItem = openItem,
-                emptyHint = if (query.isBlank()) "Type to search across your add-ons." else "No matches.",
+                emptyHint = when (val message = searchEmptyMessage(query, s)) {
+                    null -> ""
+                    else -> stringResource(message.textResourceId)
+                },
+                sectioned = true,
             )
         }
     }
@@ -262,9 +369,12 @@ fun SettingsScreen(
     onLiveTvClick: () -> Unit,
     onPlaybackClick: () -> Unit,
     onSourcesClick: () -> Unit,
+    onMetadataKeysClick: () -> Unit,
+    onHomeDiscoverClick: () -> Unit,
     onDebridKeysScreenClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
+    onBackupClick: () -> Unit,
     onWhatsNewClick: () -> Unit,
     settingsScrollState: ScrollState,
     debridServicesFocusRequester: FocusRequester,
@@ -319,6 +429,13 @@ fun SettingsScreen(
             "Theme, text size",
             onClick = onAppearanceScreenClick,
         )
+        // Home & Discover content settings (SET-3): editorial rows, collections hub, spoiler-safe, etc.
+        SettingRow(
+            VortXIcons.home,
+            "Home & Discover",
+            "Rows, collections, spoilers",
+            onClick = onHomeDiscoverClick,
+        )
         SettingRow(
             VortXIcons.listBullet,
             "Tab bar",
@@ -332,6 +449,8 @@ fun SettingsScreen(
         }
         SettingRow(VortXIcons.account, "Stremio", accountValue, onClick = onAccountClick)
         SettingRow(VortXIcons.addon, "Add-ons", "Manage", onClick = onAddonsClick)
+        // Metadata keys (SET-2): between Add-ons and Debrid, per the Apple placement.
+        SettingRow(VortXIcons.lock, "Metadata keys", "TMDB, MDBList, fanart", onClick = onMetadataKeysClick)
         SettingRow(VortXIcons.link, "Integrations", "Trakt, SIMKL", onClick = onIntegrationsClick)
         SettingRow(VortXIcons.mediaServer, "Media servers", "Plex, Jellyfin, Emby", onClick = onMediaServersClick)
         // Live TV (IPTV): add an M3U playlist or Xtream login; the converter output installs as a normal
@@ -360,6 +479,9 @@ fun SettingsScreen(
         // the two things a viewer might do here (export, import) are the honest summary anyway. Same rule as
         // the Add-ons and Media servers rows.
         SettingRow(VortXIcons.library, "Library", "Export, import", onClick = onLibraryClick)
+        // Backup: a device-wide settings backup to a file (profiles included), distinct from the Library
+        // export above (which carries saved titles only). Neither routes through account sync.
+        SettingRow(VortXIcons.download, "Backup", "Settings to a file", onClick = onBackupClick)
         SettingRow(
             VortXIcons.checkmarkCircle,
             "What's New",
@@ -417,6 +539,7 @@ private fun PosterGrid(
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     emptyHint: String,
+    sectioned: Boolean = false,
     onRemove: ((String) -> Unit)? = null,
     footer: (@Composable () -> Unit)? = null,
 ) {
@@ -424,13 +547,16 @@ private fun PosterGrid(
         EmptyState(emptyHint, modifier)
         return
     }
-    // Defense-in-depth against the "Load more" crash (GROUP 2a): `LazyVerticalGrid`'s `key = { it.id }`
-    // throws `IllegalArgumentException: Key ... was already used` on a duplicate id. The real fix dedupes
+    // Defense-in-depth against the "Load more" crash (GROUP 2a): `LazyVerticalGrid` requires unique keys.
+    // The real fix dedupes
     // at the source ([com.vortx.android.engine.EngineState.parseCatalogWithFilters], where pages get
     // flattened/appended), but this grid is shared by Discover/Library/Search, so a belt-and-suspenders
     // dedupe HERE means no future caller can reintroduce this crash class either. distinctBy is a no-op
     // allocation-wise when there are no duplicates (the common case).
-    val deduped = remember(items) { items.distinctBy { it.id } }
+    val deduped = remember(items) { items.distinctBy(::searchResultItemKey) }
+    val sections = remember(deduped, sectioned) {
+        if (sectioned) searchResultSections(deduped) else listOf(SearchResultSection(null, deduped))
+    }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
         modifier = modifier.fillMaxSize(),
@@ -438,20 +564,31 @@ private fun PosterGrid(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
-        items(deduped, key = { it.id }) { item ->
-            Box {
-                PosterCard(
-                    title = item.name,
-                    subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
-                    onClick = { onItem(item) },
-                    progress = item.progress,
-                    art = { PosterArt(item.poster, item.name) },
-                )
-                if (onRemove != null) {
-                    RemoveBadge(
-                        onClick = { onRemove(item.id) },
-                        modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+        sections.forEach { section ->
+            section.kind?.let { kind ->
+                item(key = searchResultSectionHeaderKey(kind), span = { GridItemSpan(maxLineSpan) }) {
+                    Text(
+                        text = stringResource(kind.titleResourceId),
+                        style = VortXTheme.type.sectionTitle,
+                        modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.sm),
                     )
+                }
+            }
+            items(section.items, key = ::searchResultItemKey) { item ->
+                Box {
+                    PosterCard(
+                        title = item.name,
+                        subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                        onClick = { onItem(item) },
+                        progress = item.progress,
+                        art = { PosterArt(item.poster, item.name) },
+                    )
+                    if (onRemove != null) {
+                        RemoveBadge(
+                            onClick = { onRemove(item.id) },
+                            modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+                        )
+                    }
                 }
             }
         }

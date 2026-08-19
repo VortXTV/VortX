@@ -12,11 +12,17 @@ import java.net.InetAddress
 import java.net.Proxy
 import java.net.UnknownHostException
 import java.util.concurrent.Callable
+import java.util.concurrent.CancellationException
+import java.util.concurrent.Future
 import java.util.concurrent.SynchronousQueue
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.LockSupport
 
 internal class AddonManifestFetcher(
     private val timeoutMs: Int,
@@ -136,22 +142,64 @@ internal class DeadlinePublicDns(
     private val resolver: (String) -> List<InetAddress> = PublicAddressPolicy::requirePublic,
 ) : Dns {
     override fun lookup(hostname: String): List<InetAddress> {
-        val future = try {
-            DNS_EXECUTOR.submit(Callable { resolver(hostname) })
-        } catch (error: RuntimeException) {
-            throw UnknownHostException("Unable to schedule add-on DNS lookup").apply {
+        val timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(1))
+        val deadline = System.nanoTime() + timeoutNanos
+        val admitted = try {
+            DNS_ADMISSION.tryAcquire(timeoutNanos, TimeUnit.NANOSECONDS)
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw UnknownHostException("Interrupted while waiting for add-on DNS capacity").apply {
                 initCause(error)
             }
         }
+        if (!admitted) throw UnknownHostException("Add-on DNS capacity wait exceeded its deadline")
+
+        val lease = DnsAdmissionLease(DNS_ADMISSION::release)
+        val future = try {
+            var scheduled: Future<List<InetAddress>>? = null
+            while (scheduled == null) {
+                try {
+                    scheduled = DNS_EXECUTOR.submit(
+                        Callable {
+                            if (!lease.tryStart()) {
+                                throw CancellationException("Add-on DNS lookup cancelled before resolver start")
+                            }
+                            try {
+                                resolver(hostname)
+                            } finally {
+                                // A resolver may ignore interruption. Keep its shared capacity claimed until
+                                // the worker really exits rather than creating a slot that does not exist.
+                                lease.releaseRunning()
+                            }
+                        },
+                    )
+                } catch (rejected: RejectedExecutionException) {
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0) throw rejected
+                    // A completing worker releases admission immediately before it returns to the
+                    // SynchronousQueue. Retry that tiny hand-off race within the original DNS deadline.
+                    LockSupport.parkNanos(minOf(remaining, TimeUnit.MILLISECONDS.toNanos(1)))
+                    if (Thread.interrupted()) throw InterruptedException("DNS scheduling interrupted")
+                }
+            }
+            requireNotNull(scheduled)
+        } catch (error: Exception) {
+            lease.releasePending()
+            if (error is InterruptedException) Thread.currentThread().interrupt()
+            throw UnknownHostException("Unable to schedule add-on DNS lookup").apply { initCause(error) }
+        }
         return try {
-            future.get(timeoutMs.coerceAtLeast(1), TimeUnit.MILLISECONDS)
+            val remaining = (deadline - System.nanoTime()).coerceAtLeast(1)
+            future.get(remaining, TimeUnit.NANOSECONDS)
         } catch (error: TimeoutException) {
             future.cancel(true)
+            lease.releasePending()
             throw UnknownHostException("Add-on DNS lookup exceeded its deadline").apply {
                 initCause(error)
             }
         } catch (error: Exception) {
             future.cancel(true)
+            lease.releasePending()
             val cause = error.cause ?: error
             if (cause is UnknownHostException) throw cause
             throw UnknownHostException("Unable to resolve add-on host").apply {
@@ -162,6 +210,7 @@ internal class DeadlinePublicDns(
 
     private companion object {
         val threadIds = AtomicInteger()
+        val DNS_ADMISSION = Semaphore(2, true)
         val DNS_EXECUTOR = ThreadPoolExecutor(
             0,
             2,
@@ -173,6 +222,27 @@ internal class DeadlinePublicDns(
                 isDaemon = true
             }
         }
+    }
+}
+
+/** Exactly-once ownership for one permit between lookup cancellation and its DNS worker. */
+internal class DnsAdmissionLease(private val releasePermit: () -> Unit) {
+    private val state = AtomicReference(State.PENDING)
+
+    fun tryStart(): Boolean = state.compareAndSet(State.PENDING, State.RUNNING)
+
+    fun releasePending(): Boolean = state.compareAndSet(State.PENDING, State.RELEASED).also { released ->
+        if (released) releasePermit()
+    }
+
+    fun releaseRunning(): Boolean = state.compareAndSet(State.RUNNING, State.RELEASED).also { released ->
+        if (released) releasePermit()
+    }
+
+    private enum class State {
+        PENDING,
+        RUNNING,
+        RELEASED,
     }
 }
 

@@ -1,22 +1,31 @@
 package com.vortx.android.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -48,6 +57,7 @@ import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.skip.SkipConfig
 import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.prefs.AppLanguage
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import kotlin.math.roundToInt
@@ -98,7 +108,11 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var subtitleStyle by remember { mutableStateOf(SubtitleStyle.current(appContext)) }
     var trackPrefs by remember { mutableStateOf(trackStore.current) }
     var subtitlesOnlyPreferred by remember { mutableStateOf(trackStore.subtitlesOnlyPreferred) }
+    var matchAudioSub by remember { mutableStateOf(trackStore.matchAudioSub) }
     var videoUpscaling by remember { mutableStateOf(trackStore.videoUpscaling) }
+    var autoplayTrailers by remember { mutableStateOf(trackStore.autoplayTrailers) }
+    var trailerLanguage by remember { mutableStateOf(trackStore.trailerLanguage) }
+    var trailerLanguageDialog by remember { mutableStateOf(false) }
     var autoSkip by remember { mutableStateOf(PlaybackBehaviorSettings.autoSkip(appContext)) }
     var autoAddLibrary by remember { mutableStateOf(AutoAddLibrarySetting.isEnabled(appContext)) }
 
@@ -220,11 +234,24 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 footer = "The player tries every language in order. Add as many as you need, then move " +
                     "them earlier or later to set priority.",
             ) {
-                LanguagePriorityEditor(
-                    label = "Audio",
-                    languages = trackPrefs.audioLanguages,
-                    onChange = { updateTracks(trackPrefs.copy(audioLanguages = it)) },
+                // Match audio to subtitle languages (Apple `matchAudioSub`): when ON, the audio pick follows
+                // the subtitle chain, so the separate Audio list is hidden and only the Subtitle list is kept.
+                ToggleRow(
+                    label = "Match audio to subtitle languages",
+                    detail = "Pick audio in your subtitle language too, so you only keep one list.",
+                    checked = matchAudioSub,
+                    onCheckedChange = {
+                        matchAudioSub = it
+                        trackStore.matchAudioSub = it
+                    },
                 )
+                if (!matchAudioSub) {
+                    LanguagePriorityEditor(
+                        label = "Audio",
+                        languages = trackPrefs.audioLanguages,
+                        onChange = { updateTracks(trackPrefs.copy(audioLanguages = it)) },
+                    )
+                }
                 LanguagePriorityEditor(
                     label = "Subtitle",
                     languages = trackPrefs.subtitleLanguages,
@@ -238,6 +265,12 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         subtitlesOnlyPreferred = it
                         trackStore.subtitlesOnlyPreferred = it
                     },
+                )
+                // Reject terms (Apple `stremiox.tracks.reject`): a track whose title contains any of these
+                // (case-insensitive) is never auto-picked. Comma separated (e.g. "commentary, sdh").
+                RejectTermsEditor(
+                    terms = trackPrefs.rejectTerms,
+                    onChange = { updateTracks(trackPrefs.copy(rejectTerms = it)) },
                 )
             }
 
@@ -315,6 +348,77 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     onCheckedChange = {
                         autoAddLibrary = it
                         AutoAddLibrarySetting.setEnabled(appContext, it)
+                    },
+                )
+            }
+
+            // Trailers (Apple iOSSettingsView.swift:719, :724). "Autoplay trailers" gates the ambient hero
+            // trailer (a separate Android surface); "Trailer language" picks which language the trailer
+            // resolver prefers and is read TODAY through TrackPreferencesStore.trailerAudioLanguages.
+            SettingsSection(
+                title = "Trailers",
+                footer = "Trailer language sets which language the trailer picker prefers. Autoplay controls " +
+                    "the muted trailer that plays over a title's hero art.",
+            ) {
+                ToggleRow(
+                    label = "Autoplay trailers",
+                    detail = null,
+                    checked = autoplayTrailers,
+                    onCheckedChange = {
+                        autoplayTrailers = it
+                        trackStore.autoplayTrailers = it
+                    },
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { trailerLanguageDialog = true }
+                        .padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        "Trailer language",
+                        style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+                    )
+                    Text(
+                        trailerLanguage.takeIf { it.isNotEmpty() }?.let { AppLanguage.name(it) } ?: "App language",
+                        style = VortXTheme.type.label.copy(color = VortXTheme.colors.accent),
+                    )
+                }
+            }
+
+            if (trailerLanguageDialog) {
+                AlertDialog(
+                    onDismissRequest = { trailerLanguageDialog = false },
+                    confirmButton = { TextButton(onClick = { trailerLanguageDialog = false }) { Text("Close") } },
+                    title = { Text("Trailer language", style = VortXTheme.type.cardTitle) },
+                    text = {
+                        LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
+                            item {
+                                OptionRow(
+                                    label = "App language",
+                                    detail = null,
+                                    selected = trailerLanguage.isEmpty(),
+                                    onClick = {
+                                        trailerLanguage = ""
+                                        trackStore.trailerLanguage = ""
+                                        trailerLanguageDialog = false
+                                    },
+                                )
+                            }
+                            items(AppLanguage.supported) { (languageCode, name) ->
+                                OptionRow(
+                                    label = name,
+                                    detail = null,
+                                    selected = trailerLanguage == languageCode,
+                                    onClick = {
+                                        trailerLanguage = languageCode
+                                        trackStore.trailerLanguage = languageCode
+                                        trailerLanguageDialog = false
+                                    },
+                                )
+                            }
+                        }
                     },
                 )
             }
@@ -450,6 +554,38 @@ private fun LanguagePriorityEditor(
                 onSelect = { onChange(LanguagePriority.add(ordered, it)) },
             )
         }
+    }
+}
+
+/// Comma editor for the never-auto-pick track terms (Apple `stremiox.tracks.reject`). Holds its own text
+/// state so a viewer can type freely (spaces / trailing commas), splitting to trimmed lowercased non-empty
+/// terms on every change. [TrackSelector.isRejected] reads these against every track title.
+@Composable
+private fun RejectTermsEditor(
+    terms: List<String>,
+    onChange: (List<String>) -> Unit,
+) {
+    val colors = VortXTheme.colors
+    var text by remember { mutableStateOf(terms.joinToString(", ")) }
+    Column(
+        modifier = Modifier.padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
+        Text("Never auto-pick tracks named", style = VortXTheme.type.label.copy(color = colors.textSecondary))
+        OutlinedTextField(
+            value = text,
+            onValueChange = {
+                text = it
+                onChange(it.split(",").map { term -> term.trim().lowercase() }.filter(String::isNotEmpty))
+            },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("commentary, sdh") },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = colors.accent,
+                cursorColor = colors.accent,
+            ),
+        )
     }
 }
 

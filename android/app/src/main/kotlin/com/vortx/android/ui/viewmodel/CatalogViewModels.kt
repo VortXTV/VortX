@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.CatalogPreferencesStore
 import com.vortx.android.data.ContinueWatchingDismissal
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.ContinueWatchingSnapshot
@@ -39,20 +40,25 @@ import com.vortx.android.mediaserver.MediaServerCatalogsModel
 import com.vortx.android.mediaserver.MediaServerRepository
 import com.vortx.android.mediaserver.withMediaServerRails
 import com.vortx.android.model.AuthState
+import com.vortx.android.model.AdvancedDiscoverFilters
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.advancedDiscoverGenreOptions
+import com.vortx.android.model.isAdvancedDiscoverSeriesContext
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.search.SearchHistoryStore
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.search.isSearchQueryEligible
+import com.vortx.android.ui.search.searchSuggestionTitles
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -63,16 +69,18 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
-import kotlinx.coroutines.flow.debounce
-import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.time.Year
+import java.util.concurrent.atomic.AtomicLong
 
 /// Maps a repository [Result] to a [UiState], turning a thrown/failed add-on call into a visible
 /// error instead of an empty screen. Shared by every catalog ViewModel.
@@ -617,6 +625,36 @@ internal suspend fun awaitContinueWatchingAbsent(
     confirmed
 } ?: false
 
+internal class DiscoverPaginationState {
+    private var exhausted = false
+    private var countAtLoad = 0
+    private var generation = 0L
+
+    fun reset() {
+        exhausted = false
+        countAtLoad = 0
+        generation += 1L
+    }
+
+    fun begin(itemCount: Int): Long {
+        countAtLoad = itemCount
+        return generation
+    }
+
+    fun settle(token: Long, result: DiscoverResult): DiscoverResult? {
+        if (token != generation) return null
+        if (result.items.size <= countAtLoad) exhausted = true
+        return surface(result)
+    }
+
+    fun surface(result: DiscoverResult): DiscoverResult {
+        val hasNextPage = result.filters.hasNextPage || (!exhausted && result.items.isNotEmpty())
+        return result.copy(filters = result.filters.copy(hasNextPage = hasNextPage))
+    }
+
+    fun isCurrent(token: Long): Boolean = token == generation
+}
+
 /// Discover: the engine-driven type/catalog/genre pivot (S04). REPLACES the old static-[MediaType]
 /// chip switch: that switch dispatched the SAME `args: null` Load regardless of which chip was tapped
 /// (see [com.vortx.android.engine.EngineActions.loadDiscover]'s old doc), so every type/catalog
@@ -624,16 +662,26 @@ internal suspend fun awaitContinueWatchingAbsent(
 /// Every selection now re-dispatches the chip's own `request` JSON verbatim (never reconstructed), and
 /// filters + items come back from a SINGLE engine round-trip (see
 /// [com.vortx.android.engine.EngineStremioRepository.discoverResultFrom]).
-class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
+class DiscoverViewModel(
+    private val repo: CatalogRepository,
+    private val catalogPreferences: CatalogPreferencesStore = CatalogPreferencesStore.inMemory(),
+    private val currentYear: () -> Int = { Year.now().value },
+    private val filterFillFloor: Int = FILTER_FILL_FLOOR,
+) : ViewModel() {
     private val _state = MutableStateFlow<UiState<DiscoverResult>>(UiState.Loading)
     val state: StateFlow<UiState<DiscoverResult>> = _state.asStateFlow()
 
     private val _loadingMore = MutableStateFlow(false)
     val loadingMore: StateFlow<Boolean> = _loadingMore.asStateFlow()
 
+    val advancedFilters: StateFlow<AdvancedDiscoverFilters> = catalogPreferences.filters
+
     private var currentRequestJson: String? = null
     private var everLoaded = false
     private var selectJob: Job? = null
+    private var pageJob: Job? = null
+    private val pagination = DiscoverPaginationState()
+    private val selectionGeneration = AtomicLong()
 
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): re-drives the CURRENT selection
     /// whenever an add-on is installed/removed or the signed-in identity changes, so Discover's
@@ -646,6 +694,9 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     init {
         viewModelScope.launch {
             repo.ctxUpdates().collect { reconcileSelection() }
+        }
+        viewModelScope.launch {
+            advancedFilters.drop(1).collectLatest { maybeAutoFillFilteredGrid() }
         }
     }
 
@@ -668,21 +719,24 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     /// channels and the dead chip are both gone, with no chip tap or restart needed.
     private fun reconcileSelection() {
         val requestJson = currentRequestJson
-        selectJob?.cancel()
         val showLoading = !everLoaded
-        if (showLoading) _state.value = UiState.Loading
+        val token = beginSelection(showLoading)
         selectJob = viewModelScope.launch {
             val fresh = repo.discover(null)
+            if (selectionGeneration.get() != token) return@launch
             val stillOffered = requestJson != null && fresh.getOrNull()?.filters?.let { f ->
                 f.types.any { it.requestJson == requestJson } ||
                     f.catalogs.any { it.requestJson == requestJson } ||
                     f.genres.any { it.requestJson == requestJson }
             } == true
+            if (selectionGeneration.get() != token) return@launch
             val result = if (stillOffered) repo.discover(requestJson) else fresh
+            if (selectionGeneration.get() != token) return@launch
             currentRequestJson = if (stillOffered) requestJson else null
-            _state.value = result.toUiState()
+            _state.value = result.map(pagination::surface).toUiState()
             everLoaded = true
         }
+        selectJob?.autoFillOnSuccess(token)
     }
 
     /// Pivot to a specific type/catalog/genre. [requestJson] is null for the engine's own default
@@ -692,15 +746,34 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     /// shimmer underneath them.
     fun select(requestJson: String?, showLoading: Boolean = true) {
         currentRequestJson = requestJson
-        selectJob?.cancel()
-        if (showLoading) _state.value = UiState.Loading
+        val token = beginSelection(showLoading)
         selectJob = viewModelScope.launch {
-            _state.value = repo.discover(requestJson).toUiState()
+            val result = repo.discover(requestJson)
+            if (selectionGeneration.get() != token) return@launch
+            _state.value = result.map(pagination::surface).toUiState()
             everLoaded = true
         }
+        selectJob?.autoFillOnSuccess(token)
     }
 
     fun retry() = select(null)
+
+    fun setAdvancedFilters(filters: AdvancedDiscoverFilters) = catalogPreferences.setFilters(filters)
+
+    fun clearAdvancedFilters() = catalogPreferences.clearFilters()
+
+    fun filteredItems(result: DiscoverResult): List<MetaItem> {
+        val filters = advancedFilters.value
+        return if (filters.isActive) {
+            result.items.filter { filters.matches(it, currentYear()) }
+        } else {
+            result.items
+        }
+    }
+
+    fun advancedGenreOptions(result: DiscoverResult): List<String> = advancedDiscoverGenreOptions(result)
+
+    fun showsAdvancedSeasonFilters(result: DiscoverResult): Boolean = isAdvancedDiscoverSeriesContext(result)
 
     /// "Load more" (DESIGN-SYSTEM.md §4 "Discover / Search": "'Load more' (per-catalog skip)"). The
     /// engine APPENDS the next page to the already-loaded catalog, so the returned items already
@@ -709,24 +782,73 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     /// GROUP 2a (device-verified crash): root-caused to a duplicate poster id across a page boundary
     /// hitting `LazyVerticalGrid`'s `key = { it.id }` in [com.vortx.android.ui.screens.PosterGrid] --
     /// fixed at the source in [com.vortx.android.engine.EngineState.parseCatalogWithFilters] (dedupe
-    /// while flattening pages) plus a defense-in-depth dedupe in the grid itself. `runCatching` + a
+    /// while flattening pages) plus a defense-in-depth dedupe in the grid itself. A caught and
     /// logged failure here is additional hardening so a genuinely NEW crash mode surfaces as a caught,
     /// logged error (visible via `adb logcat -s StremioXDiscover`) instead of taking the app down again,
     /// and captures the next device round's logcat if this was not the only failure mode.
     fun loadMore() {
-        val filters = (_state.value as? UiState.Success)?.data?.filters ?: return
-        if (!filters.hasNextPage || _loadingMore.value) return
-        viewModelScope.launch {
-            _loadingMore.value = true
-            runCatching { repo.discoverNextPage() }
-                .onSuccess { result -> result.onSuccess { _state.value = UiState.Success(it) } }
-                .onFailure { Log.e(TAG, "loadMore: discoverNextPage threw", it) }
-            _loadingMore.value = false
+        val current = (_state.value as? UiState.Success)?.data ?: return
+        if (!current.filters.hasNextPage || _loadingMore.value || selectJob?.isActive == true) return
+        val token = pagination.begin(current.items.size)
+        _loadingMore.value = true
+        pageJob = viewModelScope.launch {
+            var shouldAutoFill = false
+            try {
+                repo.discoverNextPage()
+                    .onSuccess { result ->
+                        pagination.settle(token, result)?.let {
+                            _state.value = UiState.Success(it)
+                            shouldAutoFill = true
+                        }
+                    }
+                    .onFailure { Log.e(TAG, "loadMore: discoverNextPage failed", it) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                Log.e(TAG, "loadMore: discoverNextPage threw", error)
+            } finally {
+                if (pagination.isCurrent(token)) _loadingMore.value = false
+            }
+            if (shouldAutoFill) maybeAutoFillFilteredGrid()
         }
+    }
+
+    /** Pulls additional pages while strict client filters leave too few visible cards. */
+    private fun maybeAutoFillFilteredGrid() {
+        val current = (_state.value as? UiState.Success)?.data ?: return
+        val filters = advancedFilters.value
+        if (!filters.isActive || filteredItems(current).size >= filterFillFloor) return
+        loadMore()
+    }
+
+    private fun beginSelection(showLoading: Boolean): Long {
+        val token = selectionGeneration.incrementAndGet()
+        selectJob?.cancel()
+        resetPagination()
+        if (showLoading) _state.value = UiState.Loading
+        return token
+    }
+
+    private fun Job.autoFillOnSuccess(token: Long) {
+        invokeOnCompletion { error ->
+            if (error == null && selectionGeneration.get() == token) {
+                viewModelScope.launch {
+                    if (selectionGeneration.get() == token) maybeAutoFillFilteredGrid()
+                }
+            }
+        }
+    }
+
+    private fun resetPagination() {
+        pagination.reset()
+        pageJob?.cancel()
+        pageJob = null
+        _loadingMore.value = false
     }
 
     private companion object {
         const val TAG = "StremioXDiscover"
+        const val FILTER_FILL_FLOOR = 18
     }
 }
 
@@ -776,28 +898,93 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     }
 }
 
-/// Search: debounced full-text query across every installed add-on. An empty query is a calm idle
+/// Search: debounced full-text query across every installed add-on. A query below two trimmed
+/// characters is a calm idle
 /// state, never an error. [history] surfaces recent searches (DESIGN-SYSTEM.md §4 "Discover / Search":
 /// "Recent searches as chips when empty"), ported from Apple `SearchHistoryStore` -- see
 /// [SearchHistoryStore]'s doc for the plain-prefs rationale.
-@OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
-class SearchViewModel(private val repo: CatalogRepository, private val historyStore: SearchHistoryStore) : ViewModel() {
+internal data class SearchScreenState(
+    val query: String,
+    val content: UiState<List<MetaItem>>,
+    val isLoading: Boolean = false,
+)
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class SearchViewModel(
+    private val repo: CatalogRepository,
+    private val historyStore: SearchHistoryStore,
+    scopeOverride: CoroutineScope? = null,
+) : ViewModel() {
     private val _query = MutableStateFlow("")
     val query: StateFlow<String> = _query.asStateFlow()
 
     private val _history = MutableStateFlow(historyStore.load())
     val history: StateFlow<List<String>> = _history.asStateFlow()
 
-    val state: StateFlow<UiState<List<MetaItem>>> = _query
-        .debounce { if (it.isBlank()) 0L else SEARCH_DEBOUNCE_MS }
-        .distinctUntilChanged()
-        .flatMapLatest { q ->
+    private val stateScope = scopeOverride ?: viewModelScope
+
+    internal val screenState: StateFlow<SearchScreenState> = _query
+        .flatMapLatest { rawQuery ->
             flow {
-                if (q.isNotBlank()) emit(UiState.Loading)
-                emit(repo.search(q).toUiState())
+                val q = rawQuery.trim()
+                if (isSearchQueryEligible(q)) {
+                    emit(SearchScreenState(rawQuery, UiState.Loading, isLoading = true))
+                    delay(SEARCH_DEBOUNCE_MS)
+                }
+                emitAll(
+                    repo.searchUpdates(q)
+                        .map { (items, isLoading) ->
+                            val content = if (isLoading && items.isEmpty()) {
+                                UiState.Loading
+                            } else {
+                                UiState.Success(items)
+                            }
+                            SearchScreenState(rawQuery, content, isLoading)
+                        }
+                        .catch { error ->
+                            emit(
+                                SearchScreenState(
+                                    rawQuery,
+                                    UiState.Error(error.message ?: "Something went wrong loading your add-ons."),
+                                ),
+                            )
+                        },
+                )
             }
         }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState.Success(emptyList()))
+        .stateIn(
+            stateScope,
+            SharingStarted.WhileSubscribed(5_000),
+            SearchScreenState("", UiState.Success(emptyList())),
+        )
+
+    val state: StateFlow<UiState<List<MetaItem>>> = screenState
+        .map { it.content }
+        .stateIn(stateScope, SharingStarted.WhileSubscribed(5_000), UiState.Success(emptyList()))
+
+    /// As-you-type search suggestions (SD-4). Interleaves the Home board's Continue Watching and catalog
+    /// titles with the current settled results, matched diacritic-insensitively in Apple's priority order
+    /// ([searchSuggestionTitles]). The Home board is read fail-soft: a slow, failed, or absent board yields
+    /// no suggestions rather than blocking the field, and results-only suggestions still surface. Empty
+    /// below the two-character gate.
+    val suggestions: StateFlow<List<String>> = combine(
+        screenState,
+        repo.homeUpdates()
+            .map<HomeUpdate, HomeUpdate?> { it }
+            .onStart { emit(null) }
+            .catch { emit(null) },
+    ) { screen, home ->
+        val rows = home?.rows.orEmpty()
+        val continueWatching = rows.firstOrNull { it.id == CONTINUE_WATCHING_ROW_ID }?.items.orEmpty()
+        val board = rows.filterNot { it.id == CONTINUE_WATCHING_ROW_ID }.flatMap { it.items }
+        val results = (screen.content as? UiState.Success)?.data.orEmpty()
+        searchSuggestionTitles(
+            query = screen.query,
+            continueWatching = continueWatching,
+            currentResults = results,
+            homeBoard = board,
+        )
+    }.stateIn(stateScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun onQueryChange(value: String) {
         _query.value = value
@@ -818,5 +1005,9 @@ class SearchViewModel(private val repo: CatalogRepository, private val historySt
 
     private companion object {
         const val SEARCH_DEBOUNCE_MS = 350L
+
+        /// The engine's stable Continue Watching row id (see EngineStremioRepository home builder), used to
+        /// split the Home board into the Continue-Watching leg and the catalog leg for suggestion priority.
+        const val CONTINUE_WATCHING_ROW_ID = "continue"
     }
 }

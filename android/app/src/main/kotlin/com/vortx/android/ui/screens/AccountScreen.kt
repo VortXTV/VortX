@@ -37,8 +37,6 @@ import com.vortx.android.ui.viewmodel.SignInFormState
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AccountScreen(viewModel: AccountViewModel, onBack: () -> Unit, modifier: Modifier = Modifier) {
-    val authState by viewModel.authState.collectAsStateWithLifecycle()
-
     Scaffold(
         topBar = {
             TopAppBar(
@@ -51,16 +49,26 @@ fun AccountScreen(viewModel: AccountViewModel, onBack: () -> Unit, modifier: Mod
             )
         },
     ) { padding ->
-        Column(
+        AccountContent(
+            viewModel = viewModel,
             modifier = modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(VortXTheme.spacing.edge),
-        ) {
-            when (val state = authState) {
-                is AuthState.SignedIn -> SignedInCard(state, onSignOut = viewModel::signOut)
-                AuthState.SignedOut -> SignInCard(viewModel)
-            }
+        )
+    }
+}
+
+/// The Stremio account card WITHOUT the screen chrome, so it can be the standalone [AccountScreen] AND the
+/// secondary (optional import) block of the unified sign-in surface (ACC-8). Signed-out shows the sign-in
+/// form; signed-in shows the summary + sign-out. Driven entirely by [AccountViewModel]'s live [AuthState].
+@Composable
+fun AccountContent(viewModel: AccountViewModel, modifier: Modifier = Modifier) {
+    val authState by viewModel.authState.collectAsStateWithLifecycle()
+    Column(modifier = modifier) {
+        when (val state = authState) {
+            is AuthState.SignedIn -> SignedInCard(state, onSignOut = viewModel::signOut)
+            AuthState.SignedOut -> SignInCard(viewModel)
         }
     }
 }

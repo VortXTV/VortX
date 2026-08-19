@@ -60,6 +60,7 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
+import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -69,7 +70,10 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
+import com.vortx.android.player.NextEpisodePreloadPolicy
+import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.ui.components.Wordmark
@@ -82,16 +86,19 @@ import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonsScreen
 import com.vortx.android.ui.screens.AppearanceScreen
+import com.vortx.android.ui.screens.BackupRestoreScreen
 import com.vortx.android.ui.screens.CustomizeHomeScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadsScreen
+import com.vortx.android.ui.screens.HomeDiscoverSettingsScreen
 import com.vortx.android.ui.screens.HomeScreen
 import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LibraryScreen
 import com.vortx.android.ui.screens.LibraryTransferScreen
 import com.vortx.android.ui.screens.MediaServersScreen
+import com.vortx.android.ui.screens.MetadataKeysScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
@@ -99,8 +106,9 @@ import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
-import com.vortx.android.ui.screens.VortXAccountScreen
+import com.vortx.android.ui.screens.UnifiedSignInScreen
 import com.vortx.android.ui.screens.WhatsNewScreen
+import com.vortx.android.ui.screens.WhosWatchingScreen
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
@@ -234,17 +242,24 @@ fun VortXApp(
         var showDownloads by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
+        var showMetadataKeys by remember { mutableStateOf(false) }
+        var showHomeDiscover by remember { mutableStateOf(false) }
         var showDebridKeys by remember { mutableStateOf(false) }
         var restoreDebridServicesFocus by remember { mutableStateOf(false) }
         val settingsScrollState = rememberScrollState()
         val debridServicesFocusRequester = remember { FocusRequester() }
         var showLiveTv by remember { mutableStateOf(false) }
         var showLibraryTransfer by remember { mutableStateOf(false) }
+        var showBackup by remember { mutableStateOf(false) }
         var showProfiles by remember { mutableStateOf(false) }
         var showAppearance by remember { mutableStateOf(false) }
         var showCustomizeHome by remember { mutableStateOf(false) }
         var showTabBar by remember { mutableStateOf(false) }
         var showWhatsNew by remember { mutableStateOf(false) }
+        // Cold-launch "Who's watching?" picker (ACC-3): shown once per launch only when there is a real
+        // choice (more than one profile, not yet picked). Seeded from ProfileStore.needsPicker at first
+        // composition so it never re-appears after the user has picked (select() sets pickedThisLaunch).
+        var showWhosWatching by remember { mutableStateOf(profileStore?.needsPicker == true) }
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
@@ -259,10 +274,13 @@ fun VortXApp(
             showDownloads = false
             showPlayback = false
             showSources = false
+            showMetadataKeys = false
+            showHomeDiscover = false
             showDebridKeys = false
             restoreDebridServicesFocus = false
             showLiveTv = false
             showLibraryTransfer = false
+            showBackup = false
             showProfiles = false
             showAppearance = false
             showCustomizeHome = false
@@ -301,6 +319,19 @@ fun VortXApp(
                 }
                 if (focused) restoreDebridServicesFocus = false
             }
+        }
+
+        // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
+        // watching" before any content renders. It self-dismisses when the store has nothing to pick.
+        if (showWhosWatching) {
+            // Back keeps the last-used profile rather than exiting the app (it is already active, so this
+            // is a no-op switch that just marks the launch picked and dismisses).
+            BackHandler {
+                profileStore?.active?.let { profileStore.select(it) }
+                showWhosWatching = false
+            }
+            WhosWatchingScreen(onDone = { showWhosWatching = false })
+            return@VortXTheme
         }
 
         // The debug-only design-system gallery (S02) is the topmost overlay when open, above even the
@@ -351,9 +382,16 @@ fun VortXApp(
         // back returns to the detail page underneath.
         val playable = playing
         if (playable != null) {
+            // History identity for the engine playback session. An in-player episode switch stays inside
+            // the mounted player (it never changes [playing]), so it advances THIS identity instead, which
+            // rekeys the session effects below so the new episode gets its own begin/end history session.
+            var historyIdentity by remember(playable) {
+                mutableStateOf(PlayerEpisodeHistoryIdentity(playable))
+            }
+            val historyPlayable = historyIdentity.playable
             // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
-            // [1] = duration. Reset when the played source changes.
-            val lastProgress = remember(playable) { longArrayOf(0L, 0L) }
+            // [1] = duration. Reset when the history identity changes (new source, or a switched episode).
+            val lastProgress = remember(historyIdentity) { longArrayOf(0L, 0L) }
             // Auto-add-to-Library (D8). One instance per player session; its own SharedPreferences ledger
             // makes the add idempotent ACROSS playbacks (so a later manual removal sticks), while the latch
             // below keeps it to one attempt WITHIN a playback. Reset per source, mirroring Apple's
@@ -411,6 +449,14 @@ fun VortXApp(
             val playerQualityOptions = remember(advanceVm, playerSourceState) {
                 advanceVm?.playerQualityOptions().orEmpty()
             }
+            val playerEpisodeOptions = remember(advanceVm, playerSourceState) {
+                advanceVm?.playerEpisodeOptions().orEmpty()
+            }
+            // PLR-8 next-episode preload policy, owned per player session (reset when an episode is switched
+            // or advanced). Drives WHEN to warm the next episode's source; the warm itself is off-fence in
+            // the ViewModel. Invalidated on dispose so a stale attempt cannot survive the player closing.
+            val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
+            DisposableEffect(historyIdentity) { onDispose { preloadPolicy.invalidate() } }
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
@@ -420,17 +466,18 @@ fun VortXApp(
             // cap per episode) lives in [DetailViewModel], which survives the swaps.
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var manualSourcePick by remember(playable) { mutableStateOf(false) }
-            val playbackSession = remember(playable) { playbackSessions.newHandle() }
+            val playbackSession = remember(historyIdentity) { playbackSessions.newHandle() }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             // Engine playback session: load the Player so progress attributes to the right library item,
             // then end it (final tick + unload + watched-near-end) when the player closes. A TRAILER is not
             // the feature (it must not write a resume position, mark watched, or attribute progress to any
             // library item), so it opens NO engine playback session -- exactly as Apple plays trailers through
-            // dedicated player instances that never touch the library.
-            DisposableEffect(playable) {
-                if (!playable.isTrailer) playbackSessions.begin(playbackSession)
+            // dedicated player instances that never touch the library. Keyed on the history identity so an
+            // in-player episode switch ends the finished episode's session and begins the new one.
+            DisposableEffect(historyIdentity) {
+                if (!historyPlayable.isTrailer) playbackSessions.begin(playbackSession)
                 onDispose {
-                    if (!playable.isTrailer) {
+                    if (!historyPlayable.isTrailer) {
                         playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1])
                     }
                 }
@@ -440,9 +487,38 @@ fun VortXApp(
                     playable = playable,
                     sourceOptions = playerSourceOptions,
                     qualityOptions = playerQualityOptions,
+                    episodeOptions = playerEpisodeOptions,
                     currentSource = advanceVm?.currentPlayerSource(),
                     onSwitchSource = advanceVm?.let { vm ->
                         { source -> vm.resolveSourceSwitch(source) }
+                    },
+                    onSwitchEpisode = advanceVm?.let { vm ->
+                        { episodeId -> vm.resolveEpisodeSwitch(episodeId) }
+                    },
+                    onEpisodeSwitched = { replacement, acceptedRevision ->
+                        historyIdentity = advancePlayerEpisodeHistory(
+                            current = historyIdentity,
+                            replacement = replacement,
+                            acceptedRevision = acceptedRevision,
+                        )
+                    },
+                    // PLR-8: drive the preload policy on each position tick; when it commits an attempt, warm
+                    // the next episode's source off the fence and report the outcome back to the policy. All
+                    // policy access stays on this composition dispatcher (the tick and the launch both run on
+                    // it), so the plain state machine is never touched concurrently.
+                    onWarmNext = onWarmNext@{ pos, dur ->
+                        val vm = advanceVm ?: return@onWarmNext
+                        val next = vm.nextEpisode() ?: return@onWarmNext
+                        val target = NextEpisodePreloadPolicy.Target(
+                            episodeId = next.id,
+                            generation = historyIdentity.acceptedRevision,
+                        )
+                        val now = android.os.SystemClock.elapsedRealtime()
+                        val attempt = preloadPolicy.evaluate(target, pos, dur, now) ?: return@onWarmNext
+                        appScope.launch {
+                            val ok = vm.warmNextEpisode(next.id)
+                            preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
+                        }
                     },
                     onBack = { playing = null },
                     onError = { playing = null },
@@ -591,13 +667,18 @@ fun VortXApp(
         }
 
         if (showVortxAccount && syncManager != null) {
-            // Settings > VortX Account: the E2E VortX account (sign in / create / recover) + cross-device
-            // sync controls, driving the app-process VortXSyncManager. Separate from the Stremio account
-            // overlay below: the VortX account is the primary login; Stremio stays the optional import.
+            // Settings > VortX Account opens the UNIFIED sign-in surface (ACC-8): the E2E VortX account
+            // (sign in / create / recover + cross-device sync + QR joiner, driving the app-process
+            // VortXSyncManager) as the PRIMARY block, with the optional Stremio import below it, in one
+            // screen. Both blocks are the same card stacks their standalone screens use, so nothing drifts.
             BackHandler { showVortxAccount = false }
             val vortxAccountVm: VortXAccountViewModel =
                 viewModel(factory = StremioXViewModelFactory(repo = repo, syncManager = syncManager))
-            VortXAccountScreen(viewModel = vortxAccountVm, onBack = { showVortxAccount = false })
+            UnifiedSignInScreen(
+                vortxViewModel = vortxAccountVm,
+                stremioViewModel = accountVm,
+                onBack = { showVortxAccount = false },
+            )
             return@VortXTheme
         }
 
@@ -666,6 +747,23 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showMetadataKeys) {
+            // Settings > Metadata keys (SET-2): three encrypted provider-key fields. Self-contained like the
+            // other settings overlays (it constructs its own MetadataProviderKeys secure store), so it needs
+            // no repository or ViewModel.
+            BackHandler { showMetadataKeys = false }
+            MetadataKeysScreen(onBack = { showMetadataKeys = false })
+            return@VortXTheme
+        }
+
+        if (showHomeDiscover) {
+            // Settings > Home & Discover (SET-3): content toggles + collections cadence on the shared
+            // vortx_settings file. Self-contained (its own HomeDiscoverPreferences store), so no ViewModel.
+            BackHandler { showHomeDiscover = false }
+            HomeDiscoverSettingsScreen(onBack = { showHomeDiscover = false })
+            return@VortXTheme
+        }
+
         if (showDebridKeys) {
             BackHandler(onBack = closeDebridKeys)
             DebridKeysScreen(
@@ -705,6 +803,15 @@ fun VortXApp(
             // transfer is one shot, driven by the file picker.
             BackHandler { showLibraryTransfer = false }
             LibraryTransferScreen(repo = repo, onBack = { showLibraryTransfer = false })
+            return@VortXTheme
+        }
+
+        if (showBackup) {
+            // Settings > Backup: export/import this device's syncable settings (profiles included) to a file
+            // (TV-5). Self-contained like the other settings overlays: it reads/writes the shared
+            // `vortx_settings` SharedPreferences directly via SettingsBackup, and never touches account sync.
+            BackHandler { showBackup = false }
+            BackupRestoreScreen(onBack = { showBackup = false })
             return@VortXTheme
         }
 
@@ -786,11 +893,25 @@ fun VortXApp(
             },
         ) { padding ->
             val content = Modifier.padding(padding)
+            // SD-8: Search and Discover unlock on EITHER a Stremio or a VortX sign-in, mirroring Apple's
+            // `account.isSignedIn || vortxSync.isSignedIn` gate. Signed out, both show a sign-in prompt.
+            val accountSignedIn = authState is AuthState.SignedIn ||
+                vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn
             when (tab) {
                 Tab.HOME -> HomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, content)
-                Tab.DISCOVER -> DiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, content)
+                Tab.DISCOVER -> DiscoverScreen(
+                    viewModel<DiscoverViewModel>(factory = factory),
+                    onItem,
+                    content,
+                    signedIn = accountSignedIn,
+                )
                 Tab.LIBRARY -> LibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem, content)
-                Tab.SEARCH -> SearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, content)
+                Tab.SEARCH -> SearchScreen(
+                    viewModel<SearchViewModel>(factory = factory),
+                    onItem,
+                    content,
+                    signedIn = accountSignedIn,
+                )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
                     // The VortX account row: live signed-in summary straight off the sync manager's
@@ -825,11 +946,14 @@ fun VortXApp(
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
+                    onMetadataKeysClick = { showMetadataKeys = true },
+                    onHomeDiscoverClick = { showHomeDiscover = true },
                     onDebridKeysScreenClick = {
                         restoreDebridServicesFocus = false
                         showDebridKeys = true
                     },
                     onLibraryClick = { showLibraryTransfer = true },
+                    onBackupClick = { showBackup = true },
                     onWhatsNewClick = { showWhatsNew = true },
                     settingsScrollState = settingsScrollState,
                     debridServicesFocusRequester = debridServicesFocusRequester,

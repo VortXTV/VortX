@@ -27,6 +27,36 @@ val externalSyncProps = Properties().apply {
 fun externalSyncSecret(name: String): String =
     (externalSyncProps.getProperty(name) ?: System.getenv(name) ?: "").trim()
 
+// Release signing (W0-2). The upload keystore and its passwords NEVER live in this repo (the tree is
+// public). They resolve, in order, from a GITIGNORED keystore.properties on a dev box, then from an
+// environment variable of the same name in CI -- mirroring the externalSyncSecret() model above. The
+// four inputs are:
+//   VORTX_KEYSTORE_FILE     -- path to the keystore (.jks/.keystore); relative paths resolve against
+//                              the android/ project root, absolute paths (what CI passes) are used as-is.
+//   VORTX_KEYSTORE_PASSWORD -- store password.
+//   VORTX_KEY_ALIAS         -- key alias inside the keystore.
+//   VORTX_KEY_PASSWORD      -- key password (falls back to the store password when a single password
+//                              was used at generation time, the keytool default).
+// When any input is missing the release build stays UNSIGNED so a fresh/public clone and the existing
+// debug CI still build unchanged (fail-soft, exactly like the dormant-by-default externalSync* keys).
+// The real keystore is generated + backed up out of git; see android/RELEASE-SIGNING.md.
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+fun signingSecret(name: String): String? =
+    (keystoreProps.getProperty(name) ?: System.getenv(name))?.trim()?.takeIf { it.isNotEmpty() }
+
+val releaseStoreFile: File? = signingSecret("VORTX_KEYSTORE_FILE")?.let { rootProject.file(it) }
+val releaseStorePassword: String? = signingSecret("VORTX_KEYSTORE_PASSWORD")
+val releaseKeyAlias: String? = signingSecret("VORTX_KEY_ALIAS")
+val releaseKeyPassword: String? = signingSecret("VORTX_KEY_PASSWORD") ?: releaseStorePassword
+val releaseSigningReady: Boolean =
+    releaseStoreFile?.isFile == true &&
+        !releaseStorePassword.isNullOrEmpty() &&
+        !releaseKeyAlias.isNullOrEmpty() &&
+        !releaseKeyPassword.isNullOrEmpty()
+
 android {
     namespace = "com.vortx.android"
     // compileSdk 36 (Android 16) requires AGP >= 8.10.0 (root build.gradle.kts / the version catalog
@@ -60,9 +90,32 @@ android {
         }
     }
 
+    // Release signing config (W0-2). Registered ONLY when all four inputs resolved above (releaseSigningReady);
+    // otherwise no "release" config exists and the release build stays unsigned (fail-soft). One identity for
+    // every release build gives a reproducible signing cert across consecutive builds.
+    signingConfigs {
+        if (releaseSigningReady) {
+            create("release") {
+                storeFile = releaseStoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                // Sign with both the APK Signature Scheme v2 (whole-file, Android 7+) and the legacy v1
+                // JAR scheme so any tooling that still checks v1 verifies too. minSdk 26 is well above
+                // v2's floor, but keeping v1 on costs nothing and avoids a verifier edge case.
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Null-safe: findByName returns null when the keystore was not provisioned, which leaves the
+            // release variant unsigned instead of failing the build. Debug is untouched (it keeps AGP's
+            // auto-generated debug keystore).
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 
@@ -202,6 +255,12 @@ dependencies {
     // via StremioXViewModelFactory) -- this dependency only supplies the 10-foot presentation layer, never
     // a parallel data path.
     implementation(libs.tv.material)
+
+    // androidx.tvprovider (TV-2): TvContractCompat + WatchNextProgram, the bridge that publishes profile-aware
+    // Continue Watching onto the Android TV home "Play Next" row (the Top Shelf equivalent). No GPL native
+    // code, so both flavors carry it; on a non-TV device the system TvProvider is simply absent and the
+    // publisher fail-softs (every ContentResolver call is guarded).
+    implementation(libs.tv.provider)
 
     // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
     // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME

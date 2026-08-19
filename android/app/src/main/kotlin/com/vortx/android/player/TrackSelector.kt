@@ -36,8 +36,13 @@ object TrackSelector {
         audio: List<PlayerTrack>,
         subtitles: List<PlayerTrack>,
         preferences: TrackPreferences,
+        matchAudioSub: Boolean = false,
     ): Selection {
-        val chainPick = firstMatch(audio, preferences.audioLanguages, preferences.rejectTerms)
+        // "Match audio to subtitle languages" (Apple `matchAudioSub`): the audio pick follows the SUBTITLE
+        // language chain, so a viewer who set a subtitle language also gets audio in that language. Default
+        // OFF keeps the independent audio chain and every existing call site unchanged.
+        val audioChain = if (matchAudioSub) preferences.subtitleLanguages else preferences.audioLanguages
+        val chainPick = firstMatch(audio, audioChain, preferences.rejectTerms)
         val audioPick = chainPick ?: firstMatch(audio, listOf("en"), preferences.rejectTerms)
         val subtitle = selectSubtitle(subtitles, preferences, gotPreferredAudio = chainPick != null)
         return Selection(audioPick?.id, subtitle)

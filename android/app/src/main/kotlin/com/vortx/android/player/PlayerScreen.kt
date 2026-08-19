@@ -59,6 +59,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import com.vortx.android.VortXApplication
 import com.vortx.android.integrations.ScrobbleService
+import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
@@ -125,10 +126,23 @@ fun PlayerScreen(
     /// Empty lists keep both controls hidden for trailers, downloads, and ad-hoc links.
     sourceOptions: List<StreamSource> = emptyList(),
     qualityOptions: List<Pair<String, StreamSource>> = emptyList(),
+    /// Current-season episodes for the in-player EPISODES picker (series only). Empty keeps the control
+    /// hidden. Picking one switches in place via [onSwitchEpisode].
+    episodeOptions: List<Episode> = emptyList(),
     currentSource: StreamSource? = null,
     /// Resolve a replacement without tearing down the healthy engine. Resolution is side-effect-free; the
     /// returned commit seam runs only after this host accepts the exact session/request authority.
     onSwitchSource: (suspend (source: StreamSource) -> Result<PlayerSourceSwitchResolution>)? = null,
+    /// Resolve the chosen episode's best source without tearing down the healthy engine, exactly like
+    /// [onSwitchSource]. Null keeps the episode picker inert (no resolver wired).
+    onSwitchEpisode: (suspend (episodeId: String) -> Result<PlayerSourceSwitchResolution>)? = null,
+    /// Fired when an episode switch is ACCEPTED, so the host can advance its own history identity (a new
+    /// engine playback session for the new episode) even when the replacement Playable is value-equal.
+    onEpisodeSwitched: (Playable, acceptedRevision: Long) -> Unit = { _, _ -> },
+    /// Fired periodically while playback rolls with the live (positionMs, durationMs), so the host can drive
+    /// its next-episode PRELOAD policy (warm the next episode's source before the current one ends). Default
+    /// no-op keeps the screen usable in isolation; the phone shell wires it to [NextEpisodePreloadPolicy].
+    onWarmNext: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -142,6 +156,9 @@ fun PlayerScreen(
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
     val currentOnSwitchSource by rememberUpdatedState(onSwitchSource)
+    val currentOnSwitchEpisode by rememberUpdatedState(onSwitchEpisode)
+    val currentOnEpisodeSwitched by rememberUpdatedState(onEpisodeSwitched)
+    val currentOnWarmNext by rememberUpdatedState(onWarmNext)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
     DisposableEffect(sourceSwitchCoordinator, outerPlaybackSessionId) {
@@ -177,6 +194,13 @@ fun PlayerScreen(
     var subtitleStyle by remember(playbackSessionKey) { mutableStateOf(SubtitleStyle.current(context)) }
     var audioDelaySeconds by remember(playbackSessionKey) { mutableStateOf(0.0) }
     var audioOutputMode by remember(playbackSessionKey) { mutableStateOf(AudioOutputMode.current(context)) }
+    // Hardware/software decode (mpv-only). Defaults to hardware (mediacodec, the DV/HDR passthrough path);
+    // Software is the escape hatch for green / garbled frames. Host-tracked so the checkmark stays reactive.
+    var hardwareDecoding by remember(playbackSessionKey) { mutableStateOf(true) }
+    // Sleep timer: a timed auto-pause (minutes) or a stop at the end of the current episode. Both reset on a
+    // new stream (keyed on the playback session). See the timer effect and the end-of-stream gate below.
+    var sleepMinutes by remember(playbackSessionKey) { mutableStateOf<Int?>(null) }
+    var sleepAtEpisodeEnd by remember(playbackSessionKey) { mutableStateOf(false) }
 
     // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
     // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
@@ -213,6 +237,17 @@ fun PlayerScreen(
     // switched stream starts fresh.
     var forceExoPlayer by remember(playbackSessionKey) { mutableStateOf(false) }
 
+    // IN-PLAYER ENGINE SWITCH (mpv <-> ExoPlayer). The viewer's tri-state preference (auto / mpv /
+    // ExoPlayer), initialized from the host's [engineOverride] and re-picked from the Player Engine sheet.
+    // Changing it rekeys the engine build below so the engine rebuilds on the chosen player. Distinct from
+    // [forceExoPlayer], which is the involuntary surface-fail demotion.
+    var enginePreference by remember(playbackSessionKey) { mutableStateOf(engineOverride) }
+    // Position (ms) to resume at on the NEXT rebuild caused by a USER engine switch, so the swap continues
+    // where the film is rather than restarting at the source's resume point (that is the surface-fail
+    // path's behavior, which is left unchanged). -1 = no user switch pending. A plain array, not Compose
+    // state, so writing it never itself triggers recomposition; the paired [enginePreference] flip does.
+    val engineSwitchResumeMs = remember(playbackSessionKey) { longArrayOf(-1L) }
+
     // ENGINE, built OFF the composition thread. The old `remember { ... .also { it.load() } }` ran the
     // whole build synchronously in composition: for the libmpv route that is System.loadLibrary +
     // native context create + mpv_initialize + the full option apply on the MAIN thread -- jank (and an
@@ -228,11 +263,17 @@ fun PlayerScreen(
     // suspension point between create and set), and every release path -- the keyed dispose below, the
     // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
     // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
-    val engineHolder = remember(playbackSessionKey, forceExoPlayer) { AtomicReference<PlayerEngine?>(null) }
-    var builtEngine by remember(playbackSessionKey, forceExoPlayer) { mutableStateOf<PlayerEngine?>(null) }
-    LaunchedEffect(playbackSessionKey, forceExoPlayer) {
+    val engineHolder = remember(playbackSessionKey, forceExoPlayer, enginePreference) { AtomicReference<PlayerEngine?>(null) }
+    var builtEngine by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf<PlayerEngine?>(null) }
+    LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
+        // A user engine switch resumes at the live position; every other rebuild loads the source at its
+        // own resume point. Consume the pending resume once so a later surface-fail rebuild is unaffected.
+        val resumeAt = engineSwitchResumeMs[0]
+        engineSwitchResumeMs[0] = -1L
+        val playableForEngine =
+            if (resumeAt >= 0L) currentPlayable.copy(startPositionMs = resumeAt) else currentPlayable
         val wantsMpv = !forceExoPlayer &&
-            PlayerEngineRouter.choose(currentPlayable, engineOverride) == PlayerEngineRouter.Engine.MPV
+            PlayerEngineRouter.choose(currentPlayable, enginePreference) == PlayerEngineRouter.Engine.MPV
         val engine: PlayerEngine = if (wantsMpv) {
             // NonCancellable: a half-initialized native mpv context must never be abandoned mid-build
             // (cancellation would leak it un-releasable); the block always completes, and the isActive
@@ -240,17 +281,17 @@ fun PlayerScreen(
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
                     engineHolder.set(it)
-                    it.load(currentPlayable)
+                    it.load(playableForEngine)
                 }
             } ?: ExoPlayerEngine(context).also {
                 // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
                 engineHolder.set(it)
-                it.load(currentPlayable)
+                it.load(playableForEngine)
             }
         } else {
             ExoPlayerEngine(context).also {
                 engineHolder.set(it)
-                it.load(currentPlayable)
+                it.load(playableForEngine)
             }
         }
         if (!isActive) {
@@ -261,7 +302,7 @@ fun PlayerScreen(
         }
         builtEngine = engine
     }
-    DisposableEffect(playbackSessionKey, forceExoPlayer) {
+    DisposableEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         onDispose { engineHolder.getAndSet(null)?.release() }
     }
 
@@ -356,6 +397,26 @@ fun PlayerScreen(
             publishState = { sourceSwitchState = it },
         )
     }
+    // In-player EPISODE switch resolver: same coordinator/authority machinery as the source switch, but
+    // the accepted episode starts from the top and notifies the host so it opens a fresh history session.
+    val pendingEpisodeSwitch = sourceSwitchState.pendingEpisodeSwitch
+    LaunchedEffect(pendingEpisodeSwitch?.authority) {
+        val pending = pendingEpisodeSwitch ?: return@LaunchedEffect
+        val resolver = currentOnSwitchEpisode
+        resolveAndApplyPlayerEpisodeSwitch(
+            coordinator = sourceSwitchCoordinator,
+            pending = pending,
+            resolver = { episode -> resolver?.invoke(episode.id) ?: Result.failure(IllegalStateException()) },
+            currentState = { sourceSwitchState },
+            publishState = { accepted ->
+                val previous = sourceSwitchState
+                sourceSwitchState = accepted
+                acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->
+                    currentOnEpisodeSwitched(replacement.playable, replacement.revision)
+                }
+            },
+        )
+    }
     var chapters by remember(engine) { mutableStateOf<List<PlayerChapter>>(emptyList()) }
     LaunchedEffect(engine, playerState.durationMs > 0L) {
         if (playerState.durationMs <= 0L || chapters.isNotEmpty()) return@LaunchedEffect
@@ -381,6 +442,21 @@ fun PlayerScreen(
         if (engine.audioOutputModeAvailable) {
             engine.setAudioOutputMode(audioOutputMode)
         }
+        // Carry a chosen software-decode escape hatch across a fail-soft demotion / engine switch; the new
+        // engine advertises whether it supports the toggle, so a rebuild to ExoPlayer is a safe no-op.
+        if (engine.hardwareDecodingAvailable && !hardwareDecoding) {
+            engine.setHardwareDecoding(false)
+        }
+    }
+
+    // SLEEP TIMER (timed leg). When armed for a number of minutes, pause playback once after that time (only
+    // if it is still rolling) then disarm. The End-of-episode leg is handled at the end-of-stream gate
+    // below, not here. Keyed on the session so a new stream clears any running countdown.
+    LaunchedEffect(sleepMinutes, playbackSessionKey) {
+        val minutes = sleepMinutes ?: return@LaunchedEffect
+        delay(minutes * 60_000L)
+        if (!latestState.isPaused) engine.pause()
+        sleepMinutes = null
     }
 
     // STALL / START WATCHDOG (engine-agnostic). Neither engine has a timeout of its own for a source
@@ -566,13 +642,18 @@ fun PlayerScreen(
     val trackPreferences = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
     }
+    // Read once per load alongside the preferences: when ON, the auto audio pick follows the subtitle chain
+    // (Apple `matchAudioSub`). Separate from [trackPreferences] because it is not part of the value struct.
+    val matchAudioSub = remember(playbackSessionKey) {
+        TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
+    }
     var autoSelectDone by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(playbackSessionKey, playerState.audioTracks, playerState.subtitleTracks) {
         if (autoSelectDone) return@LaunchedEffect
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
         if (audioTracks.isEmpty() && subtitleTracks.isEmpty()) return@LaunchedEffect
-        val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences)
+        val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences, matchAudioSub)
         pick.audioId?.let { engine.selectAudioTrack(it) }
         val subId = pick.subtitleId
         if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
@@ -704,6 +785,13 @@ fun PlayerScreen(
             runtimeMismatch = true
             return@LaunchedEffect
         }
+        // Sleep timer set to "End of episode": this one finished, so STOP here (leave the player) rather
+        // than auto-advancing to the next episode. Mirrors the Apple sleepAtEpisodeEnd branch.
+        if (sleepAtEpisodeEnd) {
+            sleepAtEpisodeEnd = false
+            currentOnBack()
+            return@LaunchedEffect
+        }
         currentOnEnded()
     }
 
@@ -730,6 +818,9 @@ fun PlayerScreen(
             val s = latestState
             if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
                 currentOnProgress(s.positionMs, s.durationMs)
+                // PLR-8: drive the host's next-episode preload with the live position/duration. The host
+                // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
+                currentOnWarmNext(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1026,13 +1117,14 @@ fun PlayerScreen(
                 speed = newSpeed
                 engine.setPlaybackSpeed(newSpeed)
             },
-            onToggleScaleMode = {
+            onSelectScaleMode = { mode ->
                 showControls()
-                scaleMode = if (scaleMode == VideoScaleMode.FIT) VideoScaleMode.ZOOM else VideoScaleMode.FIT
+                scaleMode = mode
             },
             onErrorRetry = currentOnError,
             sourceOptions = if (currentOnSwitchSource != null) sourceOptions else emptyList(),
             qualityOptions = if (currentOnSwitchSource != null) qualityOptions else emptyList(),
+            episodeOptions = if (currentOnSwitchEpisode != null) episodeOptions else emptyList(),
             currentSource = sourceSwitchState.currentSource,
             sourceSwitching = sourceSwitchState.isSwitching,
             sourceSwitchError = sourceSwitchState.errorMessage,
@@ -1047,6 +1139,25 @@ fun PlayerScreen(
                         sourceSwitchState = beginPlayerSourceSwitch(
                             state = sourceSwitchState,
                             source = source,
+                            authority = authority,
+                        )
+                    }
+                }
+            },
+            onSwitchEpisode = { episode ->
+                val resolver = currentOnSwitchEpisode
+                val currentRef = sourceSwitchState.playable.mediaRef
+                if (
+                    resolver != null &&
+                    !sourceSwitchState.isSwitching &&
+                    !(currentRef?.isSeries == true &&
+                        currentRef.season == episode.season &&
+                        currentRef.episode == episode.episode)
+                ) {
+                    sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+                        sourceSwitchState = beginPlayerEpisodeSwitch(
+                            state = sourceSwitchState,
+                            episode = episode,
                             authority = authority,
                         )
                     }
@@ -1074,6 +1185,46 @@ fun PlayerScreen(
                     pendingSubSelectAbove = latestState.subtitleTracks.size
                     engine.addExternalSubtitle(sub.url)
                 }
+            },
+            // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
+            // recomposition so the checkmarks reflect the current secondary-sid / sid after a pick.
+            secondarySubtitleAvailable = engine.secondarySubtitleAvailable,
+            primarySubtitleId = engine.primarySubtitleId,
+            secondarySubtitleId = engine.secondarySubtitleId,
+            onSelectSecondarySubtitle = { id ->
+                showControls()
+                engine.setSecondarySubtitleTrack(id)
+            },
+            // Sleep timer. End-of-episode is offered only for a series episode (it stops the auto-advance).
+            sleepSelectionMinutes = sleepMinutes,
+            sleepAtEpisodeEnd = sleepAtEpisodeEnd,
+            sleepEndOfEpisodeAvailable = currentPlayable.mediaRef?.isSeries == true,
+            onSetSleepTimer = { minutes, atEnd ->
+                showControls()
+                sleepMinutes = minutes
+                sleepAtEpisodeEnd = atEnd
+            },
+            // In-player engine switch. Hidden for torrents / trailers where the switch is not valid; the
+            // live engine name shows which player is active, and picking a preference rebuilds at position.
+            engineSwitchAvailable = !currentPlayable.isTorrent && !currentPlayable.isTrailer,
+            enginePreference = enginePreference,
+            liveEngineLabel = if (engine is ExoPlayerEngine) "Dolby Vision Player" else "VortX Player",
+            onSelectEnginePreference = { pref ->
+                showControls()
+                if (pref != enginePreference) {
+                    engineSwitchResumeMs[0] = latestState.positionMs.coerceAtLeast(0L)
+                    enginePreference = pref
+                }
+            },
+            // Playback Info: read the live engine stats on each call so the overlay refreshes while open.
+            playbackInfo = { engine.playbackStats() },
+            // Hardware/software decode (mpv-only). Host-tracked so the checkmark is reactive.
+            hardwareDecodingAvailable = engine.hardwareDecodingAvailable,
+            hardwareDecoding = hardwareDecoding,
+            onSetHardwareDecoding = { hw ->
+                showControls()
+                hardwareDecoding = hw
+                engine.setHardwareDecoding(hw)
             },
             // SERVE: the community scrub preview. Synchronous by contract -- the chrome calls this for
             // every drag frame, so it only ever crops an already-downloaded sprite in memory. Returns null

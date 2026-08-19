@@ -5,6 +5,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -37,6 +38,8 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,7 +47,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -54,6 +59,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.VortXApplication
+import com.vortx.android.catalog.SimilarClient
+import com.vortx.android.catalog.WatchProvider
+import com.vortx.android.catalog.WatchProvidersClient
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.WatchlistStore
@@ -71,12 +79,15 @@ import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
+import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.DefaultEpisodeThumb
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.EpisodeRow
+import com.vortx.android.ui.components.PosterArt
+import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SourceRow
 import com.vortx.android.ui.components.SurfaceCard
@@ -92,6 +103,7 @@ import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
+import kotlinx.coroutines.launch
 
 internal data class ResolvedDetailPlayback(
     val playable: Playable,
@@ -134,6 +146,8 @@ fun DetailScreen(
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
     val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     // The download status line is a transient confirmation, not a persistent state: show it for a beat then
     // clear it (the live queue/progress lives on the Downloads screen). Keyed on the notice text so each new
@@ -232,6 +246,31 @@ fun DetailScreen(
         }
     }
 
+    // DET-3 "More Like This" + DET-6 "Where to Watch": two view-local rails enriched off the keyless
+    // catalogs edge, keyed off the meta's imdb id, exactly like the cast + ratings fetches above (held
+    // here, not in DetailViewModel, so the media-servers wave's ViewModel is untouched). Fail-soft: an
+    // empty list leaves the rail omitted below; a non-tt id / live type / down edge never blanks a band.
+    var similarItems by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
+    var watchProviders by remember { mutableStateOf<List<WatchProvider>>(emptyList()) }
+    LaunchedEffect(castImdbId, castType) {
+        similarItems = emptyList()
+        watchProviders = emptyList()
+        if (castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
+            similarItems = SimilarClient.similar(castImdbId, castType)
+            watchProviders = WatchProvidersClient.providers(castImdbId, castType)
+        }
+    }
+
+    // Resolve a related-title card's `tmdb:` id to a `tt` id before opening it in the nested detail
+    // overlay (the same fail-soft resolve the Person filmography grid uses); a lookup miss opens the
+    // unresolved id so the page still appears, just sparser.
+    val openSimilar: (MetaItem) -> Unit = { item ->
+        scope.launch {
+            val tt = TMDBPersonClient.imdbId(item.id, item.type)
+            titleTarget = if (tt != null) item.copy(id = tt) else item
+        }
+    }
+
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
     LaunchedEffect(playback, metaState) {
@@ -260,6 +299,8 @@ fun DetailScreen(
                         resolving = resolving,
                         sourcesOpen = sourcesOpen,
                         onWatch = { viewModel.playBest() },
+                        playFromStartEnabled = viewModel.resumeAvailable() && !resolving,
+                        onPlayFromStart = { viewModel.playBest(fromStart = true) },
                         onToggleSources = { sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
                         watchlisted = watchlisted,
@@ -267,7 +308,23 @@ fun DetailScreen(
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
                         onTrailer = { viewModel.playTrailer() },
+                        onShare = { launchDetailShare(context, m.data.id, m.data.name) },
                     )
+                }
+                // DET-8: the one-line rationale for the auto-picked source (#16), shown once under the hero
+                // actions when the ranker chose the best stream for a decisive reason (instant-from-cache,
+                // preferred source type, or a Smart-Source prefer chip) the per-row tags don't convey.
+                val pickReason = (streamsState as? UiState.Success)
+                    ?.let { viewModel.bestSource() }
+                    ?.let { StreamRanking.pickReason(it) }
+                if (pickReason != null) {
+                    item {
+                        Text(
+                            text = "Picked for $pickReason",
+                            style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+                            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                        )
+                    }
                 }
                 // VortX cross-provider critic scores under the hero actions (only when the ratings service
                 // returned at least one), the additive detail ratings strip -- IMDb already shows in the
@@ -308,6 +365,11 @@ fun DetailScreen(
                             modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
                         )
                     }
+                }
+                // DET-6 Where to Watch: legal region providers from TMDB (keyless edge). Hidden for live
+                // content (no providers) and whenever the list is empty, so it never leaves a blank band.
+                if (watchProviders.isNotEmpty() && !isLiveType(m.data.type)) {
+                    item { WhereToWatchRail(providers = watchProviders) }
                 }
                 if (m.data.cast.isNotEmpty() || castMembers.isNotEmpty() ||
                     m.data.directors.isNotEmpty() || m.data.writers.isNotEmpty()
@@ -363,6 +425,17 @@ fun DetailScreen(
                                         Modifier
                                     },
                                 ),
+                        )
+                    }
+                }
+                // DET-3 More Like This: TMDB recommendations (keyless edge) as poster tiles that open the
+                // nested detail overlay. Hidden for live content and whenever the list is empty.
+                if (similarItems.isNotEmpty() && !isLiveType(m.data.type)) {
+                    item {
+                        SimilarRail(
+                            type = m.data.type,
+                            titles = similarItems,
+                            onOpen = openSimilar,
                         )
                     }
                 }
@@ -626,6 +699,8 @@ private fun ActionsCluster(
     resolving: Boolean,
     sourcesOpen: Boolean,
     onWatch: () -> Unit,
+    playFromStartEnabled: Boolean,
+    onPlayFromStart: () -> Unit,
     onToggleSources: () -> Unit,
     onToggleLibrary: () -> Unit,
     watchlisted: Boolean,
@@ -633,6 +708,7 @@ private fun ActionsCluster(
     onToggleWatched: () -> Unit,
     hasTrailer: Boolean,
     onTrailer: () -> Unit,
+    onShare: () -> Unit,
 ) {
     val watchLabel = when {
         resolving -> "Starting…"
@@ -685,6 +761,20 @@ private fun ActionsCluster(
                     onClick = onToggleSources,
                 )
             }
+            // DET-14: a secondary "Play from start" beside the primary Resume, shown only when a saved
+            // resume position exists. Plays the SAME best stream from 0:00 without clearing the stored
+            // resume point (the primary Resume still seeks there). Hidden for a fresh title and while a
+            // resolve is in flight, so it can never be a dead press.
+            if (playFromStartEnabled) {
+                item {
+                    Chip(
+                        label = "Play from start",
+                        selected = false,
+                        leadingIcon = VortXIcons.playFill,
+                        onClick = onPlayFromStart,
+                    )
+                }
+            }
             // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a miss).
             // Shown only when the meta carries a YouTube trailer id. Plays through the shared player pipeline.
             if (hasTrailer) {
@@ -709,9 +799,23 @@ private fun ActionsCluster(
                     )
                 }
             }
+            // DET-10: share the title's IMDb page (or its name when there is no imdb id) via the platform
+            // share sheet; fail-soft when no activity can handle the intent (Detail stays usable).
+            item {
+                Chip(
+                    label = "Share",
+                    selected = false,
+                    leadingIcon = VortXIcons.share,
+                    onClick = onShare,
+                )
+            }
         }
     }
 }
+
+/// Live content (a channel / TV type) has no TMDB recommendations or watch providers, so the DET-3
+/// More Like This and DET-6 Where to Watch rails are gated off it, mirroring Apple's `LiveTypes` guard.
+private fun isLiveType(type: MediaType): Boolean = type == MediaType.CHANNEL || type == MediaType.TV
 
 /// Cast & Crew (DESIGN-SYSTEM.md §4 Detail "credits"), ported from the Apple detail views' cast rail:
 /// when TMDB credits resolved ([castMembers] non-empty), the cast shows as a horizontal rail of
@@ -724,22 +828,41 @@ private fun CreditsSection(
     castMembers: List<CastMember>,
     onPersonTap: (PersonSeed) -> Unit,
 ) {
+    // DET-13: a chevron disclosure on the Cast & Crew header, defaulting to expanded (Apple's default),
+    // remembered per title so re-opening the same title keeps its fold state within the session.
+    var expanded by remember(m.id) { mutableStateOf(DETAIL_CREDITS_DEFAULT_EXPANDED) }
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
-        Text(
-            text = "Cast & Crew",
-            style = VortXTheme.type.sectionTitle,
-            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
-        )
-        // TMDB rail (tappable headshots) when it resolved, else the meta's plain-name cast list.
-        if (castMembers.isNotEmpty()) {
-            CastRail(members = castMembers, onPersonTap = onPersonTap)
-        } else {
-            m.cast.takeIf { it.isNotEmpty() }?.let { CreditLine("Cast", it) }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = toggledDetailCredits(expanded) }
+                .padding(horizontal = VortXTheme.spacing.edge),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(text = "Cast & Crew", style = VortXTheme.type.sectionTitle)
+            Icon(
+                imageVector = if (expanded) VortXIcons.chevronUp else VortXIcons.chevronDown,
+                contentDescription = if (expanded) "Collapse cast and crew" else "Expand cast and crew",
+                tint = VortXTheme.colors.textTertiary,
+            )
         }
-        m.directors.takeIf { it.isNotEmpty() }?.let { CreditLine("Director", it) }
-        m.writers.takeIf { it.isNotEmpty() }?.let { CreditLine("Writer", it) }
+        if (expanded) {
+            // TMDB rail (tappable headshots) when it resolved, else the meta's plain-name cast list.
+            if (castMembers.isNotEmpty()) {
+                CastRail(members = castMembers, onPersonTap = onPersonTap)
+            } else {
+                m.cast.takeIf { it.isNotEmpty() }?.let { CreditLine("Cast", it) }
+            }
+            m.directors.takeIf { it.isNotEmpty() }?.let { CreditLine("Director", it) }
+            m.writers.takeIf { it.isNotEmpty() }?.let { CreditLine("Writer", it) }
+        }
     }
 }
+
+internal const val DETAIL_CREDITS_DEFAULT_EXPANDED = true
+
+internal fun toggledDetailCredits(expanded: Boolean): Boolean = !expanded
 
 /// The horizontal full-cast rail: one [CastTile] per member, scrolling edge-to-edge (its own leading/
 /// trailing inset rather than a padded parent) so tiles slide under the screen edge like the hub rails.
@@ -830,6 +953,99 @@ private fun CreditLine(role: String, names: List<String>) {
         modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
     )
 }
+
+/// DET-3 "More Like This": a horizontal rail of related-title poster tiles (TMDB recommendations off the
+/// keyless edge), each opening the nested detail overlay via [onOpen]. Mirrors the Apple detail view's
+/// `moreLikeThisSection`; the caller already dropped an empty list, so this always has tiles to show.
+@Composable
+private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaItem) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+        Column(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
+            Text(
+                text = (if (type == MediaType.SERIES) "Similar Series" else "Similar Movies").uppercase(),
+                style = VortXTheme.type.eyebrow,
+            )
+            Text(text = "More Like This", style = VortXTheme.type.sectionTitle)
+        }
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+        ) {
+            // No item key: TMDB ids are effectively unique here, but keying by a possibly-repeated id
+            // risks the duplicate-key crash the grid screens guard against, and this list is static.
+            items(titles) { item ->
+                PosterCard(
+                    title = item.name,
+                    subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ").ifBlank { null },
+                    onClick = { onOpen(item) },
+                    modifier = Modifier.width(120.dp),
+                    art = { PosterArt(item.poster, item.name) },
+                )
+            }
+        }
+    }
+}
+
+/// DET-6 "Where to Watch": a horizontal rail of legal region streaming providers (TMDB watch/providers
+/// off the keyless edge). Each dark brand mark sits on a warm near-white plate so it stays legible on
+/// the app's dark chrome, mirroring the Apple `whereToWatchSection` plate treatment. The caller already
+/// dropped an empty list, so this always has providers to show.
+@Composable
+private fun WhereToWatchRail(providers: List<WatchProvider>) {
+    Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+        Text(
+            text = "Where to Watch",
+            style = VortXTheme.type.sectionTitle,
+            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+        )
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+            contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+        ) {
+            items(providers) { provider ->
+                Column(
+                    modifier = Modifier.width(64.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(VortXShapes.control)
+                            .background(WATCH_PROVIDER_PLATE),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (!provider.logoUrl.isNullOrBlank()) {
+                            AsyncImage(
+                                model = provider.logoUrl,
+                                contentDescription = provider.name,
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize().padding(6.dp),
+                            )
+                        } else {
+                            Text(
+                                text = castInitials(provider.name),
+                                style = VortXTheme.type.label.copy(color = Color(0xFF1A1712)),
+                            )
+                        }
+                    }
+                    Text(
+                        text = provider.name,
+                        style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+                        textAlign = TextAlign.Center,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// The warm near-white plate behind a Where-to-Watch provider mark: TMDB provider logos are dark /
+/// brand-hued app icons that read as "very dark" on the app's dark chrome, so each sits on a light plate
+/// to stay legible and whole, the Android analogue of Apple's `BundledLogo.plateFill`.
+private val WATCH_PROVIDER_PLATE = Color(0xFFF3F0EA)
 
 /// Season chips (DESIGN-SYSTEM.md §4 "season selector"): always rendered even for a single season, the
 /// only home of the bulk mark-watched menu (long-press a chip, or the trailing "…" chip), mirroring
@@ -981,6 +1197,18 @@ private fun SourcesSection(
     // The row whose long-press opened the pin menu (null = closed). Keyed by the stream id so the menu
     // anchors to its own row and a recompose from a pin write closes it cleanly.
     var pinMenuFor by remember { mutableStateOf<String?>(null) }
+    // DET-2 grouped/collapsible source list state: the per-add-on filter ("All" = null), the remembered
+    // collapsed add-on set, the render window (grown by "Show more"), and the two-level Quality menu.
+    var sourceFilter by remember { mutableStateOf<String?>(null) }
+    var collapsed by remember { mutableStateOf(emptySet<String>()) }
+    var renderLimit by remember { mutableStateOf(SOURCE_WINDOW_INITIAL) }
+    var qualityOpen by remember { mutableStateOf(false) }
+    var qualityTier by remember { mutableStateOf<String?>(null) }
+    val clipboard = LocalClipboardManager.current
+    // Compact source rows (SET-10, Apple `vortx.streams.compactLabels`). Read live off SharedPreferences so
+    // returning from the Sources settings screen recomposes this and reflects the new density immediately;
+    // NOT remembered, deliberately, exactly like the Settings summary rows do (OtherScreens.kt).
+    val compactRows = SourcePreferencesStore(LocalContext.current.applicationContext).compactStreamLabels
     Column(
         modifier = Modifier.padding(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
@@ -989,15 +1217,100 @@ private fun SourcesSection(
             is UiState.Loading -> Text("Finding sources…", style = VortXTheme.type.sectionTitle)
             is UiState.Error -> Text(state.message, style = VortXTheme.type.body)
             is UiState.Success -> {
-                val total = state.data.sumOf { it.streams.size }
+                val groups = state.data
+                val total = groups.sumOf { it.streams.size }
                 Text(text = "Sources · $total", style = VortXTheme.type.sectionTitle)
                 if (total > 0) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+                    // Per-add-on filter chips ("All (N)" + one per group), only when there is more than one
+                    // add-on to filter between (Apple's `filterBar`, shown for groups.count > 1).
+                    if (groups.size > 1) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                        ) {
+                            Chip(
+                                label = "All ($total)",
+                                selected = sourceFilter == null,
+                                onClick = { sourceFilter = null },
+                            )
+                            groups.forEach { group ->
+                                Chip(
+                                    label = "${group.addon} (${group.streams.size})",
+                                    selected = sourceFilter == group.addon,
+                                    onClick = { sourceFilter = group.addon },
+                                )
+                            }
+                        }
+                    }
+                    // Sort (Best/Size/Seeders) + the two-level Quality menu + Copy all links, on one scrolling row.
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         sourceSortOptions.forEach { (key, label) ->
                             Chip(
                                 label = label,
                                 selected = key == sort,
                                 onClick = { onSortChange(key) },
+                            )
+                        }
+                        // DET-2 two-level Quality menu: resolution tier (4K / 1080p / 720p / Others) then the
+                        // flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A second nested
+                        // DropdownMenu is the Compose idiom for the tvOS two-step quality dialog. Plays the
+                        // chosen variant straight through [onPlay]. Hidden until at least one tier resolves.
+                        val tiers = StreamRanking.tiers(groups)
+                        if (tiers.isNotEmpty()) {
+                            Box {
+                                Chip(
+                                    label = "Quality",
+                                    selected = qualityOpen,
+                                    leadingIcon = VortXIcons.chevronUpDown,
+                                    onClick = { qualityOpen = true; qualityTier = null },
+                                )
+                                DropdownMenu(
+                                    expanded = qualityOpen && qualityTier == null,
+                                    onDismissRequest = { qualityOpen = false },
+                                ) {
+                                    tiers.forEach { tier ->
+                                        DropdownMenuItem(
+                                            text = { Text(tier) },
+                                            onClick = { qualityTier = tier },
+                                        )
+                                    }
+                                }
+                                val activeTier = qualityTier
+                                DropdownMenu(
+                                    expanded = qualityOpen && activeTier != null,
+                                    onDismissRequest = { qualityOpen = false; qualityTier = null },
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("‹ Back") },
+                                        onClick = { qualityTier = null },
+                                    )
+                                    if (activeTier != null) {
+                                        StreamRanking.variantOptions(groups, activeTier).forEach { (label, source) ->
+                                            DropdownMenuItem(
+                                                text = { Text(label) },
+                                                onClick = {
+                                                    qualityOpen = false
+                                                    qualityTier = null
+                                                    onPlay(source)
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Copy every playable (direct / debrid / HLS) link for pasting into a debrid panel or
+                        // another player; shown only when at least one source carries a copyable URL.
+                        val links = copyableSourceLinks(groups)
+                        if (links.isNotEmpty()) {
+                            Chip(
+                                label = "Copy all links",
+                                selected = false,
+                                onClick = { clipboard.setText(AnnotatedString(links.joinToString("\n"))) },
                             )
                         }
                     }
@@ -1013,66 +1326,185 @@ private fun SourcesSection(
                 if (total == 0) {
                     Text("No sources yet -- your add-ons may still be answering.", style = VortXTheme.type.body)
                 }
-                // Groups + streams are already ranked best-first by the assembly; here we derive the quality
-                // label, flavour tags, and size from the source's own tags via the same StreamRanking parse
-                // that scored them, so the picker shows a real "4K · HDR · Remux · 18 GB" line the viewer
-                // can choose from. The sort chips reorder WITHIN each group only (Apple `sortedStreams`).
-                state.data.forEach { group ->
-                    val streams = when (sort) {
-                        "size" -> group.streams.sortedByDescending { StreamRanking.sizeForSort(it) }
-                        "seeders" -> group.streams.sortedByDescending { StreamRanking.seedersForSort(it) }
-                        else -> group.streams
-                    }
-                    streams.forEach { source ->
-                        val pinned = pin.resolved?.let { SourcePinStore.matches(source, group.addon, it) } == true
-                        Box {
-                            SourceRow(
-                                addon = source.addon,
-                                title = source.title,
-                                quality = StreamRanking.qualityLabel(source),
-                                isTorrent = source.isTorrent,
-                                flavorTags = StreamRanking.flavorTags(source),
-                                size = StreamRanking.sizeText(source),
-                                enabled = !resolving,
+                // DET-2 grouped, collapsible, windowed list. One tappable header per add-on (name + count +
+                // chevron, remembered collapsed set) with its rows beneath, filtered by the active chip. The
+                // window caps how many rows are built at once (a popular title returns thousands); "Show more"
+                // grows it. Collapsed groups emit a header only and spend no budget (Apple's `windowedPlan`).
+                // Groups + streams are already ranked best-first by the assembly; sort reorders WITHIN a group.
+                val filtered = groups.filter { sourceFilter == null || it.addon == sourceFilter }
+                var budget = renderLimit
+                var shownRows = 0
+                filtered.forEach { group ->
+                    val isCollapsed = group.addon in collapsed
+                    SourceGroupHeader(
+                        addon = group.addon,
+                        count = group.streams.size,
+                        collapsed = isCollapsed,
+                        onToggle = {
+                            collapsed = if (isCollapsed) collapsed - group.addon else collapsed + group.addon
+                        },
+                    )
+                    if (!isCollapsed && budget > 0) {
+                        val sorted = sortedStreamsInGroup(group.streams, sort)
+                        val take = minOf(sorted.size, budget)
+                        budget -= take
+                        shownRows += take
+                        sorted.take(take).forEach { source ->
+                            val pinned = pin.resolved?.let { SourcePinStore.matches(source, group.addon, it) } == true
+                            StreamRowWithPinMenu(
+                                source = source,
                                 pinned = pinned,
-                                onClick = { onPlay(source) },
-                                onLongClick = { pinMenuFor = source.id },
+                                resolving = resolving,
+                                pin = pin,
+                                entryNoun = entryNoun,
+                                menuOpen = pinMenuFor == source.id,
+                                onOpenMenu = { pinMenuFor = source.id },
+                                onDismissMenu = { pinMenuFor = null },
+                                onPlay = onPlay,
+                                onDownload = onDownload,
+                                onPin = onPin,
+                                onUnpin = onUnpin,
+                                // SET-10: thread the live compact-rows setting through the DET-2 grouped layout.
+                                compact = compactRows,
                             )
-                            DropdownMenu(
-                                expanded = pinMenuFor == source.id,
-                                onDismissRequest = { pinMenuFor = null },
-                            ) {
-                                // The download create-path entry point (DownloadManager.CREATE_PATH_WIRED): save
-                                // this source for offline viewing. First item because it is the reason the menu
-                                // most often gets opened now.
-                                DropdownMenuItem(
-                                    text = { Text("Download for offline") },
-                                    onClick = { pinMenuFor = null; onDownload(source) },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Pin for this $entryNoun") },
-                                    onClick = { pinMenuFor = null; onPin(source, SourcePinScope.ENTRY) },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Pin everywhere") },
-                                    onClick = { pinMenuFor = null; onPin(source, SourcePinScope.GLOBAL) },
-                                )
-                                if (pin.hasEntry) {
-                                    DropdownMenuItem(
-                                        text = { Text("Unpin this $entryNoun") },
-                                        onClick = { pinMenuFor = null; onUnpin(SourcePinScope.ENTRY) },
-                                    )
-                                }
-                                if (pin.hasGlobal) {
-                                    DropdownMenuItem(
-                                        text = { Text("Unpin everywhere") },
-                                        onClick = { pinMenuFor = null; onUnpin(SourcePinScope.GLOBAL) },
-                                    )
-                                }
-                            }
                         }
                     }
                 }
+                // "Show more · N more" when the window hides rows in the currently-expanded, filtered groups.
+                val expandableTotal = filtered.filter { it.addon !in collapsed }.sumOf { it.streams.size }
+                if (shownRows < expandableTotal) {
+                    Chip(
+                        label = "Show more · ${expandableTotal - shownRows} more",
+                        selected = false,
+                        leadingIcon = VortXIcons.chevronDown,
+                        onClick = { renderLimit += SOURCE_WINDOW_STEP },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/// The render window for the DET-2 grouped source list: how many rows are built up front, and the step
+/// "Show more" grows it by. Bounded so a title returning thousands of sources never instantiates them all
+/// at once (the Compose analogue of the tvOS OOM guard behind Apple's LazyVStack window).
+private const val SOURCE_WINDOW_INITIAL = 60
+private const val SOURCE_WINDOW_STEP = 60
+
+/// Streams inside one add-on group, ordered by the chosen sort: Best leaves the engine ranking intact;
+/// Size and Seeders sort descending WITHIN the group (unknown values sink, sizeForSort 0 / seedersForSort
+/// -1), so the grouping survives. Mirrors Apple `sortedStreams`.
+private fun sortedStreamsInGroup(streams: List<StreamSource>, sort: String): List<StreamSource> =
+    when (sort) {
+        "size" -> streams.sortedByDescending { StreamRanking.sizeForSort(it) }
+        "seeders" -> streams.sortedByDescending { StreamRanking.seedersForSort(it) }
+        else -> streams
+    }
+
+/// Every playable direct / debrid / HLS link across the groups, de-duplicated, for "Copy all links".
+/// Torrents with no pre-resolved URL are skipped (they resolve through the debrid path at play time and
+/// have nothing to paste), matching Apple's copy-links behaviour. Empty -> the caller hides the chip.
+private fun copyableSourceLinks(groups: List<StreamGroup>): List<String> =
+    groups.flatMap { it.streams }.mapNotNull { it.url ?: it.externalUrl }.distinct()
+
+/// A tappable per-add-on header (name + source count + chevron) that folds its rows away, the collapsible
+/// section head of the DET-2 grouped list (Apple's `sectionHeader`). Styled as a glass row so the grouping
+/// reads as a deliberate raised card.
+@Composable
+private fun SourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onToggle)
+            .vortxGlass(VortXShapes.chip, fillAlpha = VortXGlass.badgeFillAlpha, shadow = VortXGlass.Shadow.flat)
+            .padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = addon.uppercase(),
+            style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.accent),
+        )
+        Text(
+            text = "$count",
+            style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+        )
+        Spacer(Modifier.weight(1f))
+        Icon(
+            imageVector = if (collapsed) VortXIcons.chevronDown else VortXIcons.chevronUp,
+            contentDescription = if (collapsed) "Expand $addon sources" else "Collapse $addon sources",
+            tint = VortXTheme.colors.textSecondary,
+        )
+    }
+}
+
+/// One source row plus its long-press pin/download menu, extracted from [SourcesSection] so the grouped
+/// windowed loop stays legible. DET-8: the row also lights a prominent cached badge (from the ranker's
+/// [StreamRanking.isCachedSource]) and, for a torrent, a seeders count (from [StreamRanking.seedersForSort]),
+/// display-only over the existing ranker helpers; the plain "Cached" flavour tag is dropped when the
+/// prominent badge shows so a cached row reads as one badge, not two.
+@Composable
+private fun StreamRowWithPinMenu(
+    source: StreamSource,
+    pinned: Boolean,
+    resolving: Boolean,
+    pin: DetailViewModel.PinUi,
+    entryNoun: String,
+    menuOpen: Boolean,
+    onOpenMenu: () -> Unit,
+    onDismissMenu: () -> Unit,
+    onPlay: (StreamSource) -> Unit,
+    onDownload: (StreamSource) -> Unit,
+    onPin: (StreamSource, SourcePinScope) -> Unit,
+    onUnpin: (SourcePinScope) -> Unit,
+    // SET-10: compact source rows (Apple `vortx.streams.compactLabels`). Additive default keeps callers unchanged.
+    compact: Boolean = false,
+) {
+    val cached = StreamRanking.isCachedSource(source)
+    val seeders = StreamRanking.seedersForSort(source).takeIf { source.isTorrent && it >= 0 }
+    val flavorTags = StreamRanking.flavorTags(source).filter { !(it == "Cached" && cached) }
+    Box {
+        SourceRow(
+            addon = source.addon,
+            title = source.title,
+            quality = StreamRanking.qualityLabel(source),
+            isTorrent = source.isTorrent,
+            flavorTags = flavorTags,
+            size = StreamRanking.sizeText(source),
+            enabled = !resolving,
+            pinned = pinned,
+            cached = cached,
+            seeders = seeders,
+            compact = compact,
+            onClick = { onPlay(source) },
+            onLongClick = onOpenMenu,
+        )
+        DropdownMenu(expanded = menuOpen, onDismissRequest = onDismissMenu) {
+            // The download create-path entry point (DownloadManager.CREATE_PATH_WIRED): save this source
+            // for offline viewing. First item because it is the reason the menu most often gets opened now.
+            DropdownMenuItem(
+                text = { Text("Download for offline") },
+                onClick = { onDismissMenu(); onDownload(source) },
+            )
+            DropdownMenuItem(
+                text = { Text("Pin for this $entryNoun") },
+                onClick = { onDismissMenu(); onPin(source, SourcePinScope.ENTRY) },
+            )
+            DropdownMenuItem(
+                text = { Text("Pin everywhere") },
+                onClick = { onDismissMenu(); onPin(source, SourcePinScope.GLOBAL) },
+            )
+            if (pin.hasEntry) {
+                DropdownMenuItem(
+                    text = { Text("Unpin this $entryNoun") },
+                    onClick = { onDismissMenu(); onUnpin(SourcePinScope.ENTRY) },
+                )
+            }
+            if (pin.hasGlobal) {
+                DropdownMenuItem(
+                    text = { Text("Unpin everywhere") },
+                    onClick = { onDismissMenu(); onUnpin(SourcePinScope.GLOBAL) },
+                )
             }
         }
     }

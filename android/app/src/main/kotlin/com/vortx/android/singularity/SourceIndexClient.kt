@@ -68,17 +68,27 @@ object SourceIndexClient {
 
     // MARK: - Public models
 
-    /// Torrent-only v1 has one wire kind.
-    enum class Kind(val wire: String) { TORRENT("torrent") }
+    /// The three wire kinds, matching the worker contract (SRC-10): a torrent infohash, a public http(s)
+    /// direct link, and a usenet nzb link. Every kind re-resolves through the REQUESTER's own debrid / usenet
+    /// account; no personal link or credential is ever pooled. A debrid-resolved row contributes the
+    /// underlying torrent HASH (kind = torrent), never the personal expiring CDN link. The Kotlin port mirrors
+    /// Apple `Kind`. NOTE while this client is dormant ([isEnabled] false) the active upload / serve gate stays
+    /// TORRENT-only (see [uploadableDescriptors] and [streams]); the http / usenet wire kinds land here so the
+    /// separately-reviewed non-torrent lane (credential strip + worker) can enable them without a type change.
+    enum class Kind(val wire: String) { TORRENT("torrent"), HTTP("http"), USENET("usenet") }
 
     /// One anonymized source descriptor for the HOARD upload. Carries ONLY public, non-personal fields.
     /// Mirrors Apple `Descriptor`.
     data class Descriptor(
         val kind: String,
-        val id: String, // normalized 40-hex torrent infohash
+        val id: String, // torrent: normalized 40-hex infohash. http/usenet: the credential-stripped public link.
         val quality: String, // e.g. "4K", "1080p", "Other" (from StreamRanking.qualityLabel)
         val sizeBytes: Long, // 0 when the add-on advertised no size
-        val seeders: Int?, // when advertised
+        val seeders: Int?, // torrent only, when advertised
+        /// Optional debrid provider fact (rd/tb/pm/ad): which provider THIS device confirmed had the source
+        /// cached. A media fact, never a user identity. null (the common case) is omitted from the wire body,
+        /// so a provider-less torrent descriptor is byte-identical to v1. Mirrors Apple `Descriptor.provider`.
+        val provider: String? = null,
     )
 
     /// One corroborated source the pool returns for SERVE. `id` matches the descriptor id space. Mirrors
@@ -222,6 +232,7 @@ object SourceIndexClient {
                         put("quality", d.quality)
                         put("sizeBytes", d.sizeBytes)
                         if (d.seeders != null) put("seeders", d.seeders)
+                        if (d.provider != null) put("provider", d.provider)
                     },
                 )
             }
@@ -243,6 +254,9 @@ object SourceIndexClient {
                 quality = normalizeQuality(descriptor.quality),
                 sizeBytes = descriptor.sizeBytes.coerceIn(0, MAX_SAFE_SIZE_BYTES),
                 seeders = descriptor.seeders?.takeIf { it in 0..MAX_SEEDERS },
+                // A debrid provider FACT (rd/tb/pm/ad/...), clamped to the known short tags so an arbitrary
+                // string can never ride the wire as a "provider" (SRC-10). null for the common case.
+                provider = descriptor.provider?.trim()?.lowercase()?.takeIf { it in ALLOWED_PROVIDERS },
             )
         }
     }
@@ -415,6 +429,10 @@ object SourceIndexClient {
     private const val MAX_SEEDERS = 1_000_000
     internal const val MAX_SERVE_RESULTS = 100
     private const val MIN_CORROBORATION = 2
+
+    /// Known short debrid / usenet provider tags the descriptor's optional provider FACT may carry (SRC-10).
+    /// Anything outside this set is dropped at the upload boundary so no arbitrary string reaches the wire.
+    private val ALLOWED_PROVIDERS = setOf("rd", "ad", "pm", "tb", "dl", "oc", "ed", "st", "db", "pp")
 
     /// Exact public title-id boundary shared by HOARD and SERVE. ASCII digits are intentional.
     internal fun canonicalContentId(raw: String): String? = raw.takeIf(CANONICAL_CONTENT_ID::matches)

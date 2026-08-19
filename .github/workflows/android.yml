@@ -396,3 +396,106 @@ jobs:
           name: VortX-Android-play-debug
           path: android/app/build/outputs/apk/play/debug/*.apk
           if-no-files-found: error
+
+      # ---- Signed release build (W0-3) -----------------------------------------------------------
+      # Everything above (debug build + engine verification + debug uploads) is unchanged and always
+      # runs. The signed release is ADDITIVE and gated on the upload keystore being provisioned: when
+      # ANDROID_KEYSTORE_BASE64 is absent (a fork, or before the owner sets the secrets) the steps
+      # below skip and the job still succeeds on the debug artifacts. The release is the sideloaded
+      # `full` flavor (mirrors the Apple sideload-IPA model); the GPL-gated `play` flavor is a separate
+      # Play-Store concern. VORTX_REQUIRE_ENGINE=1 is carried through, so a release APK/AAB that built
+      # at all is guaranteed to embed both engines -- the build fails closed otherwise (build.gradle.kts).
+      #
+      # Secrets cannot be referenced directly in a step `if:`, so this preflight promotes their
+      # presence to an output the later steps gate on. It reveals only whether the secret is set,
+      # never its value.
+      - name: Preflight release signing (gate on keystore secret)
+        id: signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "upload keystore secret present; a signed release will be built"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ANDROID_KEYSTORE_BASE64 not set; skipping the signed release build (debug artifacts unaffected)"
+          fi
+
+      # Decode the base64 keystore secret to a temp file OUTSIDE the workspace so it is never picked up
+      # by a gradle source set or an artifact glob. Fail closed if the decode yields an empty file.
+      - name: Decode upload keystore
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/signing"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/upload.jks"
+          test -s "$RUNNER_TEMP/signing/upload.jks" || { echo "::error::decoded keystore is empty (bad ANDROID_KEYSTORE_BASE64)"; exit 1; }
+
+      # Build the signed release APK + AAB for the sideloaded `full` flavor. Same engine wiring as the
+      # debug build above (both private engines fetched at pinned commits, VORTX_REQUIRE_ENGINE=1). The
+      # VORTX_* signing env vars are exactly what app/build.gradle.kts's signingSecret() reads; with all
+      # four set, its release signingConfig activates and signs the outputs.
+      - name: Build signed release (full flavor APK + AAB)
+        if: steps.signing.outputs.ready == 'true'
+        working-directory: android
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
+          STREMIOX_CORE_DIR: ${{ github.workspace }}/core
+          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
+          VORTX_REQUIRE_ENGINE: "1"
+          VORTX_KEYSTORE_FILE: ${{ runner.temp }}/signing/upload.jks
+          VORTX_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          VORTX_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          VORTX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleFullRelease bundleFullRelease --no-daemon --stacktrace
+
+      # Remove the decoded keystore as soon as the build is done, whatever the outcome.
+      - name: Shred decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/signing/upload.jks" || true
+
+      # Prove the release APK is actually signed (not just built). apksigner ships in the SDK build-tools
+      # the AGP release build already installed; pick the highest-versioned one on disk. A build-tools
+      # bug once made `verify` exit 0 on an unsigned APK, so also require the human-readable
+      # "Verified using v2 scheme" line.
+      - name: Verify release APK is signed
+        if: steps.signing.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(android/app/build/outputs/apk/full/release/*.apk)
+          if [ ${#apks[@]} -eq 0 ]; then echo "::error::signed release APK missing"; exit 1; fi
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n1)"
+          if [ -z "${APKSIGNER:-}" ] || [ ! -x "$APKSIGNER" ]; then
+            echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            out="$("$APKSIGNER" verify --verbose "$apk")"
+            echo "$out"
+            grep -Eq 'Verified using v2 scheme \(APK Signature Scheme v2\): true' <<<"$out" \
+              || { echo "::error::$apk is not signed with the v2 scheme"; exit 1; }
+            echo "ok: $apk is a signed release APK"
+          done
+
+      - name: Upload signed release APK
+        if: steps.signing.outputs.ready == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Android-full-release-signed
+          path: android/app/build/outputs/apk/full/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload signed release AAB
+        if: steps.signing.outputs.ready == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-Android-full-release-bundle
+          path: android/app/build/outputs/bundle/fullRelease/*.aab
+          if-no-files-found: error

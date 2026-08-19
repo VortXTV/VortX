@@ -174,6 +174,42 @@ class TrackPreferencesStore(
         }
 
     /**
+     * When ON, the auto-picked AUDIO track follows the preferred SUBTITLE language chain, so a viewer who
+     * sets a subtitle language also gets audio in that language without maintaining two lists. Mirrors Apple
+     * `matchAudioSub` (iOSSettingsView.swift:101, :351): stored as the exact "1"/"0" string Apple writes, so
+     * the value round-trips across devices on the same key. Default OFF. Read by [TrackSelector.select].
+     */
+    var matchAudioSub: Boolean
+        get() = prefs.getString(KEY_MATCH_AUDIO_SUB, "0") == "1"
+        set(value) {
+            prefs.edit().putString(KEY_MATCH_AUDIO_SUB, if (value) "1" else "0").apply()
+        }
+
+    /**
+     * Whether the ambient hero trailer may autoplay (muted, over the still backdrop). Mirrors Apple
+     * `stremiox.autoplayTrailers` (iOSSettingsView.swift:155), default ON. The ambient-trailer surface
+     * (DET-5 / hero) is a separate Android item; this key persists on Apple's exact string so the choice
+     * syncs and gates that surface once it lands.
+     */
+    var autoplayTrailers: Boolean
+        get() = prefs.getBoolean(KEY_AUTOPLAY_TRAILERS, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_AUTOPLAY_TRAILERS, value).apply()
+        }
+
+    /**
+     * Explicit trailer-language override, empty when following the app language. Mirrors Apple
+     * `stremiox.trailerLanguage`: it is the highest-priority entry in [trailerAudioLanguages], and
+     * [com.vortx.android.trailer.TrailerCoordinator] already reads it through that accessor. Stored as the
+     * raw ISO code (or "" for App language) on Apple's exact key.
+     */
+    var trailerLanguage: String
+        get() = prefs.getString(KEY_TRAILER_LANG, "") ?: ""
+        set(value) {
+            prefs.edit().putString(KEY_TRAILER_LANG, value).apply()
+        }
+
+    /**
      * Preferred trailer AUDIO languages (ISO-639-1 base codes, priority order) for selecting the matching
      * audio track when a trailer ships MULTIPLE audio languages: the explicit trailer-language override first
      * (when set), then the preferred audio languages, then the device languages. Deduped, lowercased, never
@@ -208,6 +244,8 @@ class TrackPreferencesStore(
         const val KEY_FORCED = "stremiox.tracks.forced"
         const val KEY_REJECT = "stremiox.tracks.reject"
         const val KEY_SUB_ONLY_PREFERRED = "stremiox.tracks.subOnlyPreferred"
+        const val KEY_MATCH_AUDIO_SUB = "stremiox.matchAudioSub"
+        const val KEY_AUTOPLAY_TRAILERS = "stremiox.autoplayTrailers"
         const val KEY_UPSCALING = "stremiox.videoUpscaling"
         const val KEY_TRAILER_LANG = "stremiox.trailerLanguage"
     }

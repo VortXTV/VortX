@@ -112,6 +112,7 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     traktScrobble = it
                     ScrobbleService.setTraktScrobbleEnabled(it)
                 },
+                syncToggles = traktSyncToggles,
                 onOpenUrl = { uriHandler.openUri(it) },
                 onConnect = {
                     runConnect(
@@ -151,6 +152,7 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     simklScrobble = it
                     ScrobbleService.setSimklScrobbleEnabled(it)
                 },
+                syncToggles = simklSyncToggles,
                 onOpenUrl = { uriHandler.openUri(it) },
                 onConnect = {
                     runConnect(
@@ -243,6 +245,36 @@ internal fun retryStorageUnavailable(
     storageUnavailableMessage: String,
 ): ConnectUi = initialProviderState(connectionState(), storageUnavailableMessage)
 
+/// One granular sync leg's persisted preference (SET-4): a switch keyed on Apple's EXACT
+/// `vortx.<provider>.*` string with Apple's default. See [SYNC_TOGGLES_FOOTER] for the Android status.
+internal data class SyncToggle(
+    val label: String,
+    val detail: String,
+    val key: String,
+    val default: Boolean,
+)
+
+/// Trakt granular toggles, Apple keys + defaults (ExternalScrobbleProvider.swift:100-143).
+internal val traktSyncToggles: List<SyncToggle> = listOf(
+    SyncToggle("Import watched history", "Show titles watched on Trakt as watched here.", ScrobbleService.KEY_TRAKT_IMPORT_WATCHED, false),
+    SyncToggle("Sync ratings", "Mirror ratings you give to Trakt.", ScrobbleService.KEY_TRAKT_RATINGS, true),
+    SyncToggle("Sync watchlist", "Mirror your Library to your Trakt watchlist.", ScrobbleService.KEY_TRAKT_WATCHLIST, true),
+    SyncToggle("Continue Watching from Trakt", "Use Trakt's paused list as Continue Watching.", ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false),
+    SyncToggle("Check-in action", "Offer an I'm watching this action on detail pages.", ScrobbleService.KEY_TRAKT_CHECKIN, false),
+)
+
+/// SIMKL granular toggles, Apple keys + defaults.
+internal val simklSyncToggles: List<SyncToggle> = listOf(
+    SyncToggle("Import watched history", "Show titles completed on SIMKL as watched here.", ScrobbleService.KEY_SIMKL_IMPORT_WATCHED, false),
+    SyncToggle("Sync ratings", "Mirror ratings you give to SIMKL.", ScrobbleService.KEY_SIMKL_RATINGS, true),
+    SyncToggle("Sync watchlist", "Mirror your Library to your SIMKL plan-to-watch.", ScrobbleService.KEY_SIMKL_WATCHLIST, true),
+)
+
+/// The granular sync options persist on Apple's exact keys and sync across devices; each leg takes effect
+/// on a device once that sync path runs there. On Android today only playback scrobbling is a live leg.
+internal const val SYNC_TOGGLES_FOOTER =
+    "These options sync to your other devices and take effect wherever each sync runs."
+
 @Composable
 private fun ProviderCard(
     name: String,
@@ -251,6 +283,7 @@ private fun ProviderCard(
     state: ConnectUi,
     scrobbleEnabled: Boolean,
     onScrobbleChange: (Boolean) -> Unit,
+    syncToggles: List<SyncToggle>,
     onOpenUrl: (String) -> Unit,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
@@ -294,6 +327,16 @@ private fun ProviderCard(
                             modifier = Modifier.fillMaxWidth(0.7f),
                         )
                         Switch(checked = scrobbleEnabled, onCheckedChange = onScrobbleChange)
+                    }
+                    // Granular sync legs (SET-4), each on Apple's exact key + default.
+                    syncToggles.forEach { toggle ->
+                        SyncToggleRow(toggle)
+                    }
+                    if (syncToggles.isNotEmpty()) {
+                        Text(
+                            SYNC_TOGGLES_FOOTER,
+                            style = VortXTheme.type.label.copy(color = colors.textTertiary),
+                        )
                     }
                     PrimaryButton(text = "Disconnect", onClick = onDisconnect, modifier = Modifier.fillMaxWidth())
                 }
@@ -353,6 +396,30 @@ private fun ProviderCard(
                 }
             }
         }
+    }
+}
+
+/// One granular sync switch, seeded from [ScrobbleService.isToggleOn] and written back on change.
+@Composable
+private fun SyncToggleRow(toggle: SyncToggle) {
+    val colors = VortXTheme.colors
+    var checked by remember(toggle.key) { mutableStateOf(ScrobbleService.isToggleOn(toggle.key, toggle.default)) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.fillMaxWidth(0.7f)) {
+            Text(toggle.label, style = VortXTheme.type.body)
+            Text(toggle.detail, style = VortXTheme.type.label.copy(color = colors.textTertiary))
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = {
+                checked = it
+                ScrobbleService.setToggle(toggle.key, it)
+            },
+        )
     }
 }
 

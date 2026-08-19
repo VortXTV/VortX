@@ -29,6 +29,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -37,6 +38,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
@@ -134,6 +136,7 @@ private fun TvDetailContent(
     playback: Playback,
     watchlisted: Boolean,
 ) {
+    val context = LocalContext.current
     val colors = VortXTheme.colors
     val playFocus = remember { FocusRequester() }
     val secondaryFocus = remember { FocusRequester() }
@@ -258,6 +261,15 @@ private fun TvDetailContent(
                                 onClick = viewModel::toggleWatchlist,
                             )
                         }
+                    }
+                    // DET-10: share the title's IMDb page (or its name when there is no imdb id) via the
+                    // platform share sheet; fail-soft when no activity can handle the intent.
+                    item {
+                        TvFilterChip(
+                            label = "Share",
+                            selected = false,
+                            onClick = { launchDetailShare(context, detail.id, detail.name) },
+                        )
                     }
                 }
                 (playback as? Playback.Failed)?.let {

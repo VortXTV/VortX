@@ -323,6 +323,111 @@ object SettingsBackup {
         return Base64.getEncoder().encodeToString(bytes)
     }
 
+    // ------------------------------------------------------------ file backup (TV-5)
+
+    /**
+     * The Android-local file backup (TV-5), the analogue of Apple `SettingsBackup.makeBackup` / `restore`.
+     * This is DELIBERATELY separate from the `doc.settings` sync carrier above: a phone exports its own
+     * syncable settings to a user-chosen file (VortX-Backup-<date>.json) and imports one back, never routing
+     * through the account sync blob. It reuses the same envelope + [BinaryPlist] payload so a file stays
+     * readable by the same decoder.
+     *
+     * TYPE FIDELITY is the one hard problem the sync carrier does not have. Android [android.content.SharedPreferences]
+     * distinguishes Int / Long / Float / Boolean / String / Set<String>, but the plist collapses Int into
+     * `int` (decoded as Long) and Float into `real` (decoded as Double), and cannot hold a Set. Writing a
+     * value back under the wrong type would make a later typed getter throw a ClassCastException, which the
+     * fail-soft mandate forbids. So [makeBackup] records a one-char type code per key in a reserved
+     * [BACKUP_TYPES_KEY] manifest (a plist string, lossless), and [restoreValues] rebuilds the exact
+     * SharedPreferences type from it. Sets are carried as string lists.
+     */
+    const val BACKUP_TYPES_KEY = "vortx.backup.entryTypes.v1"
+
+    /** A restored value carrying its exact SharedPreferences type, so the caller can put it back verbatim. */
+    sealed interface BackupValue {
+        data class Bool(val value: Boolean) : BackupValue
+        data class IntValue(val value: Int) : BackupValue
+        data class LongValue(val value: Long) : BackupValue
+        data class FloatValue(val value: Float) : BackupValue
+        data class Str(val value: String) : BackupValue
+        data class StrSet(val value: Set<String>) : BackupValue
+    }
+
+    /**
+     * Encode a SharedPreferences snapshot ([android.content.SharedPreferences.getAll]) into a backup file's
+     * bytes. Keeps only [isSyncable] keys (so device-local keys are excluded, exactly like the sync carrier
+     * and Apple's `makeBackup`). Returns null when there is nothing syncable to back up, or the graph cannot
+     * be encoded exactly.
+     */
+    fun makeBackup(
+        all: Map<String, *>,
+        bundleId: String,
+        app: String = "VortX",
+        now: Date = Date(),
+    ): ByteArray? {
+        val domain = LinkedHashMap<String, Any>()
+        val types = JSONObject()
+        for ((key, raw) in all) {
+            if (raw == null || key == BACKUP_TYPES_KEY || !isSyncable(key)) continue
+            val (value, code) = encodeBackupEntry(raw) ?: continue
+            domain[key] = value
+            types.put(key, code)
+        }
+        if (domain.isEmpty()) return null
+        domain[BACKUP_TYPES_KEY] = types.toString()
+        return encode(domain, bundleId = bundleId, app = app, now = now)
+    }
+
+    /**
+     * Decode a backup file's bytes into typed values ready to write back into SharedPreferences. Returns null
+     * for a file that is not a valid backup (Apple's `notABackup` / `corruptPayload` cases). A set-only merge
+     * is the caller's responsibility: it must only `put` these keys and never `clear`, so keys absent from the
+     * backup keep their current values (Apple `restore`'s never-wipe contract).
+     */
+    fun restoreValues(bytes: ByteArray): Map<String, BackupValue>? {
+        val domain = decodeDomain(bytes) ?: return null
+        val types = runCatching { JSONObject(domain[BACKUP_TYPES_KEY] as? String ?: "{}") }
+            .getOrDefault(JSONObject())
+        val out = LinkedHashMap<String, BackupValue>()
+        for ((key, value) in domain) {
+            if (key == BACKUP_TYPES_KEY || !isSyncable(key)) continue
+            decodeBackupEntry(value, types.optString(key, ""))?.let { out[key] = it }
+        }
+        return out
+    }
+
+    /** SharedPreferences value -> (plist-representable value, one-char type code). */
+    private fun encodeBackupEntry(raw: Any): Pair<Any, String>? = when (raw) {
+        is Boolean -> raw to "b"
+        is Int -> raw.toLong() to "i"
+        is Long -> raw to "l"
+        is Float -> raw.toDouble() to "f"
+        is String -> raw to "s"
+        is Set<*> -> raw.filterIsInstance<String>() to "S"
+        else -> null // an unrepresentable type is skipped, never guessed (fail-soft)
+    }
+
+    /**
+     * Plist-decoded value + its recorded type code -> the exact SharedPreferences type. When the manifest has
+     * no code for a key (a foreign or older backup), fall back to the decoded value's own type so the restore
+     * still lands something sensible rather than dropping the key.
+     */
+    private fun decodeBackupEntry(value: Any, code: String): BackupValue? = when (code) {
+        "b" -> (value as? Boolean)?.let(BackupValue::Bool)
+        "i" -> (value as? Long)?.let { BackupValue.IntValue(it.toInt()) }
+        "l" -> (value as? Long)?.let(BackupValue::LongValue)
+        "f" -> (value as? Double)?.let { BackupValue.FloatValue(it.toFloat()) }
+        "s" -> (value as? String)?.let(BackupValue::Str)
+        "S" -> (value as? List<*>)?.let { BackupValue.StrSet(it.filterIsInstance<String>().toSet()) }
+        else -> when (value) {
+            is Boolean -> BackupValue.Bool(value)
+            is Long -> BackupValue.LongValue(value)
+            is Double -> BackupValue.FloatValue(value.toFloat())
+            is String -> BackupValue.Str(value)
+            is List<*> -> BackupValue.StrSet(value.filterIsInstance<String>().toSet())
+            else -> null
+        }
+    }
+
     /**
      * Apple's encoder wire format: UTC, second precision, trailing Z.
      */

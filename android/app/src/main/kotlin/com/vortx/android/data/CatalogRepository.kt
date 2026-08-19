@@ -201,6 +201,13 @@ interface CatalogRepository {
     /// `ctx.profile.addons`.
     suspend fun installedAddons(): Result<List<InstalledAddon>>
 
+    /// Canonicalize a pasted add-on URL to the exact transport URL the engine keys add-ons by (trim +
+    /// scheme check + `/manifest.json` suffix), mirroring Apple `CoreBridge.normalizedAddonURL`. Null for
+    /// anything that isn't a plausible http(s) URL. The Add-ons screen compares this against the installed
+    /// list to offer an Update confirm instead of a silent re-install (SRC-8, Apple `AddonsView.install`).
+    /// Default null so the offline preview simply installs without the update-vs-install branch.
+    fun normalizedAddonUrl(raw: String): String? = null
+
     /// Install (or update-in-place) an add-on from a pasted manifest URL. Fetches + validates the
     /// manifest first (mirrors Apple `CoreBridge.installAddon`); the [Result.failure] message is
     /// user-facing.
@@ -235,6 +242,20 @@ interface CatalogRepository {
 
     /// Full-text search across every add-on the user has installed.
     suspend fun search(query: String): Result<List<MetaItem>>
+
+    /**
+     * Continuous search settlement. The Boolean is true while any requested add-on page is still
+     * loading. Implementations may emit partial nonempty lists before the final settled snapshot.
+     */
+    fun searchUpdates(query: String): Flow<Pair<List<MetaItem>, Boolean>> = flow {
+        val trimmed = query.trim()
+        if (trimmed.length < 2) {
+            emit(emptyList<MetaItem>() to false)
+            return@flow
+        }
+        emit(emptyList<MetaItem>() to true)
+        emit(search(trimmed).getOrThrow() to false)
+    }
 
     /// Full meta detail for a title (hero artwork, metadata, episodes), resolved through the user's
     /// meta add-ons so every id scheme (tt, tmdb:, tvdb:, …) works.

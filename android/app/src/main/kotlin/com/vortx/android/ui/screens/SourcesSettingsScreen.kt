@@ -158,6 +158,19 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             }
 
             SettingsSection(
+                title = "Display",
+                footer = "Compact rows drop the raw release name, leaving the quality, add-on and size badges. " +
+                    "Applies to the source list on a title's page.",
+            ) {
+                ToggleRow(
+                    label = "Compact source rows",
+                    detail = "Show just the badges and size, without the full release title.",
+                    checked = ui.compactStreamLabels,
+                    onCheckedChange = { value -> mutate { compactStreamLabels = value } },
+                )
+            }
+
+            SettingsSection(
                 title = "Quality",
                 footer = "Caps and floors apply only to sources that ADVERTISE a resolution. A source that " +
                     "does not say is kept, unless you hide unlabelled sources below.",
@@ -362,6 +375,7 @@ private data class SourcesPrefsUi(
     val maxResolution: Int,
     val minResolution: Int,
     val maxFileSizeGB: Double,
+    val compactStreamLabels: Boolean,
 )
 
 private fun readPrefs(store: SourcePreferencesStore) = SourcesPrefsUi(
@@ -383,6 +397,7 @@ private fun readPrefs(store: SourcePreferencesStore) = SourcesPrefsUi(
     maxResolution = store.maxResolution,
     minResolution = store.minResolution,
     maxFileSizeGB = store.maxFileSizeGB,
+    compactStreamLabels = store.compactStreamLabels,
 )
 
 // ---------------------------------------------------------------------------------------------------

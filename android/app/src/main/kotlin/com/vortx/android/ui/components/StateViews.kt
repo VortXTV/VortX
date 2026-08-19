@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -21,7 +23,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
 import com.vortx.android.R
+import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 
 /// A calm shimmering placeholder fill — the loading-state building block (DESIGN-SYSTEM.md §3
@@ -96,4 +100,42 @@ fun ErrorState(message: String, onRetry: (() -> Unit)? = null, modifier: Modifie
 @Composable
 fun EmptyState(hint: String, modifier: Modifier = Modifier, actionLabel: String? = null, onAction: (() -> Unit)? = null) {
     GuidanceCard(message = hint, actionLabel = actionLabel, onAction = onAction, modifier = modifier)
+}
+
+/// The signed-out prompt shown on Search and Discover (SD-8) when neither a Stremio nor a VortX account is
+/// signed in, mirroring Apple `CoreEmptyState.signedOut`: an account glyph, a short title, and one line of
+/// guidance pointing at the two ways to sign in. Informational (no button) so it introduces no navigation
+/// coupling from these tabs; the Settings tab owns the actual sign-in surfaces.
+@Composable
+fun SignedOutState(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.xl),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        SurfaceCard(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(VortXTheme.spacing.lg),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Icon(
+                    imageVector = VortXIcons.account,
+                    contentDescription = null,
+                    tint = VortXTheme.colors.accent,
+                    modifier = Modifier.size(40.dp),
+                )
+                Text(
+                    text = stringResource(R.string.account_signed_out_title),
+                    style = VortXTheme.type.sectionTitle,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    text = stringResource(R.string.account_signed_out_message),
+                    style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+    }
 }

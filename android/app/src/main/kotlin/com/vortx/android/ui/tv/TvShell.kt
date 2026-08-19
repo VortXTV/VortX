@@ -27,6 +27,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
@@ -35,6 +36,7 @@ import androidx.tv.material3.Surface
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.model.AuthState
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -78,6 +80,12 @@ fun TvShell(
     val appContext = LocalContext.current.applicationContext
     var destination by remember { mutableStateOf(TvDestination.HOME) }
 
+    // SD-8: Discover and Search gate on a sign-in. On TV the available signal is the engine's Stremio
+    // auth state (the VortX-primary sign-in surface is a separate TV parity item); a signed-out set sees
+    // the sign-in prompt on those two tabs instead of empty add-on results.
+    val authState by auth.authState.collectAsStateWithLifecycle()
+    val signedIn = authState is AuthState.SignedIn
+
     // A single D-pad Back from any non-Home surface returns to Home rather than dropping out of the app --
     // the couch convention (and what a viewer expects after a deliberate tab move). Disabled on Home so the
     // system default (leave the app) still applies there. When a detail/player overlay is up it is composed
@@ -104,13 +112,13 @@ fun TvShell(
                 TvDestination.HOME ->
                     TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem)
                 TvDestination.DISCOVER ->
-                    TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem)
+                    TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, signedIn = signedIn)
                 TvDestination.LIBRARY ->
                     TvLibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem)
                 TvDestination.SEARCH ->
-                    TvSearchScreen(viewModel<SearchViewModel>(factory = factory), onItem)
+                    TvSearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, signedIn = signedIn)
                 TvDestination.SETTINGS ->
-                    TvSettingsScreen()
+                    TvSettingsScreen(repo = repo)
             }
         }
     }

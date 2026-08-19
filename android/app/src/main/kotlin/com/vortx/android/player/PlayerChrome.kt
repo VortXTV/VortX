@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.Tune
@@ -71,6 +72,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.R
+import com.vortx.android.engine.StreamRanking
+import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.ui.theme.VortXGlass
@@ -125,7 +128,9 @@ fun PlayerChrome(
     onSelectAudio: (Int) -> Unit,
     onSelectSubtitle: (Int?) -> Unit,
     onSetSpeed: (Float) -> Unit,
-    onToggleScaleMode: () -> Unit,
+    /// Pick the video scale mode (Fit / Fill / Stretch) from the aspect sheet. Replaces the old two-state
+    /// toggle so the third (Stretch) mode is reachable. See [VideoScaleMode].
+    onSelectScaleMode: (VideoScaleMode) -> Unit,
     onErrorRetry: () -> Unit,
     /// Player Lock: engages the host's touch-lock (controls hidden, taps/gestures ignored until the
     /// unlock affordance is used). Null hides the lock control entirely, keeping the chrome usable
@@ -153,16 +158,51 @@ fun PlayerChrome(
     playbackSessionRevision: Long = 0L,
     sourceOptions: List<StreamSource> = emptyList(),
     qualityOptions: List<Pair<String, StreamSource>> = emptyList(),
+    /// Current-season episodes for the in-player EPISODES sheet (series only). Empty hides the control
+    /// (movies, trailers, ad-hoc links). Picking one switches in place via [onSwitchEpisode].
+    episodeOptions: List<Episode> = emptyList(),
     currentSource: StreamSource? = null,
     sourceSwitching: Boolean = false,
     sourceSwitchError: String? = null,
     onSwitchSource: (StreamSource) -> Unit = {},
+    onSwitchEpisode: (Episode) -> Unit = {},
+    /// Secondary (dual) subtitle state. [secondarySubtitleAvailable] is mpv-only, so the control is hidden
+    /// on the Dolby Vision (ExoPlayer) engine and when fewer than two subtitle tracks exist. When a second
+    /// subtitle is active both the primary and secondary tracks read as selected, so the primary sheet
+    /// keys its checkmarks off [primarySubtitleId] instead of the per-track flag.
+    secondarySubtitleAvailable: Boolean = false,
+    primarySubtitleId: Int = -1,
+    secondarySubtitleId: Int = -1,
+    onSelectSecondarySubtitle: (Int?) -> Unit = {},
+    /// Sleep timer state and control. [sleepEndOfEpisodeAvailable] gates the End of episode row (series
+    /// only). Off = (null, false); a timed pause = (minutes, false); End of episode = (null, true).
+    sleepSelectionMinutes: Int? = null,
+    sleepAtEpisodeEnd: Boolean = false,
+    sleepEndOfEpisodeAvailable: Boolean = false,
+    onSetSleepTimer: (minutes: Int?, atEpisodeEnd: Boolean) -> Unit = { _, _ -> },
+    /// In-player engine switch (mpv <-> ExoPlayer). Hidden for torrents / trailers where the switch is not
+    /// valid. [enginePreference] is the current tri-state policy; [liveEngineLabel] names the engine live now.
+    engineSwitchAvailable: Boolean = false,
+    enginePreference: PlayerEngineRouter.Override = PlayerEngineRouter.Override.AUTO,
+    liveEngineLabel: String = "",
+    onSelectEnginePreference: (PlayerEngineRouter.Override) -> Unit = {},
+    /// Live playback stats for the Playback Info sheet, re-read on each recomposition so the overlay stays
+    /// current while open. Empty when the engine exposes nothing.
+    playbackInfo: () -> List<Pair<String, String>> = { emptyList() },
+    /// Hardware / software decode toggle (mpv-only; hidden on the Dolby Vision player). Software is the
+    /// escape hatch for green / garbled frames; Hardware (mediacodec) stays the default.
+    hardwareDecodingAvailable: Boolean = false,
+    hardwareDecoding: Boolean = true,
+    onSetHardwareDecoding: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
     var openSheet by remember(playable.url, playbackSessionRevision) { mutableStateOf(ControlSheet.NONE) }
     val sourceChoices = remember(sourceOptions, currentSource) { playerSourceChoices(sourceOptions, currentSource) }
     val qualityChoices = remember(qualityOptions, currentSource) { playerQualityChoices(qualityOptions, currentSource) }
+    val episodeChoices = remember(episodeOptions, playable.mediaRef) {
+        playerEpisodeChoices(episodeOptions, playable.mediaRef)
+    }
     val sourcesTitle = stringResource(R.string.player_sources)
     val sourcesDescription = stringResource(R.string.player_sources_action_description)
     val qualityTitle = stringResource(R.string.player_quality)
@@ -230,13 +270,24 @@ fun PlayerChrome(
                 if (qualityChoices.size > 1) {
                     ChromeIcon(Icons.Filled.HighQuality, qualityDescription) { onInteraction(); openSheet = ControlSheet.QUALITY }
                 }
+                // In-player episode picker (series only): the season's episodes, current one highlighted.
+                if (episodeChoices.size > 1) {
+                    ChromeIcon(Icons.AutoMirrored.Filled.List, "Episodes") { onInteraction(); openSheet = ControlSheet.EPISODES }
+                }
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 if (chapters.isNotEmpty()) {
                     ChromeIcon(Icons.AutoMirrored.Filled.List, chaptersDescription) { onInteraction(); openSheet = ControlSheet.CHAPTERS }
                 }
-                ChromeIcon(Icons.Filled.AspectRatio, "Aspect ratio", tint = if (scaleMode == VideoScaleMode.ZOOM) emberAccent else Color.White, onClick = onToggleScaleMode)
+                // Aspect ratio: opens the Fit / Fill / Stretch sheet. Ember-tinted when not on the default Fit.
+                ChromeIcon(
+                    Icons.Filled.AspectRatio,
+                    "Aspect ratio",
+                    tint = if (scaleMode != VideoScaleMode.FIT) emberAccent else Color.White,
+                ) { onInteraction(); openSheet = ControlSheet.VIDEO }
+                // Player settings overflow: sleep timer, decoder, playback info, and the engine switch.
+                ChromeIcon(Icons.Filled.Settings, "Player settings") { onInteraction(); openSheet = ControlSheet.PLAYER_SETTINGS }
                 // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
                 // therefore most protected-from-fat-finger) position.
                 onEnterPip?.let { pip ->
@@ -338,6 +389,45 @@ fun PlayerChrome(
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
+            ControlSheet.EPISODES -> ControlSelectionSheet(
+                title = "Episodes",
+                options = buildList {
+                    if (sourceSwitching) {
+                        add(SheetOption("Switching episode...", false, enabled = false, isStatus = true))
+                    } else if (sourceSwitchError != null) {
+                        add(SheetOption("Episode switch failed", false, enabled = false, isStatus = true))
+                    }
+                    episodeChoices.forEach { choice ->
+                        add(
+                            SheetOption(
+                                label = choice.label,
+                                selected = choice.selected,
+                                enabled = !sourceSwitching,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSwitchEpisode(choice.episode) },
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.VIDEO -> ControlSelectionSheet(
+                title = "Aspect Ratio",
+                options = VIDEO_SCALE_MODES.map { (mode, label, detail) ->
+                    SheetOption(
+                        label = label,
+                        detail = detail,
+                        selected = scaleMode == mode,
+                        isChoice = true,
+                        dismissOnPick = false,
+                        onPick = { onSelectScaleMode(mode) },
+                    )
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
             ControlSheet.AUDIO -> ControlSelectionSheet(
                 title = "Audio",
                 options = buildList {
@@ -367,10 +457,16 @@ fun PlayerChrome(
             ControlSheet.SUBTITLE -> ControlSelectionSheet(
                 title = "Subtitles",
                 options = buildList {
+                    // When a second subtitle is active, mpv flags BOTH the primary and secondary tracks
+                    // `selected`, so the per-track flag can no longer identify the primary: key the primary
+                    // checkmarks off the engine's explicit primary id instead. With no second subtitle (the
+                    // ordinary case, and always on the Dolby Vision engine) this stays false and the rows
+                    // fall back to the `selected` flag exactly as before.
+                    val dualActive = secondarySubtitleAvailable && secondarySubtitleId >= 0
                     add(
                         SheetOption(
                             label = "Off",
-                            selected = state.subtitleTracks.none { it.selected },
+                            selected = if (dualActive) primarySubtitleId < 0 else state.subtitleTracks.none { it.selected },
                             isChoice = true,
                             onPick = { onSelectSubtitle(null) },
                         ),
@@ -379,7 +475,7 @@ fun PlayerChrome(
                         add(
                             SheetOption(
                                 label = trackLabel(track.title, track.lang),
-                                selected = track.selected,
+                                selected = if (dualActive) track.id == primarySubtitleId else track.selected,
                                 isChoice = true,
                                 onPick = { onSelectSubtitle(track.id) },
                             ),
@@ -398,6 +494,20 @@ fun PlayerChrome(
                             ),
                         )
                     }
+                    // Second subtitle (dual tracks for language study): mpv-only, and only when there are at
+                    // least two tracks to pick a second from. Hidden on the Dolby Vision engine, where
+                    // playback degrades to the single primary subtitle.
+                    if (secondarySubtitleAvailable && state.subtitleTracks.size >= 2) {
+                        add(
+                            SheetOption(
+                                label = secondSubtitleLabel(state.subtitleTracks, secondarySubtitleId),
+                                selected = false,
+                                onPick = { openSheet = ControlSheet.SECOND_SUBTITLE },
+                                detail = "›",
+                                dismissOnPick = false,
+                            ),
+                        )
+                    }
                     add(
                         SheetOption(
                             label = subtitleSettingsTitle,
@@ -407,6 +517,34 @@ fun PlayerChrome(
                             dismissOnPick = false,
                         ),
                     )
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SECOND_SUBTITLE -> ControlSelectionSheet(
+                title = "Second Subtitle",
+                options = buildList {
+                    add(
+                        SheetOption(
+                            label = "Off",
+                            selected = secondarySubtitleId < 0,
+                            isChoice = true,
+                            onPick = { onSelectSecondarySubtitle(null) },
+                        ),
+                    )
+                    // mpv refuses to show one track as both primary and secondary, so exclude the primary.
+                    state.subtitleTracks
+                        .filter { primarySubtitleId < 0 || it.id != primarySubtitleId }
+                        .forEach { track ->
+                            add(
+                                SheetOption(
+                                    label = trackLabel(track.title, track.lang),
+                                    selected = track.id == secondarySubtitleId,
+                                    isChoice = true,
+                                    onPick = { onSelectSecondarySubtitle(track.id) },
+                                ),
+                            )
+                        }
                 },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -453,6 +591,127 @@ fun PlayerChrome(
             ControlSheet.CHAPTERS -> ControlSelectionSheet(
                 title = chaptersTitle,
                 options = chapterOptions(chapters, state.positionMs, onSeek),
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.PLAYER_SETTINGS -> ControlSelectionSheet(
+                title = "Player Settings",
+                options = buildList {
+                    add(
+                        SheetOption(
+                            label = "Sleep Timer",
+                            selected = false,
+                            detail = sleepStatusDetail(sleepSelectionMinutes, sleepAtEpisodeEnd),
+                            onPick = { openSheet = ControlSheet.SLEEP },
+                            dismissOnPick = false,
+                        ),
+                    )
+                    // Decoder toggle is mpv-only: the Dolby Vision player always decodes in hardware, so the
+                    // rows are hidden there rather than shown as dead controls.
+                    if (hardwareDecodingAvailable) {
+                        add(SheetOption("Decoder", false, enabled = false, isHeader = true))
+                        add(
+                            SheetOption(
+                                label = "Hardware",
+                                selected = hardwareDecoding,
+                                detail = "recommended",
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSetHardwareDecoding(true) },
+                            ),
+                        )
+                        add(
+                            SheetOption(
+                                label = "Software",
+                                selected = !hardwareDecoding,
+                                detail = "rescues green or garbled frames",
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSetHardwareDecoding(false) },
+                            ),
+                        )
+                    }
+                    add(
+                        SheetOption(
+                            label = "Playback Info",
+                            selected = false,
+                            detail = "›",
+                            onPick = { openSheet = ControlSheet.INFO },
+                            dismissOnPick = false,
+                        ),
+                    )
+                    if (engineSwitchAvailable) {
+                        add(
+                            SheetOption(
+                                label = "Player Engine",
+                                selected = false,
+                                detail = liveEngineLabel.ifBlank { "›" },
+                                onPick = { openSheet = ControlSheet.ENGINE },
+                                dismissOnPick = false,
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SLEEP -> ControlSelectionSheet(
+                title = "Sleep Timer",
+                options = buildList {
+                    add(
+                        SheetOption(
+                            label = "Off",
+                            selected = sleepSelectionMinutes == null && !sleepAtEpisodeEnd,
+                            isChoice = true,
+                            dismissOnPick = false,
+                            onPick = { onSetSleepTimer(null, false) },
+                        ),
+                    )
+                    SLEEP_TIMER_MINUTES.forEach { minutes ->
+                        add(
+                            SheetOption(
+                                label = "$minutes minutes",
+                                selected = sleepSelectionMinutes == minutes && !sleepAtEpisodeEnd,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSetSleepTimer(minutes, false) },
+                            ),
+                        )
+                    }
+                    // Only meaningful for a series episode: it stops the auto-advance at the end of this one.
+                    if (sleepEndOfEpisodeAvailable) {
+                        add(
+                            SheetOption(
+                                label = "End of episode",
+                                selected = sleepAtEpisodeEnd,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { onSetSleepTimer(null, true) },
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.INFO -> ControlSelectionSheet(
+                title = "Playback Info",
+                options = playbackInfoOptions(playable, currentSource, playbackInfo()),
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.ENGINE -> ControlSelectionSheet(
+                title = "Player Engine",
+                options = ENGINE_CHOICES.map { (pref, label, detail) ->
+                    SheetOption(
+                        label = label,
+                        detail = detail,
+                        selected = enginePreference == pref,
+                        isChoice = true,
+                        dismissOnPick = false,
+                        onPick = { onSelectEnginePreference(pref) },
+                    )
+                },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
@@ -504,13 +763,40 @@ private enum class ControlSheet {
     NONE,
     SOURCES,
     QUALITY,
+    EPISODES,
+    VIDEO,
     AUDIO,
     SUBTITLE,
+    SECOND_SUBTITLE,
     SUBTITLE_SETTINGS,
     AUDIO_SETTINGS,
     SPEED,
     CHAPTERS,
+    PLAYER_SETTINGS,
+    SLEEP,
+    INFO,
+    ENGINE,
 }
+
+/// Aspect-ratio choices for the VIDEO sheet, mirroring the Apple Aspect Ratio panel
+/// (original / fill / stretch): Fit keeps the whole frame, Fill crops to screen, Stretch distorts to fill.
+private val VIDEO_SCALE_MODES: List<Triple<VideoScaleMode, String, String>> = listOf(
+    Triple(VideoScaleMode.FIT, "Fit", "default"),
+    Triple(VideoScaleMode.ZOOM, "Fill", "crop to screen"),
+    Triple(VideoScaleMode.STRETCH, "Stretch", "fill, distort"),
+)
+
+/// Sleep-timer minute presets, matching the Apple player's set.
+private val SLEEP_TIMER_MINUTES: List<Int> = listOf(15, 30, 45, 60, 90)
+
+/// Engine-picker choices for the ENGINE sheet (tri-state auto / mpv / ExoPlayer). "Dolby Vision Player" is
+/// the user-facing name for the ExoPlayer engine, matching the chrome's other mpv-only "unavailable on the
+/// Dolby Vision player" copy.
+private val ENGINE_CHOICES: List<Triple<PlayerEngineRouter.Override, String, String>> = listOf(
+    Triple(PlayerEngineRouter.Override.AUTO, "Automatic", "recommended"),
+    Triple(PlayerEngineRouter.Override.MPV, "VortX Player", "all formats, styled subtitles"),
+    Triple(PlayerEngineRouter.Override.EXOPLAYER, "Dolby Vision Player", "Dolby Vision, HLS"),
+)
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -555,6 +841,42 @@ internal fun normalizePlayerChapters(chapters: List<PlayerChapter>): List<Player
 
 internal fun currentChapterIndex(chapters: List<PlayerChapter>, positionMs: Long): Int =
     chapters.indexOfLast { it.startMs <= positionMs }
+
+/// The Second Subtitle drill-in label, with the current second track's language appended when one is set.
+private fun secondSubtitleLabel(tracks: List<PlayerTrack>, secondaryId: Int): String {
+    val current = tracks.firstOrNull { it.id == secondaryId } ?: return "Second subtitle"
+    val lang = current.lang?.takeIf { it.isNotBlank() } ?: current.title.takeIf { it.isNotBlank() }
+    return if (lang != null) "Second subtitle · $lang" else "Second subtitle"
+}
+
+/// The Sleep Timer row's right-aligned status shown in the Player Settings sheet.
+private fun sleepStatusDetail(minutes: Int?, atEpisodeEnd: Boolean): String = when {
+    atEpisodeEnd -> "End of episode"
+    minutes != null -> "$minutes min"
+    else -> "Off"
+}
+
+/// Build the Playback Info sheet rows: the title, the current source (release / add-on / size), and the
+/// live engine stats. Every row is informational (non-interactive). Mirrors the Apple Playback Info panel.
+private fun playbackInfoOptions(
+    playable: Playable,
+    currentSource: StreamSource?,
+    stats: List<Pair<String, String>>,
+): List<SheetOption> = buildList {
+    add(SheetOption("Now Playing", false, enabled = false, isHeader = true))
+    add(SheetOption(playable.title, false, enabled = false))
+    currentSource?.let { src ->
+        add(SheetOption("Source", false, enabled = false, isHeader = true))
+        val release = src.title.lineSequence().firstOrNull()?.trim().orEmpty().ifBlank { src.addon }
+        if (release.isNotBlank()) add(SheetOption("Release", false, detail = release.take(80), enabled = false))
+        if (src.addon.isNotBlank()) add(SheetOption("Add-on", false, detail = src.addon, enabled = false))
+        StreamRanking.sizeText(src)?.let { add(SheetOption("Size", false, detail = it, enabled = false)) }
+    }
+    if (stats.isNotEmpty()) {
+        add(SheetOption("Playback", false, enabled = false, isHeader = true))
+        stats.forEach { (label, value) -> add(SheetOption(label, false, detail = value, enabled = false)) }
+    }
+}
 
 private data class SubtitleSettingsCopy(
     val unavailable: String,

@@ -1,5 +1,6 @@
 package com.vortx.android.ui.components
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -135,16 +136,30 @@ fun LoadingRail(title: String = "Loading your library", modifier: Modifier = Mod
 /// A small capsule label, e.g. the add-on name or a "TORRENT" tag on a source row: now the VortX glass
 /// badge (warm translucent fill, lit top edge) rather than a flat `surface2` pill. It is chrome only,
 /// used on source / episode rows and the sources list, NEVER painted over poster or backdrop art.
+///
+/// [prominent] carries meaning through an ember-accent fill + accent text (the cached / quality badge),
+/// where a neutral badge (add-on name, TORRENT) stays warm glass -- the Android analogue of the Apple
+/// source label's prominent-vs-neutral badge split.
 @Composable
-fun Badge(text: String, modifier: Modifier = Modifier) {
+fun Badge(text: String, modifier: Modifier = Modifier, prominent: Boolean = false) {
+    val accent = VortXTheme.colors.accent
     androidx.compose.material3.Text(
         text = text.uppercase(),
-        style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textSecondary, fontWeight = FontWeight.SemiBold),
+        style = VortXTheme.type.eyebrow.copy(
+            color = if (prominent) accent else VortXTheme.colors.textSecondary,
+            fontWeight = FontWeight.SemiBold,
+        ),
         modifier = modifier
-            .vortxGlass(
-                shape = VortXShapes.pill,
-                fillAlpha = VortXGlass.badgeFillAlpha,
-                shadow = VortXGlass.Shadow.flat,
+            .then(
+                if (prominent) {
+                    Modifier.background(accent.copy(alpha = 0.22f), VortXShapes.pill)
+                } else {
+                    Modifier.vortxGlass(
+                        shape = VortXShapes.pill,
+                        fillAlpha = VortXGlass.badgeFillAlpha,
+                        shadow = VortXGlass.Shadow.flat,
+                    )
+                },
             )
             .padding(horizontal = 10.dp, vertical = 4.dp),
     )

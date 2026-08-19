@@ -36,6 +36,31 @@ interface PlayerEngine {
     /** True only when this engine can force a live audio output policy. */
     val audioOutputModeAvailable: Boolean get() = false
 
+    /**
+     * True only when this engine can render a SECOND subtitle track at the same time as the primary
+     * (libmpv `secondary-sid`). ExoPlayer has no secondary-subtitle overlay, so it stays false and the
+     * chrome hides the control. Mirrors the Apple player's mpv-only dual-subtitle path.
+     */
+    val secondarySubtitleAvailable: Boolean get() = false
+
+    /**
+     * True only when this engine exposes a hardware/software decode switch (libmpv `hwdec`). ExoPlayer
+     * always decodes in hardware and offers no runtime force, so it stays false and the chrome hides the
+     * Decoder rows. Mirrors Apple `PlayerEngine.setHardwareDecoding` being an mpv-only control.
+     */
+    val hardwareDecodingAvailable: Boolean get() = false
+
+    /**
+     * The engine-native id of the PRIMARY subtitle track, or -1 for none / unsupported. When a secondary
+     * subtitle is active, libmpv flags BOTH the primary and secondary tracks `selected`, so the chrome
+     * keys the primary checkmark off this explicit id instead of the per-track flag. Mirrors Apple
+     * `MPVMetalViewController.primarySubtitleID`.
+     */
+    val primarySubtitleId: Int get() = -1
+
+    /** The engine-native id of the SECONDARY subtitle track, or -1 for none / unsupported. */
+    val secondarySubtitleId: Int get() = -1
+
     /// Begin (or replace) playback of [playable]. Applies per-stream headers and mounts external
     /// subtitles. Safe to call once per engine instance for the player's lifetime.
     fun load(playable: com.vortx.android.model.Playable)
@@ -70,6 +95,17 @@ interface PlayerEngine {
     /// Mount an additional external subtitle file at runtime and offset its timing (seconds, +/-).
     fun addExternalSubtitle(url: String)
     fun setSubtitleDelay(seconds: Double)
+
+    /// Select a SECOND subtitle track shown alongside the primary (libmpv `secondary-sid`), for language
+    /// study; `null` (or a negative id) turns the second subtitle off. A documented no-op on engines with
+    /// no secondary-subtitle overlay (ExoPlayer). Mirrors Apple `setSecondarySubtitleTrack`.
+    fun setSecondarySubtitleTrack(id: Int?) {}
+
+    /// Force hardware (`true`) or software (`false`) decode (libmpv `hwdec`). Software is the escape hatch
+    /// for green / garbled frames on a device whose hardware codec mishandles a stream; hardware
+    /// (`mediacodec`) is the default and the DV/HDR passthrough path. A documented no-op on ExoPlayer,
+    /// which always decodes in hardware. Mirrors Apple `setHardwareDecoding`.
+    fun setHardwareDecoding(hardware: Boolean) {}
 
     /// Offset the AUDIO track's timing relative to video (seconds, +/-) to fix a lip-sync drift. mpv's
     /// `audio-delay`. ExoPlayer has no live audio-delay knob, so its implementation is a documented no-op
@@ -138,8 +174,10 @@ interface PlayerEngine {
 }
 
 /// How the video fills the surface: [FIT] letterboxes to preserve the whole frame (default), [ZOOM]
-/// crops to fill the screen (fill/zoom). The chrome's aspect toggle cycles between them.
-enum class VideoScaleMode { FIT, ZOOM }
+/// crops to fill the screen keeping aspect (fill), [STRETCH] distorts the frame to fill the screen
+/// (mpv `keepaspect=no` / ExoPlayer `RESIZE_MODE_FILL`). The chrome's aspect sheet picks between them.
+/// Mirrors the Apple player's Aspect Ratio panel (`original` / `fill` / `stretch`).
+enum class VideoScaleMode { FIT, ZOOM, STRETCH }
 
 /// A single audio or subtitle track the chrome can offer. `id` is the engine-native selector passed
 /// back to [PlayerEngine.selectAudioTrack] / [selectSubtitleTrack]; `title` / `lang` are for display.

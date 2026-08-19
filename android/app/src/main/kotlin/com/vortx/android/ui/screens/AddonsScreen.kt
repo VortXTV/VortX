@@ -1,5 +1,7 @@
 package com.vortx.android.ui.screens
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,7 +16,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Visibility
@@ -28,6 +32,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -40,11 +45,15 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
+import com.vortx.android.R
+import com.vortx.android.engine.AddonHealth
+import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
@@ -52,6 +61,7 @@ import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
+import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.AddonsViewModel
 import kotlin.math.roundToInt
@@ -60,8 +70,8 @@ import kotlin.math.roundToInt
 /// install-by-URL form -> installed list as surface-card rows. Mirrors Apple `AddonsView`'s core
 /// loop, plus two ported affordances: the per-profile on/off eye toggle per row (Apple
 /// `AddonsView.swift:424` -> `toggleAddon`) and drag-reorder priority mode (Apple
-/// `AddonsView.swift:476 .onMove` / `AddonReorderView`). Health probing, QR pairing, and the
-/// add-on catalog/store browser remain deferred (the store browser has no engine model to drive it).
+/// `AddonsView.swift:476 .onMove` / `AddonReorderView`). QR pairing and the add-on catalog/store
+/// browser remain separate parity work.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modifier = Modifier) {
@@ -69,7 +79,35 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
     val urlInput by viewModel.urlInput.collectAsStateWithLifecycle()
     val installing by viewModel.installing.collectAsStateWithLifecycle()
     val installMessage by viewModel.installMessage.collectAsStateWithLifecycle()
+    val health by viewModel.health.collectAsStateWithLifecycle()
+    val pendingUpdate by viewModel.pendingUpdate.collectAsStateWithLifecycle()
     val colors = VortXTheme.colors
+
+    LaunchedEffect(viewModel) {
+        viewModel.onScreenEntry()
+    }
+
+    // Update-if-installed confirm (SRC-8, Apple `AddonsView` confirmationDialog): pasting a URL that is
+    // already installed pops this instead of silently re-installing, so an accidental re-paste is a
+    // deliberate refresh, and the success line reads "Updated." rather than "Installed.".
+    if (pendingUpdate != null) {
+        AlertDialog(
+            onDismissRequest = viewModel::cancelUpdate,
+            title = { Text(stringResource(R.string.addon_update_confirm_title), style = VortXTheme.type.cardTitle) },
+            text = { Text(stringResource(R.string.addon_update_confirm_message), style = VortXTheme.type.body) },
+            confirmButton = {
+                TextButton(onClick = viewModel::confirmUpdate) {
+                    Text(stringResource(R.string.addon_update_confirm_button), color = colors.accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = viewModel::cancelUpdate) {
+                    Text(stringResource(R.string.addon_update_confirm_cancel), color = colors.textSecondary)
+                }
+            },
+            containerColor = colors.surface2,
+        )
+    }
 
     // Reorder mode (the Android twin of Apple's separate `AddonReorderView` screen, kept in-place as
     // a mode toggle): the normal management list swaps for a drag list of the same add-ons.
@@ -151,6 +189,18 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
                     }
                 }
             }
+            if (installed.isNotEmpty()) {
+                item {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Chip(
+                            label = stringResource(R.string.addon_health_recheck),
+                            selected = false,
+                            onClick = viewModel::recheckHealth,
+                            modifier = Modifier.focusable(),
+                        )
+                    }
+                }
+            }
             when (val s = state) {
                 is UiState.Loading -> item { EmptyState("Loading your add-ons…") }
                 is UiState.Error -> item { ErrorState(s.message, onRetry = { viewModel.load() }) }
@@ -161,6 +211,7 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
                         items(s.data, key = { it.transportUrl }) { addon ->
                             AddonRow(
                                 addon = addon,
+                                health = health[AddonHealthStore.normalizeUrl(addon.transportUrl)] ?: AddonHealth.Unknown,
                                 onToggle = { viewModel.toggleAddon(addon) },
                                 onRemove = { viewModel.remove(addon) },
                             )
@@ -173,7 +224,12 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
 }
 
 @Composable
-private fun AddonRow(addon: InstalledAddon, onToggle: () -> Unit, onRemove: () -> Unit) {
+private fun AddonRow(
+    addon: InstalledAddon,
+    health: AddonHealth,
+    onToggle: () -> Unit,
+    onRemove: () -> Unit,
+) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -215,6 +271,7 @@ private fun AddonRow(addon: InstalledAddon, onToggle: () -> Unit, onRemove: () -
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                AddonHealthIndicator(health)
             }
             if (!addon.isProtected) {
                 // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls
@@ -232,6 +289,31 @@ private fun AddonRow(addon: InstalledAddon, onToggle: () -> Unit, onRemove: () -
                 }
             }
         }
+    }
+}
+
+@Composable
+internal fun AddonHealthIndicator(health: AddonHealth) {
+    val colors = VortXTheme.colors
+    val label = when (health) {
+        AddonHealth.Unknown -> stringResource(R.string.addon_health_not_checked)
+        AddonHealth.Checking -> stringResource(R.string.addon_health_checking)
+        is AddonHealth.Online -> stringResource(R.string.addon_health_online_ms, health.latencyMillis)
+        is AddonHealth.Slow -> stringResource(R.string.addon_health_slow_ms, health.latencyMillis)
+        AddonHealth.Unreachable -> stringResource(R.string.addon_health_unreachable)
+    }
+    val color = when (health) {
+        AddonHealth.Unknown, AddonHealth.Checking -> colors.textTertiary
+        is AddonHealth.Online -> VortXAccents.forest.base
+        is AddonHealth.Slow -> VortXAccents.gold.base
+        AddonHealth.Unreachable -> colors.danger
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Box(modifier = Modifier.size(8.dp).background(color, CircleShape))
+        Text(label, style = VortXTheme.type.label.copy(color = color))
     }
 }
 

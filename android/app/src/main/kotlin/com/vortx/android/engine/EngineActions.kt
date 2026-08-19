@@ -197,6 +197,8 @@ object EngineActions {
             ),
         )
 
+    fun searchUnload(): String = envelope(FIELD_SEARCH, action("Unload", null))
+
     /// Load a title's meta + a guessed best stream. For a series episode, pass [streamType]/[streamId]
     /// (the episode's video id) so the engine fetches that episode's streams. Mirrors CoreBridge.loadMeta.
     fun loadMeta(type: String, id: String, streamType: String? = null, streamId: String? = null): String {

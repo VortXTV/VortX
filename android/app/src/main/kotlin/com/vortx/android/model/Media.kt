@@ -153,6 +153,10 @@ data class MetaItem(
     val background: String? = null,
     val imdbRating: String? = null,
     val genres: List<String> = emptyList(),
+    /** Best-effort catalog-preview fields used only when an add-on supplies them in `links`. */
+    val certificationLabel: String? = null,
+    val previewRuntimeMinutes: Int? = null,
+    val previewSeasonCount: Int? = null,
     val resumeSeconds: Double? = null,
     val caption: String? = null,
     val watched: Boolean = false,

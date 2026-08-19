@@ -68,6 +68,13 @@ mpvLibmpv = "1.0.0"
 # (Compose is backward-compatible within its stable API). tv-material is NOT a licensing-boundary
 # dependency (it carries no GPL native code), so it is a plain `implementation` in BOTH flavors.
 tvMaterial = "1.0.0"
+# androidx.tvprovider (TV-2 Android TV "Play Next" / Watch Next row). 1.0.0 is the stable release of the
+# TvProvider support library; it is a plain Java/AndroidX artifact with no Kotlin metadata, so the
+# forward-metadata-compat rule the rest of this file follows does not even apply. It supplies
+# TvContractCompat + WatchNextProgram, the system-TvProvider bridge that publishes Continue Watching onto
+# the Android TV home "Play Next" row. Carries no GPL native code, so it is a plain `implementation` in
+# BOTH flavors (the row is available on the sideloaded `full` build and any future Play build alike).
+tvProvider = "1.0.0"
 coil = "3.3.0"
 # WorkManager: the offline-downloads transport (com.vortx.android.downloads.DownloadWorker). It is the Android
 # mechanism with the contract Apple gets from a `.background` URLSession -- work persisted in its own database and
@@ -119,6 +126,7 @@ media3-session = { group = "androidx.media3", name = "media3-session", version.r
 mpv-libmpv = { group = "dev.jdtech.mpv", name = "libmpv", version.ref = "mpvLibmpv" }
 
 tv-material = { group = "androidx.tv", name = "tv-material", version.ref = "tvMaterial" }
+tv-provider = { group = "androidx.tvprovider", name = "tvprovider", version.ref = "tvProvider" }
 
 coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
 coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }

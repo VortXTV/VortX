@@ -24,6 +24,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
@@ -47,9 +48,31 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private val appContext = context.applicationContext
 
     // Built once, survives the engine's lifetime. DefaultRenderersFactory carries the built-in DV codec
-    // fallback; we add nothing on top of it (mirrors the original PlayerScreen).
-    private val player: ExoPlayer =
-        ExoPlayer.Builder(appContext, DefaultRenderersFactory(appContext)).build()
+    // fallback; we keep it (and the default track selector + per-load MediaSource wiring) untouched. When
+    // the buffer-tuning flag is on we additionally hand ExoPlayer a RAM-sized LoadControl and a seeded
+    // bandwidth meter (see [buildPlayer]); when off, this is the original stock player.
+    private val player: ExoPlayer = buildPlayer(appContext)
+
+    /**
+     * Build the ExoPlayer. The renderers factory is always [DefaultRenderersFactory] (the DV/Atmos codec
+     * fallback this engine exists for). With [BufferTuningSetting] on we attach:
+     *   - [VortxExoLoadControl]: a deeper, RAM-tier-sized buffer so a 4K VBR peak is not starved.
+     *   - A [DefaultBandwidthMeter] seeded with a high initial estimate so the very first chunk of a fast
+     *     stream is not throttled by a cold, pessimistic default estimate.
+     * With the flag off, neither is set and this is the stock player (the pre-tuning behavior).
+     */
+    private fun buildPlayer(context: Context): ExoPlayer {
+        val builder = ExoPlayer.Builder(context, DefaultRenderersFactory(context))
+        if (BufferTuningSetting.isEnabled(context)) {
+            builder.setLoadControl(VortxExoLoadControl.create(context))
+            builder.setBandwidthMeter(
+                DefaultBandwidthMeter.Builder(context)
+                    .setInitialBitrateEstimate(INITIAL_BITRATE_ESTIMATE_BPS)
+                    .build(),
+            )
+        }
+        return builder.build()
+    }
 
     private val _state = MutableStateFlow(PlayerState())
     override val state: StateFlow<PlayerState> = _state.asStateFlow()
@@ -422,12 +445,19 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun VideoScaleMode.toResizeMode(): Int = when (this) {
         VideoScaleMode.FIT -> AspectRatioFrameLayout.RESIZE_MODE_FIT
         VideoScaleMode.ZOOM -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+        // Stretch distorts the frame to fill the surface (ignores the source aspect), the Media3 analogue
+        // of mpv's keepaspect=no.
+        VideoScaleMode.STRETCH -> AspectRatioFrameLayout.RESIZE_MODE_FILL
     }
 
     private companion object {
         const val POSITION_POLL_MS = 1_000L
         const val MIN_SPEED = 0.25f
         const val MAX_SPEED = 4.0f
+
+        // Seed the bandwidth meter at 50 Mbps so the first chunk of a fast 4K stream is not throttled by a
+        // cold, pessimistic estimate; the meter corrects itself from real throughput within a segment or two.
+        const val INITIAL_BITRATE_ESTIMATE_BPS = 50_000_000L
     }
 }
 

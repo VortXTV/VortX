@@ -24,6 +24,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXMotion
 import com.vortx.android.ui.theme.VortXShapes
@@ -52,6 +53,7 @@ fun Chip(
     accent: Color = VortXTheme.colors.accent,
     accentText: Color = VortXTheme.colors.accentBright,
     onLongClick: (() -> Unit)? = null,
+    stateDescription: String? = null,
 ) {
     val colors = VortXTheme.colors
     val interactionSource = remember { MutableInteractionSource() }
@@ -67,6 +69,7 @@ fun Chip(
         !enabled -> colors.textTertiary
         else -> colors.textSecondary
     }
+    val accessibilityStateDescription = stateDescription
 
     Row(
         modifier = modifier
@@ -98,7 +101,10 @@ fun Chip(
                     )
                 },
             )
-            .semantics { this.selected = selected }
+            .semantics {
+                this.selected = selected
+                accessibilityStateDescription?.let { this.stateDescription = it }
+            }
             .padding(horizontal = 16.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterHorizontally),
     ) {

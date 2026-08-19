@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.vortx.android.auth.AuthIdentityStore
 import com.vortx.android.data.AddonPrefsStore
+import com.vortx.android.data.AddonTombstones
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.ContinueWatchingDismissal
@@ -593,6 +594,10 @@ class EngineStremioRepository(
     private val addonPrefs by lazy {
         AddonPrefsStore(appContext) { ProfileStore.sharedOrNull()?.activeProfileId ?: AddonPrefsStore.DEFAULT_PROFILE }
     }
+    /// Durable add-on removal tombstones (SRC-2): a removed add-on stays removed across an engine reset /
+    /// re-seed of OFFICIAL_ADDONS (#137), and an explicit re-install forgets the tombstone. Device-wide,
+    /// mirroring Apple's `AddonTombstones` static.
+    private val addonTombstones by lazy { AddonTombstones(appContext) }
     private val homePagination = HomePaginationState(DEFAULT_BOARD_ROWS, DEFAULT_BOARD_ROWS)
     private val watchedIndex = WatchedIndex(appContext.filesDir)
 
@@ -1566,7 +1571,24 @@ class EngineStremioRepository(
         // list); newly installed add-ons fold in at the end in engine order. Each entry is stamped
         // with the ACTIVE profile's on/off overlay so the Add-ons screen renders the eye toggle
         // state without a second query.
-        val addons = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        val parsed = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        // Anti-resurrection (SRC-2): an add-on the user removed can be re-seeded into the engine by a reset /
+        // account restore (OFFICIAL_ADDONS, #137). Any effectively-removed, non-protected add-on the engine
+        // brought back is uninstalled again and hidden from the list. Protected stubs are never tombstoned, so
+        // they can never appear in the removed set. Fail-soft per add-on; self-limiting (once the engine no
+        // longer holds it, later reads find nothing to uninstall).
+        val removed = addonTombstones.all()
+        val addons = if (removed.isEmpty()) {
+            parsed
+        } else {
+            parsed.filter { addon ->
+                val resurrected = !addon.isProtected && AddonTombstones.normalize(addon.transportUrl) in removed
+                if (resurrected) {
+                    runCatching { StremioCoreNative.dispatch(EngineActions.uninstallAddon(addon.rawDescriptorJson)) }
+                }
+                !resurrected
+            }
+        }
         val disabledAddons = addonPrefs.disabledBases()
         addonPrefs.orderedByApplied(addons) { it.transportUrl }.map { addon ->
             val disabled = AddonOrder.normalize(addon.transportUrl) in disabledAddons
@@ -1654,7 +1676,7 @@ class EngineStremioRepository(
     }
 
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
-        val normalized = normalizeAddonUrl(url)
+        val normalized = normalizedAddonUrl(url)
             ?: throw IllegalArgumentException("Enter a valid add-on URL (https://…/manifest.json).")
         // The engine has no HTTP-fetch action for a bare add-on URL (mirrors Apple: CoreBridge.installAddon
         // fetches client-side too) -- fetch + validate the manifest here, then hand the engine the fully
@@ -1663,15 +1685,24 @@ class EngineStremioRepository(
         val manifest = fetchAddonManifest(normalized)
             ?: throw IllegalStateException("That URL did not return a valid add-on manifest.")
         StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest))
+        // An explicit install is intent to HAVE the add-on: clear any removal tombstone so a re-install of a
+        // previously removed add-on is honored, not re-suppressed on the next read (SRC-2, Apple
+        // `CoreBridge.installAddon` -> `AddonTombstones.forget`).
+        addonTombstones.forget(normalized)
     }
 
     override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {
         StremioCoreNative.dispatch(EngineActions.uninstallAddon(addon.rawDescriptorJson))
+        // Record the removal so a re-seeded OFFICIAL add-on (YouTube, WatchHub, ...) the user deleted stays
+        // gone across an engine reset (#137). PROTECTED stubs (Cinemeta, Local) are never tombstoned: a logout
+        // resets the engine to exactly those, so a tombstone would wrongly suppress an essential default
+        // forever (SRC-2, Apple `CoreBridge.uninstallAddon` -> `AddonTombstones.tombstone`).
+        if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)
     }
 
     /// Trim + validate scheme + ensure a `/manifest.json` suffix, mirroring Apple
     /// `CoreBridge.normalizedAddonURL`. Null for anything that isn't a plausible http(s) URL.
-    private fun normalizeAddonUrl(raw: String): String? {
+    override fun normalizedAddonUrl(raw: String): String? {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return null
         val uri = runCatching { URI(trimmed) }.getOrNull() ?: return null
@@ -1687,17 +1718,55 @@ class EngineStremioRepository(
         addonManifestFetcher.fetch(url)
     }
 
-    override suspend fun search(query: String): Result<List<MetaItem>> = withContext(Dispatchers.Default) { runCatching {
-        if (query.isBlank()) return@runCatching emptyList()
-        StremioCoreNative.dispatch(EngineActions.searchLoad(query))
-        // search is a CatalogsWithExtra (rails); flatten the rails to a flat result list for the UI.
-        // Ready = first add-on answered with rows; a genuinely zero-hit query rides the timeout and
-        // returns [] (acceptable until S04 makes Search reactive like Home).
-        val state = loadFieldUntil(EngineActions.FIELD_SEARCH, EngineActions.searchRange(DEFAULT_SEARCH_ROWS)) {
-            EngineState.parseCatalogs(it).any { row -> row.items.isNotEmpty() }
+    override fun searchUpdates(query: String): Flow<Pair<List<MetaItem>, Boolean>> = channelFlow {
+        val trimmed = query.trim()
+        if (trimmed.length < 2) {
+            StremioCoreNative.dispatch(EngineActions.searchUnload())
+            send(emptyList<MetaItem>() to false)
+            return@channelFlow
         }
-        EngineState.parseCatalogs(state).flatMap { it.items }
-    } }
+
+        // Subscribe before dispatch: Runtime::dispatch emits the initial Loading NewState
+        // synchronously, so subscribing afterwards can lose the only wake-up for that snapshot.
+        launch(start = CoroutineStart.UNDISPATCHED) {
+            changedFields.collect { fields ->
+                if (EngineActions.FIELD_CTX in fields) {
+                    // Profile/add-on replanning seeds new nil pages without fetching them. Reissue the
+                    // same range to fill only those holes; settled pages are reused by the engine.
+                    StremioCoreNative.dispatch(EngineActions.searchRange(DEFAULT_SEARCH_ROWS))
+                }
+                if (EngineActions.FIELD_SEARCH in fields || EngineActions.FIELD_CTX in fields) {
+                    send(currentSearchUpdate())
+                }
+            }
+        }
+
+        StremioCoreNative.dispatch(EngineActions.searchLoad(trimmed))
+        StremioCoreNative.dispatch(EngineActions.searchRange(DEFAULT_SEARCH_ROWS))
+        send(currentSearchUpdate())
+    }.conflate().distinctUntilChanged().flowOn(Dispatchers.Default)
+
+    private fun currentSearchUpdate(): Pair<List<MetaItem>, Boolean> =
+        EngineState.parseSearchUpdate(
+            StremioCoreNative.getState("\"${EngineActions.FIELD_SEARCH}\""),
+            requestedEnd = DEFAULT_SEARCH_ROWS,
+        )
+
+    override suspend fun search(query: String): Result<List<MetaItem>> = withContext(Dispatchers.Default) {
+        runCatching {
+            val trimmed = query.trim()
+            if (trimmed.length < 2) {
+                StremioCoreNative.dispatch(EngineActions.searchUnload())
+                return@runCatching emptyList()
+            }
+            StremioCoreNative.dispatch(EngineActions.searchLoad(trimmed))
+            val state = loadFieldUntil(
+                EngineActions.FIELD_SEARCH,
+                EngineActions.searchRange(DEFAULT_SEARCH_ROWS),
+            ) { !EngineState.parseSearchUpdate(it, DEFAULT_SEARCH_ROWS).second }
+            EngineState.parseSearchUpdate(state, DEFAULT_SEARCH_ROWS).first
+        }
+    }
 
     override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
         val permit = historyOwnerFence.captureRead()

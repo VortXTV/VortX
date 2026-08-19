@@ -75,6 +75,22 @@ object DownloadManager {
     private const val QUEUE_ORDER_KEY = "vortx.downloads.queueOrder"
     private const val AWAITING_UNLOCK_KEY = "vortx.downloads.awaitingUnlock"
 
+    /**
+     * Auto-delete watched downloads (SET-11, Apple `DownloadManager.autoDeleteWatchedDefaultsKey`). A SYNCED
+     * policy, not a device-local knob, so it lives in the shared [SHARED_SETTINGS_FILE] alongside the other
+     * cross-device settings rather than the device-local [PREFS] file (max-concurrent / queue order live
+     * there). Default OFF, on Apple's EXACT key so the choice round-trips across devices.
+     *
+     * The reclaim SWEEP itself (delete a completed download once its title is finished-watched) is NOT wired
+     * here yet: Android's [com.vortx.android.library.WatchedIndex] is a per-profile Home-badge helper that
+     * marks a SERIES watched as soon as any episode ticks, so wiring it naively would over-delete a
+     * part-watched show's episodes. The safe per-episode finished-watched signal Apple reads is a separate
+     * port; the toggle persists + syncs now and gates the sweep once that signal exists. Deleting a user's
+     * file on a false positive is the failure mode this defers.
+     */
+    const val AUTO_DELETE_WATCHED_KEY = "vortx.downloads.autoDeleteWatched"
+    private const val SHARED_SETTINGS_FILE = "vortx_settings"
+
     /** Apple's `concurrencyRange` / `defaultMaxConcurrent`, unchanged. */
     val CONCURRENCY_RANGE = 1..5
     private const val DEFAULT_MAX_CONCURRENT = 2
@@ -145,6 +161,17 @@ object DownloadManager {
     private val awaitingUnlock = mutableSetOf<String>()
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+    private fun sharedSettings(context: Context) =
+        context.applicationContext.getSharedPreferences(SHARED_SETTINGS_FILE, Context.MODE_PRIVATE)
+
+    /** Whether watched downloads should be auto-deleted (SET-11). Synced, default OFF. */
+    fun isAutoDeleteWatchedEnabled(context: Context): Boolean =
+        sharedSettings(context).getBoolean(AUTO_DELETE_WATCHED_KEY, false)
+
+    fun setAutoDeleteWatchedEnabled(context: Context, enabled: Boolean) {
+        sharedSettings(context).edit().putBoolean(AUTO_DELETE_WATCHED_KEY, enabled).apply()
+    }
 
     @Volatile
     private var restored = false
