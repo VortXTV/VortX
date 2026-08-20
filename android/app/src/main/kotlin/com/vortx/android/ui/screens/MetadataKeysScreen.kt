@@ -31,7 +31,9 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import android.content.Context
 import com.vortx.android.metadata.MetadataProviderKeys
+import com.vortx.android.VortXApplication
 import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
@@ -76,14 +78,18 @@ fun MetadataKeysScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
             )
             MetadataProviderKeys.Slot.entries.forEach { slot ->
-                MetadataKeySection(slot = slot, keys = keys)
+                MetadataKeySection(context = context, slot = slot, keys = keys)
             }
         }
     }
 }
 
 @Composable
-private fun MetadataKeySection(slot: MetadataProviderKeys.Slot, keys: MetadataProviderKeys) {
+private fun MetadataKeySection(
+    context: Context,
+    slot: MetadataProviderKeys.Slot,
+    keys: MetadataProviderKeys,
+) {
     val colors = VortXTheme.colors
     val focusManager = LocalFocusManager.current
     var hasValue by remember(slot) { mutableStateOf(keys.hasValue(slot)) }
@@ -108,6 +114,7 @@ private fun MetadataKeySection(slot: MetadataProviderKeys.Slot, keys: MetadataPr
         val durable = keys.set(slot, pending)
         storageUnavailable = !durable
         if (durable) {
+            (context as? VortXApplication)?.syncManager?.requestSyncSoon()
             hasValue = keys.hasValue(slot)
             pending = ""
             focusManager.clearFocus()
@@ -161,7 +168,10 @@ private fun MetadataKeySection(slot: MetadataProviderKeys.Slot, keys: MetadataPr
                     onClick = {
                         val durable = keys.set(slot, "")
                         storageUnavailable = !durable
-                        if (durable) hasValue = keys.hasValue(slot)
+                        if (durable) {
+                            (context as? VortXApplication)?.syncManager?.requestSyncSoon()
+                            hasValue = keys.hasValue(slot)
+                        }
                         focusManager.clearFocus()
                     },
                 ) {

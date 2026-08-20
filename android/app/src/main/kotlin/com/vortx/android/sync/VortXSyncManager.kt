@@ -6,6 +6,7 @@ import android.util.Log
 import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.metadata.MetadataProviderKeys
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
@@ -688,6 +689,7 @@ class VortXSyncManager(context: Context) {
     /** Per-account value/clear records for the settings blob; see [SettingsSyncLedger]. */
     private val settingsLedger = SettingsSyncLedger(appContext)
     private val debridKeys = DebridKeys(appContext)
+    private val metadataKeys = MetadataProviderKeys(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
     private val sessionState = DurableSessionState(
@@ -736,6 +738,7 @@ class VortXSyncManager(context: Context) {
 
     init {
         settingsPrefs.registerOnSharedPreferenceChangeListener(settingsChangeListener)
+        metadataKeys.bindOwner(sessionState.value?.account?.id)
     }
 
     private val session: Session? get() = sessionState.value
@@ -1172,6 +1175,7 @@ class VortXSyncManager(context: Context) {
             }
             cancelSessionWork()
             sessionState.clear {
+                metadataKeys.bindOwner(null)
                 _account.value = null
                 _sessionUiState.value = SessionUiState.SignedOut
             }
@@ -1522,6 +1526,7 @@ class VortXSyncManager(context: Context) {
                 // gap 2: mirror this device's connected-service (debrid) keys on doc.apiKeys, read-merge +
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
+                mergeMetadataKeysIntoDoc(lease, doc)
             }
         }
         return doc.takeIf { published && isSyncLeaseCurrent(lease) }
@@ -1595,6 +1600,35 @@ class VortXSyncManager(context: Context) {
             if (value.isNotEmpty() && debridKeys.setKey(service, value)) applied = true
         }
         return applied
+    }
+
+    /** Owner-scoped metadata slots share the account document's established exact API-key names. */
+    private fun mergeMetadataKeysIntoDoc(lease: SyncSessionLease, doc: JSONObject) {
+        if (!isSyncLeaseCurrent(lease)) return
+        metadataKeys.bindOwner(lease.accountId)
+        val keys = doc.optJSONObject("apiKeys")?.let { JSONObject(it.toString()) } ?: JSONObject()
+        metadataKeys.value(MetadataProviderKeys.Slot.TMDB).takeIf(String::isNotEmpty)?.let { keys.put("tmdb", it) }
+        metadataKeys.value(MetadataProviderKeys.Slot.MDBLIST).takeIf(String::isNotEmpty)?.let { keys.put("mdblist", it) }
+        metadataKeys.value(MetadataProviderKeys.Slot.FANART).takeIf(String::isNotEmpty)?.let { keys.put("fanart", it) }
+        if (keys.length() > 0) doc.put("apiKeys", keys)
+    }
+
+    /** Incoming metadata credentials are only admitted to the lease owner's secure namespace. */
+    private fun applyMetadataKeys(lease: SyncSessionLease, apiKeys: JSONObject?): Boolean {
+        apiKeys ?: return false
+        if (!isSyncLeaseCurrent(lease)) return false
+        metadataKeys.bindOwner(lease.accountId)
+        var applied = false
+        apiKeys.optString("tmdb", "").takeIf(String::isNotEmpty)?.let {
+            if (metadataKeys.set(MetadataProviderKeys.Slot.TMDB, it)) applied = true
+        }
+        apiKeys.optString("mdblist", "").takeIf(String::isNotEmpty)?.let {
+            if (metadataKeys.set(MetadataProviderKeys.Slot.MDBLIST, it)) applied = true
+        }
+        apiKeys.optString("fanart", "").takeIf(String::isNotEmpty)?.let {
+            if (metadataKeys.set(MetadataProviderKeys.Slot.FANART, it)) applied = true
+        }
+        return applied && isSyncLeaseCurrent(lease)
     }
 
     /**
@@ -1701,6 +1735,7 @@ class VortXSyncManager(context: Context) {
         // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
         // applyingRemote window). Owner-scoped by DebridKeys' account binding; never clears a key the blob omits.
         if (applyDebridKeys(doc.optJSONObject("apiKeys"))) restored = true
+        if (applyMetadataKeys(lease, doc.optJSONObject("apiKeys"))) restored = true
         // Stamp the applied version so the version-wins guard holds across relaunches (per account).
         if (!advanceVersion(lease, version)) return false
         return restored
@@ -1923,6 +1958,7 @@ class VortXSyncManager(context: Context) {
                 onCommitted = ::cancelSessionWork,
             ) {
                 sessionState.replace(s) {
+                    metadataKeys.bindOwner(account.id)
                     _account.value = account
                     _sessionUiState.value = SessionUiState.SignedIn(account)
                 }

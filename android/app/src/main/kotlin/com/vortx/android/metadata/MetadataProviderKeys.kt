@@ -22,7 +22,9 @@ import com.vortx.android.integrations.SecureTokenStore
  */
 class MetadataProviderKeys(context: Context) {
 
-    private val store = SecureTokenStore(context.applicationContext, CREDENTIALS_FILE)
+    private val appContext = context.applicationContext
+    private val store = SecureTokenStore(appContext, CREDENTIALS_FILE)
+    private val ownerPrefs = appContext.getSharedPreferences(OWNER_FILE, Context.MODE_PRIVATE)
 
     /** The three metadata slots, each carrying Apple's exact storage key + user-facing copy. */
     enum class Slot(val key: String, val displayName: String, val hint: String) {
@@ -43,8 +45,19 @@ class MetadataProviderKeys(context: Context) {
         ),
     }
 
+    /**
+     * Bind the secure namespace to a VortX account. Empty/malformed ids deliberately resolve to the
+     * isolated signed-out namespace rather than aliasing an account. This is synchronous so a caller
+     * cannot read an old owner's slot in the interval before an async reload completes.
+     */
+    fun bindOwner(accountId: String?) {
+        val owner = normalizedOwner(accountId)
+        ownerPrefs.edit().putString(KEY_OWNER, owner).commit()
+        migrateLegacyIfSafe(owner)
+    }
+
     /** The stored value for [slot], or empty when unset. The value never leaves the secure store otherwise. */
-    fun value(slot: Slot): String = store.string(slot.key) ?: ""
+    fun value(slot: Slot): String = store.string(scopedKey(currentOwner(), slot)) ?: ""
 
     fun hasValue(slot: Slot): Boolean = value(slot).isNotEmpty()
 
@@ -55,10 +68,41 @@ class MetadataProviderKeys(context: Context) {
      */
     fun set(slot: Slot, value: String): Boolean {
         val trimmed = value.trim()
-        return store.set(slot.key, trimmed.ifEmpty { null })
+        return store.set(scopedKey(currentOwner(), slot), trimmed.ifEmpty { null })
     }
+
+    internal fun currentOwnerForTests(): String = currentOwner()
+
+    private fun currentOwner(): String =
+        normalizedOwner(ownerPrefs.getString(KEY_OWNER, SIGNED_OUT_OWNER))
+
+    /**
+     * Old builds used one unqualified slot. Claim it once only after a verified account bind, and only
+     * if the account's scoped slot is still absent. A signed-out process never adopts it, so a launch
+     * before session restoration cannot move a real account credential into the local namespace.
+     */
+    private fun migrateLegacyIfSafe(owner: String) {
+        if (owner == SIGNED_OUT_OWNER) return
+        for (slot in Slot.entries) {
+            val scoped = scopedKey(owner, slot)
+            if (store.string(scoped) != null) continue
+            val legacy = store.string(slot.key)?.takeIf(String::isNotBlank) ?: continue
+            if (store.set(scoped, legacy)) store.set(slot.key, null)
+        }
+    }
+
+    private fun normalizedOwner(raw: String?): String {
+        val id = raw?.trim()?.lowercase().orEmpty()
+        return if (id.matches(OWNER_ID)) id else SIGNED_OUT_OWNER
+    }
+
+    private fun scopedKey(owner: String, slot: Slot): String = "vortx.apikey.$owner.${slot.key.removePrefix("vortx.apikey.")}"
 
     companion object {
         private const val CREDENTIALS_FILE = "vortx_metadata_credentials"
+        private const val OWNER_FILE = "vortx_metadata_credential_owner"
+        private const val KEY_OWNER = "owner"
+        private const val SIGNED_OUT_OWNER = "signed-out"
+        private val OWNER_ID = Regex("[a-z0-9][a-z0-9._-]{2,127}")
     }
 }
