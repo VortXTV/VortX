@@ -40,6 +40,53 @@ enum TVAVStartWatchdogPolicy {
     }
 }
 
+/// The direct AVPlayer no-frame path is intentionally a two-engine, one-source check: AVFoundation gets its
+/// short opportunity first, then libmpv gets one bounded opportunity on the exact same source. If neither
+/// engine produces a frame, this is a source-level failure and the normal hop choke point must run rather than
+/// spending the ordinary retry budget reopening the same URL again. Keeping this decision pure makes the
+/// generation/identity fence visible to a tiny deterministic harness.
+enum TVDirectAVStartRecoveryPolicy {
+    enum Decision: Equatable {
+        case cancel
+        case hop
+    }
+
+    static func fallbackTimedOut(
+        recoveryRecorded: Bool,
+        sourceStillCurrent: Bool,
+        fallbackIsLibMPV: Bool,
+        firstFrameRendered: Bool
+    ) -> Decision {
+        guard recoveryRecorded,
+              sourceStillCurrent,
+              fallbackIsLibMPV,
+              !firstFrameRendered else { return .cancel }
+        return .hop
+    }
+}
+
+/// A cold libmpv resume deliberately defers its absolute seek until the first frame because an early absolute
+/// seek empties the cache and can wedge video output. For the narrow direct-AV fallback case, a single tiny
+/// relative seek is safe (it does not arm that absolute-seek cache hold) and can wake an input that has opened
+/// but has not started decoding. It is never retried: an unframed source after this nudge is failed over.
+enum TVLibMPVStartupNudgePolicy {
+    enum Decision: Equatable {
+        case cancel
+        case nudge
+        case hop
+    }
+
+    static func decision(
+        recoveryRecorded: Bool,
+        sourceStillCurrent: Bool,
+        firstFrameRendered: Bool,
+        nudgeAlreadyIssued: Bool
+    ) -> Decision {
+        guard recoveryRecorded, sourceStillCurrent, !firstFrameRendered else { return .cancel }
+        return nudgeAlreadyIssued ? .hop : .nudge
+    }
+}
+
 /// Pure ownership and first-frame gates shared by the 30-second source-hop timer and the event surface.
 /// Position zero is a valid rendered first frame for AVPlayer, while every timer must still prove it belongs
 /// to the exact episode, source, retry generation and logical player load that armed it.
@@ -87,6 +134,11 @@ enum TVPlaybackStartPolicy {
 /// no SwiftUI focus, because SwiftUI `@FocusState` is unreliable inside a full-screen cover on tvOS.
 /// Shares the MPVKit core with the iOS app.
 struct TVPlayerView: View {
+    private struct DirectAVNoFrameRecovery: Equatable {
+        let url: URL
+        let episodeGeneration: Int
+        let sourceGeneration: Int
+    }
     let url: URL
     let title: String
     var meta: PlaybackMeta? = nil          // when set, resume + record watch progress to the library
@@ -182,6 +234,9 @@ struct TVPlayerView: View {
     // ordinary warm-pipeline scrub, which is proven to render. Cleared at every fresh mount / teardown so it can
     // never leak onto the wrong mount.
     @State private var pendingLibmpvResumeSeek: Double? = nil
+    /// One bounded relative-seek nudge for the direct-AV fallback's cold libmpv resume only. Reset for every
+    /// new source/episode and at first frame; it must never become a periodic seek loop.
+    @State private var libmpvStartupNudgeIssued = false
     @State private var appliedResume = false
     @State private var lastSaved = -1.0               // last position persisted (throttle)
     @State private var showInfo = true
@@ -395,6 +450,10 @@ struct TVPlayerView: View {
     /// EXTENDS by 20s whenever the buffered edge has advanced since it armed, so an mpv leg that is genuinely
     /// pulling bytes keeps its long budget and only a second silent leg on the same dead URL pays the 12s.
     private let avPostDemoteStartTimeoutSeconds: Double = 12
+    /// A direct AVPlayer mount that never frames has already consumed its short native budget. libmpv still
+    /// gets a meaningful chance for an engine/container-only incompatibility, but the second engine cannot be
+    /// allowed to spend the normal 30s plus retry loop on the exact same dead signed link.
+    private let directAVFallbackMPVStartTimeoutSeconds: Double = 20
     /// When the AVPlayer start watchdog was armed for the current mount; drives the [dv] time-to-first-frame
     /// line when the timePos handler disarms it. Cleared (one-shot) by that handler.
     @State private var avWatchdogArmedAt: Date?
@@ -479,6 +538,10 @@ struct TVPlayerView: View {
     /// the demote call and consumed (cleared) as the first statement of `demoteAVPlayerToMPV`, so it can never
     /// leak into an unrelated later demote.
     @State private var demoteFollowedDeadInput = false
+    /// Present only while the direct-AVPlayer -> libmpv one-source fallback is in flight. It carries the exact
+    /// URL plus episode/source generations so an old timer can never consume the hop budget for a replacement
+    /// source or a pending episode.
+    @State private var directAVNoFrameRecovery: DirectAVNoFrameRecovery?
     // Overall wall-clock cap on PRE-START recovery. The per-budget counters (30s load timeout x
     // retries, 2 torrent warm-ups, 4 source hops, stall reloads) are independent, so on a fully
     // dead title they could chain into minutes of spinner before the error overlay. This single
@@ -1553,6 +1616,10 @@ struct TVPlayerView: View {
                         )
                     )
                     hasStartedPlaying = true
+                    // A real frame from the same-source fallback completes its recovery obligation. Clearing
+                    // this before any later callbacks makes a retired watchdog inert for this source.
+                    directAVNoFrameRecovery = nil
+                    libmpvStartupNudgeIssued = false
                     firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
                     // Deferred libmpv resume seek: the pipeline is now warm (first frame rendered), so this lands
                     // as an ordinary scrub instead of the cold pre-first-frame seek that wedged video output.
@@ -3201,6 +3268,28 @@ struct TVPlayerView: View {
     /// proxy when it can (the official-Stremio path that makes picky CDNs like ok.ru play). The
     /// server applies the headers and rewrites the HLS playlist, so mpv fetches plain loopback
     /// and needs no headers of its own; everything else loads directly with mpv-applied headers.
+    /// Values and header names are intentionally never emitted: both can carry credentials or caller data.
+    private func safeHeaderReceipt(_ headers: [String: String]?) -> String {
+        let values = headers ?? [:]
+        let names = Set(values.keys.map { $0.lowercased() })
+        return "count=\(values.count) hasRange=\(names.contains("range")) hasReferer=\(names.contains("referer")) hasUserAgent=\(names.contains("user-agent"))"
+    }
+
+    /// Failure text can originate in a provider, a remote server, AVFoundation, or libmpv. Keep the exportable
+    /// source-hop record useful without accidentally emitting an upstream URL, filename, title, or response
+    /// body carried inside that text.
+    private func safeFailureClass(_ reason: String) -> String {
+        let normalized = reason.lowercased()
+        if normalized.contains("zero-packet") { return "zero-packet" }
+        if normalized.contains("no frame") { return "no-first-frame" }
+        if normalized.contains("timeout") { return "timeout" }
+        if normalized.contains("cancel") { return "cancelled" }
+        if normalized.contains("remux") { return "remux" }
+        if normalized.contains("resume") { return "resume" }
+        if normalized.contains("stall") { return "stall" }
+        return "other"
+    }
+
     @discardableResult
     private func loadIntoPlayer(_ url: URL, headers: [String: String]?, live: Bool,
                                 reusing loadToken: PlayerLoadToken? = nil,
@@ -3267,23 +3356,31 @@ struct TVPlayerView: View {
         let candidateToken: PlayerLoadToken
         // AVFoundation and the remux server consume the raw URL + headers. Only libmpv needs the embedded
         // proxy's server-side header injection and playlist rewriting.
+        let route: String
         if player is AVPlayerEngineController {
+            route = "avplayer"
             candidateToken = player.loadFile(
                 url, headers: headers, live: live, audioSidecar: sidecar,
                 reusing: loadToken
             )
         } else if let h = headers, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: url, headers: h) {
+            route = "libmpv-proxy"
             candidateToken = player.loadFile(
                 proxied, headers: nil, live: live, audioSidecar: sidecar,
                 reusing: loadToken
             )
         } else {
+            route = "libmpv-direct"
             candidateToken = player.loadFile(
                 url, headers: headers, live: live, audioSidecar: sidecar,
                 reusing: loadToken
             )
         }
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
+        DiagnosticsLog.log(
+            "playback",
+            "source attempt route=\(route) headers=\(safeHeaderReceipt(headers)) issued=\(issuedToken != nil) hop=\(sourceHops)"
+        )
         if issuedToken != nil {
             // A real new load took: no longer frozen on the previous session's final frame. Retire the bounded
             // terminal (EOF) fallback - the fresh load's own start watchdog / load timeout owns recovery now. A
@@ -3369,6 +3466,8 @@ struct TVPlayerView: View {
         clearCachedAudioOutputTruth()
         currentPickWasExplicit = userInitiated
         currentPlaybackIsResume = false
+        directAVNoFrameRecovery = nil
+        libmpvStartupNudgeIssued = false
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         sourceHops = 0; exhaustedURLs = []
         if userInitiated {
@@ -3639,7 +3738,10 @@ struct TVPlayerView: View {
         let hops = sourceHops + 1
         let resume: Double? = resumeOverride
             ?? (hasStartedPlaying ? currentTime : resumeSeconds)
-        DiagnosticsLog.log("player", "source hop \(hops)/\(maxSourceHops) (\(reason)) -> \(sourceLabel(stream).prefix(40))")
+        DiagnosticsLog.log(
+            "player",
+            "source hop \(hops)/\(maxSourceHops) reason=\(safeFailureClass(reason)) next=candidate"
+        )
         guard switchStream(
             to: stream, url: newURL, targetMeta: sourceTargetMeta,
             userInitiated: false, resumeOverride: resume
@@ -4484,6 +4586,25 @@ struct TVPlayerView: View {
     ///    a different lower-quality source; once its grace is spent it surfaces a clear "not ready" error.
     ///  - Only the AUTO path (Watch Now / resume) hops to another source.
     private func handleStartTimeout() {
+        let directFallbackDecision = TVDirectAVStartRecoveryPolicy.fallbackTimedOut(
+            recoveryRecorded: directAVNoFrameRecovery != nil,
+            sourceStillCurrent: directAVNoFrameRecovery?.url == (curURL ?? url)
+                && directAVNoFrameRecovery?.episodeGeneration == episodeSwitchGeneration
+                && directAVNoFrameRecovery?.sourceGeneration == sourceSwitchGeneration,
+            fallbackIsLibMPV: !isAVPlayerActive,
+            firstFrameRendered: hasStartedPlaying
+        )
+        if directFallbackDecision == .hop {
+            directAVNoFrameRecovery = nil
+            DiagnosticsLog.log(
+                "playback",
+                "source attempt route=libmpv-after-avplayer outcome=no-first-frame next=source-hop"
+            )
+            if hopToNextSource(reason: "direct AVPlayer and libmpv produced no frame") { return }
+            if loadErrorMsg.isEmpty { loadErrorMsg = "This source did not produce playable media." }
+            presentTerminalLoadFailure()
+            return
+        }
         if isTorrentPlayback { warmUpTorrent(); return }   // a peerless torrent never errors; warm it up
         let avController = coordinator.player as? AVPlayerEngineController
         if TVPlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(
@@ -4555,6 +4676,9 @@ struct TVPlayerView: View {
         let followedDeadInput = demoteFollowedDeadInput
         demoteFollowedDeadInput = false
         guard useAVPlayerEngine, isAVPlayerActive else { return false }
+        let followedDirectNoFrame = directAVNoFrameRecovery?.url == (curURL ?? url)
+            && directAVNoFrameRecovery?.episodeGeneration == episodeSwitchGeneration
+            && directAVNoFrameRecovery?.sourceGeneration == sourceSwitchGeneration
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
@@ -4643,6 +4767,8 @@ struct TVPlayerView: View {
         // See avPostDemoteStartTimeoutSeconds and `demoteFollowedDeadInput`.
         if followedDeadInput {
             startLoadTimeout(seconds: avPostDemoteStartTimeoutSeconds)
+        } else if followedDirectNoFrame {
+            startLoadTimeout(seconds: directAVFallbackMPVStartTimeoutSeconds)
         } else {
             startLoadTimeout()
         }
@@ -4886,6 +5012,47 @@ struct TVPlayerView: View {
             guard !Task.isCancelled, !hasStartedPlaying,
                   pendingLibmpvResumeSeek != nil,
                   coordinator.player?.activeLoadToken == armedToken else { return }
+            let sourceStillCurrent = directAVNoFrameRecovery?.url == (curURL ?? url)
+                && directAVNoFrameRecovery?.episodeGeneration == episodeSwitchGeneration
+                && directAVNoFrameRecovery?.sourceGeneration == sourceSwitchGeneration
+            switch TVLibMPVStartupNudgePolicy.decision(
+                recoveryRecorded: directAVNoFrameRecovery != nil,
+                sourceStillCurrent: sourceStillCurrent,
+                firstFrameRendered: hasStartedPlaying,
+                nudgeAlreadyIssued: libmpvStartupNudgeIssued
+            ) {
+            case .cancel:
+                break
+            case .nudge:
+                // `seek(by:)` stays on libmpv's relative-seek path and therefore avoids the absolute-seek
+                // cache hold that the deferred-resume policy is protecting against. One tenth of a second is
+                // imperceptible, but it asks an opened demuxer to advance and matches the field observation
+                // that a manual scrub can release this exact cold-start wedge.
+                libmpvStartupNudgeIssued = true
+                coordinator.player?.seek(by: 0.1)
+                DiagnosticsLog.log(
+                    "playback",
+                    "libmpv cold-resume no-frame -> one relative startup nudge; waiting 4s before source hop"
+                )
+                try? await Task.sleep(for: .seconds(4))
+                guard !Task.isCancelled, !hasStartedPlaying,
+                      coordinator.player?.activeLoadToken == armedToken else { return }
+                if TVLibMPVStartupNudgePolicy.decision(
+                    recoveryRecorded: directAVNoFrameRecovery != nil,
+                    sourceStillCurrent: directAVNoFrameRecovery?.url == (curURL ?? url)
+                        && directAVNoFrameRecovery?.episodeGeneration == episodeSwitchGeneration
+                        && directAVNoFrameRecovery?.sourceGeneration == sourceSwitchGeneration,
+                    firstFrameRendered: hasStartedPlaying,
+                    nudgeAlreadyIssued: libmpvStartupNudgeIssued
+                ) == .hop {
+                    handleStartTimeout()
+                    return
+                }
+                return
+            case .hop:
+                handleStartTimeout()
+                return
+            }
             // No first frame within the deadline: abandon the deferred byte-offset seek and reload from the
             // start. Keep a progress floor at the resume point so the stored Continue Watching position is never
             // regressed and the viewer can scrub forward on a warm pipeline. Mirrors the remux `.unreachable`
@@ -5001,6 +5168,19 @@ struct TVPlayerView: View {
                         DiagnosticsLog.log(
                             "player",
                             "AVPlayer start watchdog demoting (\(reason)), falling back to libmpv")
+                        if !remuxExpectedNow {
+                            // Keep one bounded libmpv check for a genuine AVFoundation-only incompatibility.
+                            // If libmpv also remains frame-less, `handleStartTimeout` uses this exact identity
+                            // to source-hop instead of reopening the same signed link in a retry loop.
+                            directAVNoFrameRecovery = DirectAVNoFrameRecovery(
+                                url: curURL ?? url,
+                                episodeGeneration: episodeSwitchGeneration,
+                                sourceGeneration: sourceSwitchGeneration
+                            )
+                            DiagnosticsLog.log(
+                                "playback",
+                                "source attempt route=avplayer-direct outcome=no-first-frame headers=\(safeHeaderReceipt(curHeaders)) next=libmpv-once")
+                        }
                         demoteAVPlayerToMPV()
                         return
                     }
@@ -6640,6 +6820,8 @@ struct TVPlayerView: View {
         avEngineFailed = false
         currentPickWasExplicit = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         currentPlaybackIsResume = false; resumeSourceReresolved = false
+        directAVNoFrameRecovery = nil
+        libmpvStartupNudgeIssued = false
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
         addedPooledIDs = []; pooledSeededOffset = false; embeddedUploadDone = false
