@@ -38,6 +38,12 @@ community pool, so a viewer on a different rip that lacks that language benefits
 runs only on local files and never on a stream, so it can never make the player re-download a file it is
 already playing.
 
+**Subtitle contribution: image-subtitle recognition groundwork.** The bounded, memory-safe plumbing that turns
+picture-based subtitles (Blu-ray PGS, DVD/VobSub) into text for the community pool now matches the Apple app's
+recognition policy and image pre-processing. Displaying picture subtitles already works; this is only the
+share-back half, and it is wired to a pluggable recognizer that the GPL sideload build deliberately ships
+without so it stays free of proprietary text-recognition libraries. Nothing you see on screen changes.
+
 **A scrubber that finally looks like the Apple app.** The progress bar now honours your Seek Bar Style
 choice (fourteen looks, from Classic and Minimal to Wave, Ripple, Comet, Liquid, and Spectrum), animating
 from a continuous clock so a wave really travels. It draws a faint grey buffered-ahead band so you can see
