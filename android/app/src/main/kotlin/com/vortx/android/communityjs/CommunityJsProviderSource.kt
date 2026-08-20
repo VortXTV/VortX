@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicLong
 /** Auxiliary source which turns enabled community-provider results into ordinary ranked source groups. */
 class CommunityJsProviderSource(context: Context) {
     private val store = CommunityJsProviderStore(context)
-    private val runtime = CommunityJsRuntime()
+    private val runtime = CommunityJsRuntime(context)
     private val _groups = MutableStateFlow<List<StreamGroup>>(emptyList())
     val groups: StateFlow<List<StreamGroup>> = _groups
     private val _epoch = MutableStateFlow(0)

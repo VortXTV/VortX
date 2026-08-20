@@ -1,12 +1,20 @@
 package com.vortx.android.communityjs
 
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
+import kotlin.coroutines.resume
 
 /**
  * Bounded QuickJS host for one CommonJS provider invocation.
@@ -16,9 +24,11 @@ import org.json.JSONObject
  * created per invocation and deterministically destroyed by native code before the result leaves this class.
  */
 class CommunityJsRuntime(
+    context: Context,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     private val maxResultCount: Int = MAX_RESULT_COUNT,
 ) {
+    private val appContext = context.applicationContext
     data class Invocation(
         val provider: CommunityJsProviderStore.Provider,
         val tmdbId: String,
@@ -59,22 +69,58 @@ class CommunityJsRuntime(
         }
     }
 
-    private fun evaluate(invocation: Invocation, host: NativeFetchImpl): Result = runCatching {
-        val output = CommunityJsNative.evaluate(
-            host = host,
-            code = invocation.provider.code,
-            tmdbId = invocation.tmdbId,
-            mediaType = invocation.mediaType,
-            settingsJson = JSONObject(invocation.settingsJson).toString(),
-            season = invocation.season ?: 0,
-            episode = invocation.episode ?: 0,
-            timeoutMs = timeoutMs,
-            memoryLimitBytes = MAX_MEMORY_BYTES,
-        )
+    private suspend fun evaluate(invocation: Invocation, host: NativeFetchImpl): Result = runCatching {
+        val output = executeInBroker(invocation, host)
         val envelope = JSONObject(output)
         if (!envelope.optBoolean("ok")) return Result.Failure(envelope.optString("error", "Provider execution failed."))
         decodeStreams(envelope.optJSONArray("payload")?.toString() ?: "[]")
     }.getOrElse { Result.Failure("Provider execution failed.") }
+
+    private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String = suspendCancellableCoroutine { continuation ->
+        val token = UUID.randomUUID().toString()
+        var broker: ICommunityJsBroker? = null
+        var bound = false
+        lateinit var connection: ServiceConnection
+        val callback = object : ICommunityJsBrokerCallback.Stub() {
+            override fun fetch(tokenValue: String, url: String, optionsJson: String, remainingTimeoutMs: Long): String =
+                if (tokenValue == token) host.fetch(url, optionsJson, remainingTimeoutMs) else EMPTY_RESPONSE
+
+            override fun isCancelled(tokenValue: String): Boolean = tokenValue != token || host.isCancelled() || !continuation.isActive
+
+            override fun complete(tokenValue: String, envelope: String) {
+                if (tokenValue == token && continuation.isActive) {
+                    if (bound) runCatching { appContext.unbindService(connection) }
+                    bound = false
+                    continuation.resume(envelope)
+                }
+            }
+        }
+        connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName, service: IBinder) {
+                broker = ICommunityJsBroker.Stub.asInterface(service)
+                runCatching {
+                    broker?.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
+                        JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
+                        timeoutMs, MAX_MEMORY_BYTES, callback)
+                }.onFailure { if (continuation.isActive) continuation.resume(FAILURE_ENVELOPE) }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName) {
+                if (continuation.isActive) { bound = false; continuation.resume(FAILURE_ENVELOPE) }
+            }
+
+            override fun onBindingDied(name: ComponentName) {
+                if (continuation.isActive) { bound = false; continuation.resume(FAILURE_ENVELOPE) }
+            }
+        }
+        bound = appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE)
+        if (!bound && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
+        continuation.invokeOnCancellation {
+            host.cancel()
+            runCatching { broker?.cancel(token) }
+            if (bound) runCatching { appContext.unbindService(connection) }
+        }
+    }
 
     /** The single native capability. No filesystem, reflection, application object, or credential bridge is bound. */
     interface NativeFetch {
@@ -181,6 +227,8 @@ class CommunityJsRuntime(
         private const val MAX_REQUEST_BODY_BYTES = 256 * 1024
         private const val MAX_MEMORY_BYTES = 16L * 1024 * 1024
         private const val USER_AGENT = "Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/125 Safari/537.36"
+        private const val EMPTY_RESPONSE = "{\"status\":0,\"statusText\":\"Unavailable\",\"body\":\"\",\"headers\":{}}"
+        private const val FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
         private val ALLOWED_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
         private val BODY_METHODS = setOf("POST", "PUT", "PATCH", "DELETE")
         private fun responseJson(status: Int, statusText: String, body: String, headers: Map<String, String>): String = JSONObject().apply {
