@@ -207,6 +207,16 @@ final class MPVMetalViewController: PlatformViewController {
     /// The rung the ramp started at (loadFile), so a drop-burst back-off never sinks the forward depth below the
     /// opening cache-secs. Stored per file alongside the applied depth.
     private var cacheReadaheadRampStartSecs = 0
+    /// Set on a USER-initiated seek (the remote's directional hop, a scrub commit, the iOS control bar), read-and-
+    /// cleared by each read-ahead ramp sample. A high-bitrate 4K HDR remux legitimately re-decodes from a keyframe
+    /// on a user seek and drops well past the burst threshold; without this the ramp reads that one-off seek burst
+    /// as fill starvation and BACKS OFF the forward buffer exactly when a seek most needs it refilled (the Beta 17
+    /// directional-press stutter, #202). Gates ONLY the back-off branch: a clean post-seek window may still climb,
+    /// and a real starvation burst with no user seek in the window still backs off unchanged. Written from the seek
+    /// entry points and read/cleared in the ramp step, both marshalled on `queue` (the serial mpv queue), so the
+    /// two never race. Internal reseeks/watchdog/track-change refresh-seeks deliberately leave it unset, so genuine
+    /// internal stalls are still caught.
+    private var userSeekedSinceRampSample = false
     private static let diskCacheReadaheadRampStepSecs = 60      // cache-secs added per stable rung
     private static let diskCacheReadaheadRampIntervalSecs: TimeInterval = 15   // wall time between rungs
     private static let diskCacheRampReadaheadFloorSecs = 30     // demuxer-readahead-secs during the ramp (< start)
@@ -1677,6 +1687,11 @@ final class MPVMetalViewController: PlatformViewController {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mpv != nil,
                   self.cacheReadaheadRampGeneration == generation else { return }
+            // Read-and-clear the user-seek marker for THIS sample window (serialized with the seek entry points on
+            // `queue`). A user seek's keyframe re-decode legitimately bursts frame drops, so its window must never
+            // be mistaken for fill starvation and trigger a back-off; see userSeekedSinceRampSample.
+            let seeked = self.userSeekedSinceRampSample
+            self.userSeekedSinceRampSample = false
             // Re-derive the ceiling from the live bitrate: a very-high-bitrate stream tops out lower so the disk
             // offload never over-fills; ordinary 4K keeps the full depth (see bitrateBoundedRampCeiling).
             let effectiveCeiling = self.bitrateBoundedRampCeiling(configured: ceiling)
@@ -1685,9 +1700,11 @@ final class MPVMetalViewController: PlatformViewController {
             let dropDelta = dropCount - self.cacheReadaheadRampLastFrameDrop
             self.cacheReadaheadRampLastFrameDrop = dropCount
             let floor = max(1, self.cacheReadaheadRampStartSecs)
-            if dropDelta > Self.diskCacheReadaheadRampBurstDropThreshold {
-                // A REAL burst: the fill is starving the present thread now. Back OFF one rung (never below the
-                // opening depth) to relieve read pressure; the climb resumes on the next clean rung.
+            if !seeked, dropDelta > Self.diskCacheReadaheadRampBurstDropThreshold {
+                // A REAL burst with no user seek this window: the fill is starving the present thread now. Back OFF
+                // one rung (never below the opening depth) to relieve read pressure; the climb resumes on the next
+                // clean rung. A seek's own keyframe re-decode burst is gated out above so a directional press never
+                // shrinks the buffer it is about to need refilled - that window HOLDs instead (#202).
                 let next = max(floor, self.cacheReadaheadRampAppliedSecs - Self.diskCacheReadaheadRampStepSecs)
                 if next != self.cacheReadaheadRampAppliedSecs {
                     self.cacheReadaheadRampAppliedSecs = next
@@ -2693,6 +2710,9 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func seek(to seconds: Double) {
+        // Mark this as a USER seek so the disk-cache read-ahead ramp does not misread the keyframe re-decode drop
+        // burst as fill starvation (#202). Marshalled on `queue` to serialize with the ramp step's read/clear.
+        queue.async { [weak self] in self?.userSeekedSinceRampSample = true }
         #if os(tvOS)
         // Only arm the cache-empty hold when the target lands OUTSIDE the currently buffered window. An in-window
         // scrub (a short hop while the forward cache holds minutes) is a cheap in-cache seek: arming there would
@@ -2710,6 +2730,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Small hops usually stay
     /// inside the buffered window, so no cache hold is armed for these.
     func seek(by seconds: Double) {
+        // Mark this as a USER seek (the tvOS remote's directional hop routes here via hiddenSeek) so the disk-cache
+        // read-ahead ramp does not misread the keyframe re-decode drop burst as fill starvation (#202). Marshalled
+        // on `queue` to serialize with the ramp step's read/clear.
+        queue.async { [weak self] in self?.userSeekedSinceRampSample = true }
         command("seek", args: [String(format: "%.1f", seconds), "relative"])
     }
 
