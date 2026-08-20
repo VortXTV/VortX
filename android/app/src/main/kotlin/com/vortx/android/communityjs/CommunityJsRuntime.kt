@@ -5,13 +5,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 /**
  * Bounded QuickJS host for one CommonJS provider invocation.
@@ -70,6 +65,7 @@ class CommunityJsRuntime(
             code = invocation.provider.code,
             tmdbId = invocation.tmdbId,
             mediaType = invocation.mediaType,
+            settingsJson = JSONObject(invocation.settingsJson).toString(),
             season = invocation.season ?: 0,
             episode = invocation.episode ?: 0,
             timeoutMs = timeoutMs,
@@ -100,38 +96,38 @@ class CommunityJsRuntime(
             val options = runCatching { JSONObject(optionsJson) }.getOrDefault(JSONObject())
             val request = runCatching {
                 val headers = options.optJSONObject("headers") ?: JSONObject()
-                val builder = Request.Builder().url(url)
-                val keys = headers.keys()
-                while (keys.hasNext()) {
-                    val key = keys.next()
-                    builder.header(key, headers.optString(key))
-                }
-                if (headers.optString("User-Agent").isBlank()) builder.header("User-Agent", USER_AGENT)
-                val method = options.optString("method", "GET").uppercase()
-                val bodyText = options.optString("body", "")
-                val body = if (method in setOf("POST", "PUT", "PATCH", "DELETE")) bodyText.toRequestBody(null) else null
-                builder.method(method, body).build()
-            }.getOrNull() ?: return responseJson(0, "Invalid request", "", emptyMap())
-            return runCatching {
-                http.newCall(request).also { call ->
-                    call.timeout().timeout(minOf(invocationTimeoutMs, remainingTimeoutMs).coerceAtLeast(1), TimeUnit.MILLISECONDS)
-                }.execute().use { response ->
-                    val bodyBuffer = Buffer()
-                    var total = 0L
-                    response.body?.source()?.use { source ->
-                        while (total <= MAX_RESPONSE_BYTES) {
-                            val read = source.read(bodyBuffer, MAX_RESPONSE_BYTES.toLong() + 1 - total)
-                            if (read < 0) break
-                            total += read
-                        }
+                val mappedHeaders = buildMap {
+                    val keys = headers.keys()
+                    while (keys.hasNext() && size < MAX_HEADER_COUNT) {
+                        val key = keys.next()
+                        val value = headers.optString(key)
+                        if (key.length in 1..256 && value.length <= MAX_HEADER_VALUE_BYTES) put(key, value)
                     }
-                    if (total > MAX_RESPONSE_BYTES) return responseJson(0, "Response exceeds the limit", "", emptyMap())
-                    val text = bodyBuffer.readString(Charsets.UTF_8)
-                    val responseHeaders = buildMap { response.headers.names().forEach { put(it, response.header(it).orEmpty()) } }
-                    responseJson(response.code, response.message, text, responseHeaders)
                 }
-            }.getOrElse { responseJson(0, "Network error", "", emptyMap()) }
+                val safeHeaders = if (mappedHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                    mappedHeaders + ("User-Agent" to USER_AGENT)
+                } else {
+                    mappedHeaders
+                }
+                val method = options.optString("method", "GET").uppercase()
+                require(method in ALLOWED_METHODS)
+                val bodyText = options.optString("body", "").take(MAX_REQUEST_BODY_BYTES)
+                FetchRequest(safeHeaders, method, bodyText.takeIf { method in BODY_METHODS })
+            }.getOrNull() ?: return responseJson(0, "Invalid request", "", emptyMap())
+            return CommunityJsPublicHttp.fetch(
+                rawUrl = url,
+                requireHttps = false,
+                headers = request.headers,
+                method = request.method,
+                body = request.body,
+                timeoutMs = minOf(invocationTimeoutMs, remainingTimeoutMs).coerceAtLeast(1),
+                maxBytes = MAX_RESPONSE_BYTES,
+            )?.let { response ->
+                responseJson(response.status, response.statusText, response.body, response.headers)
+            } ?: responseJson(0, "Network error", "", emptyMap())
         }
+
+        private data class FetchRequest(val headers: Map<String, String>, val method: String, val body: String?)
     }
 
     private fun decodeStreams(raw: String): Result {
@@ -180,9 +176,13 @@ class CommunityJsRuntime(
         private const val MAX_RESULT_COUNT = 100
         private const val MAX_SUBTITLE_COUNT = 20
         private const val MAX_REQUEST_COUNT = 20
+        private const val MAX_HEADER_COUNT = 32
+        private const val MAX_HEADER_VALUE_BYTES = 4096
+        private const val MAX_REQUEST_BODY_BYTES = 256 * 1024
         private const val MAX_MEMORY_BYTES = 16L * 1024 * 1024
         private const val USER_AGENT = "Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/125 Safari/537.36"
-        private val http = OkHttpClient.Builder().callTimeout(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS).build()
+        private val ALLOWED_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
+        private val BODY_METHODS = setOf("POST", "PUT", "PATCH", "DELETE")
         private fun responseJson(status: Int, statusText: String, body: String, headers: Map<String, String>): String = JSONObject().apply {
             put("status", status); put("statusText", statusText); put("body", body); put("headers", JSONObject(headers))
         }.toString()

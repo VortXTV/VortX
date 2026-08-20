@@ -27,4 +27,5 @@
     <exclude domain="sharedpref" path="vortx_mediaserver_tokens_plain.xml" />
     <exclude domain="sharedpref" path="vortx_iptv_creds.xml" />
     <exclude domain="sharedpref" path="vortx_iptv_creds_plain.xml" />
+    <exclude domain="sharedpref" path="community_js_providers.xml" />
 </full-backup-content>

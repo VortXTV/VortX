@@ -27,3 +27,4 @@ target_compile_options(quickjs_runtime PRIVATE -Wno-sign-compare -Wno-missing-fi
 add_library(vortx_community_js SHARED vortx_community_js.c)
 target_include_directories(vortx_community_js PRIVATE ${quickjs_source_SOURCE_DIR})
 target_link_libraries(vortx_community_js quickjs_runtime log m)
+target_compile_options(vortx_community_js PRIVATE -fvisibility=hidden -fstack-protector-strong)

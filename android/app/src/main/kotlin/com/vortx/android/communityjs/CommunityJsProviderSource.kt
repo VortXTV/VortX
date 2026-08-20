@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicLong
 
 /** Auxiliary source which turns enabled community-provider results into ordinary ranked source groups. */
 class CommunityJsProviderSource(context: Context) {
@@ -21,6 +22,7 @@ class CommunityJsProviderSource(context: Context) {
     val epoch: StateFlow<Int> = _epoch
     private val _settled = MutableStateFlow(true)
     val settled: StateFlow<Boolean> = _settled
+    private val activeGeneration = AtomicLong(-1L)
 
     fun refresh(
         scope: CoroutineScope,
@@ -30,6 +32,7 @@ class CommunityJsProviderSource(context: Context) {
         episode: Int?,
         requestGeneration: Long,
     ) {
+        activeGeneration.set(requestGeneration)
         _settled.value = false
         scope.launch(Dispatchers.IO) {
             val tmdbId = resolveTmdbId(imdbId, mediaType)
@@ -41,17 +44,18 @@ class CommunityJsProviderSource(context: Context) {
                         is CommunityJsRuntime.Result.Failure -> null
                     }
                 }
-            // This source is target-scoped. A newer target will immediately schedule its own refresh; publishing
-            // an older result is harmless only if it is still the current generation, so caller fences generation.
-            if (requestGeneration >= 0L) {
+            // Publication is fenced immediately before mutation. A cancelled or slower earlier request must
+            // never replace a newer title's sources merely because it completed afterward.
+            if (requestGeneration >= 0L && activeGeneration.get() == requestGeneration) {
                 _groups.value = result
                 _epoch.value += 1
+                _settled.value = true
             }
-            _settled.value = true
         }
     }
 
     fun reset() {
+        activeGeneration.incrementAndGet()
         _groups.value = emptyList()
         _epoch.value += 1
         _settled.value = true

@@ -22,6 +22,8 @@ typedef struct {
   char *error;
 } RunState;
 
+static jstring java_from_utf8(JNIEnv *env, const char *bytes, size_t length);
+
 static int64_t now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -33,18 +35,64 @@ static void set_text(char **target, const char *text) {
   *target = text ? strdup(text) : NULL;
 }
 
+/* JNI's GetStringUTFChars is modified UTF-8. Providers are ordinary UTF-8, including emoji/NUL, so
+ * convert UTF-16 explicitly at the boundary instead of silently altering script or result bytes. */
+static char *utf8_from_java(JNIEnv *env, jstring value, size_t *out_length) {
+  if (value == NULL) return NULL;
+  jsize count = (*env)->GetStringLength(env, value);
+  const jchar *chars = (*env)->GetStringChars(env, value, NULL);
+  if (chars == NULL || count < 0 || (size_t)count > (SIZE_MAX - 1) / 3) return NULL;
+  char *out = malloc((size_t)count * 3 + 1);
+  if (out == NULL) { (*env)->ReleaseStringChars(env, value, chars); return NULL; }
+  size_t write = 0;
+  for (jsize i = 0; i < count; i++) {
+    uint32_t code = chars[i];
+    if (code >= 0xD800 && code <= 0xDBFF && i + 1 < count && chars[i + 1] >= 0xDC00 && chars[i + 1] <= 0xDFFF) {
+      code = 0x10000 + ((code - 0xD800) << 10) + (chars[++i] - 0xDC00);
+    } else if (code >= 0xD800 && code <= 0xDFFF) code = 0xFFFD;
+    if (code < 0x80) out[write++] = (char)code;
+    else if (code < 0x800) { out[write++] = 0xC0 | (code >> 6); out[write++] = 0x80 | (code & 0x3F); }
+    else if (code < 0x10000) { out[write++] = 0xE0 | (code >> 12); out[write++] = 0x80 | ((code >> 6) & 0x3F); out[write++] = 0x80 | (code & 0x3F); }
+    else { out[write++] = 0xF0 | (code >> 18); out[write++] = 0x80 | ((code >> 12) & 0x3F); out[write++] = 0x80 | ((code >> 6) & 0x3F); out[write++] = 0x80 | (code & 0x3F); }
+  }
+  out[write] = '\0';
+  (*env)->ReleaseStringChars(env, value, chars);
+  *out_length = write;
+  return out;
+}
+
+static jstring java_from_utf8(JNIEnv *env, const char *bytes, size_t length) {
+  if (length > (SIZE_MAX / sizeof(jchar)) - 1) return NULL;
+  jchar *out = malloc((length + 1) * sizeof(jchar));
+  if (out == NULL) return NULL;
+  size_t read = 0, write = 0;
+  while (read < length) {
+    uint32_t code = (unsigned char)bytes[read++];
+    if (code >= 0xC2 && code <= 0xDF && read < length) code = ((code & 0x1F) << 6) | ((unsigned char)bytes[read++] & 0x3F);
+    else if (code >= 0xE0 && code <= 0xEF && read + 1 < length) { uint32_t b = (unsigned char)bytes[read++], c = (unsigned char)bytes[read++]; code = ((code & 0x0F) << 12) | ((b & 0x3F) << 6) | (c & 0x3F); }
+    else if (code >= 0xF0 && code <= 0xF4 && read + 2 < length) { uint32_t b = (unsigned char)bytes[read++], c = (unsigned char)bytes[read++], d = (unsigned char)bytes[read++]; code = ((code & 0x07) << 18) | ((b & 0x3F) << 12) | ((c & 0x3F) << 6) | (d & 0x3F); }
+    else if (code >= 0x80) code = 0xFFFD;
+    if (code > 0x10FFFF) code = 0xFFFD;
+    if (code >= 0x10000) { code -= 0x10000; out[write++] = 0xD800 | (code >> 10); out[write++] = 0xDC00 | (code & 0x3FF); }
+    else out[write++] = (jchar)code;
+  }
+  jstring result = (*env)->NewString(env, out, (jsize)write);
+  free(out);
+  return result;
+}
+
 static jstring envelope(JNIEnv *env, int ok, const char *text) {
   if (ok) {
     size_t length = strlen(text) + 32;
     char *json = malloc(length);
-    if (json == NULL) return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Out of memory\"}");
+    if (json == NULL) { const char *failure = "{\"ok\":false,\"error\":\"Out of memory\"}"; return java_from_utf8(env, failure, strlen(failure)); }
     snprintf(json, length, "{\"ok\":true,\"payload\":%s}", text);
-    jstring result = (*env)->NewStringUTF(env, json);
+    jstring result = java_from_utf8(env, json, strlen(json));
     free(json);
     return result;
   }
   /* Do not interpolate an untrusted exception into JSON. The execution error remains native-only. */
-  return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Provider execution failed\"}");
+  { const char *failure = "{\"ok\":false,\"error\":\"Provider execution failed\"}"; return java_from_utf8(env, failure, strlen(failure)); }
 }
 
 static int interrupt_handler(JSRuntime *runtime, void *opaque) {
@@ -76,8 +124,14 @@ static JSValue host_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     if (options) JS_FreeCString(ctx, options);
     return JS_EXCEPTION;
   }
-  jstring jurl = (*env)->NewStringUTF(env, url);
-  jstring joptions = (*env)->NewStringUTF(env, options);
+  size_t url_length = strlen(url), options_length = strlen(options);
+  jstring jurl = java_from_utf8(env, url, url_length);
+  jstring joptions = java_from_utf8(env, options, options_length);
+  if (jurl == NULL || joptions == NULL) {
+    if (jurl) (*env)->DeleteLocalRef(env, jurl); if (joptions) (*env)->DeleteLocalRef(env, joptions);
+    JS_FreeCString(ctx, url); JS_FreeCString(ctx, options);
+    return JS_ThrowInternalError(ctx, "native conversion failed");
+  }
   jlong remaining_ms = (jlong) (state->deadline_ms - now_ms());
   if (remaining_ms <= 0) {
     JS_FreeCString(ctx, url);
@@ -96,9 +150,11 @@ static JSValue host_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return JS_ThrowInternalError(ctx, "native fetch failed");
   }
   if (response == NULL) return JS_ThrowInternalError(ctx, "native fetch returned no response");
-  const char *json = (*env)->GetStringUTFChars(env, response, NULL);
-  JSValue value = JS_ParseJSON(ctx, json, strlen(json), "native-fetch.json");
-  (*env)->ReleaseStringUTFChars(env, response, json);
+  size_t json_length = 0;
+  char *json = utf8_from_java(env, response, &json_length);
+  if (json == NULL) { (*env)->DeleteLocalRef(env, response); return JS_ThrowInternalError(ctx, "native response conversion failed"); }
+  JSValue value = JS_ParseJSON(ctx, json, json_length, "native-fetch.json");
+  free(json);
   (*env)->DeleteLocalRef(env, response);
   return value;
 }
@@ -148,12 +204,14 @@ static char *exception_text(JSContext *ctx) {
 JNIEXPORT jstring JNICALL
 Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
     JNIEnv *env, jclass clazz, jobject host, jstring code, jstring tmdb_id, jstring media_type,
-    jint season, jint episode, jlong timeout_ms, jlong memory_limit) {
+    jstring settings_json, jint season, jint episode, jlong timeout_ms, jlong memory_limit) {
   (void) clazz;
-  const char *source = (*env)->GetStringUTFChars(env, code, NULL);
-  const char *tmdb = (*env)->GetStringUTFChars(env, tmdb_id, NULL);
-  const char *media = (*env)->GetStringUTFChars(env, media_type, NULL);
-  if (source == NULL || tmdb == NULL || media == NULL) return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Invalid input\"}");
+  size_t source_length = 0, tmdb_length = 0, media_length = 0, settings_length = 0;
+  char *source = utf8_from_java(env, code, &source_length);
+  char *tmdb = utf8_from_java(env, tmdb_id, &tmdb_length);
+  char *media = utf8_from_java(env, media_type, &media_length);
+  char *settings = utf8_from_java(env, settings_json, &settings_length);
+  if (source == NULL || tmdb == NULL || media == NULL || settings == NULL) return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Invalid input\"}");
   RunState state = {0};
   (*env)->GetJavaVM(env, &state.vm);
   state.host = (*env)->NewGlobalRef(env, host);
@@ -167,7 +225,7 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   if (runtime == NULL || context == NULL || state.fetch == NULL || state.is_cancelled == NULL) {
     if (context) JS_FreeContext(context); if (runtime) JS_FreeRuntime(runtime);
     (*env)->DeleteGlobalRef(env, state.host);
-    (*env)->ReleaseStringUTFChars(env, code, source); (*env)->ReleaseStringUTFChars(env, tmdb_id, tmdb); (*env)->ReleaseStringUTFChars(env, media_type, media);
+    free(source); free(tmdb); free(media); free(settings);
     return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Runtime unavailable\"}");
   }
   JS_SetMemoryLimit(runtime, (size_t) memory_limit);
@@ -179,11 +237,16 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   JS_SetPropertyStr(context, global, "__vortx_complete", JS_NewCFunction(context, complete_success, "__vortx_complete", 1));
   JS_SetPropertyStr(context, global, "__vortx_fail", JS_NewCFunction(context, complete_failure, "__vortx_fail", 1));
   JS_FreeValue(context, global);
-  size_t wrapper_size = strlen(source) + strlen(tmdb) + strlen(media) + 2500;
+  size_t wrapper_size = source_length + tmdb_length + media_length + settings_length + 5000;
   char *wrapper = malloc(wrapper_size);
+  if (wrapper == NULL) {
+    JS_FreeContext(context); JS_FreeRuntime(runtime); (*env)->DeleteGlobalRef(env, state.host);
+    free(source); free(tmdb); free(media); free(settings);
+    return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Runtime unavailable\"}");
+  }
   snprintf(wrapper, wrapper_size,
-    "(function(){'use strict';const fetch=(u,o)=>Promise.resolve(__vortx_native_fetch(String(u),JSON.stringify(o||{})));const axios={get:(u,o)=>fetch(u,o),request:(o)=>fetch(o.url,o)};const require=(n)=>{if(['crypto-js','cheerio','cheerio-without-node-native','react-native-cheerio'].includes(n))return Object.freeze({});throw new Error('Module '+n+' is not allowed')};const module={exports:{}};const exports=module.exports;const global=globalThis;global.SCRAPER_SETTINGS={};global.SCRAPER_ID='provider';global.TMDB_API_KEY='';const window=global;const URL_VALIDATION_ENABLED=true;%s;const f=typeof getStreams==='function'?getStreams:(module.exports&&module.exports.getStreams)||global.getStreams;if(typeof f!=='function')throw new Error('No getStreams function found');Promise.resolve(f('%s','%s',%d,%d)).then(v=>__vortx_complete(JSON.stringify(Array.isArray(v)?v:[]))).catch(e=>__vortx_fail(String(e)));})()",
-    source, tmdb, media, season, episode);
+    "(function(){'use strict';const __response=(r)=>{const h=r.headers||{},lower={};Object.keys(h).forEach(k=>lower[k.toLowerCase()]=String(h[k]));const headers={get:(k)=>lower[String(k).toLowerCase()]||null,has:(k)=>Object.prototype.hasOwnProperty.call(lower,String(k).toLowerCase()),forEach:(f)=>Object.keys(h).forEach(k=>f(h[k],k))};const text=String(r.body||'');return {ok:r.status>=200&&r.status<300,status:r.status||0,statusText:r.statusText||'',headers,text:()=>Promise.resolve(text),json:()=>{try{return Promise.resolve(JSON.parse(text))}catch(e){return Promise.reject(e)}}}};const fetch=(u,o)=>Promise.resolve(__response(__vortx_native_fetch(String(u),JSON.stringify(o||{}))));const axios={request:(o)=>fetch(o.url,o).then(r=>r.text().then(t=>{let d=t;try{d=JSON.parse(t)}catch(e){}return {data:d,status:r.status,statusText:r.statusText,headers:r.headers,config:o}})),get:(u,o)=>axios.request(Object.assign({},o||{},{url:u,method:'GET'})),post:(u,d,o)=>axios.request(Object.assign({},o||{},{url:u,method:'POST',body:d}))};const require=(n)=>{if(n==='crypto-js')return {MD5:(v)=>({toString:()=>String(v)}),SHA1:(v)=>({toString:()=>String(v)}),SHA256:(v)=>({toString:()=>String(v)})};if(['cheerio','cheerio-without-node-native','react-native-cheerio'].includes(n))return {load:(html)=>{const q=(s)=>({length:0,text:()=>'',attr:()=>null,find:()=>q(''),first:()=>q(''),each:()=>{}});q.html=html;return q}};throw new Error('Module '+n+' is not allowed')};const console={log:()=>{},warn:()=>{},error:()=>{}};const setTimeout=(f)=>{Promise.resolve().then(f);return 0},clearTimeout=()=>{};const TextEncoder=function(){this.encode=(s)=>Uint8Array.from(unescape(encodeURIComponent(String(s))).split('').map(c=>c.charCodeAt(0)))};const TextDecoder=function(){this.decode=(a)=>decodeURIComponent(Array.from(a).map(c=>'%%'+c.toString(16).padStart(2,'0')).join(''))};const URL=function(u,b){this.href=b?String(b).replace(/[^/]*$/,'')+String(u):String(u);this.toString=()=>this.href};const module={exports:{}};const exports=module.exports;const global=globalThis;global.SCRAPER_SETTINGS=%s;global.SCRAPER_ID='provider';global.TMDB_API_KEY='';const window=global;const URL_VALIDATION_ENABLED=true;%s;const f=typeof getStreams==='function'?getStreams:(module.exports&&module.exports.getStreams)||global.getStreams;if(typeof f!=='function')throw new Error('No getStreams function found');Promise.resolve(f('%s','%s',%d,%d)).then(v=>__vortx_complete(JSON.stringify(Array.isArray(v)?v:[]))).catch(e=>__vortx_fail(String(e)));})()",
+    settings, source, tmdb, media, season, episode);
   JSValue eval = JS_Eval(context, wrapper, strlen(wrapper), "community-provider.js", JS_EVAL_TYPE_GLOBAL);
   free(wrapper);
   if (JS_IsException(eval)) set_text(&state.error, exception_text(context));
@@ -196,6 +259,6 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   }
   jstring result = envelope(env, state.result != NULL, state.result ? state.result : "");
   free(state.result); free(state.error); JS_FreeContext(context); JS_FreeRuntime(runtime); (*env)->DeleteGlobalRef(env, state.host);
-  (*env)->ReleaseStringUTFChars(env, code, source); (*env)->ReleaseStringUTFChars(env, tmdb_id, tmdb); (*env)->ReleaseStringUTFChars(env, media_type, media);
+  free(source); free(tmdb); free(media); free(settings);
   return result;
 }

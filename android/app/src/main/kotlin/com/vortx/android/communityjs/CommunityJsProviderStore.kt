@@ -7,12 +7,9 @@ import com.vortx.android.config.RemoteConfig
 import com.vortx.android.config.RemoteConfigDefaults
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.TimeUnit
 
 /**
  * The installed state for user-supplied community JavaScript providers.
@@ -70,7 +67,8 @@ class CommunityJsProviderStore(context: Context) {
             ?: return@withContext InstallResult(0, "The manifest is not valid JSON.", failed = true)
         val entries = root.optJSONArray("scrapers") ?: JSONArray()
         val installed = ArrayList<Provider>()
-        for (index in 0 until entries.length()) {
+        var totalSourceBytes = 0
+        for (index in 0 until minOf(entries.length(), MAX_PROVIDER_COUNT)) {
             val entry = entries.optJSONObject(index) ?: continue
             if (entry.has("enabled") && !entry.optBoolean("enabled", true)) continue
             val id = entry.optString("id").trim()
@@ -78,6 +76,8 @@ class CommunityJsProviderStore(context: Context) {
             if (!VALID_ID.matches(id) || file.isEmpty()) continue
             val providerUrl = CommunityJsUrlPolicy.providerUrl(manifestUrl, file) ?: continue
             val code = fetchText(providerUrl)?.takeIf { it.isNotBlank() && it.toByteArray().size <= MAX_SOURCE_BYTES } ?: continue
+            totalSourceBytes += code.toByteArray(Charsets.UTF_8).size
+            if (totalSourceBytes > MAX_TOTAL_SOURCE_BYTES) break
             val types = entry.optJSONArray("supportedTypes")
                 ?.let { array -> buildSet { for (i in 0 until array.length()) add(array.optString(i).lowercase()) } }
                 ?.intersect(SUPPORTED_MEDIA_TYPES)
@@ -142,12 +142,13 @@ class CommunityJsProviderStore(context: Context) {
         }
     }.toString()
 
-    private fun fetchText(url: String): String? = runCatching {
-        val request = Request.Builder().url(url).header("User-Agent", USER_AGENT).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) null else response.body?.string()?.takeIf { it.toByteArray().size <= MAX_SOURCE_BYTES }
-        }
-    }.getOrNull()
+    private fun fetchText(url: String): String? = CommunityJsPublicHttp.fetch(
+        rawUrl = url,
+        requireHttps = true,
+        headers = mapOf("User-Agent" to USER_AGENT),
+        timeoutMs = REQUEST_TIMEOUT_MS,
+        maxBytes = MAX_SOURCE_BYTES,
+    )?.takeIf { it.status in 200..299 }?.body
 
     companion object {
         const val FEATURE_KEY = "communityJSPlugins"
@@ -156,10 +157,12 @@ class CommunityJsProviderStore(context: Context) {
         private const val KEY_MANIFEST = "manifest"
         private const val KEY_PROVIDERS = "providers"
         private const val MAX_SOURCE_BYTES = 1_000_000
+        private const val MAX_TOTAL_SOURCE_BYTES = 4_000_000
+        private const val MAX_PROVIDER_COUNT = 12
+        private const val REQUEST_TIMEOUT_MS = 25_000L
         private const val USER_AGENT = "Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/125 Safari/537.36"
         private val VALID_ID = Regex("[A-Za-z0-9._-]{1,96}")
         private val SUPPORTED_MEDIA_TYPES = setOf("movie", "tv")
-        private val http = OkHttpClient.Builder().callTimeout(25, TimeUnit.SECONDS).build()
     }
 }
 
@@ -189,9 +192,9 @@ object CommunityJsUrlPolicy {
     private fun isPublicHost(host: String): Boolean {
         val normalized = host.lowercase()
         if (normalized == "localhost" || normalized.endsWith(".localhost") || normalized.endsWith(".local")) return false
-        val addresses = runCatching { java.net.InetAddress.getAllByName(normalized).toList() }.getOrDefault(emptyList())
-        return addresses.isNotEmpty() && addresses.all { address ->
-            !address.isAnyLocalAddress && !address.isLoopbackAddress && !address.isLinkLocalAddress && !address.isSiteLocalAddress
-        }
+        return runCatching {
+            com.vortx.android.engine.PublicAddressPolicy.requireLiteralPublicOrHostname(normalized)
+            true
+        }.getOrDefault(false)
     }
 }

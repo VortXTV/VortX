@@ -11,6 +11,7 @@ internal object CommunityJsNative {
         code: String,
         tmdbId: String,
         mediaType: String,
+        settingsJson: String,
         season: Int,
         episode: Int,
         timeoutMs: Long,
