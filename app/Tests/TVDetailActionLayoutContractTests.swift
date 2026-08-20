@@ -7,11 +7,12 @@
 // can regress without a type-check failure: finite-width HStacks wrap long labels, and an outer ScrollView
 // without a semantic top route can strand the Siri Remote below a long synopsis/language block.
 //
-// Device smoke plan (not runnable in this harness): on a 1080p and 4K tvOS simulator/device, exercise a movie
-// with 0, 1, and many language-chip rows plus a deliberately long synopsis; focus Watch -> both action rows ->
-// cast/providers/recommendations, press Up until the title block is focused, then Up again and verify the tab/menu
-// is visible and focused. Repeat on a series, its episode page, and accessibility text sizes; verify left/right
-// stays within the active action row and Down still advances normally.
+// Device smoke plan (not runnable in this harness): on physical 1080p and 4K tvOS hardware, exercise a movie
+// with 0, 1, and many language-chip rows plus a deliberately long synopsis; focus Watch -> secondary actions ->
+// cast/providers/recommendations, press Up until the title block is focused, then Up again and verify the native
+// tab/menu is visible and focused (`homeExists=true`, `homeFocused=true`). Record the journey as
+// secondary -> primary (`primaryFocused=true`) -> visible title -> native tab; repeat on a series, its episode
+// page, and accessibility text sizes; verify left/right stays within the active action row and Down advances.
 
 import Foundation
 
@@ -93,7 +94,7 @@ guard let coreList = sourceBetween(source, "struct CoreStreamList: View", "/// O
     print("FAIL  CoreStreamList/action-row boundaries are missing")
     exit(1)
 }
-expect(count("TVDetailActionRow {", in: coreList) == 2,
+expect(count("TVDetailActionRow(onMoveCommand:", in: coreList) == 2,
        "movie/episode source controls have exactly two action rows")
 expect(coreList.contains("// PRIMARY: playback and source selection decisions."),
        "source primary row is explicitly playback/source grouped")
@@ -106,6 +107,35 @@ expect(coreList.contains("secondaryAction") && coreList.contains("downloadChip")
        coreList.contains("LibraryChip()") && coreList.contains("WatchlistChip()") &&
        coreList.contains("ratingChip"),
        "source secondary row retains trailer/download/library/watchlist/rating actions")
+expect(coreList.contains("if secondaryAction != nil || best != nil") &&
+       coreList.contains("loading, nil-best, no-source, and failed-source states"),
+       "secondary row is independent of source-result availability")
+guard let independentRows = sourceBetween(coreList,
+                                          "if secondaryAction != nil || best != nil",
+                                          "if let reason = StreamRanking.pickReason(best)") else {
+    print("FAIL  independent secondary-row scope is missing")
+    exit(1)
+}
+expect(independentRows.contains("secondaryAction") &&
+       independentRows.contains("focused($sourceFocusTarget, equals: .secondary)"),
+       "independent row contains the production trailer focus target")
+guard let primaryStates = sourceBetween(coreList,
+                                        "TVDetailActionRow(onMoveCommand:",
+                                        "if secondaryAction != nil || best != nil") else {
+    print("FAIL  persistent primary-row scope is missing")
+    exit(1)
+}
+expect(primaryStates.contains("else if loadingAddons") &&
+       primaryStates.contains("No sources found"),
+       "the persistent primary row covers loading and terminal error states")
+expect(coreList.contains(".focused($sourceFocusTarget, equals: .secondary)"),
+       "the trailer/first secondary control has a real focus target")
+expect(coreList.contains("handleSourceMove(direction, from: .secondary, hasSecondary: true)"),
+       "secondary row owns the production secondary-to-primary transition")
+expect(coreList.contains("handleSourceMove(direction, from: .primary") &&
+       coreList.contains("sourceFocusTarget = .secondary") &&
+       coreList.contains("watchFocused = true"),
+       "source focus state bridges secondary, primary, and top without a test-only mirror")
 expect(!coreList.contains("HStack(spacing: Theme.Space.md) {"),
        "source controls do not regress to a finite-width action HStack")
 
@@ -113,7 +143,7 @@ guard let hero = sourceBetween(source, "private func hero(", "private func heroT
     print("FAIL  series hero boundaries are missing")
     exit(1)
 }
-expect(count("TVDetailActionRow(spacing: Theme.Space.sm) {", in: hero) == 2,
+expect(count("TVDetailActionRow(spacing: Theme.Space.sm,", in: hero) == 2,
        "series hero has exactly two action rows")
 expect(hero.contains("// PRIMARY: play/resume and episode navigation."),
        "series hero primary row is semantically grouped")
@@ -132,10 +162,13 @@ expect(movie.contains("ScrollViewReader") && movie.contains("Color.clear.frame(h
 expect(movie.contains(".focused($detailFocusTarget, equals: .top)") &&
        movie.contains(".accessibilityElement(children: .combine)"),
        "movie detail uses a visible accessible top focus target")
-for region in ["CoreStreamList", "castSection", "whereToWatchSection", "collectionSection", "moreLikeThisSection"] {
-    expect(movie.contains("\(region)") && movie.contains("handleDetailMove($0, using: proxy)"),
-           "movie \(region) participates in deterministic Up escape")
-}
+expect(movie.contains("onDetailMove: { direction, region in") &&
+       movie.contains("handleDetailMove(direction, from: region, using: proxy)"),
+       "movie source rows delegate only their primary-to-top transition")
+expect(movie.contains("secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil"),
+       "movie always supplies its trailer to the independent secondary row")
+expect(count("handleMovieLowerMove($0, using: proxy)", in: movie) == 4,
+       "movie lower rails share one deterministic Up route")
 expect(!movie.contains("HStack(spacing: Theme.Space.sm) { trailerChip(m)"),
        "movie trailer is not a stray third action row")
 
@@ -149,8 +182,10 @@ expect(series.contains("CoreSeasonedEpisodes") && series.contains("castSection")
        series.contains("whereToWatchSection") && series.contains("collectionSection") &&
        series.contains("moreLikeThisSection"),
        "series detail includes every lower focus region")
-expect(count("handleDetailMove($0, using: proxy)", in: series) >= 6,
-       "series hero, episodes, and lower rails all route Up")
+expect(count("handleDetailMove($0, from: .lower, using: proxy)", in: series) == 5,
+       "series episodes and lower rails all route Up through one scoped handler")
+expect(!series.contains("onMoveCommand { handleDetailMove($0, from: .top"),
+       "series top target does not swallow the native shell handoff")
 
 guard let episode = sourceBetween(source, "struct CoreEpisodeStreams: View", "/// The per-addon stream list") else {
     print("FAIL  episode detail boundaries are missing")
@@ -159,45 +194,65 @@ guard let episode = sourceBetween(source, "struct CoreEpisodeStreams: View", "//
 expect(episode.contains("ScrollViewReader") && episode.contains("Color.clear.frame(height: 0).id(DetailFocusAnchor.top)"),
        "episode detail has a scroll-position top anchor")
 expect(episode.contains(".focused($episodeFocusTarget, equals: .top)") &&
-       episode.contains("handleEpisodeMove($0, using: proxy)"),
-       "episode sources have a visible top focus target and Up escape")
+       episode.contains("onDetailMove: { direction, region in") &&
+       episode.contains("DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: true) == .top"),
+       "episode sources have a visible top focus target and production Up escape")
+expect(!episode.contains("handleEpisodeMove") &&
+       !episode.contains("onMoveCommand { handleDetailMove($0, from: .top"),
+       "episode does not duplicate a child/outer handler or swallow top-to-shell")
 
-expect(source.contains("private enum DetailFocusEscapePolicy") &&
-       source.contains("DetailFocusEscapePolicy.shouldCaptureUp(topFocused: detailFocusTarget == .top)"),
-       "detail focus policy is explicit and state-based")
+guard let focusPolicy = declaration(source, markedBy: "private enum DetailFocusEscapePolicy") else {
+    print("FAIL  production focus policy declaration is missing or unbalanced")
+    exit(1)
+}
+expect(focusPolicy.contains("static func nextUp(from region: DetailFocusRegion, hasSecondary: Bool) -> DetailFocusRegion?"),
+       "production focus policy is explicit and state-based")
+for (transition, sourceCase) in [
+    ("secondary -> primary", "case .secondary:\n            return .primary"),
+    ("primary -> visible top", "case .primary:\n            return .top"),
+    ("lower -> nearest action row", "case .lower:\n            return hasSecondary ? .secondary : .primary"),
+    ("top -> native shell", "case .top:\n            return .shell"),
+    ("shell has no local target", "case .shell:\n            return nil")
+] {
+    expect(focusPolicy.contains(sourceCase), "production Up graph contains \(transition)")
+}
+expect(source.contains("@FocusState private var detailFocusTarget: DetailFocusRegion?") &&
+       source.contains("@State private var detailFocusRegion: DetailFocusRegion = .top") &&
+       source.contains("detailFocusTarget = region"),
+       "production focus state records the visible region and target")
 expect(source.contains("guard direction == .up"),
        "focus escape captures Up only, preserving horizontal and Down navigation")
 expect(source.contains("proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)"),
        "Up escape restores the outer scroll position")
-expect(source.contains("detailFocusTarget = .top") && source.contains("TabBarHealer.heal(\"detail-focus-top\")"),
-       "Up escape restores focus and requests menu/tab-bar visibility")
+expect(source.contains("detailFocusTarget = region") && source.contains("TabBarHealer.heal(\"detail-focus-\\(String(describing: region))\")"),
+       "Up escape restores a visible target and keeps tab-bar layout healed")
+expect(!source.contains("DetailFocusEscapePolicy.shouldCaptureUp") &&
+       !source.contains("func shouldCaptureUp") &&
+       !source.contains("struct DetailFocusScenario"),
+       "the contract does not duplicate production focus policy")
+expect(!source.contains(".onMoveCommand { handleDetailMove($0, using: proxy) }"),
+       "no legacy outer handler remains to swallow top-to-shell")
 expect(source.contains(".scrollClipDisabled()"),
        "unclipped focused action effects remain part of the source contract")
 
-// Height-independent policy scenarios mirror the user-visible failure matrix. The production policy only
-// depends on whether the visible top target owns focus, so wrapping synopsis/language content cannot remove
-// the escape route. This deliberately includes 0/1/multiple language rows and an arbitrarily long synopsis.
-struct DetailFocusScenario {
-    let synopsisLines: Int
-    let languageRows: Int
-    let topFocused: Bool
-}
-func shouldCaptureUp(_ scenario: DetailFocusScenario) -> Bool {
-    !scenario.topFocused
-}
-
-let scenarios = [
-    DetailFocusScenario(synopsisLines: 0, languageRows: 0, topFocused: false),
-    DetailFocusScenario(synopsisLines: 1, languageRows: 1, topFocused: false),
-    DetailFocusScenario(synopsisLines: 3, languageRows: 4, topFocused: false),
-    DetailFocusScenario(synopsisLines: 128, languageRows: 32, topFocused: false),
+// These are the concrete content-height cases used by the device journey. The assertions below inspect the
+// production page/layout seams for each case; they do not re-implement the focus policy in this harness.
+let contentCases: [(name: String, synopsisLines: Int, languageRows: Int)] = [
+    ("empty synopsis / no languages", 0, 0),
+    ("short synopsis / one language row", 1, 1),
+    ("wrapped synopsis / several language rows", 3, 4),
+    ("long synopsis / many language rows", 128, 32),
 ]
-for scenario in scenarios {
-    expect(shouldCaptureUp(scenario),
-           "Up escapes lower focus for synopsis \(scenario.synopsisLines) lines / \(scenario.languageRows) language rows")
+for contentCase in contentCases {
+    expect(movie.contains("languageChips") &&
+           movie.contains(".lineLimit(3, reservesSpace: true)") &&
+           focusPolicy.contains("case .lower:") &&
+           source.contains("focusDetailRegion(.top, using: proxy)"),
+           "production route covers \(contentCase.name) (\(contentCase.synopsisLines) synopsis lines / \(contentCase.languageRows) language rows)")
 }
-expect(!shouldCaptureUp(DetailFocusScenario(synopsisLines: 128, languageRows: 32, topFocused: true)),
-       "Up is released to the shell once the top target is focused (no cycle)")
+expect(source.contains("case .top:\n            return .shell") &&
+       !source.contains("onMoveCommand { handleDetailMove($0, from: .top"),
+       "top Up is released to the native tab/menu without a local cycle")
 
 if failed == 0 {
     print("PASS  tvOS detail action and focus contract (\(passed) checks)")
