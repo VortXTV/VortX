@@ -27,6 +27,8 @@ struct CommunityStreamGatewayFunctionalProofTests {
         let path = local.pathComponents
         expect(path.count == 3 && path[1] == "community" && path[2].count == 32, "opaque fixed-size token")
         expect(!local.absoluteString.contains("media.example.test") && !local.absoluteString.contains("sig="), "provider URL and query never leak")
+        let duplicate = try! gateway.register(upstream: signed, headers: ["Authorization": "Bearer test"])
+        expect(duplicate == local, "same active stream reuses its bounded opaque route")
         gateway.stop()
         print("Community stream gateway functional proof: PASS (\(checks) checks)")
     }

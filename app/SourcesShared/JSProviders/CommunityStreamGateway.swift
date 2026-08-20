@@ -121,6 +121,11 @@ final class CommunityStreamGateway: @unchecked Sendable {
         defer { lock.unlock() }
         pruneLocked(now: now)
         guard let port else { throw Failure.unavailable }
+        if let token = routes.first(where: {
+            $0.value.upstream == upstream && $0.value.headers == safeHeaders(headers) && $0.value.providerID == providerID
+        })?.key {
+            return URL(string: "http://127.0.0.1:\(port)/community/\(token)")!
+        }
         if routes.count >= maximumRoutes, let oldest = routes.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
             routes[oldest] = nil
         }
@@ -440,7 +445,7 @@ private final class ForwardState: @unchecked Sendable {
     private static func filtered(_ headers: [String: String], length: Int, preserveLength: Bool) -> [String: String] {
         let allowed = Set(["content-type", "content-range", "content-length", "accept-ranges", "cache-control", "etag", "last-modified"])
         var out = headers.filter { allowed.contains($0.key.lowercased()) && !$0.value.contains("\r") && !$0.value.contains("\n") }
-        if !preserveLength || out["content-length"] == nil { out["content-length"] = String(length) }
+        if !preserveLength { out["content-length"] = String(length) }
         out["connection"] = "close"
         return out
     }
