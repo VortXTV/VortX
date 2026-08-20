@@ -130,6 +130,12 @@ internal class SettingsSyncLedger(context: Context) {
         read(accountId).filterValues { it.dirty }
     }
 
+    /** Every locally-known revision, including acknowledged ones that must suppress legacy fallback. */
+    fun knownKeys(accountId: String): Set<String> = synchronized(lock) { read(accountId).keys }
+
+    /** Immutable record image used to construct both wire revisions and the matching PUT receipt. */
+    fun recordsSnapshot(accountId: String): Map<String, Stamp> = synchronized(lock) { read(accountId).toMap() }
+
     /**
      * A successful PUT acknowledges only the dirty revisions encoded for that PUT. A later local edit has
      * a distinct stamp and remains dirty, even when it happened while the request was in flight.
@@ -150,6 +156,9 @@ internal class SettingsSyncLedger(context: Context) {
     fun encodeForDocument(accountId: String, existing: JSONObject?): JSONObject = synchronized(lock) {
         mergeDocumentRevisions(existing, read(accountId))
     }
+
+    fun encodeSnapshotForDocument(existing: JSONObject?, records: Map<String, Stamp>): JSONObject =
+        mergeDocumentRevisions(existing, records)
 
     fun decodeDocument(raw: JSONObject?): Map<String, Stamp> {
         raw ?: return emptyMap()
@@ -268,7 +277,16 @@ internal class SettingsSyncLedger(context: Context) {
             existing: JSONObject?,
             local: Map<String, Stamp>,
         ): JSONObject = JSONObject(existing?.toString() ?: "{}").also { out ->
-            for ((key, stamp) in local) out.put(key, encodeStamp(stamp, includeDirty = false))
+            for ((key, stamp) in local) {
+                // Forward-compatible fields belong to the entry, not just the top-level map. Preserve them
+                // while updating only this protocol's three revision fields.
+                val entry = out.optJSONObject(key)?.let { JSONObject(it.toString()) } ?: JSONObject()
+                entry.put("clock", stamp.clock)
+                entry.put("device", stamp.device)
+                entry.put("tombstone", stamp.tombstone)
+                entry.remove("dirty")
+                out.put(key, entry)
+            }
         }
 
         /** Keys not named by a partial revision map retain legacy set-only carrier behaviour. */

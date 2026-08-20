@@ -120,4 +120,21 @@ class SettingsSyncLedgerTest {
         assertEquals(12L, merged.getJSONObject(known).getLong("clock"))
         assertFalse(merged.getJSONObject(known).has("dirty"))
     }
+
+    @Test
+    fun documentMergePreservesFutureFieldsInsideKnownRevision() {
+        val known = "stremiox.theme.oled"
+        val existing = JSONObject().put(known, JSONObject()
+            .put("clock", 1)
+            .put("device", "device-old")
+            .put("futureProof", JSONObject().put("mode", "keep")))
+
+        val merged = SettingsSyncLedger.mergeDocumentRevisions(
+            existing,
+            mapOf(known to SettingsSyncLedger.Stamp(12, "device-a", tombstone = true, dirty = true)),
+        )
+
+        assertEquals("keep", merged.getJSONObject(known).getJSONObject("futureProof").getString("mode"))
+        assertTrue(merged.getJSONObject(known).getBoolean("tombstone"))
+    }
 }

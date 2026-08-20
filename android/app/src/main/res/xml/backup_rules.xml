@@ -27,4 +27,8 @@
     <exclude domain="sharedpref" path="vortx_mediaserver_tokens_plain.xml" />
     <exclude domain="sharedpref" path="vortx_iptv_creds.xml" />
     <exclude domain="sharedpref" path="vortx_iptv_creds_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_metadata_credentials.xml" />
+    <exclude domain="sharedpref" path="vortx_metadata_credentials_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_metadata_credential_owner.xml" />
+    <exclude domain="sharedpref" path="vortx_settings_sync_ledger.xml" />
 </full-backup-content>

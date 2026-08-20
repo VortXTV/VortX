@@ -731,13 +731,19 @@ class VortXSyncManager(context: Context) {
         if (key != null && !applyingRemote && key in SettingsBackup.SYNCABLE_SETTING_TYPES) {
             captureSyncLease()?.let { lease ->
                 settingsLedger.recordLocal(lease.accountId, key, prefs.contains(key))
-                requestSyncSoon()
+                // Reuse the lease that owns the ledger record. Re-capturing here could arm account B's
+                // pending marker after an A→B transition, leaving A's durable edit without its retry job.
+                if (isSyncLeaseCurrent(lease) && !applyingRemote) {
+                    armPendingSync(lease, recordEdit = true)
+                }
             }
         }
     }
 
     init {
         settingsPrefs.registerOnSharedPreferenceChangeListener(settingsChangeListener)
+        // The mutable owner pointer is only for Settings UI reads. Lease-bound sync calls always use the
+        // account carried by their immutable lease, so a delayed restore cannot redirect a credential write.
         metadataKeys.bindOwner(sessionState.value?.account?.id)
     }
 
@@ -1480,6 +1486,8 @@ class VortXSyncManager(context: Context) {
             fallbackIsLossless = parsed.rosterIsLossless,
         )
         // ProfileStore is a main-thread store (mirroring Apple's @MainActor); fold + build on Main.
+        var preparedPublication: Map<String, SettingsSyncLedger.Stamp>? = null
+        var settingsSerializationValid = true
         val published = withContext(Dispatchers.Main) {
             publishIfSyncLeaseCurrent(lease) {
                 settingsLedger.establishBaseline(lease.accountId, settingsPrefs.all)
@@ -1493,7 +1501,7 @@ class VortXSyncManager(context: Context) {
                 val legacySettings = SettingsSyncLedger.unrevisionedKeys(
                     SettingsBackup.settingsFromBlob(doc.opt("settings"))?.keys.orEmpty(),
                     remoteSettings,
-                )
+                ).minus(settingsLedger.knownKeys(lease.accountId))
                 // UNION the cloud roster into the local one first (never shrinks local), so the block we push
                 // already carries both sides; a cloud-only profile survives the round-trip. Fold under the
                 // remote-apply flag so this union does not self-arm a push.
@@ -1530,6 +1538,16 @@ class VortXSyncManager(context: Context) {
                 } finally {
                     applyingRemote = false
                 }
+                // Capture one receipt and one preference snapshot before any encoding. The accepted PUT may
+                // acknowledge only these exact records; a later listener event gets a newer stamp and survives.
+                val recordsAtPrepare = settingsLedger.recordsSnapshot(lease.accountId)
+                val publication = recordsAtPrepare.filterValues { it.dirty }
+                val preparedSettings = settingsPrefs.all.toMap()
+                val publicationValues = publication.filterValues { !it.tombstone }.keys
+                val encodedPublicationValues = SettingsBackup.plistSettingsFrom(preparedSettings, publicationValues)
+                val serializable = encodedPublicationValues.keys == publicationValues
+                if (!serializable) settingsSerializationValid = false
+                if (!serializable) return@publishIfSyncLeaseCurrent
                 SettingsBackup.settingsBlobFor(
                     pulledBlob = doc.opt("settings"),
                     roster = store.profiles,
@@ -1537,18 +1555,15 @@ class VortXSyncManager(context: Context) {
                     bundleId = settingsBundleId,
                     // Only dirty local keys overlay the pulled domain. Explicit clears are carried by the
                     // ledger and remove the corresponding plist entry rather than masquerading as absence.
-                    deviceSettings = SettingsBackup.plistSettingsFrom(
-                        settingsPrefs.all,
-                        includeOnly = settingsMerge.publishValues,
-                    ),
-                    removedDeviceSettings = settingsMerge.publishTombstones,
+                    deviceSettings = encodedPublicationValues,
+                    removedDeviceSettings = publication.filterValues { it.tombstone }.keys,
                 )?.let { doc.put("settings", it) }
                 VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx")).also { vortx ->
                     vortx.put(
                         SETTINGS_LEDGER_KEY,
-                        settingsLedger.encodeForDocument(
-                            lease.accountId,
+                        settingsLedger.encodeSnapshotForDocument(
                             vortx.optJSONObject(SETTINGS_LEDGER_KEY),
+                            recordsAtPrepare,
                         ),
                     )
                     doc.put("vortx", vortx)
@@ -1557,10 +1572,11 @@ class VortXSyncManager(context: Context) {
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
                 mergeMetadataKeysIntoDoc(lease, doc)
+                preparedPublication = publication
             }
         }
-        return if (published && isSyncLeaseCurrent(lease)) {
-            PreparedSyncDocument(doc, settingsLedger.publicationSnapshot(lease.accountId))
+        return if (published && settingsSerializationValid && preparedPublication != null && isSyncLeaseCurrent(lease)) {
+            PreparedSyncDocument(doc, checkNotNull(preparedPublication))
         } else {
             null
         }
@@ -1618,7 +1634,7 @@ class VortXSyncManager(context: Context) {
         for (service in DebridService.entries) {
             if (debridKeys.isConfigured(service)) keys.put(service.id, debridKeys.key(service))
         }
-        if (keys.length() > 0) doc.put("apiKeys", keys)
+        if (keys.length() > 0) doc.put("apiKeys", keys) else doc.remove("apiKeys")
     }
 
     /**
@@ -1640,30 +1656,39 @@ class VortXSyncManager(context: Context) {
     /** Owner-scoped metadata slots share the account document's established exact API-key names. */
     private fun mergeMetadataKeysIntoDoc(lease: SyncSessionLease, doc: JSONObject) {
         if (!isSyncLeaseCurrent(lease)) return
-        metadataKeys.bindOwner(lease.accountId)
+        val snapshot = metadataKeys.snapshotForOwner(lease.accountId) ?: return
+        if (!isSyncLeaseCurrent(lease)) return
         val keys = doc.optJSONObject("apiKeys")?.let { JSONObject(it.toString()) } ?: JSONObject()
-        metadataKeys.value(MetadataProviderKeys.Slot.TMDB).takeIf(String::isNotEmpty)?.let { keys.put("tmdb", it) }
-        metadataKeys.value(MetadataProviderKeys.Slot.MDBLIST).takeIf(String::isNotEmpty)?.let { keys.put("mdblist", it) }
-        metadataKeys.value(MetadataProviderKeys.Slot.FANART).takeIf(String::isNotEmpty)?.let { keys.put("fanart", it) }
+        for (slot in MetadataProviderKeys.Slot.entries) {
+            val revision = snapshot.revisions[slot] ?: continue
+            val wire = slot.key.removePrefix("vortx.apikey.")
+            if (revision.tombstone) keys.remove(wire) else snapshot.values[slot]?.let { keys.put(wire, it) }
+        }
         if (keys.length() > 0) doc.put("apiKeys", keys)
+        val vortx = doc.optJSONObject("vortx")?.let { JSONObject(it.toString()) } ?: JSONObject()
+        vortx.put(METADATA_REVISIONS_KEY, metadataKeys.encodeRevisions(
+            vortx.optJSONObject(METADATA_REVISIONS_KEY), snapshot.revisions,
+        ))
+        doc.put("vortx", vortx)
     }
 
     /** Incoming metadata credentials are only admitted to the lease owner's secure namespace. */
-    private fun applyMetadataKeys(lease: SyncSessionLease, apiKeys: JSONObject?): Boolean {
-        apiKeys ?: return false
+    private fun applyMetadataKeys(lease: SyncSessionLease, doc: JSONObject): Boolean {
+        val apiKeys = doc.optJSONObject("apiKeys") ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
-        metadataKeys.bindOwner(lease.accountId)
-        var applied = false
-        apiKeys.optString("tmdb", "").takeIf(String::isNotEmpty)?.let {
-            if (metadataKeys.set(MetadataProviderKeys.Slot.TMDB, it)) applied = true
+        val revisions = metadataKeys.decodeRevisions(
+            doc.optJSONObject("vortx")?.optJSONObject(METADATA_REVISIONS_KEY),
+        )
+        if (revisions.isEmpty()) return false
+        val values = buildMap<MetadataProviderKeys.Slot, String?> {
+            if (apiKeys.has("tmdb")) put(MetadataProviderKeys.Slot.TMDB, apiKeys.optString("tmdb", ""))
+            if (apiKeys.has("mdblist")) put(MetadataProviderKeys.Slot.MDBLIST, apiKeys.optString("mdblist", ""))
+            if (apiKeys.has("fanart")) put(MetadataProviderKeys.Slot.FANART, apiKeys.optString("fanart", ""))
+            revisions.filterValues { it.tombstone }.keys.forEach { put(it, null) }
         }
-        apiKeys.optString("mdblist", "").takeIf(String::isNotEmpty)?.let {
-            if (metadataKeys.set(MetadataProviderKeys.Slot.MDBLIST, it)) applied = true
+        return metadataKeys.applyForOwner(lease.accountId, values, revisions) {
+            isSyncLeaseCurrent(lease)
         }
-        apiKeys.optString("fanart", "").takeIf(String::isNotEmpty)?.let {
-            if (metadataKeys.set(MetadataProviderKeys.Slot.FANART, it)) applied = true
-        }
-        return applied && isSyncLeaseCurrent(lease)
     }
 
     /**
@@ -1713,7 +1738,7 @@ class VortXSyncManager(context: Context) {
         val legacySettings = SettingsSyncLedger.unrevisionedKeys(
             SettingsBackup.settingsFromBlob(doc.opt("settings"))?.keys.orEmpty(),
             remoteSettings,
-        )
+        ).minus(settingsLedger.knownKeys(lease.accountId))
         var restored = false
         val published = withContext(Dispatchers.Main) {
             val store = resolveStore() ?: return@withContext false
@@ -1770,7 +1795,7 @@ class VortXSyncManager(context: Context) {
         // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
         // applyingRemote window). Owner-scoped by DebridKeys' account binding; never clears a key the blob omits.
         if (applyDebridKeys(doc.optJSONObject("apiKeys"))) restored = true
-        if (applyMetadataKeys(lease, doc.optJSONObject("apiKeys"))) restored = true
+        if (applyMetadataKeys(lease, doc)) restored = true
         // Stamp the applied version so the version-wins guard holds across relaunches (per account).
         if (!advanceVersion(lease, version)) return false
         return restored
@@ -1988,12 +2013,14 @@ class VortXSyncManager(context: Context) {
             twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
         )
         val s = Session(token, account, dataKey)
+        // Claim/migrate the account's credential namespace before publishing a new authenticated owner.
+        // A failed secure migration is an auth storage failure, never a partly-bound signed-in session.
+        if (!metadataKeys.bindOwner(account.id)) return SessionAdoption.STORAGE_FAILURE
         val adoption = when (
             val result = operation.commitSessionMutation(
                 onCommitted = ::cancelSessionWork,
             ) {
                 sessionState.replace(s) {
-                    metadataKeys.bindOwner(account.id)
                     _account.value = account
                     _sessionUiState.value = SessionUiState.SignedIn(account)
                 }
@@ -2267,5 +2294,6 @@ class VortXSyncManager(context: Context) {
          */
         private const val SETTINGS_PREFS_FILE = "vortx_settings"
         private const val SETTINGS_LEDGER_KEY = "settingsRevisions"
+        private const val METADATA_REVISIONS_KEY = "metadataKeyRevisions"
     }
 }
