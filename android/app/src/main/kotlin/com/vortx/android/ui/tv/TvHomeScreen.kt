@@ -49,8 +49,12 @@ import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
 import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
 import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
 import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
+import com.vortx.android.ui.HomeRowItem
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.collectionsHubSlot
 import com.vortx.android.ui.homeCatalogItemKey
+import com.vortx.android.ui.homeRowKey
+import com.vortx.android.ui.homeRowsWithHub
 import com.vortx.android.ui.normalizeHomeCatalogs
 import com.vortx.android.ui.normalizeHomeItems
 import androidx.compose.ui.platform.LocalContext
@@ -76,6 +80,8 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
     val catalogLayout by viewModel.homeCatalogLayout.collectAsStateWithLifecycle()
     val collections by viewModel.collections.collectAsStateWithLifecycle()
     val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
+    val hubOrder by viewModel.collectionsHubOrder.collectAsStateWithLifecycle()
+    val hubHidden by viewModel.collectionsHubHidden.collectAsStateWithLifecycle()
     if (collectionBrowse.target != null) {
         TvCollectionsBrowseScreen(
             state = collectionBrowse,
@@ -104,6 +110,8 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
                     contentOwnerGeneration = contentOwnerGeneration,
                     catalogLayout = catalogLayout,
                     collections = collections,
+                    collectionsHubOrder = hubOrder,
+                    collectionsHubHidden = hubHidden,
                     onCollection = viewModel::openCollection,
                     onRetryCollections = viewModel::retryCollectionsHub,
                     onItem = onItem,
@@ -122,6 +130,8 @@ private fun TvHomeContent(
     contentOwnerGeneration: Long,
     catalogLayout: HomeCatalogLayout,
     collections: CollectionsHubSnapshot,
+    collectionsHubOrder: List<HomeRail>,
+    collectionsHubHidden: Boolean,
     onCollection: (CollectionsHubTarget) -> Unit,
     onRetryCollections: () -> Unit,
     onItem: (MetaItem) -> Unit,
@@ -181,39 +191,55 @@ private fun TvHomeContent(
                 modifier = Modifier.fillMaxWidth().weight(1f),
             )
         } else {
+            // The hub is not a catalog, so [visibleCatalogs] (which drives focus + hero above) stays pure; the
+            // hub rides Customize-Home order/hide only for THIS list via [homeRowsWithHub].
+            val hubShown = collections.isVisible && !collectionsHubHidden
+            val rows = remember(visibleCatalogs, hubShown, collectionsHubOrder) {
+                homeRowsWithHub(
+                    visibleCatalogs,
+                    if (hubShown) collectionsHubSlot(visibleCatalogs, collectionsHubOrder) else null,
+                )
+            }
+            val lastCatalogId = visibleCatalogs.lastOrNull()?.id
             LazyColumn(
                 modifier = Modifier.fillMaxWidth().weight(1f),
                 state = columnState,
                 contentPadding = PaddingValues(top = TvDimens.rowGap, bottom = TvDimens.edge),
                 verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
             ) {
-                if (collections.isVisible) {
-                    item(key = "vortx.home.collectionsHub") {
-                        TvCollectionsHub(collections, onCollection, onRetryCollections, firstCardFocus)
+                itemsIndexed(rows, key = { _, row -> homeRowKey(row) }) { index, row ->
+                    when (row) {
+                        HomeRowItem.HubRow -> TvCollectionsHub(
+                            collections,
+                            onCollection,
+                            onRetryCollections,
+                            if (index == 0) firstCardFocus else null,
+                        )
+                        is HomeRowItem.CatalogRow -> {
+                            val catalog = row.catalog
+                            if (catalog.id == lastCatalogId) {
+                                LaunchedEffect(rows.size, catalog.id) { onLoadMoreRows() }
+                            }
+                            TvCatalogRow(
+                                catalog = catalog,
+                                onItem = onItem,
+                                onFocused = { acceptFocus(catalog.id, it) },
+                                onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                                onEndReached = if (catalog.hasNextPage) {
+                                    { onLoadRowPage(catalog) }
+                                } else {
+                                    null
+                                },
+                                firstCardFocus = if (index == 0) firstCardFocus else null,
+                                recovery = focusRecovery?.recovery,
+                                recoveryFocus = recoveryFocus,
+                                onRowState = { rowId, state -> rowStates[rowId] = state },
+                                onRowDisposed = { rowId, state ->
+                                    if (rowStates[rowId] === state) rowStates.remove(rowId)
+                                },
+                            )
+                        }
                     }
-                }
-                itemsIndexed(visibleCatalogs, key = { _, c -> c.id }) { index, catalog ->
-                    if (index == visibleCatalogs.lastIndex) {
-                        LaunchedEffect(visibleCatalogs.size, catalog.id) { onLoadMoreRows() }
-                    }
-                    TvCatalogRow(
-                        catalog = catalog,
-                        onItem = onItem,
-                        onFocused = { acceptFocus(catalog.id, it) },
-                        onRemoveFromContinueWatching = onRemoveFromContinueWatching,
-                        onEndReached = if (catalog.hasNextPage) {
-                            { onLoadRowPage(catalog) }
-                        } else {
-                            null
-                        },
-                        firstCardFocus = if (index == 0 && !collections.isVisible) firstCardFocus else null,
-                        recovery = focusRecovery?.recovery,
-                        recoveryFocus = recoveryFocus,
-                        onRowState = { rowId, state -> rowStates[rowId] = state },
-                        onRowDisposed = { rowId, state ->
-                            if (rowStates[rowId] === state) rowStates.remove(rowId)
-                        },
-                    )
                 }
             }
         }

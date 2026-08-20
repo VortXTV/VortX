@@ -55,6 +55,7 @@ enum class HomeRail(val key: String, val title: String) {
         fun forCatalog(catalog: Catalog): HomeRail = when {
             catalog.id.startsWith("${MEDIA_SERVERS.catalogId}:") -> MEDIA_SERVERS
             catalog.id.startsWith("${IMPORTED_LISTS.catalogId}:") -> IMPORTED_LISTS
+            catalog.id.startsWith("${EDITORIAL_COLLECTIONS.catalogId}:") -> EDITORIAL_COLLECTIONS
             else -> entries.firstOrNull { catalog.id == it.catalogId } ?: ADDON_CATALOGS
         }
 

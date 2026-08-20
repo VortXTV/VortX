@@ -65,6 +65,44 @@ finish on your phone from TV) and a Change-URL action that swaps its manifest li
 new one first so a bad link never leaves you with neither. Pasting an add-on's `/configure` page instead of
 its personalized manifest now guides you to finish setup rather than silently installing a dead copy.
 Android phone and TV.
+### Details page
+
+**A richer, safer title details page, matching the Apple app.** The details page gains the breadth the Apple
+apps have: a spoiler-safe mode that blurs unwatched episode thumbnails and hides their descriptions behind a
+tap-to-reveal (turn it on under Home and Discover, and revealing an episode never marks it watched); a
+cross-provider ratings strip led by the IMDb star, then Rotten Tomatoes, Metacritic and TMDB, filled from
+your own MDBList key when you have set one; for movies, a budget and box-office line (opt out under Home and
+Discover), the theatrical and digital release dates for your region, and a franchise/collection rail listing
+the whole series in release order. More Like This now blends the installed add-ons' genre-similar picks
+behind TMDB's recommendations and starts filling in before the metadata finishes loading. Where to Watch
+follows your region override before the device region and links out to the full JustWatch page. Titles your
+add-ons cannot recognise are resolved automatically where possible, and when nothing can, you now get a clear
+"Details unavailable" screen with a Try Again button instead of a page that never loads; a title with no
+metadata still shows a hero and its source list. Cast now always shows as a rail (with initials when there is
+no photo), a missing synopsis falls back to TMDB, and Share moves to a tidy overflow button in the top corner.
+### Home and Discover
+
+**Editorial Home rows, a richer Collections hub, and a browsable decade shelf.** Home now leads with a set
+of hand-curated editorial rows (Critically Acclaimed, Hidden Gems, Modern Classics, Award Winners), built
+from public catalogs so they fill in even when you have no extra add-ons installed, and each open shows a
+freshly rotated slice rather than the same list every time. The Collections hub gains a Browse by Decade
+shelf from the 2010s all the way back to the 1950s, each opening Movies, Shows, New, and Trending scoped to
+that decade, and every Discover card, genre tile, and decade tile now shows a representative piece of
+artwork instead of a flat gradient. Two genres that were missing, Fantasy and Mystery, are back. You can
+turn on the editorial rows or the Collections hub under Settings > Home & Discover, and the hub now sits
+wherever you place Collections in Customize Home (and disappears when you hide it there), on both phone and
+TV.
+
+**Browse another region, and a fleet safety switch.** A new Discover region control under Settings > Home &
+Discover lets you point the Collections hub at another market's streaming services and catalogs, so you can
+browse what is available elsewhere while Auto keeps following your device region. The Collections hub also
+now honors a remote feature switch, so it can be turned off fleet-wide if its catalog service ever needs
+maintenance, with no app update. Android phone and TV.
+
+**Titles you plan to watch on SIMKL now surface their air and release dates.** The shows and movies on your
+SIMKL plan-to-watch list are folded into the Upcoming Episodes and Upcoming Movies rows alongside your
+library and local watchlist, so a followed title shows its next date whether or not it is in your library.
+This drops back out the moment you disconnect SIMKL.
 
 ### Live TV
 

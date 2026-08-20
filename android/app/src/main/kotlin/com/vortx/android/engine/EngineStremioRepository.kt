@@ -18,6 +18,8 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
+import com.vortx.android.model.CoreLocalSearchState
+import com.vortx.android.model.CoreSearchSuggestion
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.Episode
 import com.vortx.android.model.InstalledAddon
@@ -1500,7 +1502,59 @@ class EngineStremioRepository(
     private fun discoverResultFrom(discoverStateJson: String): DiscoverResult {
         val titleMap = EngineState.parseAddonCatalogTitles(StremioCoreNative.getState(EngineActions.ctxField()))
         val rows = EngineState.parseCatalogWithFilters(discoverStateJson, titleMap)
-        return DiscoverResult(items = rows.firstOrNull()?.items.orEmpty(), filters = EngineState.parseDiscoverFilters(discoverStateJson))
+        return DiscoverResult(
+            items = withWatchedFlags(rows.firstOrNull()?.items.orEmpty()),
+            filters = EngineState.parseDiscoverFilters(discoverStateJson),
+        )
+    }
+
+    /// S10: badge already-watched titles on Discover/Search result cards (the shared [PosterCard]'s
+    /// `watched` overlay). Stamps `watched = true` on any item whose id the ACTIVE profile has watched,
+    /// computed per-profile by [currentWatchedIds] exactly like the Home board -- so a title marked watched
+    /// on Home reads watched on a Search/Discover card too, and an overlay profile's badges are its own.
+    /// A no-op allocation when the set is empty (the common case).
+    private fun withWatchedFlags(items: List<MetaItem>): List<MetaItem> {
+        val ids = currentWatchedIds()
+        if (ids.isEmpty()) return items
+        return items.map { if (!it.watched && it.id in ids) it.copy(watched = true) else it }
+    }
+
+    /// The set of meta ids the ACTIVE profile has watched, for badging catalog/search/discover cards.
+    /// Mirrors the Home board builder's own watched-id computation verbatim (an overlay profile reads its
+    /// local watch overlay; the main profile reads the engine bucket + library + Continue Watching), so the
+    /// per-profile watch-history invariant holds identically on every browse surface. Recomputed on each
+    /// call (search/discover both re-emit on a `ctx` change), never cached, so a fresh watch flips the badge
+    /// on the next emission.
+    private fun currentWatchedIds(): Set<String> {
+        val ctxJson = StremioCoreNative.getState(EngineActions.ctxField())
+        val profileStore = ProfileStore.sharedOrNull()
+        val privacy = homePrivacyFence.capture()
+        val principalMatches = engineHistoryPrincipalMatches(
+            profileStore?.active,
+            EngineState.parseAuthState(ctxJson),
+        )
+        val suppressEngineHistory = privacy.suppressAccountHistory || !principalMatches
+        return if (profileStore != null && !profileStore.activeUsesEngineHistory) {
+            WatchedIndex.overlayIds(profileStore.watch)
+        } else {
+            val uid = (EngineState.parseAuthState(ctxJson) as? AuthState.SignedIn)?.uid
+            WatchedIndex.engineHomeIds(
+                bucketIds = if (suppressEngineHistory) emptySet() else watchedIndex.engineIds(uid),
+                libraryIds = if (suppressEngineHistory) {
+                    emptySet()
+                } else {
+                    EngineState.parseWatchedLibraryIds(StremioCoreNative.getState(EngineActions.libraryField()))
+                },
+                continueWatchingIds = if (privacy.suppressContinueWatchingPreview || !principalMatches) {
+                    emptySet()
+                } else {
+                    EngineState.parseWatchedContinueWatchingIds(
+                        StremioCoreNative.getState(EngineActions.continueWatchingPreviewField()),
+                    )
+                },
+                suppressAccountHistory = suppressEngineHistory,
+            )
+        }
     }
 
     override suspend fun library(requestJson: String?): Result<LibraryResult> = withContext(Dispatchers.Default) { runCatching {
@@ -1825,11 +1879,47 @@ class EngineStremioRepository(
         send(currentSearchUpdate())
     }.conflate().distinctUntilChanged().flowOn(Dispatchers.Default)
 
-    private fun currentSearchUpdate(): Pair<List<MetaItem>, Boolean> =
-        EngineState.parseSearchUpdate(
+    private fun currentSearchUpdate(): Pair<List<MetaItem>, Boolean> {
+        val (items, isLoading) = EngineState.parseSearchUpdate(
             StremioCoreNative.getState("\"${EngineActions.FIELD_SEARCH}\""),
             requestedEnd = DEFAULT_SEARCH_ROWS,
         )
+        return withWatchedFlags(items) to isLoading
+    }
+
+    /// The engine `local_search` suggestion index for [query] (Apple `CoreBridge.loadSearchSuggestions` +
+    /// `suggestSearch`). Mirrors [searchUpdates]' subscribe-before-dispatch shape: Load the `LocalSearch`
+    /// model once, run a `Search maxResults 10`, and re-read the `local_search` field on every NewState that
+    /// touches it. Gated at two characters exactly like the full search field -- below it there is no engine
+    /// round-trip, so a one-character surface still shows client-side completions but never dispatches here.
+    override fun searchSuggestionUpdates(query: String): Flow<List<CoreSearchSuggestion>> = channelFlow {
+        val trimmed = query.trim()
+        if (trimmed.length < MIN_LOCAL_SEARCH_LENGTH) {
+            send(emptyList())
+            return@channelFlow
+        }
+
+        launch(start = CoroutineStart.UNDISPATCHED) {
+            changedFields.collect { fields ->
+                if (EngineActions.FIELD_LOCAL_SEARCH in fields) {
+                    send(currentLocalSearchSuggestions())
+                }
+            }
+        }
+
+        // Load the LocalSearch model (idempotent) then run the query. Apple loads once on field appear and
+        // searches on change; re-loading here per query is harmless and keeps the model resident with no
+        // separate lifecycle to track.
+        StremioCoreNative.dispatch(EngineActions.loadSearchSuggestions())
+        StremioCoreNative.dispatch(EngineActions.suggestSearch(trimmed))
+        send(currentLocalSearchSuggestions())
+    }.conflate().distinctUntilChanged().flowOn(Dispatchers.Default)
+
+    private fun currentLocalSearchSuggestions(): List<CoreSearchSuggestion> =
+        runCatching {
+            CoreLocalSearchState.fromJson(JSONObject(StremioCoreNative.getState(EngineActions.localSearchField())))
+                .searchResults
+        }.getOrDefault(emptyList())
 
     override suspend fun search(query: String): Result<List<MetaItem>> = withContext(Dispatchers.Default) {
         runCatching {
@@ -1843,7 +1933,7 @@ class EngineStremioRepository(
                 EngineActions.FIELD_SEARCH,
                 EngineActions.searchRange(DEFAULT_SEARCH_ROWS),
             ) { !EngineState.parseSearchUpdate(it, DEFAULT_SEARCH_ROWS).second }
-            EngineState.parseSearchUpdate(state, DEFAULT_SEARCH_ROWS).first
+            withWatchedFlags(EngineState.parseSearchUpdate(state, DEFAULT_SEARCH_ROWS).first)
         }
     }
 
@@ -1873,8 +1963,18 @@ class EngineStremioRepository(
         episodeId: String?,
         rememberedQuality: String?,
         wantedAddon: String?,
+        forceRefresh: Boolean,
     ): Result<List<StreamGroup>> = runLatestStreamLoad { generation ->
         withContext(Dispatchers.Default) { runCatching {
+        // Re-find sources: the engine caches this title's stream groups, so the plain Load below is a
+        // no-op with ZERO add-on HTTP once they are resident. Unload the MetaDetails model FIRST so the
+        // Load re-queries every stream add-on fresh and expired/dead sources are replaced. Default off:
+        // an ordinary detail load never pays this cost. The loadStreamFieldUntil / loadStreamsUntilWanted
+        // wait below still holds -- post-Unload the immediate field read is empty, so it correctly waits
+        // for the real re-fetch to settle instead of returning the just-cleared state.
+        if (forceRefresh) {
+            StremioCoreNative.dispatch(EngineActions.unloadMeta())
+        }
         // Meta + a guessed stream were already requested by meta(); re-pull meta_details for its
         // stream groups. If meta() was not called first, this Load brings both in.
         //
@@ -2037,6 +2137,35 @@ class EngineStremioRepository(
             )
         }
     }
+
+    // ---- SD-1: Play a link / magnet ----
+
+    /// A pasted DIRECT/debrid/usenet http(s) link plays as-is (it is already resolved by the user's
+    /// service) -- no debrid round-trip and no keys, matching Apple's paste-a-link path. Carries no
+    /// mediaRef, so it never scrobbles or writes Continue Watching (an ad-hoc play is not a library title).
+    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> =
+        withContext(Dispatchers.Default) {
+            runCatching {
+                Playable(url = url, title = title, viaStreamingServer = false, isTorrent = false)
+            }
+        }
+
+    /// A pasted magnet resolves through the EXISTING torrent/debrid path by building the same torrent
+    /// [StreamSource] the engine's own raw-torrent branch handles and delegating to [resolve]: a configured
+    /// debrid key unlocks a direct cached link; otherwise the in-process streaming server serves
+    /// `{base}/{infoHash}/{fileIdx}`. Reuses the debrid secure store exactly as [resolve] does -- the key
+    /// is never logged and never enters a URL path. [fileIdx] pins the saved file for a re-opened magnet.
+    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> =
+        resolve(
+            StreamSource(
+                id = infoHash,
+                addon = "Magnet",
+                title = title,
+                infoHash = infoHash.lowercase(),
+                fileIdx = fileIdx,
+                isTorrent = true,
+            ),
+        )
 
     // ---- Live playback progress (engine Player) ----
     //
@@ -2467,6 +2596,9 @@ class EngineStremioRepository(
         // Match CoreBridge's initial board fetch and search range so behavior tracks the reference app.
         const val DEFAULT_BOARD_ROWS = 12
         const val DEFAULT_SEARCH_ROWS = 30
+
+        /// Apple's two-character gate for the engine local-search dispatch (CoreBridge.suggestSearch).
+        const val MIN_LOCAL_SEARCH_LENGTH = 2
         const val TAG = "StremioXEngine"
 
         /// Connect/read timeout for a pasted add-on's manifest.json fetch ([fetchAddonManifest]).

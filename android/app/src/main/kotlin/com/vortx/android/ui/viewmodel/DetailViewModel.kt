@@ -10,6 +10,7 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.catalog.DetailMetaRecoveryPolicy
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
@@ -29,6 +30,7 @@ import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.orderedBySeasonEpisode
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PlayerSourceSwitchCommitGate
 import com.vortx.android.player.PlayerSourceSwitchResolution
@@ -236,9 +238,25 @@ class DetailViewModel(
     private val type: MediaType,
     private val id: String,
     appContext: Context,
+    private val routeName: String? = null,
 ) : ViewModel() {
 
     private val app = appContext.applicationContext
+
+    /// The route identity the screen opened, exposed so a view-local enrichment (More Like This) can key
+    /// off the ROUTE id and populate before the engine meta resolves (Apple's `loadSimilarFallback`).
+    val routeId: String get() = id
+    val routeType: MediaType get() = type
+
+    /// The EFFECTIVE meta/source id: the route [id] first, swapped ONCE by [loadMetaWithRecovery] to a
+    /// recovered `tt` when a non-`tt` catalog id (`tmdb:`/`tvdb:`/`kitsu:`) has no add-on meta. Only the
+    /// meta load, the reactive meta re-pull, and the source scope read this; the local preference stores
+    /// (pins / sticky / downloads / library) keep the stable route [id]. Mirrors Apple's `recoveredIMDbID`.
+    @Volatile private var metaId: String = id
+
+    /// One-shot latch for the non-`tt` meta recovery, re-armed by [retryMeta] so Try Again is a genuine
+    /// second attempt. Mirrors Apple `metaRecoveryAttempted`.
+    @Volatile private var metaRecoveryAttempted = false
 
     // ---- Source-list assembly + debrid orchestration (the assembly + coordinator wave) ----
     //
@@ -287,6 +305,14 @@ class DetailViewModel(
 
     private val _meta = MutableStateFlow<UiState<MetaDetail>>(UiState.Loading)
     val meta: StateFlow<UiState<MetaDetail>> = _meta.asStateFlow()
+
+    /// The terminal "Details unavailable" state (DET meta recovery): a non-`tt` catalog id that neither an
+    /// add-on nor the one-shot `TMDBPersonClient.imdbId` recovery could resolve. True here makes the screen
+    /// show the "Details unavailable" page with a working Try Again ([retryMeta]) instead of the old
+    /// back-navigating error. Never fires for a `tt` id (a meta-less `tt` renders a placeholder hero + a
+    /// working source list). Mirrors Apple `metaUnavailable`.
+    private val _metaUnavailable = MutableStateFlow(false)
+    val metaUnavailable: StateFlow<Boolean> = _metaUnavailable.asStateFlow()
 
     private val _streams = MutableStateFlow<UiState<List<StreamGroup>>>(UiState.Loading)
     val streams: StateFlow<UiState<List<StreamGroup>>> = _streams.asStateFlow()
@@ -390,7 +416,7 @@ class DetailViewModel(
         viewModelScope.launch {
             repo.ctxUpdates().collect {
                 if (_meta.value !is UiState.Success) return@collect
-                repo.peekMeta(type, id)?.let { fresh -> _meta.value = UiState.Success(fresh) }
+                repo.peekMeta(type, metaId)?.let { fresh -> _meta.value = UiState.Success(fresh) }
             }
         }
         // Start the assembly pipeline and bridge its ranked output to [_streams]. The bridge is gated by
@@ -426,33 +452,103 @@ class DetailViewModel(
             }
         }
         val initialProfile = sourceSticky.currentProfileId()
-        profileReloadJob = viewModelScope.launch {
-            if (type == MediaType.SERIES) {
-                // A series' hero Watch/Resume target depends on which episode + watched state the meta
-                // carries, so meta must land before the sources fan-out is scoped.
-                val loaded = repo.meta(type, id)
-                if (sourceSticky.currentProfileId() != initialProfile) return@launch
-                _meta.value = loaded.toUiState()
-                val detail = (_meta.value as? UiState.Success)?.data
-                val primary = detail?.let { primaryEpisodeOf(it) }
-                if (primary != null) {
-                    _selectedSeason.value = primary.first.season
-                    // Programmatic first selection: never arms the auto-pick latch (auto-playing on merely
-                    // OPENING a detail page would be aggressive; Apple fires only on the episode source
-                    // page the viewer navigated to).
-                    selectEpisode(primary.first.id, userTap = false)
-                } else {
-                    startSourceLoad(null)
-                }
+        profileReloadJob = viewModelScope.launch { loadMetaAndSources(initialProfile) }
+    }
+
+    /// Load the meta (with the DET recovery ladder), then scope the sources: a series to its RESUME/PLAY
+    /// primary episode, a movie to the title level. A terminal "Details unavailable" (a non-`tt` id nothing
+    /// could resolve) loads no sources. The one path both the initial load and [retryMeta] run through.
+    private suspend fun loadMetaAndSources(initialProfile: String) {
+        val detail = loadMetaWithRecovery(initialProfile) ?: return
+        if (sourceSticky.currentProfileId() != initialProfile) return
+        if (type == MediaType.SERIES) {
+            // A series' hero Watch/Resume target depends on which episode + watched state the meta carries,
+            // so meta must land (above) before the sources fan-out is scoped.
+            val primary = primaryEpisodeOf(detail)
+            if (primary != null) {
+                _selectedSeason.value = primary.first.season
+                // Programmatic first selection: never arms the auto-pick latch (auto-playing on merely
+                // OPENING a detail page would be aggressive; Apple fires only on the episode source page
+                // the viewer navigated to).
+                selectEpisode(primary.first.id, userTap = false)
             } else {
-                // Movie: land meta first (the hero + the media-server scoping both read it), then load the
-                // title-level sources through the assembly.
-                val loaded = repo.meta(type, id)
-                if (sourceSticky.currentProfileId() != initialProfile) return@launch
-                _meta.value = loaded.toUiState()
                 startSourceLoad(null)
             }
+        } else {
+            // Movie: the hero + the media-server scoping both read the meta, already landed above; load the
+            // title-level sources through the assembly.
+            startSourceLoad(null)
         }
+    }
+
+    /// The DET meta-recovery ladder (Kotlin twin of Apple `iOSDetailView`'s watchdog + `recoverMetaIfNeeded`
+    /// + terminal state):
+    ///
+    ///  1. Load the meta on the current [metaId], bounded by [META_WATCHDOG_MS] so a hung add-on can't leave
+    ///     the page on a permanent skeleton.
+    ///  2. Success -> publish it and return it (the hero + sources proceed).
+    ///  3. Failure / timeout on a `tt` id -> synthesize [MetaDetail.placeholder] so a meta-less `tt` (a
+    ///     brand-new / hub-seeded title Cinemeta does not know yet) still paints a hero and keeps a WORKING
+    ///     source list, instead of erroring out (DET synopsis / placeholder fallback).
+    ///  4. Failure / timeout on a NON-`tt`, recoverable id (`tmdb:`/`tvdb:`/`kitsu:`) -> one-shot recovery:
+    ///     resolve it to a `tt` via [TMDBPersonClient.imdbId], adopt that as [metaId], and reload the meta
+    ///     (placeholder if Cinemeta still has nothing). The one-attempt latch is re-armed only by [retryMeta].
+    ///  5. Nothing resolves it -> the terminal [_metaUnavailable] state (the "Details unavailable" page).
+    ///
+    /// Returns the [MetaDetail] to scope sources against, or null for the terminal state (no sources).
+    private suspend fun loadMetaWithRecovery(initialProfile: String): MetaDetail? {
+        _metaUnavailable.value = false
+        _meta.value = UiState.Loading
+        loadMetaOnce(initialProfile)?.let { return publishMeta(it) }
+        if (sourceSticky.currentProfileId() != initialProfile) return null
+
+        if (metaId.startsWith("tt")) return publishMeta(placeholderMeta())
+
+        if (!metaRecoveryAttempted && DetailMetaRecoveryPolicy.isRecoverableNonImdb(metaId)) {
+            metaRecoveryAttempted = true
+            val recovered = TMDBPersonClient.imdbId(metaId, type)
+            if (sourceSticky.currentProfileId() != initialProfile) return null
+            if (recovered != null && recovered != metaId) {
+                metaId = recovered
+                loadMetaOnce(initialProfile)?.let { return publishMeta(it) }
+                if (sourceSticky.currentProfileId() != initialProfile) return null
+                // Recovered to a `tt` but Cinemeta still has no meta: a placeholder keeps hero + sources.
+                return publishMeta(placeholderMeta())
+            }
+        }
+        _metaUnavailable.value = true
+        return null
+    }
+
+    /// One watchdog-bounded meta load on the current [metaId]; the loaded [MetaDetail] on success, else null
+    /// (a failure OR the watchdog firing) so the ladder can fall through to recovery / placeholder / terminal.
+    private suspend fun loadMetaOnce(initialProfile: String): MetaDetail? {
+        val result = withTimeoutOrNull(META_WATCHDOG_MS) { repo.meta(type, metaId) }
+        if (sourceSticky.currentProfileId() != initialProfile) return null
+        return result?.getOrNull()
+    }
+
+    private fun publishMeta(detail: MetaDetail): MetaDetail {
+        _meta.value = UiState.Success(detail)
+        return detail
+    }
+
+    /// A minimal placeholder meta for the current [metaId] (a `tt`): a hero + the standard metahub backdrop/
+    /// logo, named from the tapped card ([routeName]) so a meta-less title still reads as itself.
+    private fun placeholderMeta(): MetaDetail =
+        MetaDetail.placeholder(metaId, type, routeName?.takeIf { it.isNotBlank() } ?: metaId)
+
+    /// Try Again from the terminal "Details unavailable" state: re-arm the recovery latch, ask the engine for
+    /// the ORIGINAL route id again (not the previously-recovered one), and re-run the load. Mirrors Apple
+    /// `retryMeta`.
+    fun retryMeta() {
+        profileReloadJob?.cancel()
+        sourceLoadJob?.cancel()
+        metaRecoveryAttempted = false
+        metaId = id
+        _metaUnavailable.value = false
+        val profile = sourceSticky.currentProfileId()
+        profileReloadJob = viewModelScope.launch { loadMetaAndSources(profile) }
     }
 
     /// Reload sources scoped to a series [episodeId] (the engine `CoreVideo.id`). A no-op if the same episode
@@ -468,10 +564,27 @@ class DetailViewModel(
         startSourceLoad(episodeId)
     }
 
-    private fun startSourceLoad(episodeId: String?) {
+    private fun startSourceLoad(episodeId: String?, forceRefresh: Boolean = false) {
         sourceLoadJob?.cancel()
         val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), episodeId)
-        sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token) }
+        sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token, forceRefresh) }
+    }
+
+    /// Re-find sources (viewer escape hatch on the detail screen + terminal playback-failure path): re-query
+    /// the stream add-ons FRESH so an expired/dead source is replaced. The engine caches a title's stream
+    /// groups, so a plain re-load is a no-op with zero add-on HTTP; the real re-fetch is forced two ways --
+    /// clearing the TorBox per-title cache so its next refresh re-fetches instead of re-publishing stale rows,
+    /// and [forceRefresh] so the engine unloads MetaDetails before the load. Reuses the normal source pipeline:
+    /// [startSourceLoad] bumps the per-profile [SourceRequestFence] generation and [loadSources] repaints
+    /// through [UiState.Loading] ("Finding sources..."), so the fresh set is re-ranked with the SAME
+    /// non-authoritative soft-sticky bias (never a forced old pick) and the debrid circuit breaker is left
+    /// untouched. Only ever called from the detail screen or after playback has stopped, so it never wipes a
+    /// warmed next-episode lane mid-binge.
+    fun refreshSources() {
+        val episodeId = _selectedEpisodeId.value
+        val gen = sourceRequestFence.currentToken()?.generation ?: 0L
+        torbox.reset(gen, clearCache = true)
+        startSourceLoad(episodeId, forceRefresh = true)
     }
 
     private fun rebuildForProfile(profileId: String) {
@@ -497,8 +610,10 @@ class DetailViewModel(
         _streams.value = UiState.Loading
         _playback.value = Playback.Idle
         _meta.value = UiState.Loading
+        _metaUnavailable.value = false
         profileReloadJob = viewModelScope.launch {
-            val loaded = repo.meta(type, id)
+            // [metaId] carries any recovery already made for this title; a profile switch keeps it.
+            val loaded = repo.meta(type, metaId)
             if (sourceSticky.currentProfileId() != profileId) return@launch
             _meta.value = loaded.toUiState()
             val detail = loaded.getOrNull()
@@ -521,7 +636,7 @@ class DetailViewModel(
     /// contributor lanes + the account cache badge fold in a beat later through the coalescer, the "sources
     /// stream in behind the hero" shape. Fail-soft: an add-on-load failure surfaces as [UiState.Error] and
     /// leaves any still-arriving contributor lane to be handled on the next load.
-    private suspend fun loadSources(episodeId: String?, request: SourceRequestFence.Token) {
+    private suspend fun loadSources(episodeId: String?, request: SourceRequestFence.Token, forceRefresh: Boolean = false) {
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         // Reset per-target state so a superseded episode's rows / cache badges can never leak into the new one.
         sourcesReady = false
@@ -530,7 +645,9 @@ class DetailViewModel(
         sourceModel.setRawGroups(emptyList())
 
         val detail = (_meta.value as? UiState.Success)?.data
-        val imdb = id.takeIf { it.startsWith("tt") }
+        // [metaId] is the route id, or the `tt` a non-`tt` catalog id was recovered to (see
+        // [loadMetaWithRecovery]), so a recovered title's sources fan out on the resolved `tt`.
+        val imdb = metaId.takeIf { it.startsWith("tt") }
         val ep = episodeId?.let { eid -> detail?.videos?.firstOrNull { it.id == eid } }
         val season = if (type == MediaType.SERIES) ep?.season else null
         val episodeNum = if (type == MediaType.SERIES) ep?.episode else null
@@ -564,10 +681,11 @@ class DetailViewModel(
 
         repo.streams(
             type = type,
-            id = id,
+            id = metaId,
             episodeId = episodeId,
             rememberedQuality = advanceHint?.first,
             wantedAddon = advanceHint?.let { sourceSticky.preference(id)?.addon },
+            forceRefresh = forceRefresh,
         ).fold(
             onSuccess = { raw ->
                 // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
@@ -1765,6 +1883,11 @@ class DetailViewModel(
 
     private companion object {
         const val OWNER_CHANGED_MESSAGE = "The active VortX account changed. Try again."
+
+        /// Meta watchdog: how long the initial (and recovered) meta load may run before it is treated as
+        /// stalled and the recovery / placeholder / terminal ladder takes over, so a hung add-on can never
+        /// leave the detail page on a permanent skeleton. Mirrors Apple `metaWatchdogSeconds` (12s).
+        const val META_WATCHDOG_MS = 12_000L
 
         /// How many DISTINCT sources the bad-source ladder may burn per play target before it stops
         /// auto-retrying and the shell surfaces manual selection (the CEO's "after 3 failures, ask").

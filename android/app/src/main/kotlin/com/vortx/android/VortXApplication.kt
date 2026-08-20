@@ -17,6 +17,7 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
+import com.vortx.android.config.RemoteConfig
 import com.vortx.android.debrid.DebridAccountOwnerState
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.EngineStremioRepository
@@ -94,6 +95,11 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
+        // Bootstrap the minimal RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch). Loads
+        // the last-good cached feature flags synchronously, then refreshes once in the background. Fail-soft:
+        // the collections-hub fleet kill-switch reads a baked-true default until a remote value lands.
+        runCatching { RemoteConfig.bootstrap(this, applicationScope) }
+            .onFailure { Log.w(TAG, "RemoteConfig bootstrap failed; features stay at baked defaults", it) }
         // Activate the (until-now dormant) VortX account sync engine now that the roster + watch overlay it
         // folds into are stood up: construct VortXSyncManager, wire its push seams, and add the foreground
         // pull. Fail-soft inside; a no-op when signed out, and never on the critical launch path.

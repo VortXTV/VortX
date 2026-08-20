@@ -335,11 +335,25 @@ private fun TvDetailContent(
 
             // Focusable source list.
             Column(modifier = Modifier.weight(0.48f).fillMaxHeight()) {
-                Text(
-                    text = "Sources",
-                    style = VortXTheme.type.sectionTitle,
-                    modifier = Modifier.padding(bottom = VortXTheme.spacing.sm),
-                )
+                // Header + the "Re-find" escape hatch (D-pad focusable): re-query the add-ons fresh so an
+                // expired/dead source, or an exhausted ladder, is replaced. All logic lives in
+                // [DetailViewModel.refreshSources]; this only calls it. Disabled visual is unnecessary here
+                // because a re-find while resolving simply re-begins the fence the resolve rides.
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = VortXTheme.spacing.sm),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Sources",
+                        style = VortXTheme.type.sectionTitle,
+                    )
+                    TvFilterChip(
+                        label = "Re-find",
+                        selected = false,
+                        onClick = viewModel::refreshSources,
+                    )
+                }
                 TvSourceList(streamsState = streamsState, onPlaySource = viewModel::play)
             }
         }

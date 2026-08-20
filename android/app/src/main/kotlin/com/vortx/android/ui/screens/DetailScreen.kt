@@ -43,6 +43,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -59,8 +60,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.VortXApplication
+import com.vortx.android.catalog.AddonSimilarClient
+import com.vortx.android.catalog.CollectionClient
+import com.vortx.android.catalog.DiscoverRegion
+import com.vortx.android.catalog.FinancialsClient
+import com.vortx.android.catalog.ReleaseDatesClient
 import com.vortx.android.catalog.SimilarClient
-import com.vortx.android.catalog.WatchProvider
+import com.vortx.android.catalog.WatchAvailability
 import com.vortx.android.catalog.WatchProvidersClient
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
@@ -75,7 +81,9 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.ratings.MdbListClient
 import com.vortx.android.ratings.MdbListRatings
+import com.vortx.android.ratings.RatingsFormat
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
@@ -92,6 +100,7 @@ import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SourceRow
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.components.shimmer
+import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
@@ -146,6 +155,9 @@ fun DetailScreen(
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
     val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
+    // DET meta recovery: a non-`tt` catalog id nothing could resolve shows the terminal "Details
+    // unavailable" page (with a working Try Again) instead of the old back-navigating error.
+    val metaUnavailable by viewModel.metaUnavailable.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -193,7 +205,7 @@ fun DetailScreen(
             key = "detail-nested-${target.type.id}-${target.id}-$nestedOwner:$nestedCredentialRevision:$nestedSourceRevision",
             factory = StremioXViewModelFactory(
                 repo = app.catalogRepository,
-                detailArgs = StremioXViewModelFactory.DetailArgs(target.type, target.id),
+                detailArgs = StremioXViewModelFactory.DetailArgs(target.type, target.id, target.name),
                 appContext = app,
             ),
         )
@@ -226,48 +238,111 @@ fun DetailScreen(
         return
     }
 
-    // View-local TMDB cast enrichment, mirroring the Apple detail views' `loadCredits` @State: fetch the
-    // full cast (person ids + character + headshots) through VortX's keyless signed edge, keyed off the
-    // meta's imdb id. Fail-soft -- an empty result (no tt id, or the edge is down) leaves the plain-name
-    // cast fallback below. Held here (not in DetailViewModel) so the media-servers wave's ViewModel is
-    // untouched, exactly as the credits fetch is view-local on iOS/tvOS.
+    // View-local TMDB cast + synopsis-fallback enrichment, mirroring the Apple detail views' `loadCredits`:
+    // the full cast (person ids + character + headshots) AND TMDB's overview (the synopsis fallback for a
+    // title Cinemeta has no description for) through VortX's keyless signed edge, keyed off the meta's imdb
+    // id. Fail-soft -- an empty result leaves the plain-name cast fallback + no fallback synopsis. Held here
+    // (not in DetailViewModel) so the media-servers wave's ViewModel is untouched, as on iOS/tvOS.
     var castMembers by remember { mutableStateOf<List<CastMember>>(emptyList()) }
+    var fallbackOverview by remember { mutableStateOf<String?>(null) }
     val loadedMeta = metaState as? UiState.Success
     val castImdbId = loadedMeta?.data?.id
     val castType = loadedMeta?.data?.type
+    val hasDescription = !loadedMeta?.data?.description.isNullOrBlank()
     LaunchedEffect(castImdbId, castType) {
         castMembers = emptyList()
         if (castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
             castMembers = TMDBPersonClient.credits(castImdbId, castType)
         }
     }
-
-    // View-local VortX ratings enrichment, mirroring the Apple detail views loading `VortXRatingsClient`:
-    // the keyless, edge-signed ratings.vortx.tv service returns cross-provider critic scores (Rotten
-    // Tomatoes / Metacritic / TMDB) the engine meta does not carry, keyed off the meta's imdb id. Fail-soft
-    // -- a non-`tt` id, a title with no scores, or a down edge leaves this null and the ratings strip is
-    // omitted. Held here (not in DetailViewModel) so the media-servers wave's ViewModel is untouched,
-    // exactly as the cast credits fetch is view-local.
-    var vortxRatings by remember { mutableStateOf<MdbListRatings?>(null) }
-    LaunchedEffect(castImdbId, castType) {
-        vortxRatings = null
-        if (castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
-            vortxRatings = VortXRatingsClient.ratings(castImdbId, castType.id)
+    // DET synopsis fallback: reach for TMDB's overview only when the engine meta carries no description.
+    LaunchedEffect(castImdbId, castType, hasDescription) {
+        fallbackOverview = null
+        if (!hasDescription && castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
+            fallbackOverview = TMDBPersonClient.overview(castImdbId, castType)
         }
     }
 
-    // DET-3 "More Like This" + DET-6 "Where to Watch": two view-local rails enriched off the keyless
-    // catalogs edge, keyed off the meta's imdb id, exactly like the cast + ratings fetches above (held
-    // here, not in DetailViewModel, so the media-servers wave's ViewModel is untouched). Fail-soft: an
-    // empty list leaves the rail omitted below; a non-tt id / live type / down edge never blanks a band.
-    var similarItems by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
-    var watchProviders by remember { mutableStateOf<List<WatchProvider>>(emptyList()) }
+    // DET ratings: the keyless VortX ratings service (IMDb + RT / MC / TMDB), FILLED from the user's own
+    // MDBList key for any RT / MC the service did not return (most users need no key). Keyed off the meta's
+    // imdb id, rendered as the hero rating token strip ([RatingsFormat]). Fail-soft: null leaves only the
+    // instant engine IMDb in the strip. Held here (not in DetailViewModel), as on iOS.
+    var ratings by remember { mutableStateOf<MdbListRatings?>(null) }
     LaunchedEffect(castImdbId, castType) {
-        similarItems = emptyList()
-        watchProviders = emptyList()
+        ratings = null
         if (castImdbId != null && castImdbId.startsWith("tt") && castType != null) {
-            similarItems = SimilarClient.similar(castImdbId, castType)
-            watchProviders = WatchProvidersClient.providers(castImdbId, castType)
+            val vx = VortXRatingsClient.ratings(castImdbId, castType.id)
+            val needsMore = vx == null || vx.rottenTomatoes == null || vx.metacritic == null
+            val mdb = if (needsMore) MdbListClient.ratings(context, castImdbId, castType.id) else null
+            val merged = MdbListRatings(
+                imdb = vx?.imdb ?: mdb?.imdb,
+                rottenTomatoes = vx?.rottenTomatoes ?: mdb?.rottenTomatoes,
+                metacritic = vx?.metacritic ?: mdb?.metacritic,
+                tmdb = vx?.tmdb ?: mdb?.tmdb,
+            )
+            ratings = if (merged.hasAny) merged else null
+        }
+    }
+
+    // DET-3 "More Like This": the TMDB-recommendations leg keyed off the ROUTE id so the rail populates
+    // BEFORE the engine meta resolves (Apple's `loadSimilarFallback`). Once meta lands with genres, the
+    // add-on genre-similar leg (Cinemeta top-by-genre + franchise keyword) is merged BEHIND the deduped
+    // recommendations (Apple's `loadSimilar`). Fail-soft on both legs.
+    var similarItems by remember { mutableStateOf<List<MetaItem>>(emptyList()) }
+    val routeId = viewModel.routeId
+    val routeType = viewModel.routeType
+    LaunchedEffect(routeId, routeType) {
+        similarItems = emptyList()
+        if (routeId.startsWith("tt") && !isLiveType(routeType)) {
+            similarItems = SimilarClient.similar(routeId, routeType)
+        }
+    }
+    val similarGenres = loadedMeta?.data?.genres
+    val similarTitle = loadedMeta?.data?.name
+    LaunchedEffect(castImdbId, castType, similarGenres, similarTitle) {
+        val id = castImdbId
+        val type = castType
+        if (id == null || type == null || isLiveType(type)) return@LaunchedEffect
+        val recs = if (id.startsWith("tt")) SimilarClient.similar(id, type) else emptyList()
+        val genre = if (!similarGenres.isNullOrEmpty()) {
+            AddonSimilarClient.genreSimilar(type, id, similarGenres, similarTitle ?: "")
+        } else {
+            emptyList()
+        }
+        val merged = mergeSimilar(recs = recs, genre = genre, excludingId = id)
+        if (merged.isNotEmpty()) similarItems = merged
+    }
+
+    // DET-6 "Where to Watch": legal region providers + the region's JustWatch page link, from TMDB (keyless
+    // edge), honouring the user's region override before the device region ([DiscoverRegion]). Fail-soft.
+    var watchAvail by remember { mutableStateOf<WatchAvailability?>(null) }
+    LaunchedEffect(castImdbId, castType) {
+        watchAvail = null
+        if (castImdbId != null && castImdbId.startsWith("tt") && castType != null && !isLiveType(castType)) {
+            watchAvail = WatchProvidersClient.availability(castImdbId, castType, DiscoverRegion.effective(context))
+        }
+    }
+
+    // DET financials / collection / release dates: MOVIES ONLY, off the keyless edge. Financials is gated on
+    // the Home & Discover "Show budget & box office" setting. Fail-soft: null leaves each row / rail omitted.
+    var financials by remember { mutableStateOf<FinancialsClient.Financials?>(null) }
+    var movieCollection by remember { mutableStateOf<CollectionClient.MovieCollection?>(null) }
+    var releaseDates by remember { mutableStateOf<ReleaseDatesClient.ReleaseDates?>(null) }
+    val discoverPrefs = remember(context) { HomeDiscoverPreferences(context) }
+    val showFinancials = discoverPrefs.showFinancials
+    // Spoiler-safe mode + the session-only reveal set (DET spoiler-safe). The first tap on a veiled episode
+    // reveals it here (read-only against watched state, never a watch write).
+    val spoilerSafe = discoverPrefs.spoilerSafe
+    var revealedEpisodeIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(castImdbId, castType, showFinancials) {
+        financials = null
+        movieCollection = null
+        releaseDates = null
+        val id = castImdbId
+        if (id != null && id.startsWith("tt") && castType == MediaType.MOVIE) {
+            if (showFinancials) financials = FinancialsClient.financials(id, isSeries = false)
+            movieCollection = CollectionClient.collection(id, isSeries = false)
+            releaseDates = ReleaseDatesClient.releaseDates(id, isSeries = false, DiscoverRegion.effective(context))
         }
     }
 
@@ -294,8 +369,17 @@ fun DetailScreen(
 
     Box(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         when (val m = metaState) {
-            is UiState.Loading -> DetailSkeleton(title)
-            is UiState.Error -> ErrorState(m.message, onRetry = onBack, modifier = Modifier.fillMaxSize())
+            // A non-`tt` catalog id that neither an add-on nor the one-shot recovery could resolve sits in
+            // Loading with [metaUnavailable] set: show the terminal "Details unavailable" page (Try Again
+            // genuinely re-attempts) instead of a permanent skeleton. A `tt` never reaches here (it gets a
+            // placeholder hero + a working source list).
+            is UiState.Loading -> if (metaUnavailable) {
+                DetailUnavailable(onRetry = viewModel::retryMeta, modifier = Modifier.fillMaxSize())
+            } else {
+                DetailSkeleton(title)
+            }
+            // Replace the back-navigating error with a genuine retry (Apple's `retryMeta`).
+            is UiState.Error -> ErrorState(m.message, onRetry = viewModel::retryMeta, modifier = Modifier.fillMaxSize())
             is UiState.Success -> LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
@@ -318,7 +402,6 @@ fun DetailScreen(
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
                         onTrailer = { viewModel.playTrailer() },
-                        onShare = { launchDetailShare(context, m.data.id, m.data.name) },
                     )
                 }
                 // DET-8: the one-line rationale for the auto-picked source (#16), shown once under the hero
@@ -336,16 +419,24 @@ fun DetailScreen(
                         )
                     }
                 }
-                // VortX cross-provider critic scores under the hero actions (only when the ratings service
-                // returned at least one), the additive detail ratings strip -- IMDb already shows in the
-                // hero MetaRow, so this surfaces Rotten Tomatoes / Metacritic / TMDB.
-                vortxRatings?.let { r ->
+                // DET ratings token strip (RatingsFormat): the cross-provider set led by the accent star
+                // (IMDb) then RT / MC / TMDB, shown once the keyless VortX service (+ any MDBList fill)
+                // resolves. Per-score fail-soft; the caller already dropped a fully-empty result.
+                ratings?.let { r ->
                     item {
-                        RatingsRow(
+                        RatingsTokenStrip(
                             ratings = r,
                             modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
                         )
                     }
+                }
+                // DET financials (MOVIES ONLY, gated on the "Show budget & box office" setting) + theatrical
+                // / digital release dates: compact fact lines under the ratings.
+                financials?.let { FinancialsClient.financialsText(it) }?.let { text ->
+                    item { DetailFactLine(text) }
+                }
+                releaseDates?.let { ReleaseDatesClient.releaseDatesText(it) }?.let { text ->
+                    item { DetailFactLine(text) }
                 }
                 if (sourcesOpen) {
                     item {
@@ -357,6 +448,7 @@ fun DetailScreen(
                                 downloadNotice = downloadNotice,
                                 sort = sourceSort,
                                 onSortChange = viewModel::setSourceSort,
+                                onRefresh = viewModel::refreshSources,
                                 pin = pinUi,
                                 entryNoun = viewModel.pinEntryNoun,
                                 onPin = viewModel::pinSource,
@@ -367,7 +459,9 @@ fun DetailScreen(
                         }
                     }
                 }
-                m.data.description?.let { synopsis ->
+                // DET synopsis: the engine meta's description, or TMDB's overview fallback for a title
+                // Cinemeta has no description for (a brand-new / hub-seeded tt or the placeholder hero).
+                (m.data.description?.takeIf { it.isNotBlank() } ?: fallbackOverview)?.let { synopsis ->
                     item {
                         Text(
                             text = synopsis,
@@ -376,10 +470,16 @@ fun DetailScreen(
                         )
                     }
                 }
-                // DET-6 Where to Watch: legal region providers from TMDB (keyless edge). Hidden for live
-                // content (no providers) and whenever the list is empty, so it never leaves a blank band.
-                if (watchProviders.isNotEmpty() && !isLiveType(m.data.type)) {
-                    item { WhereToWatchRail(providers = watchProviders) }
+                // DET-6 Where to Watch: legal region providers from TMDB (keyless edge), plus the region's
+                // JustWatch page link. Hidden for live content and an empty result, so it never leaves a
+                // blank band.
+                watchAvail?.takeIf { !isLiveType(m.data.type) }?.let { avail ->
+                    item {
+                        WhereToWatchRail(
+                            availability = avail,
+                            onOpenLink = { url -> openExternalLink(context, url) },
+                        )
+                    }
                 }
                 if (m.data.cast.isNotEmpty() || castMembers.isNotEmpty() ||
                     m.data.directors.isNotEmpty() || m.data.writers.isNotEmpty()
@@ -407,22 +507,34 @@ fun DetailScreen(
                         .sortedBy { it.episode }
                     items(episodes, key = { it.id }) { episode ->
                         val currentForSources = episode.id == selectedEpisodeId
+                        val watched = episode.id in m.data.watchedVideoIds
+                        // DET spoiler-safe veil (read-only against watched state): an unwatched, not-yet-
+                        // revealed episode's thumbnail is blurred with an eye-slash overlay and its synopsis
+                        // is withheld behind "Tap to reveal". The first tap on a veiled row REVEALS it (a
+                        // session-only reveal) rather than navigating / choosing sources.
+                        val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
                         EpisodeRow(
                             code = if (episode.season > 0) "S${episode.season} · E${episode.episode}" else "Episode ${episode.episode}",
                             title = episode.title,
-                            overview = episode.overview,
+                            overview = if (veiled) "Tap to reveal" else episode.overview,
                             airDate = episode.released?.take(10),
-                            watched = episode.id in m.data.watchedVideoIds,
+                            watched = watched,
                             progress = episodeProgress(episode, m.data),
                             onClick = {
-                                // With Smart auto-pick on, the tap plays the best source straight away;
-                                // opening the sources section under it is the escape hatch (backing out
-                                // of the player reveals the full list, Apple's exact wording).
-                                if (viewModel.autoPickEnabled) sourcesOpen = true
-                                viewModel.selectEpisode(episode.id)
+                                if (veiled) {
+                                    // Reveal first: a veiled row's first tap never jumps into a spoilery
+                                    // source list. Session-only; never writes a watched tick.
+                                    revealedEpisodeIds = revealedEpisodeIds + episode.id
+                                } else {
+                                    // With Smart auto-pick on, the tap plays the best source straight away;
+                                    // opening the sources section under it is the escape hatch (backing out
+                                    // of the player reveals the full list, Apple's exact wording).
+                                    if (viewModel.autoPickEnabled) sourcesOpen = true
+                                    viewModel.selectEpisode(episode.id)
+                                }
                             },
                             onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
-                            thumb = { EpisodeThumb(episode) },
+                            thumb = { EpisodeThumb(episode, veiled = veiled) },
                             modifier = Modifier
                                 .padding(horizontal = VortXTheme.spacing.edge)
                                 .then(
@@ -438,8 +550,18 @@ fun DetailScreen(
                         )
                     }
                 }
-                // DET-3 More Like This: TMDB recommendations (keyless edge) as poster tiles that open the
-                // nested detail overlay. Hidden for live content and whenever the list is empty.
+                // DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in
+                // release order, reusing the More-Like-This rail idiom. Hidden for a single-part collection.
+                movieCollection?.takeIf { it.parts.size > 1 }?.let { collection ->
+                    item {
+                        CollectionRail(
+                            collection = collection,
+                            onOpen = openSimilar,
+                        )
+                    }
+                }
+                // DET-3 More Like This: TMDB recommendations + the add-on genre-similar leg (keyless edge) as
+                // poster tiles that open the nested detail overlay. Hidden for live content and an empty list.
                 if (similarItems.isNotEmpty() && !isLiveType(m.data.type)) {
                     item {
                         SimilarRail(
@@ -453,6 +575,14 @@ fun DetailScreen(
             }
         }
         BackChip(onBack = onBack, modifier = Modifier.align(Alignment.TopStart))
+        // DET share overflow: a top-right glass overflow disc (matching the Back chip glass) hosting Share,
+        // shown once the meta has loaded so it can share the title's IMDb URL (else its name).
+        loadedMeta?.data?.let { detail ->
+            DetailOverflowChip(
+                onShare = { launchDetailShare(context, detail.id, detail.name) },
+                modifier = Modifier.align(Alignment.TopEnd),
+            )
+        }
         mutationError?.let {
             // A resolve/mutation failure is transient and non-blocking (the page underneath stays
             // usable) -- a small pill at the bottom rather than a second full-screen error layer.
@@ -467,6 +597,47 @@ fun DetailScreen(
                     .padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
             )
         }
+    }
+}
+
+/// Merge the More-Like-This legs (DET-3): the deduped TMDB recommendations FIRST, then the add-on
+/// genre-similar leg behind, dropping the seed and any id already carried by the recommendations. Mirrors
+/// Apple `loadSimilar`'s `merged = recs + items` with the existing-id filter.
+private fun mergeSimilar(
+    recs: List<MetaItem>,
+    genre: List<MetaItem>,
+    excludingId: String,
+): List<MetaItem> {
+    val seen = HashSet<String>()
+    val out = ArrayList<MetaItem>(recs.size + genre.size)
+    for (item in recs) {
+        if (item.id == excludingId) continue
+        if (seen.add(item.id)) out += item
+    }
+    for (item in genre) {
+        if (item.id == excludingId) continue
+        if (seen.add(item.id)) out += item
+    }
+    return out
+}
+
+/// The terminal "Details unavailable" page (DET meta recovery): a non-`tt` catalog id nothing could resolve.
+/// Centered in the viewport with the standard margins and the shared primary button, so Try Again ([onRetry],
+/// wired to [DetailViewModel.retryMeta]) reads as part of this surface. Mirrors Apple's `metaUnavailableScreen`.
+@Composable
+private fun DetailUnavailable(onRetry: () -> Unit, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.padding(VortXTheme.spacing.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(text = "Details unavailable", style = VortXTheme.type.screenTitle)
+        Text(
+            text = "This catalog item could not be matched to metadata your installed add-ons can load.",
+            style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+            textAlign = TextAlign.Center,
+        )
+        PrimaryButton(text = "Try Again", onClick = onRetry, modifier = Modifier.widthIn(max = 240.dp))
     }
 }
 
@@ -660,39 +831,46 @@ private fun MetaText(text: String) {
     Text(text = text, style = VortXTheme.type.label.copy(color = Color.White.copy(alpha = 0.82f)))
 }
 
-/// The VortX cross-provider ratings strip: Rotten Tomatoes / Metacritic / TMDB critic scores from the
-/// keyless [VortXRatingsClient], rendered as compact score badges. Shown only when at least one provider
-/// returned a value (the caller already dropped a null / empty result). Mirrors the extra ratings the Apple
-/// detail row renders from `MDBListRatings`; IMDb stays in the hero [MetaRow], so this shows the three
-/// critic providers the engine meta does not carry.
+/// DET ratings token strip ([RatingsFormat]): the cross-provider set led by the accent star (IMDb, whose
+/// label is dropped in favour of the star), then RT / MC / TMDB, each `label value`. ONE formatting shared
+/// with the rest of VortX so the number and order never drift. The caller already dropped a fully-empty
+/// result; a title carrying only IMDb renders exactly one token.
 @Composable
-private fun RatingsRow(ratings: MdbListRatings, modifier: Modifier = Modifier) {
+private fun RatingsTokenStrip(ratings: MdbListRatings, modifier: Modifier = Modifier) {
+    val tokens = RatingsFormat.tokens(ratings)
+    if (tokens.isEmpty()) return
     Row(
         modifier = modifier,
-        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        ratings.rottenTomatoes?.let { RatingBadge("Rotten Tomatoes", "$it%") }
-        ratings.metacritic?.let { RatingBadge("Metacritic", it.toString()) }
-        ratings.tmdb?.let { RatingBadge("TMDB", "$it%") }
-    }
-}
-
-/// One provider score badge: the emphasized value over its muted provider label.
-@Composable
-private fun RatingBadge(label: String, value: String) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(
-            text = value,
-            style = VortXTheme.type.label.copy(
-                color = VortXTheme.colors.textPrimary,
-                fontWeight = FontWeight.SemiBold,
-            ),
-        )
-        Text(
-            text = label,
-            style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textTertiary),
-        )
+        tokens.forEach { token ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (token.isImdb) {
+                    Icon(
+                        VortXIcons.starFill,
+                        contentDescription = null,
+                        tint = VortXTheme.colors.accentBright,
+                        modifier = Modifier.size(14.dp),
+                    )
+                } else {
+                    Text(
+                        text = token.label,
+                        style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textTertiary),
+                    )
+                }
+                Text(
+                    text = token.value,
+                    style = VortXTheme.type.label.copy(
+                        color = VortXTheme.colors.textPrimary,
+                        fontWeight = FontWeight.SemiBold,
+                    ),
+                )
+            }
+        }
     }
 }
 
@@ -718,7 +896,6 @@ private fun ActionsCluster(
     onToggleWatched: () -> Unit,
     hasTrailer: Boolean,
     onTrailer: () -> Unit,
-    onShare: () -> Unit,
 ) {
     val watchLabel = when {
         resolving -> "Starting…"
@@ -809,18 +986,47 @@ private fun ActionsCluster(
                     )
                 }
             }
-            // DET-10: share the title's IMDb page (or its name when there is no imdb id) via the platform
-            // share sheet; fail-soft when no activity can handle the intent (Detail stays usable).
-            item {
-                Chip(
-                    label = "Share",
-                    selected = false,
-                    leadingIcon = VortXIcons.share,
-                    onClick = onShare,
-                )
-            }
         }
     }
+}
+
+/// DET share overflow: a top-right glass disc (matching the [BackChip] glass) whose menu hosts Share -- the
+/// title's IMDb URL (or its name when there is no imdb id), via the platform share sheet, fail-soft when no
+/// activity can handle it. Mirrors Apple's hero overflow chrome (share lives here, not as a hero chip).
+@Composable
+private fun DetailOverflowChip(onShare: () -> Unit, modifier: Modifier = Modifier) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Box(
+        modifier = modifier
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(VortXTheme.spacing.md)
+            .vortxGlass(
+                shape = VortXShapes.chip,
+                fillAlpha = VortXGlass.pillFillAlpha,
+                shadow = VortXGlass.Shadow.pill,
+            ),
+    ) {
+        IconButton(onClick = { menuOpen = true }) {
+            Icon(VortXIcons.moreHoriz, contentDescription = "More", tint = Color.White)
+        }
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            DropdownMenuItem(
+                text = { Text("Share") },
+                onClick = { menuOpen = false; onShare() },
+            )
+        }
+    }
+}
+
+/// A compact fact line under the hero ratings (DET financials / release dates), tertiary tone so it reads as
+/// supporting metadata, at the standard screen edge inset.
+@Composable
+private fun DetailFactLine(text: String) {
+    Text(
+        text = text,
+        style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+    )
 }
 
 /// Live content (a channel / TV type) has no TMDB recommendations or watch providers, so the DET-3
@@ -858,11 +1064,19 @@ private fun CreditsSection(
             )
         }
         if (expanded) {
-            // TMDB rail (tappable headshots) when it resolved, else the meta's plain-name cast list.
-            if (castMembers.isNotEmpty()) {
-                CastRail(members = castMembers, onPersonTap = onPersonTap)
+            // DET-9 cast rail: TMDB credits (tappable headshots) when they resolved, else the meta's plain
+            // cast names mapped to NON-tappable [CastMember]s (synthetic NEGATIVE ids -> not tappable, no
+            // headshot -> initials-disc tiles) through the SAME [CastRail], so the section keeps its rail
+            // shape instead of collapsing to a flat credit line (Apple's `railCastMembers` fallback).
+            val railMembers = if (castMembers.isNotEmpty()) {
+                castMembers
             } else {
-                m.cast.takeIf { it.isNotEmpty() }?.let { CreditLine("Cast", it) }
+                m.cast.mapIndexed { index, name ->
+                    CastMember(id = -(index + 1), name = name, character = null, profileUrl = null)
+                }
+            }
+            if (railMembers.isNotEmpty()) {
+                CastRail(members = railMembers, onPersonTap = onPersonTap)
             }
             m.directors.takeIf { it.isNotEmpty() }?.let { CreditLine("Director", it) }
             m.writers.takeIf { it.isNotEmpty() }?.let { CreditLine("Writer", it) }
@@ -996,23 +1210,72 @@ private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaIt
     }
 }
 
-/// DET-6 "Where to Watch": a horizontal rail of legal region streaming providers (TMDB watch/providers
-/// off the keyless edge). Each dark brand mark sits on a warm near-white plate so it stays legible on
-/// the app's dark chrome, mirroring the Apple `whereToWatchSection` plate treatment. The caller already
-/// dropped an empty list, so this always has providers to show.
+/// DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in release
+/// order, reusing the [SimilarRail] poster-tile idiom. The header frames "Part of the <X> Collection"
+/// ([CollectionClient.collectionRowTitle]); each tile opens the nested detail overlay via [onOpen] (the same
+/// tmdb->tt resolve the More-Like-This rail uses). The caller already hid a single-part collection.
 @Composable
-private fun WhereToWatchRail(providers: List<WatchProvider>) {
+private fun CollectionRail(collection: CollectionClient.MovieCollection, onOpen: (MetaItem) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-        Text(
-            text = "Where to Watch",
-            style = VortXTheme.type.sectionTitle,
-            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
-        )
+        Column(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
+            Text(text = "Collection".uppercase(), style = VortXTheme.type.eyebrow)
+            Text(
+                text = CollectionClient.collectionRowTitle(collection.name),
+                style = VortXTheme.type.sectionTitle,
+            )
+        }
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+        ) {
+            // No item key: tmdb ids are effectively unique here, but keying by a possibly-repeated id risks
+            // the duplicate-key crash the grid screens guard against, and this list is static per title.
+            items(collection.parts) { item ->
+                PosterCard(
+                    title = item.name,
+                    subtitle = item.year,
+                    onClick = { onOpen(item) },
+                    modifier = Modifier.width(120.dp),
+                    art = { PosterArt(item.poster, item.name) },
+                )
+            }
+        }
+    }
+}
+
+/// DET-6 "Where to Watch": a horizontal rail of legal region streaming providers (TMDB watch/providers off
+/// the keyless edge). Each dark brand mark sits on a warm near-white plate so it stays legible on the app's
+/// dark chrome, mirroring the Apple `whereToWatchSection` plate treatment. When the region's JustWatch page
+/// link is present, the header is tappable and opens it via [onOpenLink]. The caller already dropped an empty
+/// result, so this always has providers to show.
+@Composable
+private fun WhereToWatchRail(availability: WatchAvailability, onOpenLink: (String) -> Unit) {
+    val link = availability.link
+    Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(if (link != null) Modifier.clickable { onOpenLink(link) } else Modifier)
+                .padding(horizontal = VortXTheme.spacing.edge),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(text = "Where to Watch", style = VortXTheme.type.sectionTitle)
+            // The JustWatch deep link (parsed off the region bucket) opens the full options page.
+            if (link != null) {
+                Icon(
+                    imageVector = VortXIcons.link,
+                    contentDescription = "Open on JustWatch",
+                    tint = VortXTheme.colors.textTertiary,
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
             contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
         ) {
-            items(providers) { provider ->
+            items(availability.providers) { provider ->
                 Column(
                     modifier = Modifier.width(64.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -1147,19 +1410,37 @@ private fun SeasonMenu(
     }
 }
 
-/// [EpisodeRow]'s `thumb` slot for a real episode: a Coil [AsyncImage] of the video's thumbnail,
-/// falling back to the default placeholder -- the same slot-fill pattern as [com.vortx.android.ui.components.PosterArt].
+/// [EpisodeRow]'s `thumb` slot for a real episode: a Coil [AsyncImage] of the video's thumbnail, falling
+/// back to the default placeholder -- the same slot-fill pattern as [com.vortx.android.ui.components.PosterArt].
+/// When [veiled] (DET spoiler-safe: an unwatched, not-yet-revealed episode) the art is blurred and an
+/// eye-slash overlay marks it as hidden (blur is a no-op below API 31, so it degrades gracefully).
 @Composable
-private fun EpisodeThumb(episode: Episode) {
-    if (episode.thumbnail.isNullOrBlank()) {
-        DefaultEpisodeThumb()
-    } else {
-        AsyncImage(
-            model = episode.thumbnail,
-            contentDescription = episode.title,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
-        )
+private fun EpisodeThumb(episode: Episode, veiled: Boolean = false) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        val artModifier = if (veiled) Modifier.fillMaxSize().blur(14.dp) else Modifier.fillMaxSize()
+        if (episode.thumbnail.isNullOrBlank()) {
+            Box(modifier = artModifier) { DefaultEpisodeThumb() }
+        } else {
+            AsyncImage(
+                model = episode.thumbnail,
+                contentDescription = episode.title,
+                contentScale = ContentScale.Crop,
+                modifier = artModifier,
+            )
+        }
+        if (veiled) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = VortXIcons.eyeSlash,
+                    contentDescription = "Spoiler hidden",
+                    tint = Color.White.copy(alpha = 0.9f),
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        }
     }
 }
 
@@ -1197,6 +1478,7 @@ private fun SourcesSection(
     downloadNotice: String?,
     sort: String,
     onSortChange: (String) -> Unit,
+    onRefresh: () -> Unit,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPin: (StreamSource, SourcePinScope) -> Unit,
@@ -1229,7 +1511,23 @@ private fun SourcesSection(
             is UiState.Success -> {
                 val groups = state.data
                 val total = groups.sumOf { it.streams.size }
-                Text(text = "Sources · $total", style = VortXTheme.type.sectionTitle)
+                // Header + the "Re-find" escape hatch: re-query the add-ons fresh so an expired/dead source
+                // (or an empty result) is replaced. All the work lives in [DetailViewModel.refreshSources];
+                // this only calls [onRefresh]. Disabled mid-resolve so a re-find can't race an in-flight play.
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(text = "Sources · $total", style = VortXTheme.type.sectionTitle)
+                    Chip(
+                        label = "Re-find",
+                        selected = false,
+                        enabled = !resolving,
+                        leadingIcon = VortXIcons.refresh,
+                        onClick = onRefresh,
+                    )
+                }
                 if (total > 0) {
                     // Per-add-on filter chips ("All (N)" + one per group), only when there is more than one
                     // add-on to filter between (Apple's `filterBar`, shown for groups.count > 1).

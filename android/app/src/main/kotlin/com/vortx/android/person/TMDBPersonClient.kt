@@ -113,6 +113,20 @@ object TMDBPersonClient {
         return out
     }
 
+    /// TMDB's overview for a title, resolved from an IMDb id off the keyless edge (the `/find` result's
+    /// `overview`), used as the detail synopsis fallback when the engine meta carries no `description`
+    /// (a brand-new / hub-seeded `tt` Cinemeta does not know yet). Ported from the overview half of Apple
+    /// `TMDBClient.credits` (which rides the overview alongside the cast). null on a non-`tt` id, no match,
+    /// no overview, or any transport error, so the caller simply shows no synopsis.
+    suspend fun overview(imdbId: String, type: MediaType): String? {
+        if (!imdbId.startsWith("tt")) return null
+        val media = mediaPath(type)
+        val found = getJson("/find/$imdbId?external_source=imdb_id") ?: return null
+        val resultsKey = if (media == "tv") "tv_results" else "movie_results"
+        val first = found.optJSONArray(resultsKey)?.optJSONObject(0) ?: return null
+        return first.optStringOrNull("overview")
+    }
+
     /// Full person record via `/person/{id}` for the Person page header, ported from
     /// `TMDBClient.person(id:)`. [id] is the TMDB person id a [CastMember] carries. null on a
     /// non-positive id (a name-only fallback tile has no person), no match, or any error.

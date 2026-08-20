@@ -15,12 +15,16 @@ object EngineActions {
 
     const val FIELD_BOARD = "board"
     const val FIELD_SEARCH = "search"
+    const val FIELD_LOCAL_SEARCH = "local_search"
     const val FIELD_DISCOVER = "discover"
     const val FIELD_LIBRARY = "library"
     const val FIELD_META_DETAILS = "meta_details"
     const val FIELD_CTX = "ctx"
     const val FIELD_CONTINUE_WATCHING_PREVIEW = "continue_watching_preview"
     const val FIELD_PLAYER = "player"
+
+    /// Apple's exact `maxResults` cap for the engine local-search suggestion query (CoreBridge.swift:1206).
+    const val LOCAL_SEARCH_MAX_RESULTS = 10
 
     /// Load the Home board (every catalog of every installed add-on). Mirrors CoreBridge.loadBoard.
     ///
@@ -198,6 +202,33 @@ object EngineActions {
         )
 
     fun searchUnload(): String = envelope(FIELD_SEARCH, action("Unload", null))
+
+    // ---- S09: engine local-search suggestions (the `local_search` field) ----
+    //
+    // The lightweight as-you-type suggestion index, distinct from the full `search` (CatalogsWithExtra)
+    // field. Mirrors Apple `CoreBridge.loadSearchSuggestions` / `suggestSearch` (CoreBridge.swift:1196-1207)
+    // exactly: Load the `LocalSearch` model ONCE (its ActionLoad variant carries no selected payload, so
+    // args is just `{ model }`, NOT the nested `{ model, args }` the board's CatalogsWithExtra needs), then
+    // dispatch a `Search { searchQuery, maxResults }` on each query. There is NO Unload -- the model is
+    // loaded once and left resident (Apple has no local_search Unload either).
+
+    /// Load the engine's `LocalSearch` model (the as-you-type suggestion index). Mirrors Apple
+    /// `CoreBridge.loadSearchSuggestions`. Dispatched once when the search surface first needs suggestions;
+    /// idempotent to re-Load.
+    fun loadSearchSuggestions(): String =
+        envelope(FIELD_LOCAL_SEARCH, action("Load", JSONObject().put("model", "LocalSearch")))
+
+    /// Run a local-search suggestion query (`ActionLocalSearch::Search`). [maxResults] is the raw integer
+    /// cap Apple sends (10). Mirrors Apple `CoreBridge.suggestSearch`, which only dispatches this at two or
+    /// more characters -- the caller is responsible for the same gate.
+    fun suggestSearch(query: String): String =
+        envelope(
+            FIELD_LOCAL_SEARCH,
+            action("Search", JSONObject().put("searchQuery", query).put("maxResults", LOCAL_SEARCH_MAX_RESULTS)),
+        )
+
+    /// The state field-selector for `local_search`, ready for [StremioCoreNative.getState].
+    fun localSearchField(): String = "\"$FIELD_LOCAL_SEARCH\""
 
     /// Load a title's meta + a guessed best stream. For a series episode, pass [streamType]/[streamId]
     /// (the episode's video id) so the engine fetches that episode's streams. Mirrors CoreBridge.loadMeta.

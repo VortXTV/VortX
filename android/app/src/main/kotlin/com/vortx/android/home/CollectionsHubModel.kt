@@ -7,6 +7,7 @@ import com.vortx.android.R
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.InstalledAddon
+import com.vortx.android.config.RemoteConfig
 import com.vortx.android.net.VortXEdgeAuth
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.trickplay.TmdbImdbResolution
@@ -39,11 +40,20 @@ import java.util.Locale
 internal const val SHOW_COLLECTIONS_HUB_KEY = "vortx.home.showCollectionsHub"
 internal const val COLLECTIONS_REFRESH_CADENCE_KEY = "vortx.collections.refreshCadence"
 internal const val COLLECTIONS_SELECTED_PROVIDERS_KEY = "vortx.collections.selectedProviders"
+// Discover region override (Apple `vortx.discover.regionPreference`, uppercased): forces the hub's TMDB
+// watch_region so an out-of-region user can browse another market. Blank/absent => the device locale region.
+internal const val DISCOVER_REGION_PREFERENCE_KEY = "vortx.discover.regionPreference"
 internal const val COLLECTIONS_HUB_ENABLED_DEFAULT = true
+// RemoteConfig fleet kill-switch (Apple CollectionsHubModel.isAvailable): a remote `false` hides the hub
+// fleet-wide (e.g. if the catalogs edge is down). Baked default true => absent/null remote == shipping.
+internal const val COLLECTIONS_HUB_FEATURE_KEY = "collectionsHub"
+internal const val COLLECTIONS_HUB_FEATURE_DEFAULT = true
 internal const val COLLECTIONS_REFRESH_CADENCE_DEFAULT = "daily"
 internal const val COLLECTIONS_SELECTED_PROVIDERS_DEFAULT = ""
 private const val COLLECTIONS_PROVIDER_CACHE_PREFIX = "vortx.collections.providers."
 private const val COLLECTIONS_PROVIDER_CACHE_AT_PREFIX = "vortx.collections.providersAt."
+private const val COLLECTIONS_ART_CACHE_PREFIX = "vortx.collections.tileArt."
+private const val COLLECTIONS_ART_CACHE_AT_PREFIX = "vortx.collections.tileArtAt."
 private const val COLLECTIONS_EDGE_BASE = "https://catalogs.vortx.tv/3"
 private const val COLLECTIONS_EDGE_TIMEOUT_MS = 12_000
 
@@ -72,6 +82,11 @@ internal sealed interface CollectionsHubTarget {
         override val id = "genre:${spec.id}"
         override val title = CollectionsHubLabel.Resource(spec.titleResource)
     }
+
+    data class Decade(val spec: DecadeSpec) : CollectionsHubTarget {
+        override val id = "decade:${spec.id}"
+        override val title = CollectionsHubLabel.Literal(spec.title)
+    }
 }
 
 internal data class CollectionsHubTile(
@@ -89,8 +104,10 @@ internal data class CollectionsHubSnapshot(
     val streamingLoading: Boolean = false,
     val streamingLoadFailed: Boolean = false,
     val genres: List<CollectionsHubTile> = emptyList(),
+    val decades: List<CollectionsHubTile> = emptyList(),
 ) {
-    val isVisible: Boolean get() = enabled && (discover.isNotEmpty() || streaming.isNotEmpty() || genres.isNotEmpty())
+    val isVisible: Boolean get() = enabled &&
+        (discover.isNotEmpty() || streaming.isNotEmpty() || genres.isNotEmpty() || decades.isNotEmpty())
 }
 
 internal data class CollectionsHubBrowseState(
@@ -135,7 +152,16 @@ internal enum class DiscoverList(
     TRENDING("trending", R.string.collections_discover_trending, R.string.collections_discover_trending_subtitle),
     POPULAR("popular", R.string.collections_discover_popular, R.string.collections_discover_popular_subtitle),
     LATEST("latest", R.string.collections_discover_latest, R.string.collections_discover_latest_subtitle),
-    UPCOMING("upcoming", R.string.collections_discover_upcoming, R.string.collections_discover_upcoming_subtitle),
+    UPCOMING("upcoming", R.string.collections_discover_upcoming, R.string.collections_discover_upcoming_subtitle);
+
+    /** The TMDB movie-list path whose first result gives this card its representative backdrop (Apple parity). */
+    val backdropListPath: String
+        get() = when (this) {
+            TRENDING -> "/trending/movie/week"
+            POPULAR -> "/movie/popular"
+            LATEST -> "/movie/now_playing"
+            UPCOMING -> "/movie/upcoming"
+        }
 }
 
 internal data class GenreSpec(
@@ -147,6 +173,21 @@ internal data class GenreSpec(
     val originalLanguage: String? = null,
 )
 
+/** A browse-by-decade tile: a release-year window baked into every discover query. Mirrors Apple DecadeSpec. */
+internal data class DecadeSpec(
+    val id: String,
+    val title: String,
+    val startYear: Int,
+    val endYear: Int,
+)
+
+/**
+ * Representative artwork for the static hub tiles, keyed by tile id ("discover:trending" / "genre:action" /
+ * "decade:2020s"). Resolved off the catalogs edge and cached per region on the hub cadence; a tile with no
+ * entry falls back to its gradient (the UI never blanks). Mirrors Apple's genre/discover/decade backdrops.
+ */
+internal data class CollectionsHubArtwork(val byTileId: Map<String, String> = emptyMap())
+
 internal interface CollectionsHubSource {
     suspend fun providers(region: String, selectedProviderIds: List<Int>): List<CollectionsHubTile>
     suspend fun page(
@@ -156,6 +197,17 @@ internal interface CollectionsHubSource {
         page: Int,
         tmdbCatalogSupported: Boolean,
     ): CollectionsHubPage
+
+    /**
+     * Resolve a representative backdrop / cover per static tile (Discover cards, genres, decades), keyed by
+     * tile id. Batched 429-safely; fail-soft to empty. Defaulted so test doubles and non-edge sources need
+     * not implement it (they simply carry the gradient fallback).
+     */
+    suspend fun artwork(
+        region: String,
+        genres: List<GenreSpec>,
+        decades: List<DecadeSpec>,
+    ): CollectionsHubArtwork = CollectionsHubArtwork()
 }
 
 internal data class CollectionsHubProviderCache(val encoded: String?, val savedAtMillis: Long)
@@ -164,8 +216,13 @@ internal interface CollectionsHubPreferences {
     fun enabled(): Boolean
     fun refreshCadence(): String
     fun selectedProviders(): String
+    /** The uppercased 2-letter Discover region override, or null to use the device locale region. */
+    fun regionOverride(): String? = null
     fun providerCache(scope: String): CollectionsHubProviderCache
     fun saveProviderCache(scope: String, encoded: String, savedAtMillis: Long)
+    // Cadence-cached representative artwork (defaulted so test doubles need not implement it).
+    fun artworkCache(scope: String): CollectionsHubProviderCache = CollectionsHubProviderCache(null, 0L)
+    fun saveArtworkCache(scope: String, encoded: String, savedAtMillis: Long) {}
     fun observe(listener: (String) -> Unit)
     fun close()
 }
@@ -184,6 +241,12 @@ private class AndroidCollectionsHubPreferences(context: Context) : CollectionsHu
     override fun selectedProviders(): String =
         prefs.getString(COLLECTIONS_SELECTED_PROVIDERS_KEY, COLLECTIONS_SELECTED_PROVIDERS_DEFAULT).orEmpty()
 
+    override fun regionOverride(): String? =
+        prefs.getString(DISCOVER_REGION_PREFERENCE_KEY, null)
+            ?.trim()
+            ?.uppercase(Locale.ROOT)
+            ?.takeIf { it.length == 2 && it.all(Char::isLetter) }
+
     override fun providerCache(scope: String): CollectionsHubProviderCache = CollectionsHubProviderCache(
         encoded = prefs.getString("$COLLECTIONS_PROVIDER_CACHE_PREFIX$scope", null),
         savedAtMillis = prefs.getLong("$COLLECTIONS_PROVIDER_CACHE_AT_PREFIX$scope", 0L),
@@ -193,6 +256,18 @@ private class AndroidCollectionsHubPreferences(context: Context) : CollectionsHu
         prefs.edit()
             .putString("$COLLECTIONS_PROVIDER_CACHE_PREFIX$scope", encoded)
             .putLong("$COLLECTIONS_PROVIDER_CACHE_AT_PREFIX$scope", savedAtMillis)
+            .apply()
+    }
+
+    override fun artworkCache(scope: String): CollectionsHubProviderCache = CollectionsHubProviderCache(
+        encoded = prefs.getString("$COLLECTIONS_ART_CACHE_PREFIX$scope", null),
+        savedAtMillis = prefs.getLong("$COLLECTIONS_ART_CACHE_AT_PREFIX$scope", 0L),
+    )
+
+    override fun saveArtworkCache(scope: String, encoded: String, savedAtMillis: Long) {
+        prefs.edit()
+            .putString("$COLLECTIONS_ART_CACHE_PREFIX$scope", encoded)
+            .putLong("$COLLECTIONS_ART_CACHE_AT_PREFIX$scope", savedAtMillis)
             .apply()
     }
 
@@ -237,12 +312,15 @@ internal class CollectionsHubModel internal constructor(
     )
 
     private val loadMutex = Mutex()
+    private val artworkMutex = Mutex()
     private val browseMutex = Mutex()
     private val stateLock = Any()
     private var loadGeneration = 0L
     private var browseGeneration = 0L
     private var closed = false
-    private var featureEnabled = preferences.enabled()
+    private var featureEnabled = enabled()
+    /** Representative tile artwork (Discover/genre/decade backdrops), applied in [baseSnapshot]. */
+    private var artwork = CollectionsHubArtwork()
 
     private val _snapshot = MutableStateFlow(initialSnapshot(featureEnabled))
     val snapshot: StateFlow<CollectionsHubSnapshot> = _snapshot.asStateFlow()
@@ -256,7 +334,8 @@ internal class CollectionsHubModel internal constructor(
     private val listener: (String) -> Unit = { key ->
         if (key == SHOW_COLLECTIONS_HUB_KEY ||
             key == COLLECTIONS_REFRESH_CADENCE_KEY ||
-            key == COLLECTIONS_SELECTED_PROVIDERS_KEY
+            key == COLLECTIONS_SELECTED_PROVIDERS_KEY ||
+            key == DISCOVER_REGION_PREFERENCE_KEY
         ) {
             val changed = synchronized(stateLock) {
                 if (closed) return@synchronized false
@@ -268,7 +347,7 @@ internal class CollectionsHubModel internal constructor(
                     _browse.value = CollectionsHubBrowseState()
                 }
                 _snapshot.value = if (isEnabled) {
-                    val region = deviceRegion()
+                    val region = resolvedRegion()
                     baseSnapshot(cachedProviders(cacheScope(region, selectedProviderIds())))
                 } else {
                     CollectionsHubSnapshot()
@@ -295,7 +374,7 @@ internal class CollectionsHubModel internal constructor(
             }
             ++loadGeneration
         }
-        val region = deviceRegion()
+        val region = resolvedRegion()
         val selected = selectedProviderIds()
         val scope = cacheScope(region, selected)
         val cached = cachedProviders(scope)
@@ -325,6 +404,61 @@ internal class CollectionsHubModel internal constructor(
                 _snapshot.value = baseSnapshot(cached).copy(streamingLoadFailed = true)
             }
         }
+    }
+
+    /**
+     * Resolve + cache the representative tile artwork (Discover cards, genres, decades) and republish the
+     * snapshot with the imageUrls applied. Independent of the provider load (Apple runs the artwork on its
+     * own tasks), cadence-cached per region, fail-soft: an all-empty fetch keeps the prior art rather than
+     * blanking the tiles, which already gradient-fallback when no art is present.
+     */
+    suspend fun loadArtwork() = artworkMutex.withLock {
+        if (synchronized(stateLock) { closed || !featureEnabled }) return@withLock
+        val region = resolvedRegion()
+        val cached = cachedArtwork(region)
+        if (cached.byTileId.isNotEmpty()) applyArtwork(cached)
+        if (artworkCacheFresh(region)) return@withLock
+        val fetched = try {
+            source.artwork(region, GENRES, DECADES)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            CollectionsHubArtwork()
+        }
+        if (fetched.byTileId.isEmpty()) return@withLock
+        cacheArtwork(region, fetched)
+        applyArtwork(fetched)
+    }
+
+    private fun applyArtwork(art: CollectionsHubArtwork) = synchronized(stateLock) {
+        if (closed || !featureEnabled) return@synchronized
+        artwork = art
+        _snapshot.value = _snapshot.value.applyingArtwork(art)
+    }
+
+    private fun CollectionsHubSnapshot.applyingArtwork(art: CollectionsHubArtwork): CollectionsHubSnapshot {
+        if (art.byTileId.isEmpty()) return this
+        fun List<CollectionsHubTile>.arted() =
+            map { tile -> art.byTileId[tile.id]?.let { tile.copy(imageUrl = it) } ?: tile }
+        return copy(discover = discover.arted(), genres = genres.arted(), decades = decades.arted())
+    }
+
+    private fun cachedArtwork(scope: String): CollectionsHubArtwork {
+        val raw = preferences.artworkCache(scope).encoded ?: return CollectionsHubArtwork()
+        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return CollectionsHubArtwork()
+        val map = LinkedHashMap<String, String>()
+        obj.keys().forEach { key -> obj.optString(key).takeIf(String::isNotBlank)?.let { map[key] = it } }
+        return CollectionsHubArtwork(map)
+    }
+
+    private fun cacheArtwork(scope: String, art: CollectionsHubArtwork) {
+        val obj = JSONObject().apply { art.byTileId.forEach { (key, value) -> put(key, value) } }
+        preferences.saveArtworkCache(scope, obj.toString(), nowMillis())
+    }
+
+    private fun artworkCacheFresh(scope: String): Boolean {
+        val at = preferences.artworkCache(scope).savedAtMillis
+        return at > 0L && nowMillis() - at in 0 until cadenceMillis()
     }
 
     suspend fun open(target: CollectionsHubTarget) = browseMutex.withLock {
@@ -480,7 +614,7 @@ internal class CollectionsHubModel internal constructor(
         } catch (_: Throwable) {
             false
         }
-        Result.success(source.page(target, category, deviceRegion(), page, supportsTmdb))
+        Result.success(source.page(target, category, resolvedRegion(), page, supportsTmdb))
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Throwable) {
@@ -489,38 +623,63 @@ internal class CollectionsHubModel internal constructor(
 
     private fun initialSnapshot(enabled: Boolean): CollectionsHubSnapshot =
         if (enabled) {
-            val region = deviceRegion()
+            val region = resolvedRegion()
             baseSnapshot(cachedProviders(cacheScope(region, selectedProviderIds())))
         } else {
             CollectionsHubSnapshot()
         }
 
-    private fun baseSnapshot(providers: List<CollectionsHubTile>) = CollectionsHubSnapshot(
-        enabled = true,
-        discover = DiscoverList.entries.map { list ->
-            CollectionsHubTile(
-                id = "discover:${list.wire}",
-                title = CollectionsHubLabel.Resource(list.titleResource),
-                subtitle = CollectionsHubLabel.Resource(list.subtitleResource),
-                target = CollectionsHubTarget.Discover(list),
-            )
-        },
-        streaming = providers,
-        genres = GENRES.map { genre ->
-            CollectionsHubTile(
-                id = "genre:${genre.id}",
-                title = CollectionsHubLabel.Resource(genre.titleResource),
-                target = CollectionsHubTarget.Genre(genre),
-            )
-        },
-    )
+    private fun baseSnapshot(providers: List<CollectionsHubTile>): CollectionsHubSnapshot {
+        val art = artwork.byTileId
+        return CollectionsHubSnapshot(
+            enabled = true,
+            discover = DiscoverList.entries.map { list ->
+                val tileId = "discover:${list.wire}"
+                CollectionsHubTile(
+                    id = tileId,
+                    title = CollectionsHubLabel.Resource(list.titleResource),
+                    subtitle = CollectionsHubLabel.Resource(list.subtitleResource),
+                    imageUrl = art[tileId],
+                    target = CollectionsHubTarget.Discover(list),
+                )
+            },
+            streaming = providers,
+            genres = GENRES.map { genre ->
+                val tileId = "genre:${genre.id}"
+                CollectionsHubTile(
+                    id = tileId,
+                    title = CollectionsHubLabel.Resource(genre.titleResource),
+                    imageUrl = art[tileId],
+                    target = CollectionsHubTarget.Genre(genre),
+                )
+            },
+            decades = DECADES.map { decade ->
+                val tileId = "decade:${decade.id}"
+                CollectionsHubTile(
+                    id = tileId,
+                    title = CollectionsHubLabel.Literal(decade.title),
+                    imageUrl = art[tileId],
+                    target = CollectionsHubTarget.Decade(decade),
+                )
+            },
+        )
+    }
 
     private fun categoriesFor(target: CollectionsHubTarget): List<CollectionsHubCategory> = when (target) {
         is CollectionsHubTarget.Discover -> BASIC_CATEGORIES
         is CollectionsHubTarget.Service, is CollectionsHubTarget.Genre -> SCOPED_CATEGORIES
+        // Decade windows omit the rolling Top-This-* pills (meaningless for an old decade), mirroring Apple.
+        is CollectionsHubTarget.Decade -> DECADE_CATEGORIES
     }
 
-    private fun enabled(): Boolean = preferences.enabled()
+    // AND the RemoteConfig fleet kill-switch into the user toggle, exactly as Apple ANDs
+    // `CollectionsHubModel.isAvailable` (RemoteConfig `features.collectionsHub`) with the per-surface show
+    // toggle. Baked-true default => an unreachable RemoteConfig is byte-identical to shipping.
+    private fun enabled(): Boolean =
+        preferences.enabled() && RemoteConfig.isFeatureOn(COLLECTIONS_HUB_FEATURE_KEY, COLLECTIONS_HUB_FEATURE_DEFAULT)
+
+    /** The Discover region override (`vortx.discover.regionPreference`) when set, else the device region. */
+    private fun resolvedRegion(): String = preferences.regionOverride() ?: deviceRegion()
 
     private fun selectedProviderIds(): List<Int> {
         return CollectionsHubProviderPolicy.selectedProviderIds(preferences.selectedProviders(), MAX_PROVIDERS)
@@ -593,6 +752,22 @@ internal class CollectionsHubModel internal constructor(
             GenreSpec("thriller", R.string.collections_genre_thriller, 53, null),
             GenreSpec("anime", R.string.collections_genre_anime, 16, 16, keyword = 210024, originalLanguage = "ja"),
             GenreSpec("korean-drama", R.string.collections_genre_korean_drama, null, 18, originalLanguage = "ko"),
+            // Apple parity (CollectionsHubModel.swift genreList): Fantasy + Mystery were the two genres the
+            // Android tile set was still missing. Same TMDB genre ids as Apple (Fantasy movie 14 / tv 10765,
+            // Mystery movie 9648 / tv 9648).
+            GenreSpec("fantasy", R.string.collections_genre_fantasy, 14, 10765),
+            GenreSpec("mystery", R.string.collections_genre_mystery, 9648, 9648),
+        )
+        // Browse-by-decade tiles, newest first back to the 1950s (Apple CollectionsHubModel.decadeList).
+        val DECADES = listOf(
+            DecadeSpec("2020s", "2020s", 2020, 2029),
+            DecadeSpec("2010s", "2010s", 2010, 2019),
+            DecadeSpec("2000s", "2000s", 2000, 2009),
+            DecadeSpec("1990s", "1990s", 1990, 1999),
+            DecadeSpec("1980s", "1980s", 1980, 1989),
+            DecadeSpec("1970s", "1970s", 1970, 1979),
+            DecadeSpec("1960s", "1960s", 1960, 1969),
+            DecadeSpec("1950s", "1950s", 1950, 1959),
         )
         val BASIC_CATEGORIES = listOf(
             CollectionsHubCategory("movies", R.string.collections_category_movies),
@@ -604,6 +779,11 @@ internal class CollectionsHubModel internal constructor(
             CollectionsHubCategory("topweek", R.string.collections_category_top_week),
             CollectionsHubCategory("topmonth", R.string.collections_category_top_month),
             CollectionsHubCategory("topyear", R.string.collections_category_top_year),
+            CollectionsHubCategory("trending", R.string.collections_category_trending),
+        )
+        val DECADE_CATEGORIES = BASIC_CATEGORIES + listOf(
+            CollectionsHubCategory("newmovies", R.string.collections_category_new_movies),
+            CollectionsHubCategory("newshows", R.string.collections_category_new_shows),
             CollectionsHubCategory("trending", R.string.collections_category_trending),
         )
     }
@@ -725,6 +905,49 @@ internal object CollectionsHubItemPolicy {
     }
 }
 
+/**
+ * Freshness for the VortX-curated catalogs: the hub's popularity windows (the genre / service / decade
+ * "Movies", "Shows" and "Trending" pills, page-rotated here). Mirrors Apple `CuratedFreshness`
+ * (CollectionsHubModel.swift) so the same static ordering does not read as the identical list every open.
+ * The seed is drawn ONCE per process, so the rotation is STABLE within a viewing session (scrolling,
+ * paginating and returning never reorder under the user) and changes on the next app open. Deterministic
+ * per catalog: the offset hashes the catalog's own query, so "1990s Movies" and "1990s Shows" rotate
+ * independently. Complements (not replaces) the server-side `vxday=1` daily shuffle opt-in.
+ */
+internal object CuratedFreshness {
+    /** One draw per process launch: fresh rotation each open, stable for the whole session. */
+    private val sessionSeed: Long = java.security.SecureRandom().nextLong()
+
+    /**
+     * Pages 1..span rotate; span 4 keeps every rotated first page inside the top ~80 titles of the window,
+     * so a curated row still reads as "the good stuff", just a different slice of it per open.
+     */
+    private const val SPAN = 4L
+
+    /** Deterministic 0..<span page offset for a curated window (FNV-1a over the query, mixed with the seed). */
+    fun pageOffset(key: String): Int = (Math.floorMod(mix(key), SPAN)).toInt()
+
+    /**
+     * Deterministic 0..<count rotation start for an already-fetched curated pool (the editorial Home rails):
+     * the same seeded mix, scaled to the pool size instead of the page span. 0 on an empty pool. Mirrors
+     * Apple `CuratedFreshness.rotation`.
+     */
+    fun rotation(key: String, count: Int): Int =
+        if (count <= 0) 0 else Math.floorMod(mix(key), count.toLong()).toInt()
+
+    /** FNV-1a over the key, mixed with the per-open session seed. */
+    private fun mix(key: String): Long {
+        var h = -0x340d631b7bdddcdbL // 0xcbf29ce484222325 (FNV-1a 64-bit offset basis)
+        for (byte in key.toByteArray(Charsets.UTF_8)) {
+            h = h xor (byte.toLong() and 0xFF)
+            h *= 0x100000001b3L
+        }
+        h = h xor sessionSeed
+        h *= 0x100000001b3L
+        return h
+    }
+}
+
 internal sealed class CollectionsHubTransportFailure(message: String, cause: Throwable? = null) : IOException(message, cause) {
     class Auth(val statusCode: Int) : CollectionsHubTransportFailure("Collections authorization failed (HTTP $statusCode)")
     class Http(val statusCode: Int) : CollectionsHubTransportFailure("Collections request failed (HTTP $statusCode)")
@@ -837,6 +1060,7 @@ internal class EdgeCollectionsHubSource internal constructor(
                     page = page,
                 )
             }
+            is CollectionsHubTarget.Decade -> decadePage(target.spec, category, region, page)
         }
         return CollectionsHubPage(
             items = resolvePlayable(raw, tmdbCatalogSupported),
@@ -965,7 +1189,111 @@ internal class EdgeCollectionsHubSource internal constructor(
                 append(tvScope, "sort_by=popularity.desc&first_air_date.gte=${today.minusDays(365)}&first_air_date.lte=$today&vote_count.gte=10")
             else -> append(movieScope, "sort_by=popularity.desc") to append(tvScope, "sort_by=popularity.desc")
         }
-        return mergedDiscover(movie, tv, region, page)
+        // `fresh` opts a POPULARITY window (Movies / Shows / Trending) into the per-app-open seeded page
+        // rotation (CuratedFreshness). Date-sorted and Top-This-* rows keep their semantic order. When a
+        // rotated first page comes back empty (a sparse window shorter than the rotation span), fall back to
+        // the unrotated page 1 so rotation never blanks a working row. Mirrors Apple scopedSubs.
+        val offset = if (category.id in FRESH_CATEGORY_IDS) {
+            CuratedFreshness.pageOffset("${movie.orEmpty()}|${tv.orEmpty()}")
+        } else {
+            0
+        }
+        val rotated = mergedDiscover(movie, tv, region, page + offset)
+        if (offset > 0 && page == 1 && rotated.isEmpty()) {
+            return mergedDiscover(movie, tv, region, 1)
+        }
+        return rotated
+    }
+
+    /**
+     * A decade's browse page: Movies / Shows / New / Trending scoped to the release-year window, with the
+     * same seeded page rotation for the popularity windows. Omits the Top-This-* pills (see DECADE_CATEGORIES)
+     * and, for "New", sorts by release date descending WITHIN the decade. Mirrors Apple decadeSubs.
+     */
+    private suspend fun decadePage(
+        spec: DecadeSpec,
+        category: CollectionsHubCategory,
+        region: String,
+        page: Int,
+    ): List<MetaItem> {
+        val movieWindow = "primary_release_date.gte=${spec.startYear}-01-01&primary_release_date.lte=${spec.endYear}-12-31"
+        val tvWindow = "first_air_date.gte=${spec.startYear}-01-01&first_air_date.lte=${spec.endYear}-12-31"
+        val (movie, tv) = when (category.id) {
+            "movies" -> "$movieWindow&sort_by=popularity.desc" to null
+            "shows" -> null to "$tvWindow&sort_by=popularity.desc"
+            "newmovies" -> "$movieWindow&sort_by=primary_release_date.desc&vote_count.gte=5" to null
+            "newshows" -> null to "$tvWindow&sort_by=first_air_date.desc&vote_count.gte=5"
+            else -> "$movieWindow&sort_by=popularity.desc" to "$tvWindow&sort_by=popularity.desc"
+        }
+        val offset = if (category.id in FRESH_CATEGORY_IDS) {
+            CuratedFreshness.pageOffset("${movie.orEmpty()}|${tv.orEmpty()}")
+        } else {
+            0
+        }
+        val rotated = mergedDiscover(movie, tv, region, page + offset)
+        if (offset > 0 && page == 1 && rotated.isEmpty()) {
+            return mergedDiscover(movie, tv, region, 1)
+        }
+        return rotated
+    }
+
+    override suspend fun artwork(
+        region: String,
+        genres: List<GenreSpec>,
+        decades: List<DecadeSpec>,
+    ): CollectionsHubArtwork = coroutineScope {
+        val slots = Semaphore(4) // gentle, once-daily op; kept 429-safe like Apple's batched backdrop resolve
+        val requests = buildList<Pair<String, suspend () -> String?>> {
+            DiscoverList.entries.forEach { list ->
+                add("discover:${list.wire}" to { firstBackdrop(list.backdropListPath, region) })
+            }
+            genres.forEach { genre ->
+                add("genre:${genre.id}" to { genreBackdrop(genre, region) })
+            }
+            decades.forEach { decade ->
+                val window = "primary_release_date.gte=${decade.startYear}-01-01&primary_release_date.lte=${decade.endYear}-12-31&sort_by=popularity.desc"
+                add("decade:${decade.id}" to { firstPoster("/discover/movie?$window&watch_region=$region&page=1") })
+            }
+        }
+        // The permit is acquired INSIDE each async, right before the network call, so concurrency is genuinely
+        // bounded (not just the await). Fail-soft: a failed lookup contributes no entry (gradient fallback).
+        val resolved = requests.map { (tileId, resolve) ->
+            async { tileId to slots.withPermit { resolve() } }
+        }.awaitAll()
+        CollectionsHubArtwork(resolved.mapNotNull { (id, url) -> url?.let { id to it } }.toMap())
+    }
+
+    private suspend fun genreBackdrop(genre: GenreSpec, region: String): String? {
+        val movieScope = scope(genre.movieGenreId, genre.keyword, genre.originalLanguage)
+        val tvScope = scope(genre.tvGenreId, genre.keyword, genre.originalLanguage)
+        val (media, scope) = when {
+            movieScope != null -> "movie" to movieScope
+            tvScope != null -> "tv" to tvScope
+            else -> return null
+        }
+        return firstBackdrop("/discover/$media?$scope&sort_by=popularity.desc&watch_region=$region&page=1", region = null)
+    }
+
+    /** First result's `backdrop_path` (w780) from a native list / discover path, or null. */
+    private suspend fun firstBackdrop(path: String, region: String?): String? {
+        val separator = if ('?' in path) '&' else '?'
+        val query = if (region != null) "$path${separator}region=$region&page=1" else path
+        val rows = runCatching { transport.getJson(query).resultsArray() }.getOrNull() ?: return null
+        for (index in 0 until rows.length()) {
+            val backdrop = rows.optJSONObject(index)?.optString("backdrop_path")?.takeIf(String::isNotBlank)
+            if (backdrop != null) return "$IMAGE_BASE/w780$backdrop"
+        }
+        return null
+    }
+
+    /** First result's `poster_path` (w342) from a discover path, or null. */
+    private suspend fun firstPoster(path: String): String? {
+        val rows = runCatching { transport.getJson(path).resultsArray() }.getOrNull() ?: return null
+        for (index in 0 until rows.length()) {
+            val poster = rows.optJSONObject(index)?.optString("poster_path")?.takeIf(String::isNotBlank)
+            if (poster != null) return "$IMAGE_BASE/w342$poster"
+        }
+        return null
     }
 
     private suspend fun mergedDiscover(
@@ -990,7 +1318,10 @@ internal class EdgeCollectionsHubSource internal constructor(
     }
 
     private suspend fun discover(media: String, type: MediaType, extra: String, region: String, page: Int): List<MetaItem> {
-        val root = transport.getJson("/discover/$media?$extra&watch_region=$region&page=$page")
+        // vxday=1: opt these curated discover rows into the catalogs worker's daily shuffle (#6). An unknown,
+        // harmless no-op until the worker ships the shuffle, then it reorders the SAME window once per day so a
+        // static curated row does not read identically forever. Mirrors Apple CollectionsHubModel.mergeBuckets.
+        val root = transport.getJson("/discover/$media?$extra&vxday=1&watch_region=$region&page=$page")
         return parseResults(root.resultsArray(), type)
     }
 
@@ -1064,6 +1395,10 @@ internal class EdgeCollectionsHubSource internal constructor(
     private companion object {
         const val IMAGE_BASE = "https://image.tmdb.org/t/p"
         const val MAX_PROVIDER_TILES = 50
+
+        // The popularity windows that opt into the per-app-open seeded page rotation (CuratedFreshness). The
+        // date-sorted ("newmovies"/"newshows") and rolling Top-This-* rows keep their semantic order.
+        val FRESH_CATEGORY_IDS = setOf("movies", "shows", "trending")
 
         val featuredProviderRank = mapOf(
             8 to 0,

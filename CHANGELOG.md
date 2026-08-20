@@ -27,6 +27,13 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 ### Android watch stats
 
 **Your year in review.** A new Watch Stats screen in Settings turns your existing watch history into a personal recap: total hours watched, how many movies, series, and episodes you got through, your longest binge, your top genres by time spent, and your most-watched titles. A scope picker switches between all-time and any year you have history for. It is read-only, computed entirely on the device from history that is already there, and never changes a watched mark or resume point. It reads the right history for whoever is watching, the account library for the main profile and a shared profile's own private history for everyone else, so one profile never sees another's numbers. Android phone and tablet.
+### Android imports
+
+**Import a public list as a Home row.** Under Settings, Integrations, Import a list, paste a public Letterboxd, MDBList, or Trakt list link and it becomes a Home row you can browse. VortX reads the list, matches each title to a poster you can open and play, and shows a preview of what it found. It caps at 150 titles, only reads public lists, and never touches your account or library; the row lives on this device. Android phone, tablet, and TV.
+
+**Bring your add-ons over from Stremio or Nuvio.** Two new screens under Integrations, Import from Stremio and Import from Nuvio, let you paste add-on manifest URLs, one per line, and install them all in one step, with a clear summary of what was added and why anything was skipped. Import from Stremio also points you to sign in with your Stremio account, which brings your add-ons, library, and Continue Watching across on the shared engine. Android phone, tablet, and TV.
+
+**Stremio mirror controls.** Integrations now has the three Stremio mirror toggles: add-ons, library, and Continue Watching. Off (recommended) is one-way, so VortX pulls those in but never lets Stremio remove them; turning one on makes VortX track Stremio for that category. Your add-ons, library, and Continue Watching always stay even when you sign out of Stremio. Android phone, tablet, and TV.
 
 ### Android player controls
 
@@ -176,6 +183,8 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **Play from start, Share, and a foldable Cast and Crew.** A resumed title gains a Play from start action beside Resume that plays from the beginning without losing your saved spot, a Share action puts the title's IMDb link (or its name) into the system share sheet, and the Cast and Crew section folds away behind a chevron. Android phone and TV.
 
+**Re-find sources.** A Re-find control beside the Sources header re-queries every add-on fresh, so a source that has since expired or gone dead is replaced instead of being served from a stale list. It also appears as the escape hatch when a title's automatic source retries are exhausted during playback, so you can pull a fresh set without leaving and reopening the title. Android phone and TV.
+
 ### Android search and discover
 
 **Search fills in as each add-on answers.** Search used to fire one request and show whatever had arrived by the time it gave up, so a slow add-on's matches never appeared. It is now reactive: results stream in as each add-on responds, the loading state reflects whether any add-on is still working, and clearing the box unloads the search cleanly. Android phone and TV.
@@ -191,6 +200,18 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Discover has an advanced filter panel.** Filter the current catalog by genre (tap to include, tap again to exclude), release decade, upcoming only, age rating, runtime, and season count. The active count shows on the Filters button, filters only narrow titles that actually carry the field, a strict filter pulls more pages to fill the grid, and your choices persist. Android phone and TV.
 
 **Search and Discover ask you to sign in when you are signed out.** With no VortX or Stremio sign-in, both tabs now show a clear sign-in prompt instead of an empty grid. Android phone and TV.
+
+**Play a link or magnet.** A new Play a link entry at the top of Search opens a sheet that accepts a direct link, a debrid or usenet link your service already resolved to http(s), or a magnet, and hands it straight to the player. A magnet resolves through the same torrent and debrid path the app already uses, so a debrid key unlocks a cached copy and otherwise it streams through the built-in server. You can save links and magnets for later in a per-profile list with play and remove on each row, and a saved magnet remembers the exact file you played so a season pack reopens the same episode. Android phone and TV.
+
+**Recent searches are per profile.** Your recent searches are now kept separately for each profile and shown under a Recent Searches heading, so switching profiles shows that profile's own history and one profile's searches never appear on another. Android phone and TV.
+
+**Suggestions from the first character, and from the engine's own index.** As-you-type suggestions now appear from a single character using titles you already have on the device, and from two characters the engine's own local search index feeds in alongside them. Android phone and TV.
+
+**Mark and manage titles straight from a result card.** Long-pressing a Search or Discover result opens a quick menu to add it to your library or mark it watched or unwatched, and a card for something you have already watched now carries a watched badge. Both respect the active profile. Android phone.
+
+**A tidier search field.** The field now has a clear button, the keyboard Search key runs the query at once without waiting for the pause, and re-tapping the Search or Discover tab you are already on scrolls back to the top and closes an open title. Android phone.
+
+**Combine Discover and Search into one surface.** A new Home and Discover setting folds Search into Discover, with a search field above the browse and the Search tab dropped from the bar; typing two or more characters shows grouped results in place, and turning it off brings the Search tab back. When Live TV is hidden, the Discover type filter drops live types too. Android phone.
 ### Android
 
 **Pick who is watching at launch.** On an account with more than one profile, the Android app now opens on a "Who's watching?" picker so you land in the right profile, with its own Continue Watching, library, and source ranking, from the first screen. A profile with a PIN is gated the same way it is in Settings, and the picker only appears when there is a real choice to make. Android.

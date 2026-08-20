@@ -16,7 +16,9 @@ import com.vortx.android.home.CollectionsHubCategory
 import com.vortx.android.home.CollectionsHubModel
 import com.vortx.android.home.CollectionsHubSnapshot
 import com.vortx.android.home.CollectionsHubTarget
+import com.vortx.android.home.CuratedCollectionsModel
 import com.vortx.android.home.HomeCatalogLayout
+import com.vortx.android.home.HomeRail
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.home.ImportedCatalogs
@@ -24,6 +26,7 @@ import com.vortx.android.home.ReleaseCalendarModel
 import com.vortx.android.home.ReleaseCalendarOwner
 import com.vortx.android.home.ReleaseCalendarRefresh
 import com.vortx.android.home.SimklRailsModel
+import com.vortx.android.home.foldSimklUpcomingSeeds
 import com.vortx.android.home.TopPicksModel
 import com.vortx.android.home.TraktRailsModel
 import com.vortx.android.home.importedCatalogRails
@@ -31,6 +34,7 @@ import com.vortx.android.home.upcomingMetaBases
 import com.vortx.android.home.withBecauseYouWatchedRail
 import com.vortx.android.home.withExternalWatchlistRails
 import com.vortx.android.home.withImportedCatalogRails
+import com.vortx.android.home.withEditorialCollectionsRails
 import com.vortx.android.home.withReleaseCalendarRails
 import com.vortx.android.home.withTopPicksRail
 import com.vortx.android.integrations.SIMKLAuth
@@ -42,6 +46,7 @@ import com.vortx.android.mediaserver.withMediaServerRails
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.AdvancedDiscoverFilters
 import com.vortx.android.model.Catalog
+import com.vortx.android.model.CoreSearchSuggestion
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MediaType
@@ -68,6 +73,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.emitAll
@@ -169,6 +175,7 @@ class HomeViewModel internal constructor(
     private val confirmationTimeoutMs: Long = CONFIRMATION_TIMEOUT_MS,
     private val confirmationPollMs: Long = CONFIRMATION_POLL_MS,
     private val collectionsHub: CollectionsHubModel? = null,
+    private val curatedCollections: CuratedCollectionsModel? = null,
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<Catalog>>>(UiState.Loading)
     val state: StateFlow<UiState<List<Catalog>>> = _state.asStateFlow()
@@ -183,6 +190,21 @@ class HomeViewModel internal constructor(
         ) ?: MutableStateFlow(HomeCatalogLayout.RAILS).asStateFlow()
     internal val collections: StateFlow<CollectionsHubSnapshot> = collectionsHub?.snapshot
         ?: MutableStateFlow(CollectionsHubSnapshot())
+    /**
+     * The Collections hub's position among the Home rails, and whether it is hidden, both derived from
+     * Customize-Home (HomeRailPreferences). The hub is not a catalog, so it rides these instead of `arrange`:
+     * the UI places it at [collectionsHubOrder]'s COLLECTIONS_HUB slot and drops it when [collectionsHubHidden].
+     */
+    internal val collectionsHubOrder: StateFlow<List<HomeRail>> = railPreferences?.let { prefs ->
+        prefs.state.map { prefs.ordered(railSurface) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, prefs.ordered(railSurface))
+    } ?: MutableStateFlow(
+        if (railSurface == HomeRailSurface.TV) HomeRail.tvDefaultOrder else HomeRail.phoneDefaultOrder,
+    ).asStateFlow()
+    internal val collectionsHubHidden: StateFlow<Boolean> = railPreferences?.let { prefs ->
+        prefs.state.map { HomeRail.COLLECTIONS_HUB in it.hidden }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, HomeRail.COLLECTIONS_HUB in prefs.state.value.hidden)
+    } ?: MutableStateFlow(false).asStateFlow()
     internal val collectionBrowse: StateFlow<CollectionsHubBrowseState> = collectionsHub?.browse
         ?: MutableStateFlow(CollectionsHubBrowseState())
 
@@ -198,6 +220,9 @@ class HomeViewModel internal constructor(
     private var simklWatchlist: List<MetaItem> = emptyList()
     private var becauseYouWatchedRail: Catalog? = null
     private var mediaServerRails: List<Catalog> = emptyList()
+    // Editorial rails are GLOBAL (not profile-specific), like Apple's CuratedCollectionsModel, so they are
+    // never cleared on an owner change; the model's own StateFlow keeps this field current.
+    private var editorialRails: List<Catalog> = emptyList()
     private var importedRails: List<Catalog> = importedCatalogs?.catalogs?.value
         ?.let(::importedCatalogRails).orEmpty()
     private val topPicks = TopPicksModel()
@@ -212,7 +237,19 @@ class HomeViewModel internal constructor(
         load()
         collectionsHub?.let { hub ->
             scope.launch {
-                hub.settingsChanges.collectLatest { hub.load() }
+                hub.settingsChanges.collectLatest {
+                    hub.load()
+                    hub.loadArtwork()
+                }
+            }
+        }
+        curatedCollections?.let { model ->
+            scope.launch { model.settingsChanges.collectLatest { model.load() } }
+            scope.launch {
+                model.rails.collectLatest { rails ->
+                    editorialRails = rails
+                    publishHome()
+                }
             }
         }
         scope.launch {
@@ -349,6 +386,8 @@ class HomeViewModel internal constructor(
         publishHome()
         refreshPersonalizedRails()
         scope.launch { collectionsHub?.load() }
+        scope.launch { collectionsHub?.loadArtwork() }
+        scope.launch { curatedCollections?.load() }
     }
 
     internal fun openCollection(target: CollectionsHubTarget) {
@@ -377,6 +416,7 @@ class HomeViewModel internal constructor(
 
     override fun onCleared() {
         collectionsHub?.close()
+        curatedCollections?.close()
         super.onCleared()
     }
 
@@ -410,10 +450,16 @@ class HomeViewModel internal constructor(
             val releaseWork = async {
                 val addonsResult = addonsWork.await()
                 if (libraryResult.isFailure || addonsResult.isFailure) return@async null
+                // Fold the already-resolved SIMKL plan-to-watch seeds into the calendar seeds (base wins on
+                // id, so a library / local-watchlist title is never duplicated by its SIMKL twin). simklRails
+                // fails closed on a SIMKL session change (an empty list), so a disconnect drops the SIMKL
+                // titles here. Awaiting simklWork here does not serialize the other rails (each is its own
+                // async); it only orders the SIMKL fetch before the calendar build that consumes it.
+                val simklSeeds = simklWork.await().items
                 releaseCalendar.refresh(
                     owner = owner,
                     library = library,
-                    watchlist = watchlist,
+                    watchlist = foldSimklUpcomingSeeds(library, watchlist, simklSeeds),
                     metaBases = upcomingMetaBases(addonsResult.getOrThrow()),
                     onInvalidated = { invalidated ->
                         if (applyReleaseCalendar(invalidated)) publishHome()
@@ -477,14 +523,18 @@ class HomeViewModel internal constructor(
     private fun publishHome() {
         val hasClientRows = topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
             traktWatchlist.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
-            importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty()
+            importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty() ||
+            editorialRails.isNotEmpty()
         if (!sourceHasRows && !hasClientRows) return
         val topRows = withTopPicksRail(baseRows, topPicksItems)
         val becauseRows = withBecauseYouWatchedRail(topRows, becauseYouWatchedRail)
         val externalRows = withExternalWatchlistRails(becauseRows, traktWatchlist, simklWatchlist)
         val serverRows = withMediaServerRails(externalRows, mediaServerRails)
         val importedRows = withImportedCatalogRails(serverRows, importedRails)
-        val enriched = withReleaseCalendarRails(importedRows, upcomingEpisodes, upcomingMovies)
+        val calendarRows = withReleaseCalendarRails(importedRows, upcomingEpisodes, upcomingMovies)
+        // Editorial rails are spliced last; HomeRailPreferences.arrange re-groups everything by HomeRail and
+        // places them at the EDITORIAL_COLLECTIONS slot (phone default order only, so TV drops them).
+        val enriched = withEditorialCollectionsRails(calendarRows, editorialRails)
         val rows = railPreferences?.let { preferences ->
             preferences.arrange(enriched, railSurface, preferences.state.value)
         } ?: enriched
@@ -915,21 +965,43 @@ class SearchViewModel(
     private val historyStore: SearchHistoryStore,
     scopeOverride: CoroutineScope? = null,
 ) : ViewModel() {
-    private val _query = MutableStateFlow("")
-    val query: StateFlow<String> = _query.asStateFlow()
+    /// A query paired with whether it should be debounced. Typing carries `debounce = true` (the calm
+    /// 350ms settle); an IME "Search" submit re-issues the SAME text with `debounce = false` so the search
+    /// runs immediately (mirrors Apple's `.onSubmit` skipping the debounce `Task.sleep`). The `debounce`
+    /// flag differs, so the flatMapLatest below cancels the pending debounced run and dispatches at once.
+    private data class SearchRequest(val text: String, val debounce: Boolean)
+
+    private val _request = MutableStateFlow(SearchRequest("", debounce = true))
+    val query: StateFlow<String> = _request
+        .map { it.text }
+        .stateIn(scopeOverride ?: viewModelScope, SharingStarted.Eagerly, "")
 
     private val _history = MutableStateFlow(historyStore.load())
     val history: StateFlow<List<String>> = _history.asStateFlow()
 
     private val stateScope = scopeOverride ?: viewModelScope
 
-    internal val screenState: StateFlow<SearchScreenState> = _query
-        .flatMapLatest { rawQuery ->
+    init {
+        // Per-profile recents (S09): re-read the ACTIVE profile's list whenever the active profile
+        // changes, so switching profiles swaps the recent-searches row to that profile's own terms
+        // (the [SearchHistoryStore] bucket already keys by ProfileStore.activeID). The StateFlow emits
+        // its current value immediately on collect, so the first emission is a harmless no-op reload.
+        ProfileStore.sharedOrNull()?.let { store ->
+            stateScope.launch {
+                store.activeProfile.collect { _history.value = historyStore.load() }
+            }
+        }
+    }
+
+    internal val screenState: StateFlow<SearchScreenState> = _request
+        .flatMapLatest { request ->
+            val rawQuery = request.text
             flow {
                 val q = rawQuery.trim()
                 if (isSearchQueryEligible(q)) {
                     emit(SearchScreenState(rawQuery, UiState.Loading, isLoading = true))
-                    delay(SEARCH_DEBOUNCE_MS)
+                    // An IME submit re-issues the same text with debounce = false so the search fires now.
+                    if (request.debounce) delay(SEARCH_DEBOUNCE_MS)
                 }
                 emitAll(
                     repo.searchUpdates(q)
@@ -962,18 +1034,34 @@ class SearchViewModel(
         .map { it.content }
         .stateIn(stateScope, SharingStarted.WhileSubscribed(5_000), UiState.Success(emptyList()))
 
-    /// As-you-type search suggestions (SD-4). Interleaves the Home board's Continue Watching and catalog
-    /// titles with the current settled results, matched diacritic-insensitively in Apple's priority order
-    /// ([searchSuggestionTitles]). The Home board is read fail-soft: a slow, failed, or absent board yields
-    /// no suggestions rather than blocking the field, and results-only suggestions still surface. Empty
-    /// below the two-character gate.
+    /// The engine's own local-search index (SD-4, Apple `CoreBridge.searchSuggestions` / the `local_search`
+    /// field). Dispatched per query through [CatalogRepository.searchSuggestionUpdates], which loads the
+    /// `LocalSearch` model once and re-runs `Search maxResults 10` on each query -- but ONLY at the engine's
+    /// two-character dispatch gate (the repo returns an empty list below it). Fail-soft: an engine with no
+    /// local-search index (or the offline preview) simply yields an empty list, so client-side suggestions
+    /// still surface. Interleaved ahead of the settled results by [searchSuggestionTitles].
+    private val engineSuggestions: StateFlow<List<CoreSearchSuggestion>> = _request
+        .map { it.text }
+        .distinctUntilChanged()
+        .flatMapLatest { rawQuery -> repo.searchSuggestionUpdates(rawQuery) }
+        .catch { emit(emptyList()) }
+        .stateIn(stateScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /// As-you-type search suggestions (SD-4). Interleaves the Home board's Continue Watching, the engine's
+    /// own local-search index, the current settled results, and the Home catalog titles, matched
+    /// diacritic-insensitively in Apple's priority order ([searchSuggestionTitles]). Every source is read
+    /// fail-soft: a slow, failed, or absent board / engine index yields no suggestions rather than blocking
+    /// the field. Unlike the engine DISPATCH (gated at two characters), the suggestion SURFACE opens from a
+    /// SINGLE character (Apple `searchSuggestionTitles` guards only on non-empty), so client-side
+    /// completions from Continue Watching / the board appear before the first engine round-trip.
     val suggestions: StateFlow<List<String>> = combine(
         screenState,
         repo.homeUpdates()
             .map<HomeUpdate, HomeUpdate?> { it }
             .onStart { emit(null) }
             .catch { emit(null) },
-    ) { screen, home ->
+        engineSuggestions,
+    ) { screen, home, engine ->
         val rows = home?.rows.orEmpty()
         val continueWatching = rows.firstOrNull { it.id == CONTINUE_WATCHING_ROW_ID }?.items.orEmpty()
         val board = rows.filterNot { it.id == CONTINUE_WATCHING_ROW_ID }.flatMap { it.items }
@@ -981,19 +1069,27 @@ class SearchViewModel(
         searchSuggestionTitles(
             query = screen.query,
             continueWatching = continueWatching,
+            engineSuggestions = engine,
             currentResults = results,
             homeBoard = board,
         )
     }.stateIn(stateScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun onQueryChange(value: String) {
-        _query.value = value
+        _request.value = SearchRequest(value, debounce = true)
+    }
+
+    /// An IME "Search" submit (SD-6): re-issue the current text with `debounce = false` so the search runs
+    /// immediately instead of waiting out the 350ms settle. Re-emitting the same text with the flag flipped
+    /// is what makes the flatMapLatest cancel the pending debounced run and dispatch at once.
+    fun submitQuery() {
+        _request.value = _request.value.copy(debounce = false)
     }
 
     /// Record the CURRENT query in history (mirrors Apple: recorded when a result is actually opened,
     /// not on every keystroke) and refresh the published list. Called by the screen's `onItem`.
     fun recordHistory() {
-        val q = _query.value
+        val q = _request.value.text
         historyStore.add(q)
         _history.value = historyStore.load()
     }

@@ -1,6 +1,7 @@
 package com.vortx.android.ui.prefs
 
 import android.content.Context
+import java.util.Locale
 
 /**
  * Home & Discover content preferences (SET-3), the Android port of the Home/Discover section of Apple
@@ -70,6 +71,25 @@ class HomeDiscoverPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_HIDE_POSTER_LABELS, false)
         set(value) { prefs.edit().putBoolean(KEY_HIDE_POSTER_LABELS, value).apply() }
 
+    /**
+     * Discover region override (Apple `vortx.discover.regionPreference`), stored uppercased. WIRED: the
+     * collections hub reads this key and forces its TMDB watch_region to it. Empty == the device locale region.
+     */
+    var regionPreference: String
+        get() = prefs.getString(KEY_REGION_PREFERENCE, "").orEmpty()
+        set(value) {
+            val normalized = value.trim().uppercase(Locale.ROOT).filter(Char::isLetter).take(2)
+            prefs.edit().putString(KEY_REGION_PREFERENCE, normalized).apply()
+        }
+
+    /**
+     * Per-tile / per-section Discover hidden categories (Apple `vortx.discover.hiddenCategories`, canonical
+     * ids). Persisted on the exact key, ready for its Discover-surface consumer.
+     */
+    var hiddenCategories: Set<String>
+        get() = prefs.getStringSet(KEY_HIDDEN_CATEGORIES, emptySet()).orEmpty()
+        set(value) { prefs.edit().putStringSet(KEY_HIDDEN_CATEGORIES, value.toSet()).apply() }
+
     companion object {
         // MUST equal com.vortx.android.profile.ProfileStore.PREFS_FILE so CollectionsHubModel sees writes.
         const val PREFS_FILE = "vortx_settings"
@@ -85,5 +105,8 @@ class HomeDiscoverPreferences(context: Context) {
         const val KEY_SPOILER_SAFE = "vortx.detail.spoilerSafe"
         const val KEY_SPOILER_BLUR = "vortx.spoilerBlur"
         const val KEY_HIDE_POSTER_LABELS = "stremiox.catalog.hidePosterLabels"
+        // MUST equal com.vortx.android.home.DISCOVER_REGION_PREFERENCE_KEY so the hub sees region writes.
+        const val KEY_REGION_PREFERENCE = "vortx.discover.regionPreference"
+        const val KEY_HIDDEN_CATEGORIES = "vortx.discover.hiddenCategories"
     }
 }

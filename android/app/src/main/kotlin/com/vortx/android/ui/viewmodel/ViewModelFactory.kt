@@ -16,6 +16,7 @@ import com.vortx.android.home.TraktRailsModel
 import com.vortx.android.home.ImportedCatalogs
 import com.vortx.android.home.CollectionsHubModel
 import com.vortx.android.home.CollectionsHubProviderPolicy
+import com.vortx.android.home.CuratedCollectionsModel
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.search.SearchHistoryStore
@@ -38,7 +39,9 @@ class StremioXViewModelFactory(
     private val homeSurface: HomeRailSurface = HomeRailSurface.PHONE,
 ) : ViewModelProvider.Factory {
 
-    data class DetailArgs(val type: MediaType, val id: String)
+    /// [name] is the tapped card's title, used only to paint the placeholder hero for a meta-less `tt`
+    /// (see [DetailViewModel]'s meta recovery); optional so existing call sites stay unchanged.
+    data class DetailArgs(val type: MediaType, val id: String, val name: String? = null)
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T = when {
@@ -60,6 +63,11 @@ class StremioXViewModelFactory(
                     },
                 )
             },
+            // Editorial Home rails are phone-only (the TV default rail order omits EDITORIAL_COLLECTIONS,
+            // matching Apple where they render on iOS Home, not tvOS), so only stand the model up there.
+            curatedCollections = appContext
+                ?.takeIf { homeSurface == HomeRailSurface.PHONE }
+                ?.let(::CuratedCollectionsModel),
         ) as T
         modelClass.isAssignableFrom(DiscoverViewModel::class.java) -> DiscoverViewModel(
             repo,
@@ -88,7 +96,7 @@ class StremioXViewModelFactory(
             val context = requireNotNull(appContext) {
                 "DetailViewModel requires an app Context (debrid keys + source-list assembly)"
             }
-            DetailViewModel(repo, args.type, args.id, context) as T
+            DetailViewModel(repo, args.type, args.id, context, args.name) as T
         }
         else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }

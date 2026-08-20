@@ -284,10 +284,11 @@ fun TvSettingsScreen(
     }
 
     if (route == TvSettingsRoute.INTEGRATIONS) {
-        // Trakt / SIMKL. IntegrationsScreen is self-contained (drives the auth singletons directly), so it
-        // needs no repository or ViewModel -- reused verbatim from the phone.
+        // Trakt / SIMKL plus the Stremio / Nuvio / list-import surfaces. The auth flows drive the singletons
+        // directly; the import cards need the repository to install add-ons and register imported list rows,
+        // so the screen takes [repo] -- reused verbatim from the phone.
         BackHandler { route = TvSettingsRoute.ROOT }
-        IntegrationsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        IntegrationsScreen(repo = repo, onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
         return
     }
 

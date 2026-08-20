@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -30,6 +31,7 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.SwitchAccount
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircle
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
@@ -39,6 +41,7 @@ import androidx.compose.material.icons.filled.Subtitles
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.ui.graphics.vector.ImageVector
 
 /// The one icon set for the whole app (DESIGN-SYSTEM.md §6 "Icons"): a fixed name → glyph mapping so
@@ -85,6 +88,10 @@ object VortXIcons {
     /// glyph, `SmartDisplay` (a play triangle in a rounded rect) is the closest available shape.
     val playRectangle: ImageVector = Icons.Filled.SmartDisplay
 
+    /// SF `arrow.clockwise`: the "Re-find sources" affordance, re-query the stream add-ons fresh so an
+    /// expired/dead source is replaced. `Refresh` is Material's closest clockwise-reload glyph.
+    val refresh: ImageVector = Icons.Filled.Refresh
+
     val bookmark: ImageVector = Icons.Filled.BookmarkBorder
     val bookmarkFill: ImageVector = Icons.Filled.Bookmark
     val share: ImageVector = Icons.Filled.Share
@@ -102,6 +109,10 @@ object VortXIcons {
     val live: ImageVector = Icons.Filled.LiveTv
     val library: ImageVector = Icons.Filled.VideoLibrary
     val search: ImageVector = Icons.Filled.Search
+
+    /// SF `clock`, a recent-search chip's leading glyph (the "Recent Searches" row). Material `History`
+    /// (a clock face with a counter-clockwise arrow) is the closest recents-semantic Material Symbol.
+    val clock: ImageVector = Icons.Filled.History
     val settings: ImageVector = Icons.Filled.Settings
     val account: ImageVector = Icons.Filled.Person
     val audioOutput: ImageVector = Icons.Filled.GraphicEq
@@ -110,6 +121,10 @@ object VortXIcons {
 
     /// SF `ellipsis` — the visible face of a bulk/overflow menu (S05: the season "…" mark-watched menu).
     val moreHoriz: ImageVector = Icons.Filled.MoreHoriz
+
+    /// SF `eye.slash` — the spoiler-safe veil overlay on an unwatched episode thumbnail + the "Tap to
+    /// reveal" hint that stands in for its withheld synopsis.
+    val eyeSlash: ImageVector = Icons.Filled.VisibilityOff
 
     // S04 (Add-ons / Library remove control) additions -- same one-object discipline as above.
     /// SF `trash` — remove/uninstall/delete affordance (Library poster "x", Add-ons "Remove").

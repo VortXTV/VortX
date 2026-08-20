@@ -80,6 +80,7 @@ import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.components.Wordmark
 import com.vortx.android.ui.gallery.GalleryScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
+import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.TabSlot
 import com.vortx.android.ui.prefs.isVisible
@@ -105,10 +106,13 @@ import com.vortx.android.ui.screens.LiveScreen
 import com.vortx.android.ui.screens.LibraryScreen
 import com.vortx.android.ui.screens.LibraryTransferScreen
 import com.vortx.android.ui.screens.MediaServersScreen
+import com.vortx.android.ui.screens.MergedDiscoverSearchScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
+import com.vortx.android.ui.search.PlayLinkEntry
+import com.vortx.android.ui.search.PlayLinkScreen
 import com.vortx.android.ui.screens.SettingsScreen
 import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
@@ -230,7 +234,13 @@ fun VortXApp(
             oled = oled,
         ) {
             var tab by remember { mutableStateOf(Tab.HOME) }
-            val visibleTabs = Tab.entries.filter { hiddenTabs.isVisible(it.slot) }
+            // SD-2: the combined Discover+Search surface folds Search into Discover, so the standalone
+            // Search tab is dropped from the bar while the pref is on (Apple `visibleTabs`).
+            val homeDiscoverPrefs = remember(appContext) { HomeDiscoverPreferences(appContext) }
+            var mergeDiscoverSearch by remember { mutableStateOf(homeDiscoverPrefs.mergeDiscoverSearch) }
+            val visibleTabs = Tab.entries.filter {
+                hiddenTabs.isVisible(it.slot) && !(mergeDiscoverSearch && it == Tab.SEARCH)
+            }
             LaunchedEffect(tab, hiddenTabs) {
                 if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) tab = Tab.HOME
             }
@@ -285,10 +295,29 @@ fun VortXApp(
         var showTabBar by remember { mutableStateOf(false) }
         var showWatchStats by remember { mutableStateOf(false) }
         var showWhatsNew by remember { mutableStateOf(false) }
+        // SD-1: the "Play a link / magnet" sheet, reachable from the top of Search.
+        var showPlayLink by remember { mutableStateOf(false) }
         // Cold-launch "Who's watching?" picker (ACC-3): shown once per launch only when there is a real
         // choice (more than one profile, not yet picked). Seeded from ProfileStore.needsPicker at first
         // composition so it never re-appears after the user has picked (select() sets pickedThisLaunch).
         var showWhosWatching by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        // SD-2: re-read "Combine Discover & Search" whenever the Home & Discover settings screen closes (the
+        // only place it is toggled) so the combined surface flips without a relaunch, matching Apple's
+        // reactive @AppStorage. When it turns ON while the (now-dropped) Search tab is selected, heal
+        // selection to Discover -- or Home if Discover itself is hidden -- exactly like Apple's
+        // `.onChange(of: mergeDiscoverSearch)` healer.
+        LaunchedEffect(showHomeDiscover) {
+            if (!showHomeDiscover) mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+        }
+        LaunchedEffect(mergeDiscoverSearch, tab) {
+            if (mergeDiscoverSearch && tab == Tab.SEARCH) {
+                tab = if (hiddenTabs.isVisible(TabSlot.DISCOVER)) Tab.DISCOVER else Tab.HOME
+            }
+        }
+        // SD-6: per-tab re-tap tokens. The shell bumps one when the ALREADY-active tab is re-tapped, and the
+        // active screen scrolls its list to the top in response (Apple `TabScrollToTop`).
+        var searchReselect by remember { mutableStateOf(0) }
+        var discoverReselect by remember { mutableStateOf(0) }
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
             val target = event.target
@@ -320,6 +349,7 @@ fun VortXApp(
             showWatchStats = false
             showWhatsNew = false
             showTabBar = false
+            showPlayLink = false
             detailGeneration += 1
             detail = target.toMetaItem()
         }
@@ -710,6 +740,10 @@ fun VortXApp(
                             sources = advanceVm.manualSourceOptions(),
                             resolving = retryPlayback is Playback.Resolving,
                             onPick = { advanceVm.play(it) },
+                            onRefind = {
+                                advanceVm.refreshSources()
+                                playing = null
+                            },
                             onClose = { playing = null },
                         )
                     } else {
@@ -774,10 +808,12 @@ fun VortXApp(
         }
 
         if (showIntegrations) {
-            // Settings > Integrations: connect Trakt / SIMKL. Self-contained (drives the auth singletons
-            // directly), so it needs no repository or ViewModel, matching its own doc comment.
+            // Settings > Integrations: connect Trakt / SIMKL, plus the Stremio / Nuvio / list imports and the
+            // Stremio mirror toggles. It drives the auth singletons directly and reaches the import sub-screens
+            // in-place; [repo] is passed through only so the Stremio/Nuvio batch installers can reuse
+            // [CatalogRepository.installAddon] (the same path the Add-ons screen uses).
             BackHandler { showIntegrations = false }
-            IntegrationsScreen(onBack = { showIntegrations = false })
+            IntegrationsScreen(repo = repo, onBack = { showIntegrations = false })
             return@VortXTheme
         }
 
@@ -849,6 +885,23 @@ fun VortXApp(
             // vortx_settings file. Self-contained (its own HomeDiscoverPreferences store), so no ViewModel.
             BackHandler { showHomeDiscover = false }
             HomeDiscoverSettingsScreen(onBack = { showHomeDiscover = false })
+            return@VortXTheme
+        }
+
+        if (showPlayLink) {
+            // SD-1: the "Play a link / magnet" sheet. Handing back a Playable sets [playing] with a null
+            // [playingMeta], so this ad-hoc play never scrobbles or auto-adds to the library (Apple's
+            // paste-a-link launch carries no meta either).
+            BackHandler { showPlayLink = false }
+            PlayLinkScreen(
+                repo = repo,
+                onPlay = { playable ->
+                    playingMeta = null
+                    playing = playable
+                    showPlayLink = false
+                },
+                onBack = { showPlayLink = false },
+            )
             return@VortXTheme
         }
 
@@ -991,7 +1044,20 @@ fun VortXApp(
                     visibleTabs.forEach { t ->
                         NavigationBarItem(
                             selected = t == tab,
-                            onClick = { tab = t },
+                            // SD-6: re-tapping the ALREADY-active Search/Discover tab pops any open detail
+                            // (back to root) and scrolls that screen to the top (Apple's active-tab re-tap).
+                            onClick = {
+                                if (t == tab) {
+                                    detail = null
+                                    when (t) {
+                                        Tab.SEARCH -> searchReselect++
+                                        Tab.DISCOVER -> discoverReselect++
+                                        else -> Unit
+                                    }
+                                } else {
+                                    tab = t
+                                }
+                            },
                             icon = { Icon(t.icon, contentDescription = t.label) },
                             label = { Text(t.label) },
                         )
@@ -1006,12 +1072,27 @@ fun VortXApp(
                 vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn
             when (tab) {
                 Tab.HOME -> HomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, content)
-                Tab.DISCOVER -> DiscoverScreen(
-                    viewModel<DiscoverViewModel>(factory = factory),
-                    onItem,
-                    content,
-                    signedIn = accountSignedIn,
-                )
+                Tab.DISCOVER -> if (mergeDiscoverSearch) {
+                    // SD-2: the combined surface hosts both the Discover browse and the folded-in Search.
+                    MergedDiscoverSearchScreen(
+                        discoverViewModel = viewModel<DiscoverViewModel>(factory = factory),
+                        searchViewModel = viewModel<SearchViewModel>(factory = factory),
+                        onItem = onItem,
+                        modifier = content,
+                        signedIn = accountSignedIn,
+                        hideLive = hiddenTabs.hideLive,
+                        reselectSignal = discoverReselect,
+                    )
+                } else {
+                    DiscoverScreen(
+                        viewModel<DiscoverViewModel>(factory = factory),
+                        onItem,
+                        content,
+                        signedIn = accountSignedIn,
+                        hideLive = hiddenTabs.hideLive,
+                        reselectSignal = discoverReselect,
+                    )
+                }
                 Tab.LIVE -> LiveScreen(viewModel<LiveViewModel>(factory = factory), onItem, content)
                 Tab.LIBRARY -> LibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem, content)
                 Tab.SEARCH -> SearchScreen(
@@ -1019,6 +1100,8 @@ fun VortXApp(
                     onItem,
                     content,
                     signedIn = accountSignedIn,
+                    reselectSignal = searchReselect,
+                    leadingSlot = { PlayLinkEntry(onClick = { showPlayLink = true }) },
                 )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
@@ -1204,6 +1287,7 @@ private fun ManualSourcePickOverlay(
     sources: List<StreamSource>,
     resolving: Boolean,
     onPick: (StreamSource) -> Unit,
+    onRefind: () -> Unit,
     onClose: () -> Unit,
 ) {
     Box(
@@ -1270,15 +1354,33 @@ private fun ManualSourcePickOverlay(
                     }
                 }
             }
-            Text(
-                text = if (resolving) "Starting…" else "Back",
-                color = Color.White,
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 14.sp,
-                modifier = Modifier
-                    .clickable(enabled = !resolving, onClick = onClose)
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-            )
+            // Re-find is the escape hatch when the ranked ladder is exhausted: re-query the add-ons fresh
+            // (all logic in [DetailViewModel.refreshSources]) so expired/dead sources are replaced, then
+            // drop back to the detail page where the fresh, re-ranked list appears. Back keeps today's exit.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Re-find sources",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    modifier = Modifier
+                        .clickable(enabled = !resolving, onClick = onRefind)
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                )
+                Text(
+                    text = if (resolving) "Starting…" else "Back",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    modifier = Modifier
+                        .clickable(enabled = !resolving, onClick = onClose)
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                )
+            }
         }
     }
 }

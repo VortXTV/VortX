@@ -17,17 +17,23 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,7 +46,9 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.BuildConfig
@@ -52,6 +60,7 @@ import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryFilters
 import com.vortx.android.model.LibraryResult
+import com.vortx.android.model.LiveTypes
 import com.vortx.android.model.MetaItem
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.profile.ProfileStore
@@ -64,6 +73,7 @@ import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.components.SignedOutState
 import com.vortx.android.ui.components.shimmer
+import com.vortx.android.ui.search.RecentSearchesRow
 import com.vortx.android.ui.search.SearchResultSection
 import com.vortx.android.ui.search.textResourceId
 import com.vortx.android.ui.search.searchEmptyMessage
@@ -90,12 +100,20 @@ fun DiscoverScreen(
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     signedIn: Boolean = true,
+    // SD-6: when Live TV is hidden (TabBarPrefs.hideLive) the Discover TYPE chips drop every live/tv type
+    // too (Apple `iOSRootView` `hideLiveTab ? types.filter { !LiveTypes.contains($0.type) }`).
+    hideLive: Boolean = false,
+    reselectSignal: Int = 0,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val loadingMore by viewModel.loadingMore.collectAsStateWithLifecycle()
     val advancedFilters by viewModel.advancedFilters.collectAsStateWithLifecycle()
     val filters = (state as? UiState.Success<DiscoverResult>)?.data?.filters
     var showAdvancedFilters by remember { mutableStateOf(false) }
+    val gridState = rememberLazyGridState()
+    LaunchedEffect(reselectSignal) {
+        if (reselectSignal > 0) gridState.animateScrollToItem(0)
+    }
 
     // SD-8: without a Stremio or VortX sign-in there are no catalogs to pivot; show the sign-in prompt.
     if (!signedIn) {
@@ -124,7 +142,7 @@ fun DiscoverScreen(
                 }
             }
         }
-        DiscoverFilterChips(filters = filters, onSelect = { viewModel.select(it) })
+        DiscoverFilterChips(filters = filters, hideLive = hideLive, onSelect = { viewModel.select(it) })
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
@@ -155,6 +173,8 @@ fun DiscoverScreen(
                     } else {
                         stringResource(R.string.discover_catalog_empty)
                     },
+                    showMenu = true,
+                    gridState = gridState,
                     footer = if (s.data.filters.hasNextPage) {
                         { LoadMoreFooter(loading = loadingMore, onClick = viewModel::loadMore) }
                     } else {
@@ -187,12 +207,15 @@ fun DiscoverScreen(
 /// (at most three) rows in their own [Column] with explicit `sm` spacing keeps every row scrollable
 /// and unchanged in content, just legibly separated -- a minimal, cosmetic-only fix, not a redesign.
 @Composable
-private fun DiscoverFilterChips(filters: DiscoverFilters?, onSelect: (String) -> Unit) {
+private fun DiscoverFilterChips(filters: DiscoverFilters?, hideLive: Boolean, onSelect: (String) -> Unit) {
     if (filters == null) return
+    // SD-6: when Live TV is hidden, drop live/tv type chips (the label is the capitalized engine type, so
+    // LiveTypes matches it case-insensitively). Catalog/genre rows are untouched, exactly like Apple.
+    val types = if (hideLive) filters.types.filterNot { LiveTypes.contains(it.label) } else filters.types
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-        if (filters.types.isNotEmpty()) {
+        if (types.isNotEmpty()) {
             ChipScrollRow {
-                filters.types.forEach { option ->
+                types.forEach { option ->
                     Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
                 }
             }
@@ -257,22 +280,34 @@ private fun LibraryFilterChips(filters: LibraryFilters?, onSelect: (String) -> U
 
 /// Search: a query field over a poster grid of matches across every installed add-on, with recent
 /// searches as chips when the query is empty (DESIGN-SYSTEM.md §4 "Discover / Search").
+///
+/// SD-6 polish: a trailing clear button, an IME "Search" action that skips the debounce
+/// ([SearchViewModel.submitQuery]), a "Recent Searches" heading with clock/trash glyphs, the long-press
+/// catalog menu + watched badge on result cards, and [reselectSignal] -- bumped by the shell when the
+/// already-active Search tab is re-tapped -- to scroll the results back to the top. [leadingSlot] renders
+/// above the field (the "Play a link" entry, SD-1).
 @Composable
 fun SearchScreen(
     viewModel: SearchViewModel,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     signedIn: Boolean = true,
+    reselectSignal: Int = 0,
+    leadingSlot: (@Composable () -> Unit)? = null,
 ) {
     val searchState by viewModel.screenState.collectAsStateWithLifecycle()
     val history by viewModel.history.collectAsStateWithLifecycle()
     val suggestions by viewModel.suggestions.collectAsStateWithLifecycle()
     val query = searchState.query
     val state = searchState.content
-    val colors = VortXTheme.colors
     val openItem: (MetaItem) -> Unit = {
         viewModel.recordHistory()
         onItem(it)
+    }
+    val gridState = rememberLazyGridState()
+    // Re-tap of the active Search tab scrolls the results back to top (Apple `TabScrollToTop`).
+    LaunchedEffect(reselectSignal) {
+        if (reselectSignal > 0) gridState.animateScrollToItem(0)
     }
 
     // SD-8: a signed-out device sees a sign-in prompt, not empty add-on results. Gate on either account.
@@ -282,28 +317,23 @@ fun SearchScreen(
     }
 
     Column(modifier = modifier.fillMaxSize()) {
-        OutlinedTextField(
-            value = query,
-            onValueChange = viewModel::onQueryChange,
-            leadingIcon = { Icon(VortXIcons.search, contentDescription = null) },
-            placeholder = { Text("Search movies, series, channels", style = VortXTheme.type.body) },
-            singleLine = true,
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = colors.accent,
-                unfocusedBorderColor = colors.hairline,
-                cursorColor = colors.accent,
-            ),
-            modifier = Modifier.fillMaxWidth().padding(VortXTheme.spacing.edge),
+        leadingSlot?.invoke()
+        SearchField(
+            query = query,
+            onQueryChange = viewModel::onQueryChange,
+            onSubmit = viewModel::submitQuery,
+            onClear = { viewModel.onQueryChange("") },
         )
         if (query.isBlank() && history.isNotEmpty()) {
-            ChipScrollRow {
-                history.forEach { term ->
-                    Chip(label = term, selected = false, onClick = { viewModel.onQueryChange(term) })
-                }
-                Chip(label = "Clear", selected = false, onClick = viewModel::clearHistory)
-            }
+            RecentSearchesRow(
+                history = history,
+                onPick = viewModel::onQueryChange,
+                onClear = viewModel::clearHistory,
+                modifier = Modifier.padding(top = VortXTheme.spacing.xs),
+            )
         }
-        // SD-4: as-you-type suggestions under the field. Cleared below two characters by the ViewModel.
+        // SD-4: as-you-type suggestions under the field. Surfaced from one character (client-side); the
+        // engine's own local-search index feeds in from two characters. Cleared when the query is empty.
         if (suggestions.isNotEmpty()) {
             ChipScrollRow {
                 suggestions.forEach { suggestion ->
@@ -326,9 +356,53 @@ fun SearchScreen(
                     else -> stringResource(message.textResourceId)
                 },
                 sectioned = true,
+                showMenu = true,
+                gridState = gridState,
             )
         }
     }
+}
+
+/// The shared search text field (phone Search + the merged Discover surface): a leading magnifier, the
+/// query, a trailing clear ("x") button when non-empty, and an IME "Search" action that fires
+/// [onSubmit] (which skips the debounce) and dismisses the keyboard.
+@Composable
+internal fun SearchField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSubmit: () -> Unit,
+    onClear: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = VortXTheme.colors
+    val focusManager = LocalFocusManager.current
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        leadingIcon = { Icon(VortXIcons.search, contentDescription = null) },
+        trailingIcon = {
+            if (query.isNotEmpty()) {
+                IconButton(onClick = onClear) {
+                    Icon(VortXIcons.close, contentDescription = "Clear search", tint = colors.textSecondary)
+                }
+            }
+        },
+        placeholder = { Text("Search movies, series, channels", style = VortXTheme.type.body) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+        keyboardActions = KeyboardActions(
+            onSearch = {
+                onSubmit()
+                focusManager.clearFocus()
+            },
+        ),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = colors.accent,
+            unfocusedBorderColor = colors.hairline,
+            cursorColor = colors.accent,
+        ),
+        modifier = modifier.fillMaxWidth().padding(VortXTheme.spacing.edge),
+    )
 }
 
 /// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). The
@@ -550,13 +624,20 @@ private fun ChipScrollRow(content: @Composable RowScope.() -> Unit) {
 /// "Library": "poster grid with the remove (x) control"); [footer] renders a full-width trailing row
 /// (Discover's "Load more").
 @Composable
-private fun PosterGrid(
+internal fun PosterGrid(
     items: List<MetaItem>,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     emptyHint: String,
     sectioned: Boolean = false,
     onRemove: ((String) -> Unit)? = null,
+    // S10: attach the long-press catalog quick-action menu (Add to Library / Mark Watched / Unwatched)
+    // to each card and honor the item's watched flag. On for Discover/Search result cards, off for the
+    // Library grid (which uses its own remove ("x") badge instead).
+    showMenu: Boolean = false,
+    // Hoisted so the shell's active-tab re-tap can scroll this grid to the top; null = the grid owns its
+    // own scroll state (Library, the offline preview).
+    gridState: LazyGridState? = null,
     footer: (@Composable () -> Unit)? = null,
 ) {
     if (items.isEmpty()) {
@@ -573,8 +654,11 @@ private fun PosterGrid(
     val sections = remember(deduped, sectioned) {
         if (sectioned) searchResultSections(deduped) else listOf(SearchResultSection(null, deduped))
     }
+    // Always remember a fallback state (unconditional Composable call); use the hoisted one when supplied.
+    val ownGridState = rememberLazyGridState()
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
+        state = gridState ?: ownGridState,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(VortXTheme.spacing.edge),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
@@ -597,6 +681,8 @@ private fun PosterGrid(
                         subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
                         onClick = { onItem(item) },
                         progress = item.progress,
+                        watched = item.watched,
+                        menuItem = if (showMenu) item else null,
                         art = { PosterArt(item.poster, item.name) },
                     )
                     if (onRemove != null) {

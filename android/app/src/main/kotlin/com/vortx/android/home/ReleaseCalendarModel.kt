@@ -387,6 +387,26 @@ internal class ReleaseCalendarModel(
     }
 }
 
+/**
+ * Fold already-resolved SIMKL plan-to-watch seeds into the calendar's watchlist seed list, BASE WINS: a
+ * title already present in the library or local watchlist keeps its own entry (fresher engine/local meta)
+ * and its SIMKL twin is dropped. Returns the new watchlist seed list for [ReleaseCalendarModel.refresh].
+ *
+ * Fail-closed on a SIMKL session change: the caller passes SIMKL items only for the CURRENT session
+ * ([SimklRailsModel] `refresh` returns an empty list when the session epoch no longer matches), so a SIMKL
+ * disconnect naturally drops these titles from Upcoming on the next Home refresh. Mirrors Apple
+ * `SIMKLUpcomingSeeds.fold` (ReleaseCalendarModel.swift).
+ */
+internal fun foldSimklUpcomingSeeds(
+    library: List<MetaItem>,
+    watchlist: List<MetaItem>,
+    simkl: List<MetaItem>,
+): List<MetaItem> {
+    if (simkl.isEmpty()) return watchlist
+    val seen = (library + watchlist).mapTo(hashSetOf()) { "${it.type.id}:${it.id}" }
+    return watchlist + simkl.filter { seen.add("${it.type.id}:${it.id}") }
+}
+
 internal fun upcomingMetaBases(addons: List<InstalledAddon>): List<String> = addons.asSequence()
     .filter { it.providesMeta && !it.isDisabled }
     .mapNotNull { addon ->

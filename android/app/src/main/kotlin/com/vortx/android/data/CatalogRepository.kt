@@ -1,6 +1,7 @@
 package com.vortx.android.data
 
 import com.vortx.android.model.Catalog
+import com.vortx.android.model.CoreSearchSuggestion
 import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.DiscoverTypeOption
@@ -274,6 +275,18 @@ interface CatalogRepository {
         emit(search(trimmed).getOrThrow() to false)
     }
 
+    /**
+     * The engine's as-you-type local-search suggestion index for [query] (the `local_search` field, distinct
+     * from [searchUpdates]'s full results). Mirrors Apple `CoreBridge`'s `loadSearchSuggestions` +
+     * `suggestSearch`: Load the `LocalSearch` model, then `Search maxResults 10`, gated at two characters --
+     * below it (and for any implementation without an engine index, e.g. the offline preview) this yields a
+     * single empty emission and never dispatches. The [com.vortx.android.ui.viewmodel.SearchViewModel]
+     * interleaves these ahead of the settled results in its suggestion list.
+     */
+    fun searchSuggestionUpdates(query: String): Flow<List<CoreSearchSuggestion>> = flow {
+        emit(emptyList())
+    }
+
     /// Full meta detail for a title (hero artwork, metadata, episodes), resolved through the user's
     /// meta add-ons so every id scheme (tt, tmdb:, tvdb:, …) works.
     suspend fun meta(type: MediaType, id: String): Result<MetaDetail>
@@ -286,12 +299,18 @@ interface CatalogRepository {
     /// it null and the engine guesses the best stream for the title. Auto-next may also pass its
     /// [rememberedQuality] and manually chosen [wantedAddon], allowing a bounded wait for that provider;
     /// ordinary detail loads leave both null and keep the original first-playable timing.
+    ///
+    /// [forceRefresh] drives "Re-find sources": the engine caches a title's stream groups, so a plain
+    /// re-Load of the same meta is a no-op with zero add-on HTTP. With it set the engine impl unloads the
+    /// MetaDetails model FIRST, so the Load re-queries every stream add-on fresh and expired/dead sources
+    /// are replaced. Default off: an ordinary detail load never pays that cost.
     suspend fun streams(
         type: MediaType,
         id: String,
         episodeId: String? = null,
         rememberedQuality: String? = null,
         wantedAddon: String? = null,
+        forceRefresh: Boolean = false,
     ): Result<List<StreamGroup>>
 
     /// Resolve a chosen [StreamSource] into a directly-playable [Playable] for the player. The engine
@@ -302,6 +321,19 @@ interface CatalogRepository {
         source: StreamSource,
         episode: Episode? = null,
     ): Result<Playable>
+
+    /// Resolve a pasted DIRECT/debrid/usenet http(s) link into a [Playable] (SD-1). The URL is already
+    /// resolved by the user's service, so it plays as-is (no debrid round-trip, no keys). Overridden by
+    /// [com.vortx.android.engine.EngineStremioRepository]; the preview cannot play ad-hoc links.
+    suspend fun resolveDirectLink(url: String, title: String): Result<Playable> =
+        Result.failure(UnsupportedOperationException("Playing a link is not available here."))
+
+    /// Resolve a pasted magnet (by its info hash) into a [Playable] (SD-1), through the EXISTING
+    /// torrent/debrid path: a configured debrid key unlocks a direct cached link, otherwise it streams
+    /// through the in-process streaming server. [fileIdx] pins the exact file for a re-opened saved magnet
+    /// (#81); null lets the server serve the default file. Overridden by the engine repository.
+    suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int? = null): Result<Playable> =
+        Result.failure(UnsupportedOperationException("Playing a magnet is not available here."))
 
     // ---- Live playback progress (engine Player) ----
     //
@@ -566,6 +598,7 @@ class PreviewCatalogRepository(
         episodeId: String?,
         rememberedQuality: String?,
         wantedAddon: String?,
+        forceRefresh: Boolean,
     ): Result<List<StreamGroup>> {
         delay(latencyMs)
         // A representative stub of the per-add-on, multi-quality source list the engine returns. The

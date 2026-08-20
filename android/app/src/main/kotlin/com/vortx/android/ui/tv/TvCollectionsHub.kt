@@ -79,6 +79,7 @@ internal fun TvCollectionsHub(
             TvProviderLoadError(onRetryProviders)
         }
         TvHubRow(stringResource(R.string.collections_group_genres), snapshot.genres, onOpen)
+        TvHubRow(stringResource(R.string.collections_group_decades), snapshot.decades, onOpen)
     }
 }
 

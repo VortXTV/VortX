@@ -37,7 +37,12 @@ import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
 import com.vortx.android.home.TRAKT_WATCHLIST_CATALOG_ID
 import com.vortx.android.home.UPCOMING_EPISODES_CATALOG_ID
 import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
+import com.vortx.android.home.HomeRail
+import com.vortx.android.ui.HomeRowItem
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.collectionsHubSlot
+import com.vortx.android.ui.homeRowKey
+import com.vortx.android.ui.homeRowsWithHub
 import com.vortx.android.ui.normalizeHomeCatalogs
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
@@ -56,6 +61,8 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
     val state by viewModel.state.collectAsStateWithLifecycle()
     val collections by viewModel.collections.collectAsStateWithLifecycle()
     val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
+    val hubOrder by viewModel.collectionsHubOrder.collectAsStateWithLifecycle()
+    val hubHidden by viewModel.collectionsHubHidden.collectAsStateWithLifecycle()
 
     if (collectionBrowse.target != null) {
         CollectionsBrowseScreen(
@@ -83,7 +90,7 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
                     modifier,
                 )
             } else {
-                HomeContent(s.data, collections, onItem, viewModel, modifier)
+                HomeContent(s.data, collections, hubOrder, hubHidden, onItem, viewModel, modifier)
             }
     }
 }
@@ -92,12 +99,20 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
 private fun HomeContent(
     catalogs: List<Catalog>,
     collections: CollectionsHubSnapshot,
+    hubOrder: List<HomeRail>,
+    hubHidden: Boolean,
     onItem: (MetaItem) -> Unit,
     viewModel: HomeViewModel,
     modifier: Modifier,
 ) {
     val visibleCatalogs = remember(catalogs) { normalizeHomeCatalogs(catalogs) }
+    // The hub is not a catalog, so the hero (first item of the first REAL rail) is unaffected by it.
     val hero = visibleCatalogs.firstOrNull()?.items?.firstOrNull()
+    val hubShown = collections.isVisible && !hubHidden
+    val rows = remember(visibleCatalogs, hubShown, hubOrder) {
+        homeRowsWithHub(visibleCatalogs, if (hubShown) collectionsHubSlot(visibleCatalogs, hubOrder) else null)
+    }
+    val lastCatalogId = visibleCatalogs.lastOrNull()?.id
     // The featured hero is the first item of the first rail (Continue Watching, else the leading add-on
     // catalog) -- the SAME data the rails below already render. It now loads that title's real
     // backdrop/poster art (see [HeroHeader]), so the earlier large-screen gate (which hid the hero on
@@ -113,35 +128,37 @@ private fun HomeContent(
         if (hero != null) {
             item { HeroHeader(hero, onItem) }
         }
-        if (collections.isVisible) {
-            item(key = "vortx.home.collectionsHub") {
-                CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub)
+        itemsIndexed(rows, key = { _, row -> homeRowKey(row) }) { _, row ->
+            when (row) {
+                HomeRowItem.HubRow ->
+                    CollectionsHub(collections, viewModel::openCollection, viewModel::retryCollectionsHub)
+                is HomeRowItem.CatalogRow -> {
+                    val catalog = row.catalog
+                    if (catalog.id == lastCatalogId) {
+                        LaunchedEffect(rows.size, catalog.id) { viewModel.loadMoreRows() }
+                    }
+                    // The leading Continue Watching rail carries the editorial kicker, like tvOS.
+                    val eyebrow = when (catalog.id) {
+                        "continue" -> "Pick up where you left off"
+                        TOP_PICKS_CATALOG_ID -> "Based on what you watch"
+                        UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
+                        TRAKT_WATCHLIST_CATALOG_ID -> "From Trakt"
+                        SIMKL_WATCHLIST_CATALOG_ID -> "From SIMKL"
+                        else -> null
+                    }
+                    PosterRail(
+                        catalog = catalog,
+                        onItem = onItem,
+                        onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
+                        eyebrow = eyebrow,
+                        onEndReached = if (catalog.hasNextPage) {
+                            { viewModel.loadNextPage(catalog) }
+                        } else {
+                            null
+                        },
+                    )
+                }
             }
-        }
-        itemsIndexed(visibleCatalogs, key = { _, catalog -> catalog.id }) { index, catalog ->
-            if (index == visibleCatalogs.lastIndex) {
-                LaunchedEffect(visibleCatalogs.size, catalog.id) { viewModel.loadMoreRows() }
-            }
-            // The leading Continue Watching rail carries the editorial kicker, like tvOS.
-            val eyebrow = when (catalog.id) {
-                "continue" -> "Pick up where you left off"
-                TOP_PICKS_CATALOG_ID -> "Based on what you watch"
-                UPCOMING_EPISODES_CATALOG_ID, UPCOMING_MOVIES_CATALOG_ID -> "Coming soon"
-                TRAKT_WATCHLIST_CATALOG_ID -> "From Trakt"
-                SIMKL_WATCHLIST_CATALOG_ID -> "From SIMKL"
-                else -> null
-            }
-            PosterRail(
-                catalog = catalog,
-                onItem = onItem,
-                onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
-                eyebrow = eyebrow,
-                onEndReached = if (catalog.hasNextPage) {
-                    { viewModel.loadNextPage(catalog) }
-                } else {
-                    null
-                },
-            )
         }
     }
 }

@@ -39,6 +39,7 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     var showHubDiscover by remember { mutableStateOf(prefs.showCollectionsHubDiscover) }
     var refreshCadence by remember { mutableStateOf(prefs.refreshCadence) }
     var mergeDiscoverSearch by remember { mutableStateOf(prefs.mergeDiscoverSearch) }
+    var regionPreference by remember { mutableStateOf(prefs.regionPreference) }
     var showFinancials by remember { mutableStateOf(prefs.showFinancials) }
     var spoilerSafe by remember { mutableStateOf(prefs.spoilerSafe) }
     var hidePosterLabels by remember { mutableStateOf(prefs.hidePosterLabels) }
@@ -112,6 +113,22 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
             }
 
             SettingsSection(
+                title = "Region",
+                footer = "Browse another market's streaming services and catalogs in Collections. Auto uses " +
+                    "your device region.",
+            ) {
+                PickerRow(
+                    label = "Discover region",
+                    options = regionOptions,
+                    selectedId = regionPreference,
+                    onSelect = {
+                        regionPreference = it
+                        prefs.regionPreference = it
+                    },
+                )
+            }
+
+            SettingsSection(
                 title = "Collections",
                 footer = "How often the Collections hub refreshes its tiles.",
             ) {
@@ -168,4 +185,24 @@ private val refreshCadenceOptions: List<Pair<String, String>> = listOf(
     "daily" to "Daily",
     "twiceDaily" to "Twice daily",
     "fourTimesDaily" to "4x daily",
+)
+
+/// Region override options: id = the stored uppercase code ("" = Auto/device region), label = display name.
+/// A common-markets shortlist rather than every ISO country, so the wrap-chip picker stays one-handed.
+private val regionOptions: List<Pair<String, String>> = listOf(
+    "" to "Auto",
+    "US" to "United States",
+    "GB" to "United Kingdom",
+    "CA" to "Canada",
+    "AU" to "Australia",
+    "IN" to "India",
+    "DE" to "Germany",
+    "FR" to "France",
+    "ES" to "Spain",
+    "IT" to "Italy",
+    "BR" to "Brazil",
+    "MX" to "Mexico",
+    "JP" to "Japan",
+    "KR" to "South Korea",
+    "NL" to "Netherlands",
 )

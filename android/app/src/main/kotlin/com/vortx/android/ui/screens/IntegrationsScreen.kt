@@ -1,5 +1,8 @@
 package com.vortx.android.ui.screens
 
+import android.content.Context
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -9,6 +12,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -30,12 +35,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.vortx.android.data.CatalogRepository
 import com.vortx.android.integrations.CredentialConnectionState
 import com.vortx.android.integrations.SIMKLAuth
 import com.vortx.android.integrations.SIMKLException
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.integrations.TraktAuthException
+import com.vortx.android.model.MirrorSettings
 import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
@@ -51,7 +58,29 @@ import kotlinx.coroutines.launch
 /// once authorized, the token is already stored, so reopening shows Connected).
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun IntegrationsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Modifier = Modifier) {
+    // Sub-navigation kept LOCAL to this screen (like the auth flows below): the import surfaces are reached
+    // from the cards at the top of this screen, so a system Back from a sub-route returns here rather than
+    // closing Integrations entirely. Mirrors the Apple Integrations screen, which pushes ListImportView /
+    // NuvioImportView / StremioImportView from its cards.
+    var route by remember { mutableStateOf(ImportRoute.None) }
+    BackHandler(enabled = route != ImportRoute.None) { route = ImportRoute.None }
+    when (route) {
+        ImportRoute.Stremio -> {
+            StremioImportScreen(repo = repo, onBack = { route = ImportRoute.None }, modifier = modifier)
+            return
+        }
+        ImportRoute.Nuvio -> {
+            NuvioImportScreen(repo = repo, onBack = { route = ImportRoute.None }, modifier = modifier)
+            return
+        }
+        ImportRoute.List -> {
+            ListImportScreen(onBack = { route = ImportRoute.None }, modifier = modifier)
+            return
+        }
+        ImportRoute.None -> Unit
+    }
+
     val appContext = LocalContext.current.applicationContext
     val uriHandler = LocalUriHandler.current
     val scope = rememberCoroutineScope()
@@ -96,6 +125,35 @@ fun IntegrationsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
+            Text(
+                "Optional imports and services that enrich VortX. Connect what you already use; VortX keeps " +
+                    "its own account, add-ons, and library either way.",
+                style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+            )
+
+            // Imports: bring in add-ons or lists from Stremio / Nuvio / a public list link. Each opens a
+            // sub-screen in-place (see [ImportRoute] above). On-device and separate from your VortX account.
+            NavCard(
+                title = "Import from Stremio",
+                description = "Sign in with your Stremio account, or paste your add-on links to bring them in.",
+                onClick = { route = ImportRoute.Stremio },
+            )
+            NavCard(
+                title = "Import from Nuvio",
+                description = "Paste the Stremio-compatible add-on you use in Nuvio to bring it into VortX.",
+                onClick = { route = ImportRoute.Nuvio },
+            )
+            NavCard(
+                title = "Import a list",
+                description = "Paste a public Letterboxd, MDBList, or Trakt list link and browse it as a Home row.",
+                onClick = { route = ImportRoute.List },
+            )
+
+            // Stremio mirror: per-category control of whether VortX tracks a connected Stremio account. Default
+            // OFF for all three = VortX owns its own add-ons / library / Continue Watching. Mirrors the Apple
+            // "Stremio mirror" toggles (iOSSettingsView.stremioMirrorSection), on the SAME MirrorSettings keys.
+            StremioMirrorCard(context = appContext)
+
             Text(
                 "Sync your watch progress and history to Trakt or SIMKL. Playback scrobbles automatically " +
                     "while connected.",
@@ -432,4 +490,93 @@ internal sealed interface ConnectUi {
     data class Connected(val status: String? = null) : ConnectUi
     data class StorageUnavailable(val message: String) : ConnectUi
     data class Error(val message: String) : ConnectUi
+}
+
+/// The in-place import sub-routes reached from the cards at the top of the Integrations screen.
+private enum class ImportRoute { None, Stremio, Nuvio, List }
+
+/// A tappable settings card that opens a sub-screen (title + description + trailing chevron), matching the
+/// Apple Integrations cards (Nuvio / List import) that push a NavigationLink destination.
+@Composable
+private fun NavCard(title: String, description: String, onClick: () -> Unit) {
+    val colors = VortXTheme.colors
+    SurfaceCard(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(VortXTheme.spacing.lg),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(0.9f),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+            ) {
+                Text(title, style = VortXTheme.type.cardTitle)
+                Text(description, style = VortXTheme.type.body.copy(color = colors.textSecondary))
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = colors.textTertiary,
+            )
+        }
+    }
+}
+
+/// The "Stremio mirror" card: the three per-category mirror toggles (add-ons / library / Continue Watching),
+/// each seeded from and written back to [MirrorSettings] on the SAME `stremiox.sync.mirror.*` keys Apple uses.
+/// DEFAULT OFF for all three = VortX owns the category; a Stremio removal never removes it from VortX (the
+/// mirror DIRECTION + removal propagation live in the sync layer, a separate lane; this is only the flags UI).
+@Composable
+private fun StremioMirrorCard(context: Context) {
+    val colors = VortXTheme.colors
+    val settings = remember { MirrorSettings(context) }
+    var mirrorAddons by remember { mutableStateOf(settings.mirrorAddons) }
+    var mirrorLibrary by remember { mutableStateOf(settings.mirrorLibrary) }
+    var mirrorContinueWatching by remember { mutableStateOf(settings.mirrorContinueWatching) }
+
+    SurfaceCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(VortXTheme.spacing.lg),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+        ) {
+            Text("Stremio mirror", style = VortXTheme.type.cardTitle)
+            MirrorToggleRow(
+                label = "Two-way sync add-ons with Stremio",
+                checked = mirrorAddons,
+                onCheckedChange = { mirrorAddons = it; settings.mirrorAddons = it },
+            )
+            MirrorToggleRow(
+                label = "Mirror library from Stremio",
+                checked = mirrorLibrary,
+                onCheckedChange = { mirrorLibrary = it; settings.mirrorLibrary = it },
+            )
+            MirrorToggleRow(
+                label = "Mirror Continue Watching from Stremio",
+                checked = mirrorContinueWatching,
+                onCheckedChange = { mirrorContinueWatching = it; settings.mirrorContinueWatching = it },
+            )
+            Text(
+                "Off (recommended) is one-way: VortX pulls your Stremio add-ons, library, and Continue Watching " +
+                    "in, but never lets Stremio take them back out. On makes VortX track Stremio for that " +
+                    "category, so a removal or a rewind there applies here too. Your add-ons, library, and " +
+                    "Continue Watching always stay even when you are signed out of Stremio.",
+                style = VortXTheme.type.label.copy(color = colors.textTertiary),
+            )
+        }
+    }
+}
+
+/// One mirror toggle row: label plus a Switch, matching the Trakt/SIMKL scrobble toggle rows above.
+@Composable
+private fun MirrorToggleRow(label: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, style = VortXTheme.type.body, modifier = Modifier.fillMaxWidth(0.75f))
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
 }

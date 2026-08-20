@@ -166,6 +166,7 @@
     <string name="collections_streaming_loading">Loading streaming services...</string>
     <string name="collections_streaming_load_error">Couldn’t load streaming services. Try again.</string>
     <string name="collections_group_genres">Genres</string>
+    <string name="collections_group_decades">Decades</string>
     <string name="collections_action_back">Back</string>
     <string name="collections_action_retry">Retry</string>
     <string name="collections_action_load_more">Load more</string>
@@ -198,6 +199,8 @@
     <string name="collections_genre_thriller">Thriller</string>
     <string name="collections_genre_anime">Anime</string>
     <string name="collections_genre_korean_drama">Korean Drama</string>
+    <string name="collections_genre_fantasy">Fantasy</string>
+    <string name="collections_genre_mystery">Mystery</string>
 
     <string name="collections_category_movies">Movies</string>
     <string name="collections_category_shows">Shows</string>

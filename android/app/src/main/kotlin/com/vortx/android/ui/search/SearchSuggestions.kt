@@ -25,10 +25,14 @@ internal fun normalizeForSuggestion(value: String): String =
  * diacritic-insensitively as a substring of the trimmed query, de-duplicated by their normalized form
  * (first occurrence wins, preserving the priority order), and capped at [MAX_SEARCH_SUGGESTIONS].
  *
- * Below the two-character gate ([isSearchQueryEligible]) there are no suggestions, mirroring the search
- * dispatch gate so a single character never offers completions. [engineSuggestions] is the wired seam for
- * [CoreSearchSuggestion]: when the engine exposes a local-search index those titles interleave here; when
- * it does not the list simply degrades to the client-side sources, never spinning or erroring.
+ * The suggestion SURFACE opens from a SINGLE non-empty character, decoupled from the engine DISPATCH gate:
+ * Apple's `CoreBridge.searchSuggestionTitles` guards only on a non-empty trimmed query (not the two-char
+ * gate), so at one character the client-side sources (Continue Watching, the Home board, any already-settled
+ * results) still offer completions before the first engine round-trip. The engine `local_search` Search is
+ * separately gated at two characters by the repository, so [engineSuggestions] is simply empty below it.
+ * [engineSuggestions] is the wired seam for [CoreSearchSuggestion]: when the engine exposes a local-search
+ * index those titles interleave here; when it does not the list degrades to the client-side sources, never
+ * spinning or erroring.
  */
 internal fun searchSuggestionTitles(
     query: String,
@@ -37,7 +41,6 @@ internal fun searchSuggestionTitles(
     currentResults: List<MetaItem> = emptyList(),
     homeBoard: List<MetaItem> = emptyList(),
 ): List<String> {
-    if (!isSearchQueryEligible(query)) return emptyList()
     val needle = normalizeForSuggestion(query)
     if (needle.isEmpty()) return emptyList()
 

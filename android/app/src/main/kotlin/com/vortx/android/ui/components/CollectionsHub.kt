@@ -69,6 +69,7 @@ internal fun CollectionsHub(
             ProviderLoadError(onRetryProviders)
         }
         HubTileRow(stringResource(R.string.collections_group_genres), snapshot.genres, onOpen)
+        HubTileRow(stringResource(R.string.collections_group_decades), snapshot.decades, onOpen)
     }
 }
 
