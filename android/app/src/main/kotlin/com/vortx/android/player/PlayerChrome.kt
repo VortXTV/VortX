@@ -386,10 +386,10 @@ fun PlayerChrome(
                     ChromeIcon(Icons.AutoMirrored.Filled.List, "Episodes") { onInteraction(); openSheet = ControlSheet.EPISODES }
                 }
                 previousEpisode?.let { episode ->
-                    ChromeIcon(Icons.Filled.SkipPrevious, "Previous episode") { onInteraction(); onSwitchEpisode(episode) }
+                    ChromeIcon(Icons.Filled.SkipPrevious, stringResource(R.string.player_previous_episode)) { onInteraction(); onSwitchEpisode(episode) }
                 }
                 nextEpisode?.let { episode ->
-                    ChromeIcon(Icons.Filled.SkipNext, "Next episode") { onInteraction(); onSwitchEpisode(episode) }
+                    ChromeIcon(Icons.Filled.SkipNext, stringResource(R.string.player_next_episode)) { onInteraction(); onSwitchEpisode(episode) }
                 }
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 // Volume + mute (Apple `stremiox.playerVolume`): the speaker glyph reflects the mute / level

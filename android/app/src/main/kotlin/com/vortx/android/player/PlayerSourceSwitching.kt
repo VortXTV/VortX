@@ -158,17 +158,15 @@ internal data class PlayerEpisodeChoice(
     val selected: Boolean,
 )
 
-/// The current-season episodes for the in-player picker, in episode order, with the playing one selected.
+/// Full cross-season episode inventory for picker and direct transport, with the playing one selected.
 /// Empty for movies / an unmappable ref, so the chrome hides the control. Mirrors Apple's `.episodes` panel.
 internal fun playerEpisodeChoices(
     episodes: List<Episode>,
     currentMediaRef: MediaRef?,
 ): List<PlayerEpisodeChoice> {
     val current = currentMediaRef?.takeIf { it.isSeries } ?: return emptyList()
-    val season = current.season ?: return emptyList()
     return episodes.asSequence()
-        .filter { it.season == season }
-        .sortedWith(compareBy<Episode> { it.episode }.thenBy { it.id })
+        .sortedWith(compareBy<Episode> { it.season }.thenBy { it.episode }.thenBy { it.id })
         .map { episode ->
             PlayerEpisodeChoice(
                 episode = episode,

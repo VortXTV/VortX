@@ -81,6 +81,14 @@
     <string name="player_current_selection">Current selection</string>
     <string name="player_chapters">Chapters</string>
     <string name="player_chapters_action_description">Open chapters</string>
+    <string name="player_previous_episode">Previous episode</string>
+    <string name="player_next_episode">Next episode</string>
+    <string name="player_up_next">Up Next</string>
+    <string name="player_play_next">Play next</string>
+    <string name="player_play_now_remaining">Play now · %1$ds</string>
+    <string name="player_starting">Starting…</string>
+    <string name="player_watch_credits">Watch credits</string>
+    <string name="player_cancel">Cancel</string>
 
     <!-- Google Cast lane (com.vortx.android.cast). The Cast button in the player chrome, the device chooser,
          and the "Casting to X" overlay. Shown only for castable direct/HLS/debrid streams (torrents never

@@ -151,6 +151,9 @@ fun PlayerScreen(
     /// The final-credits window is intentionally separate from EOF: the host can show an Up Next choice
     /// while the current episode still plays, then fence its decision to the current episode generation.
     onUpNextWindow: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    /// A host modal (Up Next) temporarily owns remote focus. Once it closes, park focus back on the player
+    /// root so the next D-pad action reopens its chrome rather than falling through to obscured content.
+    progressionOverlayVisible: Boolean = false,
     /// How many episodes auto-advanced back-to-back (with no interaction) to reach THIS playback, so the
     /// binge boundary of the "Still watching?" guard can fire. The host counts the streak across the
     /// auto-advance chain and resets it on any manual play. 0 (the default) never trips the binge boundary.
@@ -1011,9 +1014,9 @@ fun PlayerScreen(
     // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
     // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
     // auto-advance, whichever engine reported the EOF.
-    LaunchedEffect(playerState.hasEnded) {
+    LaunchedEffect(playerState.hasEnded, sourceSwitchState.isSwitching) {
         val s = latestState
-        if (!playerState.hasEnded || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
+        if (!playerState.hasEnded || sourceSwitchState.isSwitching || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
         // A userForcedSource play skips the conversion (the viewer chose this exact file off the
         // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
         // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
@@ -1056,8 +1059,10 @@ fun PlayerScreen(
                 currentOnProgress(s.positionMs, s.durationMs)
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
-                currentOnWarmNext(s.positionMs, s.durationMs)
-                currentOnUpNextWindow(s.positionMs, s.durationMs)
+                if (!sourceSwitchState.isSwitching) {
+                    currentOnWarmNext(s.positionMs, s.durationMs)
+                    currentOnUpNextWindow(s.positionMs, s.durationMs)
+                }
             }
         }
     }
@@ -1157,8 +1162,8 @@ fun PlayerScreen(
     // would dead-end. Parking focus on the root box lets the next key press land in [onKeyEvent] below,
     // which consumes it and re-shows the controls (Back/Escape excepted, so Back still exits the player).
     val rootFocus = remember { FocusRequester() }
-    LaunchedEffect(controlsVisible) {
-        if (!controlsVisible) runCatching { rootFocus.requestFocus() }
+    LaunchedEffect(controlsVisible, progressionOverlayVisible) {
+        if (!controlsVisible && !progressionOverlayVisible) runCatching { rootFocus.requestFocus() }
     }
 
     Box(

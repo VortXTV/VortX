@@ -44,6 +44,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
@@ -52,6 +53,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
+import com.vortx.android.R
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
@@ -144,6 +146,7 @@ import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -539,16 +542,21 @@ fun VortXApp(
             // the ViewModel. Invalidated on dispose so a stale attempt cannot survive the player closing.
             val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
             val episodeProgression = remember(historyIdentity) { EpisodeProgressionPolicy() }
+            var warmNextJob by remember(historyIdentity) { mutableStateOf<Job?>(null) }
             DisposableEffect(historyIdentity) {
                 onDispose {
+                    warmNextJob?.cancel()
                     preloadPolicy.invalidate()
                     episodeProgression.invalidate()
                 }
             }
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
-            var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
-            var upNextTarget by remember(playable) { mutableStateOf<EpisodeProgressionPolicy.Target?>(null) }
+            var upNext by remember(historyIdentity) { mutableStateOf<Episode?>(null) }
+            var upNextTarget by remember(historyIdentity) { mutableStateOf<EpisodeProgressionPolicy.Target?>(null) }
+            var upNextRemainingMs by remember(historyIdentity) { mutableStateOf(0L) }
+            var upNextAtEof by remember(historyIdentity) { mutableStateOf(false) }
+            var progressionResolving by remember(historyIdentity) { mutableStateOf(false) }
             // Bad-source ladder surfaces, keyed per playable DELIBERATELY: a successful retry swaps
             // [playing] to the new source's playable, which resets both to false and closes the
             // overlay on its own. The ladder's cross-retry memory (failed sources + the 3-attempt
@@ -566,10 +574,14 @@ fun VortXApp(
             DisposableEffect(historyIdentity) {
                 if (!historyPlayable.isTrailer) playbackSessions.begin(playbackSession)
                 onDispose {
+                    advanceVm?.cancelEpisodeProgressionResolve()
                     if (!historyPlayable.isTrailer) {
                         playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1])
                     }
                 }
+            }
+            LaunchedEffect(historyIdentity) {
+                episodeProgression.invalidate()
             }
             Box {
                 PlayerScreen(
@@ -600,39 +612,52 @@ fun VortXApp(
                     // it), so the plain state machine is never touched concurrently.
                     onWarmNext = onWarmNext@{ pos, dur ->
                         val vm = advanceVm ?: return@onWarmNext
-                        val next = vm.nextEpisode() ?: return@onWarmNext
+                        val currentRef = historyIdentity.playable.mediaRef ?: return@onWarmNext
+                        val next = vm.nextEpisodeAfter(currentRef) ?: return@onWarmNext
                         val target = NextEpisodePreloadPolicy.Target(
                             episodeId = next.id,
                             generation = historyIdentity.acceptedRevision,
                         )
                         val now = android.os.SystemClock.elapsedRealtime()
                         val attempt = preloadPolicy.evaluate(target, pos, dur, now) ?: return@onWarmNext
-                        appScope.launch {
-                            val ok = vm.warmNextEpisode(next.id)
+                        warmNextJob?.cancel()
+                        warmNextJob = appScope.launch {
+                            val ok = vm.warmNextEpisode(next.id, currentRef)
                             preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
                         }
                     },
                     onUpNextWindow = onUpNextWindow@{ pos, dur ->
-                        val next = advanceVm?.nextEpisode() ?: return@onUpNextWindow
+                        val currentRef = historyIdentity.playable.mediaRef ?: return@onUpNextWindow
+                        val next = advanceVm?.nextEpisodeAfter(currentRef) ?: return@onUpNextWindow
                         val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
-                        if (episodeProgression.offer(target, pos, dur, ended = false) != null) {
+                        val offer = episodeProgression.observe(target, pos, dur, ended = false)
+                        if (offer != null) {
                             upNext = next
                             upNextTarget = target
+                            upNextRemainingMs = offer.remainingMs
+                            upNextAtEof = offer.phase == EpisodeProgressionPolicy.Phase.EOF
+                        } else if (!progressionResolving) {
+                            upNext = null
                         }
                     },
-                    onBack = { playing = null },
-                    onError = { playing = null },
+                    progressionOverlayVisible = upNext != null,
+                    onBack = { advanceVm?.cancelEpisodeProgressionResolve(); playing = null },
+                    onError = { advanceVm?.cancelEpisodeProgressionResolve(); playing = null },
                     // Natural end of the stream: offer the next episode when the open series has one,
                     // otherwise keep the old exit back to the detail page.
                     onEnded = {
-                        val next = advanceVm?.nextEpisode()
+                        val currentRef = historyIdentity.playable.mediaRef
+                        val next = currentRef?.let(advanceVm::nextEpisodeAfter)
                         if (next == null) {
                             playing = null
                         } else {
                             val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
-                            if (episodeProgression.offer(target, 0L, 0L, ended = true) != null) {
+                            val offer = episodeProgression.observe(target, 0L, 0L, ended = true)
+                            if (offer != null) {
                                 upNext = next
                                 upNextTarget = target
+                                upNextRemainingMs = 0L
+                                upNextAtEof = true
                             } else if (upNext == null) {
                                 playing = null
                             }
@@ -723,8 +748,19 @@ fun VortXApp(
                     LaunchedEffect(nextPlayback) {
                         when (val pb = nextPlayback) {
                             is Playback.Ready -> {
+                                val target = upNextTarget
                                 advanceVm.clearPlayback()
-                                playing = pb.playable
+                                // A non-cooperative resolver may complete after the viewer changed episode
+                                // or dismissed this offer. Only the exact target/revision may replace player.
+                                if (
+                                    target?.episodeId == nextEp.id &&
+                                    target.generation == historyIdentity.acceptedRevision &&
+                                    pb.playable.mediaRef?.isSeries == true &&
+                                    pb.playable.mediaRef?.season == nextEp.season &&
+                                    pb.playable.mediaRef?.episode == nextEp.episode
+                                ) {
+                                    playing = pb.playable
+                                }
                             }
                             is Playback.Failed -> {
                                 advanceVm.clearPlayback()
@@ -736,29 +772,37 @@ fun VortXApp(
                     UpNextOverlay(
                         episode = nextEp,
                         resolving = nextPlayback is Playback.Resolving,
+                        remainingMs = upNextRemainingMs,
+                        atEof = upNextAtEof,
                         // A countdown-expiry advance is an AUTO-advance: grow the streak so the binge
                         // boundary can fire on the next episode. A manual "Play now" tap or Cancel is
                         // presence, so it resets the streak (Apple's `noteInteraction`). Both paths play.
                         onAutoAdvance = {
                             if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.AUTO_ADVANCE) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
                                 autoAdvanceStreak[0]++
-                                advanceVm.playNextEpisode()
+                                progressionResolving = advanceVm.playNextEpisode(historyIdentity.playable.mediaRef, nextEp.id)
                             }
                         },
                         onPlayNow = {
                             if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.PLAY_NOW) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
                                 autoAdvanceStreak[0] = 0
-                                advanceVm.playNextEpisode()
+                                progressionResolving = advanceVm.playNextEpisode(historyIdentity.playable.mediaRef, nextEp.id)
                             }
                         },
                         onWatchCredits = {
-                            upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.WATCH_CREDITS) }
-                            upNext = null
+                            if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.WATCH_CREDITS) } == EpisodeProgressionPolicy.Decision.SUPPRESS) {
+                                advanceVm.cancelEpisodeProgressionResolve()
+                                progressionResolving = false
+                                upNext = null
+                            }
                         },
                         onCancel = {
-                            upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.CANCEL) }
-                            autoAdvanceStreak[0] = 0
-                            playing = null
+                            if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.CANCEL) } == EpisodeProgressionPolicy.Decision.SUPPRESS) {
+                                advanceVm.cancelEpisodeProgressionResolve()
+                                autoAdvanceStreak[0] = 0
+                                progressionResolving = false
+                                upNext = null
+                            }
                         },
                     )
                 }
@@ -1238,29 +1282,20 @@ fun VortXApp(
 private fun UpNextOverlay(
     episode: Episode,
     resolving: Boolean,
+    remainingMs: Long,
+    atEof: Boolean,
     onPlayNow: () -> Unit,
     onCancel: () -> Unit,
     onWatchCredits: () -> Unit,
-    /// Fired instead of [onPlayNow] when the COUNTDOWN expires (an automatic advance), so the host can
-    /// distinguish an unattended binge from a deliberate "Play now" tap. Both ultimately play the episode.
-    onAutoAdvance: () -> Unit = onPlayNow,
+    onAutoAdvance: () -> Unit,
 ) {
-    var secondsLeft by remember(episode.id) { mutableStateOf(UP_NEXT_COUNTDOWN_S) }
-    // Latched once the advance has been kicked (countdown expiry OR the Play-now tap), so neither path
-    // can double-fire the other.
-    var fired by remember(episode.id) { mutableStateOf(false) }
     val currentOnPlayNow by rememberUpdatedState(onPlayNow)
-    val currentOnAutoAdvance by rememberUpdatedState(onAutoAdvance)
-    LaunchedEffect(episode.id) {
-        while (secondsLeft > 0) {
-            delay(1_000)
-            secondsLeft--
-        }
-        if (!fired) {
-            fired = true
-            currentOnAutoAdvance()
-        }
-    }
+    val title = stringResource(R.string.player_up_next)
+    val starting = stringResource(R.string.player_starting)
+    val playNext = stringResource(R.string.player_play_next)
+    val playNow = stringResource(R.string.player_play_now_remaining, ((remainingMs + 999L) / 1_000L).toInt())
+    val cancel = stringResource(R.string.player_cancel)
+    val watchCredits = stringResource(R.string.player_watch_credits)
     Box(Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
@@ -1271,7 +1306,7 @@ private fun UpNextOverlay(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
-                text = "Up Next",
+                text = title,
                 color = Color.White.copy(alpha = 0.7f),
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
@@ -1290,20 +1325,19 @@ private fun UpNextOverlay(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = if (resolving || fired) "Starting…" else "Play now · ${secondsLeft}s",
+                    text = if (resolving) starting else if (atEof) playNext else playNow,
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
                     modifier = Modifier
                         .vortxGlassProminent(shape = RoundedCornerShape(8.dp), tint = DefaultEmber)
-                        .clickable(enabled = !resolving && !fired) {
-                            fired = true
-                            currentOnPlayNow()
+                        .clickable(enabled = !resolving) {
+                            if (atEof) onAutoAdvance() else currentOnPlayNow()
                         }
                         .padding(horizontal = 14.dp, vertical = 8.dp),
                 )
                 Text(
-                    text = "Cancel",
+                    text = cancel,
                     color = Color.White.copy(alpha = 0.85f),
                     fontSize = 14.sp,
                     modifier = Modifier
@@ -1311,11 +1345,11 @@ private fun UpNextOverlay(
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                 )
                 Text(
-                    text = "Watch credits",
+                    text = watchCredits,
                     color = Color.White.copy(alpha = 0.85f),
                     fontSize = 14.sp,
                     modifier = Modifier
-                        .clickable(enabled = !resolving && !fired, onClick = onWatchCredits)
+                        .clickable(enabled = !resolving, onClick = onWatchCredits)
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                 )
             }

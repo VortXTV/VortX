@@ -282,6 +282,9 @@ class DetailViewModel(
     private val sourceSwitchCommitGate = PlayerSourceSwitchCommitGate()
     private var sourceLoadJob: Job? = null
     private var playbackResolveJob: Job? = null
+    /// Monotonic ownership fence for asynchronous playback resolves. Cancellation is cooperative, so every
+    /// publisher also verifies this value before it can replace the current player's [Playback].
+    private var playbackResolveGeneration = 0L
     private var profileReloadJob: Job? = null
     private val watchlistStore = WatchlistStore.shared(app)
     val watchlisted: StateFlow<Boolean> = watchlistStore.items
@@ -403,7 +406,15 @@ class DetailViewModel(
     /// episode id, populated off the live fence by [warmNextEpisode] and consumed once by [playNextEpisode]
     /// so an accepted Up Next skips the source-assembly "Starting..." wait. Best-effort: a miss (never
     /// warmed, superseded, or a different episode) falls straight through to the cold resolve.
-    @Volatile private var warmNextSourceByEpisode: Pair<String, StreamSource>? = null
+    private data class WarmedNextSource(
+        val episodeId: String,
+        val current: MediaRef,
+        val source: StreamSource,
+    )
+
+    /// A warmed source is owned by the exact currently playing episode identity. It cannot be consumed by a
+    /// same-episode detail selection that arrived after the player identity changed.
+    @Volatile private var warmNextSourceByEpisode: WarmedNextSource? = null
 
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
@@ -590,6 +601,7 @@ class DetailViewModel(
     private fun rebuildForProfile(profileId: String) {
         sourceLoadJob?.cancel()
         playbackResolveJob?.cancel()
+        playbackResolveGeneration++
         profileReloadJob?.cancel()
         val invalidGeneration = sourceRequestFence.invalidate(profileId)
         sourceSticky.onProfileChanged()
@@ -981,10 +993,10 @@ class DetailViewModel(
         // resolve() only knows the opaque source, not the title identity). Null for an id we can't map, in
         // which case playback simply doesn't scrobble.
         val ref = currentMediaRef()
-        playbackResolveJob?.cancel()
+        val resolveGeneration = beginPlaybackResolve()
         playbackResolveJob = viewModelScope.launch {
             val result = resolveForOwner(source, episode, actionOwner)
-            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
+            if (!ownsPlaybackResolve(resolveGeneration) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
             _playback.value = result.fold(
                 onSuccess = { playable ->
                     if (playable.url.isBlank()) {
@@ -1006,7 +1018,7 @@ class DetailViewModel(
             )
             // Persistence follows successful publication. A failed resolve, blank URL, superseded target, or
             // profile switch leaves the previous preference untouched.
-            if (_playback.value is Playback.Ready && stickyWrite != null) {
+            if (ownsPlaybackResolve(resolveGeneration) && _playback.value is Playback.Ready && stickyWrite != null) {
                 sourceSticky.record(stickyWrite, source.addon, source.bingeGroup)
             }
         }
@@ -1265,7 +1277,7 @@ class DetailViewModel(
         val detail = (_meta.value as? UiState.Success)?.data ?: return
         val ytId = detail.trailerYouTubeId ?: return
         _playback.value = Playback.Resolving
-        playbackResolveJob?.cancel()
+        val resolveGeneration = beginPlaybackResolve()
         playbackResolveJob = viewModelScope.launch {
             val playable = TrailerCoordinator.trailerPlayable(
                 context = app,
@@ -1275,7 +1287,7 @@ class DetailViewModel(
                 year = detail.releaseInfo?.take(4),
                 mediaType = if (type == MediaType.SERIES) "series" else "movie",
             )
-            if (sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
+            if (ownsPlaybackResolve(resolveGeneration) && sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 _playback.value = playable?.let { Playback.Ready(it) }
                     ?: Playback.Failed("This trailer isn't available right now.")
             }
@@ -1312,8 +1324,9 @@ class DetailViewModel(
         val episode = currentModelEpisode()
         val debridEpisode = episode?.debridEpisodeForResolve()
         val actionOwner = debridKeys.ownerToken()
-        playbackResolveJob?.cancel()
+        val resolveGeneration = beginPlaybackResolve()
         playbackResolveJob = viewModelScope.launch {
+            if (!ownsPlaybackResolve(resolveGeneration)) return@launch
             if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
                 return@launch
@@ -1321,6 +1334,7 @@ class DetailViewModel(
             // 1) CW resume: replay the exact stored debrid source for this target if we have one.
             resumeRef?.takeIf { it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
                 val resumed = debrid.resumePlaybackURL(stored.ref, stored.url, stored.savedAtMs)
+                if (!ownsPlaybackResolve(resolveGeneration)) return@launch
                 if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                     _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
                     return@launch
@@ -1339,6 +1353,7 @@ class DetailViewModel(
             }
             // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
             val winner = resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
+            if (!ownsPlaybackResolve(resolveGeneration)) return@launch
             if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
                 return@launch
@@ -1360,7 +1375,7 @@ class DetailViewModel(
             // 3) Fall back to the single-source resolve of the labeled best (direct / media-server / single
             //    debrid, or the confirmed-cached best the gate insisted on).
             val resolved = resolveForOwner(best, episode, actionOwner)
-            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
+            if (!ownsPlaybackResolve(resolveGeneration) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
             _playback.value = resolved.fold(
                 onSuccess = { playable ->
                     Playback.Ready(
@@ -1521,6 +1536,14 @@ class DetailViewModel(
         _playback.value = Playback.Idle
     }
 
+    private fun beginPlaybackResolve(): Long {
+        playbackResolveJob?.cancel()
+        return ++playbackResolveGeneration
+    }
+
+    private fun ownsPlaybackResolve(generation: Long): Boolean =
+        playbackResolveGeneration == generation
+
     fun clearMutationError() {
         _mutationError.value = null
     }
@@ -1531,12 +1554,16 @@ class DetailViewModel(
     /// ([orderedBySeasonEpisode]: a season's last episode rolls into the next season's first), or null
     /// for a movie, before an episode is selected, or at the very last episode. The shell reads this
     /// when a playback ends to decide whether to offer Up Next instead of exiting to Detail.
-    fun nextEpisode(): Episode? {
+    fun nextEpisode(): Episode? = nextEpisodeAfter(currentMediaRef())
+
+    /** Computes adjacency from the accepted player identity, never a pending detail selection. */
+    fun nextEpisodeAfter(current: MediaRef?): Episode? {
         if (type != MediaType.SERIES) return null
         val detail = (_meta.value as? UiState.Success)?.data ?: return null
-        val currentId = _selectedEpisodeId.value ?: return null
         val ordered = detail.videos.orderedBySeasonEpisode
-        val idx = ordered.indexOfFirst { it.id == currentId }
+        val idx = ordered.indexOfFirst {
+            current?.isSeries == true && it.season == current.season && it.episode == current.episode
+        }
         if (idx < 0 || idx + 1 >= ordered.size) return null
         return ordered[idx + 1]
     }
@@ -1558,9 +1585,9 @@ class DetailViewModel(
      * torrent warm-up), so it is cheap and cannot contend with the playing stream. Fail-soft and idempotent
      * per episode. Returns true when a source was cached. Driven by the shell's [NextEpisodePreloadPolicy].
      */
-    suspend fun warmNextEpisode(episodeId: String): Boolean {
-        if (type != MediaType.SERIES) return false
-        if (warmNextSourceByEpisode?.first == episodeId) return true
+    suspend fun warmNextEpisode(episodeId: String, expectedCurrent: MediaRef?): Boolean {
+        if (type != MediaType.SERIES || expectedCurrent == null) return false
+        if (warmNextSourceByEpisode?.let { it.episodeId == episodeId && it.current == expectedCurrent } == true) return true
         val detail = (_meta.value as? UiState.Success)?.data ?: return false
         val target = detail.videos.firstOrNull { it.id == episodeId } ?: return false
         val groups = repo.streams(
@@ -1579,26 +1606,40 @@ class DetailViewModel(
             providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
             prefs = lastCtx?.prefs ?: StreamRanking.reading(),
         ) ?: return false
-        warmNextSourceByEpisode = episodeId to best
+        // Compare-and-publish: a stale warm task may finish after an episode switch, but it cannot replace a
+        // newer generation's cache or be consumed by that new identity.
+        if (currentMediaRef() != expectedCurrent || nextEpisodeAfter(expectedCurrent)?.id != episodeId) return false
+        warmNextSourceByEpisode = WarmedNextSource(episodeId, expectedCurrent, best)
         return true
     }
 
-    fun playNextEpisode() {
-        if (_playback.value is Playback.Resolving) return
-        val next = nextEpisode() ?: return
+    /** Cancels a host-owned progression resolve and makes a late completion ineligible for publication. */
+    fun cancelEpisodeProgressionResolve() {
+        playbackResolveJob?.cancel()
+        playbackResolveJob = null
+        playbackResolveGeneration++
+        if (_playback.value is Playback.Resolving) _playback.value = Playback.Idle
+    }
+
+    /** Advances only when [expectedCurrent] and [expectedEpisodeId] still describe the accepted player. */
+    fun playNextEpisode(expectedCurrent: MediaRef?, expectedEpisodeId: String): Boolean {
+        if (_playback.value is Playback.Resolving) return false
+        val next = nextEpisodeAfter(expectedCurrent)?.takeIf { it.id == expectedEpisodeId } ?: return false
         // Consume a warm-cached best source for this episode (PLR-8): resolve the pre-ranked source right
         // away and skip the source-assembly "Starting..." wait. Any miss falls through to the cold path
         // below. The fence is (re)begun for the target so play()'s token + episode identity are correct;
         // the reactive assembly still runs to populate the new episode's in-player source list, but playback
         // no longer waits on it.
-        val warm = warmNextSourceByEpisode?.takeIf { it.first == next.id }?.second
+        val warm = warmNextSourceByEpisode?.takeIf {
+            it.episodeId == next.id && it.current == expectedCurrent && currentMediaRef() == expectedCurrent
+        }?.source
         warmNextSourceByEpisode = null
         if (warm != null) {
             _selectedSeason.value = next.season
             _selectedEpisodeId.value = next.id
             startSourceLoad(next.id)
             playAutomatically(warm)
-            return
+            return true
         }
         pendingAdvanceHint = lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }
         // Keep the episode browser in step so backing out of the advanced play shows the RIGHT season.
@@ -1607,11 +1648,19 @@ class DetailViewModel(
             // Already scoped to the target (a countdown double-fire, or a re-offer): play what is loaded.
             pendingAdvanceHint = null
             playBest()
-            return
+            return true
         }
         _selectedEpisodeId.value = next.id
         pendingAutoPick = true
         startSourceLoad(next.id)
+        return true
+    }
+
+    /** Legacy detail action: derive from the current detail identity only when there is no player transaction. */
+    fun playNextEpisode() {
+        val current = currentMediaRef() ?: return
+        val next = nextEpisodeAfter(current) ?: return
+        playNextEpisode(current, next.id)
     }
 
     // ---- Bad-source retry ladder (the trust fix) ----
@@ -1672,16 +1721,11 @@ class DetailViewModel(
     fun playerSourceOptions(limit: Int = PLAYER_SOURCE_LIMIT): List<StreamSource> =
         rankedSourceOptions(limit)
 
-    /** Episodes offered inside the player: only the playing target's current season, in episode order. */
+    /** The full, cross-season episode inventory used by direct player transport. */
     fun playerEpisodeOptions(): List<Episode> {
         if (type != MediaType.SERIES) return emptyList()
         val detail = (_meta.value as? UiState.Success)?.data ?: return emptyList()
-        val current = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value } ?: return emptyList()
-        return detail.videos
-            .asSequence()
-            .filter { it.season == current.season }
-            .sortedWith(compareBy<Episode> { it.episode }.thenBy { it.id })
-            .toList()
+        return detail.videos.orderedBySeasonEpisode
     }
 
     /** Best stream per visible resolution bucket, using the current assembled target only. */
