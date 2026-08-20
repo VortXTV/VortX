@@ -32,8 +32,8 @@ Do not cut until all of these Apple gates pass:
 2. tvOS: repair the two semantic action rows, P0 compile failure, `livePage`
    focus blocker, and lower-rail focus blocker; prove the physical-device
    focus matrix.
-3. Apple community add-on gateway: finish checkpoint `8572d2e` and pass fresh
-   language and security review.
+3. Apple community add-on gateway: repair rejected checkpoint `8572d2e`, then
+   pass fresh runtime, language, and security review.
 4. Apple integration/build: build the exact Apple release targets from the
    approved immutable tree.
 5. Release workflow and AltStore: update every release and verify the live
@@ -57,6 +57,24 @@ reevaluates the `90/60` producer lead only on roughly six-second publication
 while fast 4K fills a 1 GiB spool, so duration retention delays reclaim. Four
 subtitle collectors report `arrived=270`, `rejected=19`, `empty=135`,
 `stored=115`; duplicate-render root cause remains open.
+
+## Reverse parity and active Apple receipts
+
+Supplemental reverse report: remote branch
+`origin/docs/bidirectional-parity-report` at
+`e39ebbc15053bdb34164e99cb3d3092e8e0b441e`, file
+`dept/audits/bidirectional-parity-2026-08-20/00-reverse-audit.md`. It records
+reverse advantages and conditional rows separately without double counting.
+The existing totals remain 379 raw / 4 N/A / 375 applicable / 241 present /
+93 partial / 41 absent / 134 non-PRESENT, and the report adds no Apple Beta 19
+blocker.
+
+- Immutable Apple playback checkpoint `c2a1d83` is under active review; it does
+  not close the `diag5` gate until review and physical-device proof pass.
+- AltStore tip `6f077b9` is under security review; live route/build/assets/
+  checksum proof remains required.
+- Apple gateway `8572d2e` is rejected with repair active; it requires fresh
+  runtime, language, and security review before integration.
 
 ## Android preservation registry
 
@@ -108,7 +126,7 @@ Continuity WIPs are explicitly **NON-MERGEABLE**:
 1. Close Apple playback and subtitle-flash evidence from `diag5`.
 2. Repair and physically verify `e067657` compilation, `livePage`, lower rails,
    two-row actions, accessibility, and long-text focus paths.
-3. Finish and independently review Apple gateway `8572d2e`.
+3. Repair rejected Apple gateway `8572d2e`, then independently review it.
 4. Integrate and build the exact Apple-only Beta 19 tree.
 5. Update and live-verify AltStore, release assets, sizes, and checksums.
 6. Cut Beta 19 only after steps 1–5 pass.

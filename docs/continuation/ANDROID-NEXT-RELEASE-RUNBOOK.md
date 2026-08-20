@@ -31,6 +31,16 @@ Historical baseline only: 321 rows, 236 present, 27 partial, 58 absent,
 non-PRESENT applicable rows must end in PRESENT or a reviewed true N/A with
 source and acceptance evidence.
 
+Supplemental reverse report: remote branch
+`origin/docs/bidirectional-parity-report` at
+`e39ebbc15053bdb34164e99cb3d3092e8e0b441e`, file
+`dept/audits/bidirectional-parity-2026-08-20/00-reverse-audit.md`. It records
+reverse advantages and conditional rows separately without double counting;
+the totals above remain unchanged and it adds no Apple Beta 19 blocker. For
+the deferred Android context, immutable Apple playback `c2a1d83` is under
+active review, AltStore `6f077b9` is under security review, and rejected Apple
+gateway `8572d2e` is repair-active.
+
 ## 2. Release and device gates
 
 1. All applicable rows are PRESENT in both directions, with Apple behavior and
