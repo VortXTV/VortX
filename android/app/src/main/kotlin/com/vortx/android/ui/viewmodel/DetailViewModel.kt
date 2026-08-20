@@ -409,6 +409,7 @@ class DetailViewModel(
     private data class WarmedNextSource(
         val episodeId: String,
         val current: MediaRef,
+        val generation: Long,
         val source: StreamSource,
     )
 
@@ -1585,9 +1586,15 @@ class DetailViewModel(
      * torrent warm-up), so it is cheap and cannot contend with the playing stream. Fail-soft and idempotent
      * per episode. Returns true when a source was cached. Driven by the shell's [NextEpisodePreloadPolicy].
      */
-    suspend fun warmNextEpisode(episodeId: String, expectedCurrent: MediaRef?): Boolean {
+    suspend fun warmNextEpisode(
+        episodeId: String,
+        expectedCurrent: MediaRef?,
+        expectedGeneration: Long,
+    ): Boolean {
         if (type != MediaType.SERIES || expectedCurrent == null) return false
-        if (warmNextSourceByEpisode?.let { it.episodeId == episodeId && it.current == expectedCurrent } == true) return true
+        if (warmNextSourceByEpisode?.let {
+                it.episodeId == episodeId && it.current == expectedCurrent && it.generation == expectedGeneration
+            } == true) return true
         val detail = (_meta.value as? UiState.Success)?.data ?: return false
         val target = detail.videos.firstOrNull { it.id == episodeId } ?: return false
         val groups = repo.streams(
@@ -1609,12 +1616,20 @@ class DetailViewModel(
         // Compare-and-publish: a stale warm task may finish after an episode switch, but it cannot replace a
         // newer generation's cache or be consumed by that new identity.
         if (currentMediaRef() != expectedCurrent || nextEpisodeAfter(expectedCurrent)?.id != episodeId) return false
-        warmNextSourceByEpisode = WarmedNextSource(episodeId, expectedCurrent, best)
+        warmNextSourceByEpisode = WarmedNextSource(episodeId, expectedCurrent, expectedGeneration, best)
         return true
     }
 
     /** Cancels a host-owned progression resolve and makes a late completion ineligible for publication. */
     fun cancelEpisodeProgressionResolve() {
+        // The cold auto-pick load is part of the same user-visible transaction as a resolving source. It may
+        // complete after a Back/Cancel unless both its job and request fence are revoked here.
+        sourceLoadJob?.cancel()
+        sourceLoadJob = null
+        sourceRequestFence.invalidate(sourceSticky.currentProfileId())
+        pendingAutoPick = false
+        pendingAdvanceHint = null
+        warmNextSourceByEpisode = null
         playbackResolveJob?.cancel()
         playbackResolveJob = null
         playbackResolveGeneration++
@@ -1622,7 +1637,11 @@ class DetailViewModel(
     }
 
     /** Advances only when [expectedCurrent] and [expectedEpisodeId] still describe the accepted player. */
-    fun playNextEpisode(expectedCurrent: MediaRef?, expectedEpisodeId: String): Boolean {
+    fun playNextEpisode(
+        expectedCurrent: MediaRef?,
+        expectedEpisodeId: String,
+        expectedGeneration: Long,
+    ): Boolean {
         if (_playback.value is Playback.Resolving) return false
         val next = nextEpisodeAfter(expectedCurrent)?.takeIf { it.id == expectedEpisodeId } ?: return false
         // Consume a warm-cached best source for this episode (PLR-8): resolve the pre-ranked source right
@@ -1631,7 +1650,10 @@ class DetailViewModel(
         // the reactive assembly still runs to populate the new episode's in-player source list, but playback
         // no longer waits on it.
         val warm = warmNextSourceByEpisode?.takeIf {
-            it.episodeId == next.id && it.current == expectedCurrent && currentMediaRef() == expectedCurrent
+            it.episodeId == next.id &&
+                it.current == expectedCurrent &&
+                it.generation == expectedGeneration &&
+                currentMediaRef() == expectedCurrent
         }?.source
         warmNextSourceByEpisode = null
         if (warm != null) {
@@ -1660,7 +1682,7 @@ class DetailViewModel(
     fun playNextEpisode() {
         val current = currentMediaRef() ?: return
         val next = nextEpisodeAfter(current) ?: return
-        playNextEpisode(current, next.id)
+        playNextEpisode(current, next.id, expectedGeneration = 0L)
     }
 
     // ---- Bad-source retry ladder (the trust fix) ----

@@ -207,6 +207,9 @@ fun PlayerScreen(
     }
     val currentPlayable = sourceSwitchState.playable
     val playbackSessionKey = sourceSwitchState.sessionKey
+    // Callbacks are tied to the source-switch session that produced them. `rememberUpdatedState` is useful
+    // for ordinary UI lambdas, but must not route a final old-engine tick into the new episode's history.
+    val latestPlaybackSessionKey by rememberUpdatedState(playbackSessionKey)
     val subtitleContentKey = remember(playbackSessionKey) {
         subtitleOffsetContentKey(currentPlayable.mediaRef)
     }
@@ -1014,9 +1017,16 @@ fun PlayerScreen(
     // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
     // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
     // auto-advance, whichever engine reported the EOF.
-    LaunchedEffect(playerState.hasEnded, sourceSwitchState.isSwitching) {
+    LaunchedEffect(playerState.hasEnded, sourceSwitchState.isSwitching, playbackSessionKey) {
         val s = latestState
-        if (!playerState.hasEnded || sourceSwitchState.isSwitching || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
+        if (
+            latestPlaybackSessionKey != playbackSessionKey ||
+            !playerState.hasEnded ||
+            sourceSwitchState.isSwitching ||
+            s.hasError ||
+            stallError ||
+            runtimeMismatch
+        ) return@LaunchedEffect
         // A userForcedSource play skips the conversion (the viewer chose this exact file off the
         // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
         // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
@@ -1051,11 +1061,12 @@ fun PlayerScreen(
     // [isJunkDuration] read of the same snapshot, so even the first tick after the duration lands can
     // never race the verdict state and slip a poisoned ratio through. A genuine mid-play error is NOT
     // gated (a real 30-minute watch that then dies still deserves its resume point).
-    LaunchedEffect(engine) {
+    LaunchedEffect(engine, playbackSessionKey) {
         while (true) {
             delay(PROGRESS_REPORT_MS)
+            if (latestPlaybackSessionKey != playbackSessionKey) return@LaunchedEffect
             val s = latestState
-            if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
+            if (!s.isPaused && !s.hasError && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
                 currentOnProgress(s.positionMs, s.durationMs)
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
@@ -1162,8 +1173,19 @@ fun PlayerScreen(
     // would dead-end. Parking focus on the root box lets the next key press land in [onKeyEvent] below,
     // which consumes it and re-shows the controls (Back/Escape excepted, so Back still exits the player).
     val rootFocus = remember { FocusRequester() }
+    var progressionOverlayHadFocus by remember { mutableStateOf(false) }
     LaunchedEffect(controlsVisible, progressionOverlayVisible) {
         if (!controlsVisible && !progressionOverlayVisible) runCatching { rootFocus.requestFocus() }
+    }
+    LaunchedEffect(progressionOverlayVisible) {
+        if (progressionOverlayVisible) {
+            progressionOverlayHadFocus = true
+        } else if (progressionOverlayHadFocus) {
+            // A TV modal owns D-pad focus while open. On its terminal action, deterministically return it to
+            // the player root; the root's key handling either reveals chrome or accepts transport input.
+            runCatching { rootFocus.requestFocus() }
+            progressionOverlayHadFocus = false
+        }
     }
 
     Box(
@@ -1341,8 +1363,9 @@ fun PlayerScreen(
             playerEpisodeChoices(episodeOptions, sourceSwitchState.playable.mediaRef)
         }
         val selectedEpisodeIndex = episodeChoices.indexOfFirst { it.selected }
-        val previousEpisode = episodeChoices.getOrNull(selectedEpisodeIndex - 1)?.episode
-        val nextEpisode = episodeChoices.getOrNull(selectedEpisodeIndex + 1)?.episode
+        val previousEpisode = selectedEpisodeIndex.takeIf { it > 0 }?.let { episodeChoices[it - 1].episode }
+        val nextEpisode = selectedEpisodeIndex.takeIf { it >= 0 && it + 1 < episodeChoices.size }
+            ?.let { episodeChoices[it + 1].episode }
 
         PlayerChrome(
             playable = currentPlayable,

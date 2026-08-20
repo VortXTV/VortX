@@ -483,10 +483,6 @@ fun VortXApp(
             // `autoAddedThisPlayback` being a per-playback @State.
             val autoAdd = remember(appContext) { LibraryAutoAdd(appContext) }
             val autoAddedThisPlayback = remember(playable) { booleanArrayOf(false) }
-            // Hardware/gesture back pops the player overlay instead of exiting the app (there was no
-            // BackHandler anywhere in the shell before; this is the minimum one, scoped to the player).
-            BackHandler { playing = null }
-
             // UP NEXT AUTO-ADVANCE + BAD-SOURCE RETRY. For ANY detail-launched play (never a trailer,
             // never a local download -- those reach the player with `detail == null`), grab the SAME
             // keyed DetailViewModel the detail layer below uses (identical key + factory args, so this
@@ -521,6 +517,8 @@ fun VortXApp(
                 } else {
                     null
                 }
+            // Hardware/gesture back must revoke a pending auto-advance before removing the player host.
+            BackHandler { advanceVm?.cancelEpisodeProgressionResolve(); playing = null }
             // Keep the in-player Sources/Quality sheets live as late add-ons settle. The options themselves
             // come from the ViewModel's unified, filtered, ranked assembly, never from an ad-hoc UI sort.
             val playerSourceState = if (advanceVm != null) {
@@ -622,7 +620,7 @@ fun VortXApp(
                         val attempt = preloadPolicy.evaluate(target, pos, dur, now) ?: return@onWarmNext
                         warmNextJob?.cancel()
                         warmNextJob = appScope.launch {
-                            val ok = vm.warmNextEpisode(next.id, currentRef)
+                            val ok = vm.warmNextEpisode(next.id, currentRef, historyIdentity.acceptedRevision)
                             preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
                         }
                     },
@@ -647,17 +645,19 @@ fun VortXApp(
                     // otherwise keep the old exit back to the detail page.
                     onEnded = {
                         val currentRef = historyIdentity.playable.mediaRef
-                        val next = currentRef?.let(advanceVm::nextEpisodeAfter)
+                        val next = currentRef?.let { ref -> advanceVm?.nextEpisodeAfter(ref) }
                         if (next == null) {
                             playing = null
                         } else {
                             val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
                             val offer = episodeProgression.observe(target, 0L, 0L, ended = true)
-                            if (offer != null) {
-                                upNext = next
-                                upNextTarget = target
-                                upNextRemainingMs = 0L
-                                upNextAtEof = true
+                            if (offer != null && episodeProgression.decide(target, EpisodeProgressionPolicy.Intent.AUTO_ADVANCE) == EpisodeProgressionPolicy.Decision.ADVANCE) {
+                                autoAdvanceStreak[0]++
+                                progressionResolving = advanceVm?.playNextEpisode(
+                                    expectedCurrent = currentRef,
+                                    expectedEpisodeId = next.id,
+                                    expectedGeneration = historyIdentity.acceptedRevision,
+                                ) == true
                             } else if (upNext == null) {
                                 playing = null
                             }
@@ -673,6 +673,11 @@ fun VortXApp(
                     // [BadSourceAutoRetrySetting] is off.
                     onSourceFailed = if (advanceVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
                         { positionMs ->
+                            // A failed/stalled source is never a valid episode completion. Retract any
+                            // pre-EOF offer before the retry transaction begins.
+                            episodeProgression.invalidate()
+                            upNext = null
+                            progressionResolving = false
                             retryResumePositionMs = positionMs
                             if (advanceVm.retryNextSource(positionMs)) retryingSource = true else manualSourcePick = true
                         }
@@ -771,7 +776,7 @@ fun VortXApp(
                     }
                     UpNextOverlay(
                         episode = nextEp,
-                        resolving = nextPlayback is Playback.Resolving,
+                        resolving = progressionResolving || nextPlayback is Playback.Resolving,
                         remainingMs = upNextRemainingMs,
                         atEof = upNextAtEof,
                         // A countdown-expiry advance is an AUTO-advance: grow the streak so the binge
@@ -780,13 +785,13 @@ fun VortXApp(
                         onAutoAdvance = {
                             if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.AUTO_ADVANCE) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
                                 autoAdvanceStreak[0]++
-                                progressionResolving = advanceVm.playNextEpisode(historyIdentity.playable.mediaRef, nextEp.id)
+                                progressionResolving = advanceVm.playNextEpisode(historyIdentity.playable.mediaRef, nextEp.id, historyIdentity.acceptedRevision)
                             }
                         },
                         onPlayNow = {
                             if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.PLAY_NOW) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
                                 autoAdvanceStreak[0] = 0
-                                progressionResolving = advanceVm.playNextEpisode(historyIdentity.playable.mediaRef, nextEp.id)
+                                progressionResolving = advanceVm.playNextEpisode(historyIdentity.playable.mediaRef, nextEp.id, historyIdentity.acceptedRevision)
                             }
                         },
                         onWatchCredits = {
