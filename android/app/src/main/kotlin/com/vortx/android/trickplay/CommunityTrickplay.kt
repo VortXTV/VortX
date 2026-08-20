@@ -106,6 +106,21 @@ object CommunityTrickplay {
         return prefs.getBoolean(SETTING_KEY, true)
     }
 
+    /**
+     * Persist the viewer's opt-in choice under the SAME [SETTING_KEY] Apple writes, in the SAME
+     * `vortx_settings` store the rest of the settings layer uses, so a change here rides the account backup
+     * and the Apple/web value round-trips byte-for-byte. This is the write side [isEnabled] was always meant
+     * to pair with; the Android TV settings "Community scrub previews" row is its first writer. Once the key
+     * exists, [isEnabled] returns the stored value instead of the unset default (on).
+     */
+    fun setEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext
+            .getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(SETTING_KEY, enabled)
+            .apply()
+    }
+
     // MARK: - Worker-mirrored constants (kept in sync with vortx-trickplay decision.ts + RemoteConfig defaults)
 
     /** The Worker's serve floor (`MIN_SERVE_COVERAGE`): a POST below this is discarded, so never sent. */

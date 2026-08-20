@@ -61,15 +61,11 @@ internal const val HERO_TRAILER_DWELL_MS = 3_000L
 /// Cross-fade duration for revealing the clip over the still backdrop. Mirrors Apple's 0.6s reveal.
 private const val HERO_TRAILER_FADE_MS = 600
 
-/// Resolve the focused item's YouTube trailer id. Returns null until the Android meta model carries the
-/// trailer field, so the home hero degrades to Ken Burns rather than a new trailer fetch path.
-///
-/// The Android [MetaItem] catalog-preview model does NOT yet carry `trailerStreams` / a trailer id (a
-/// tier-1 model gap owned by a later round, documented in `model/TrailerRequest.kt`), and the task's
-/// contract is reuse-only: do NOT add a new trailer fetch/extractor path. So today this returns null and the
-/// hero shows its Ken Burns backdrop (graceful degrade). The instant [MetaItem] gains the field, returning it
-/// here lights up the ambient trailer through the existing [TrailerCoordinator] with no other change.
-internal fun heroTrailerYouTubeId(@Suppress("UNUSED_PARAMETER") item: MetaItem): String? = null
+/// Resolve the focused item's YouTube trailer id from the preview model. [MetaItem.trailerYouTubeId] is
+/// threaded onto the hero item post-focus by [rememberEnrichedHeroItem] (which reuses the existing engine
+/// meta route to read the meta's `trailerStreams` / "Trailer" link) -- no new trailer fetch/extractor. Null
+/// (a preview not yet enriched, or a title with no trailer) keeps the hero on its Ken Burns still backdrop.
+internal fun heroTrailerYouTubeId(item: MetaItem): String? = item.trailerYouTubeId?.takeIf { it.isNotEmpty() }
 
 /// Dwell-gated ambient trailer resolution. Emits a [Playable] once focus has rested on [item] for
 /// [HERO_TRAILER_DWELL_MS] AND a trailer id is readily available; emits null while settling, when disabled,
@@ -79,7 +75,9 @@ internal fun heroTrailerYouTubeId(@Suppress("UNUSED_PARAMETER") item: MetaItem):
 internal fun rememberHeroTrailerPlayable(item: MetaItem?, enabled: Boolean): Playable? {
     val context = LocalContext.current
     var playable by remember { mutableStateOf<Playable?>(null) }
-    LaunchedEffect(item?.id, enabled) {
+    // Re-key on the trailer id too: the hero item's id does not change when post-focus enrichment fills its
+    // trailer id in place, so keying on the id alone would never re-arm the resolve once the id lands.
+    LaunchedEffect(item?.id, item?.trailerYouTubeId, enabled) {
         playable = null
         if (!enabled) return@LaunchedEffect
         val current = item ?: return@LaunchedEffect

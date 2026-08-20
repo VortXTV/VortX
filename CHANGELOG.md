@@ -14,7 +14,17 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **New episode alerts.** A series you keep in your Library now pings you when its next episode drops. A background sweep checks each followed show's upcoming air dates and schedules a local notification for the soonest one, with no server push. It is on by default and can be turned off under Settings, on both the phone and Android TV, on the same setting as every other platform. Turning it on asks for notification permission the first time. Alerts respect the active profile, so a show followed under one profile never pings while another profile is watching. Android phone, tablet, and TV.
 
-**Tells you when a new version is out.** Because the Android app is sideloaded, it now checks for a newer build on launch and offers it: an update banner in Settings and a one-time popup at launch, both linking to the download. It never downloads or installs anything on its own, and a build you dismiss stays quiet until a newer one ships. Android phone, tablet, and TV.
+**Tells you when a new version is out.** Because the Android app is sideloaded, it now checks for a newer build on launch and offers it: an update banner in Settings and a one-time popup at launch, both linking to the download. It never downloads or installs anything on its own, and a build you dismiss stays quiet until a newer one ships. Android phone, tablet, and TV. The launch popup now shows on Android TV too.
+
+### Android TV
+
+**Asks who's watching when the TV starts.** When your device has more than one profile, the TV now opens on a 10-foot "Who's watching?" picker, so the right profile, theme, and watch history are in place before anything loads. A profile with a PIN prompts for it on a D-pad keypad before switching. A single profile, or a pick already made this session, goes straight to Home. Android TV.
+
+**Manage your downloads from the couch.** The offline downloads you already have on a device now have a Downloads spot in the TV navigation: each series is a folder of episodes, each movie a row, with the same play, pause, resume, and delete actions as the phone, and the total storage used. It plays a finished download straight from the device with no network. There is also a Play a link action to play a direct or debrid stream URL pasted from your phone. Downloads are per device, never synced, and never touch your library. Android TV.
+
+**Add-ons get their own tab.** The TV navigation now has a top-level Add-ons entry alongside Home and Settings, with the same installed list, health status, add-on store, and install-by-QR flow that lives under Settings, so managing sources no longer means digging through Settings on the remote. Re-selecting the tab returns to the installed list. Android TV.
+
+**Pick audio and subtitle languages, and share a stream, from the TV player.** The player's audio and subtitle panels now let you set your preferred audio and subtitle language and choose whether subtitles show off, forced only, or always, on the same settings every other platform uses, applied to what is playing right away. A Stream link entry shows a QR you can scan with your phone to open the same stream there, sending a magnet for a torrent or the direct link otherwise. And when the controls are hidden, the Skip Intro pill is reachable with the D-pad: press Select to skip, Back to dismiss it. Android TV.
 
 ### Android add-ons
 
@@ -90,6 +100,10 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Browse seasons and episodes on the detail page.** A series detail page on Android TV now has a focusable season picker and an episode list beneath the hero. Pick a season, choose an episode to load its sources and target Watch at it, and mark any episode, or a whole season, watched or unwatched from the remote. Watched state is kept per profile, exactly as on the phone. Android TV.
 
 **Cast and crew, with tappable people.** The detail page now shows a Cast & Crew rail. Select a cast member to open their page with a biography and filmography, and open any of their titles from there. Android TV.
+
+**A richer detail page.** The Android TV detail page now carries the same extras the phone does: a cross-provider ratings strip (Rotten Tomatoes, Metacritic, TMDB), a Where to Watch rail of the services that legally carry the title in your region, and a More Like This rail of related titles you can open straight from the remote. Android TV.
+
+**A source list that groups, sorts, and filters.** The detail page's source list on Android TV is now grouped by add-on, each group foldable, with Best, Size, and Seeders sort, a per-add-on filter, and a two-level Quality picker to jump straight to a resolution and its flavor. The best source is pinned to the top as a Watch Now row, cached sources are marked Instant, and long-pressing any source pins it to the top for this title or everywhere, or saves it for offline. It uses the same sort and pin choices as the phone. Android TV.
 
 **Deeper TV settings.** Android TV Settings now includes the account and integrations block (sign-in, Import from Stremio, Trakt and SIMKL, and Metadata keys), the full subtitle style controls (font, size, color, brightness, and background), a skip-provider picker, and show/hide switches for the Discover, Live TV, Library, and Search tabs. Every control writes the same setting the phone does. Android TV.
 

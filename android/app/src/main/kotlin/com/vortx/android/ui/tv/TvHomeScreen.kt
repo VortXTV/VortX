@@ -175,10 +175,13 @@ private fun TvHomeContent(
         focusState = focusState.withFocused(rowId, item)
     }
 
+    // Enrich the focused item post-focus (backdrop + clearlogo + synopsis/rating/genres + the trailer id
+    // that lights the ambient trailer) through the existing engine meta route -- see TvHeroEnrichment.kt.
+    val enrichedHeroItem = rememberEnrichedHeroItem(heroItem)
     Column(modifier = modifier.fillMaxSize().background(colors.canvas)) {
         // Hook site: the living-backdrop cinematic hero (backdrop crossfade + Ken Burns + ambient trailer +
-        // metadata overlay) lives in TvAmbientHero.kt. It follows the same focus-driven `heroItem`.
-        TvAmbientHero(heroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
+        // metadata overlay) lives in TvAmbientHero.kt. It follows the enriched focus-driven hero item.
+        TvAmbientHero(enrichedHeroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
         if (catalogLayout == HomeCatalogLayout.WALL) {
             TvCatalogWall(
                 catalogs = visibleCatalogs,

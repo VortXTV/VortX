@@ -15,9 +15,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
@@ -43,11 +41,16 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
-import com.vortx.android.model.StreamSource
+import com.vortx.android.catalog.DiscoverRegion
+import com.vortx.android.catalog.SimilarClient
+import com.vortx.android.catalog.WatchProvider
+import com.vortx.android.catalog.WatchProvidersClient
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.ratings.MdbListRatings
+import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
@@ -167,6 +170,13 @@ private fun TvDetailContent(
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
 
+    // Source-list depth state, from the SAME [DetailViewModel] the phone drives: the remembered sort, the
+    // effective pin, and the transient offline-download notice. The couch source list re-ranks / re-badges off
+    // these exactly as the phone SourcesSection does; there is no second copy of any of it.
+    val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
+    val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
+    val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
+
     // View-local Person overlay + TMDB cast enrichment, mirroring the phone [DetailScreen] (held in the view,
     // not the shared ViewModel -- the credits fetch is view-local on iOS/tvOS too). Credits come from VortX's
     // keyless, signed catalog edge, keyed off the meta's imdb id and reset per title.
@@ -176,6 +186,27 @@ private fun TvDetailContent(
         castMembers = emptyList()
         if (detail.id.startsWith("tt")) {
             castMembers = TMDBPersonClient.credits(detail.id, detail.type)
+        }
+    }
+
+    // View-local detail-breadth enrichment off the SAME keyless, edge-signed phone clients the phone
+    // [com.vortx.android.ui.screens.DetailScreen] fetches (held in the view, not the shared ViewModel, exactly
+    // as the cast credits are): the VortX cross-provider ratings token strip ([VortXRatingsClient]), the
+    // Where-to-Watch providers ([WatchProvidersClient]), and the More-Like-This rail ([SimilarClient]).
+    // Fail-soft -- a non-`tt` id / live type / down edge leaves each null/empty and its rail is simply omitted.
+    var vortxRatings by remember(detail.id) { mutableStateOf<MdbListRatings?>(null) }
+    var similarItems by remember(detail.id) { mutableStateOf<List<MetaItem>>(emptyList()) }
+    var watchProviders by remember(detail.id) { mutableStateOf<List<WatchProvider>>(emptyList()) }
+    LaunchedEffect(detail.id, detail.type) {
+        vortxRatings = null
+        similarItems = emptyList()
+        watchProviders = emptyList()
+        if (detail.id.startsWith("tt")) {
+            vortxRatings = VortXRatingsClient.ratings(detail.id, detail.type.id)
+            similarItems = SimilarClient.similar(detail.id, detail.type)
+            watchProviders =
+                WatchProvidersClient.availability(detail.id, detail.type, DiscoverRegion.effective(context))
+                    ?.providers.orEmpty()
         }
     }
 
@@ -333,7 +364,8 @@ private fun TvDetailContent(
 
             Spacer(Modifier.width(TvDimens.edge))
 
-            // Focusable source list.
+            // Focusable source-list DEPTH: add-on grouping, sort, per-add-on filter, a quality-tier picker,
+            // pin-to-top, and Watch-Now prominence, all off the SAME [DetailViewModel] the phone drives.
             Column(modifier = Modifier.weight(0.48f).fillMaxHeight()) {
                 // Header + the "Re-find" escape hatch (D-pad focusable): re-query the add-ons fresh so an
                 // expired/dead source, or an exhausted ladder, is replaced. All logic lives in
@@ -354,9 +386,33 @@ private fun TvDetailContent(
                         onClick = viewModel::refreshSources,
                     )
                 }
-                TvSourceList(streamsState = streamsState, onPlaySource = viewModel::play)
+                TvSourceList(
+                    streamsState = streamsState,
+                    best = viewModel.bestSource(),
+                    resolving = playback is Playback.Resolving,
+                    failure = (playback as? Playback.Failed)?.message,
+                    downloadNotice = downloadNotice,
+                    sort = sourceSort,
+                    onSortChange = viewModel::setSourceSort,
+                    pin = pinUi,
+                    entryNoun = viewModel.pinEntryNoun,
+                    onPlay = viewModel::play,
+                    onDownload = viewModel::download,
+                    onPin = viewModel::pinSource,
+                    onUnpin = viewModel::unpinSource,
+                )
             }
         }
+            }
+
+            // VortX cross-provider critic scores (Rotten Tomatoes / Metacritic / TMDB) as a token strip just
+            // beneath the hero band -- additive to the IMDb score already in the hero meta line, shown only
+            // when the ratings service returned at least one.
+            vortxRatings?.takeIf { it.hasAny }?.let { r ->
+                TvRatingsStrip(
+                    ratings = r,
+                    modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
+                )
             }
 
             // A series gains a focusable season picker + episode rail beneath the hero. Choosing an episode
@@ -383,6 +439,32 @@ private fun TvDetailContent(
                 castMembers = castMembers,
                 onPersonTap = { personTarget = it },
             )
+
+            // Where to Watch: legal region providers (TMDB, keyless edge). Gated off live content (no
+            // providers) and an empty result, so it never leaves a blank band.
+            if (watchProviders.isNotEmpty() && !tvIsLiveType(detail.type)) {
+                TvWhereToWatchRail(
+                    providers = watchProviders,
+                    modifier = Modifier.padding(top = TvDimens.rowGap),
+                )
+            }
+
+            // More Like This: TMDB recommendations as focusable poster tiles that open the title (resolving
+            // the tile's tmdb: id to a tt id first, the same fail-soft resolve the phone SimilarRail uses).
+            // Gated off live content and an empty result.
+            if (similarItems.isNotEmpty() && !tvIsLiveType(detail.type)) {
+                TvSimilarRail(
+                    type = detail.type,
+                    titles = similarItems,
+                    onOpen = { item ->
+                        scope.launch {
+                            val tt = TMDBPersonClient.imdbId(item.id, item.type)
+                            onOpenTitle(if (tt != null) item.copy(id = tt) else item)
+                        }
+                    },
+                    modifier = Modifier.padding(top = TvDimens.rowGap, bottom = TvDimens.edge),
+                )
+            }
         }
     }
 
@@ -421,38 +503,3 @@ private fun TvDetailLoading(title: String) {
     }
 }
 
-@Composable
-private fun TvSourceList(
-    streamsState: UiState<List<com.vortx.android.model.StreamGroup>>,
-    onPlaySource: (StreamSource) -> Unit,
-) {
-    when (val s = streamsState) {
-        is UiState.Loading -> TvLoading()
-        is UiState.Error -> Text(
-            text = s.message,
-            style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
-        )
-        is UiState.Success -> {
-            // Flatten the per-add-on groups into one ranked list for the slice (the phone screen keeps the
-            // grouped headers + sort/pin controls; those are a later parity item). Keyed by index+id so a
-            // decorated/duplicate source id can never collide in the LazyColumn.
-            val sources = s.data.flatMap { it.streams }
-            if (sources.isEmpty()) {
-                Text(
-                    text = "No playable sources found for this title.",
-                    style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
-                )
-            } else {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize(),
-                    verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
-                    contentPadding = PaddingValues(bottom = TvDimens.edge),
-                ) {
-                    itemsIndexed(sources, key = { i, src -> "$i-${src.id}" }) { _, source ->
-                        TvSourceRow(source = source, onClick = { onPlaySource(source) })
-                    }
-                }
-            }
-        }
-    }
-}

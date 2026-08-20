@@ -160,6 +160,15 @@ data class MetaItem(
     val resumeSeconds: Double? = null,
     val caption: String? = null,
     val watched: Boolean = false,
+    /// The first playable YouTube trailer id for this preview, threaded onto the catalog-preview model so
+    /// the TV living-backdrop hero can play a muted ambient trailer through the EXISTING trailer route
+    /// ([com.vortx.android.trailer.TrailerCoordinator]) without a new fetch/extractor. A catalog preview
+    /// almost never carries `trailerStreams`, so this is null on the raw engine preview and is FILLED
+    /// post-focus by the TV hero's metadata enrichment ([com.vortx.android.ui.tv.rememberEnrichedHeroItem]),
+    /// which reuses [com.vortx.android.data.CatalogRepository.peekMeta] to read the meta's
+    /// [MetaDetail.trailerYouTubeId]. Mirrors Apple's Home hero, whose `HomeHeroTrailerModel` fetches the
+    /// focused item's meta to find its trailer. Null keeps the hero on its Ken Burns still backdrop.
+    val trailerYouTubeId: String? = null,
 ) {
     /// The formatted "resume 1:03" affordance for a Continue Watching card, or null when there is
     /// nothing to resume (mirrors Apple `CoreCWItem.resumeSeconds` -> `resumeTimecode`).

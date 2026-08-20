@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.os.Build
 import android.view.Display
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -67,6 +68,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
@@ -78,8 +80,12 @@ import androidx.compose.ui.unit.sp
 import com.vortx.android.R
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.Episode
+import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.TrackPreferences
+import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.ui.components.qrBitmap
 import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.theme.vortxGlassPanel
@@ -218,6 +224,18 @@ fun PlayerChrome(
     hardwareDecodingAvailable: Boolean = false,
     hardwareDecoding: Boolean = true,
     onSetHardwareDecoding: (Boolean) -> Unit = {},
+    /// TV-ONLY additions (the phone host leaves both at their defaults, so its chrome is byte-for-byte
+    /// unchanged). [shareLink] is the raw usable link this stream can be shared as -- a direct/debrid URL, or a
+    /// magnet URI rebuilt from a torrent's info-hash -- and, when non-null, adds a "QR for your phone" row to
+    /// the Player Settings sheet that opens a full-screen QR (the 10-foot analogue of Apple's in-player
+    /// StreamLinkQR). [isTvPlayer], when true, adds a preferred-audio-language picker to the Audio
+    /// sheet and a subtitle-language + forced/always policy picker to the Subtitles sheet, both writing through
+    /// the SAME [TrackPreferencesStore] the phone Playback Settings and the auto-picker read, so a couch change
+    /// moves the same cross-platform keys. The in-player per-track pick (embedded audio/subtitle tracks) is the
+    /// shared chrome above and already works on TV; these add the persistent LANGUAGE preference that the phone
+    /// edits in Settings, which the TV has no keyboard-driven Settings equivalent for.
+    shareLink: String? = null,
+    isTvPlayer: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
@@ -252,6 +270,34 @@ fun PlayerChrome(
         brightness = stringResource(R.string.player_subtitle_brightness),
         background = stringResource(R.string.player_subtitle_background),
     )
+
+    // TV-only preferred-language state. The store handle is cheap (a SharedPreferences reference) and is only
+    // ever read/written from the TV language sheets below, so constructing it unconditionally leaves the phone
+    // chrome untouched. [trackPrefs] mirrors the persisted value so the sheets show the current pick and a
+    // change round-trips to disk immediately.
+    val context = LocalContext.current
+    val trackStore = remember(context) {
+        TrackPreferencesStore(context.applicationContext, PerformanceMode.isConstrainedDevice(context))
+    }
+    var trackPrefs by remember { mutableStateOf(trackStore.current) }
+    // Persist a new preference and apply it to the LIVE engine so the couch pick takes effect now, not just on
+    // the next load. The subtitle apply keys off TrackSelector exactly as the auto-picker does (a -1 result is
+    // "off"). Audio is left alone when neither the chain nor the English fallback matched (null id).
+    fun applyPreferredAudioLanguage(code: String) {
+        val next = trackPrefs.copy(audioLanguages = LanguagePriority.normalized(listOf(code) + trackPrefs.audioLanguages))
+        trackPrefs = next
+        trackStore.save(next)
+        TrackSelector.select(state.audioTracks, state.subtitleTracks, next, trackStore.matchAudioSub)
+            .audioId?.let { onSelectAudio(it) }
+    }
+    fun applySubtitlePreferences(next: TrackPreferences) {
+        trackPrefs = next
+        trackStore.save(next)
+        val subtitleId = TrackSelector
+            .select(state.audioTracks, state.subtitleTracks, next, trackStore.matchAudioSub)
+            .subtitleId
+        onSelectSubtitle(if (subtitleId == null || subtitleId < 0) null else subtitleId)
+    }
 
     Box(modifier = modifier) {
         // Top scrim so the title, back button, and controls stay legible over bright video.
@@ -482,6 +528,18 @@ fun PlayerChrome(
                             ),
                         )
                     }
+                    // TV: the persistent preferred-audio-language pick (phone edits this in Settings).
+                    if (isTvPlayer) {
+                        add(
+                            SheetOption(
+                                label = "Preferred audio language",
+                                selected = false,
+                                detail = preferredLanguageDetail(trackPrefs.audioLanguages),
+                                onPick = { openSheet = ControlSheet.AUDIO_LANGUAGE },
+                                dismissOnPick = false,
+                            ),
+                        )
+                    }
                     add(
                         SheetOption(
                             label = "Audio Settings",
@@ -553,6 +611,18 @@ fun PlayerChrome(
                                 selected = false,
                                 onPick = { openSheet = ControlSheet.SECOND_SUBTITLE },
                                 detail = "›",
+                                dismissOnPick = false,
+                            ),
+                        )
+                    }
+                    // TV: preferred subtitle language + the Off / Forced only / Always on policy.
+                    if (isTvPlayer) {
+                        add(
+                            SheetOption(
+                                label = "Subtitle language & forced",
+                                selected = false,
+                                detail = trackPrefs.forcedPolicy.label,
+                                onPick = { openSheet = ControlSheet.SUBTITLE_LANGUAGE },
                                 dismissOnPick = false,
                             ),
                         )
@@ -700,6 +770,19 @@ fun PlayerChrome(
                             ),
                         )
                     }
+                    // TV: share THIS stream to a phone as a QR (a magnet for a torrent, else the raw URL). The
+                    // host only supplies [shareLink] on TV, so the row never appears on the phone chrome.
+                    if (shareLink != null) {
+                        add(
+                            SheetOption(
+                                label = if (playable.isTorrent) "Magnet link · QR for your phone" else "Stream link · QR for your phone",
+                                selected = false,
+                                detail = "›",
+                                onPick = { openSheet = ControlSheet.SHARE_QR },
+                                dismissOnPick = false,
+                            ),
+                        )
+                    }
                 },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -764,6 +847,66 @@ fun PlayerChrome(
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
+            ControlSheet.AUDIO_LANGUAGE -> ControlSelectionSheet(
+                title = "Preferred audio language",
+                options = TrackPreferences.commonLanguages.map { (code, label) ->
+                    SheetOption(
+                        label = label,
+                        selected = TrackSelector.matches(trackPrefs.audioLanguages.firstOrNull(), code),
+                        isChoice = true,
+                        dismissOnPick = false,
+                        onPick = { applyPreferredAudioLanguage(code) },
+                    )
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SUBTITLE_LANGUAGE -> ControlSelectionSheet(
+                title = "Subtitles",
+                options = buildList {
+                    add(SheetOption("When you have your audio language", false, enabled = false, isHeader = true))
+                    TrackPreferences.ForcedPolicy.entries.forEach { policy ->
+                        add(
+                            SheetOption(
+                                label = policy.label,
+                                selected = trackPrefs.forcedPolicy == policy,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = { applySubtitlePreferences(trackPrefs.copy(forcedPolicy = policy)) },
+                            ),
+                        )
+                    }
+                    add(SheetOption("Preferred subtitle language", false, enabled = false, isHeader = true))
+                    TrackPreferences.commonLanguages.forEach { (code, label) ->
+                        add(
+                            SheetOption(
+                                label = label,
+                                selected = TrackSelector.matches(trackPrefs.subtitleLanguages.firstOrNull(), code),
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = {
+                                    applySubtitlePreferences(
+                                        trackPrefs.copy(
+                                            subtitleLanguages = LanguagePriority.normalized(
+                                                listOf(code) + trackPrefs.subtitleLanguages,
+                                            ),
+                                        ),
+                                    )
+                                },
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SHARE_QR -> shareLink?.let { link ->
+                StreamLinkQrOverlay(
+                    link = link,
+                    title = if (playable.isTorrent) "Magnet link" else "Stream link",
+                    onDismiss = { openSheet = ControlSheet.NONE },
+                )
+            }
             ControlSheet.NONE -> Unit
         }
 
@@ -826,6 +969,10 @@ private enum class ControlSheet {
     SLEEP,
     INFO,
     ENGINE,
+    // TV-only sheets (reached only when the host opts in via shareLink / isTvPlayer).
+    AUDIO_LANGUAGE,
+    SUBTITLE_LANGUAGE,
+    SHARE_QR,
 }
 
 /// Aspect-ratio choices for the VIDEO sheet, mirroring the Apple Aspect Ratio panel
@@ -900,6 +1047,62 @@ private fun sleepStatusDetail(minutes: Int?, atEpisodeEnd: Boolean): String = wh
     atEpisodeEnd -> "End of episode"
     minutes != null -> "$minutes min"
     else -> "Off"
+}
+
+/// The right-aligned human label of the top preferred language (TV language rows), e.g. "English".
+private fun preferredLanguageDetail(languages: List<String>): String {
+    val code = languages.firstOrNull() ?: return ""
+    return TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second ?: code.uppercase()
+}
+
+/// The TV per-stream share overlay: a full-screen QR of [link] (a magnet for a torrent, else the raw stream
+/// URL) so a viewer can hand the exact stream to their phone. The 10-foot analogue of Apple's `StreamLinkQR`.
+/// D-pad Back and Select both dismiss it. Renders nothing over the video except while open.
+@Composable
+private fun StreamLinkQrOverlay(link: String, title: String, onDismiss: () -> Unit) {
+    BackHandler { onDismiss() }
+    val bitmap = remember(link) { qrBitmap(link, 512) }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.94f))
+            .clickable(onClick = onDismiss),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Text(title, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 22.sp)
+            if (bitmap != null) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color.White)
+                        .padding(20.dp),
+                ) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "QR code for $title",
+                        modifier = Modifier.size(360.dp),
+                    )
+                }
+            } else {
+                Text("Could not build a code for this link.", color = Color.White, fontSize = 14.sp)
+            }
+            Text(
+                text = link,
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 13.sp,
+                maxLines = 2,
+            )
+            Text(
+                text = "Scan with your phone to open this stream there · Press Back to dismiss.",
+                color = Color.White.copy(alpha = 0.75f),
+                fontSize = 13.sp,
+            )
+        }
+    }
 }
 
 /// Build the Playback Info sheet rows: the title, the current source (release / add-on / size), and the

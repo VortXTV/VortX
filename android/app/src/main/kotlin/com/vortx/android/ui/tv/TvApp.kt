@@ -33,6 +33,7 @@ import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.detailViewModelKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
@@ -69,6 +70,22 @@ fun TvApp(
         accentId = activeProfile?.accentID ?: VortXAccents.default.id,
         oled = activeProfile?.oled ?: false,
     ) {
+        // WHO'S WATCHING launch gate (the 10-foot mirror of VortXApp's): with more than one profile and no
+        // pick yet this cold launch, cover everything with the picker until a profile settles, so no title's
+        // Home wall leaks before the viewer is known. Back keeps the current profile (re-selects it, which
+        // marks the launch picked) and dismisses. A single-profile install and a pick already made this launch
+        // skip it by construction, because ProfileStore.needsPicker is false in both cases.
+        var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        if (showPicker) {
+            BackHandler {
+                val store = profileStore
+                if (store != null) store.active?.let { store.select(it) }
+                showPicker = false
+            }
+            TvWhosWatching(onDone = { showPicker = false })
+            return@VortXTheme
+        }
+
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var detailGeneration by remember { mutableStateOf(0L) }
@@ -218,6 +235,10 @@ fun TvApp(
                 onProgress = { pos, dur ->
                     playbackHistory.report(pos, dur)
                 },
+                // TV player additions: the per-stream Share QR (a magnet for a torrent, else the raw URL) and
+                // the 10-foot audio/subtitle language + forced-policy sheets and hidden-chrome D-pad skip pill.
+                shareLink = tvStreamShareLink(playable),
+                isTvPlayer = true,
             )
             return@VortXTheme
         }
@@ -228,6 +249,10 @@ fun TvApp(
         // reads (colors/type/spacing); the two themes coexist -- one owns tv-component defaults, the other
         // owns the brand tokens.
         TvMaterialTheme(colorScheme = tvDarkColorScheme()) {
+            // The launch update prompt (sideload channel): floated over the browse/detail shell but never the
+            // player (this block only composes when nothing is playing -- the player branch returns above).
+            // Reads the SAME process-wide UpdateChecker the phone shell reads (armed in VortXApplication).
+            UpdatePromptHost()
             val current = detail
             if (current != null) {
                 key(current.type, current.id, detailGeneration) {
@@ -276,6 +301,13 @@ fun TvApp(
                         detailGeneration += 1
                         detail = it
                     },
+                    // A finished download plays straight into the shared player slot (no detail page), the same
+                    // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
+                    // local file, not a previous title's badges.
+                    onPlayLocal = {
+                        playingMeta = null
+                        playing = it
+                    },
                     syncManager = syncManager,
                 )
             }
@@ -313,3 +345,23 @@ internal class TvPlaybackHistorySession(
         playbackSessions.end(activeHandle, lastPositionMs, lastDurationMs)
     }
 }
+
+/// The raw usable link this stream can be shared to a phone as, or null when there is nothing shareable. A
+/// torrent's loopback URL (`127.0.0.1:PORT/...`) is meaningless on another device, so a magnet URI is rebuilt
+/// from its 40-hex info-hash; a direct or resolved-debrid HTTP(S) stream shares its own URL; a local offline
+/// download (a `file://` URL) and a loopback with no extractable hash share nothing. Mirrors Apple's in-player
+/// `shareLink`, which is what the TV player's QR row encodes.
+private fun tvStreamShareLink(playable: Playable): String? {
+    val url = playable.url
+    if (playable.isTorrent) {
+        val hash = TV_INFO_HASH_REGEX.find(url)?.value ?: return null
+        return "magnet:?xt=urn:btih:${hash.lowercase()}"
+    }
+    return if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
+        url
+    } else {
+        null
+    }
+}
+
+private val TV_INFO_HASH_REGEX = Regex("[0-9a-fA-F]{40}")

@@ -156,6 +156,13 @@ fun PlayerScreen(
     /// Fired once when the binge boundary raised the "Still watching?" prompt, so the host resets its
     /// auto-advance streak (Apple's `noteInteraction` clears `consecutiveAutoAdvances` on Continue).
     onBingePrompted: () -> Unit = {},
+    /// TV-ONLY opt-ins (all default off/null, so the phone host's player is byte-for-byte unchanged).
+    /// [shareLink] adds the per-stream "QR for your phone" row. [isTvPlayer] turns on the 10-foot player
+    /// additions: the preferred-audio/subtitle-language + forced-policy pickers in the audio/subtitle sheets
+    /// (forwarded to [PlayerChrome]) and the hidden-chrome D-pad skip pill (Select skips the segment, Back
+    /// dismisses the pill without leaving the player).
+    shareLink: String? = null,
+    isTvPlayer: Boolean = false,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -859,6 +866,10 @@ fun PlayerScreen(
     // SkipTimestampService.candidates once it has the imdb id + duration and resolves them through
     // SegmentResolver. This is the READ side; the in-player submit editor (SkipDBClient) is a later round.
     var skipSegments by remember(playbackSessionKey) { mutableStateOf<List<SkipSegment>>(emptyList()) }
+    // TV skip-pill dismissal (Back-to-dismiss while the chrome is hidden): the `start` of the segment the
+    // viewer waved off, so its pill stays hidden until the next segment. Reset per playback session and
+    // cleared on a skip. Only ever set on TV (isTvPlayer); the phone leaves it null so the pill is unchanged.
+    var dismissedSkipStart by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
     LaunchedEffect(playbackSessionKey, playerState.durationMs > 0L) {
         val ref = currentPlayable.mediaRef
         val imdb = ref?.imdb
@@ -1168,6 +1179,31 @@ fun PlayerScreen(
                     return@onKeyEvent true
                 }
                 if (!controlsVisible) {
+                    // TV hidden-chrome SKIP PILL reachability: while a resolved skip segment sits under the
+                    // playhead and its pill has not been waved off, Select seeks past it and Back dismisses the
+                    // pill (rather than leaving the player), so the couch reaches the skip without raising the
+                    // whole transport bar. The phone host passes isTvPlayer=false, so this is inert there and
+                    // Back keeps its "leave the player" meaning.
+                    val posSec = latestState.positionMs / 1000.0
+                    val activeSkip = if (isTvPlayer) {
+                        skipSegments.filter { posSec >= it.start && posSec < it.end }.minByOrNull { it.start }
+                    } else {
+                        null
+                    }
+                    if (activeSkip != null && activeSkip.start != dismissedSkipStart) {
+                        when (event.key) {
+                            Key.Back, Key.Escape -> {
+                                dismissedSkipStart = activeSkip.start
+                                return@onKeyEvent true
+                            }
+                            Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
+                                engine.seekTo((activeSkip.end * 1000).toLong())
+                                dismissedSkipStart = null
+                                return@onKeyEvent true
+                            }
+                            else -> Unit
+                        }
+                    }
                     // Back must keep meaning "leave the player", never be swallowed into a reveal.
                     if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
                     // HIDDEN-CHROME D-PAD NUDGE: Left/Right does a small seek and shows a floating time pill
@@ -1471,6 +1507,9 @@ fun PlayerScreen(
             // until (or unless) this title has a community sheet, and the scrubber then simply shows no
             // thumbnail, exactly as it does today.
             scrubPreview = trickplay::previewAt,
+            // TV-only chrome opt-ins (both default off on the phone host, leaving its chrome unchanged).
+            shareLink = shareLink,
+            isTvPlayer = isTvPlayer,
             modifier = Modifier.fillMaxSize(),
         )
 
@@ -1487,6 +1526,8 @@ fun PlayerScreen(
                 positionMs = playerState.positionMs,
                 emberAccent = emberAccent,
                 onSkip = engine::seekTo,
+                // TV Back-to-dismiss hides this segment's pill; null on phone leaves it always visible.
+                dismissedStart = dismissedSkipStart,
             )
         }
 
@@ -1604,6 +1645,9 @@ private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
     emberAccent: Color,
     onSkip: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    // The `start` of a segment the TV viewer dismissed with Back while the chrome was hidden; its pill stays
+    // hidden until the next segment. Null (the phone default) never hides the pill.
+    dismissedStart: Double? = null,
 ) {
     if (segments.isEmpty()) return
     val positionSec = positionMs / 1000.0
@@ -1613,6 +1657,7 @@ private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
     val active = remember(segments, positionSec.toLong()) {
         segments.filter { positionSec >= it.start && positionSec < it.end }.minByOrNull { it.start }
     } ?: return
+    if (active.start == dismissedStart) return
 
     Row(
         modifier = modifier

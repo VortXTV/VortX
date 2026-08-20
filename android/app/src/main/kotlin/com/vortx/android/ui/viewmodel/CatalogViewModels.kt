@@ -946,6 +946,17 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
             _state.value = repo.library(currentRequestJson).toUiState()
         }
     }
+
+    /// Mark/unmark a saved title watched from the TV Library card's long-press menu (the 10-foot analogue of
+    /// the phone poster quick-action). Fires the engine's card-level `MetaItemMarkAsWatched`
+    /// ([repo.setCatalogWatched]) -- itself a ctx broadcast, so [ctxUpdates] re-loads the grid; the explicit
+    /// reload just keeps the watched dot feeling instant.
+    fun markWatched(item: MetaItem, isWatched: Boolean) {
+        viewModelScope.launch {
+            repo.setCatalogWatched(item, isWatched)
+            _state.value = repo.library(currentRequestJson).toUiState()
+        }
+    }
 }
 
 /// Search: debounced full-text query across every installed add-on. A query below two trimmed

@@ -788,12 +788,23 @@ internal object EngineState {
         previewSeasonCount = parsePreviewSeasonCount(obj),
     )
 
-    private fun parseLibraryItem(obj: JSONObject): MetaItem = MetaItem(
-        id = obj.optString("_id").ifEmpty { obj.optString("id") },
-        type = MediaType.fromId(obj.optString("type", "movie")),
-        name = obj.optString("name"),
-        poster = obj.optStringOrNull("poster"),
-    )
+    /// Mirrors Apple `LibraryView` item state so the Library smart-filter bar (Unwatched / In Progress /
+    /// Watched / Short) and the poster watched badges resolve: `watched` from `state.timesWatched > 0` (the
+    /// same signal [parseWatchedLibraryIds] uses), `progress` from `state.timeOffset` over `state.duration`
+    /// via [cwProgress], and any preview runtime. The old id/type/name/poster projection dropped all three,
+    /// leaving those filters permanently inapplicable.
+    private fun parseLibraryItem(obj: JSONObject): MetaItem {
+        val state = obj.optJSONObject("state")
+        return MetaItem(
+            id = obj.optString("_id").ifEmpty { obj.optString("id") },
+            type = MediaType.fromId(obj.optString("type", "movie")),
+            name = obj.optString("name"),
+            poster = obj.optStringOrNull("poster"),
+            watched = (state?.optInt("timesWatched", 0) ?: 0) > 0,
+            progress = cwProgress(state),
+            previewRuntimeMinutes = parsePreviewRuntimeMinutes(obj),
+        )
+    }
 
     /// Parse the SAME `library.catalog` array [parseLibrary] reads, but into the portable export shape
     /// (`LibraryPortability.Item`) instead of a UI [MetaItem]. A separate parse rather than widening

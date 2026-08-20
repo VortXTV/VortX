@@ -210,4 +210,20 @@
     <string name="collections_category_top_month">Top This Month</string>
     <string name="collections_category_top_year">Top This Year</string>
     <string name="collections_category_trending">Trending</string>
+
+    <!-- TV Library: hero + client segment bar (adds Anime) + smart filters + per-poster actions -->
+    <string name="library_empty">Titles you save appear here.</string>
+    <string name="library_no_matches">No saved titles match these filters.</string>
+    <string name="library_watched_badge">Watched</string>
+    <string name="library_segment_all">All</string>
+    <string name="library_segment_movies">Movies</string>
+    <string name="library_segment_shows">Shows</string>
+    <string name="library_segment_anime">Anime</string>
+    <string name="library_filter_unwatched">Unwatched</string>
+    <string name="library_filter_in_progress">In Progress</string>
+    <string name="library_filter_watched">Watched</string>
+    <string name="library_filter_short">Short</string>
+    <string name="library_action_mark_watched">Mark as Watched</string>
+    <string name="library_action_mark_unwatched">Mark as Unwatched</string>
+    <string name="library_action_remove">Remove from Library</string>
 </resources>

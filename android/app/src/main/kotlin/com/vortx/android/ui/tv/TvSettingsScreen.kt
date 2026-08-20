@@ -23,6 +23,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Switch
@@ -71,8 +73,16 @@ import com.vortx.android.skip.SkipConfig
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.screens.AccountContent
+import com.vortx.android.ui.screens.AppearanceScreen
+import com.vortx.android.ui.screens.HomeDiscoverSettingsScreen
 import com.vortx.android.ui.screens.IntegrationsScreen
+import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
+import com.vortx.android.ui.screens.PlaybackSettingsScreen
+import com.vortx.android.ui.screens.SourcesSettingsScreen
+import com.vortx.android.iptv.IPTVSettingsScreen
+import com.vortx.android.ui.prefs.AppearancePrefs
+import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.ui.viewmodel.AccountViewModel
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.home.HomeRailPreferences
@@ -82,6 +92,7 @@ import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
+import com.vortx.android.player.MatchFrameRateSetting
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
@@ -171,6 +182,16 @@ fun TvSettingsScreen(
     val notifyPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { /* the schedule already stands; the post is permission-gated at fire time */ }
+    // Match Frame Rate (AFR): the cheap fix. The controller ([MatchFrameRateSetting], key
+    // `vortx.player.matchFrameRate`, read per play at PlayerScreen) was wired but NO UI wrote the key, so it
+    // could never be turned on. This is its first (and the natural 10-foot) writer: refresh-rate matching is a
+    // TV-panel setting. Same key/default as Apple, so the account restores one value.
+    var matchFrameRate by remember { mutableStateOf(MatchFrameRateSetting.isEnabled(appContext)) }
+    // Community scrub previews (trickplay contribution). The read side existed on the same key Apple writes
+    // (`stremiox.communityTrickplay`); this row is its first writer via the new [CommunityTrickplay.setEnabled].
+    var communityScrub by remember { mutableStateOf(CommunityTrickplay.isEnabled(appContext)) }
+    // The 10-foot settings search: filters which sections render. Blank shows everything.
+    var settingsQuery by remember { mutableStateOf("") }
 
     val store = ProfileStore.sharedOrNull()
     // Bumped after a switch to force a fresh read of the plain (non-observable) store fields.
@@ -299,6 +320,77 @@ fun TvSettingsScreen(
         return
     }
 
+    // The deep configuration surfaces reuse the EXACT phone screens behind a D-pad route, so every control
+    // reads and writes the identical `vortx_settings` keys the phone and Apple write -- a couch change and a
+    // phone change are the same value. Each phone screen is self-contained (it builds its own stores) and takes
+    // only an `onBack`, except Appearance (an injected `AppearancePrefs` + a Customize-Home hop) and IPTV (the
+    // catalog repository), mirrored here exactly as the phone nav constructs them.
+    if (route == TvSettingsRoute.APPEARANCE) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        AppearanceScreen(
+            prefs = remember(appContext) { AppearancePrefs(appContext) },
+            onCustomizeHome = { route = TvSettingsRoute.CUSTOMIZE_HOME },
+            onBack = { route = TvSettingsRoute.ROOT },
+            modifier = modifier,
+        )
+        return
+    }
+
+    if (route == TvSettingsRoute.HOME_DISCOVER) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        HomeDiscoverSettingsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.MEDIA_SERVERS) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        MediaServersScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.IPTV) {
+        // Live TV: add / remove M3U + Xtream playlists. Needs the catalog repository (the converter output
+        // installs as a normal add-on), exactly like the phone nav's IPTVSettingsScreen call.
+        BackHandler { route = TvSettingsRoute.ROOT }
+        IPTVSettingsScreen(repo = repo, onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.PLAYBACK) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        PlaybackSettingsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.SOURCES) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        SourcesSettingsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.BACKUP) {
+        // Backup / restore IS the VortX account QR pairing on a TV (no D-pad file picker), mirroring Apple TV
+        // BackupExportView / BackupImportView. Built from the SAME sync manager the Account route uses.
+        BackHandler { route = TvSettingsRoute.ROOT }
+        val vortxVm: VortXAccountViewModel? = if (syncManager != null) {
+            viewModel(factory = StremioXViewModelFactory(repo = repo, syncManager = syncManager))
+        } else {
+            null
+        }
+        TvBackupRestoreScreen(
+            vortxViewModel = vortxVm,
+            onBack = { route = TvSettingsRoute.ROOT },
+            modifier = modifier,
+        )
+        return
+    }
+
+    if (route == TvSettingsRoute.DIAGNOSTICS) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        TvDiagnosticsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
     fun commitSwitch(profile: UserProfile) {
         if (store == null) return
         status = null
@@ -314,6 +406,13 @@ fun TvSettingsScreen(
         refresh++
     }
 
+    // A section renders when the search field is blank, or when the query matches any of the section's terms
+    // (its title plus the labels a viewer might type). Case-insensitive substring; trimmed. Keeps the couch
+    // search dumb-simple and never hides a section the query names.
+    val trimmedQuery = settingsQuery.trim()
+    fun show(vararg terms: String): Boolean =
+        trimmedQuery.isEmpty() || terms.any { it.contains(trimmedQuery, ignoreCase = true) }
+
     Box(modifier = modifier.fillMaxSize()) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
@@ -323,7 +422,11 @@ fun TvSettingsScreen(
         ) {
             item { TvProfileHeader(store?.active) }
 
-            if (roster.isNotEmpty()) {
+            item {
+                TvSettingsSearchField(query = settingsQuery, onQueryChange = { settingsQuery = it })
+            }
+
+            if (roster.isNotEmpty() && show("who's watching", "profile", "switch profile", "kids")) {
                 item {
                     TvSettingsSection("Who's watching") {
                         roster.forEach { profile ->
@@ -343,7 +446,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("account", "sign in", "sign-in", "stremio", "trakt", "simkl", "metadata", "tmdb", "omdb")) item {
                 TvSettingsSection("Account") {
                     TvSettingsNavigationRow(
                         label = "Account & sign-in",
@@ -368,8 +471,22 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show(
+                    "appearance", "theme", "accent", "oled", "text size", "app language",
+                    "home", "discover", "collections", "spoiler", "poster", "continue watching",
+                )
+            ) item {
                 TvSettingsSection("Appearance") {
+                    TvSettingsNavigationRow(
+                        label = "Theme & text size",
+                        detail = "Accent color, OLED black, app language, and text size.",
+                        onClick = { route = TvSettingsRoute.APPEARANCE },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "Home & Discover",
+                        detail = "Home rows, collections hub, and spoiler-safe mode.",
+                        onClick = { route = TvSettingsRoute.HOME_DISCOVER },
+                    )
                     TvSettingsNavigationRow(
                         label = "Customize Home",
                         detail = "Reorder or hide Home rows",
@@ -400,7 +517,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("library", "auto-add", "watched", "new episode", "alerts", "notifications")) item {
                 TvSettingsSection("Library") {
                     TvToggleRow(
                         label = "Auto-add watched to Library",
@@ -428,7 +545,11 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show(
+                    "services", "add-ons", "addons", "debrid", "api keys",
+                    "media server", "plex", "jellyfin", "emby", "live tv", "iptv", "m3u", "xtream",
+                )
+            ) item {
                 TvSettingsSection(stringResource(R.string.tv_settings_section_services)) {
                     TvSettingsNavigationRow(
                         label = stringResource(R.string.addons_title),
@@ -442,10 +563,59 @@ fun TvSettingsScreen(
                         onClick = { route = TvSettingsRoute.DEBRID },
                         focusRequester = debridServicesFocus,
                     )
+                    TvSettingsNavigationRow(
+                        label = "Media servers",
+                        detail = "Connect Plex, Jellyfin, or Emby.",
+                        onClick = { route = TvSettingsRoute.MEDIA_SERVERS },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "Live TV (IPTV)",
+                        detail = "Add an M3U or Xtream playlist as channels.",
+                        onClick = { route = TvSettingsRoute.IPTV },
+                    )
                 }
             }
 
-            item {
+            if (show(
+                    "playback", "player", "still watching", "seek", "volume", "default volume",
+                    "match frame rate", "afr", "refresh rate", "24p", "community scrub previews",
+                    "trickplay", "scrub", "trailers",
+                )
+            ) item {
+                TvSettingsSection("Playback") {
+                    TvSettingsNavigationRow(
+                        label = "All playback settings",
+                        detail = "Still watching, seek step, default volume, subtitles, and more.",
+                        onClick = { route = TvSettingsRoute.PLAYBACK },
+                    )
+                    // Match Frame Rate: the toggle that was missing. Its controller reads the same key per
+                    // play; this is its first writer. A no-op on panels that expose no matching mode.
+                    TvToggleRow(
+                        label = "Match Frame Rate",
+                        detail = "Switch the TV to the video's refresh rate so 24p film runs judder-free.",
+                        checked = matchFrameRate,
+                        onToggle = {
+                            val next = !matchFrameRate
+                            matchFrameRate = next
+                            MatchFrameRateSetting.setEnabled(appContext, next)
+                        },
+                    )
+                    // Community scrub previews: contribute anonymized scrub thumbnails so every viewer gets
+                    // instant previews. Writes the same key Apple writes (no token or PII is ever sent).
+                    TvToggleRow(
+                        label = "Community scrub previews",
+                        detail = "Share anonymized scrub previews so titles get instant thumbnails for everyone.",
+                        checked = communityScrub,
+                        onToggle = {
+                            val next = !communityScrub
+                            communityScrub = next
+                            CommunityTrickplay.setEnabled(appContext, next)
+                        },
+                    )
+                }
+            }
+
+            if (show("audio output", "audio", "sound", "passthrough")) item {
                 TvSettingsSection("Audio output") {
                     AudioOutputMode.entries.forEach { mode ->
                         TvOptionRow(
@@ -461,7 +631,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("subtitle", "subtitles", "caption", "subtitle color")) item {
                 TvSettingsSection("Subtitle color") {
                     SubtitleStyle.colors.forEach { (id, label) ->
                         TvOptionRow(
@@ -477,7 +647,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("subtitle", "subtitles", "caption", "subtitle brightness")) item {
                 TvSettingsSection("Subtitle brightness") {
                     SubtitleStyle.brightnessLevels.forEach { level ->
                         TvOptionRow(
@@ -493,7 +663,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("subtitle", "subtitles", "caption", "subtitle font")) item {
                 TvSettingsSection("Subtitle font") {
                     SubtitleStyle.fonts.forEach { (id, label) ->
                         TvOptionRow(
@@ -509,7 +679,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("subtitle", "subtitles", "caption", "subtitle size")) item {
                 TvSettingsSection("Subtitle size") {
                     SubtitleStyle.sizes.forEach { (id, label) ->
                         TvOptionRow(
@@ -525,7 +695,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("subtitle", "subtitles", "caption", "subtitle background")) item {
                 TvSettingsSection("Subtitle background") {
                     SubtitleStyle.backgrounds.forEach { (id, label) ->
                         TvOptionRow(
@@ -541,7 +711,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("subtitle", "subtitles", "external subtitles", "preferred")) item {
                 TvSettingsSection("External subtitles") {
                     TvToggleRow(
                         label = "Only preferred external subtitles",
@@ -556,7 +726,7 @@ fun TvSettingsScreen(
             }
 
             if (MpvEngineFactory.isBundled) {
-                item {
+                if (show("video quality", "upscaling", "quality")) item {
                     TvSettingsSection("Video quality") {
                         VideoUpscaling.androidChoices.forEach { preset ->
                             TvOptionRow(
@@ -573,8 +743,17 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
-                TvSettingsSection("Source selection") {
+            if (show(
+                    "source selection", "sources", "source ranking", "quality preset", "size cap",
+                    "min quality", "max quality", "add-on order", "regex", "stated quality", "direct links",
+                )
+            ) item {
+                TvSettingsSection("Sources") {
+                    TvSettingsNavigationRow(
+                        label = "Source ranking",
+                        detail = "Quality preset, type priority, size cap, min/max quality, add-on order, regex.",
+                        onClick = { route = TvSettingsRoute.SOURCES },
+                    )
                     TvToggleRow(
                         label = "Direct links only",
                         detail = "Hide unresolved torrents; keep direct, resolved debrid, and media-server links.",
@@ -587,7 +766,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("skip", "skip segments", "intro", "recap", "credits", "preview")) item {
                 TvSettingsSection("Skip segments") {
                     TvToggleRow(
                         label = "Skip automatically",
@@ -601,7 +780,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("skip", "skip provider", "theintrodb", "skipdb", "database")) item {
                 TvSettingsSection("Skip provider") {
                     tvSkipProviderOptions.forEach { (id, copy) ->
                         TvOptionRow(
@@ -617,7 +796,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("tabs", "tab bar", "discover", "live tv", "library", "search")) item {
                 TvSettingsSection("Tabs") {
                     TvToggleRow(
                         label = "Show Discover tab",
@@ -646,7 +825,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("performance", "battery", "smoothness", "power")) item {
                 TvSettingsSection("Performance") {
                     PerformanceMode.Override.entries.forEach { option ->
                         TvOptionRow(
@@ -662,11 +841,26 @@ fun TvSettingsScreen(
                 }
             }
 
-            item {
+            if (show("backup", "restore", "back up", "export", "import", "sync", "qr", "code")) item {
+                TvSettingsSection("Backup & Restore") {
+                    TvSettingsNavigationRow(
+                        label = "Backup & Restore",
+                        detail = "Scan a code to back up to, or restore from, your VortX account.",
+                        onClick = { route = TvSettingsRoute.BACKUP },
+                    )
+                }
+            }
+
+            if (show("about", "diagnostics", "version", "what's new", "whats new", "update")) item {
                 TvSettingsSection("About") {
                     // The passive "update available" banner (sideloaded, no store channel). Renders nothing
                     // when up to date or dismissed; focusing + selecting it opens the install channel.
                     UpdateAvailableBanner()
+                    TvSettingsNavigationRow(
+                        label = "Diagnostics",
+                        detail = "App, device, and engine info for support.",
+                        onClick = { route = TvSettingsRoute.DIAGNOSTICS },
+                    )
                     TvSettingsNavigationRow(
                         label = "What's New",
                         detail = "VortX ${BuildConfig.VERSION_NAME}",
@@ -675,7 +869,7 @@ fun TvSettingsScreen(
                 }
             }
 
-            item { TvSettingsFootnote() }
+            if (trimmedQuery.isEmpty()) item { TvSettingsFootnote() }
         }
 
         pinTarget?.let { target ->
@@ -725,7 +919,15 @@ internal enum class TvSettingsRoute {
     ACCOUNT,
     IMPORT_STREMIO,
     INTEGRATIONS,
-    METADATA;
+    METADATA,
+    APPEARANCE,
+    HOME_DISCOVER,
+    MEDIA_SERVERS,
+    IPTV,
+    PLAYBACK,
+    SOURCES,
+    BACKUP,
+    DIAGNOSTICS;
 
     internal fun back(): TvSettingsRoute = when (this) {
         // The store + pairing screens are nested under Add-ons; Back returns there, not to the root.
@@ -1019,6 +1221,27 @@ private fun TvSettingsNavigationRow(
             )
         }
     }
+}
+
+/// The 10-foot settings search field. Its query drives the `show` filter in [TvSettingsScreen], so typing
+/// narrows the list to matching sections and clearing it (or leaving it blank) shows everything again. A plain
+/// Material [OutlinedTextField] is D-pad-focusable and raises the on-screen keyboard on select, the same field
+/// the TV debrid-keys screen already uses on the couch.
+@Composable
+private fun TvSettingsSearchField(query: String, onQueryChange: (String) -> Unit) {
+    val colors = VortXTheme.colors
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        modifier = Modifier.fillMaxWidth(),
+        label = { Text("Search settings") },
+        singleLine = true,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = colors.accent,
+            unfocusedBorderColor = colors.hairline,
+            cursorColor = colors.accent,
+        ),
+    )
 }
 
 /// A 10-foot PIN gate: a dimmed scrim over a panel with the entered digits and a focusable numeric keypad,

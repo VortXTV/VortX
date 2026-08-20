@@ -5,6 +5,40 @@ Apple release notes live in the repository [CHANGELOG.md](../CHANGELOG.md).
 
 ## Unreleased
 
+### Android TV
+
+**A living hero across Home, Discover, and Library.** The big cinematic banner now follows whatever you point
+at and fills in the moment focus lands: it seeds the focused title's backdrop and, a beat later, enriches it
+with the clearlogo, synopsis, rating, and genres, then eases a muted trailer in over the still art once one is
+found. The trailer plays through the same trailer path the rest of the app uses, so nothing new is fetched to
+make it work, and titles without a trailer simply keep their slow-panning backdrop.
+
+**Discover gets the Collections hub and a focus hero.** The Discover tab now leads with the same Collections
+band the Home tab has (curated Discover lists, streaming services, and genres), and the hero above the grid
+tracks the poster you are on. Opening a collection browses it full-screen with categories and load-more,
+exactly like Home.
+
+**A deeper Library on the couch.** The Library adds a focus hero, a type bar that breaks out an Anime segment
+(shows and movies from anime catalogs get their own tab), smart filters for Unwatched, In Progress, Watched,
+and Short that appear only when they would actually narrow your saved titles, and a press-and-hold menu on any
+poster to Mark as Watched, Mark as Unwatched, or Remove from Library.
+
+**Full TV settings, on the same keys as everywhere else.** Android TV Settings now reaches the deep
+configuration surfaces from the couch, each one the exact phone screen behind a D-pad route so a change here
+writes the identical setting the phone and Apple write: Theme and text size (accent, OLED black, app language,
+text size), Home and Discover (rows, collections hub, spoiler-safe mode), Media servers (Plex, Jellyfin,
+Emby), Live TV (M3U and Xtream playlists), Source ranking (quality preset, type priority, size cap, min and
+max quality, add-on order, regex, stated quality), and All playback settings (still watching prompt and
+threshold, seek step, default volume, subtitles, and more). A new Match Frame Rate toggle finally lets the TV
+switch to a video's refresh rate so 24p film runs judder-free, and a Community scrub previews toggle lets you
+share anonymized scrub thumbnails so titles get instant previews for everyone. A Diagnostics screen shows app,
+device, and engine info for support, and a search field at the top of Settings filters the list.
+
+**Back up and restore on a TV, no file picker.** A new Backup and Restore screen signs this TV into your VortX
+account by scanning a code (or entering it at vortx.tv/approve) on a signed-in phone or browser, so your
+profiles, add-ons, library, and settings are stored in your account, end-to-end encrypted, and restored on any
+device you sign in. Nothing is written to a file and your account token never leaves the device.
+
 ### Sources and debrid
 
 **Browse and play your debrid cloud, no add-on needed.** A new Settings > Debrid > Your cloud screen lists

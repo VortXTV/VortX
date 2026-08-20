@@ -40,10 +40,14 @@ import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.Playable
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.viewmodel.AddonPairingViewModel
+import com.vortx.android.ui.viewmodel.AddonStoreViewModel
+import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.HomeViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
@@ -58,7 +62,12 @@ enum class TvDestination(val label: String, val icon: ImageVector) {
     DISCOVER("Discover", com.vortx.android.ui.theme.VortXIcons.discover),
     LIVE("Live TV", com.vortx.android.ui.theme.VortXIcons.live),
     LIBRARY("Library", com.vortx.android.ui.theme.VortXIcons.library),
+    // DOWNLOADS is an Android-TV rail entry (Apple TV keeps its offline list inside Library, but a persistent
+    // rail entry guarantees the couch downloads UI is reachable regardless of where a download was started).
+    // ADDONS is a top-level entry mirroring the Apple TV Add-ons tab; it is also reachable under Settings.
+    DOWNLOADS("Downloads", com.vortx.android.ui.theme.VortXIcons.download),
     SEARCH("Search", com.vortx.android.ui.theme.VortXIcons.search),
+    ADDONS("Add-ons", com.vortx.android.ui.theme.VortXIcons.addon),
     SETTINGS("Settings", com.vortx.android.ui.theme.VortXIcons.settings),
 }
 
@@ -81,10 +90,16 @@ fun TvShell(
     auth: AuthRepository,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
+    // A finished download plays straight into the shell's player slot (no detail page). Default no-op keeps
+    // the shell usable in a @Preview / test.
+    onPlayLocal: (Playable) -> Unit = {},
     syncManager: VortXSyncManager? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
     var destination by remember { mutableStateOf(TvDestination.HOME) }
+    // Bumped when the active tab is re-selected on the rail, so a depth-aware destination (Add-ons) can pop
+    // its own stack back to root -- the 10-foot analogue of re-tapping a bottom-nav tab to pop to root.
+    var reselectSignal by remember { mutableStateOf(0) }
 
     // Every rail tab (except the always-present Home + Settings) honors the SAME cross-platform "Show <tab>"
     // preferences the phone shell reads (TabBarPrefs, keys `vortx.tabs.hide.discover|live|library|search`):
@@ -100,7 +115,7 @@ fun TvShell(
                 TvDestination.LIVE -> !hiddenTabs.hideLive
                 TvDestination.LIBRARY -> !hiddenTabs.hideLibrary
                 TvDestination.SEARCH -> !hiddenTabs.hideSearch
-                TvDestination.HOME, TvDestination.SETTINGS -> true
+                TvDestination.HOME, TvDestination.DOWNLOADS, TvDestination.ADDONS, TvDestination.SETTINGS -> true
             }
         }
     }
@@ -131,7 +146,12 @@ fun TvShell(
     )
 
     Row(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
-        TvNavRail(destinations = destinations, selected = destination, onSelect = { destination = it })
+        TvNavRail(
+            destinations = destinations,
+            selected = destination,
+            // Re-selecting the active tab pops that tab's own stack to root (Add-ons); switching tabs moves.
+            onSelect = { dest -> if (dest == destination) reselectSignal++ else destination = dest },
+        )
         Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
             // Only the selected destination's ViewModel is instantiated (lazily inside the branch); each is
             // retained in the Activity's ViewModelStore by its default class key, so switching tabs keeps a
@@ -145,8 +165,16 @@ fun TvShell(
                     TvLiveScreen(viewModel<LiveViewModel>(factory = factory), onItem)
                 TvDestination.LIBRARY ->
                     TvLibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem)
+                TvDestination.DOWNLOADS ->
+                    TvDownloadsScreen(onPlay = onPlayLocal)
                 TvDestination.SEARCH ->
                     TvSearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, signedIn = signedIn)
+                TvDestination.ADDONS ->
+                    TvAddonsDestination(
+                        repo = repo,
+                        reselectSignal = reselectSignal,
+                        onExit = { destination = TvDestination.HOME },
+                    )
                 TvDestination.SETTINGS ->
                     TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager)
             }
@@ -231,3 +259,45 @@ private fun TvNavItem(destination: TvDestination, selected: Boolean, onClick: ()
         }
     }
 }
+
+/// The top-level Add-ons tab: a self-contained three-state stack (installed list -> add-on store / install-by-QR)
+/// that reuses the SAME [TvAddonsScreen] / [TvAddonStoreScreen] / [TvAddonPairingScreen] the Settings-nested
+/// Add-ons route uses, built on the SAME [StremioXViewModelFactory], so there is one add-ons flow with two entry
+/// points (the rail and Settings), not a fork. Depth-aware Back: a sub-screen's own [BackHandler] pops it to the
+/// installed root; at the root there is no local handler, so the shell's "Back returns to Home" applies -- and
+/// [onExit] gives the visible Back button the same destination. [reselectSignal] (bumped when the Add-ons tab is
+/// re-selected on the rail) pops the stack to root, the couch analogue of re-tapping a bottom-nav tab.
+@Composable
+private fun TvAddonsDestination(
+    repo: CatalogRepository,
+    reselectSignal: Int,
+    onExit: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var route by remember { mutableStateOf(TvAddonsRoute.ROOT) }
+    LaunchedEffect(reselectSignal) { route = TvAddonsRoute.ROOT }
+    when (route) {
+        TvAddonsRoute.STORE -> {
+            BackHandler { route = TvAddonsRoute.ROOT }
+            val storeVm: AddonStoreViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            TvAddonStoreScreen(viewModel = storeVm, onBack = { route = TvAddonsRoute.ROOT }, modifier = modifier)
+        }
+        TvAddonsRoute.PAIRING -> {
+            BackHandler { route = TvAddonsRoute.ROOT }
+            val pairingVm: AddonPairingViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            TvAddonPairingScreen(viewModel = pairingVm, onBack = { route = TvAddonsRoute.ROOT }, modifier = modifier)
+        }
+        TvAddonsRoute.ROOT -> {
+            val addonsVm: AddonsViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            TvAddonsScreen(
+                viewModel = addonsVm,
+                onBack = onExit,
+                onDiscover = { route = TvAddonsRoute.STORE },
+                onInstallByQr = { route = TvAddonsRoute.PAIRING },
+                modifier = modifier,
+            )
+        }
+    }
+}
+
+private enum class TvAddonsRoute { ROOT, STORE, PAIRING }
