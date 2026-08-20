@@ -3,10 +3,10 @@ main = "src/index.js"
 compatibility_date = "2024-11-01"
 
 routes = [
-  { pattern = "vortx.tv/altstore.json", zone_name = "vortx.tv" },
-  { pattern = "vortx.tv/vortx-altstore.json", zone_name = "vortx.tv" },
-  { pattern = "vortx.tv/appcast.json", zone_name = "vortx.tv" },
-  { pattern = "vortx.tv/__release/receipt", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/altstore.json*", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/vortx-altstore.json*", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/appcast.json*", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/__release/receipt*", zone_name = "vortx.tv" },
 ]
 
 [[kv_namespaces]]
