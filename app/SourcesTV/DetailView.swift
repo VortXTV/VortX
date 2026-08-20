@@ -585,6 +585,13 @@ struct DetailView: View {
         return metaRequestID
     }
 
+    /// The engine Unload -> Load for a movie/live "Re-find sources", wired into `CoreStreamList`. Uses the SAME
+    /// stream args `loadMovieStreamsIfNeeded` dispatches, so imdb-keyed add-ons still match on the re-query.
+    private func performMovieRefindLoad() {
+        core.refindSources(type: effectiveType, id: metaRequestID,
+                           streamType: effectiveType, streamId: movieStreamId)
+    }
+
     /// The AUTHORITATIVE type for the stream request + series/movie render: the loaded meta's type once
     /// resident, else the incoming `type`. The Collections/Trending HUB passes a TMDB movie/tv GUESS as `type`
     /// (TMDBClient), which for TV-movies / mini-series / anime disagrees with the type stream add-ons index the
@@ -921,7 +928,8 @@ struct DetailView: View {
                                                               season: nil, episode: nil),
                                            identityRoles: sourceIndexRoles,
                                            initialStartAtSeconds: validInitialResumeSeconds,
-                                           initialTraktSessionID: initialTraktSessionID)
+                                           initialTraktSessionID: initialTraktSessionID,
+                                           performRefindLoad: { performMovieRefindLoad() })
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -1019,7 +1027,8 @@ struct DetailView: View {
                                    meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
                                                       name: m.name, poster: m.poster,
                                                       season: nil, episode: nil),
-                                   identityRoles: sourceIndexRoles)
+                                   identityRoles: sourceIndexRoles,
+                                   performRefindLoad: { performMovieRefindLoad() })
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -2057,7 +2066,12 @@ struct CoreEpisodeStreams: View {
                                        kind: .series
                                    ),
                                    initialStartAtSeconds: initialStartAtSeconds,
-                                   initialTraktSessionID: initialTraktSessionID)
+                                   initialTraktSessionID: initialTraktSessionID,
+                                   // Re-find sources: same per-episode stream args this page's loadMeta uses.
+                                   performRefindLoad: {
+                                       core.refindSources(type: "series", id: meta.id,
+                                                          streamType: "series", streamId: currentVideo.id)
+                                   })
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
                 .padding(.bottom, Theme.Space.xl)
@@ -2194,6 +2208,11 @@ struct CoreStreamList: View {
     var initialStartAtSeconds: Double? = nil
     /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
     var initialTraktSessionID: TraktSessionID? = nil
+    /// "Re-find sources": the exact engine `refindSources` call, wired by the mounting page (which owns the
+    /// title/episode stream args). This list owns the auxiliary contributors + the `SourceListModel`, so its
+    /// own `refindSources()` handler busts the per-title caches and repaints, then invokes this to Unload ->
+    /// Load the engine meta. nil (or the RemoteConfig kill switch off) hides the control.
+    var performRefindLoad: (() -> Void)? = nil
 
     /// The title's resolved IMDb identity. ONE value: the pool and the IMDb-keyed TorBox index take the same
     /// IMDb-only key (decision REQ-260721-33), so there is no second field for a caller to pick wrongly.
@@ -2301,6 +2320,26 @@ struct CoreStreamList: View {
     private var sourcePin: ResolvedPin? { pinContext.flatMap { pinStore.effectivePin($0) } }
     /// A live channel has no fixed file to save, so the offline Download chip is hidden for it.
     private var isLive: Bool { meta.map { LiveTypes.contains($0.type) } ?? false }
+
+    /// The RemoteConfig kill switch for the "Re-find sources" control (backend-first mandate). Baked ON, so a
+    /// device that cannot reach RemoteConfig behaves exactly as today; an explicit remote OFF hides the control.
+    /// Also requires the mounting page to have wired `performRefindLoad` (its exact engine stream args).
+    private var refindEnabled: Bool {
+        performRefindLoad != nil
+            && RemoteConfig.snapshot.isFeatureOn("refindSources", default: RemoteConfigDefaults.featureRefindSources)
+    }
+
+    /// Re-find sources: bust this title/episode's per-title auxiliary caches, repaint the list to its loading
+    /// state, then Unload -> Load the engine meta (via `performRefindLoad`) so expired sources are replaced. A
+    /// plain re-Load would be an engine eq_update no-op; the Unload -> Load is what re-queries the add-ons.
+    private func refindSources() {
+        guard refindEnabled else { return }
+        torboxSearch.invalidateCachedResult(for: auxiliaryTarget)
+        mediaServers.invalidateCache()
+        sourceIndex.clearResults()
+        sourceList.beginRefresh()
+        performRefindLoad?()
+    }
 
     /// The saved resume position (seconds) for this title/episode, or nil when there is none. Reads the
     /// SAME per-profile source `play(_:)` seeks to: the engine library item for engine-history profiles
@@ -2505,6 +2544,15 @@ struct CoreStreamList: View {
                     }
                     .buttonStyle(ChipButtonStyle(selected: showAllSources))
 
+                    // Re-find sources: re-query the add-ons fresh so expired sources are replaced. Only on the
+                    // detail screen (never mid-play), so the warmed next-episode lane is never disturbed.
+                    if refindEnabled {
+                        Button { refindSources() } label: {
+                            Label("Re-find sources", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(ChipButtonStyle())
+                    }
+
                     // Offline download of the auto-picked best source (#30). Same three-state feedback as
                     // iOS: Download (idle, only when watchReady) / Downloading / Downloaded. Disabled while
                     // sources still settle so it can't queue a half-ranked pick. Hidden for LIVE channels,
@@ -2564,6 +2612,13 @@ struct CoreStreamList: View {
                     .focused($watchFocused)   // FIX H take 3: keep the seat valid in the no-sources state as well
                 Text("None of your \(addons.total) add-on\(addons.total == 1 ? "" : "s") returned a playable source for this title.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                // Re-find sources: the add-on may have been offline or its config expired; re-query fresh.
+                if refindEnabled {
+                    Button { refindSources() } label: {
+                        Label("Re-find sources", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(ChipButtonStyle())
+                }
             }
         }
         // Greedy width so the column never shrinks to its widest child. Without this, the Watch-Now state

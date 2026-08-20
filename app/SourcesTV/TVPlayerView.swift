@@ -408,6 +408,8 @@ struct TVPlayerView: View {
     // best-ranked UNTRIED source instead of dropping the viewer at the error overlay.
     @State private var exhaustedURLs: Set<URL> = []    // sources already given up on for this video
     @State private var sourceHops = 0                  // automatic source switches so far for this video
+    @State private var refinding = false               // a terminal-failure "Re-find sources" is in flight
+    @State private var refindTask: Task<Void, Never>? = nil   // bounded settle-then-retry after a re-find
     @State private var triedYouTubeAppRescue = false   // #95: the YouTube-app trailer hand-off fires at most once per playback
     private let maxSourceHops = 4                      // a fully-dead title still errors out, just later
     // Whether the CURRENTLY loading source was explicitly chosen by the user (seeded from
@@ -762,6 +764,7 @@ struct TVPlayerView: View {
             if showInfo && !showOptions && !loadFailed { controlBar }
             if showOptions { optionsPanel }
             if loadFailed { loadErrorOverlay }
+            if refinding { refindingOverlay }
             if let seg = skipPillSegment { skipPill(seg) }
             if controlsHidden, let d = hiddenSeekDelta { hiddenSeekPill(d) }
             if controlsHidden, upNextRemaining != nil || isCreditsUpNext { upNextBand }
@@ -1990,11 +1993,20 @@ struct TVPlayerView: View {
             if type == .menu || type == .select || type == .playPause { showStreamQR = false }
             return
         }
+        if refinding {
+            // A re-find is settling fresh sources: only Back cancels it (returns to the details page).
+            if type == .menu { refindTask?.cancel(); refinding = false; saveProgress(at: currentTime); leavePlayback() }
+            return
+        }
         if loadFailed {
             switch type {
             case .menu: saveProgress(at: currentTime); leavePlayback()
             case .select:
-                if !currentSourceGroups.isEmpty {     // jump straight to another source
+                if sourcesExhausted {
+                    // Every known source has been tried (or there were none): re-query the add-ons for FRESH
+                    // links instead of reopening a panel of already-dead sources.
+                    refindSourcesAndRetry()
+                } else if !currentSourceGroups.isEmpty {     // jump straight to another (still-untried) source
                     withAnimation { loadFailed = false }
                     openPanel(.sources)
                 } else { retryLoad() }
@@ -3645,6 +3657,62 @@ struct TVPlayerView: View {
         return true
     }
 
+    /// The RemoteConfig kill switch for the terminal-failure "Re-find sources" action (backend-first mandate).
+    /// Baked ON, so a device that cannot reach RemoteConfig behaves exactly as today.
+    private var refindEnabled: Bool {
+        RemoteConfig.snapshot.isFeatureOn("refindSources", default: RemoteConfigDefaults.featureRefindSources)
+    }
+
+    /// Terminal-failure "Re-find sources": every known source has been tried and none worked, so re-query the
+    /// add-ons FRESH for this exact title/episode (engine Unload -> Load, not an eq_update no-op) and, once
+    /// fresh sources settle, retry playback on the best untried one. This is offered ONLY from the terminal
+    /// load-error overlay (playback already stopped), never mid-play, so the warmed next-episode lane is never
+    /// disturbed. Resets the tried-source budget so the re-queried set gets a clean set of attempts.
+    private func refindSourcesAndRetry() {
+        guard refindEnabled, !isTrailer, let m = curMeta else { retryLoad(); return }
+        refindTask?.cancel()
+        sourceHops = 0
+        exhaustedURLs = []
+        loadErrorMsg = ""
+        refinding = true
+        withAnimation { loadFailed = false }
+        DiagnosticsLog.log("player", "re-find sources requested (\(m.type):\(VXProbeRedaction.identityToken(m.videoId)))")
+        core.refindSources(type: m.type, id: m.libraryId, streamType: m.type, streamId: m.videoId)
+        let videoId = m.videoId
+        refindTask = Task { @MainActor in
+            let startedAt = Date()
+            while !Task.isCancelled {
+                // Bail if a navigation/teardown changed the target or the re-find was cancelled out from under us.
+                guard refinding, curMeta?.videoId == videoId else { refinding = false; return }
+                let elapsed = Date().timeIntervalSince(startedAt)
+                let groups = currentSourceGroups
+                let progress = (isEpisodePlaybackContext ? sourceTargetMeta?.videoId : nil)
+                    .map { core.streamLoadProgress(forStreamId: $0) } ?? core.streamLoadProgress()
+                let settled = StreamRanking.resolveSettled(
+                    groups, loaded: progress.loaded, total: progress.total,
+                    secondsSinceRequestStart: elapsed, rememberedQuality: curHint
+                )
+                if settled, nextUntriedStream() != nil {
+                    refinding = false
+                    // Reuse the proven failover choke point: it books the dead provider, excludes the dead URL,
+                    // picks the best fresh untried source, and switches. Beyond the ordinary hop budget because
+                    // this is a deliberate user retry, not an automatic cascade.
+                    if !hopToNextSource(reason: "re-find fresh sources", allowBeyondFailureBudget: true) {
+                        presentTerminalLoadFailure()
+                    }
+                    return
+                }
+                if elapsed >= StreamRanking.completeSetDeadline {
+                    refinding = false
+                    // Nothing fresh turned up within the settle deadline: fall back to the terminal overlay.
+                    presentTerminalLoadFailure()
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(300)) } catch { refinding = false; return }
+            }
+        }
+    }
+
     /// Nudge subtitle sync by `delta` seconds (rounded to 0.1); keeps the panel open to repeat.
     private func adjustSubDelay(_ delta: Double) {
         guard coordinator.player?.subtitleDelayAvailable == true else { return }
@@ -4013,8 +4081,32 @@ struct TVPlayerView: View {
                      : "It may be unavailable, offline, or unsupported.  (\(loadErrorMsg))")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 900)
-                Text("Select = choose another source    ·    Play/Pause = retry    ·    Menu = back")
+                // When every known source has been tried, Select re-queries the add-ons for fresh links
+                // instead of reopening a panel of dead sources; otherwise it opens the source picker.
+                Text(sourcesExhausted
+                     ? "Select = re-find sources    ·    Play/Pause = retry    ·    Menu = back"
+                     : "Select = choose another source    ·    Play/Pause = retry    ·    Menu = back")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary).padding(.top, Theme.Space.xs)
+            }
+            .padding(Theme.Space.screenEdge)
+        }
+        .transition(.opacity)
+    }
+
+    /// True when the terminal-failure overlay's Select should re-find (every known source tried) rather than
+    /// open the source picker. Gated by the RemoteConfig kill switch and never for a trailer (FIX I).
+    private var sourcesExhausted: Bool { refindEnabled && !isTrailer && nextUntriedStream() == nil }
+
+    /// Shown while a terminal-failure "Re-find sources" settles fresh sources before retrying playback.
+    private var refindingOverlay: some View {
+        ZStack {
+            Theme.Palette.canvas.opacity(0.94).ignoresSafeArea()
+            VStack(spacing: Theme.Space.md) {
+                ProgressView().tint(Theme.Palette.accent)
+                Text("Finding fresh sources…")
+                    .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
+                Text("Re-querying your add-ons for this title. Menu = back")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
             }
             .padding(Theme.Space.screenEdge)
         }
@@ -7824,6 +7916,7 @@ struct TVPlayerView: View {
         cancelTerminalFinalityRefresh()
         exitAcceptedLoadToken = assetSanityAccepted ? exitLoadToken : nil
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
+        refindTask?.cancel(); refindTask = nil; refinding = false   // a settling re-find must not retry into a left player
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer pressing Back immediately
         invalidateEpisodeResolution()
         eofFrozenAtTerminal = false; terminalAdvanceDeadlineTask?.cancel(); terminalAdvanceDeadlineTask = nil

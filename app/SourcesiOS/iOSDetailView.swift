@@ -2373,7 +2373,8 @@ struct iOSDetailView: View {
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
             download: movieDownloadHandler,
-            isSuspended: suspended
+            isSuspended: suspended,
+            refind: refindEnabled ? { refindMovieSources() } : nil
         )
         // Equatable gate: unrelated detail re-renders (progress ticks, hero state) skip re-diffing the
         // 1000+ row list; the groups compare is a buffer-identity fast path until the model republishes.
@@ -2437,6 +2438,26 @@ struct iOSDetailView: View {
             )
         }
         core.loadMeta(type: effectiveType, id: metaRequestID, streamType: effectiveType, streamId: streamId)
+    }
+
+    /// The RemoteConfig kill switch for the "Re-find sources" control (backend-first mandate). Baked ON, so a
+    /// device that cannot reach RemoteConfig behaves exactly as today; an explicit remote OFF hides the control.
+    private var refindEnabled: Bool {
+        RemoteConfig.snapshot.isFeatureOn("refindSources", default: RemoteConfigDefaults.featureRefindSources)
+    }
+
+    /// Re-find sources for this movie/live title: bust the per-title auxiliary caches, force the engine to
+    /// re-query the stream add-ons (Unload -> Load, not an eq_update no-op), and repaint the source list to
+    /// its loading state. The engine re-load's onChange re-drives the auxiliary contributors. Uses the SAME
+    /// stream args `loadMovieStreamsIfNeeded` dispatches, so imdb-keyed add-ons still match.
+    private func refindMovieSources() {
+        guard refindEnabled else { return }
+        torboxSearch.invalidateCachedResult(for: auxiliaryTarget)
+        mediaServers.invalidateCache()
+        sourceIndex.clearResults()
+        sourceList.beginRefresh()
+        core.refindSources(type: effectiveType, id: metaRequestID,
+                           streamType: effectiveType, streamId: movieStreamId)
     }
 
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
@@ -3284,7 +3305,8 @@ struct iOSDetailView: View {
             play: { stream, url in Task { await playLiveStream(stream, url: url) } },
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
-            isSuspended: suspended
+            isSuspended: suspended,
+            refind: refindEnabled ? { refindMovieSources() } : nil
         )
         .equatable()   // see sourceSection: skip re-diffing the list on unrelated re-renders
         .padding(.horizontal, Theme.Space.md)
@@ -4252,6 +4274,23 @@ struct iOSEpisodeStreams: View {
         .frame(width: width, alignment: .leading)
     }
 
+    /// The RemoteConfig kill switch for the "Re-find sources" control (backend-first mandate). Baked ON.
+    private var refindEnabled: Bool {
+        RemoteConfig.snapshot.isFeatureOn("refindSources", default: RemoteConfigDefaults.featureRefindSources)
+    }
+
+    /// Re-find sources for THIS episode: bust the per-title auxiliary caches, force the engine to re-query the
+    /// stream add-ons (Unload -> Load, not an eq_update no-op), and repaint the source list to its loading
+    /// state. Uses the SAME per-episode stream args this page's `loadMeta` dispatches.
+    private func refindEpisodeSources() {
+        guard refindEnabled else { return }
+        torboxSearch.invalidateCachedResult(for: episodeTarget)
+        mediaServers.invalidateCache()
+        sourceIndex.clearResults()
+        sourceList.beginRefresh()
+        core.refindSources(type: "series", id: meta.id, streamType: "series", streamId: shownVideo.id)
+    }
+
     /// The episode source list (extracted so the iOS single-scroll body and the macOS pinned body render the
     /// EXACT same list). While the episode's player / trailer cover is up, skip the rankedGroups pass (pass []
     /// + isSuspended) so this hidden episode list stops re-rendering behind the video; it restores on close.
@@ -4272,7 +4311,8 @@ struct iOSEpisodeStreams: View {
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
             download: episodeDownloadHandler,
-            isSuspended: presentation != nil
+            isSuspended: presentation != nil,
+            refind: refindEnabled ? { refindEpisodeSources() } : nil
         )
         // Equatable gate: unrelated episode re-renders skip re-diffing the ranked list (the
         // groups compare is a buffer-identity fast path until the model republishes).
@@ -5340,6 +5380,11 @@ struct iOSSourceList: View {
     /// closing the player restores the list exactly as it was. The caller ALSO passes `groups: []` when
     /// suspended, which skips the heavy `rankedGroups(displayGroups(...))` argument evaluation at the call site.
     var isSuspended: Bool = false
+    /// "Re-find sources": re-query the stream add-ons fresh so expired sources are replaced. Optional so a
+    /// caller that does not support it (or has the RemoteConfig kill switch off) passes nil and no control
+    /// renders. The caller owns the whole action (bust the per-title auxiliary caches, call
+    /// `core.refindSources`, and `sourceList.beginRefresh()`); this component only surfaces the control.
+    var refind: (() -> Void)? = nil
 
     @State private var sourceFilter: String? = nil      // nil = all add-ons
     @State private var showAllSources = false           // the full ranked list is revealed on demand
@@ -5511,9 +5556,23 @@ struct iOSSourceList: View {
         return AnyView(sourceListBody)
     }
 
+    /// "Re-find sources" control: re-query the add-ons fresh so expired sources are replaced. Rendered by
+    /// the Sources header and in the empty/error state; only present when the caller wired `refind`.
+    @ViewBuilder private func refindControl(_ action: @escaping () -> Void) -> some View {
+        Button { action() } label: {
+            Label("Re-find sources", systemImage: "arrow.clockwise")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.accent)
+        }
+        .buttonStyle(.plain)
+    }
+
     @ViewBuilder private var sourceListBody: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            iOSRailHeader(eyebrow: eyebrow, title: "Sources")
+            HStack(alignment: .bottom, spacing: Theme.Space.sm) {
+                iOSRailHeader(eyebrow: eyebrow, title: "Sources")
+                if let refind { refindControl(refind) }
+            }
 
             if groups.isEmpty {
                 if loading {
@@ -5522,6 +5581,11 @@ struct iOSSourceList: View {
                                   : "Finding sources…")
                 } else {
                     emptyState
+                    if let refind {
+                        refindControl(refind)
+                            .padding(.horizontal, Theme.Space.md)
+                            .padding(.top, Theme.Space.xs)
+                    }
                 }
             } else {
                 // Singularity renders INLINE ONLY: its merged group flows through the ranked list like

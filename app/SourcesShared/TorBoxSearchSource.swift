@@ -504,6 +504,19 @@ final class TorBoxSearchSource: ObservableObject {
         if !streams.isEmpty { streams = [] }
     }
 
+    /// Re-find sources: drop this title's SESSION-CACHED search result so the next `refresh` re-queries the
+    /// scraper instead of re-serving the stale cached rows, then blank the published streams via
+    /// `clearResults`. The 429/transport cooldown lives in the shared `ProviderCircuitBreaker` (keyed by
+    /// provider + contentID) and the key gate lives in `hasKey`; BOTH are left untouched, so a re-find still
+    /// honors an active rate-limit cooldown and never re-fires without a configured key. Only the per-title
+    /// result cache is invalidated.
+    func invalidateCachedResult(for resolution: SourceIndexIdentity.TargetResolution) {
+        if let target = SourceIndexIdentity.validatedTarget(resolution) {
+            cache.removeValue(forKey: target.contentID)
+        }
+        clearResults()
+    }
+
     /// Merge only with a capability proving that these rows and this page share one validated target.
     func merged(
         into groups: [CoreStreamSourceGroup],

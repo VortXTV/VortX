@@ -116,6 +116,16 @@ final class MediaServerSource: ObservableObject {
         clearResults(settlementTarget: nil)
     }
 
+    /// Re-find sources: drop the SESSION cache so the next `refresh` re-resolves the title on the connected
+    /// servers instead of re-publishing the cached hits, then blank the published groups via `clearResults`.
+    /// The whole store is emptied because this source is a per-detail-view `@StateObject` (its cache only ever
+    /// holds this one screen's title/episodes), and the dormancy gate (no server -> no network) and every
+    /// other protection are untouched. Only the per-title result cache is invalidated.
+    func invalidateCache() {
+        cache.removeAll()
+        clearResults()
+    }
+
     private func clearResults(settlementTarget: SourceIndexIdentity.MediaServerTarget?) {
         task?.cancel()
         task = nil
