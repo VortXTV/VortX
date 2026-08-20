@@ -54,6 +54,8 @@ struct VortXiOSApp: App {
     #endif
 
     init() {
+        CommunityGatewayProductProof.runIfRequested()
+        CommunityStreamGateway.shared.startIfNeededAsync()
         // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
         // The owner cannot easily pull .ips reports off a sideloaded device, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
@@ -106,6 +108,7 @@ struct VortXiOSApp: App {
             iOSRootView()
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
+                        CommunityStreamGateway.shared.startIfNeededAsync()
                         UpdateChecker.shared.checkIfStale()
                         // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero
                         // call sites anywhere in the repo, so the only refreshes were the cold-launch fetch
@@ -140,6 +143,7 @@ struct VortXiOSApp: App {
                         VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
                     }
                     if phase == .background {
+                        CommunityStreamGateway.shared.stop()
                         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
                         // Phase 8: stop the flag-gated in-process engine server on background (graceful
                         // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.

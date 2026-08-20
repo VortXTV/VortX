@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct VortXApp: App {
     init() {
+        CommunityStreamGateway.shared.startIfNeededAsync()
         // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
         VXProbeHeartbeat.start()

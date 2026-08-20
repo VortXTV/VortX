@@ -41,7 +41,8 @@ struct PinnedHTTPClientFunctionalProofTests {
         expect(parsed.statusCode == 206 && parsed.body == Data("hello".utf8), "bounded content-length framing")
         let chunked = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n".utf8)
         expect(try! PinnedHTTPClient.decodeResponse(chunked, limits: .init())?.body == Data("hello".utf8), "chunked framing")
-        expectFailure({ _ = try PinnedHTTPClient.decodeResponse(Data("HTTP/1.1 302 Found\r\nLocation: https://other.example/\r\n\r\n".utf8), limits: .init()) }, .redirect(302), "redirect requires revalidation")
+        let redirect = try! PinnedHTTPClient.decodeResponse(Data("HTTP/1.1 302 Found\r\nLocation: https://other.example/\r\nContent-Length: 0\r\n\r\n".utf8), limits: .init())!
+        expect(redirect.statusCode == 302 && redirect.headers["location"] == "https://other.example/", "redirect is returned for manual revalidation")
         var small = PinnedHTTPClient.Limits(); small.maximumBodyBytes = 4
         expectFailure({ _ = try PinnedHTTPClient.decodeResponse(complete, limits: small) }, .responseTooLarge, "response body cap")
         expect(try! PinnedHTTPClient.decodeResponse(Data("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nsmall".utf8), limits: .init()) == nil, "incomplete framing waits")

@@ -78,6 +78,7 @@ final class JSProviderSource: ObservableObject {
         // Cancel the native interpreter, discard its identity cache, and publish an empty contribution at once.
         gateSubscription = JSProviderStore.shared.$userEnabled.dropFirst().sink { [weak self] enabled in
             guard !enabled else { return }
+            CommunityStreamGateway.shared.invalidate()
             self?.cache.removeAll()
             self?.clearResults()
         }
@@ -111,6 +112,7 @@ final class JSProviderSource: ObservableObject {
     /// applicable providers clears publication synchronously and launches no work.
     func refresh(call: AuxiliarySourcePipeline.Call) {
         guard let target = SourceIndexIdentity.validatedTarget(call.resolution), gate() else {
+            CommunityStreamGateway.shared.invalidate()
             clearResults(); return
         }
         let mediaType = Self.mediaType(for: target)

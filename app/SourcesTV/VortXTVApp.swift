@@ -47,6 +47,8 @@ struct VortXTVApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        CommunityGatewayProductProof.runIfRequested()
+        CommunityStreamGateway.shared.startIfNeededAsync()
         // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
         // A sideloaded Apple TV cannot hand its .ips reports to the owner, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
@@ -137,6 +139,7 @@ struct VortXTVApp: App {
                 // from "we crashed" when a device report says the app vanished.
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
+                    CommunityStreamGateway.shared.startIfNeededAsync()
                     UpdateChecker.shared.checkIfStale()
                     // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero call
                     // sites anywhere in the repo, so the only refreshes were the cold-launch fetch and the
@@ -177,6 +180,7 @@ struct VortXTVApp: App {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { TabBarHealer.heal("foreground+1.5s") }
                 }
                 if phase == .background {
+                    CommunityStreamGateway.shared.stop()
                     #if !VORTX_NO_EMBEDDED_SERVER
                     // Phase 8: stop the flag-gated in-process engine server on background (graceful
                     // rqbit shutdown off-main); .active above restarts it. No-op while the flag is off.
