@@ -15,6 +15,8 @@ struct PreparedRemuxHandoffTests {
     static func main() {
         exactIdentityIncludesEveryTransportInput()
         preparationNeverStartsBesideCurrentPlaybackProducer()
+        cancelledPreparationCannotStartAfterPlaybackUnwinds()
+        rejectedBeforeStartAcknowledgesQuiescence()
         readinessGatesOneShotAdoption()
         adoptionReusesThePreparedTransport()
         staleCleanupRunsOnce()
@@ -89,6 +91,30 @@ struct PreparedRemuxHandoffTests {
                "next preparation queues while current playback still produces")
         expect(policy.active?.id == 1 && policy.pending?.id == 2,
                "queued preparation never replaces or preempts current playback")
+    }
+
+    private static func cancelledPreparationCannotStartAfterPlaybackUnwinds() {
+        var policy = VortXRemuxProducerArbitration()
+        _ = policy.submit(id: 1, purpose: .playback)
+        _ = policy.submit(id: 2, purpose: .preparation)
+        expect(policy.cancel(id: 2) == [.reject(2)],
+               "handoff cancellation removes queued preparation before the old producer unwinds")
+        expect(policy.producerDidUnwind(id: 1).isEmpty,
+               "an AV-to-mpv handoff leaves no queued preparation to start beside mpv")
+        expect(
+            VortXRemuxHandoffPolicy.canMountMPV(routeStillCurrent: true, producerQuiescent: true)
+                && !VortXRemuxHandoffPolicy.canMountMPV(routeStillCurrent: true, producerQuiescent: false),
+            "replacement mpv is admitted only with zero active remux producers"
+        )
+    }
+
+    private static func rejectedBeforeStartAcknowledgesQuiescence() {
+        let relay = VortXRemuxProducerTerminalRelay()
+        let receipt = VortXRemuxQuiescenceReceipt(terminal: relay)
+        expect(!receipt.isAcknowledged, "a queued producer is not quiescent before cancellation")
+        relay.fire()
+        expect(receipt.isAcknowledged,
+               "a rejected never-started producer acknowledges the same terminal receipt")
     }
 
     private static func readinessGatesOneShotAdoption() {
