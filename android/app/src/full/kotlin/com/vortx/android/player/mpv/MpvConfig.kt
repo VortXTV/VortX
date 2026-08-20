@@ -145,6 +145,21 @@ object MpvConfig {
     )
 
     /**
+     * HDR output policy for the gpu-next / libplacebo pipeline. When [forceSDR] is true the output transfer
+     * + primaries are pinned to SDR (bt.1886 gamma, bt.709 gamut), so libplacebo tone-maps HDR/DV down using
+     * the [TONE_MAPPING] curve already in [baseOptions]; when false both are left on `auto`, so mpv requests
+     * HDR passthrough and lets the panel present it. Always returns BOTH keys so a live mode switch fully
+     * overwrites the previous one (mpv retains a property that is omitted from a later update). The Android
+     * analogue of Apple's `target-trc` / `target-prim` application, driven by `stremiox.hdrToneMapMode`.
+     */
+    fun hdrOutputOptions(forceSDR: Boolean): List<Pair<String, String>> =
+        if (forceSDR) {
+            listOf("target-trc" to "bt.1886", "target-prim" to "bt.709")
+        } else {
+            listOf("target-trc" to "auto", "target-prim" to "auto")
+        }
+
+    /**
      * App-owned trust policy. [MpvPlayer] applies these after every ordinary preference and treats
      * any rejected option as a hard initialization failure, which safely demotes to the platform
      * player instead of starting libmpv with unknown certificate behavior.

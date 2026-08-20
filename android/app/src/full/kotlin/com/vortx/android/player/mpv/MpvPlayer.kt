@@ -57,6 +57,7 @@ class MpvPlayer private constructor(
     override val audioOutputModeAvailable: Boolean = true
     override val secondarySubtitleAvailable: Boolean = true
     override val hardwareDecodingAvailable: Boolean = true
+    override val hdrToneMapAvailable: Boolean = true
 
     /// The live primary / secondary subtitle track ids, read from mpv (`sid` / `secondary-sid`). Both read
     /// -1 when their slot is off (mpv reports the property as `no`, which [MPVLib.getPropertyInt] surfaces
@@ -116,6 +117,14 @@ class MpvPlayer private constructor(
                     _state.value = _state.value.copy(positionMs = (value * 1000).toLong().coerceAtLeast(0L))
                 }
                 PROP_DURATION -> _state.value = _state.value.copy(durationMs = (value * 1000).toLong().coerceAtLeast(0L))
+                // `demuxer-cache-time` is the ABSOLUTE timestamp (seconds) of the end of the forward cache,
+                // i.e. how far ahead of the playhead the demuxer has loaded. Feeds the scrubber's buffered
+                // band, the mpv analogue of ExoPlayer's `bufferedPosition`. A negative sentinel (no cache
+                // info) leaves the last value untouched so the band never flickers to 0 mid-play.
+                PROP_DEMUXER_CACHE_TIME ->
+                    if (value >= 0.0) {
+                        _state.value = _state.value.copy(bufferedPositionMs = (value * 1000).toLong().coerceAtLeast(0L))
+                    }
             }
         }
 
@@ -186,12 +195,28 @@ class MpvPlayer private constructor(
         for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
             mpv.setOptionString(name, value)
         }
+        // HDR -> SDR tone-map policy (Apple `stremiox.hdrToneMapMode`): pin the output transfer/primaries to
+        // SDR when forcing, else leave them on auto for HDR passthrough. Applied pre-init here and live via
+        // [applyHdrToneMap]. mpv-only; the ExoPlayer engine leaves HDR/DV to the panel.
+        for ((name, value) in MpvConfig.hdrOutputOptions(
+            com.vortx.android.player.extras.HdrToneMapSetting.forceSDR(appContext),
+        )) {
+            mpv.setOptionString(name, value)
+        }
         val upscaling = TrackPreferencesStore(
             appContext,
             PerformanceMode.isConstrainedDevice(appContext),
         ).videoUpscaling
-        for ((name, value) in upscaling.mpvOptions) {
-            mpv.setOptionString(name, value)
+        // Anime4K needs its bundled GLSL chain extracted to disk before its options mean anything: its
+        // `mpvOptions` set bilinear scalers precisely BECAUSE the neural shaders do the upscaling. If the
+        // chain cannot be armed (assets missing / IO failure), skip this preset entirely and fall back to the
+        // plain baseline rather than applying bilinear-with-no-shaders, which would look WORSE than Standard.
+        val shaderChain = Anime4KShaders.glslShadersOption(appContext, upscaling.glslShaderFileNames)
+        if (upscaling.glslShaderFileNames.isEmpty() || shaderChain != null) {
+            for ((name, value) in upscaling.mpvOptions) {
+                mpv.setOptionString(name, value)
+            }
+            shaderChain?.let { mpv.setOptionString("glsl-shaders", it) }
         }
         // Apply the trust policy last and fail closed if this packaged libmpv rejects any part of it.
         // create() catches the exception, destroys this libmpv instance, and returns null so the router
@@ -205,6 +230,7 @@ class MpvPlayer private constructor(
         mpv.observeProperty(PROP_DURATION, MPVLib.Format.DOUBLE)
         mpv.observeProperty(PROP_PAUSE, MPVLib.Format.FLAG)
         mpv.observeProperty(PROP_PAUSED_FOR_CACHE, MPVLib.Format.FLAG)
+        mpv.observeProperty(PROP_DEMUXER_CACHE_TIME, MPVLib.Format.DOUBLE)
         mpv.observeProperty(PROP_TRACK_LIST, MPVLib.Format.NONE)
         mpv.addObserver(observer)
     }
@@ -379,6 +405,17 @@ class MpvPlayer private constructor(
         }
     }
 
+    /// Re-read `stremiox.hdrToneMapMode` and apply the SDR-force (or HDR-passthrough) target-trc/target-prim
+    /// live, so an in-player mode switch takes effect on the current frame. Mirrors Apple `setVideoSize`-style
+    /// live property application for the tone-map decision.
+    override fun applyHdrToneMap() {
+        for ((name, value) in MpvConfig.hdrOutputOptions(
+            com.vortx.android.player.extras.HdrToneMapSetting.forceSDR(appContext),
+        )) {
+            mpv.setPropertyString(name, value)
+        }
+    }
+
     /// The container's chapters, read from mpv's `chapter-list` (count + per-index title/time). Empty when
     /// the file carries no chapters. Mirrors Apple `chapters()`.
     override fun chapters(): List<PlayerChapter> {
@@ -408,6 +445,14 @@ class MpvPlayer private constructor(
         mpv.getPropertyString("audio-codec")?.takeIf { it.isNotEmpty() }?.let { stats += "Audio codec" to it }
         mpv.getPropertyString("audio-params/hr-channels")?.takeIf { it.isNotEmpty() }
             ?.let { stats += "Channels" to it }
+        // Performance rows (the on-screen equivalent of a stats overlay): how many decoded frames mpv had to
+        // drop to keep sync, and how many seconds of forward buffer the demuxer is holding ahead of the
+        // playhead. Both surface a struggling device or a starving link at a glance. Mirrors the Apple
+        // player's frame-drop / cache readout.
+        mpv.getPropertyInt("frame-drop-count")?.takeIf { it >= 0 }
+            ?.let { stats += "Dropped frames" to it.toString() }
+        mpv.getPropertyDouble("demuxer-cache-duration")?.takeIf { it >= 0 }
+            ?.let { stats += "Buffer ahead" to String.format("%.1fs", it) }
         return stats
     }
 
@@ -422,8 +467,10 @@ class MpvPlayer private constructor(
     }
 
     override fun onEnterBackground() {
-        // Drop video decode off-screen (matches Apple enterBackground: `vid=no`) and pause.
-        pause()
+        // Drop video decode off-screen either way (matches Apple enterBackground: `vid=no`), which saves
+        // power while backgrounded. Pause the audio too ONLY when "keep playing in the background" is off;
+        // when on (Apple's default) the audio keeps going. onEnterForeground restores video + play.
+        if (!com.vortx.android.player.extras.KeepPlayingBackgroundSetting.isEnabled(appContext)) pause()
         mpv.setPropertyString(PROP_VID, "no")
     }
 
@@ -621,6 +668,7 @@ class MpvPlayer private constructor(
         private const val PROP_DURATION = "duration"
         private const val PROP_PAUSE = "pause"
         private const val PROP_PAUSED_FOR_CACHE = "paused-for-cache"
+        private const val PROP_DEMUXER_CACHE_TIME = "demuxer-cache-time"
         private const val PROP_TRACK_LIST = "track-list"
 
         // Runtime property names.

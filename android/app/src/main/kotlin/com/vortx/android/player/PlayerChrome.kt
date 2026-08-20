@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -42,6 +43,9 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Subtitles
@@ -79,6 +83,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.R
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.player.extras.AutoLandscapeSetting
+import com.vortx.android.player.extras.HdrToneMapSetting
+import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
+import com.vortx.android.player.extras.PlayerHandoff
+import com.vortx.android.player.extras.SeekBarStyle
+import com.vortx.android.player.extras.SkipBand
+import com.vortx.android.player.extras.StyledScrubber
 import com.vortx.android.model.Episode
 import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.Playable
@@ -123,6 +134,10 @@ fun PlayerChrome(
     speed: Float,
     scaleMode: VideoScaleMode,
     chapters: List<PlayerChapter>,
+    /// Skippable intro/recap/credits/preview segments for THIS title, drawn as coloured bands on the
+    /// scrubber (the host maps its [com.vortx.android.skip.SkipSegment] list to a colour per kind). Empty
+    /// leaves the scrubber unbanded. See [StyledScrubber].
+    skipBands: List<SkipBand> = emptyList(),
     subtitleDelayAvailable: Boolean,
     subtitleDelaySeconds: Double,
     onAdjustSubtitleDelay: (Double) -> Unit,
@@ -224,6 +239,14 @@ fun PlayerChrome(
     hardwareDecodingAvailable: Boolean = false,
     hardwareDecoding: Boolean = true,
     onSetHardwareDecoding: (Boolean) -> Unit = {},
+    /// HDR tone-map control (mpv-only; hidden on the Dolby Vision player, whose HDR/DV is hardware). The
+    /// chrome persists the mode itself (Apple `stremiox.hdrToneMapMode`) and calls [onApplyHdrToneMap] so the
+    /// host re-applies it to the live engine.
+    hdrToneMapAvailable: Boolean = false,
+    onApplyHdrToneMap: () -> Unit = {},
+    /// Opens the "contribute a skip time" editor. Non-null only for a submittable title (an IMDb id, not
+    /// live), gated by the host with [com.vortx.android.player.extras.SkipEditPolicy]; null hides the row.
+    onSubmitSkipTime: (() -> Unit)? = null,
     /// TV-ONLY additions (the phone host leaves both at their defaults, so its chrome is byte-for-byte
     /// unchanged). [shareLink] is the raw usable link this stream can be shared as -- a direct/debrid URL, or a
     /// magnet URI rebuilt from a torrent's info-hash -- and, when non-null, adds a "QR for your phone" row to
@@ -280,6 +303,20 @@ fun PlayerChrome(
         TrackPreferencesStore(context.applicationContext, PerformanceMode.isConstrainedDevice(context))
     }
     var trackPrefs by remember { mutableStateOf(trackStore.current) }
+
+    // The persisted seek-bar style, read once and updatable live by the in-player Seek Bar Style sheet. A
+    // change writes Apple's key immediately (so it rides the cross-device settings blob) and redraws the
+    // scrubber on the next frame. Mirrors Apple `SeekBarStyle.current`.
+    var seekBarStyle by remember { mutableStateOf(SeekBarStyle.current(context)) }
+
+    // The persisted HDR tone-map mode (mpv-only), read once and updated live by its sheet.
+    var hdrToneMapMode by remember { mutableStateOf(HdrToneMapSetting.currentMode(context)) }
+
+    // "Keep playing in background" toggle state (device-scoped), shown in the Player Settings sheet.
+    var keepPlayingBackground by remember { mutableStateOf(KeepPlayingBackgroundSetting.isEnabled(context)) }
+
+    // "Auto-rotate to landscape" toggle state (phone-only), shown in the Player Settings sheet.
+    var autoLandscape by remember { mutableStateOf(AutoLandscapeSetting.isEnabled(context)) }
     // Persist a new preference and apply it to the LIVE engine so the couch pick takes effect now, not just on
     // the next load. The subtitle apply keys off TrackSelector exactly as the auto-picker does (a -1 result is
     // "off"). Audio is left alone when neither the chain nor the English fallback matched (null id).
@@ -368,6 +405,14 @@ fun PlayerChrome(
                     tint = if (scaleMode != VideoScaleMode.FIT) emberAccent else Color.White,
                 ) { onInteraction(); openSheet = ControlSheet.VIDEO }
                 // Player settings overflow: sleep timer, decoder, playback info, and the engine switch.
+                // Share / hand-off: only for a stream that can actually leave the app (a real remote link,
+                // never a loopback torrent or a trailer). Opens a small sheet with Share link + Open in
+                // another player. Mirrors the Apple player's share sheet + external-player hand-off.
+                if (PlayerHandoff.canRouteExternally(playable)) {
+                    ChromeIcon(Icons.Filled.Share, "Share or open in another app") {
+                        onInteraction(); openSheet = ControlSheet.SHARE
+                    }
+                }
                 ChromeIcon(Icons.Filled.Settings, "Player settings") { onInteraction(); openSheet = ControlSheet.PLAYER_SETTINGS }
                 // Google Cast (the CAST lane), when the host supplies it for a castable stream. Drawn as a
                 // host slot so ALL cast logic stays in com.vortx.android.cast; the slot itself self-hides
@@ -405,6 +450,9 @@ fun PlayerChrome(
             seekStepSeconds = seekStepSeconds,
             onInteraction = onInteraction,
             scrubPreview = scrubPreview,
+            seekBarStyle = seekBarStyle,
+            chapters = chapters,
+            skipBands = skipBands,
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter),
@@ -752,6 +800,35 @@ fun PlayerChrome(
                     }
                     add(
                         SheetOption(
+                            label = "Keep playing in background",
+                            selected = keepPlayingBackground,
+                            detail = "Audio continues with the screen off",
+                            isChoice = true,
+                            dismissOnPick = false,
+                            onPick = {
+                                keepPlayingBackground = !keepPlayingBackground
+                                KeepPlayingBackgroundSetting.setEnabled(context, keepPlayingBackground)
+                            },
+                        ),
+                    )
+                    // Phone-only: the TV is always landscape, so the toggle is meaningless there.
+                    if (!isTvPlayer) {
+                        add(
+                            SheetOption(
+                                label = "Auto-rotate to landscape",
+                                selected = autoLandscape,
+                                detail = "Turn to landscape when a video opens",
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = {
+                                    autoLandscape = !autoLandscape
+                                    AutoLandscapeSetting.setEnabled(context, autoLandscape)
+                                },
+                            ),
+                        )
+                    }
+                    add(
+                        SheetOption(
                             label = "Playback Info",
                             selected = false,
                             detail = "›",
@@ -759,6 +836,40 @@ fun PlayerChrome(
                             dismissOnPick = false,
                         ),
                     )
+                    // Contribute a skip time: only for a submittable title (host-gated on an IMDb id + not
+                    // live). Opens the editor overlay the host draws above the chrome.
+                    onSubmitSkipTime?.let { submit ->
+                        add(
+                            SheetOption(
+                                label = "Contribute a skip time",
+                                selected = false,
+                                detail = "›",
+                                onPick = { submit() },
+                            ),
+                        )
+                    }
+                    add(
+                        SheetOption(
+                            label = "Seek Bar Style",
+                            selected = false,
+                            detail = seekBarStyle.displayName,
+                            onPick = { openSheet = ControlSheet.SEEK_BAR_STYLE },
+                            dismissOnPick = false,
+                        ),
+                    )
+                    // HDR tone mapping is mpv-only: the Dolby Vision player passes HDR through in hardware,
+                    // so the row is hidden there rather than shown as a dead control.
+                    if (hdrToneMapAvailable) {
+                        add(
+                            SheetOption(
+                                label = "HDR Tone Mapping",
+                                selected = false,
+                                detail = hdrToneMapMode.label,
+                                onPick = { openSheet = ControlSheet.HDR_TONE_MAP },
+                                dismissOnPick = false,
+                            ),
+                        )
+                    }
                     if (engineSwitchAvailable) {
                         add(
                             SheetOption(
@@ -822,6 +933,61 @@ fun PlayerChrome(
                             ),
                         )
                     }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SEEK_BAR_STYLE -> ControlSelectionSheet(
+                title = "Seek Bar Style",
+                options = SeekBarStyle.choices.map { candidate ->
+                    SheetOption(
+                        label = candidate.displayName,
+                        selected = seekBarStyle == candidate,
+                        isChoice = true,
+                        dismissOnPick = false,
+                        onPick = {
+                            seekBarStyle = candidate
+                            SeekBarStyle.setCurrent(context, candidate)
+                        },
+                    )
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SHARE -> ControlSelectionSheet(
+                title = "Share",
+                options = listOf(
+                    SheetOption(
+                        label = "Share link",
+                        selected = false,
+                        detail = "Send this stream's link",
+                        onPick = { PlayerHandoff.shareStream(context, playable) },
+                    ),
+                    SheetOption(
+                        label = "Open in another player",
+                        selected = false,
+                        detail = "Hand off to an installed video app",
+                        onPick = { PlayerHandoff.openInExternalPlayer(context, playable) },
+                    ),
+                ),
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.HDR_TONE_MAP -> ControlSelectionSheet(
+                title = "HDR Tone Mapping",
+                options = HdrToneMapSetting.Mode.entries.map { mode ->
+                    SheetOption(
+                        label = mode.label,
+                        detail = mode.detail,
+                        selected = hdrToneMapMode == mode,
+                        isChoice = true,
+                        dismissOnPick = false,
+                        onPick = {
+                            hdrToneMapMode = mode
+                            HdrToneMapSetting.setMode(context, mode)
+                            onApplyHdrToneMap()
+                        },
+                    )
                 },
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
@@ -951,6 +1117,21 @@ fun PlayerChrome(
 }
 
 /// The selection sheets the chrome can open.
+/// The seek target (ms) for a Previous-chapter press, or null when the playhead is already at the start of
+/// the first chapter. Jumps to the START of the CURRENT chapter when more than 3s into it (the universal
+/// "prev restarts this chapter first" behaviour), otherwise to the previous chapter's start.
+private fun prevChapterTargetMs(chapters: List<PlayerChapter>, positionMs: Long): Long? {
+    val starts = chapters.map { it.startMs }.sorted()
+    val threshold = positionMs - 3_000L
+    return starts.lastOrNull { it <= threshold }
+        ?: starts.firstOrNull()?.takeIf { positionMs > it + 500L }
+}
+
+/// The seek target (ms) for a Next-chapter press: the first chapter boundary ahead of the playhead, or null
+/// when the playhead is already in the last chapter.
+private fun nextChapterTargetMs(chapters: List<PlayerChapter>, positionMs: Long): Long? =
+    chapters.map { it.startMs }.sorted().firstOrNull { it > positionMs + 500L }
+
 private enum class ControlSheet {
     NONE,
     SOURCES,
@@ -967,6 +1148,9 @@ private enum class ControlSheet {
     CHAPTERS,
     PLAYER_SETTINGS,
     SLEEP,
+    SEEK_BAR_STYLE,
+    HDR_TONE_MAP,
+    SHARE,
     INFO,
     ENGINE,
     // TV-only sheets (reached only when the host opts in via shareLink / isTvPlayer).
@@ -1589,6 +1773,9 @@ private fun TransportBar(
     /// yank the slider out from under the finger. No-op by default.
     onInteraction: () -> Unit = {},
     scrubPreview: (Double) -> Bitmap? = { null },
+    seekBarStyle: SeekBarStyle = SeekBarStyle.CLASSIC,
+    chapters: List<PlayerChapter> = emptyList(),
+    skipBands: List<SkipBand> = emptyList(),
     modifier: Modifier = Modifier,
 ) {
     var scrubbing by remember { mutableStateOf(false) }
@@ -1663,29 +1850,66 @@ private fun TransportBar(
                     tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
                 )
             }
+            // Previous / next CHAPTER jumps: shown only for a title that actually carries chapters (the
+            // mpv engine reads `chapter-list`; a title with none leaves the pair absent, so the transport
+            // is byte-for-byte unchanged for the common case). Each is disabled when there is no boundary
+            // in that direction. Mirrors the Apple player's prev/next chapter controls.
+            if (chapters.size >= 2) {
+                val prevTarget = prevChapterTargetMs(chapters, position)
+                val nextTarget = nextChapterTargetMs(chapters, position)
+                IconButton(onClick = { prevTarget?.let(onSeek) }, enabled = prevTarget != null) {
+                    Icon(
+                        imageVector = Icons.Filled.SkipPrevious,
+                        contentDescription = "Previous chapter",
+                        tint = if (prevTarget != null) Color.White else Color.White.copy(alpha = 0.4f),
+                    )
+                }
+                IconButton(onClick = { nextTarget?.let(onSeek) }, enabled = nextTarget != null) {
+                    Icon(
+                        imageVector = Icons.Filled.SkipNext,
+                        contentDescription = "Next chapter",
+                        tint = if (nextTarget != null) Color.White else Color.White.copy(alpha = 0.4f),
+                    )
+                }
+            }
             Text(
                 text = formatTime(if (scrubbing && duration > 0L) (scrubValue * duration).toLong() else position),
                 color = Color.White,
                 fontSize = 12.sp,
                 modifier = Modifier.width(52.dp),
             )
-            Slider(
-                value = sliderValue,
-                onValueChange = {
+            StyledScrubber(
+                displayProgress = sliderValue,
+                bufferedFraction = if (duration > 0L) {
+                    (state.bufferedPositionMs.toFloat() / duration.toFloat())
+                } else {
+                    0f
+                },
+                durationSeconds = duration / 1000.0,
+                accent = emberAccent,
+                style = seekBarStyle,
+                // Freeze the per-frame motion while paused (Apple's `animated: !paused`): the played fill
+                // and knob still show, only the animation stops, which saves power on a paused player.
+                animated = !state.isPaused,
+                chapterStartsSeconds = chapters.map { it.startMs / 1000.0 },
+                skipBands = skipBands,
+                enabled = duration > 0L,
+                onScrubStart = {
+                    onInteraction()
+                    scrubbing = true
+                },
+                onScrub = {
                     onInteraction()
                     scrubbing = true
                     scrubValue = it
                 },
-                onValueChangeFinished = {
-                    if (duration > 0L) onSeek((scrubValue * duration).toLong())
+                onScrubEnd = {
+                    if (duration > 0L) onSeek((it * duration).toLong())
                     scrubbing = false
                 },
-                enabled = duration > 0L,
-                colors = SliderDefaults.colors(
-                    thumbColor = emberAccent,
-                    activeTrackColor = emberAccent,
-                ),
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .height(30.dp),
             )
             Text(
                 text = formatTime(duration),

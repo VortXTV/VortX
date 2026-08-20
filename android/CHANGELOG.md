@@ -5,6 +5,63 @@ Apple release notes live in the repository [CHANGELOG.md](../CHANGELOG.md).
 
 ## Unreleased
 
+### Player
+
+**A scrubber that finally looks like the Apple app.** The progress bar now honours your Seek Bar Style
+choice (fourteen looks, from Classic and Minimal to Wave, Ripple, Comet, Liquid, and Spectrum), animating
+from a continuous clock so a wave really travels. It draws a faint grey buffered-ahead band so you can see
+how far the stream has loaded, thin ticks at chapter boundaries, and coloured bands over skippable intros,
+recaps, and credits. The style is on the same setting key as Apple and web, so a look you pick on one device
+shows up on the others. Reachable in the player under Player Settings, Seek Bar Style.
+
+**Jump by chapter.** A title with chapters now shows Previous and Next chapter buttons in the transport
+row; Previous restarts the current chapter when you are a few seconds in, then steps back, and each button
+dims when there is no boundary that way. Titles without chapters look exactly as before.
+
+**Aspect ratio is remembered.** Your Fit, Fill, or Stretch choice now persists across titles and devices on
+the same key the Apple app uses, instead of snapping back to Fit every time you start something.
+
+**HDR tone mapping control.** Player Settings gains an HDR Tone Mapping choice (Auto, On, Off) on the same
+key as the Apple app. Auto tone-maps HDR and Dolby Vision down to SDR only when the screen cannot show HDR,
+On always tone-maps (the fix for a green or purple Dolby Vision mis-render), and Off always asks for HDR.
+It appears on the libmpv engine, which tone-maps in software; the Dolby Vision player leaves HDR to the panel.
+
+**Playback Info shows performance.** The Playback Info sheet now reports dropped frames and how many seconds
+of buffer sit ahead of the playhead, on both engines, so a struggling device or a starving link is obvious.
+
+**Chapters on the Dolby Vision player too.** The Dolby Vision (ExoPlayer) engine now surfaces in-stream ID3
+chapters, so the chapter picker and chapter ticks work there for streams that carry them, not only on libmpv.
+
+**Share and open elsewhere.** A share button in the player lets you share the current stream's link or hand
+it off to another installed video player, through the normal Android chooser so any app is offered and your
+"always" choice is remembered. It appears only for a real remote stream, never a loopback torrent or a trailer.
+
+**Keep playing in the background.** Player Settings gains a Keep playing in background toggle (on the same key
+and default as the Apple app), so audio keeps going with the screen off or the app behind another instead of
+pausing. The libmpv engine drops the off-screen video to save power. Turn it off to pause on background.
+
+**Skip from the Picture-in-Picture window.** The PiP window now shows skip-back and skip-forward controls
+either side of play/pause, seeking by your Skip step, so you can move through a video without leaving PiP.
+
+**Contribute skip times.** Player Settings now has a Contribute a skip time editor: pick a segment (intro,
+recap, credits, or preview), set its start and end from the playhead, and submit. It posts to the same
+skip.vortx.tv worker plus the community and any custom database, exactly like the Apple app, and appears only
+for a title with an IMDb id that is not live.
+
+**Your own scrub previews, even before the pool has them.** A per-device trickplay cache now serves scrub
+thumbnails from your own captured frames when the shared community pool has none yet (the first person to
+watch a title, or offline). It survives restarts on disk, prunes old frames, and is capped so it never grows
+without limit. This closes the second trickplay layer the Apple app has.
+
+**Auto-rotate to landscape.** On a phone, opening a video now turns the screen to landscape to match it and
+restores your orientation when you leave, on the same key and default as the Apple app. Trailers and TV are
+unaffected, and you can turn it off in Player Settings.
+
+**Anime4K upscaling.** The Anime4K neural upscaling preset now works on the libmpv engine: the bundled shader
+chain is extracted and applied through mpv, so animation gets the same anime-tuned upscaling the Apple app
+offers. It is a heavy GPU option best used on animation, and it appears only on builds that carry libmpv (it
+falls back gracefully if the shaders cannot be armed).
+
 ### Android TV
 
 **A living hero across Home, Discover, and Library.** The big cinematic banner now follows whatever you point

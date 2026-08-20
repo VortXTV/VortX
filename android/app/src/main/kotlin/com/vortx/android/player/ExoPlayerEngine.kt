@@ -12,9 +12,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.C
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
+import androidx.media3.common.Metadata
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.extractor.metadata.id3.ChapterFrame
+import androidx.media3.extractor.metadata.id3.TextInformationFrame
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
@@ -29,6 +32,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.vortx.android.model.Playable
+import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
 import com.vortx.android.player.tuning.AdaptiveTuning
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -99,6 +103,33 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         override fun onPlayerError(error: PlaybackException) {
             _state.value = _state.value.copy(hasError = true)
         }
+
+        // In-stream ID3 chapter frames (`CHAP`), accumulated so [chapters] can offer a chapter picker on
+        // this engine too. See [chapters] for what this can and cannot surface.
+        override fun onMetadata(metadata: Metadata) {
+            for (i in 0 until metadata.length()) {
+                val frame = metadata.get(i) as? ChapterFrame ?: continue
+                val startMs = frame.startTimeMs.toLong().coerceAtLeast(0L)
+                if (chapterStore.any { it.startMs == startMs }) continue
+                chapterStore.add(PlayerChapter(chapterTitle(frame) ?: "Chapter ${chapterStore.size + 1}", startMs))
+            }
+        }
+    }
+
+    /// ID3 chapters discovered in the current stream, published from [Player.Listener.onMetadata]. Thread-safe
+    /// because it is written on the player's callback thread and read (via [chapters]) from the chrome.
+    private val chapterStore = java.util.concurrent.CopyOnWriteArrayList<PlayerChapter>()
+
+    /// The title of an ID3 chapter frame, taken from its embedded TIT2 text sub-frame, or null when it
+    /// carries no title (the caller then names it by index).
+    private fun chapterTitle(frame: ChapterFrame): String? {
+        for (i in 0 until frame.subFrameCount) {
+            val sub = frame.getSubFrame(i)
+            if (sub is TextInformationFrame) {
+                sub.values.firstOrNull { it.isNotBlank() }?.let { return it }
+            }
+        }
+        return null
     }
 
     // ExoPlayer pushes position only on discrete callbacks, never per second, so a 1s ticker republishes
@@ -129,6 +160,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         _state.value = current.copy(
             positionMs = player.currentPosition.coerceAtLeast(0L),
             durationMs = player.duration.let { if (it == C.TIME_UNSET) 0L else it },
+            bufferedPositionMs = player.bufferedPosition.coerceAtLeast(0L),
             isPaused = !player.playWhenReady,
             isBuffering = buffering,
             hasEnded = ended,
@@ -170,6 +202,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     override fun load(playable: Playable) {
         lastPlayable = playable
+        // A fresh stream starts with no chapters; the ID3 frames for the new file repopulate the store.
+        chapterStore.clear()
 
         // Record this stream so the adaptive tuner can (when opted in, on an unmetered link) measure its
         // host in the background for the NEXT play. Fail-soft and gated inside noteStream.
@@ -316,9 +350,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // implements the manual auto/stereo/surround/passthrough control.
     override fun setAudioOutputMode(mode: AudioOutputMode) { /* auto-negotiated by DefaultAudioSink */ }
 
-    // Documented no-op: Media3 has no generic container-chapter API, so there are no chapters to expose.
-    // The mpv engine reads `chapter-list`.
-    override fun chapters(): List<PlayerChapter> = emptyList()
+    /// Chapters this engine can see: ONLY the in-stream ID3 `CHAP` frames delivered through
+    /// [Player.Listener.onMetadata] (HLS / MP3 / AAC that carry them). Media3 does NOT expose MP4 or Matroska
+    /// container chapter atoms through any public API, so those titles still show none here (the libmpv engine
+    /// reads `chapter-list` and does surface them). This is an honest partial, not a no-op: the picker now
+    /// works wherever Media3 actually delivers chapters.
+    override fun chapters(): List<PlayerChapter> = chapterStore.sortedBy { it.startMs }
 
     override fun setVolume(volume0to100: Double) {
         player.volume = (volume0to100 / 100.0).toFloat().coerceIn(0f, 1f)
@@ -370,6 +407,14 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             if (a.channelCount != Format.NO_VALUE) stats += "Channels" to a.channelCount.toString()
             if (a.sampleRate != Format.NO_VALUE) stats += "Sample rate" to "${a.sampleRate} Hz"
         }
+        // Performance rows: dropped video frames (from Media3's decoder counters) and how many seconds of
+        // buffer sit ahead of the playhead, the ExoPlayer analogue of the mpv frame-drop / cache readout.
+        player.videoDecoderCounters?.let { counters ->
+            counters.ensureUpdated()
+            if (counters.droppedBufferCount >= 0) stats += "Dropped frames" to counters.droppedBufferCount.toString()
+        }
+        val aheadMs = (player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)
+        if (player.duration != C.TIME_UNSET) stats += "Buffer ahead" to String.format("%.1fs", aheadMs / 1000.0)
         return stats
     }
 
@@ -417,7 +462,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         }
     }
 
-    override fun onEnterBackground() { player.pause() }
+    override fun onEnterBackground() {
+        // Keep audio going when "keep playing in the background" is on (Apple's default); the detached
+        // surface stops video output on its own, so nothing extra is needed for that. Off = pause as before.
+        if (!KeepPlayingBackgroundSetting.isEnabled(appContext)) player.pause()
+    }
     override fun onEnterForeground() { /* resume is the chrome's choice; keep paused-on-return conservative */ }
 
     override fun release() {

@@ -26,13 +26,12 @@ import kotlinx.coroutines.withContext
  * platform"; acceptance: play 6 minutes anywhere and the pool row grows) was being violated by a
  * subsystem marked DONE. This class is the missing driver.
  *
- * SCOPE vs Apple, stated up front so the gap is not mistaken for parity. Apple's store is TWO layers:
- * an L1 community sheet AND a per-device local disk cache (`LocalTrickplayFrameCache`) that serves scrub
- * previews from this device's own captures when the pool has nothing. This port implements the COMMUNITY
- * layer only. A local disk cache is a separate, self-contained piece of work; leaving it out costs a
- * first-contributor their own previews (they still contribute, and every later viewer gets the sheet),
- * whereas leaving the community layer unwired costs the whole pool. Previews therefore come from the
- * community sheet or not at all.
+ * SCOPE vs Apple. Apple's store is TWO layers: an L1 community sheet AND a per-device local disk cache
+ * (`LocalTrickplayFrameCache`) that serves scrub previews from this device's own captures when the pool has
+ * nothing. BOTH are now ported: [previewAt] returns the community crop when the pool has one, else this
+ * device's own frame from [LocalTrickplayFrameCache], so a first-contributor gets their own previews (and
+ * every later viewer still gets the shared sheet). Previews come from the community sheet, the local cache,
+ * or -- only when neither has a frame yet -- nothing.
  *
  * THREADING: the player calls [configure] / [recordFrame] / [finishAndFlush] from the Compose main
  * thread. Mutable state is confined behind [mutex] and every network/CPU step runs off the main thread
@@ -71,6 +70,16 @@ class TrickplaySession(context: Context) {
      */
     @Volatile
     private var sheet: CommunityTrickplay.Sheet? = null
+
+    /** Per-device local frame cache (this device's own captures), the second serve layer behind [sheet]. */
+    private val localCache = LocalTrickplayFrameCache(context)
+
+    /**
+     * The content key for the LOCAL cache, published `@Volatile` for the same reason as [sheet]: [previewAt]
+     * reads it on the main thread (per drag frame) while the keying coroutine writes it from IO.
+     */
+    @Volatile
+    private var localKey: String? = null
 
     /** Identity of the title currently keyed. Guarded by [mutex]. */
     private var contentKey: String? = null
@@ -179,6 +188,10 @@ class TrickplaySession(context: Context) {
             wasKeyed
         }
         if (rekeying) sheet = null
+        // Publish the local-cache key and warm this device's own frames for it from disk, so a re-opened
+        // title serves the viewer's previous previews before any fresh capture lands.
+        localKey = key
+        localCache.warm(key)
         Log.d(TAG, "community ${if (rekeying) "re-keyed" else "keyed"}: $key (imdb=$tt)")
 
         val fetched = CommunityTrickplay.fetch(key) ?: return
@@ -197,7 +210,8 @@ class TrickplaySession(context: Context) {
      * must never suspend, hit the network, or touch disk. Mirrors the community fast path of Apple's
      * `ScrubThumbnailsStore.show(time:)`.
      */
-    fun previewAt(timeSeconds: Double): Bitmap? = sheet?.crop(timeSeconds)
+    fun previewAt(timeSeconds: Double): Bitmap? =
+        sheet?.crop(timeSeconds) ?: localKey?.let { localCache.previewAt(it, timeSeconds) }
 
     /**
      * Record one captured frame and, if the gates allow, push the set. [jpeg] is the raw encoded frame
@@ -212,6 +226,9 @@ class TrickplaySession(context: Context) {
     fun recordFrame(jpeg: ByteArray, timeSeconds: Double, videoHeight: Int) {
         admissionQueue.enqueue {
             if (!keepFrame(jpeg, timeSeconds)) return@enqueue
+            // Bank the frame in the per-device local cache too (runs on this IO-backed queue), so this device
+            // serves its OWN previews even before it has contributed enough to fetch a community sheet.
+            localKey?.let { localCache.store(it, timeSeconds, jpeg) }
             val push = mutex.withLock {
                 if (contentKey == null) return@withLock null
                 // Remember the source height HERE rather than reading it off the engine at teardown: the

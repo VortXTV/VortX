@@ -37,6 +37,14 @@ interface PlayerEngine {
     val audioOutputModeAvailable: Boolean get() = false
 
     /**
+     * True only when this engine tone-maps HDR/DV in software and so can honour the HDR tone-map control
+     * (libmpv via libplacebo). The ExoPlayer / Dolby Vision engine passes HDR through in hardware and lets
+     * the panel present it, so it stays false and the chrome hides the control. Mirrors the Apple player's
+     * mpv-only HDR tone-map setting.
+     */
+    val hdrToneMapAvailable: Boolean get() = false
+
+    /**
      * True only when this engine can render a SECOND subtitle track at the same time as the primary
      * (libmpv `secondary-sid`). ExoPlayer has no secondary-subtitle overlay, so it stays false and the
      * chrome hides the control. Mirrors the Apple player's mpv-only dual-subtitle path.
@@ -116,6 +124,11 @@ interface PlayerEngine {
     /// `SubtitleView` style). Both concrete engines override; the default is a no-op for any future engine
     /// that renders no subtitles. Mirrors Apple `applySubtitleStyle`.
     fun applySubtitleStyle() {}
+
+    /// Re-read the persisted HDR tone-map policy (`stremiox.hdrToneMapMode`) and apply it to the live engine
+    /// (libmpv `target-trc` / `target-prim`). A documented no-op on ExoPlayer, whose HDR/DV passthrough is
+    /// hardware. Mirrors Apple applying the tone-map decision on the mpv lane.
+    fun applyHdrToneMap() {}
 
     /// Apply the device's [AudioOutputMode] (auto/stereo/surround/passthrough). The libmpv engine drives
     /// its AO channel/passthrough policy; ExoPlayer's `DefaultAudioSink` self-negotiates and exposes no
@@ -211,6 +224,10 @@ data class PlayerChapter(
 data class PlayerState(
     val positionMs: Long = 0L,
     val durationMs: Long = 0L,
+    /// Absolute position (ms) the engine has buffered/loaded ahead of the playhead: ExoPlayer's
+    /// `bufferedPosition`, libmpv's `demuxer-cache-time`. Feeds the scrubber's YouTube-style buffered-ahead
+    /// band (mirrors Apple `SeekBarTrack.buffered`). 0 = unknown, which draws nothing (fail-soft).
+    val bufferedPositionMs: Long = 0L,
     val isPaused: Boolean = false,
     val isBuffering: Boolean = false,
     val hasEnded: Boolean = false,

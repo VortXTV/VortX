@@ -2,6 +2,7 @@ package com.vortx.android.model
 
 import android.content.Context
 import android.content.res.Resources
+import com.vortx.android.BuildConfig
 
 /**
  * Player audio/subtitle auto-selection preferences plus the video upscaling preset. The Android port of
@@ -88,9 +89,10 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
         }
 
     /**
-     * Required file names for the planned Anime4K shader chain (Mode A: restore + upscale, Medium CNN
-     * variants). Android currently ships neither these resources nor the application wiring that resolves
-     * and applies them, so [ANIME4K] is never exposed or returned as an effective Android preset.
+     * File names for the Anime4K shader chain (Mode A: restore + upscale, Medium CNN variants), in chain
+     * order. The full flavor bundles these under `assets/shaders/` and the libmpv engine extracts + applies
+     * them via `glsl-shaders` ([com.vortx.android.player.mpv.Anime4KShaders]); the play flavor ships no libmpv,
+     * so [ANIME4K] is not offered there (see [androidChoices]).
      */
     val glslShaderFileNames: List<String>
         get() = when (this) {
@@ -108,8 +110,13 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
     companion object {
         fun fromStorage(raw: String?): VideoUpscaling? = entries.firstOrNull { it.storageValue == raw }
 
-        /** Implemented Android presets. Anime4K needs both packaged shaders and application wiring. */
-        val androidChoices: List<VideoUpscaling> = entries.filterNot { it == ANIME4K }
+        /**
+         * Implemented Android presets. Anime4K is offered ONLY on the full flavor, whose libmpv engine can
+         * extract and apply the bundled GLSL chain; the play flavor (ExoPlayer only, no libmpv, no GLSL hook)
+         * omits it rather than offering a dead control.
+         */
+        val androidChoices: List<VideoUpscaling> =
+            if (BuildConfig.FLAVOR == "full") entries.toList() else entries.filterNot { it == ANIME4K }
     }
 }
 
@@ -118,8 +125,8 @@ enum class VideoUpscaling(val storageValue: String, val label: String, val detai
  * Apple's `TrackPreferences.current`/`.save()` and `PlaybackSettings.videoUpscaling` (both on `UserDefaults`).
  *
  * [isConstrainedDevice] is Android's live `PerformanceMode.isConstrainedDevice` result. It controls the
- * default preset. Anime4K falls back on every Android device because neither its shaders nor its application
- * wiring are implemented; the stored value remains intact for cross-platform round trips.
+ * default preset. Anime4K is effective on the full flavor and falls back to the default on the play flavor
+ * (no libmpv); either way the stored value remains intact for cross-platform round trips.
  */
 class TrackPreferencesStore(
     context: Context,
@@ -147,15 +154,16 @@ class TrackPreferencesStore(
 
     /**
      * Video upscaling preset. Default is hardware-aware: a constrained device gets [VideoUpscaling.PERFORMANCE],
-     * everything else [VideoUpscaling.STANDARD]. Android never runs Anime4K until both its shader resources
-     * and application wiring exist, even if a synced profile selected it. Mirrors Apple
-     * `PlaybackSettings.videoUpscaling`.
+     * everything else [VideoUpscaling.STANDARD]. Anime4K is effective on the full flavor (its libmpv engine
+     * extracts + applies the bundled GLSL chain); on the play flavor, which has no libmpv, a stored/synced
+     * Anime4K value falls back to the hardware-aware default while the STORED value stays intact for
+     * cross-platform round trips. Mirrors Apple `PlaybackSettings.videoUpscaling`.
      */
     var videoUpscaling: VideoUpscaling
         get() {
             val stored = VideoUpscaling.fromStorage(prefs.getString(KEY_UPSCALING, null))
             if (stored != null) {
-                if (stored == VideoUpscaling.ANIME4K) {
+                if (stored == VideoUpscaling.ANIME4K && BuildConfig.FLAVOR != "full") {
                     return if (isConstrainedDevice) VideoUpscaling.PERFORMANCE else VideoUpscaling.STANDARD
                 }
                 return stored

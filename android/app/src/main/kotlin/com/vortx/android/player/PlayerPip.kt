@@ -150,13 +150,24 @@ internal fun rememberPlayerPip(
         val appContext = context.applicationContext
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(receiverContext: Context?, intent: Intent?) {
-                if (intent?.action == PIP_ACTION_TOGGLE_PLAY) engine.togglePause()
+                when (intent?.action) {
+                    PIP_ACTION_TOGGLE_PLAY -> engine.togglePause()
+                    // Relative seeks by the viewer's Skip step (Apple `stremiox.seekStep`), the same seam the
+                    // transport +/- buttons drive, so the PiP window's controls match the full player.
+                    PIP_ACTION_SKIP_BACK -> engine.seekBy(-SeekStepSetting.stepMs(appContext))
+                    PIP_ACTION_SKIP_FORWARD -> engine.seekBy(SeekStepSetting.stepMs(appContext))
+                }
             }
+        }
+        val filter = IntentFilter().apply {
+            addAction(PIP_ACTION_TOGGLE_PLAY)
+            addAction(PIP_ACTION_SKIP_BACK)
+            addAction(PIP_ACTION_SKIP_FORWARD)
         }
         ContextCompat.registerReceiver(
             appContext,
             receiver,
-            IntentFilter(PIP_ACTION_TOGGLE_PLAY),
+            filter,
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
         onDispose { runCatching { appContext.unregisterReceiver(receiver) } }
@@ -245,7 +256,15 @@ private fun buildPipParams(
     val (w, h) = pipAspect(videoWidthOf(engine), videoHeightForPip(engine))
     val builder = PictureInPictureParams.Builder()
         .setAspectRatio(Rational(w, h))
-        .setActions(listOf(playPauseRemoteAction(context, paused)))
+        // Skip back, play/pause, skip forward: three actions is within the framework's PiP action budget on
+        // every supported release, giving the PiP window the same core transport the full player has.
+        .setActions(
+            listOf(
+                skipRemoteAction(context, forward = false),
+                playPauseRemoteAction(context, paused),
+                skipRemoteAction(context, forward = true),
+            ),
+        )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         builder.setAutoEnterEnabled(autoEnter)
         // Seamless resize suits video surfaces (the system crossfades otherwise).
@@ -268,6 +287,22 @@ private fun playPauseRemoteAction(context: Context, paused: Boolean): RemoteActi
     return RemoteAction(Icon.createWithResource(context, iconRes), label, label, pendingIntent)
 }
 
+/// A skip-back / skip-forward PiP action. Platform rewind/fast-forward glyphs; each fires its own immutable
+/// broadcast that the receiver turns into a relative seek by the viewer's Skip step.
+private fun skipRemoteAction(context: Context, forward: Boolean): RemoteAction {
+    val label = if (forward) "Skip forward" else "Skip back"
+    val iconRes = if (forward) android.R.drawable.ic_media_ff else android.R.drawable.ic_media_rew
+    val action = if (forward) PIP_ACTION_SKIP_FORWARD else PIP_ACTION_SKIP_BACK
+    val requestCode = if (forward) PIP_SKIP_FORWARD_REQUEST_CODE else PIP_SKIP_BACK_REQUEST_CODE
+    val pendingIntent = PendingIntent.getBroadcast(
+        context,
+        requestCode,
+        Intent(action).setPackage(context.packageName),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+    return RemoteAction(Icon.createWithResource(context, iconRes), label, label, pendingIntent)
+}
+
 /// The source video WIDTH from the engine-agnostic playbackStats "Resolution" entry ("1920x1080"),
 /// the same seam [PlayerScreen]'s videoHeightOf uses for trickplay. 0 when unknown.
 private fun videoWidthOf(engine: PlayerEngine): Int {
@@ -284,11 +319,15 @@ private fun videoHeightForPip(engine: PlayerEngine): Int {
     return resolution.substringAfter('x', "").trim().toIntOrNull() ?: 0
 }
 
-/// App-internal broadcast action for the PiP window's play/pause RemoteAction.
+/// App-internal broadcast actions for the PiP window's RemoteActions.
 private const val PIP_ACTION_TOGGLE_PLAY = "com.vortx.android.player.PIP_TOGGLE_PLAY"
+private const val PIP_ACTION_SKIP_BACK = "com.vortx.android.player.PIP_SKIP_BACK"
+private const val PIP_ACTION_SKIP_FORWARD = "com.vortx.android.player.PIP_SKIP_FORWARD"
 
-/// Stable request code so FLAG_UPDATE_CURRENT swaps the action's icon in place.
+/// Stable request codes so FLAG_UPDATE_CURRENT swaps each action's icon in place.
 private const val PIP_TOGGLE_REQUEST_CODE = 4801
+private const val PIP_SKIP_BACK_REQUEST_CODE = 4802
+private const val PIP_SKIP_FORWARD_REQUEST_CODE = 4803
 
 /// The framework's legal PiP aspect band and the clamps/fallback used by [pipAspect].
 private const val PIP_MAX_RATIO = 2.39

@@ -205,9 +205,15 @@ fun PlayerScreen(
     }
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
-    // current playback speed reflected in the speed control.
-    var scaleMode by remember(playbackSessionKey) { mutableStateOf(VideoScaleMode.FIT) }
+    // current playback speed reflected in the speed control. The aspect mode is seeded from the persisted
+    // choice (Apple `stremiox.videoSize`) rather than always Fit, so the viewer's last pick is restored on
+    // every title instead of snapping back. Read per session so a change made mid-session sticks next time.
+    var scaleMode by remember(playbackSessionKey) {
+        mutableStateOf(com.vortx.android.player.extras.AspectRatioSetting.current(context))
+    }
     var speed by remember(playbackSessionKey) { mutableStateOf(1.0f) }
+    // Whether the "contribute a skip time" editor overlay is open. Reset per playback session.
+    var showSkipEditor by remember(playbackSessionKey) { mutableStateOf(false) }
     var subtitleDelaySeconds by remember(playbackSessionKey) {
         mutableStateOf(SubtitleOffsetMemory.savedOffset(context, subtitleContentKey) ?: 0.0)
     }
@@ -428,6 +434,25 @@ fun PlayerScreen(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // AUTO-ROTATE TO LANDSCAPE (Apple `stremiox.autoLandscapeInPlayer`, default on). On a phone, opening a
+    // non-trailer stream turns the device to landscape to match the video (following the sensor between the
+    // two landscape orientations), and restores the previous orientation on exit. A no-op on TV, which is
+    // always landscape, and for trailers, exactly like Apple's `forceLandscape` gate.
+    DisposableEffect(currentPlayable.isTrailer) {
+        val activity = activityOf(context)
+        val isTv = context.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK)
+        if (
+            activity != null && !isTv && !currentPlayable.isTrailer &&
+            com.vortx.android.player.extras.AutoLandscapeSetting.isEnabled(context)
+        ) {
+            val previous = activity.requestedOrientation
+            activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            onDispose { activity.requestedOrientation = previous }
+        } else {
+            onDispose { }
+        }
     }
 
     // MATCH FRAME RATE (AFR). When enabled, switch the display mode to match the source's frame rate once
@@ -1329,6 +1354,9 @@ fun PlayerScreen(
             speed = speed,
             scaleMode = scaleMode,
             chapters = chapters,
+            skipBands = skipSegments.map { seg ->
+                com.vortx.android.player.extras.SkipBand(seg.start, seg.end, skipBandColor(seg.kind))
+            },
             subtitleDelayAvailable = engine.subtitleDelayAvailable,
             subtitleDelaySeconds = subtitleDelaySeconds,
             onAdjustSubtitleDelay = { delta ->
@@ -1381,6 +1409,8 @@ fun PlayerScreen(
             onSelectScaleMode = { mode ->
                 showControls()
                 scaleMode = mode
+                // Persist under Apple's key so the pick survives this title and rides the cross-device blob.
+                com.vortx.android.player.extras.AspectRatioSetting.setCurrent(context, mode)
             },
             onErrorRetry = currentOnError,
             sourceOptions = if (currentOnSwitchSource != null) sourceOptions else emptyList(),
@@ -1501,6 +1531,20 @@ fun PlayerScreen(
                 showControls()
                 hardwareDecoding = hw
                 engine.setHardwareDecoding(hw)
+            },
+            // HDR tone-map (mpv-only). The chrome persists the mode; the host re-applies it to the live engine.
+            hdrToneMapAvailable = engine.hdrToneMapAvailable,
+            onApplyHdrToneMap = { engine.applyHdrToneMap() },
+            // Skip-time editor: offered only for a submittable title (an IMDb id, not live), on either engine.
+            onSubmitSkipTime = if (
+                com.vortx.android.player.extras.SkipEditPolicy.canEdit(
+                    isLiveContent = currentPlayable.isLive,
+                    contentId = currentPlayable.mediaRef?.imdb ?: "",
+                )
+            ) {
+                { showSkipEditor = true }
+            } else {
+                null
             },
             // SERVE: the community scrub preview. Synchronous by contract -- the chrome calls this for
             // every drag frame, so it only ever crops an already-downloaded sprite in memory. Returns null
@@ -1630,6 +1674,21 @@ fun PlayerScreen(
                     onStop = { castManager.stopCasting() },
                 )
             }
+        }
+
+        // Skip-time editor overlay, drawn above the chrome. Opened from the Player Settings sheet for a
+        // submittable title; seeded from the live playhead. Withheld in PiP (the tiny window is video-only).
+        val skipImdb = currentPlayable.mediaRef?.imdb
+        if (showSkipEditor && skipImdb != null && !pip.isInPip) {
+            com.vortx.android.player.extras.SkipSubmitEditor(
+                imdbId = skipImdb,
+                season = currentPlayable.mediaRef?.season,
+                episode = currentPlayable.mediaRef?.episode,
+                currentPositionMs = latestState.positionMs,
+                durationMs = latestState.durationMs,
+                emberAccent = emberAccent,
+                onDismiss = { showSkipEditor = false },
+            )
         }
     }
 }
@@ -1788,6 +1847,27 @@ private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
 /// threshold toward zero, so only truly tiny files are condemned). With NO expected runtime the
 /// only safe signal is the absolute floor: nothing feature-length is under [JUNK_DURATION_FLOOR_MS].
 /// Trailers are exempt (short by design); a non-positive duration is "not demuxed yet", never junk.
+/// The scrubber band colour for a skippable segment kind. Cool cyan for the intro, amber for a recap,
+/// violet for the credits, and orange for a next-episode preview, so a glance at the bar reads what each
+/// coloured stretch is. Kept next to the player because [PlayerChrome]'s scrubber is colour-agnostic.
+/// Unwrap the hosting [android.app.Activity] from a Compose [android.content.Context] (which may be a
+/// ContextWrapper chain), or null when none is found. Used to drive the window's requested orientation.
+private fun activityOf(context: android.content.Context): android.app.Activity? {
+    var ctx: android.content.Context = context
+    while (ctx is android.content.ContextWrapper) {
+        if (ctx is android.app.Activity) return ctx
+        ctx = ctx.baseContext
+    }
+    return null
+}
+
+private fun skipBandColor(kind: SkipSegment.Kind): Color = when (kind) {
+    SkipSegment.Kind.INTRO -> Color(0xFF3FC7E0)
+    SkipSegment.Kind.RECAP -> Color(0xFFE0B23F)
+    SkipSegment.Kind.CREDITS -> Color(0xFF9B7BE0)
+    SkipSegment.Kind.PREVIEW -> Color(0xFFE0803F)
+}
+
 private fun isJunkDuration(fileDurationMs: Long, playable: Playable): Boolean {
     if (playable.isTrailer || fileDurationMs <= 0L) return false
     val expectedMs = playable.expectedDurationMs
