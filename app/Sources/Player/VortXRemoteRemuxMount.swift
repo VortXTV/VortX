@@ -59,6 +59,10 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     private var invalidated = false
     private var poller: Task<Void, Never>?
     private var readyMarked = false
+    /// One exact remote close is shared by ordinary invalidation and an AV→MPV physical-quiescence handoff.
+    /// Repeating DELETEs may receive the same idempotent host receipt, but we never create competing local
+    /// waiters that could race their deadlines.
+    private var teardownReceipt: VortXRemuxQuiescenceReceipt?
 
     private init(session: VortXExternalEngine.OpenedSession,
                  engine: VortXExternalEngine,
@@ -288,18 +292,26 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         lock.unlock()
         guard !already else { return }
         task?.cancel()
-        engine.close(session)
+        _ = quiescenceReceipt()
     }
 
     /// A remote producer cannot be observed locally.  This receipt polls only the authenticated, generation-
     /// bound control acknowledgement; no HTTP 200 or listener cancellation is considered proof by itself.
     func quiescenceReceipt() -> VortXRemuxQuiescenceReceipt {
+        lock.lock()
+        if let teardownReceipt {
+            lock.unlock()
+            return teardownReceipt
+        }
         let terminal = VortXRemuxProducerTerminalRelay()
+        let receipt = VortXRemuxQuiescenceReceipt(terminal: terminal)
+        teardownReceipt = receipt
+        lock.unlock()
         Task.detached(priority: .userInitiated) { [engine, session] in
             guard await engine.closeAndAwaitReceipt(session) != nil else { return }
             terminal.fire()
         }
-        return VortXRemuxQuiescenceReceipt(terminal: terminal)
+        return receipt
     }
 }
 #endif

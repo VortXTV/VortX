@@ -907,24 +907,25 @@ enum SubtitleRenditionPolicy {
     static func webVTTDocument(cues: [Cue], segmentStart: Double? = nil,
                                segmentEnd: Double? = nil) -> String {
         let origin = segmentStart.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        let endBoundary: Double? = segmentEnd.flatMap { end in
-            guard end.isFinite, end >= 0, origin.map({ end >= $0 }) ?? true else { return nil }
-            return end
-        }
+        _ = segmentEnd // Segment overlap selects cues; a selected cue retains its complete interval.
         let mpegTimestamp: Int64 = origin.map { seconds in
             let ticks = (seconds * 90_000).rounded()
             guard ticks.isFinite, ticks >= 0, ticks <= Double(Int64.max) else { return 0 }
-            return Int64(ticks)
+            return Int64(ticks) % 8_589_934_592 // MPEG-TS PTS is 33-bit.
         } ?? 0
-        var lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:\(mpegTimestamp),LOCAL:00:00:00.000"]
+        var lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:\(mpegTimestamp),LOCAL:00:00:00.000", ""]
         for cue in cues {
             // A zero-or-negative-length cue is not displayable and some parsers reject the whole document
             // over one, so it is skipped here as a last line of defence even though `cue(payload:...)`
             // already enforces a minimum length.
             let start = origin.map { max(0, cue.start - $0) } ?? cue.start
-            let absoluteEnd = endBoundary.map { min(cue.end, $0) } ?? cue.end
+            // RFC 8216 requires a full cue in every segment it overlaps. Clipping at this segment's end
+            // loses continuity during a playlist reload and creates a visible subtitle flash.
+            let absoluteEnd = cue.end
             let end = origin.map { absoluteEnd - $0 } ?? absoluteEnd
-            guard end > start else { continue }
+            let startMilliseconds = Int((max(0, start) * 1_000).rounded())
+            let endMilliseconds = Int((max(0, end) * 1_000).rounded())
+            guard endMilliseconds > startMilliseconds else { continue }
             lines.append("")
             lines.append("\(timestamp(start)) --> \(timestamp(end))")
             lines.append(cue.text)

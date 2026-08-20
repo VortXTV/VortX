@@ -48,6 +48,8 @@ enum VortXRemuxProducerLeadPolicyTests {
         gateSetPausedIsIdempotent()
         gateCancelForcesUnpausedAndSticks()
         highThroughputProducerCannotConsumeTheRetainedWindowBudget()
+        clocklessStartupStillHonoursByteReservation()
+        monotonicLedgerRejectsStaleReceipts()
         anchorModeCannotBypassTheProducerGate()
 
         print("===== FAILURES: \(failures) =====")
@@ -166,5 +168,29 @@ enum VortXRemuxProducerLeadPolicyTests {
                 consumptionAnchored: false, retainsFullTimeline: true, reachedEndOfStream: false)
                 && !VortXRemuxProducerLeadPolicy.shouldDriveProducerGate(
                     consumptionAnchored: false, retainsFullTimeline: false, reachedEndOfStream: true))
+    }
+
+    static func clocklessStartupStillHonoursByteReservation() {
+        check("unknown playhead cannot bypass the producer byte cap",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: .nan,
+                aheadBytes: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                currentlyPaused: false))
+        check("unknown playhead cannot release a byte-cap pause",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: .nan,
+                aheadBytes: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                currentlyPaused: true))
+    }
+
+    static func monotonicLedgerRejectsStaleReceipts() {
+        var ledger = VortXRemuxProducerLeadLedger()
+        ledger.recordProduced(.init(id: 11, end: 12, byteLength: 100))
+        ledger.recordProduced(.init(id: 10, end: 6, byteLength: 100))
+        ledger.recordPlayback(8)
+        ledger.recordPlayback(4)
+        check("producer ledger keeps the newest physical boundary", ledger.producedEnd == 12)
+        check("producer ledger never rolls its consumer frontier back", ledger.playbackSeconds == 8)
+        check("producer ledger retains exactly the still-ahead byte reservation", ledger.outstandingBytes == 100)
     }
 }

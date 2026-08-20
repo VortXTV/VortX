@@ -29,7 +29,8 @@ enum VortXEngineProtocol {
 
     /// Bumped only for a BREAKING change. Additive fields do not move it. A client refuses a host whose major
     /// version it does not know rather than guessing at a shape.
-    static let version = 1
+    // v2 makes the generation-bound teardown receipt mandatory before a client starts a replacement decoder.
+    static let version = 2
 
     static let basePath = "/engine/v1"
 
@@ -248,7 +249,7 @@ enum VortXEngineProtocol {
     /// Additive teardown handshake.  The protocol major remains compatible; a client that requires this
     /// receipt refuses an older host rather than treating a successful DELETE as proof of producer unwind.
     struct TeardownRequest: Codable, Sendable, Equatable {
-        static let currentVersion = 1
+        static let currentVersion = 2
         let version: Int
         let sessionID: String
         let mountGeneration: String

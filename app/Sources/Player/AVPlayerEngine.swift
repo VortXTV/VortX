@@ -511,6 +511,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var bypassExternalEngine = false
     /// The in-flight external mount preflight, cancelled by the next load exactly as `nativePreAttachTask` is.
     private var externalMountTask: Task<Void, Never>?
+    /// A pending remote open can already have caused the host to construct a producer before its response
+    /// reaches us. Its terminal relay is owned immediately and joins AV→MPV teardown just like an attached
+    /// remote mount; cancellation alone is not a physical-release receipt.
+    private var externalMountTerminalRelay: VortXRemuxProducerTerminalRelay?
     /// One-shot resume request configured by the chrome before `loadFile`. `currentLoadResumeOrigin` retains
     /// the request only for same-token internal remounts (plain-remux and hvc1 repair); a new logical load with
     /// no configuration resets it to zero. `remuxTimelineOrigin` is the achieved base-video timestamp reported
@@ -1210,9 +1214,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                                           loadToken: PlayerLoadToken,
                                           generation: UInt64) {
         externalMountTask?.cancel()
+        let terminalRelay = VortXRemuxProducerTerminalRelay()
+        externalMountTerminalRelay = terminalRelay
         let mode: VortXEngineProtocol.RemuxMode = wantsPlainRemux ? .plain : .dolbyVision
         DiagnosticsLog.log("engine", "external engine mount requested mode=\(mode.rawValue) generation=\(generation)")
         externalMountTask = Task { @MainActor [weak self] in
+            defer {
+                terminalRelay.fire()
+                if self?.externalMountTerminalRelay === terminalRelay {
+                    self?.externalMountTerminalRelay = nil
+                }
+            }
             guard let self else { return }
             let mount = await VortXRemoteRemuxMount.open(
                 input: url, headers: headers, mode: mode, startAtSeconds: startAtSeconds,
@@ -2035,6 +2047,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if let server = remuxHLSServer { receipts.append(server.quiescenceReceipt()) }
         if let loader = remuxLoader { receipts.append(loader.quiescenceReceipt()) }
         if let remote = remuxRemoteMount { receipts.append(remote.quiescenceReceipt()) }
+        if let pendingRemote = externalMountTerminalRelay {
+            receipts.append(VortXRemuxQuiescenceReceipt(terminal: pendingRemote))
+        }
+        if let prepared = configuredPreparedRemux { receipts.append(prepared.handle.quiescenceReceipt()) }
         let receipt = VortXRemuxQuiescenceReceipt.all(receipts)
         stop()
         return receipt

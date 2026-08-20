@@ -107,12 +107,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// lead only while rendering a playlist, which leaves a fast UHD remux free to cross the spool ceiling
     /// between AVPlayer's roughly six-second reloads.
     private let producerLeadLock = NSLock()
-    private var latestProducedWindow = VortXHLSWindow(segments: [])
+    private var producerLeadLedger = VortXRemuxProducerLeadLedger()
     private var lastProducerLeadPaused: Bool?
     /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
     private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
     private var advertisedDolbyVision = false
+    private let engineReadyLock = NSLock()
     private var engineReady = false
     private var startupTimeoutLogged = false
     private let displayRequestLock = NSLock()
@@ -281,8 +282,10 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         self.hosting = hosting
         self.startupReadiness = startupReadiness
         self.onStartupTimeout = onStartupTimeout
-        stream.onHLSSegmentPublished = { [weak self] _ in
-            self?.producerDidPublish()
+        if !self.retainsFullTimeline {
+            stream.onHLSSegmentPublished = { [weak self] segment in
+                self?.producerDidPublish(segment)
+            }
         }
     }
 
@@ -536,7 +539,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         if transition.didExpire { handleMountTimeout() }
         guard transition.accepted else { return false }
         work?.cancel()
-        publicationLock.lock(); engineReady = true; publicationLock.unlock()
+        engineReadyLock.lock(); engineReady = true; engineReadyLock.unlock()
         stream.markEngineReady()
         DiagnosticsLog.log(
             "dv",
@@ -547,7 +550,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// True only after this mount accepted its one ready transition. Recovery items use this to distinguish an
     /// already-ready mount from a mount whose deadline expired before either item became playable.
     var hasMarkedEngineReady: Bool {
-        publicationLock.lock(); defer { publicationLock.unlock() }
+        isEngineReady
+    }
+
+    private var isEngineReady: Bool {
+        engineReadyLock.lock(); defer { engineReadyLock.unlock() }
         return engineReady
     }
 
@@ -641,7 +648,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         playbackClockLock.lock()
         seekAnchorState.reportPlaybackPosition(playerSeconds)
         playbackClockLock.unlock()
-        refreshProducerLeadGate()
+        refreshProducerLeadGate(playbackReceipt: playerSeconds)
     }
 
     func registerLatestSeekRequest(requestID: UInt64) {
@@ -729,27 +736,30 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Updates the lead gate from either a producer boundary or a confirmed player-clock receipt. This is kept
     /// outside `publicationLock`: neither source needs a playlist render to make progress, and the gate itself
     /// only parks at the next closed fragment boundary.
-    private func refreshProducerLeadGate(window: VortXHLSWindow? = nil) {
+    private func refreshProducerLeadGate(producedReceipt: VortXHLSSegment? = nil,
+                                         playbackReceipt: Double? = nil) {
         guard !retainsFullTimeline else {
             stream.producerLeadGate.setPaused(false)
             return
         }
         producerLeadLock.lock()
-        if let window { latestProducedWindow = window }
-        let produced = latestProducedWindow
+        if let producedReceipt {
+            producerLeadLedger.recordProduced(.init(
+                id: producedReceipt.id,
+                end: producedReceipt.end,
+                byteLength: max(0, producedReceipt.byteLength)))
+        }
+        if let playbackReceipt { producerLeadLedger.recordPlayback(playbackReceipt) }
+        let producedEnd = producerLeadLedger.producedEnd
+        let playback = producerLeadLedger.playbackSeconds
+        let aheadBytes = producerLeadLedger.outstandingBytes
+        let segmentCount = producerLeadLedger.outstandingSegmentCount
         producerLeadLock.unlock()
-        guard let tail = produced.segments.last else { return }
-        let playback = currentPlaybackSeconds()
-        let aheadBytes: Int? = playback.isFinite
-            ? produced.segments.reduce(into: 0) { total, segment in
-                guard segment.end > playback else { return }
-                let (next, overflow) = total.addingReportingOverflow(max(0, segment.byteLength))
-                total = overflow ? Int.max : next
-            }
-            : nil
+        guard let producedEnd else { return }
+        let playhead = playback ?? .nan
         let wasPaused = stream.producerLeadGate.isPaused
         let shouldPause = VortXRemuxProducerLeadPolicy.shouldPauseProducer(
-            leadSeconds: tail.end - playback,
+            leadSeconds: producedEnd - playhead,
             aheadBytes: aheadBytes,
             currentlyPaused: wasPaused)
         stream.producerLeadGate.setPaused(shouldPause)
@@ -758,15 +768,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         lastProducerLeadPaused = shouldPause
         producerLeadLock.unlock()
         if changed {
+            engineReadyLock.lock(); let ready = engineReady; engineReadyLock.unlock()
             DiagnosticsLog.log(
                 "hls",
-                "producer lead gate=\(shouldPause ? "park" : "run") engineReady=\(engineReady) anchored=\(consumptionAnchored) retainsFullTimeline=\(retainsFullTimeline) edge=\(String(format: "%.3f", tail.end)) playhead=\(playback.isFinite ? String(format: "%.3f", playback) : "unknown") lead=\((tail.end - playback).isFinite ? String(format: "%.3f", tail.end - playback) : "unknown") aheadBytes=\(aheadBytes.map(String.init) ?? "unknown") byteBudget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) segments=\(produced.segments.count)"
+                "producer lead gate=\(shouldPause ? "park" : "run") engineReady=\(ready) anchored=\(consumptionAnchored) retainsFullTimeline=\(retainsFullTimeline) edge=\(String(format: "%.3f", producedEnd)) playhead=\(playhead.isFinite ? String(format: "%.3f", playhead) : "unknown") lead=\((producedEnd - playhead).isFinite ? String(format: "%.3f", producedEnd - playhead) : "unknown") aheadBytes=\(aheadBytes) byteBudget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) segments=\(segmentCount)"
             )
         }
     }
 
-    private func producerDidPublish() {
-        refreshProducerLeadGate(window: stream.hlsWindowSnapshot().window)
+    private func producerDidPublish(_ segment: VortXHLSSegment) {
+        refreshProducerLeadGate(producedReceipt: segment)
     }
 
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
@@ -1476,7 +1487,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // readyToPlay until the live playlist offers more than the minimum cohort, so a frozen pre-ready
         // window deadlocks startup (the engine's readyToPlay is exactly what would have unfrozen it). The
         // consumption floor already pins the start at the startup sequence while nothing has been fetched.
-        if !engineReady, startup.ended || !consumptionAnchored {
+        if !isEngineReady, startup.ended || !consumptionAnchored {
             // `!consumptionAnchored` is the fleet escape hatch: the exact build 190 frozen pre-ready window.
             selectedVideo = startup.window
             ended = startup.ended
@@ -1588,7 +1599,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 consumptionAnchored: consumptionAnchored,
                 retainsFullTimeline: retainsFullTimeline,
                 reachedEndOfStream: commonReachedEOF) {
-                refreshProducerLeadGate(window: common)
+                // The gate is driven only by the monotonic producer boundary ledger and explicit playhead
+                // receipts.  Reusing this playlist's common window would let an older render overwrite a
+                // newer boundary receipt and re-open a cap pause.
             } else {
                 // At EOF, or on a hosted session, there is nothing left to bound production against (EOF: the
                 // producer is already done; hosted: production is meant to run ahead) - make sure a pause
@@ -1602,7 +1615,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // observe bounded playlist growth without waiting half a target duration for its first reload. A delayed
         // master still cannot expose the long producer tail and pull playback toward the live edge despite
         // EXT-X-START. The first segment fetch is the receipt that releases this cap.
-        if !engineReady,
+        if !isEngineReady,
            consumptionAnchored,
            highestServedVideoSegmentID < 0,
            !ended,

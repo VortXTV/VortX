@@ -3504,6 +3504,9 @@ struct PlayerScreen: View {
         }
         let directFallbackAttempt = directAVNoFrameRecovery?.attemptID
         avStartWatchdog?.cancel(); avStartWatchdog = nil
+        // This timer belongs to the retiring AV load token.  It must not fire while teardown is proving the
+        // old producer quiescent and misclassify the replacement MPV mount as a third attempt.
+        loadTimeout?.cancel(); loadTimeout = nil
         let engineRequestedResume =
             retiringAVPlayer.pendingRequestedSourcePositionSeconds
         // Real DV-profile evidence from the outgoing AVPlayer's own remux parse (#148), captured for the
@@ -3636,6 +3639,13 @@ struct PlayerScreen: View {
     /// design; matching is by lang/title). No-op when already on the requested engine.
     private func switchPlayerEngine(toAVPlayer: Bool) {
         guard toAVPlayer != isAVPlayerActive else { close(); return }
+        // A manual AV→MPV pick is the same physical handoff as automatic recovery.  Going through the shared
+        // transaction preserves the live URL/generations and refuses to mount MPV until every producer stops.
+        if !toAVPlayer, coordinator.player is AVPlayerEngineController {
+            demoteAVPlayerToMPV(silent: true)
+            close()
+            return
+        }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
         // non-DV MKV, or a mid-session switch to a torrent) so we never feed a dead URL into AVPlayer.

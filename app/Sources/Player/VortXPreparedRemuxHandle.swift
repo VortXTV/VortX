@@ -142,6 +142,13 @@ final class VortXPreparedRemuxHandle: @unchecked Sendable {
         server.invalidate()
     }
 
+    /// Available in every preparation state after construction, including a queued producer.  The caller can
+    /// therefore aggregate it with the active mount before mounting MPV; cancelling the handle alone is not a
+    /// physical input/network-release receipt.
+    func quiescenceReceipt() -> VortXRemuxQuiescenceReceipt {
+        server.quiescenceReceipt()
+    }
+
     deinit {
         abandon(reason: "handle-released")
     }

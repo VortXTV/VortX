@@ -888,6 +888,21 @@ final class VortXEngineHost: @unchecked Sendable {
     }
 
     private func handleTeardown(_ connection: NWConnection, id: String, body: Data) {
+        // A v1 client cannot validate a receipt.  Still accept its bodyless DELETE as cleanup so an upgrade
+        // does not strand an old session; v2 clients preflight and never rely on this path for a handoff.
+        if body.isEmpty {
+            stateLock.lock()
+            let legacySession = sessions[id]
+            stateLock.unlock()
+            guard let legacySession else {
+                reply(connection, status: "404 Not Found", body: VortXEngineProtocol.ErrorBody(
+                    error: "no_session", detail: nil))
+                return
+            }
+            legacySession.server.invalidate()
+            reply(connection, status: "204 No Content", body: Data())
+            return
+        }
         guard let request = try? JSONDecoder().decode(VortXEngineProtocol.TeardownRequest.self, from: body),
               request.version == VortXEngineProtocol.TeardownRequest.currentVersion,
               request.sessionID == id else {

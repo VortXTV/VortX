@@ -480,9 +480,10 @@ private func productionWiring() {
             end: ".ignoresSafeArea()",
             exactSection: """
                 MPVMetalPlayerView(coordinator: coordinator)
-                    .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
-                          isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
-                    .live(initialLiveMode)
+                    .play(mpvSurfacePlayback.url, headers: mpvSurfacePlayback.headers,
+                          audioSidecar: mpvSurfacePlayback.audioSidecar,
+                          isDolbyVision: mpvSurfacePlayback.isDolbyVision)
+                    .live(mpvSurfacePlayback.live)
                     .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                     .onAppear {
                         coordinator.player?.isFullPlayerPresentation = true
@@ -744,7 +745,7 @@ private func productionWiring() {
             && section.components(separatedBy: "?? \"na\"").count - 1 == 5
             && boundedProperties.allSatisfy(section.contains)
             && section.contains("decoder: false")
-            && section.contains("if sample.delta > 0 {")
+            && section.contains("if sample.delta > 0, presentationSettled {")
             && !section.contains("handle: self.mpv")
     }
     let controllerSource = sources["MPVMetalViewController.swift"]!

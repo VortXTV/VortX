@@ -3109,6 +3109,24 @@ final class MPVMetalViewController: PlatformViewController {
     /// ONE retry rescues a transient timeout / flaky first connection.
     private static let subtitleDownloadTimeout: TimeInterval = 12
     private static let subtitleDownloadRetries = 1
+    private static let maximumExternalSubtitleBytes = 2 * 1024 * 1024
+    private let externalSubtitleRequestLock = NSLock()
+    private var externalSubtitleRequestGeneration: UInt64 = 0
+
+    private static func acceptsExternalSubtitleURL(_ url: URL) -> Bool {
+        guard (url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http"),
+              let host = url.host?.lowercased(),
+              url.user == nil, url.password == nil else { return false }
+        // Reject local and private numeric targets before a request is issued.  DNS names remain subject to
+        // the normal platform resolver; this closes direct file/loopback/LAN SSRF from untrusted add-ons.
+        let forbidden = ["localhost", "::1", "0.0.0.0"]
+        guard !forbidden.contains(host), !host.hasPrefix("127."), !host.hasPrefix("10."),
+              !host.hasPrefix("192.168."), !host.hasPrefix("169.254."), !host.hasPrefix("fc"),
+              !host.hasPrefix("fd") else { return false }
+        if host.hasPrefix("172."), let second = host.split(separator: ".").dropFirst().first,
+           let octet = Int(second), (16...31).contains(octet) { return false }
+        return true
+    }
 
     /// Load an external subtitle from a (possibly slow) add-on URL WITHOUT blocking the caller, then
     /// select it. The old form ran `sub-add <remoteURL>` straight through `mpv_command`, which downloads
@@ -3123,10 +3141,15 @@ final class MPVMetalViewController: PlatformViewController {
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval = MPVMetalViewController.subtitleDownloadTimeout,
                              completion: ((Bool) -> Void)? = nil) {
-        guard let remote = URL(string: url), let requestToken = activeLoadToken else {
+        guard let remote = URL(string: url), Self.acceptsExternalSubtitleURL(remote),
+              let requestToken = activeLoadToken else {
             completion?(false)
             return
         }
+        externalSubtitleRequestLock.lock()
+        externalSubtitleRequestGeneration &+= 1
+        let requestGeneration = externalSubtitleRequestGeneration
+        externalSubtitleRequestLock.unlock()
         let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
 
         // Fast path: reuse a previously downloaded file if it's still on disk (no network).
@@ -3134,7 +3157,8 @@ final class MPVMetalViewController: PlatformViewController {
             self.queue.async { [weak self] in
                 guard let self else { finish(false); return }
                 finish(self.applyExternalSubtitle(
-                    cached, title: title, lang: lang, loadToken: requestToken
+                    cached, title: title, lang: lang, loadToken: requestToken,
+                    requestGeneration: requestGeneration
                 ))
             }
             return
@@ -3144,19 +3168,24 @@ final class MPVMetalViewController: PlatformViewController {
             guard let self, let localFile else { finish(false); return }
             self.queue.async {
                 finish(self.applyExternalSubtitle(
-                    localFile, title: title, lang: lang, loadToken: requestToken
+                    localFile, title: title, lang: lang, loadToken: requestToken,
+                    requestGeneration: requestGeneration
                 ))
             }
         }
     }
 
     private func applyExternalSubtitle(_ localFile: URL, title: String, lang: String,
-                                       loadToken: PlayerLoadToken) -> Bool {
+                                       loadToken: PlayerLoadToken,
+                                       requestGeneration: UInt64) -> Bool {
         // Serialize the ownership check and sub-add with replacement load issue. If replacement won the lock,
         // this fetch is stale and is dropped. If subtitle add won, it completes on the old file before that file
         // is synchronously replaced, so it cannot attach an E2 subtitle to E3 media.
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
-        guard PlayerLoadProvenanceState.accepts(
+        externalSubtitleRequestLock.lock()
+        let isLatestRequest = externalSubtitleRequestGeneration == requestGeneration
+        externalSubtitleRequestLock.unlock()
+        guard isLatestRequest, PlayerLoadProvenanceState.accepts(
             callbackToken: loadToken, activeToken: loadProvenance.activeToken
         ) else { return false }
         command("sub-add", args: [localFile.path, "select", title, lang])
@@ -3184,7 +3213,8 @@ final class MPVMetalViewController: PlatformViewController {
         request.cachePolicy = .returnCacheDataElseLoad
         subtitleSession.dataTask(with: request) { data, response, _ in
             let statusOK = (response as? HTTPURLResponse).map { (200 ..< 400).contains($0.statusCode) } ?? true
-            guard statusOK, let data, !data.isEmpty else {
+            guard statusOK, let data, !data.isEmpty,
+                  data.count <= maximumExternalSubtitleBytes else {
                 if retriesLeft > 0 {
                     downloadSubtitle(remote, timeout: timeout, retriesLeft: retriesLeft - 1, done: done)
                 } else { done(nil) }

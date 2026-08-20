@@ -4768,6 +4768,7 @@ struct TVPlayerView: View {
         let fallbackAttemptID = directAVNoFrameRecovery?.attemptID ?? UUID().uuidString
         let followedDirectNoFrame = directAVNoFrameRecovery != nil
         avStartWatchdog?.cancel(); avStartWatchdog = nil
+        loadTimeout?.cancel(); loadTimeout = nil
         libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil   // fresh mount incoming: retire any deferred-resume safety net
         let engineRequestedResume =
             retiringAVPlayer.pendingRequestedSourcePositionSeconds
@@ -4940,6 +4941,11 @@ struct TVPlayerView: View {
     /// design; matching is by lang/title). No-op when already on the requested engine.
     private func switchPlayerEngine(toAVPlayer: Bool) {
         guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
+        if !toAVPlayer, coordinator.player is AVPlayerEngineController {
+            _ = demoteAVPlayerToMPV()
+            withAnimation { showOptions = false }
+            return
+        }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
         // non-DV MKV, or a mid-session switch to a torrent) so we never feed a dead URL into AVPlayer.
