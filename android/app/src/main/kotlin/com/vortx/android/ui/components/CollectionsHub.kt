@@ -41,6 +41,7 @@ import com.vortx.android.home.CollectionsHubLabel
 import com.vortx.android.home.CollectionsHubSnapshot
 import com.vortx.android.home.CollectionsHubTarget
 import com.vortx.android.home.CollectionsHubTile
+import com.vortx.android.metadata.ProviderBrandLogo
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.theme.VortXTheme
 
@@ -145,7 +146,21 @@ private fun HubTile(tile: CollectionsHubTile, onOpen: (CollectionsHubTarget) -> 
         colors = CardDefaults.cardColors(containerColor = VortXTheme.colors.surface2),
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            if (tile.imageUrl != null) {
+            // A streaming-service tile with a curated brand style is drawn as a full-bleed brand fill with
+            // its own centered mark (item 8), which IS its label, so the dark gradient + name overlay is
+            // suppressed for it. Every other tile (Discover / genre / decade, or a service with no curated
+            // style) keeps the representative-backdrop crop + the editorial title overlay.
+            val serviceTarget = tile.target as? CollectionsHubTarget.Service
+            val brandLabeled = serviceTarget != null &&
+                ProviderBrandLogo.brandStyle(serviceTarget.providerId) != null
+            if (serviceTarget != null) {
+                ServiceTileArt(
+                    providerId = serviceTarget.providerId,
+                    name = serviceTarget.name,
+                    imageUrl = tile.imageUrl,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            } else if (tile.imageUrl != null) {
                 AsyncImage(
                     model = tile.imageUrl,
                     contentDescription = null,
@@ -153,22 +168,24 @@ private fun HubTile(tile: CollectionsHubTile, onOpen: (CollectionsHubTarget) -> 
                     modifier = Modifier.fillMaxSize(),
                 )
             }
-            Box(
-                modifier = Modifier.fillMaxSize().background(
-                    Brush.verticalGradient(listOf(Color.Transparent, VortXTheme.colors.canvas.copy(alpha = 0.94f))),
-                ),
-            )
-            Column(
-                modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
-            ) {
-                Text(title, style = VortXTheme.type.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                subtitle?.let {
-                    Text(
-                        it,
-                        style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textSecondary),
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+            if (!brandLabeled) {
+                Box(
+                    modifier = Modifier.fillMaxSize().background(
+                        Brush.verticalGradient(listOf(Color.Transparent, VortXTheme.colors.canvas.copy(alpha = 0.94f))),
+                    ),
+                )
+                Column(
+                    modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
+                ) {
+                    Text(title, style = VortXTheme.type.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    subtitle?.let {
+                        Text(
+                            it,
+                            style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textSecondary),
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
         }
@@ -243,7 +260,7 @@ internal fun CollectionsBrowseScreen(
                         title = item.name,
                         subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
                         onClick = { onItem(item) },
-                        art = { PosterArt(item.poster, item.name) },
+                        art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                     )
                 }
                 if (state.hasMore || (state.error != null && state.items.isNotEmpty())) {

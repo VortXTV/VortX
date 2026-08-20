@@ -134,7 +134,7 @@ fun TvPosterCard(
                 ),
             ),
         ) {
-            PosterArt(item.poster, item.name)
+            PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
             if (item.watched) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
                 Icon(

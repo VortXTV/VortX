@@ -39,6 +39,24 @@ account by scanning a code (or entering it at vortx.tv/approve) on a signed-in p
 profiles, add-ons, library, and settings are stored in your account, end-to-end encrypted, and restored on any
 device you sign in. Nothing is written to a file and your account token never leaves the device.
 
+### Posters, artwork and ratings
+
+**Ratings baked onto your posters, on by default.** Every catalog and detail poster now routes through
+VortX's own keyless poster service, so the cross-provider rating (IMDb, Rotten Tomatoes, Metacritic, TMDB)
+is baked right onto the artwork with no key and no setup. Where a poster is not baked (a card showing clean
+art, or an add-on id the service cannot render), a small rating badge is drawn over the card instead, so a
+rating shows either way. The original artwork is always carried as a fail-soft fallback, so a title the
+service cannot map keeps its own poster.
+
+**Poster Style screen.** A new Settings > Poster Style screen sets the card width, corner radius, a landscape
+16:9 vs portrait layout, and a hide-labels option, with a live preview that updates as you change each one.
+The same screen carries the artwork toggles: turn ratings-on-posters off, switch on ERDB baked posters,
+backdrops and logos, or use fanart.tv community logos for the hero.
+
+**Richer hero art.** The detail hero now tints its band with the dominant color of the backdrop, and can
+show a fanart.tv or rating-baked clearlogo in place of the title text. Streaming-service tiles in Discover
+render each service's real brand logo on its own brand color, instead of a generic mark.
+
 ### Sources and debrid
 
 **Browse and play your debrid cloud, no add-on needed.** A new Settings > Debrid > Your cloud screen lists

@@ -108,6 +108,7 @@ import com.vortx.android.ui.screens.LibraryTransferScreen
 import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MergedDiscoverSearchScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
+import com.vortx.android.ui.screens.PosterStyleScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
@@ -280,6 +281,7 @@ fun VortXApp(
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
         var showMetadataKeys by remember { mutableStateOf(false) }
+        var showPosterStyle by remember { mutableStateOf(false) }
         var showHomeDiscover by remember { mutableStateOf(false) }
         var showDebridKeys by remember { mutableStateOf(false) }
         var showDebridLibrary by remember { mutableStateOf(false) }
@@ -336,6 +338,7 @@ fun VortXApp(
             showPlayback = false
             showSources = false
             showMetadataKeys = false
+            showPosterStyle = false
             showHomeDiscover = false
             showDebridKeys = false
             showDebridLibrary = false
@@ -880,6 +883,15 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showPosterStyle) {
+            // Settings > Poster Style (poster-artwork lane): width / corner-radius presets + landscape 16:9 +
+            // hide-labels, on Apple's exact `stremiox.catalog.*` keys, with a live preview. Self-contained
+            // (its own PosterStylePreferences store), so no ViewModel.
+            BackHandler { showPosterStyle = false }
+            PosterStyleScreen(onBack = { showPosterStyle = false })
+            return@VortXTheme
+        }
+
         if (showHomeDiscover) {
             // Settings > Home & Discover (SET-3): content toggles + collections cadence on the shared
             // vortx_settings file. Self-contained (its own HomeDiscoverPreferences store), so no ViewModel.
@@ -1138,6 +1150,7 @@ fun VortXApp(
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
                     onMetadataKeysClick = { showMetadataKeys = true },
+                    onPosterStyleClick = { showPosterStyle = true },
                     onHomeDiscoverClick = { showHomeDiscover = true },
                     onDebridKeysScreenClick = {
                         restoreDebridServicesFocus = false

@@ -1,6 +1,8 @@
 package com.vortx.android.ui.prefs
 
 import android.content.Context
+import com.vortx.android.config.RemoteConfig
+import com.vortx.android.config.RemoteConfigDefaults
 import java.util.Locale
 
 /**
@@ -56,9 +58,14 @@ class HomeDiscoverPreferences(context: Context) {
     /**
      * Spoiler-safe mode. One toggle drives BOTH keys together (Apple iOSSettingsView.swift:1704-1705), so
      * turning it off fully clears the veil with no leftover default-on `vortx.spoilerBlur`.
+     *
+     * The fleet default (Apple `SpoilerBlurSetting`): a user who has toggled the key wins; otherwise the
+     * RemoteConfig `features.spoilerBlur` fleet default applies. Baked-true default keeps a fresh install and
+     * an unreachable RemoteConfig byte-identical to shipping, while a remote false can clear the veil fleet-wide.
      */
     val spoilerSafe: Boolean
-        get() = prefs.getBoolean(KEY_SPOILER_SAFE, true)
+        get() = if (prefs.contains(KEY_SPOILER_SAFE)) prefs.getBoolean(KEY_SPOILER_SAFE, true)
+                else RemoteConfig.isFeatureOn("spoilerBlur", RemoteConfigDefaults.FEATURE_SPOILER_BLUR)
 
     fun setSpoilerSafe(value: Boolean) {
         prefs.edit()

@@ -122,7 +122,7 @@ fun PersonScreen(
                         title = item.name,
                         subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ").ifBlank { null },
                         onClick = { openTitle(item) },
-                        art = { PosterArt(item.poster, item.name) },
+                        art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                     )
                 }
             } else {

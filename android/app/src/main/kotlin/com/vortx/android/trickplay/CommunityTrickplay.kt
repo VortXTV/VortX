@@ -8,6 +8,8 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
 import android.util.Log
+import com.vortx.android.config.RemoteConfig
+import com.vortx.android.config.RemoteConfigDefaults
 import com.vortx.android.net.VortXEdgeAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -52,9 +54,9 @@ import kotlin.math.sqrt
  *   - the CAPTURE feed: `PlayerScreen`'s wall-clock capture driver pulls a frame off the live engine via
  *     `PlayerEngine.captureFrameJpeg` and hands it to [TrickplaySession.recordFrame], which buffers
  *     [CapturedFrame]s and calls [buildAndUpload].
- * [isEnabled] now reads Apple's real setting key ([SETTING_KEY]). Still NOT wired: the RemoteConfig fleet
- * kill-switch (`features.communityTrickplay`) Apple ANDs in, because Android has no remote-config dial;
- * and no settings row WRITES [SETTING_KEY] yet, so it sits at its unset default (on).
+ * [isEnabled] reads Apple's real setting key ([SETTING_KEY]) AND the RemoteConfig fleet kill-switch
+ * (`features.communityTrickplay`), matching Apple. Still missing: a settings row that WRITES [SETTING_KEY],
+ * so the user key sits at its unset default (on) until one lands.
  *
  * ANDROID CONTRIBUTION ASYMMETRY (does not exist on Apple, do not "fix" it in this file): capture needs a
  * frame readback, and only the libmpv engine can attempt one. The ExoPlayer engine renders to a
@@ -92,19 +94,21 @@ object CommunityTrickplay {
      * default-on-when-unset semantics (Apple: `if UserDefaults.standard.object(forKey:) == nil { return
      * true }`), so a fresh install contributes and a viewer who opts out is honored on both platforms.
      *
-     * STILL MISSING vs Apple, and deliberately not faked here: (1) the RemoteConfig fleet kill-switch
-     * (`features.communityTrickplay`) Apple ANDs in -- Android has no remote-config dial at all yet, so
-     * there is nothing to AND; (2) a user-reachable control that WRITES this key. Android's settings
-     * screen has no trickplay row, so today the key is always its unset default (true) and this is
-     * behaviourally identical to the old `const val isEnabled = true`. Reading the real key now means the
-     * moment a settings row lands on this key it takes effect, with no second wiring pass and no window
-     * where the UI claims to control something that is not read.
+     * Now ALSO ANDs the RemoteConfig fleet kill-switch (`features.communityTrickplay`), exactly as Apple's
+     * `isEnabled` does: a remote `false` disables contribution across the fleet with no app update, while the
+     * baked-true default keeps an unreachable RemoteConfig byte-identical to shipping. Still missing vs Apple:
+     * a user-reachable control that WRITES [SETTING_KEY]; Android's settings screen has no trickplay row, so
+     * today the user key sits at its unset default (true) and the effective gate is the fleet flag AND true.
      */
     fun isEnabled(context: Context): Boolean {
+        if (!RemoteConfig.isFeatureOn(FEATURE_KEY, RemoteConfigDefaults.FEATURE_COMMUNITY_TRICKPLAY)) return false
         val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
         if (!prefs.contains(SETTING_KEY)) return true
         return prefs.getBoolean(SETTING_KEY, true)
     }
+
+    /** RemoteConfig fleet kill-switch key, byte-for-byte Apple's `features.communityTrickplay`. */
+    private const val FEATURE_KEY = "communityTrickplay"
 
     /**
      * Persist the viewer's opt-in choice under the SAME [SETTING_KEY] Apple writes, in the SAME

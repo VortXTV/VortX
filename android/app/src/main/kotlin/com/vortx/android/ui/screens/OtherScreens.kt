@@ -445,6 +445,7 @@ fun SettingsScreen(
     onPlaybackClick: () -> Unit,
     onSourcesClick: () -> Unit,
     onMetadataKeysClick: () -> Unit,
+    onPosterStyleClick: () -> Unit,
     onHomeDiscoverClick: () -> Unit,
     onDebridKeysScreenClick: () -> Unit,
     onDebridLibraryClick: () -> Unit,
@@ -508,6 +509,14 @@ fun SettingsScreen(
             "Appearance",
             "Theme, text size",
             onClick = onAppearanceScreenClick,
+        )
+        // Poster Style (poster-artwork lane): card width / corner-radius presets + landscape + hide-labels,
+        // on Apple's exact `stremiox.catalog.*` keys, with a live preview.
+        SettingRow(
+            VortXIcons.settings,
+            "Poster Style",
+            "Card size, corners, layout",
+            onClick = onPosterStyleClick,
         )
         // Home & Discover content settings (SET-3): editorial rows, collections hub, spoiler-safe, etc.
         SettingRow(
@@ -683,7 +692,7 @@ internal fun PosterGrid(
                         progress = item.progress,
                         watched = item.watched,
                         menuItem = if (showMenu) item else null,
-                        art = { PosterArt(item.poster, item.name) },
+                        art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                     )
                     if (onRemove != null) {
                         RemoveBadge(

@@ -81,6 +81,8 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.metadata.PosterArtwork
+import com.vortx.android.metadata.rememberBackdropTint
 import com.vortx.android.ratings.MdbListClient
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.RatingsFormat
@@ -716,7 +718,14 @@ private fun Backdrop(m: MetaDetail) {
                 .fillMaxWidth()
                 .height(heroHeight(maxWidth)),
         ) {
-            val backdropUrl = m.background ?: m.poster
+            // Route the backdrop through the artwork router: ERDB bakes ratings/quality onto backdrops when
+            // active, otherwise the original add-on/metahub backdrop (or the poster) is used unchanged.
+            val rawBackdrop = m.background ?: m.poster
+            val backdropUrl = PosterArtwork.backdrop(m.id, rawBackdrop)
+            // Dominant-color tint (item 6): the alpha-weighted average of the decoded backdrop, washed into
+            // the lower hero band so the banner blends into a color drawn from the art itself, not a fixed
+            // neutral. Null until it resolves (or on any miss), so the band keeps its scrim-only look.
+            val tint by rememberBackdropTint(backdropUrl)
             if (backdropUrl.isNullOrBlank()) {
                 Box(
                     modifier = Modifier
@@ -729,6 +738,18 @@ private fun Backdrop(m: MetaDetail) {
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize(),
+                )
+            }
+            tint?.let { bandTint ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(
+                            Brush.verticalGradient(
+                                0f to bandTint.copy(alpha = 0f),
+                                1f to bandTint.copy(alpha = 0.42f),
+                            ),
+                        ),
                 )
             }
             // Dual scrim: a vertical fade to the canvas color (blends the banner into the content
@@ -770,7 +791,15 @@ private fun Backdrop(m: MetaDetail) {
 @Composable
 private fun DetailTitle(m: MetaDetail) {
     var logoFailed by remember(m.logo) { mutableStateOf(false) }
-    val logo = detailLogoUrl(m.logo, logoFailed)
+    // Resolve the hero logo the same way every Apple hero/detail slot does (PosterArtwork.resolvedLogo):
+    // fanart.tv clearlogo first when the fanart toggle is on (item 4), else the ERDB-aware add-on/metahub
+    // logo (item 2). The add-on logo shows immediately and a fanart/ERDB logo swaps in once resolved, so the
+    // band never blanks. Instant (no network) when both toggles are off.
+    var resolvedLogo by remember(m.id) { mutableStateOf(m.logo) }
+    LaunchedEffect(m.id) {
+        resolvedLogo = PosterArtwork.resolvedLogo(m.id, m.type.id, m.logo)
+    }
+    val logo = detailLogoUrl(resolvedLogo, logoFailed)
     if (logo != null) {
         AsyncImage(
             model = logo,
@@ -1203,7 +1232,7 @@ private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaIt
                     subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ").ifBlank { null },
                     onClick = { onOpen(item) },
                     modifier = Modifier.width(120.dp),
-                    art = { PosterArt(item.poster, item.name) },
+                    art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                 )
             }
         }
@@ -1236,7 +1265,7 @@ private fun CollectionRail(collection: CollectionClient.MovieCollection, onOpen:
                     subtitle = item.year,
                     onClick = { onOpen(item) },
                     modifier = Modifier.width(120.dp),
-                    art = { PosterArt(item.poster, item.name) },
+                    art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                 )
             }
         }

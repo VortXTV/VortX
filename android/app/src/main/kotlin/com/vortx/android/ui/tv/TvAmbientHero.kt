@@ -33,6 +33,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.lerp
 import coil3.compose.AsyncImage
+import com.vortx.android.config.RemoteConfig
+import com.vortx.android.config.RemoteConfigDefaults
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.ui.theme.VortXMotion
@@ -54,7 +56,8 @@ import com.vortx.android.ui.theme.rememberReducedMotion
 ///   * Crossfade animates ALPHA only (compositor-friendly), Ken Burns animates scale/translation only -- no
 ///     layout animation, matching DESIGN-SYSTEM.md.
 ///   * Ambient motion is gated on the Apple-parity "Autoplay trailers" setting
-///     ([TrackPreferencesStore.autoplayTrailers], key `stremiox.autoplayTrailers`) AND the Android
+///     ([TrackPreferencesStore.autoplayTrailers], key `stremiox.autoplayTrailers`), the RemoteConfig fleet
+///     kill-switch (`features.trailers`, Apple ANDs the same in HomeView/FeaturedHeroView), AND the Android
 ///     reduced-motion signal ([rememberReducedMotion]): reduced motion pins a still frame, no pan, no clip.
 ///   * TV-only: this replaces the flat [com.vortx.android.ui.tv] Home hero and never touches the phone Home
 ///     ([com.vortx.android.ui.screens.HomeScreen]).
@@ -82,7 +85,10 @@ internal fun TvAmbientHero(item: MetaItem?, modifier: Modifier = Modifier) {
 
         // 2) Ambient trailer: a muted looping clip fades in OVER the still backdrop once focus settles and a
         //    trailer is readily available; otherwise this stays absent and the Ken Burns above is the ambient.
-        val trailer = rememberHeroTrailerPlayable(item, enabled = autoplayTrailers && !reducedMotion)
+        // Fleet kill-switch (Apple ANDs `features.trailers` in HomeView/FeaturedHeroView): a remote false
+        // stops ambient trailers across the fleet; baked-true default => unreachable config == shipping.
+        val trailersFleetOn = RemoteConfig.isFeatureOn("trailers", RemoteConfigDefaults.FEATURE_TRAILERS)
+        val trailer = rememberHeroTrailerPlayable(item, enabled = autoplayTrailers && !reducedMotion && trailersFleetOn)
         if (trailer != null) {
             TvHeroAmbientTrailer(
                 playable = trailer,

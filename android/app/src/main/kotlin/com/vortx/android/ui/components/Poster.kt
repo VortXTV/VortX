@@ -13,35 +13,69 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
+import com.vortx.android.metadata.LocalizedMetadataStore
+import com.vortx.android.metadata.PosterArtwork
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 
-/// [PosterCard]'s `art` slot for a real catalog item: a Coil [AsyncImage] with crossfade when
-/// [posterUrl] is present, falling back to [DefaultPosterArt] (the deterministic brand-tinted
-/// placeholder) when it's null -- an unloaded add-on preview, or a still-hydrating row. This is the
-/// ONE place every poster/backdrop image request in the app goes through, so cache config and
-/// crossfade behavior stay consistent call-site to call-site (see `VortXApplication`'s ImageLoader,
-/// wired app-wide via Coil's `SingletonImageLoader.Factory` install in that class).
+/// [PosterCard]'s `art` slot for a real catalog item: a Coil [AsyncImage] with crossfade when a poster
+/// is present, falling back to [DefaultPosterArt] (the deterministic brand-tinted placeholder) when
+/// it's null. This is the ONE place every poster image request in the app goes through, so cache
+/// config and crossfade behavior stay consistent (see `VortXApplication`'s ImageLoader).
+///
+/// When [id] is supplied it routes the poster URL through [PosterArtwork] (the Kotlin port of Apple's
+/// poster router): a localized-title poster override first (item 9, gated off for English), then the
+/// baked-rating poster service (poster.vortx.tv / ERDB, default on) with the original art carried as
+/// `fb=` for fail-soft. A [CardRatingBadge] is overlaid ONLY when the visible art is NOT itself baked
+/// (a non-`tt`/`tmdb` id, or the feature off), so a baked poster is never double-badged.
 @Composable
-fun BoxScope.PosterArt(posterUrl: String?, title: String) {
-    if (posterUrl.isNullOrBlank()) {
+fun BoxScope.PosterArt(
+    posterUrl: String?,
+    title: String,
+    id: String? = null,
+    type: String = "movie",
+    showRatingBadge: Boolean = true,
+) {
+    // Observe the localized-metadata store so a poster override that resolves after first paint re-renders.
+    val l10nEntries by LocalizedMetadataStore.entries.collectAsStateWithLifecycle()
+    val localizedPoster = remember(id, l10nEntries) { id?.let { LocalizedMetadataStore.poster(it) } }
+    val base = localizedPoster ?: posterUrl
+    val resolved = if (id != null) PosterArtwork.poster(id, base) else base
+
+    if (resolved.isNullOrBlank()) {
         DefaultPosterArt(title)
     } else {
         AsyncImage(
-            model = posterUrl,
+            model = resolved,
             contentDescription = title,
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize(),
+        )
+    }
+    // The rating badge sits over CLEAN art only: when the active provider will actually bake a rating onto
+    // this id's poster, suppress it (no double badge). Placed top-start so it never collides with the
+    // watched checkmark (top-end) or the Continue-Watching progress track (bottom).
+    if (showRatingBadge && id != null && id.startsWith("tt")) {
+        CardRatingBadge(
+            id = id,
+            type = type,
+            active = !PosterArtwork.bakesRatings(forId = id),
+            modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
         )
     }
 }
@@ -80,6 +114,13 @@ fun PosterRail(
     onEndReached: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
+    // Poster width preset (item 5): the rail card width follows the user's Poster Style choice (default
+    // Balanced = 168dp), read live so a change re-lays out the rail. Also enqueue this page of ids for a
+    // localized-metadata resolve (item 9), a cheap no-op for English / when the feature is off.
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    LaunchedEffect(catalog.items) {
+        LocalizedMetadataStore.resolve(catalog.items.map { it.id })
+    }
     Column(modifier = modifier) {
         RailHeader(title = catalog.title, eyebrow = eyebrow)
         LazyRow(contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge)) {
@@ -104,8 +145,8 @@ fun PosterRail(
                     onRemoveFromContinueWatching = if (
                         menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
                     ) ({ onRemoveFromContinueWatching(item) }) else null,
-                    art = { PosterArt(item.poster, item.name) },
-                    modifier = Modifier.width(124.dp).padding(end = VortXTheme.spacing.sm),
+                    art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
+                    modifier = Modifier.width(posterStyle.width.compactWidth).padding(end = VortXTheme.spacing.sm),
                 )
             }
         }

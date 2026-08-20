@@ -25,6 +25,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -84,6 +86,12 @@ fun PosterCard(
     art: @Composable BoxScope.() -> Unit = { DefaultPosterArt(title) },
 ) {
     val colors = VortXTheme.colors
+    // Poster Style presentation prefs (item 5), on Apple's exact keys: corner-radius preset, hide-labels,
+    // and the landscape 16:9 vs portrait 2:3 aspect. Reading the live StateFlow re-lays the card out the
+    // moment a preset changes in the Poster Style screen.
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val cardShape = RoundedCornerShape(posterStyle.radius.radius)
+    val aspect = if (posterStyle.landscape) 16f / 9f else 2f / 3f
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val reduced = VortXTheme.reducedMotion
@@ -130,9 +138,9 @@ fun PosterCard(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(2f / 3f)
-                .vortxShadow(elevationSpec, VortXShapes.card)
-                .clip(VortXShapes.card),
+                .aspectRatio(aspect)
+                .vortxShadow(elevationSpec, cardShape)
+                .clip(cardShape),
         ) {
             art()
             if (watched) {
@@ -164,20 +172,24 @@ fun PosterCard(
                 }
             }
         }
-        Text(
-            text = title,
-            style = VortXTheme.type.cardTitle.copy(color = if (active) colors.textPrimary else colors.textPrimary.copy(alpha = 0.92f)),
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(top = 6.dp),
-        )
-        if (subtitle != null) {
+        // Hide-labels preset (item 5): the poster art carries the identity, so the title/subtitle rows are
+        // dropped when the user opts in. Labels shown is the default, today's look.
+        if (!posterStyle.hideLabels) {
             Text(
-                text = subtitle,
-                style = VortXTheme.type.label.copy(color = colors.textTertiary, fontSize = 12.sp),
-                maxLines = 1,
+                text = title,
+                style = VortXTheme.type.cardTitle.copy(color = if (active) colors.textPrimary else colors.textPrimary.copy(alpha = 0.92f)),
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp),
             )
+            if (subtitle != null) {
+                Text(
+                    text = subtitle,
+                    style = VortXTheme.type.label.copy(color = colors.textTertiary, fontSize = 12.sp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }

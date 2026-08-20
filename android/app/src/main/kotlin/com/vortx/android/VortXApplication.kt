@@ -9,8 +9,19 @@ import coil3.PlatformContext
 import coil3.SingletonImageLoader
 import coil3.disk.DiskCache
 import coil3.memory.MemoryCache
+import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Path.Companion.toOkioPath
+import com.vortx.android.metadata.ArtworkPreferences
+import com.vortx.android.metadata.LocalizedMetadataStore
+import com.vortx.android.metadata.PosterImageNegativeCache
+import com.vortx.android.net.VortXEdgeAuth
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.PreviewAuthRepository
@@ -95,11 +106,20 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
-        // Bootstrap the minimal RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch). Loads
-        // the last-good cached feature flags synchronously, then refreshes once in the background. Fail-soft:
-        // the collections-hub fleet kill-switch reads a baked-true default until a remote value lands.
+        // Bootstrap the RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch with ETag/304).
+        // Loads the last-good cached config synchronously, then refreshes once in the background. Fail-soft:
+        // every feature flag + typed value reads its baked (== shipping) default until a remote value lands.
         runCatching { RemoteConfig.bootstrap(this, applicationScope) }
             .onFailure { Log.w(TAG, "RemoteConfig bootstrap failed; features stay at baked defaults", it) }
+        // Poster artwork (XRDB/ERDB/fanart) reads its flat settings + the secure fanart key through this
+        // context; the poster-style presentation prefs seed their live StateFlow; the localized-metadata pool
+        // store hydrates its disk cache. All fail-soft and off the critical launch path (XRDB defaults on,
+        // ERDB/fanart/localized default off / English-gated), so a miss just leaves the shipping behavior.
+        runCatching {
+            ArtworkPreferences.init(this)
+            PosterStylePreferences.init(this)
+            LocalizedMetadataStore.init(this)
+        }.onFailure { Log.w(TAG, "Poster-artwork stores init failed; art stays at add-on/default behavior", it) }
         // Activate the (until-now dormant) VortX account sync engine now that the roster + watch overlay it
         // folds into are stood up: construct VortXSyncManager, wire its push seams, and add the foreground
         // pull. Fail-soft inside; a no-op when signed out, and never on the critical launch path.
@@ -281,6 +301,14 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     override fun newImageLoader(context: PlatformContext): ImageLoader =
         ImageLoader.Builder(context)
             .crossfade(true)
+            // Give Coil a dedicated OkHttp client whose interceptor edge-signs requests to OUR gated art
+            // hosts (poster.vortx.tv / erdb.vortx.tv). The signature rides X-VX-* HEADERS, which are NOT part
+            // of Coil's cache key, so the disk cache stays warm (a query-signed URL would carry a per-second
+            // `vts` and bust the cache every second). Fail-open for every other host (tmdb / metahub / add-on
+            // art) and for an unprovisioned build, matching Apple's `PosterImageLoader` header-sign contract.
+            .components {
+                add(OkHttpNetworkFetcherFactory(callFactory = { edgeSignedImageClient }))
+            }
             .memoryCache {
                 MemoryCache.Builder()
                     .maxSizePercent(context, 0.25)
@@ -293,6 +321,76 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                     .build()
             }
             .build()
+
+    /**
+     * The OkHttp client Coil uses for image bytes, with the edge-signing interceptor installed. Built once,
+     * lazily; a plain client (no signing) for every non-gated host.
+     */
+    private val edgeSignedImageClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            // Order matters: the negative-cache interceptor is OUTERMOST so it can short-circuit a
+            // recently-failed art URL before signing or a network hit; the edge signer runs only for
+            // requests that actually go out.
+            .addInterceptor(negativeCacheInterceptor)
+            .addInterceptor(edgeSigningInterceptor)
+            .build()
+    }
+
+    /**
+     * Poster loader hardening (item 7) over Coil: a status-classified negative cache so a card that just
+     * failed does not re-hammer the network on every scroll, with the suppression window chosen by WHY it
+     * failed (terminal 4xx that cannot become an image get the long expiry; auth/throttle/timeout/5xx retry
+     * after a short backoff). Diagnostics are HOST-ONLY (a poster URL can carry a title id or signed query
+     * value), matching Apple's `PosterImageLoader` probe discipline. A 2xx clears any prior negative.
+     */
+    private val negativeCacheInterceptor = Interceptor { chain ->
+        val request = chain.request()
+        val key = PosterImageNegativeCache.key(request.url.host, request.url.encodedPath)
+        if (PosterImageNegativeCache.shouldSuppress(key)) {
+            // Suppressed: return a synthetic gateway-timeout so Coil treats it as a miss with NO network hit.
+            // A miss is retried on the next appear, so a transient failure never latches a permanently blank
+            // card (Coil re-requests when the card recomposes after the TTL).
+            return@Interceptor Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(504)
+                .message("VortX poster negative-cache suppressed")
+                .body(ByteArray(0).toResponseBody(null))
+                .build()
+        }
+        val response = chain.proceed(request)
+        when (val failure = PosterImageNegativeCache.classify(response.code)) {
+            null -> PosterImageNegativeCache.clear(key)
+            else -> {
+                PosterImageNegativeCache.record(key, failure)
+                Log.d(TAG, "poster fetch host=${request.url.host} status=${response.code} -> negative-cache")
+            }
+        }
+        response
+    }
+
+    /**
+     * Stamp `X-VX-Ts` / `X-VX-Kid` / `X-VX-Sig` on an outgoing image GET IFF its host is one of VortX's gated
+     * services ([VortXEdgeAuth.signingHeaders] returns null otherwise, so this is a no-op for tmdb / metahub /
+     * add-on hosts). Never throws: a signing failure falls through to the unsigned request (observe-safe).
+     */
+    private val edgeSigningInterceptor = Interceptor { chain ->
+        val request = chain.request()
+        val headers = runCatching {
+            VortXEdgeAuth.signingHeaders(request.method, request.url.toUrl())
+        }.getOrNull()
+        if (headers == null) {
+            chain.proceed(request)
+        } else {
+            chain.proceed(
+                request.newBuilder()
+                    .header(VortXEdgeAuth.tsHeaderName(), headers.ts)
+                    .header(VortXEdgeAuth.kidHeaderName(), headers.kid)
+                    .header(VortXEdgeAuth.sigHeaderName(), headers.sig)
+                    .build(),
+            )
+        }
+    }
 
     private companion object {
         const val TAG = "VortXApplication"

@@ -240,6 +240,8 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **Back up your settings to a file.** A new Backup screen in Settings saves your syncable settings, profiles included, to a file, with no account needed, and imports one back. Device only settings such as the streaming cache size are left out, and importing merges a backup in without removing settings that are not in the file. Android.
 
+**Fixes and safety switches can reach the app without an update.** The Android app now reads the same signed fleet configuration the Apple app does, so a feature that misbehaves can be turned off, an endpoint corrected, or a limit tuned across every installed build with no store update or sideload. It is fail safe by design: the app ships with every value baked in, so if the configuration is unreachable or a value is missing nothing changes, and a bad configuration can never push a value past the limits the app relies on to stay safe. The fetch is signed and cached, so an unchanged configuration costs no work. Android phone, tablet, and TV.
+
 ## 0.3.14 Beta 11 - 2026-07-31
 
 A hotfix that replaces Beta 10. Beta 10 could freeze on the splash screen and never open on a signed-in install, worst on Apple TV, where it could hang the device until it was unplugged. It was a real bug in Beta 10, not a bad download, which is why a fresh signed-out install could look fine while a signed-in one would not.
