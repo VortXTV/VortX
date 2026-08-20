@@ -156,7 +156,9 @@ class CommunityJsProviderStore(context: Context) {
         private const val KEY_ENABLED = "enabled"
         private const val KEY_MANIFEST = "manifest"
         private const val KEY_PROVIDERS = "providers"
-        private const val MAX_SOURCE_BYTES = 1_000_000
+        // Provider code crosses the isolated-process Binder boundary. Keep its encoded input well below
+        // Binder's transaction limit, including the remaining invocation fields and callback metadata.
+        private const val MAX_SOURCE_BYTES = 192 * 1024
         private const val MAX_TOTAL_SOURCE_BYTES = 4_000_000
         private const val MAX_PROVIDER_COUNT = 12
         private const val REQUEST_TIMEOUT_MS = 25_000L

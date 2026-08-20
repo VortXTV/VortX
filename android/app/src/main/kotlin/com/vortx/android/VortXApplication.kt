@@ -1,9 +1,7 @@
 package com.vortx.android
 
 import android.app.Activity
-import android.app.ActivityManager
 import android.app.Application
-import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
@@ -106,7 +104,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // An isolated service still receives this Application callback. Its broker is deliberately supplied
         // only bounded IPC input, so do not initialize any process-wide repositories, encrypted stores,
         // filesystem caches, or network clients in that process.
-        if (isCommunityJsBrokerProcess()) return
+        if (isIsolatedBrokerProcess()) return
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
@@ -152,14 +150,12 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             .onFailure { Log.w(TAG, "Update check could not start this launch", it) }
     }
 
-    private fun isCommunityJsBrokerProcess(): Boolean {
-        val name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            Application.getProcessName()
-        } else {
-            val manager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-            manager?.runningAppProcesses?.firstOrNull { it.pid == Process.myPid() }?.processName
-        }
-        return name == "$packageName:communityjs"
+    private fun isIsolatedBrokerProcess(): Boolean {
+        // Android assigns isolated services an ephemeral UID and does not guarantee a stable process name.
+        // UID identity is therefore the only trustworthy boundary before any app-owned state is initialized.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return Process.isIsolated()
+        val appId = Process.myUid() % APP_ID_RANGE
+        return appId in FIRST_ISOLATED_APP_ID..LAST_ISOLATED_APP_ID
     }
 
     private fun startIPTVCleanupReplay() {
@@ -443,5 +439,8 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     private companion object {
         const val TAG = "VortXApplication"
+        const val FIRST_ISOLATED_APP_ID = 99_000
+        const val LAST_ISOLATED_APP_ID = 99_999
+        const val APP_ID_RANGE = 100_000
     }
 }

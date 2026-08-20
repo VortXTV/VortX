@@ -23,7 +23,7 @@ class CommunityJsBrokerInstrumentationTest {
                 const crypto = require('crypto-js');
                 module.exports.getStreams = async (id, type) => {
                   await Promise.resolve();
-                  if (crypto.SHA256('x').toString() !== 'x') throw new Error('crypto contract');
+                  if (crypto.SHA256('abc').toString() !== 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') throw new Error('crypto contract');
                   return [{
                     name: 'Málaga', title: type + '-' + id,
                     url: 'https://93.184.216.34/video.m3u8', quality: '1080p', size: '42',
@@ -77,5 +77,19 @@ class CommunityJsBrokerInstrumentationTest {
         invocation.join()
 
         assertTrue(invocation.isCancelled)
+    }
+
+    @Test
+    fun unsupportedHtmlModuleFailsInsteadOfReturningEmptySelectors() = runBlocking {
+        val runtime = CommunityJsRuntime(InstrumentationRegistry.getInstrumentation().targetContext, timeoutMs = 5_000)
+        val provider = CommunityJsProviderStore.Provider(
+            id = "unsupported-html", name = "Unsupported HTML", supportedTypes = setOf("movie"),
+            code = "const html = require('cheerio'); module.exports.getStreams = () => [];",
+            enabled = true,
+        )
+
+        val result = runtime.execute(CommunityJsRuntime.Invocation(provider, "123", "movie", null, null))
+
+        assertTrue(result is CommunityJsRuntime.Result.Failure)
     }
 }

@@ -2038,6 +2038,11 @@ class EngineStremioRepository(
         // THAT is unavailable (no .so in this build, start failure, kill-switch flag off) does it
         // surface a clear error the player layer can show instead of failing opaquely.
         val handle = source.id.substringBefore('#')
+        // Engine-originated streams encode the transport in their id handle. Community providers retain a
+        // stable opaque identity for ranking/pinning and carry their independently validated transport in
+        // `url`; always prefer that explicit direct handle when it is an HTTP(S) URL.
+        val directUrl = source.url?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+            ?: handle.takeIf { it.startsWith("http://") || it.startsWith("https://") }
         // Flag DV/Atmos from the source's own tags so [PlayerEngineRouter] routes those to the ExoPlayer
         // engine (its DefaultRenderersFactory does the DV codec fallback + DefaultAudioSink negotiates
         // Atmos passthrough); a text parse is the only pre-play signal, same as Apple.
@@ -2064,14 +2069,14 @@ class EngineStremioRepository(
                 isDolbyVision = isDolbyVision,
                 isAtmos = isAtmos,
             )
-        } else if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
+        } else if (!source.isTorrent && directUrl != null) {
             // The stream's declared proxyHeaders ride onto the Playable so a header-gated CDN (a
             // Referer / User-Agent requirement) actually plays: both engines already apply
             // [Playable.headers] (mpv http-header-fields, ExoPlayer data-source factory), and the
             // download path forwards them off the same Playable. Direct-URL streams only: a
             // debrid-resolved link below is a DIFFERENT host the add-on's headers were never meant for.
             Playable(
-                url = handle,
+                url = directUrl,
                 title = source.title,
                 viaStreamingServer = false,
                 isDolbyVision = isDolbyVision,

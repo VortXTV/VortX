@@ -56,7 +56,7 @@ class CommunityJsRuntime(
     }
 
     suspend fun execute(invocation: Invocation): Result {
-        if (invocation.provider.code.toByteArray().size > MAX_SOURCE_BYTES) return Result.Failure("Provider source exceeds the limit.")
+        if (invocation.provider.code.toByteArray().size > MAX_SOURCE_BYTES || invocation.settingsJson.toByteArray().size > MAX_SETTINGS_BYTES) return Result.Failure("Provider input exceeds the limit.")
         if (invocation.mediaType !in setOf("movie", "tv") || invocation.tmdbId.toIntOrNull() == null) return Result.Failure("Invalid media identity.")
         val host = NativeFetchImpl(timeoutMs)
         val cancellation = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
@@ -217,8 +217,9 @@ class CommunityJsRuntime(
 
     companion object {
         private const val DEFAULT_TIMEOUT_MS = 25_000L
-        private const val MAX_SOURCE_BYTES = 1_000_000
-        private const val MAX_RESPONSE_BYTES = 1_000_000
+        private const val MAX_SOURCE_BYTES = 192 * 1024
+        private const val MAX_SETTINGS_BYTES = 16 * 1024
+        private const val MAX_RESPONSE_BYTES = 128 * 1024
         private const val MAX_RESULT_COUNT = 100
         private const val MAX_SUBTITLE_COUNT = 20
         private const val MAX_REQUEST_COUNT = 20

@@ -9,7 +9,7 @@
 
 #define TAG "community-js"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define MAX_RESULT_BYTES (1024 * 1024)
+#define MAX_RESULT_BYTES (192 * 1024)
 #define MAX_ERROR_BYTES 1024
 
 typedef struct {
@@ -179,6 +179,39 @@ static JSValue complete_success(JSContext *ctx, JSValueConst this_val, int argc,
   return JS_UNDEFINED;
 }
 
+/* The sandbox exposes one real digest primitive. It uses the platform implementation in the isolated
+ * process and never exposes a Java object or provider credentials to JavaScript. */
+static JSValue host_sha256(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void) this_val;
+  RunState *state = JS_GetContextOpaque(ctx);
+  if (state == NULL || argc < 1) return JS_ThrowTypeError(ctx, "SHA256 requires input");
+  const char *input = JS_ToCString(ctx, argv[0]);
+  if (input == NULL) return JS_EXCEPTION;
+  size_t input_length = strlen(input);
+  if (input_length > 256 * 1024) { JS_FreeCString(ctx, input); return JS_ThrowRangeError(ctx, "SHA256 input exceeds the limit"); }
+  JNIEnv *env = NULL;
+  if ((*state->vm)->GetEnv(state->vm, (void **) &env, JNI_VERSION_1_6) != JNI_OK) { JS_FreeCString(ctx, input); return JS_ThrowInternalError(ctx, "native thread unavailable"); }
+  jclass digest_class = (*env)->FindClass(env, "java/security/MessageDigest");
+  jstring algorithm = digest_class ? (*env)->NewStringUTF(env, "SHA-256") : NULL;
+  jmethodID get_instance = digest_class ? (*env)->GetStaticMethodID(env, digest_class, "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;") : NULL;
+  jobject digest = get_instance && algorithm ? (*env)->CallStaticObjectMethod(env, digest_class, get_instance, algorithm) : NULL;
+  jbyteArray bytes = digest ? (*env)->NewByteArray(env, (jsize) input_length) : NULL;
+  jmethodID digest_method = digest ? (*env)->GetMethodID(env, digest_class, "digest", "([B)[B") : NULL;
+  if (bytes && input_length > 0) (*env)->SetByteArrayRegion(env, bytes, 0, (jsize) input_length, (const jbyte *) input);
+  jbyteArray output = digest_method && bytes ? (jbyteArray) (*env)->CallObjectMethod(env, digest, digest_method, bytes) : NULL;
+  JSValue result = JS_EXCEPTION;
+  if (!(*env)->ExceptionCheck(env) && output != NULL && (*env)->GetArrayLength(env, output) == 32) {
+    jbyte hash[32]; char hex[65]; static const char chars[] = "0123456789abcdef";
+    (*env)->GetByteArrayRegion(env, output, 0, 32, hash);
+    for (int i = 0; i < 32; i++) { unsigned char byte = (unsigned char) hash[i]; hex[i * 2] = chars[byte >> 4]; hex[i * 2 + 1] = chars[byte & 15]; }
+    hex[64] = '\0'; result = JS_NewStringLen(ctx, hex, 64);
+  } else if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+  if (output) (*env)->DeleteLocalRef(env, output); if (bytes) (*env)->DeleteLocalRef(env, bytes);
+  if (digest) (*env)->DeleteLocalRef(env, digest); if (algorithm) (*env)->DeleteLocalRef(env, algorithm);
+  if (digest_class) (*env)->DeleteLocalRef(env, digest_class); JS_FreeCString(ctx, input);
+  return result;
+}
+
 static JSValue complete_failure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   (void) this_val;
   RunState *state = JS_GetContextOpaque(ctx);
@@ -205,8 +238,9 @@ static char *exception_text(JSContext *ctx) {
   const char *fallback = "JavaScript execution failed";
   const char *source = text ? text : fallback;
   size_t length = strlen(source);
+  if (length > MAX_ERROR_BYTES) length = MAX_ERROR_BYTES;
   char *copy = malloc(length + 1);
-  if (copy != NULL) memcpy(copy, source, length + 1);
+  if (copy != NULL) { memcpy(copy, source, length); copy[length] = '\0'; }
   if (text) JS_FreeCString(ctx, text);
   JS_FreeValue(ctx, exception);
   return copy;
@@ -251,6 +285,7 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   JS_SetContextOpaque(context, &state);
   JSValue global = JS_GetGlobalObject(context);
   JS_SetPropertyStr(context, global, "__vortx_native_fetch", JS_NewCFunction(context, host_fetch, "__vortx_native_fetch", 2));
+  JS_SetPropertyStr(context, global, "__vortx_sha256", JS_NewCFunction(context, host_sha256, "__vortx_sha256", 1));
   JS_SetPropertyStr(context, global, "__vortx_complete", JS_NewCFunction(context, complete_success, "__vortx_complete", 1));
   JS_SetPropertyStr(context, global, "__vortx_fail", JS_NewCFunction(context, complete_failure, "__vortx_fail", 1));
   JS_FreeValue(context, global);
@@ -269,7 +304,7 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
     { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
   }
   snprintf(wrapper, wrapper_size,
-    "(function(){'use strict';const __response=(r)=>{const h=r.headers||{},lower={};Object.keys(h).forEach(k=>lower[k.toLowerCase()]=String(h[k]));const headers={get:(k)=>lower[String(k).toLowerCase()]||null,has:(k)=>Object.prototype.hasOwnProperty.call(lower,String(k).toLowerCase()),forEach:(f)=>Object.keys(h).forEach(k=>f(h[k],k))};const text=String(r.body||'');return {ok:r.status>=200&&r.status<300,status:r.status||0,statusText:r.statusText||'',headers,text:()=>Promise.resolve(text),json:()=>{try{return Promise.resolve(JSON.parse(text))}catch(e){return Promise.reject(e)}}}};const fetch=(u,o)=>Promise.resolve(__response(__vortx_native_fetch(String(u),JSON.stringify(o||{}))));const axios={request:(o)=>fetch(o.url,o).then(r=>r.text().then(t=>{let d=t;try{d=JSON.parse(t)}catch(e){}return {data:d,status:r.status,statusText:r.statusText,headers:r.headers,config:o}})),get:(u,o)=>axios.request(Object.assign({},o||{},{url:u,method:'GET'})),post:(u,d,o)=>axios.request(Object.assign({},o||{},{url:u,method:'POST',body:d}))};const require=(n)=>{if(n==='crypto-js')return {MD5:(v)=>({toString:()=>String(v)}),SHA1:(v)=>({toString:()=>String(v)}),SHA256:(v)=>({toString:()=>String(v)})};if(['cheerio','cheerio-without-node-native','react-native-cheerio'].includes(n))return {load:(html)=>{const q=(s)=>({length:0,text:()=>'',attr:()=>null,find:()=>q(''),first:()=>q(''),each:()=>{}});q.html=html;return q}};throw new Error('Module '+n+' is not allowed')};const console={log:()=>{},warn:()=>{},error:()=>{}};const setTimeout=(f)=>{Promise.resolve().then(f);return 0},clearTimeout=()=>{};const TextEncoder=function(){this.encode=(s)=>Uint8Array.from(unescape(encodeURIComponent(String(s))).split('').map(c=>c.charCodeAt(0)))};const TextDecoder=function(){this.decode=(a)=>decodeURIComponent(Array.from(a).map(c=>'%%'+c.toString(16).padStart(2,'0')).join(''))};const URL=function(u,b){this.href=b?String(b).replace(/[^/]*$/,'')+String(u):String(u);this.toString=()=>this.href};const module={exports:{}};const exports=module.exports;const global=globalThis;global.SCRAPER_SETTINGS=%s;global.SCRAPER_ID='provider';global.TMDB_API_KEY='';const window=global;const URL_VALIDATION_ENABLED=true;%s;const f=typeof getStreams==='function'?getStreams:(module.exports&&module.exports.getStreams)||global.getStreams;if(typeof f!=='function')throw new Error('No getStreams function found');Promise.resolve(f('%s','%s',%d,%d)).then(v=>__vortx_complete(JSON.stringify(Array.isArray(v)?v:[]))).catch(e=>__vortx_fail(String(e)));})()",
+    "(function(){'use strict';const __response=(r)=>{const h=r.headers||{},lower={};Object.keys(h).forEach(k=>lower[k.toLowerCase()]=String(h[k]));const headers={get:(k)=>lower[String(k).toLowerCase()]||null,has:(k)=>Object.prototype.hasOwnProperty.call(lower,String(k).toLowerCase()),forEach:(f)=>Object.keys(h).forEach(k=>f(h[k],k))};const text=String(r.body||'');return {ok:r.status>=200&&r.status<300,status:r.status||0,statusText:r.statusText||'',headers,text:()=>Promise.resolve(text),json:()=>{try{return Promise.resolve(JSON.parse(text))}catch(e){return Promise.reject(e)}}}};const fetch=(u,o)=>Promise.resolve(__response(__vortx_native_fetch(String(u),JSON.stringify(o||{}))));const axios={request:(o)=>fetch(o.url,o).then(r=>r.text().then(t=>{let d=t;try{d=JSON.parse(t)}catch(e){}return {data:d,status:r.status,statusText:r.statusText,headers:r.headers,config:o}})),get:(u,o)=>axios.request(Object.assign({},o||{},{url:u,method:'GET'})),post:(u,d,o)=>axios.request(Object.assign({},o||{},{url:u,method:'POST',body:d}))};const require=(n)=>{if(n==='crypto-js')return {SHA256:(v)=>({toString:()=>__vortx_sha256(String(v))})};throw new Error('Module '+n+' is not supported')};const console={log:()=>{},warn:()=>{},error:()=>{}};const setTimeout=(f)=>{Promise.resolve().then(f);return 0},clearTimeout=()=>{};const TextEncoder=function(){this.encode=(s)=>Uint8Array.from(unescape(encodeURIComponent(String(s))).split('').map(c=>c.charCodeAt(0)))};const TextDecoder=function(){this.decode=(a)=>decodeURIComponent(Array.from(a).map(c=>'%%'+c.toString(16).padStart(2,'0')).join(''))};const URL=function(u,b){this.href=b?String(b).replace(/[^/]*$/,'')+String(u):String(u);this.toString=()=>this.href};const module={exports:{}};const exports=module.exports;const global=globalThis;global.SCRAPER_SETTINGS=%s;global.SCRAPER_ID='provider';global.TMDB_API_KEY='';const window=global;const URL_VALIDATION_ENABLED=true;%s;const f=typeof getStreams==='function'?getStreams:(module.exports&&module.exports.getStreams)||global.getStreams;if(typeof f!=='function')throw new Error('No getStreams function found');Promise.resolve(f('%s','%s',%d,%d)).then(v=>__vortx_complete(JSON.stringify(Array.isArray(v)?v:[]))).catch(e=>__vortx_fail(String(e)));})()",
     settings, source, tmdb, media, season, episode);
   JSValue eval = JS_Eval(context, wrapper, strlen(wrapper), "community-provider.js", JS_EVAL_TYPE_GLOBAL);
   free(wrapper);
