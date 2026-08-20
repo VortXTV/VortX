@@ -211,7 +211,7 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   char *tmdb = utf8_from_java(env, tmdb_id, &tmdb_length);
   char *media = utf8_from_java(env, media_type, &media_length);
   char *settings = utf8_from_java(env, settings_json, &settings_length);
-  if (source == NULL || tmdb == NULL || media == NULL || settings == NULL) return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Invalid input\"}");
+  if (source == NULL || tmdb == NULL || media == NULL || settings == NULL) { const char *failure = "{\"ok\":false,\"error\":\"Invalid input\"}"; free(source); free(tmdb); free(media); free(settings); return java_from_utf8(env, failure, strlen(failure)); }
   RunState state = {0};
   (*env)->GetJavaVM(env, &state.vm);
   state.host = (*env)->NewGlobalRef(env, host);
@@ -226,7 +226,7 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
     if (context) JS_FreeContext(context); if (runtime) JS_FreeRuntime(runtime);
     (*env)->DeleteGlobalRef(env, state.host);
     free(source); free(tmdb); free(media); free(settings);
-    return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Runtime unavailable\"}");
+    { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
   }
   JS_SetMemoryLimit(runtime, (size_t) memory_limit);
   JS_SetMaxStackSize(runtime, 256 * 1024);
@@ -242,7 +242,7 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   if (wrapper == NULL) {
     JS_FreeContext(context); JS_FreeRuntime(runtime); (*env)->DeleteGlobalRef(env, state.host);
     free(source); free(tmdb); free(media); free(settings);
-    return (*env)->NewStringUTF(env, "{\"ok\":false,\"error\":\"Runtime unavailable\"}");
+    { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
   }
   snprintf(wrapper, wrapper_size,
     "(function(){'use strict';const __response=(r)=>{const h=r.headers||{},lower={};Object.keys(h).forEach(k=>lower[k.toLowerCase()]=String(h[k]));const headers={get:(k)=>lower[String(k).toLowerCase()]||null,has:(k)=>Object.prototype.hasOwnProperty.call(lower,String(k).toLowerCase()),forEach:(f)=>Object.keys(h).forEach(k=>f(h[k],k))};const text=String(r.body||'');return {ok:r.status>=200&&r.status<300,status:r.status||0,statusText:r.statusText||'',headers,text:()=>Promise.resolve(text),json:()=>{try{return Promise.resolve(JSON.parse(text))}catch(e){return Promise.reject(e)}}}};const fetch=(u,o)=>Promise.resolve(__response(__vortx_native_fetch(String(u),JSON.stringify(o||{}))));const axios={request:(o)=>fetch(o.url,o).then(r=>r.text().then(t=>{let d=t;try{d=JSON.parse(t)}catch(e){}return {data:d,status:r.status,statusText:r.statusText,headers:r.headers,config:o}})),get:(u,o)=>axios.request(Object.assign({},o||{},{url:u,method:'GET'})),post:(u,d,o)=>axios.request(Object.assign({},o||{},{url:u,method:'POST',body:d}))};const require=(n)=>{if(n==='crypto-js')return {MD5:(v)=>({toString:()=>String(v)}),SHA1:(v)=>({toString:()=>String(v)}),SHA256:(v)=>({toString:()=>String(v)})};if(['cheerio','cheerio-without-node-native','react-native-cheerio'].includes(n))return {load:(html)=>{const q=(s)=>({length:0,text:()=>'',attr:()=>null,find:()=>q(''),first:()=>q(''),each:()=>{}});q.html=html;return q}};throw new Error('Module '+n+' is not allowed')};const console={log:()=>{},warn:()=>{},error:()=>{}};const setTimeout=(f)=>{Promise.resolve().then(f);return 0},clearTimeout=()=>{};const TextEncoder=function(){this.encode=(s)=>Uint8Array.from(unescape(encodeURIComponent(String(s))).split('').map(c=>c.charCodeAt(0)))};const TextDecoder=function(){this.decode=(a)=>decodeURIComponent(Array.from(a).map(c=>'%%'+c.toString(16).padStart(2,'0')).join(''))};const URL=function(u,b){this.href=b?String(b).replace(/[^/]*$/,'')+String(u):String(u);this.toString=()=>this.href};const module={exports:{}};const exports=module.exports;const global=globalThis;global.SCRAPER_SETTINGS=%s;global.SCRAPER_ID='provider';global.TMDB_API_KEY='';const window=global;const URL_VALIDATION_ENABLED=true;%s;const f=typeof getStreams==='function'?getStreams:(module.exports&&module.exports.getStreams)||global.getStreams;if(typeof f!=='function')throw new Error('No getStreams function found');Promise.resolve(f('%s','%s',%d,%d)).then(v=>__vortx_complete(JSON.stringify(Array.isArray(v)?v:[]))).catch(e=>__vortx_fail(String(e)));})()",
