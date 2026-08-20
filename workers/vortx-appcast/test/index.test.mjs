@@ -68,7 +68,7 @@ function makeReceipt({ releaseId = "19", build = BUILD } = {}) {
     prerelease: true,
     sourceCommit: COMMIT,
     releaseId,
-    generation: `${TAG}:${BUILD}:${feedSha256}`,
+    generation: `${TAG}:${build}:${feedSha256}`,
     feedSha256,
     sourceSha256: sha256(sourceText),
     appcastSha256: sha256(appcastText),
@@ -90,12 +90,22 @@ class MemoryKV {
   async delete(key) { this.values.delete(key); }
 }
 
+class MemoryStorage {
+  constructor() { this.values = new Map(); }
+  async get(key) { return this.values.get(key); }
+  async put(key, value) { this.values.set(key, structuredClone(value)); }
+  async delete(key) { this.values.delete(key); }
+  async transaction(callback) { return callback(this); }
+}
+
 function environment(kv) {
-  const env = { LASTGOOD: kv, RELEASE_FEED_RECEIPT_SECRET: SECRET };
+  const env = { RELEASE_FEED_RECEIPT_SECRET: SECRET };
+  const state = { storage: new MemoryStorage() };
   env.COORDINATOR = {
     idFromName: () => "release-feed",
-    get: () => ({ fetch: (request) => new FeedCoordinator({}, env).fetch(request) }),
+    get: () => ({ fetch: (request) => new FeedCoordinator(state, env).fetch(request) }),
   };
+  env.__state = state;
   return env;
 }
 
@@ -140,7 +150,7 @@ test("unsigned or malformed staged generations never reach the public routes", a
   receipt.manifest.android = {};
   const response = await worker.fetch(signedRequest("/__release/receipt", receipt), env);
   assert.equal(response.status, 503);
-  assert.equal(await kv.get("feed:active"), null);
+  assert.equal(await env.__state.storage.get("active"), undefined);
   const wrongAuth = await worker.fetch(new Request("https://vortx.tv/__release/receipt", { method: "POST", body: JSON.stringify(makeReceipt()) }), env);
   assert.equal(wrongAuth.status, 401);
 });
@@ -160,8 +170,8 @@ test("staging requires an immutable release ID and serializes build order", asyn
   assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", releaseId: "19", generation, expectedActiveGeneration: null }), env)).status, 200);
   const older = makeReceipt({ releaseId: "18", build: 220 });
   const olderResponse = await worker.fetch(signedRequest("/__release/receipt", older), env);
-  assert.equal(olderResponse.status, 503);
-  assert.equal(await kv.get("feed:staged:18"), null);
+  assert.equal(olderResponse.status, 409);
+  assert.equal(await env.__state.storage.get("staged:release:18"), undefined);
 });
 
 test("HTML and unknown routes fail as JSON errors", async () => {
@@ -171,4 +181,32 @@ test("HTML and unknown routes fail as JSON errors", async () => {
   const missing = await worker.fetch(new Request("https://vortx.tv/unknown.json"), env);
   assert.equal(missing.status, 404);
   assert.match(await missing.text(), /unknown feed route/);
+});
+
+test("the Durable Object serializes conflicting stages and records a canonical receipt digest", async () => {
+  const env = environment(new MemoryKV());
+  const first = makeReceipt({ releaseId: "19" });
+  const conflicting = makeReceipt({ releaseId: "19", build: 222 });
+  const [one, two] = await Promise.all([
+    worker.fetch(signedRequest("/__release/receipt", first), env),
+    worker.fetch(signedRequest("/__release/receipt", conflicting), env),
+  ]);
+  const statuses = [one.status, two.status].sort();
+  assert.deepEqual(statuses, [200, 409]);
+  const record = await env.__state.storage.get("staged:release:19");
+  assert.match(record.receiptSha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual(await env.__state.storage.get(`staged:generation:${record.manifest.generation}`), record);
+});
+
+test("integrity repair can seed a malformed legacy generation once and never overwrite an active receipt", async () => {
+  const env = environment(new MemoryKV());
+  const repair = makeReceipt({ releaseId: "18", build: 220 });
+  repair.action = "repair";
+  repair.repairReason = "integrity-repair";
+  const seeded = await worker.fetch(signedRequest("/__release/receipt", repair), env);
+  assert.equal(seeded.status, 200, await seeded.text());
+  const second = await worker.fetch(signedRequest("/__release/receipt", repair), env);
+  assert.equal(second.status, 409);
+  const publicFeed = await worker.fetch(new Request("https://vortx.tv/altstore.json"), env);
+  assert.equal(publicFeed.status, 200);
 });

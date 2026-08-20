@@ -157,6 +157,17 @@ function readText(file) {
   }
 }
 
+export function projectBuildFromYmlText(content) {
+  const builds = [...String(content).matchAll(/CURRENT_PROJECT_VERSION:\s*"([0-9]+)"/g)].map((match) => match[1]);
+  if (builds.length !== 6) die(`app/project.yml must contain exactly six CURRENT_PROJECT_VERSION values (found ${builds.length})`, "project-build");
+  if (new Set(builds).size !== 1) die(`app/project.yml build values disagree: ${builds.join(", ")}`, "project-build");
+  return requirePositiveInteger("project-build", builds[0]);
+}
+
+export function projectBuildFromYml(file) {
+  return projectBuildFromYmlText(readText(file));
+}
+
 function normalizedDigest(value) {
   return String(value || "").toLowerCase().replace(/^sha256:/, "");
 }
@@ -676,6 +687,10 @@ export function assertAppcast(manifest, expected) {
 export function main(argv = process.argv.slice(2)) {
   const [command, ...rest] = argv;
   const args = parseArgs(rest);
+  if (command === "project-build") {
+    console.log(projectBuildFromYml(args.file || "app/project.yml"));
+    return;
+  }
   if (command === "update-altstore") {
     updateSourceFile({
       file: args.file,
@@ -798,7 +813,7 @@ export function main(argv = process.argv.slice(2)) {
     console.log(`release-feed: built ${result.manifest.generation}`);
     return;
   }
-  die(`unknown command ${JSON.stringify(command)}; expected update-altstore, verify-source, check-monotonic, verify-asset, verify-public, build-artifact, or rollback`);
+  die(`unknown command ${JSON.stringify(command)}; expected project-build, update-altstore, verify-source, check-monotonic, verify-asset, verify-public, build-artifact, or rollback`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -13,6 +13,7 @@ import {
   buildReleaseFeedArtifact,
   fetchJSON,
   main,
+  projectBuildFromYmlText,
   releaseAssetURL,
   sha256File,
   verifyPublicRoutes,
@@ -124,13 +125,22 @@ test("Beta 10 build mismatch is rejected instead of advertising the wrong binary
   );
 });
 
+test("the project build is an all-target contract, not the first matching line", () => {
+  const six = Array.from({ length: 6 }, () => 'CURRENT_PROJECT_VERSION: "221"').join("\n");
+  assert.equal(projectBuildFromYmlText(six), 221);
+  assert.throws(() => projectBuildFromYmlText('CURRENT_PROJECT_VERSION: "221"'), /exactly six/);
+  assert.throws(() => projectBuildFromYmlText(six.replace('"221"', '"220"')), /disagree/);
+});
+
 test("release and manual cut paths both require feed propagation", async () => {
   const workflow = await readFile(new URL("../../.github/workflows/release-tvos.yml", import.meta.url), "utf8");
   assert.match(workflow, /concurrency:\s*\n\s+group:\s*vortx-release-\$\{\{ inputs\.release_tag \}\}/);
   assert.match(workflow, /name: Build the content-addressed release feed artifact/);
   assert.match(workflow, /name: Attach only exact draft assets and create the authenticated staged receipt/);
   assert.match(workflow, /publish_release/);
-  assert.match(workflow, /name: Publish the verified draft, promote the exact edge generation, and prove public bytes/);
+  assert.match(workflow, /name: Atomically activate the staged feed, prove routes, then publish last/);
+  assert.match(workflow, /node scripts\/release-feed\.mjs project-build --file app\/project\.yml/);
+  assert.match(workflow, /PUBLISH_DEADLINE/);
   assert.match(workflow, /name: Verify the immutable published release and public feed/);
   assert.doesNotMatch(workflow, /if:\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*\n\s*uses: actions\/checkout/);
   const releaseWrite = workflow.slice(workflow.indexOf("  attach-release:"));

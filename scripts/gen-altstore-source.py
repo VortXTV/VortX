@@ -93,8 +93,10 @@ def tag_build(tag: str) -> str:
     except (KeyError, ValueError, UnicodeDecodeError, TypeError) as error:
         raise MetadataError(f"project metadata for {tag} could not be decoded") from error
     matches = re.findall(r'CURRENT_PROJECT_VERSION:\s*"([0-9]+)"', content)
-    if len(matches) != 1:
-        raise MetadataError(f"project metadata for {tag} has {len(matches)} build values")
+    if len(matches) != 6:
+        raise MetadataError(f"project metadata for {tag} has {len(matches)} build values (need six)")
+    if len(set(matches)) != 1:
+        raise MetadataError(f"project metadata for {tag} has inconsistent build values: {matches}")
     return matches[0]
 
 

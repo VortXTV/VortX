@@ -1,6 +1,12 @@
-const ACTIVE_KEY = "feed:active";
-const STAGED_PREFIX = "feed:staged:";
-const ROLLBACK_PREFIX = "feed:rollback:";
+// Durable Object storage is the authority for every mutable release state.  Do
+// not move these records back to KV: a KV read/put pair cannot provide the
+// compare-and-swap semantics a release promotion needs.
+const ACTIVE_KEY = "active";
+const STAGED_RELEASE_PREFIX = "staged:release:";
+const STAGED_GENERATION_PREFIX = "staged:generation:";
+const STAGED_TAG_PREFIX = "staged:tag:";
+const ROLLBACK_PREFIX = "rollback:";
+const AUDIT_PREFIX = "audit:";
 const ARTIFACT_SCHEMA = 2;
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_PUBLIC_AGE = 120;
@@ -12,6 +18,26 @@ const CANONICAL_ALTSTORE = "https://vortx.tv/altstore.json";
 
 function jsonText(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function canonicalValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalValue(value[key])]));
+  }
+  return value;
+}
+
+function canonicalReceiptText(payload) {
+  // Authentication covers the bytes sent by the caller.  This digest covers
+  // the semantic receipt and remains stable across harmless JSON key order.
+  return JSON.stringify(canonicalValue({
+    action: payload.action,
+    manifest: payload.manifest,
+    source: payload.source,
+    appcast: payload.appcast,
+    checksum: payload.checksum,
+  }));
 }
 
 function jsonResponse(value, status = 200, extra = {}) {
@@ -182,7 +208,7 @@ function validateAppcast(appcast, manifest) {
 }
 
 async function validateStage(payload) {
-  if (Number(payload.schemaVersion) !== ARTIFACT_SCHEMA || payload.action !== "stage") throw new Error("unsupported feed receipt schema or action");
+  if (Number(payload.schemaVersion) !== ARTIFACT_SCHEMA || !["stage", "repair"].includes(payload.action)) throw new Error("unsupported feed receipt schema or action");
   const manifest = payload.manifest;
   if (!manifest || Number(manifest.schemaVersion) !== ARTIFACT_SCHEMA || !RELEASE_TAG_RE.test(String(manifest.tag || ""))) throw new Error("manifest identity is invalid");
   positiveInteger(manifest.build, "manifest build");
@@ -221,7 +247,13 @@ async function validateStage(payload) {
   if (manifest.sourceSha256 !== sourceSha || manifest.appcastSha256 !== appcastSha || manifest.checksumSha256 !== checksumSha || manifest.feedSha256 !== feedSha || manifest.generation !== `${manifest.tag}:${manifest.build}:${feedSha}`) {
     throw new Error("manifest digest does not match staged feed bytes");
   }
-  return { manifest, sourceText, appcastText, checksumText };
+  return {
+    manifest,
+    sourceText,
+    appcastText,
+    checksumText,
+    receiptSha256: await sha256(canonicalReceiptText(payload)),
+  };
 }
 
 async function readBody(request) {
@@ -254,41 +286,62 @@ export class FeedCoordinator {
 
   async fetch(request) {
     const payload = await request.json();
-    const current = await this.env.LASTGOOD.get(ACTIVE_KEY, { type: "json" });
-    const currentGeneration = current?.manifest?.generation || null;
-    if (payload.action === "stage") {
-      const stagedKey = `${STAGED_PREFIX}${payload.manifest.releaseId}`;
-      const existing = await this.env.LASTGOOD.get(stagedKey, { type: "json" });
-      if (existing) {
-        if (existing.manifest.generation !== payload.manifest.generation) return failure(409, "staged-conflict", "release ID already has a different feed generation");
-        return jsonResponse({ staged: true, generation: existing.manifest.generation, releaseId: existing.manifest.releaseId });
-      }
-      if (current && Number(payload.manifest.build) < Number(current.manifest.build)) {
-        return failure(409, "build-order", "a staged release cannot be older than the active generation");
-      }
-      await this.env.LASTGOOD.put(stagedKey, JSON.stringify(payload));
-      return jsonResponse({ staged: true, generation: payload.manifest.generation, releaseId: payload.manifest.releaseId });
+    if (payload.action === "read-active") {
+      const active = await this.state.storage.get(ACTIVE_KEY);
+      return jsonResponse({ active: active || null });
     }
-    if (payload.action === "promote") {
-      if (payload.expectedActiveGeneration === undefined || payload.expectedActiveGeneration !== currentGeneration) {
-        return failure(409, "active-generation-conflict", "active generation changed before promotion");
+    return this.state.storage.transaction(async (storage) => {
+      const current = await storage.get(ACTIVE_KEY);
+      const currentGeneration = current?.manifest?.generation || null;
+      if (payload.action === "stage") {
+        const releaseKey = `${STAGED_RELEASE_PREFIX}${payload.manifest.releaseId}`;
+        const generationKey = `${STAGED_GENERATION_PREFIX}${payload.manifest.generation}`;
+        const tagKey = `${STAGED_TAG_PREFIX}${payload.manifest.tag}`;
+        const [byRelease, byGeneration, byTag] = await Promise.all([storage.get(releaseKey), storage.get(generationKey), storage.get(tagKey)]);
+        if (byRelease || byGeneration || byTag) {
+          const existing = byRelease || byGeneration || byTag;
+          if (existing.manifest.generation !== payload.manifest.generation || existing.receiptSha256 !== payload.receiptSha256) return failure(409, "staged-conflict", "release or generation is already bound to different receipt bytes");
+          return jsonResponse({ staged: true, idempotent: true, generation: existing.manifest.generation, releaseId: existing.manifest.releaseId, receiptSha256: existing.receiptSha256 });
+        }
+        if (current && Number(payload.manifest.build) < Number(current.manifest.build)) return failure(409, "build-order", "a staged release cannot be older than the active generation");
+        if (current && Number(payload.manifest.build) === Number(current.manifest.build) && payload.manifest.tag !== current.manifest.tag) return failure(409, "build-tag-conflict", "a build is permanently bound to one release tag");
+        if (current && payload.manifest.tag === current.manifest.tag && Number(payload.manifest.build) !== Number(current.manifest.build)) return failure(409, "tag-build-conflict", "a release tag is permanently bound to one build");
+        await storage.put(releaseKey, payload);
+        await storage.put(generationKey, payload);
+        await storage.put(tagKey, payload);
+        await storage.put(`${AUDIT_PREFIX}stage:${payload.manifest.generation}`, { action: "stage", generation: payload.manifest.generation, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
+        return jsonResponse({ staged: true, generation: payload.manifest.generation, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
       }
-      const staged = await this.env.LASTGOOD.get(`${STAGED_PREFIX}${payload.releaseId}`, { type: "json" });
-      if (!staged || staged.manifest.generation !== payload.generation || String(staged.manifest.releaseId) !== String(payload.releaseId)) return failure(404, "staged-generation-missing", "requested staged generation is not present");
-      if (current) await this.env.LASTGOOD.put(`${ROLLBACK_PREFIX}${payload.generation}`, JSON.stringify(current));
-      await this.env.LASTGOOD.put(ACTIVE_KEY, JSON.stringify(staged));
-      return jsonResponse({ promoted: true, generation: payload.generation, previousGeneration: currentGeneration });
-    }
-    if (payload.action === "rollback") {
-      if (!text(payload.expectedCurrentGeneration, "expectedCurrentGeneration") || !text(payload.restoreGeneration, "restoreGeneration")) return failure(400, "rollback-contract", "rollback requires exact current and restore generations");
-      if (payload.expectedCurrentGeneration !== currentGeneration) return failure(409, "rollback-generation-conflict", "active generation changed before rollback");
-      const previous = payload.restoreGeneration === "none" ? null : await this.env.LASTGOOD.get(`${ROLLBACK_PREFIX}${payload.expectedCurrentGeneration}`, { type: "json" });
-      if (payload.restoreGeneration !== "none" && previous?.manifest?.generation !== payload.restoreGeneration) return failure(409, "rollback-target-mismatch", "trusted rollback generation is unavailable");
-      if (previous) await this.env.LASTGOOD.put(ACTIVE_KEY, JSON.stringify(previous));
-      else await this.env.LASTGOOD.delete(ACTIVE_KEY);
-      return jsonResponse({ rolledBack: true, generation: payload.restoreGeneration });
-    }
-    return failure(400, "coordinator-action", "unsupported coordinator action");
+      if (payload.action === "repair") {
+        if (current) return failure(409, "repair-active-exists", "integrity repair is only allowed when no durable active receipt exists");
+        if (payload.repairReason !== "integrity-repair") return failure(400, "repair-contract", "integrity repair requires the exact repair reason");
+        await storage.put(ACTIVE_KEY, payload);
+        await storage.put(`${STAGED_RELEASE_PREFIX}${payload.manifest.releaseId}`, payload);
+        await storage.put(`${STAGED_GENERATION_PREFIX}${payload.manifest.generation}`, payload);
+        await storage.put(`${STAGED_TAG_PREFIX}${payload.manifest.tag}`, payload);
+        await storage.put(`${AUDIT_PREFIX}repair:${payload.manifest.generation}`, { action: "repair", generation: payload.manifest.generation, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
+        return jsonResponse({ repaired: true, generation: payload.manifest.generation, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
+      }
+      if (payload.action === "promote") {
+        if (payload.expectedActiveGeneration === undefined || payload.expectedActiveGeneration !== currentGeneration) return failure(409, "active-generation-conflict", "active generation changed before promotion");
+        const staged = await storage.get(`${STAGED_RELEASE_PREFIX}${payload.releaseId}`);
+        if (!staged || staged.manifest.generation !== payload.generation || String(staged.manifest.releaseId) !== String(payload.releaseId)) return failure(404, "staged-generation-missing", "requested staged generation is not present");
+        if (current) await storage.put(`${ROLLBACK_PREFIX}${payload.generation}`, current);
+        await storage.put(ACTIVE_KEY, staged);
+        await storage.put(`${AUDIT_PREFIX}promote:${payload.generation}`, { action: "promote", generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
+        return jsonResponse({ promoted: true, generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
+      }
+      if (payload.action === "rollback") {
+        if (!text(payload.expectedCurrentGeneration, "expectedCurrentGeneration") || !text(payload.restoreGeneration, "restoreGeneration")) return failure(400, "rollback-contract", "rollback requires exact current and restore generations");
+        if (payload.expectedCurrentGeneration !== currentGeneration) return failure(409, "rollback-generation-conflict", "active generation changed before rollback");
+        const previous = payload.restoreGeneration === "none" ? null : await storage.get(`${ROLLBACK_PREFIX}${payload.expectedCurrentGeneration}`);
+        if (payload.restoreGeneration !== "none" && previous?.manifest?.generation !== payload.restoreGeneration) return failure(409, "rollback-target-mismatch", "trusted rollback generation is unavailable");
+        if (previous) await storage.put(ACTIVE_KEY, previous); else await storage.delete(ACTIVE_KEY);
+        await storage.put(`${AUDIT_PREFIX}rollback:${payload.expectedCurrentGeneration}`, { action: "rollback", generation: payload.restoreGeneration });
+        return jsonResponse({ rolledBack: true, generation: payload.restoreGeneration });
+      }
+      return failure(400, "coordinator-action", "unsupported coordinator action");
+    });
   }
 }
 
@@ -297,7 +350,7 @@ async function handleReceipt(request, env) {
   const body = await readBody(request);
   if (!(await authenticate(request, body, env))) return failure(401, "receipt-auth", "authenticated release receipt required");
   const payload = parseJSON(body, "receipt");
-  if (payload.action === "stage") {
+  if (payload.action === "stage" || payload.action === "repair") {
     const validated = await validateStage(payload);
     return stageReceipt({ ...payload, ...validated }, env);
   }
@@ -306,7 +359,9 @@ async function handleReceipt(request, env) {
 }
 
 async function handlePublic(pathname, env) {
-  const active = await env.LASTGOOD.get(ACTIVE_KEY, { type: "json" });
+  const response = await coordinatorRequest(new Request("https://coordinator.internal/"), env, { action: "read-active" });
+  if (!response.ok) return response;
+  const { active } = await response.json();
   if (!active || !active.manifest?.generation) return failure(503, "feed-unavailable", "no verified feed generation is active");
   const body = pathname === "/appcast.json" ? active.appcastText : active.sourceText;
   const generation = active.manifest.generation;

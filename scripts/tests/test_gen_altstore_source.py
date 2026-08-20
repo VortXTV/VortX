@@ -108,7 +108,7 @@ class BackfillTests(unittest.TestCase):
                 return details[args[4]]
             if args[0] == "api":
                 tag = args[1].split("ref=", 1)[1]
-                content = f'CURRENT_PROJECT_VERSION: "{details[tag]["build"]}"\n'.encode()
+                content = (f'CURRENT_PROJECT_VERSION: "{details[tag]["build"]}"\n' * 6).encode()
                 return {"content": base64.b64encode(content).decode()}
             raise AssertionError(args)
 

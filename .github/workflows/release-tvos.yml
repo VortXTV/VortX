@@ -915,7 +915,7 @@ jobs:
           TAG="$RELEASE_TAG"
           TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
           [[ "$TAG" =~ $TAG_RE ]] || { echo "::error::release tag $TAG is not strict"; exit 1; }
-          BUILD="$(grep -m1 -E 'CURRENT_PROJECT_VERSION:' app/project.yml | sed -E 's/.*"([0-9]+)".*/\1/')"
+          BUILD="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
           RELEASE_JSON="$(gh api --paginate -- "repos/$GH_REPO/releases" | jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("release identity is missing or duplicated") end')"
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
@@ -1105,7 +1105,7 @@ jobs:
             '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
             feed-artifact/manifest.json > "$RUNNER_TEMP/receipt-manifest.json"
           jq -c --slurpfile manifest "$RUNNER_TEMP/receipt-manifest.json" --rawfile source feed-artifact/source.json --rawfile appcast feed-artifact/appcast.json --rawfile checksum feed-artifact/SHA256SUMS-ci.txt \
-            '{action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > "$RUNNER_TEMP/feed-receipt.json"
+            '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > "$RUNNER_TEMP/feed-receipt.json"
           SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary <"$RUNNER_TEMP/feed-receipt.json" | od -An -tx1 | tr -d ' \n')"
           RECEIPT_RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS \
             -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" \
@@ -1125,7 +1125,7 @@ jobs:
             exit 0
           fi
 
-      - name: Publish the verified draft, promote the exact edge generation, and prove public bytes
+      - name: Atomically activate the staged feed, prove routes, then publish last
         if: inputs.publish_release == true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1138,6 +1138,7 @@ jobs:
           set -Eeuo pipefail
           PROMOTED=0
           SOURCE_COMMITTED=0
+          ROLLBACK_FAILURE=0
           rollback_edge() {
             [ "$PROMOTED" = 1 ] || return 0
             local restore="$EXPECTED_ACTIVE"
@@ -1146,7 +1147,10 @@ jobs:
             body="$(jq -cn --arg generation "$FEED_GENERATION" --arg restore "$restore" '{action:"rollback",expectedCurrentGeneration:$generation,restoreGeneration:$restore}')"
             signature="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
             result="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$signature" --data-binary "$body" https://vortx.tv/__release/receipt || true)"
-            echo "edge rollback receipt: $result"
+            if ! jq -e --arg restore "$restore" '.rolledBack == true and .generation == (if $restore == "none" then "none" else $restore end)' <<<"$result" >/dev/null; then
+              echo "::error::incident: edge rollback did not verify"
+              ROLLBACK_FAILURE=1
+            fi
           }
           commit_source_bytes() {
             local file="$1" message="$2" expected_head="${3:-}" main_head base_tree source_b64 blob_sha tree_sha commit_sha
@@ -1172,9 +1176,13 @@ jobs:
             gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=main" | jq -er '.content' | tr -d '\n' | base64 --decode > "$current" || return 0
             if cmp -s "$current" feed-artifact/source.json; then
               [ -n "$current_head" ] || return 0
-              commit_source_bytes "$PREVIOUS_SOURCE_FILE" "chore(release): restore verified install feed" "$current_head"
+              if ! commit_source_bytes "$PREVIOUS_SOURCE_FILE" "chore(release): restore verified install feed" "$current_head"; then
+                echo "::error::incident: main-source rollback failed"
+                ROLLBACK_FAILURE=1
+              fi
             else
               echo "::error::source rollback CAS refused because main no longer contains the published feed bytes"
+              ROLLBACK_FAILURE=1
             fi
           }
           rollback_release() {
@@ -1182,7 +1190,7 @@ jobs:
             current="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
             if [ -n "$current" ] && [ -n "${PUBLISHED_AT:-}" ] && jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" '.tag_name == $tag and .draft == false and .published_at == $published' <<<"$current" >/dev/null; then
               restored="$(gh api --method PATCH -f draft=true -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-              jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true' <<<"$restored" >/dev/null || echo "::error::GitHub could not restore release $RELEASE_ID to draft"
+              jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true' <<<"$restored" >/dev/null || { echo "::error::incident: GitHub could not restore release $RELEASE_ID to draft"; ROLLBACK_FAILURE=1; }
             fi
           }
           on_failure() {
@@ -1193,16 +1201,18 @@ jobs:
               rollback_source
               rollback_release
               set -e
+              if [ "$ROLLBACK_FAILURE" = 1 ]; then
+                echo "::error::incident: release rollback was incomplete; do not retry blindly"
+              fi
             fi
             exit "$status"
           }
           trap on_failure EXIT
+          # The draft asset API proof happened before staging. Do not fetch the
+          # public download URLs yet: the release must remain a draft until the
+          # main and edge state have both accepted the exact staged bytes.
           RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
           jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true' <<<"$RELEASE_JSON" >/dev/null
-          gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null
-          RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
-          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null
-          PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
           for KEY_FILE in \
             "ios:out/VortX-iOS-$TAG-ci.ipa:$IOS_ASSET_ID" \
             "tvos:out/VortX-tvOS-$TAG-ci.ipa:$TVOS_ASSET_ID" \
@@ -1210,16 +1220,13 @@ jobs:
             "mac:out/VortX-macOS-$TAG-ci.dmg:$MAC_ASSET_ID"; do
             KEY="${KEY_FILE%%:*}"; REMAINDER="${KEY_FILE#*:}"; FILE="${REMAINDER%%:*}"; ASSET_ID="${REMAINDER#*:}"
             NAME="$(jq -er --arg key "$KEY" '.assets[$key].name' feed-artifact/manifest.json)"; URL="$(jq -er --arg key "$KEY" '.assets[$key].url' feed-artifact/manifest.json)"; SIZE="$(jq -er --arg key "$KEY" '.assets[$key].size' feed-artifact/manifest.json)"; SHA="$(jq -er --arg key "$KEY" '.assets[$key].sha256' feed-artifact/manifest.json)"
-            curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "$URL" -o "$RUNNER_TEMP/public-$KEY"
-            cmp -s "$FILE" "$RUNNER_TEMP/public-$KEY" || { echo "::error::public asset bytes differ for $KEY"; exit 1; }
-            [ "$(wc -c <"$RUNNER_TEMP/public-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::public asset size differs for $KEY"; exit 1; }
             API_DIGEST="$(jq -er --argjson id "$ASSET_ID" '.assets[] | select(.id == $id) | (.digest // "") | sub("^sha256:"; "") | ascii_downcase' <<<"$RELEASE_JSON")"
             API_SIZE="$(jq -er --argjson id "$ASSET_ID" '.assets[] | select(.id == $id) | .size' <<<"$RELEASE_JSON")"
             API_NAME="$(jq -er --argjson id "$ASSET_ID" '.assets[] | select(.id == $id) | .name' <<<"$RELEASE_JSON")"
             [ "$API_NAME" = "$NAME" ] && [ "$API_SIZE" = "$SIZE" ] && [ "$API_DIGEST" = "$SHA" ] || { echo "::error::release API asset metadata differs for $KEY"; exit 1; }
           done
-          curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "https://github.com/$GH_REPO/releases/download/$TAG/SHA256SUMS-ci.txt" -o "$RUNNER_TEMP/public-checksums.txt"
-          cmp -s out/SHA256SUMS-ci.txt "$RUNNER_TEMP/public-checksums.txt" || { echo "::error::public checksum bytes differ from the trusted local checksum file"; exit 1; }
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$CHECKSUM_ASSET_ID" > "$RUNNER_TEMP/draft-checksums.txt"
+          cmp -s out/SHA256SUMS-ci.txt "$RUNNER_TEMP/draft-checksums.txt" || { echo "::error::authenticated draft checksum bytes differ"; exit 1; }
           commit_source_bytes feed-artifact/source.json "chore(release): publish verified install feed" "$EXPECTED_MAIN_HEAD"
           PROMOTE_BODY="$(jq -cn --arg rid "$RELEASE_ID" --arg generation "$FEED_GENERATION" --arg expected "$EXPECTED_ACTIVE" '{action:"promote",releaseId:$rid,generation:$generation,expectedActiveGeneration:(if $expected == "none" then null else $expected end)}')"
           PROMOTE_SIGNATURE="$(printf '%s' "$PROMOTE_BODY" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
@@ -1255,8 +1262,40 @@ jobs:
             sleep 15
           done
           [ "$MAIN_VERIFIED" = 1 ] || { echo "::error::raw main source did not converge to the exact staged bytes"; exit 1; }
+          # Final write: only now can the draft become externally installable.
+          # Retrying is bounded and every readback binds the same immutable ID,
+          # tag, and published timestamp before any public-asset proof starts.
+          PUBLISH_DEADLINE=$(($(date +%s) + 90))
+          PUBLISHED=0
+          while [ "$(date +%s)" -lt "$PUBLISH_DEADLINE" ]; do
+            gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
+            RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+              PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
+              PUBLISHED=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$PUBLISHED" = 1 ] || { echo "::error::release:published did not converge for immutable release $RELEASE_ID"; exit 1; }
+          # Post-publication checks are read-only. They use the API-bound
+          # release JSON plus the public CDN bytes and never mutate a feed.
+          for KEY_FILE in \
+            "ios:out/VortX-iOS-$TAG-ci.ipa" \
+            "tvos:out/VortX-tvOS-$TAG-ci.ipa" \
+            "tvosLite:out/VortX-tvOS-lite-$TAG-ci.ipa" \
+            "mac:out/VortX-macOS-$TAG-ci.dmg"; do
+            KEY="${KEY_FILE%%:*}"; FILE="${KEY_FILE#*:}"
+            URL="$(jq -er --arg key "$KEY" '.assets[$key].url' feed-artifact/manifest.json)"; SIZE="$(jq -er --arg key "$KEY" '.assets[$key].size' feed-artifact/manifest.json)"; SHA="$(jq -er --arg key "$KEY" '.assets[$key].sha256' feed-artifact/manifest.json)"
+            curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "$URL" -o "$RUNNER_TEMP/public-$KEY"
+            cmp -s "$FILE" "$RUNNER_TEMP/public-$KEY" || { echo "::error::public asset bytes differ for $KEY"; exit 1; }
+            [ "$(wc -c <"$RUNNER_TEMP/public-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::public asset size differs for $KEY"; exit 1; }
+            [ "$(shasum -a 256 "$RUNNER_TEMP/public-$KEY" | awk '{print $1}')" = "$SHA" ] || { echo "::error::public asset digest differs for $KEY"; exit 1; }
+          done
+          curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "https://github.com/$GH_REPO/releases/download/$TAG/SHA256SUMS-ci.txt" -o "$RUNNER_TEMP/public-checksums.txt"
+          cmp -s out/SHA256SUMS-ci.txt "$RUNNER_TEMP/public-checksums.txt" || { echo "::error::public checksum bytes differ from the trusted local checksum file"; exit 1; }
           trap - EXIT
-          echo "published release $RELEASE_ID, promoted feed generation $FEED_GENERATION, and verified public routes/assets"
+          echo "promoted feed generation $FEED_GENERATION, verified public/raw bytes, then published release $RELEASE_ID and completed read-only postchecks"
 
   # A published event is verification and recovery only. It is bound to the immutable release ID
   # from the event payload and never attaches assets, mutates main, promotes a feed, or republishes.
@@ -1270,6 +1309,26 @@ jobs:
       contents: read
     timeout-minutes: 12
     steps:
+      - name: Wait for the immutable published release to become readable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
+          READ_DEADLINE=$(($(date +%s) + 90))
+          READY=0
+          while [ "$(date +%s)" -lt "$READ_DEADLINE" ]; do
+            RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$READY" = 1 ] || { echo "::error::release:published did not become readable for immutable release $RELEASE_ID"; exit 1; }
       - name: Verify the immutable published release and public feed
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

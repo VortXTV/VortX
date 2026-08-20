@@ -9,10 +9,6 @@ routes = [
   { pattern = "vortx.tv/__release/receipt*", zone_name = "vortx.tv" },
 ]
 
-[[kv_namespaces]]
-binding = "LASTGOOD"
-id = "7edd0bcba056430fb3e6fb7fc6656281"
-
 [[durable_objects.bindings]]
 name = "COORDINATOR"
 class_name = "FeedCoordinator"
