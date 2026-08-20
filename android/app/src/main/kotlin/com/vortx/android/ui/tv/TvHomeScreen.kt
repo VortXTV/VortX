@@ -74,7 +74,14 @@ import kotlinx.coroutines.flow.first
 /// screen only changes the presentation to a 10-foot, focus-first layout. Loading/error are first-class
 /// states, never a bare black screen.
 @Composable
-fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+fun TvHomeScreen(
+    viewModel: HomeViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    // Bumped by the shell when the Home tab is re-selected on the rail, so the rail list scrolls back to the
+    // top -- the 10-foot analogue of Apple's `scrollToTopOnBump`.
+    reselectSignal: Int = 0,
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val contentOwnerGeneration by viewModel.contentOwnerGeneration.collectAsStateWithLifecycle()
     val catalogLayout by viewModel.homeCatalogLayout.collectAsStateWithLifecycle()
@@ -118,6 +125,7 @@ fun TvHomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier:
                     onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
                     onLoadRowPage = viewModel::loadNextPage,
                     onLoadMoreRows = viewModel::loadMoreRows,
+                    reselectSignal = reselectSignal,
                     modifier = modifier,
                 )
             }
@@ -138,6 +146,7 @@ private fun TvHomeContent(
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     onLoadRowPage: (Catalog) -> Unit,
     onLoadMoreRows: () -> Unit,
+    reselectSignal: Int = 0,
     modifier: Modifier,
 ) {
     val colors = VortXTheme.colors
@@ -165,6 +174,15 @@ private fun TvHomeContent(
     val columnState = rememberLazyListState()
     val rowStates = remember(contentOwnerGeneration, catalogLayout) {
         mutableStateMapOf<String, LazyListState>()
+    }
+
+    // Re-selecting the active Home tab scrolls the rail list back to the top (Apple `scrollToTopOnBump`).
+    // Baseline-captured on first composition so a plain tab switch (which restores the saved scroll position)
+    // never force-scrolls; only a bump that happens WHILE this screen is composed scrolls. Fail-soft if the
+    // list is not attached (e.g. the poster-wall layout owns its own scroller).
+    val initialReselect = remember { reselectSignal }
+    LaunchedEffect(reselectSignal) {
+        if (reselectSignal != initialReselect) runCatching { columnState.animateScrollToItem(0) }
     }
 
     val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.5f).dp.coerceIn(280.dp, 460.dp)

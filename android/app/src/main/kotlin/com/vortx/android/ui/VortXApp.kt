@@ -60,6 +60,7 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
+import com.vortx.android.moat.WatchSignalClient
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
@@ -668,6 +669,19 @@ fun VortXApp(
                                     enabled = AutoAddLibrarySetting.isEnabled(appContext),
                                 )
                             }
+                            // Same 60s "really watching this" moment sends the anonymized fleet watch signal,
+                            // exactly as Apple hangs it off the same tick beside the auto-add
+                            // (PlayerScreen.swift:1777 / TVPlayerView.swift:1733). Gated only by the pool
+                            // consent + a per-title/day dedup INSIDE [WatchSignalClient], independent of the
+                            // auto-add-to-Library setting, so the same latch that guards the add covers it once
+                            // per playback. A `tmdb:` hub/catalog id resolves to its `tt` identity first
+                            // (fire-and-forget); a `tt` id pings inline. Never blocks and fully fail-soft.
+                            WatchSignalClient.pingResolvingTmdb(
+                                context = appContext,
+                                contentId = meta.id,
+                                type = meta.type.id,
+                                seriesHint = meta.type == MediaType.SERIES,
+                            )
                         }
                     },
                 )

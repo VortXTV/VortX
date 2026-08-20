@@ -90,8 +90,10 @@ class HomeDiscoverPreferences(context: Context) {
         }
 
     /**
-     * Per-tile / per-section Discover hidden categories (Apple `vortx.discover.hiddenCategories`, canonical
-     * ids). Persisted on the exact key, ready for its Discover-surface consumer.
+     * Per-tile / per-section Discover hidden categories (Apple `vortx.discover.hiddenCategories`). WIRED: the
+     * collections hub ([com.vortx.android.home.CollectionsHubModel]) reads this key and drops the matching
+     * section rows / tiles from Home and Discover; section keys ([com.vortx.android.home.HubCategoryKey]) match
+     * Apple exactly, so a whole-section hide carries across devices.
      */
     var hiddenCategories: Set<String>
         get() = prefs.getStringSet(KEY_HIDDEN_CATEGORIES, emptySet()).orEmpty()

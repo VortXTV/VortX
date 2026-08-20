@@ -86,6 +86,9 @@ import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.ui.viewmodel.AccountViewModel
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.home.HomeRailPreferences
+import com.vortx.android.home.HomeRailSurface
+import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.viewmodel.HomeViewModel
 import com.vortx.android.notifications.NewEpisodeNotifications
 import com.vortx.android.update.UpdateAvailableBanner
 import com.vortx.android.model.TrackPreferencesStore
@@ -138,6 +141,9 @@ fun TvSettingsScreen(
     modifier: Modifier = Modifier,
     auth: AuthRepository = PreviewAuthRepository(),
     syncManager: VortXSyncManager? = null,
+    // Opening a title from a Settings-nested browse surface (the Upcoming screen) routes back up to the shell's
+    // shared detail flow. Default no-op keeps the screen usable in a @Preview / test.
+    onItem: (MetaItem) -> Unit = {},
 ) {
     val appContext = LocalContext.current.applicationContext
     val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
@@ -342,6 +348,31 @@ fun TvSettingsScreen(
         return
     }
 
+    if (route == TvSettingsRoute.STREAMING_SERVICES) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        TvReorderServicesScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.UPCOMING) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        // The shared Home ViewModel already assembles the release-calendar catalogs; reuse the retained
+        // instance so the Upcoming screen reflects Home's loaded state with no second data path.
+        val homeFactory = StremioXViewModelFactory(
+            repo = repo,
+            auth = auth,
+            appContext = appContext,
+            homeSurface = HomeRailSurface.TV,
+        )
+        TvUpcomingScreen(
+            viewModel = viewModel<HomeViewModel>(factory = homeFactory),
+            onItem = onItem,
+            onBack = { route = TvSettingsRoute.ROOT },
+            modifier = modifier,
+        )
+        return
+    }
+
     if (route == TvSettingsRoute.MEDIA_SERVERS) {
         BackHandler { route = TvSettingsRoute.ROOT }
         MediaServersScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
@@ -474,6 +505,7 @@ fun TvSettingsScreen(
             if (show(
                     "appearance", "theme", "accent", "oled", "text size", "app language",
                     "home", "discover", "collections", "spoiler", "poster", "continue watching",
+                    "streaming", "services",
                 )
             ) item {
                 TvSettingsSection("Appearance") {
@@ -486,6 +518,11 @@ fun TvSettingsScreen(
                         label = "Home & Discover",
                         detail = "Home rows, collections hub, and spoiler-safe mode.",
                         onClick = { route = TvSettingsRoute.HOME_DISCOVER },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "Streaming Services",
+                        detail = "Choose and reorder the services in Collections.",
+                        onClick = { route = TvSettingsRoute.STREAMING_SERVICES },
                     )
                     TvSettingsNavigationRow(
                         label = "Customize Home",
@@ -517,8 +554,13 @@ fun TvSettingsScreen(
                 }
             }
 
-            if (show("library", "auto-add", "watched", "new episode", "alerts", "notifications")) item {
+            if (show("library", "auto-add", "watched", "new episode", "alerts", "notifications", "upcoming", "coming soon")) item {
                 TvSettingsSection("Library") {
+                    TvSettingsNavigationRow(
+                        label = "Upcoming",
+                        detail = "Next-airing episodes and releases from titles in your Library.",
+                        onClick = { route = TvSettingsRoute.UPCOMING },
+                    )
                     TvToggleRow(
                         label = "Auto-add watched to Library",
                         detail = "Adds a title once about a minute has played. A title you remove by hand stays removed.",
@@ -922,6 +964,8 @@ internal enum class TvSettingsRoute {
     METADATA,
     APPEARANCE,
     HOME_DISCOVER,
+    STREAMING_SERVICES,
+    UPCOMING,
     MEDIA_SERVERS,
     IPTV,
     PLAYBACK,

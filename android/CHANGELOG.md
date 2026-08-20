@@ -7,6 +7,31 @@ Apple release notes live in the repository [CHANGELOG.md](../CHANGELOG.md).
 
 ### Player
 
+**Sound that follows your speakers.** The player now reads the audio route you are actually listening on
+(phone speaker, wired or Bluetooth headphones, an HDMI receiver, a USB DAC, or a cast target) before it
+decides how to send sound. A surround (5.1 or Atmos) track is kept intact for a receiver that can play it
+and cleanly folded down to stereo for anything that cannot, so a multichannel movie can never come out
+silent on a stereo output. Dolby/DTS passthrough is only handed to a route that can decode it. The Audio
+Output control (Auto, Stereo, Surround, Passthrough) stays on the same setting key as the Apple app.
+
+**Picks the right audio track for your setup.** When a title carries more than one audio track in your
+preferred language (say an English 5.1 and an English stereo), the player now chooses by what you are
+listening on: a receiver that can play surround gets the full 5.1 or 7.1 mix, while headphones or a phone
+speaker get the native stereo track instead of a folded-down surround one. Your preferred audio language
+still comes first; this only breaks the tie between same-language tracks, and titles that report no channel
+information behave exactly as before.
+
+**Chinese, Japanese, Korean, and other non-Latin subtitles render properly.** The libmpv engine now draws
+subtitle glyphs from a CJK-capable fallback font set, so Chinese, Japanese, Korean, Arabic, Hebrew, Thai, and
+similar scripts show real characters instead of empty boxes, the same way the Apple app does. It only fills in
+glyphs the chosen style cannot draw, so your Latin subtitles keep their look.
+
+**Community subtitle groundwork.** The foundation for VortX's community subtitle pool landed: a signed,
+fail-soft client that can read subtitles other viewers have contributed for the same title, learn a per-release
+sync offset and apply it automatically, and contribute embedded or add-on subtitle text back so the next viewer
+benefits. Your own manual sync nudge always wins and teaches the pool the right offset for that exact release. A
+later update wires this into the subtitle picker; today it ships as the tested groundwork behind it.
+
 **A scrubber that finally looks like the Apple app.** The progress bar now honours your Seek Bar Style
 choice (fourteen looks, from Classic and Minimal to Wave, Ripple, Comet, Liquid, and Spectrum), animating
 from a continuous clock so a wave really travels. It draws a faint grey buffered-ahead band so you can see
@@ -79,6 +104,32 @@ exactly like Home.
 (shows and movies from anime catalogs get their own tab), smart filters for Unwatched, In Progress, Watched,
 and Short that appear only when they would actually narrow your saved titles, and a press-and-hold menu on any
 poster to Mark as Watched, Mark as Unwatched, or Remove from Library.
+
+**The couch detail page gains the franchise rail and box-office line.** A movie's title page on the TV now
+shows the collection it belongs to as its own poster rail, just above More Like This, in release order, so a
+franchise is one click to browse end to end. It also shows a compact budget, box office, and profit line under
+the ratings, on the same "Show budget & box office" setting the phone and Apple read, so turning it off on any
+device turns it off everywhere.
+
+**A quiet "You're offline" chip.** When the TV loses its internet connection, a small chip appears at the
+bottom of the screen letting you know, and pointing out that your downloads still play. It clears itself the
+moment the connection is back and never steals focus, so the remote keeps driving the content beneath it. A
+brief Wi-Fi blip no longer flickers it in and out.
+
+**Re-select to jump back to the top.** Selecting the Home or Discover rail entry again while you are already on
+it now scrolls that surface back to the top, so a long scroll down is one click to reset. Switching between
+tabs still keeps each one where you left it.
+
+**Pick and reorder your streaming services.** A new Streaming Services screen under Settings > Appearance lets
+you choose exactly which services show in the Collections hub and put them in the order you want, with Up,
+Down, Remove, and an Add list of everything available in your region. Leave it untouched and the hub keeps
+showing every service in your region as before. Your picks ride the same setting the Apple app uses, so they
+carry across your devices.
+
+**An Upcoming screen for what is coming soon.** Settings > Library now has an Upcoming screen that gathers the
+next-airing episode of every series you follow and every followed movie with a release on the way into one
+full-screen grid, the couch version of the Apple app's Upcoming view. It reuses the same "Coming soon" rows
+Home already builds, so nothing new is fetched to show it, and each poster opens straight into the title.
 
 **Full TV settings, on the same keys as everywhere else.** Android TV Settings now reaches the deep
 configuration surfaces from the couch, each one the exact phone screen behind a D-pad route so a change here
@@ -202,6 +253,11 @@ turn on the editorial rows or the Collections hub under Settings > Home & Discov
 wherever you place Collections in Customize Home (and disappears when you hide it there), on both phone and
 TV.
 
+**Hide the sections you never browse.** Settings > Home & Discover now has a Collections categories block that
+turns whole hub rows off: Discover cards, Streaming services, Genres, or Decades. The Home and Discover hubs
+honour it live on phone and TV, and it rides the same setting the Apple app uses, so a section you hide on one
+device stays hidden on the others.
+
 **Browse another region, and a fleet safety switch.** A new Discover region control under Settings > Home &
 Discover lets you point the Collections hub at another market's streaming services and catalogs, so you can
 browse what is available elsewhere while Auto keeps following your device region. The Collections hub also
@@ -236,6 +292,38 @@ next time the app opens. Live scrobbling (start, pause, stop) and the watchlist 
 for your main profile: a guest or kids profile plays against its own local history and never writes into
 your account's Trakt or SIMKL. Everything stays dormant until you connect Trakt or SIMKL, and no change is
 ever written into data the official Stremio apps read. Android phone and TV.
+
+**Your app settings now follow you across devices.** When you are signed in, VortX carries your global
+settings on the same private, encrypted account channel and under the same setting keys the Apple app and the
+website use, so a choice made on one device shows up on the others. This covers the appearance and text size,
+subtitle look, audio output, the player behaviour toggles, the Home and Discover layout, the hidden tabs, the
+language override, and the Stremio mirror switches. Device-specific choices are deliberately left out and stay
+per device, exactly as the Apple app leaves them out: the streaming cache size, the custom streaming server,
+video upscaling, the Dolby Vision toggle, and the download queue and limits. Your per profile preferences keep
+travelling with the profile, and your account sign-in never leaves this device. Android phone and TV.
+
+**Your debrid keys now follow your account across devices.** A debrid service key (Real-Debrid, AllDebrid,
+Premiumize, or TorBox) entered on one device now travels on the same private, encrypted account channel and
+appears on your other signed-in devices, so you set it once. VortX only ever adds the keys this device holds
+and never removes one another device or the website set, so connecting a service on your phone does not clear
+the one on your TV. The keys stay tied to the signed-in account and are never written into anything the
+official Stremio apps read. Android phone and TV.
+
+**Auto-added Library state now lines up with the other apps.** The record of which titles VortX auto-added to
+your Library at about a minute of playback (so a title you later remove by hand is not re-added) is now stored
+under the exact same key the Apple app and the website use, instead of a slightly different Android-only one.
+Anything already remembered on this device is carried across to the shared key, so nothing is lost. Android
+phone and TV.
+
+### Privacy
+
+**Anonymized signals that sharpen your recommendations, on by default and fully opt-out.** With the same
+anonymized-data preference the Apple app uses (on by default), VortX can now contribute a small, anonymous
+"this was watched" signal that helps the app surface better Trending and Popular results over time. It carries
+no account, no name, and nothing that identifies you or your device, is limited to at most one signal per
+title per day, and simply does nothing if you turn the preference off. The preference is the single switch for
+this kind of anonymized contribution, held on the same key as the Apple app and the website so a choice you
+make on one carries to the others. Android phone and TV.
 
 ### Playback and buffering
 

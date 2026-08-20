@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.util.Log
 import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.debrid.DebridService
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
@@ -674,6 +675,16 @@ class VortXSyncManager(context: Context) {
 
     private val appContext = context.applicationContext
     private val settingsBundleId = appContext.packageName
+
+    /**
+     * The `vortx_settings` [SharedPreferences] domain, Android's analogue of Apple's `UserDefaults`: the shared
+     * file the settings stores (theme, subtitle style, player toggles, home/discover layout, ...) read and write.
+     * The device app-settings sync leg (gap 1) reads its syncable keys into `doc.settings` on push and writes an
+     * incoming account blob back here on pull. NOT the credential store: the account token and every secret live
+     * only in the encrypted session/credential stores, never in this file.
+     */
+    private val settingsPrefs: SharedPreferences =
+        appContext.getSharedPreferences(SETTINGS_PREFS_FILE, Context.MODE_PRIVATE)
     private val debridKeys = DebridKeys(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
@@ -1463,11 +1474,75 @@ class VortXSyncManager(context: Context) {
                     roster = store.profiles,
                     rosterModifiedSeconds = store.rosterModified,
                     bundleId = settingsBundleId,
+                    // gap 1: carry this device's syncable GLOBAL app settings (theme, subtitle style, player
+                    // toggles, home/discover layout, ...) on the SAME channel + keys Apple uses. Local-wins,
+                    // never-delete: only keys this device holds are set; a key it lacks keeps the account's value.
+                    deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
                 )?.let { doc.put("settings", it) }
                 doc.put("vortx", VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx")))
+                // gap 2: mirror this device's connected-service (debrid) keys on doc.apiKeys, read-merge +
+                // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
+                mergeDebridKeysIntoDoc(doc)
             }
         }
         return doc.takeIf { published && isSyncLeaseCurrent(lease) }
+    }
+
+    /**
+     * Apply an incoming account `doc.settings` blob's GLOBAL device settings into `vortx_settings` (gap 1). Writes
+     * ONLY the [SettingsBackup.SYNCABLE_SETTING_TYPES] keys the blob carries, each under the exact type its getter
+     * expects, and NEVER clears a key the blob omits (a device missing a setting keeps its own value, mirroring
+     * Apple's never-wipe restore). Must run inside syncDown's apply window (applyingRemote true) so these
+     * SharedPreferences writes cannot arm a self-echo push. Returns true when at least one setting was applied.
+     */
+    private fun applyDeviceSettings(blob: Any?): Boolean {
+        val settings = SettingsBackup.settingsFromBlob(blob) ?: return false
+        if (settings.isEmpty()) return false
+        val editor = settingsPrefs.edit()
+        for ((key, value) in settings) {
+            when (value) {
+                is SettingsBackup.BackupValue.Bool -> editor.putBoolean(key, value.value)
+                is SettingsBackup.BackupValue.IntValue -> editor.putInt(key, value.value)
+                is SettingsBackup.BackupValue.LongValue -> editor.putLong(key, value.value)
+                is SettingsBackup.BackupValue.FloatValue -> editor.putFloat(key, value.value)
+                is SettingsBackup.BackupValue.Str -> editor.putString(key, value.value)
+                is SettingsBackup.BackupValue.StrSet -> editor.putStringSet(key, value.value)
+            }
+        }
+        editor.apply()
+        return true
+    }
+
+    /**
+     * Read-merge this device's configured debrid service keys into `doc.apiKeys` (gap 2), mirroring Apple's
+     * apiKeys leg. START from the pulled `apiKeys` and SET only the slots this device holds; NEVER delete a key
+     * this device did not author, so a TMDB / Trakt / SIMKL / media-server / IPTV key another surface wrote is
+     * preserved (the asymmetric read-merge Apple uses). The keys are owner-scoped by [DebridKeys]' account
+     * binding, so a signed-in device only ever emits its OWN account's keys. Key VALUES are never logged. An
+     * empty result never creates an `apiKeys` object, so a fresh account does not gain an empty key.
+     */
+    private fun mergeDebridKeysIntoDoc(doc: JSONObject) {
+        val keys = doc.optJSONObject("apiKeys")?.let { JSONObject(it.toString()) } ?: JSONObject()
+        for (service in DebridService.entries) {
+            if (debridKeys.isConfigured(service)) keys.put(service.id, debridKeys.key(service))
+        }
+        if (keys.length() > 0) doc.put("apiKeys", keys)
+    }
+
+    /**
+     * Apply connected-service (debrid) keys from an incoming `doc.apiKeys` (gap 2). Sets ONLY the slots the blob
+     * carries and NEVER clears a locally-configured key the blob omits (mirrors Apple's never-delete-on-absence
+     * apiKeys guard). Owner-scoped via [DebridKeys]' account binding; a failed durable write is skipped
+     * (fail-soft) rather than surfaced. Key VALUES are never logged. Returns true when at least one key applied.
+     */
+    private fun applyDebridKeys(apiKeys: JSONObject?): Boolean {
+        apiKeys ?: return false
+        var applied = false
+        for (service in DebridService.entries) {
+            val value = apiKeys.optString(service.id, "")
+            if (value.isNotEmpty() && debridKeys.setKey(service, value)) applied = true
+        }
+        return applied
     }
 
     /**
@@ -1538,12 +1613,20 @@ class VortXSyncManager(context: Context) {
                     // Re-assert this session's local deletes after the fold: a profile deleted this session stays
                     // gone even if the pulled doc predates its tombstone (the resurrect window).
                     store.applyLocalTombstones()
+                    // gap 1: adopt the account's GLOBAL app settings (theme, subtitle style, player toggles,
+                    // home/discover layout, ...). Never-wipe: only keys the blob carries are written; a key it
+                    // omits keeps this device's own value. Under applyingRemote so these writes never arm a push.
+                    if (applyDeviceSettings(doc.opt("settings"))) restored = true
                 } finally {
                     applyingRemote = false
                 }
             }
         }
         if (!published || !isSyncLeaseCurrent(lease)) return false
+        // gap 2: adopt connected-service (debrid) keys set on another device. Applied off the Main thread
+        // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
+        // applyingRemote window). Owner-scoped by DebridKeys' account binding; never clears a key the blob omits.
+        if (applyDebridKeys(doc.optJSONObject("apiKeys"))) restored = true
         // Stamp the applied version so the version-wins guard holds across relaunches (per account).
         if (!advanceVersion(lease, version)) return false
         return restored
@@ -2032,5 +2115,11 @@ class VortXSyncManager(context: Context) {
 
         /** Bounded optimistic-concurrency retries for a derived push (Apple `pushDerivedDoc`: 3). */
         private const val PUSH_MAX_RETRIES = 3
+
+        /**
+         * The shared settings [SharedPreferences] file (Android's `UserDefaults` analogue). Kept as a literal
+         * here rather than reaching into one store's private constant; every settings store names the same file.
+         */
+        private const val SETTINGS_PREFS_FILE = "vortx_settings"
     }
 }

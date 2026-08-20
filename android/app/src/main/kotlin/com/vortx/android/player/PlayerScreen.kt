@@ -873,7 +873,16 @@ fun PlayerScreen(
         val subtitleTracks = latestState.subtitleTracks
         if (audioTracks.isEmpty() && subtitleTracks.isEmpty()) return@LaunchedEffect
         val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences, matchAudioSub)
-        pick.audioId?.let { engine.selectAudioTrack(it) }
+        // Fidelity refinement: among same-language audio tracks, honour the channel layout the active
+        // output route can render, the tie-break Apple's picker cannot make (TrackSelector.swift documents
+        // MPVTrack carries no channel counts). Fail-soft: unknown channels leave the language pick as-is.
+        val audioId = com.vortx.android.player.audio.AudioTrackFidelity.refine(
+            audioTracks,
+            pick.audioId,
+            trackPreferences.rejectTerms,
+            com.vortx.android.player.audio.AudioRoute.current(context),
+        )
+        audioId?.let { engine.selectAudioTrack(it) }
         val subId = pick.subtitleId
         if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
         autoSelectDone = true

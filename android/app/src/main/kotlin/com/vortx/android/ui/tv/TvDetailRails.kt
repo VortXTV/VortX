@@ -25,6 +25,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import com.vortx.android.catalog.CollectionClient
 import com.vortx.android.catalog.WatchProvider
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
@@ -177,6 +178,53 @@ fun TvSimilarRail(
             // No item key: TMDB ids are effectively unique here, but keying by a possibly-repeated id risks
             // the duplicate-key crash the grid screens guard against, and this list is static per title.
             items(titles) { item ->
+                TvPosterCard(item = item, onClick = { onOpen(item) }, onFocused = {})
+            }
+        }
+    }
+}
+
+/// DET financials fact line (MOVIES ONLY): the movie's budget + box office as one compact tertiary line just
+/// beneath the ratings strip, gated on the "Show budget & box office" setting. The caller passes the already
+/// formatted [FinancialsClient.financialsText] string ("Budget $200M  ·  Box Office $1.4B  ·  Profit 7.0x").
+/// The couch analogue of the phone `DetailFactLine` and the mirror of Apple `DetailView.swift`'s
+/// `financialsRow`.
+@Composable
+fun TvFinancialsLine(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text = text,
+        style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+        modifier = modifier,
+    )
+}
+
+/// DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in release order,
+/// reusing the [TvSimilarRail] poster-tile idiom. The header frames "Part of the <X> Collection"
+/// ([CollectionClient.collectionRowTitle]); each focusable [TvPosterCard] opens its title through [onOpen]
+/// (the same tmdb->tt resolve the More Like This rail uses). The couch analogue of the phone `CollectionRail`
+/// and the mirror of Apple `DetailView.swift`'s collection rail JUST ABOVE More Like This. The caller already
+/// hid a single-part collection.
+@Composable
+fun TvCollectionRail(
+    collection: CollectionClient.MovieCollection,
+    onOpen: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = TvDimens.edge)) {
+            Text(text = "Collection".uppercase(), style = VortXTheme.type.eyebrow)
+            Text(text = CollectionClient.collectionRowTitle(collection.name), style = VortXTheme.type.sectionTitle)
+        }
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = TvDimens.edge),
+            horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
+        ) {
+            // No item key: tmdb ids are effectively unique here, but keying by a possibly-repeated id risks
+            // the duplicate-key crash the grid screens guard against, and this list is static per title.
+            items(collection.parts) { item ->
                 TvPosterCard(item = item, onClick = { onOpen(item) }, onFocused = {})
             }
         }

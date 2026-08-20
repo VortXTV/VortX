@@ -2,6 +2,7 @@ package com.vortx.android.player
 
 import android.app.ActivityManager
 import android.content.Context
+import com.vortx.android.player.subtitles.SubtitleFontProvider
 import java.io.File
 import kotlin.math.roundToInt
 
@@ -42,6 +43,11 @@ private fun prefs(context: Context) =
  * We therefore do NOT emit `sub-font` here (MpvConfig ships `embeddedfonts=yes` + `subs-fallback=yes` so
  * in-container fonts and the libass default still render); the Modern look comes from the thin-outline +
  * shadow treatment, not the face, exactly as Apple documents.
+ *
+ * CJK / non-Latin FALLBACK: we DO emit `sub-fonts-dir` (via [SubtitleFontProvider]) pointed at a fonts
+ * DIRECTORY of CJK-capable faces, the direct analog of the libass bundled-font path Apple sets in
+ * MPVMetalViewController. A fonts-dir only supplies fallback glyphs for characters the base face lacks; it
+ * never forces a base face, so it is safe against the name-based failure above. See [SubtitleFontProvider].
  */
 data class SubtitleStyle(
     val fontId: String,
@@ -91,6 +97,10 @@ data class SubtitleStyle(
             BOX -> "sub-back-color" to "#FF000000"    // opaque black box
             else -> "sub-back-color" to "#00000000"   // outline only (transparent)
         }
+        // CJK / non-Latin fallback: hand libass a fonts DIRECTORY of CJK-capable faces so non-Latin subtitles
+        // render instead of tofu, mirroring Apple's MPVMetalViewController `sub-fonts-dir`. Only added when a
+        // usable directory resolves, and it never forces a base face (see the class divergence note).
+        SubtitleFontProvider.mpvFontsDir()?.let { fontsDir -> opts += "sub-fonts-dir" to fontsDir }
         return opts
     }
 
@@ -298,6 +308,32 @@ enum class AudioOutputMode(val storageValue: String, val label: String, val deta
             ""
         },
     )
+
+    /**
+     * ROUTE-AWARE pre-init options: consults the LIVE output route ([com.vortx.android.player.audio
+     * .AudioRoute.current]) so a multichannel layout / Dolby-DTS bitstream is never forced onto a route that
+     * can only render stereo PCM (the Apple silence guard: a 5.1/Atmos stream into a 2-channel sink is
+     * silence). This is the version the libmpv engine applies at load; the no-arg [mpvOptions] above stays a
+     * route-blind fallback for tests and any caller with no [Context]. Mirrors how Apple's
+     * `MPVMetalViewController` combines `AudioRoutePolicy.channelPolicy` with the live `AVAudioSession` route
+     * before setting `audio-channels` / `audio-spdif`.
+     */
+    fun mpvOptions(context: Context): List<Pair<String, String>> =
+        com.vortx.android.player.audio.AudioRoutePolicy.mpvOptions(
+            this,
+            com.vortx.android.player.audio.AudioRoute.current(context),
+        )
+
+    /**
+     * ROUTE-AWARE live properties for an in-player mode change: the route-aware sibling of the route-blind
+     * [mpvLiveProperties] above, so a Passthrough pick on a stereo-only route clears spdif and downmixes
+     * instead of wedging the AO. Clears `audio-spdif` explicitly (mpv retains an omitted property).
+     */
+    internal fun mpvLiveProperties(context: Context): List<Pair<String, String>> =
+        com.vortx.android.player.audio.AudioRoutePolicy.mpvLiveProperties(
+            this,
+            com.vortx.android.player.audio.AudioRoute.current(context),
+        )
 
     companion object {
         const val KEY = "stremiox.audioOutputMode"

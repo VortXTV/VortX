@@ -187,6 +187,12 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     // Carry the container's forced disposition so TrackSelector's forced-subtitle policy
                     // can key off the flag (not the title text), matching the mpv engine.
                     forced = (format.selectionFlags and C.SELECTION_FLAG_FORCED) != 0,
+                    // Audio channel count for the fidelity tie-break (0 for non-audio; NO_VALUE there).
+                    channels = if (group.type == C.TRACK_TYPE_AUDIO && format.channelCount != Format.NO_VALUE) {
+                        format.channelCount
+                    } else {
+                        0
+                    },
                 )
                 when (group.type) {
                     C.TRACK_TYPE_AUDIO -> audio.add(entry)

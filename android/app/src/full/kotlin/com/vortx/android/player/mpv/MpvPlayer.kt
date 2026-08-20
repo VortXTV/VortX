@@ -192,7 +192,9 @@ class MpvPlayer private constructor(
         for ((name, value) in SubtitleStyle.current(appContext).mpvOptions()) {
             mpv.setOptionString(name, value)
         }
-        for ((name, value) in AudioOutputMode.current(appContext).mpvOptions()) {
+        // Route-aware: the live output route decides the channel layout / bitstream so a multichannel
+        // (5.1/Atmos) stream is never forced onto a stereo-only sink as silence (the Apple silence guard).
+        for ((name, value) in AudioOutputMode.current(appContext).mpvOptions(appContext)) {
             mpv.setOptionString(name, value)
         }
         // HDR -> SDR tone-map policy (Apple `stremiox.hdrToneMapMode`): pin the output transfer/primaries to
@@ -400,7 +402,9 @@ class MpvPlayer private constructor(
     /// (mpv may only fully honor them on the next AO (re)open); applied as options pre-init for the reliable
     /// path. Mirrors Apple `setAudioOutputMode`.
     override fun setAudioOutputMode(mode: AudioOutputMode) {
-        for ((name, value) in mode.mpvLiveProperties()) {
+        // Route-aware live properties: a Passthrough pick on a stereo-only route clears spdif and downmixes
+        // instead of wedging the AO, matching the pre-init route-aware options and the Apple silence guard.
+        for ((name, value) in mode.mpvLiveProperties(appContext)) {
             mpv.setPropertyString(name, value)
         }
     }
@@ -597,6 +601,8 @@ class MpvPlayer private constructor(
                     // mpv track-list carries the container's forced disposition; carry it so TrackSelector's
                     // forced-subtitle policy keys off the flag, matching the ExoPlayer engine.
                     forced = t.optBoolean("forced", false),
+                    // Audio channel count for the fidelity tie-break (0 for subs; mpv reports none there).
+                    channels = if (type == "audio") t.optInt("demux-channel-count", 0) else 0,
                 )
                 when (type) {
                     "audio" -> audio.add(entry)

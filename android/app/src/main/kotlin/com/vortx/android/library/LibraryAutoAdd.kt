@@ -42,6 +42,32 @@ class LibraryAutoAdd(
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
 
+    init {
+        migrateLegacyKeyPrefix()
+    }
+
+    /**
+     * One-shot rename of the ledger keys from the old `vortx.autoAddedLibrary` prefix to Apple/web's exact
+     * `stremiox.autoAddedLibrary` prefix (the same-key mandate: Apple `LibraryAutoAdd.swift:24`). Android used a
+     * mismatched `vortx.` prefix, so the auto-added-library state did not line up with the other surfaces. Each
+     * per-profile entry (`<prefix>.<profileId>`) and the no-profile fallback (`<prefix>`) is moved across so
+     * nothing a viewer already accumulated is lost. Idempotent: after the move no old-prefixed key remains, so a
+     * later construction is a no-op. A new-prefixed key that already exists is never overwritten (a re-run, or a
+     * value already written under the new key, wins).
+     */
+    private fun migrateLegacyKeyPrefix() {
+        val legacyKeys = prefs.all.keys.filter { it == OLD_KEY_PREFIX || it.startsWith("$OLD_KEY_PREFIX.") }
+        if (legacyKeys.isEmpty()) return
+        val editor = prefs.edit()
+        for (oldKey in legacyKeys) {
+            val newKey = KEY_PREFIX + oldKey.removePrefix(OLD_KEY_PREFIX)
+            val value = prefs.getString(oldKey, null)
+            if (value != null && !prefs.contains(newKey)) editor.putString(newKey, value)
+            editor.remove(oldKey)
+        }
+        editor.apply()
+    }
+
     /** The per-profile storage key. Falls back to the shared key when there is no active profile id. */
     private fun storageKey(profileId: String? = activeProfileId()): String =
         if (profileId != null) "$KEY_PREFIX.$profileId" else KEY_PREFIX
@@ -105,7 +131,16 @@ class LibraryAutoAdd(
     private companion object {
         const val TAG = "autolib"
         const val PREFS_FILE = "vortx_auto_added_library"
-        const val KEY_PREFIX = "vortx.autoAddedLibrary"
+
+        /**
+         * Apple/web's EXACT key prefix (the same-key mandate: Apple `LibraryAutoAdd.swift:24`
+         * `stremiox.autoAddedLibrary`), so the auto-added-library state is keyed identically on every surface.
+         */
+        const val KEY_PREFIX = "stremiox.autoAddedLibrary"
+
+        /** The mismatched prefix Android shipped before the alignment; [migrateLegacyKeyPrefix] moves it across. */
+        const val OLD_KEY_PREFIX = "vortx.autoAddedLibrary"
+
         const val CAP = 2000   // bound the remembered-ids set so it can't grow without limit
     }
 }

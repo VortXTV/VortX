@@ -97,8 +97,9 @@ fun TvShell(
 ) {
     val appContext = LocalContext.current.applicationContext
     var destination by remember { mutableStateOf(TvDestination.HOME) }
-    // Bumped when the active tab is re-selected on the rail, so a depth-aware destination (Add-ons) can pop
-    // its own stack back to root -- the 10-foot analogue of re-tapping a bottom-nav tab to pop to root.
+    // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
+    // stack back to root; a browse surface (Home, Discover) scrolls its list back to the top -- the 10-foot
+    // analogue of re-tapping a bottom-nav tab to pop to root / scroll to top (Apple `scrollToTopOnBump`).
     var reselectSignal by remember { mutableStateOf(0) }
 
     // Every rail tab (except the always-present Home + Settings) honors the SAME cross-platform "Show <tab>"
@@ -158,9 +159,14 @@ fun TvShell(
             // surface's state (Home's live stream, a Search query) exactly as the phone shell does.
             when (destination) {
                 TvDestination.HOME ->
-                    TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem)
+                    TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, reselectSignal = reselectSignal)
                 TvDestination.DISCOVER ->
-                    TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, signedIn = signedIn)
+                    TvDiscoverScreen(
+                        viewModel<DiscoverViewModel>(factory = factory),
+                        onItem,
+                        signedIn = signedIn,
+                        reselectSignal = reselectSignal,
+                    )
                 TvDestination.LIVE ->
                     TvLiveScreen(viewModel<LiveViewModel>(factory = factory), onItem)
                 TvDestination.LIBRARY ->
@@ -176,7 +182,18 @@ fun TvShell(
                         onExit = { destination = TvDestination.HOME },
                     )
                 TvDestination.SETTINGS ->
-                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager)
+                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem)
+            }
+
+            // Quiet "You're offline" chip pinned to the bottom of the active surface while the device has no
+            // validated internet path (Apple RootTabView parity). Non-focusable and overlaid, so the D-pad
+            // keeps driving the content beneath and Downloads stays reachable on the rail.
+            if (rememberTvOffline()) {
+                TvOfflineChip(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = TvDimens.edge),
+                )
             }
         }
     }

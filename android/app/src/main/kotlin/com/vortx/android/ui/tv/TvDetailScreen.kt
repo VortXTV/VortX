@@ -41,7 +41,9 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.catalog.CollectionClient
 import com.vortx.android.catalog.DiscoverRegion
+import com.vortx.android.catalog.FinancialsClient
 import com.vortx.android.catalog.SimilarClient
 import com.vortx.android.catalog.WatchProvider
 import com.vortx.android.catalog.WatchProvidersClient
@@ -52,6 +54,7 @@ import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.theme.VortXTheme
@@ -207,6 +210,24 @@ private fun TvDetailContent(
             watchProviders =
                 WatchProvidersClient.availability(detail.id, detail.type, DiscoverRegion.effective(context))
                     ?.providers.orEmpty()
+        }
+    }
+
+    // DET financials + franchise/collection rails (MOVIES ONLY), off the SAME keyless phone clients the phone
+    // [com.vortx.android.ui.screens.DetailScreen] uses. Financials is gated on the cross-device "Show budget &
+    // box office" setting (`vortx.detail.showFinancials`); the collection rail always resolves. Fail-soft: a
+    // non-`tt` id / series / down edge leaves each null and its line/rail is simply omitted. Mirrors Apple
+    // `DetailView.swift`'s `loadFinancials` + `loadCollection`.
+    val discoverPrefs = remember(context) { HomeDiscoverPreferences(context) }
+    val showFinancials = discoverPrefs.showFinancials
+    var financials by remember(detail.id) { mutableStateOf<FinancialsClient.Financials?>(null) }
+    var movieCollection by remember(detail.id) { mutableStateOf<CollectionClient.MovieCollection?>(null) }
+    LaunchedEffect(detail.id, detail.type, showFinancials) {
+        financials = null
+        movieCollection = null
+        if (detail.id.startsWith("tt") && detail.type == MediaType.MOVIE) {
+            if (showFinancials) financials = FinancialsClient.financials(detail.id, isSeries = false)
+            movieCollection = CollectionClient.collection(detail.id, isSeries = false)
         }
     }
 
@@ -415,6 +436,16 @@ private fun TvDetailContent(
                 )
             }
 
+            // DET financials (MOVIES ONLY, gated on "Show budget & box office"): budget + box office + profit
+            // as one compact fact line under the ratings, additive to the hero meta line. Mirrors the phone
+            // `DetailFactLine`.
+            financials?.let { FinancialsClient.financialsText(it) }?.let { text ->
+                TvFinancialsLine(
+                    text = text,
+                    modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.xs),
+                )
+            }
+
             // A series gains a focusable season picker + episode rail beneath the hero. Choosing an episode
             // selects it (loading its sources up top) and scrolls back to the hero where Watch/Resume now
             // targets it; the per-episode + per-season watched toggles route through the ViewModel's
@@ -445,6 +476,23 @@ private fun TvDetailContent(
             if (watchProviders.isNotEmpty() && !tvIsLiveType(detail.type)) {
                 TvWhereToWatchRail(
                     providers = watchProviders,
+                    modifier = Modifier.padding(top = TvDimens.rowGap),
+                )
+            }
+
+            // DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in
+            // release order, rendered JUST ABOVE More Like This (Apple parity). Hidden for a single-part
+            // collection. Each tile resolves its tmdb: id to a tt id before opening, the same fail-soft resolve
+            // the More Like This rail uses.
+            movieCollection?.takeIf { it.parts.size > 1 }?.let { collection ->
+                TvCollectionRail(
+                    collection = collection,
+                    onOpen = { item ->
+                        scope.launch {
+                            val tt = TMDBPersonClient.imdbId(item.id, item.type)
+                            onOpenTitle(if (tt != null) item.copy(id = tt) else item)
+                        }
+                    },
                     modifier = Modifier.padding(top = TvDimens.rowGap),
                 )
             }

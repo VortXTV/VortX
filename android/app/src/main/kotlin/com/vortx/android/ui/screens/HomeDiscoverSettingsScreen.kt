@@ -19,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import com.vortx.android.home.HubCategoryKey
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
@@ -40,6 +41,7 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     var refreshCadence by remember { mutableStateOf(prefs.refreshCadence) }
     var mergeDiscoverSearch by remember { mutableStateOf(prefs.mergeDiscoverSearch) }
     var regionPreference by remember { mutableStateOf(prefs.regionPreference) }
+    var hiddenCategories by remember { mutableStateOf(prefs.hiddenCategories) }
     var showFinancials by remember { mutableStateOf(prefs.showFinancials) }
     var spoilerSafe by remember { mutableStateOf(prefs.spoilerSafe) }
     var hidePosterLabels by remember { mutableStateOf(prefs.hidePosterLabels) }
@@ -140,6 +142,44 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
                         refreshCadence = it
                         prefs.refreshCadence = it
                     },
+                )
+            }
+
+            // The per-section show/hide toggles for the Collections hub rows (Apple `TVDiscoverSettingsView`).
+            // Each writes the SAME cross-device `vortx.discover.hiddenCategories` key the hub consumer honours,
+            // so turning a section off here drops that row from Home and Discover on every device that syncs.
+            SettingsSection(
+                title = "Collections categories",
+                footer = "Hide a whole section from the Collections hub on Home and Discover.",
+            ) {
+                fun setSectionShown(key: String, shown: Boolean) {
+                    val next = if (shown) hiddenCategories - key else hiddenCategories + key
+                    hiddenCategories = next
+                    prefs.hiddenCategories = next
+                }
+                ToggleRow(
+                    label = "Discover cards",
+                    detail = null,
+                    checked = HubCategoryKey.SECTION_DISCOVER !in hiddenCategories,
+                    onCheckedChange = { setSectionShown(HubCategoryKey.SECTION_DISCOVER, it) },
+                )
+                ToggleRow(
+                    label = "Streaming services",
+                    detail = null,
+                    checked = HubCategoryKey.SECTION_STREAMING !in hiddenCategories,
+                    onCheckedChange = { setSectionShown(HubCategoryKey.SECTION_STREAMING, it) },
+                )
+                ToggleRow(
+                    label = "Genres",
+                    detail = null,
+                    checked = HubCategoryKey.SECTION_GENRES !in hiddenCategories,
+                    onCheckedChange = { setSectionShown(HubCategoryKey.SECTION_GENRES, it) },
+                )
+                ToggleRow(
+                    label = "Decades",
+                    detail = null,
+                    checked = HubCategoryKey.SECTION_DECADES !in hiddenCategories,
+                    onCheckedChange = { setSectionShown(HubCategoryKey.SECTION_DECADES, it) },
                 )
             }
 

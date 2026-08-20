@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -50,6 +51,9 @@ fun TvDiscoverScreen(
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     signedIn: Boolean = true,
+    // Bumped by the shell when the Discover tab is re-selected on the rail, so the browse grid scrolls back to
+    // the top -- the 10-foot analogue of Apple's `scrollToTopOnBump`.
+    reselectSignal: Int = 0,
 ) {
     // SD-8: without a Stremio or VortX sign-in there are no catalogs to pivot; show the sign-in prompt.
     if (!signedIn) {
@@ -105,6 +109,16 @@ fun TvDiscoverScreen(
     val enriched = rememberEnrichedHeroItem(heroItem)
     val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.44f).dp.coerceIn(240.dp, 400.dp)
 
+    // Re-selecting the active Discover tab scrolls the browse grid back to the top (Apple `scrollToTopOnBump`).
+    // Baseline-captured on first composition so a plain tab switch (which restores the saved scroll position)
+    // never force-scrolls; only a bump that happens WHILE this screen is composed scrolls. Fail-soft if the
+    // grid is not attached yet.
+    val discoverGridState = rememberLazyGridState()
+    val initialReselect = remember { reselectSignal }
+    LaunchedEffect(reselectSignal) {
+        if (reselectSignal != initialReselect) runCatching { discoverGridState.animateScrollToItem(0) }
+    }
+
     Column(modifier = modifier.fillMaxSize()) {
         TvAmbientHero(enriched, modifier = Modifier.fillMaxWidth().height(heroHeight))
         TvDiscoverFilters(
@@ -125,6 +139,7 @@ fun TvDiscoverScreen(
                     stringResource(R.string.discover_catalog_empty)
                 },
                 modifier = Modifier.fillMaxWidth().weight(1f),
+                gridState = discoverGridState,
                 header = if (snapshot.isVisible || advancedFilters.isActive) {
                     {
                         if (advancedFilters.isActive && s.data.items.isNotEmpty()) {

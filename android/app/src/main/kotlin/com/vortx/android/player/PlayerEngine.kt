@@ -210,6 +210,12 @@ data class PlayerTrack(
     /// [TrackSelector] keys the forced-subtitle policy off this flag, not the title text, so real forced
     /// tracks auto-enable even when they carry no "forced" label. Mirrors Apple `MPVTrack.forced`.
     val forced: Boolean = false,
+    /// An AUDIO track's channel count (2 = stereo, 6 = 5.1, 8 = 7.1); 0 when unknown or for a
+    /// subtitle/video track. [com.vortx.android.player.audio.AudioTrackFidelity] breaks a same-language tie
+    /// toward the layout the active output route can render, the fidelity dimension Apple's `MPVTrack`
+    /// deliberately omits (`TrackSelector.swift` notes it "carries no channel counts to break ties on").
+    /// mpv `demux-channel-count` / ExoPlayer `Format.channelCount`.
+    val channels: Int = 0,
 )
 
 /// A single chapter marker from the container, for the chrome's chapter picker. `startMs` is the chapter

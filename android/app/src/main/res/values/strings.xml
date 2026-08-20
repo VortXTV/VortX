@@ -113,6 +113,33 @@
     <string name="player_subtitle_brightness">Brightness</string>
     <string name="player_subtitle_background">Background</string>
 
+    <!-- The quiet "You're offline" shell chip (Apple RootTabView parity): pinned to the bottom of the TV
+         shell while the device has no validated internet path, pointing at what still plays. -->
+    <string name="tv_offline_chip">You\'re offline. Your downloads still play.</string>
+
+    <!-- Upcoming screen (Apple TVUpcomingScreen parity): the next-airing episode of every followed series and
+         every followed movie releasing inside the calendar horizon. -->
+    <string name="tv_upcoming_title">Upcoming</string>
+    <string name="tv_upcoming_episodes">Upcoming Episodes</string>
+    <string name="tv_upcoming_movies">Upcoming Movies</string>
+    <string name="tv_upcoming_empty">The next-airing episodes and releases from the titles in your library appear here.</string>
+    <string name="tv_upcoming_navigation_description">Next-airing episodes and releases from your library.</string>
+
+    <!-- Streaming Services picker (Apple TVReorderServicesView parity): choose + reorder the Collections-hub
+         service tiles. Writes the cross-device vortx.collections.selectedProviders key. -->
+    <string name="tv_services_title">Streaming Services</string>
+    <string name="tv_services_subtitle">Choose and reorder the services on Home and Discover. With none chosen, every service in your region shows.</string>
+    <string name="tv_services_your">Your services</string>
+    <string name="tv_services_your_empty">No services in your region yet.</string>
+    <string name="tv_services_all">All services</string>
+    <string name="tv_services_all_empty">Every available service is already in your list.</string>
+    <string name="tv_services_up">Up</string>
+    <string name="tv_services_down">Down</string>
+    <string name="tv_services_remove">Remove</string>
+    <string name="tv_services_add">Add</string>
+    <string name="tv_services_done">Done</string>
+    <string name="tv_services_navigation_description">Pick and reorder the streaming services shown in Collections.</string>
+
     <!-- Android TV debrid-key settings. Credentials remain masked and only status is shown. -->
     <string name="tv_settings_section_services">Services</string>
     <string name="tv_debrid_services_title">Debrid services</string>

@@ -43,6 +43,9 @@ internal const val COLLECTIONS_SELECTED_PROVIDERS_KEY = "vortx.collections.selec
 // Discover region override (Apple `vortx.discover.regionPreference`, uppercased): forces the hub's TMDB
 // watch_region so an out-of-region user can browse another market. Blank/absent => the device locale region.
 internal const val DISCOVER_REGION_PREFERENCE_KEY = "vortx.discover.regionPreference"
+// Discover-hub hidden categories (Apple `vortx.discover.hiddenCategories`): the section / per-tile keys the
+// user has permanently hidden from the hub. Absent/empty => every tile shows (today's behavior).
+internal const val DISCOVER_HIDDEN_CATEGORIES_KEY = "vortx.discover.hiddenCategories"
 internal const val COLLECTIONS_HUB_ENABLED_DEFAULT = true
 // RemoteConfig fleet kill-switch (Apple CollectionsHubModel.isAvailable): a remote `false` hides the hub
 // fleet-wide (e.g. if the catalogs edge is down). Baked default true => absent/null remote == shipping.
@@ -96,6 +99,19 @@ internal data class CollectionsHubTile(
     val imageUrl: String? = null,
     val target: CollectionsHubTarget,
 )
+
+/**
+ * The keys stored in `vortx.discover.hiddenCategories` (Apple `HubCategoryKey`). A SECTION key hides a whole
+ * hub row; a per-tile key is the tile's own id ([CollectionsHubTile.id] / [CollectionsHubTarget.id], e.g.
+ * `discover:trending`, `genre:action`, `decade:2020s`), which hides one tile. The section keys match Apple
+ * exactly so a whole-section hide carries across devices; per-tile keys follow Android's tile-id scheme.
+ */
+internal object HubCategoryKey {
+    const val SECTION_DISCOVER = "section:discover"
+    const val SECTION_STREAMING = "section:streaming"
+    const val SECTION_GENRES = "section:genres"
+    const val SECTION_DECADES = "section:decades"
+}
 
 internal data class CollectionsHubSnapshot(
     val enabled: Boolean = false,
@@ -216,8 +232,23 @@ internal interface CollectionsHubPreferences {
     fun enabled(): Boolean
     fun refreshCadence(): String
     fun selectedProviders(): String
+
+    /**
+     * Persist the user's explicit streaming-service selection (Apple `selectedProviders`): the ordered,
+     * comma-separated canonical ids, or the empty string for AUTO (the region list). Defaulted no-op so test
+     * doubles need not implement it; the services picker writes it and the change listener reloads the hub.
+     */
+    fun saveSelectedProviders(value: String) {}
     /** The uppercased 2-letter Discover region override, or null to use the device locale region. */
     fun regionOverride(): String? = null
+
+    /**
+     * The Discover-hub categories the user has permanently hidden (Apple `vortx.discover.hiddenCategories`).
+     * Section keys (see [HubCategoryKey]) hide a whole row; a per-tile key (the tile's own id, e.g.
+     * `discover:trending` / `genre:action` / `decade:2020s`) hides one tile. Empty by default (defaulted so
+     * test doubles need not implement it) => every tile shows, today's behavior.
+     */
+    fun hiddenCategories(): Set<String> = emptySet()
     fun providerCache(scope: String): CollectionsHubProviderCache
     fun saveProviderCache(scope: String, encoded: String, savedAtMillis: Long)
     // Cadence-cached representative artwork (defaulted so test doubles need not implement it).
@@ -241,11 +272,18 @@ private class AndroidCollectionsHubPreferences(context: Context) : CollectionsHu
     override fun selectedProviders(): String =
         prefs.getString(COLLECTIONS_SELECTED_PROVIDERS_KEY, COLLECTIONS_SELECTED_PROVIDERS_DEFAULT).orEmpty()
 
+    override fun saveSelectedProviders(value: String) {
+        prefs.edit().putString(COLLECTIONS_SELECTED_PROVIDERS_KEY, value).apply()
+    }
+
     override fun regionOverride(): String? =
         prefs.getString(DISCOVER_REGION_PREFERENCE_KEY, null)
             ?.trim()
             ?.uppercase(Locale.ROOT)
             ?.takeIf { it.length == 2 && it.all(Char::isLetter) }
+
+    override fun hiddenCategories(): Set<String> =
+        prefs.getStringSet(DISCOVER_HIDDEN_CATEGORIES_KEY, emptySet()).orEmpty()
 
     override fun providerCache(scope: String): CollectionsHubProviderCache = CollectionsHubProviderCache(
         encoded = prefs.getString("$COLLECTIONS_PROVIDER_CACHE_PREFIX$scope", null),
@@ -335,7 +373,8 @@ internal class CollectionsHubModel internal constructor(
         if (key == SHOW_COLLECTIONS_HUB_KEY ||
             key == COLLECTIONS_REFRESH_CADENCE_KEY ||
             key == COLLECTIONS_SELECTED_PROVIDERS_KEY ||
-            key == DISCOVER_REGION_PREFERENCE_KEY
+            key == DISCOVER_REGION_PREFERENCE_KEY ||
+            key == DISCOVER_HIDDEN_CATEGORIES_KEY
         ) {
             val changed = synchronized(stateLock) {
                 if (closed) return@synchronized false
@@ -379,13 +418,16 @@ internal class CollectionsHubModel internal constructor(
         val scope = cacheScope(region, selected)
         val cached = cachedProviders(scope)
         val cacheIsFresh = cached.isNotEmpty() && cacheFresh(scope)
+        // A hidden Streaming section drops the whole row (baseSnapshot), so never show its loading line and
+        // never spend a provider fetch on it.
+        val streamingHidden = streamingSectionHidden()
         synchronized(stateLock) {
             if (!closed && featureEnabled && generation == loadGeneration) {
-                _snapshot.value = baseSnapshot(cached).copy(streamingLoading = !cacheIsFresh)
+                _snapshot.value = baseSnapshot(cached).copy(streamingLoading = !cacheIsFresh && !streamingHidden)
             }
         }
         if (synchronized(stateLock) { closed || !featureEnabled || generation != loadGeneration }) return@withLock
-        if (cacheIsFresh) return@withLock
+        if (cacheIsFresh || streamingHidden) return@withLock
 
         val fetched = try {
             Result.success(source.providers(region, selected))
@@ -631,36 +673,55 @@ internal class CollectionsHubModel internal constructor(
 
     private fun baseSnapshot(providers: List<CollectionsHubTile>): CollectionsHubSnapshot {
         val art = artwork.byTileId
+        // The Home/Discover hub honours the cross-device `vortx.discover.hiddenCategories` set (Apple parity):
+        // a section key drops a whole row, a per-tile key (the tile's own id) drops one tile. Empty => every
+        // tile shows. Mirrors Apple `TVCollectionsHub`'s `visibleDiscover` / `showStreaming` / `visibleGenres`.
+        val hidden = hiddenCategories()
         return CollectionsHubSnapshot(
             enabled = true,
-            discover = DiscoverList.entries.map { list ->
-                val tileId = "discover:${list.wire}"
-                CollectionsHubTile(
-                    id = tileId,
-                    title = CollectionsHubLabel.Resource(list.titleResource),
-                    subtitle = CollectionsHubLabel.Resource(list.subtitleResource),
-                    imageUrl = art[tileId],
-                    target = CollectionsHubTarget.Discover(list),
-                )
+            discover = if (HubCategoryKey.SECTION_DISCOVER in hidden) {
+                emptyList()
+            } else {
+                DiscoverList.entries.mapNotNull { list ->
+                    val tileId = "discover:${list.wire}"
+                    if (tileId in hidden) return@mapNotNull null
+                    CollectionsHubTile(
+                        id = tileId,
+                        title = CollectionsHubLabel.Resource(list.titleResource),
+                        subtitle = CollectionsHubLabel.Resource(list.subtitleResource),
+                        imageUrl = art[tileId],
+                        target = CollectionsHubTarget.Discover(list),
+                    )
+                }
             },
-            streaming = providers,
-            genres = GENRES.map { genre ->
-                val tileId = "genre:${genre.id}"
-                CollectionsHubTile(
-                    id = tileId,
-                    title = CollectionsHubLabel.Resource(genre.titleResource),
-                    imageUrl = art[tileId],
-                    target = CollectionsHubTarget.Genre(genre),
-                )
+            streaming = if (HubCategoryKey.SECTION_STREAMING in hidden) emptyList() else providers,
+            genres = if (HubCategoryKey.SECTION_GENRES in hidden) {
+                emptyList()
+            } else {
+                GENRES.mapNotNull { genre ->
+                    val tileId = "genre:${genre.id}"
+                    if (tileId in hidden) return@mapNotNull null
+                    CollectionsHubTile(
+                        id = tileId,
+                        title = CollectionsHubLabel.Resource(genre.titleResource),
+                        imageUrl = art[tileId],
+                        target = CollectionsHubTarget.Genre(genre),
+                    )
+                }
             },
-            decades = DECADES.map { decade ->
-                val tileId = "decade:${decade.id}"
-                CollectionsHubTile(
-                    id = tileId,
-                    title = CollectionsHubLabel.Literal(decade.title),
-                    imageUrl = art[tileId],
-                    target = CollectionsHubTarget.Decade(decade),
-                )
+            decades = if (HubCategoryKey.SECTION_DECADES in hidden) {
+                emptyList()
+            } else {
+                DECADES.mapNotNull { decade ->
+                    val tileId = "decade:${decade.id}"
+                    if (tileId in hidden) return@mapNotNull null
+                    CollectionsHubTile(
+                        id = tileId,
+                        title = CollectionsHubLabel.Literal(decade.title),
+                        imageUrl = art[tileId],
+                        target = CollectionsHubTarget.Decade(decade),
+                    )
+                }
             },
         )
     }
@@ -681,8 +742,71 @@ internal class CollectionsHubModel internal constructor(
     /** The Discover region override (`vortx.discover.regionPreference`) when set, else the device region. */
     private fun resolvedRegion(): String = preferences.regionOverride() ?: deviceRegion()
 
+    /** The user's hidden Discover-hub categories (`vortx.discover.hiddenCategories`); empty => nothing hidden. */
+    private fun hiddenCategories(): Set<String> = preferences.hiddenCategories()
+
+    /** Whether the whole Streaming Services section is hidden (drives both the row and its loading line). */
+    private fun streamingSectionHidden(): Boolean = HubCategoryKey.SECTION_STREAMING in hiddenCategories()
+
     private fun selectedProviderIds(): List<Int> {
         return CollectionsHubProviderPolicy.selectedProviderIds(preferences.selectedProviders(), MAX_PROVIDERS)
+    }
+
+    // --- Services picker (Apple `TVReorderServicesView`) -----------------------------------------------------
+    // The picker chooses + reorders the streaming-service tiles by writing the SAME `vortx.collections
+    // .selectedProviders` key the hub already honours; the change listener reloads every live hub. All ids are
+    // canonicalized so a pin saved under a since-aliased id still resolves to its canonical tile.
+
+    /** The currently PUBLISHED streaming tiles ("Your services": the selected set, or the region list in AUTO). */
+    val streamingServices: List<CollectionsHubTile>
+        get() = _snapshot.value.streaming
+
+    /** The region streaming-service pool the picker offers to add from (Apple `allServices`). Fail-soft to []. */
+    suspend fun availableServices(): List<CollectionsHubTile> = try {
+        source.providers(resolvedRegion(), emptyList())
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        emptyList()
+    }
+
+    /** The user's explicit selection, canonicalized (empty == AUTO, the region list). */
+    fun selectedServiceIds(): List<Int> = selectedProviderIds()
+
+    /** Add a service to the selection (activating the picker from the shown set if it was AUTO), appended last. */
+    fun addService(id: Int) {
+        val canonical = CollectionsHubProviderPolicy.canonicalId(id)
+        val current = currentSelectionOrShown()
+        if (canonical in current) return
+        setSelectedServices(current + canonical)
+    }
+
+    /** Remove a service from the selection (activating the picker from the shown set if it was AUTO). */
+    fun removeService(id: Int) {
+        val canonical = CollectionsHubProviderPolicy.canonicalId(id)
+        setSelectedServices(currentSelectionOrShown().filterNot { it == canonical })
+    }
+
+    /** Persist a new explicit order; any still-selected id the picker did not pass is appended so it is never dropped. */
+    fun reorderServices(ids: List<Int>) {
+        val incoming = ids.map(CollectionsHubProviderPolicy::canonicalId)
+        val incomingSet = incoming.toSet()
+        setSelectedServices(incoming + selectedServiceIds().filterNot { it in incomingSet })
+    }
+
+    /** The ids to seed an edit from: the active selection, else the currently shown tiles (Apple parity). */
+    private fun currentSelectionOrShown(): List<Int> {
+        val selection = selectedServiceIds()
+        return selection.ifEmpty {
+            _snapshot.value.streaming.mapNotNull { (it.target as? CollectionsHubTarget.Service)?.providerId }
+        }
+    }
+
+    /** Canonicalize + order-stably de-dup, then persist (empty string == AUTO). The listener reloads the hub. */
+    private fun setSelectedServices(ids: List<Int>) {
+        val seen = HashSet<Int>()
+        val canonical = ids.map(CollectionsHubProviderPolicy::canonicalId).filter(seen::add).take(MAX_PROVIDERS)
+        preferences.saveSelectedProviders(canonical.joinToString(","))
     }
 
     private fun cacheScope(region: String, selected: List<Int>): String =

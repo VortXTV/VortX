@@ -6,8 +6,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridScope
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -27,6 +29,7 @@ internal fun TvBrowseGrid(
     items: List<MetaItem>,
     emptyHint: String,
     modifier: Modifier = Modifier,
+    gridState: LazyGridState = rememberLazyGridState(),
     header: (LazyGridScope.() -> Unit)? = null,
     footer: (@Composable () -> Unit)? = null,
     card: @Composable (MetaItem) -> Unit,
@@ -39,6 +42,7 @@ internal fun TvBrowseGrid(
     }
     val deduped = remember(items) { items.distinctBy(::searchResultItemKey) }
     LazyVerticalGrid(
+        state = gridState,
         columns = GridCells.Adaptive(minSize = TvDimens.posterWidth),
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(TvDimens.edge),

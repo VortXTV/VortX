@@ -42,6 +42,7 @@ import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.ui.graphics.vector.ImageVector
 
 /// The one icon set for the whole app (DESIGN-SYSTEM.md §6 "Icons"): a fixed name → glyph mapping so
@@ -151,4 +152,8 @@ object VortXIcons {
 
     /// SF `lock.fill` — a PIN-protected profile (picker badge + PIN gate).
     val lock: ImageVector = Icons.Filled.Lock
+
+    /// SF `wifi.slash`: the quiet "You're offline" shell chip's leading glyph. `WifiOff` is Material's
+    /// crossed-out-Wi-Fi mark, the closest to Apple's `wifi.slash`.
+    val wifiOff: ImageVector = Icons.Filled.WifiOff
 }

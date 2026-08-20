@@ -37,7 +37,9 @@ import com.vortx.android.iptv.IPTVPlaylists
 import com.vortx.android.iptv.iptvCleanupActions
 import com.vortx.android.iptv.launchIPTVStartupCleanup
 import com.vortx.android.mediaserver.MediaServerRepository
+import com.vortx.android.moat.MoatToken
 import com.vortx.android.notifications.NewEpisodeNotifications
+import com.vortx.android.singularity.SourceIndexClient
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.update.UpdateChecker
 import com.vortx.android.sync.VortXSyncManager
@@ -124,6 +126,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // folds into are stood up: construct VortXSyncManager, wire its push seams, and add the foreground
         // pull. Fail-soft inside; a no-op when signed out, and never on the critical launch path.
         wireAccountSync()
+        // Connect the give-to-get MOAT groundwork now that the session manager (read below) exists. This only
+        // makes the moat-token client available + wires the reserved SourceIndexClient hook; the Singularity
+        // SERVE it feeds stays DORMANT behind its own compile-time gate. Fail-soft + off the critical path.
+        wireMoatGroundwork()
         runCatching { MediaServerRepository.init(this) }
             .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
         startIPTVCleanupReplay()
@@ -200,6 +206,31 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// signed out), so a null here degrades to "no cross-device sync this launch", never a crash.
     var syncManager: VortXSyncManager? = null
         private set
+
+    /**
+     * Wire the give-to-get MOAT groundwork, kept DORMANT exactly like Apple ships it gated. The Singularity
+     * SERVE consumer ([SourceIndexClient]) stays behind its own compile-time `isEnabled = false` gate pending a
+     * separately security-signed-off lane; this only makes the moat-token client ([MoatToken]) available and
+     * connects the reserved `moatTokenProvider` hook, so the token flows the same way Apple wires
+     * `MoatToken.shared` into `SourceIndexClient.fetchPooled` once SERVE re-enables. Because that gate is
+     * closed, the provider is never invoked at runtime today: nothing here mints or reaches the network.
+     *
+     * [MoatToken] reads the VortX account session bearer live through [sessionProvider], sourced from the
+     * already-built [syncManager] (the api.vortx.tv identity, NOT the Stremio authKey). A null manager (sync
+     * unavailable this launch) or a signed-out / opted-out device yields no credential, so the client stays
+     * fully dormant and fail-soft.
+     */
+    private fun wireMoatGroundwork() {
+        MoatToken.appContext = applicationContext
+        MoatToken.sessionProvider = {
+            syncManager?.currentSession()?.let { session ->
+                MoatToken.SessionCredential(bearer = session.token, accountId = session.account.id)
+            }
+        }
+        // The reserved hook is invoked only after the login-only SERVE gate has already passed, so isSignedIn is
+        // known true at that point (SourceIndexClient re-checks the flag before calling the provider).
+        SourceIndexClient.moatTokenProvider = { MoatToken.current(isSignedIn = true) }
+    }
 
     /**
      * Activate the account sync engine: construct the (dormant-until-now) [VortXSyncManager], wire its push

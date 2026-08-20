@@ -301,6 +301,7 @@ object SettingsBackup {
         bundleId: String,
         app: String = "VortX",
         activeId: String? = null,
+        deviceSettings: Map<String, Any> = emptyMap(),
         now: Date = Date(),
     ): String? {
         if (roster.isEmpty()) return null                       // never-zero
@@ -312,6 +313,14 @@ object SettingsBackup {
             else -> return null
         }
 
+        // LOCAL-WINS, NEVER-DELETE settings read-merge (the app-settings leg, gap 1). [deviceSettings] holds this
+        // device's own syncable global settings (Apple's exact keys, plist-native values from [plistSettingsFrom]).
+        // Overlaying them onto the pulled domain SETS only the keys this device actually holds and leaves every
+        // key it does not carry at the account's value, so a device missing a setting never wipes the account's
+        // copy (the same asymmetric read-merge Apple's `mergedSyncBlob` / `apiKeys` use). Roster keys are written
+        // AFTER this, so they always win their own slots; [deviceSettings] never carries a roster key.
+        base.putAll(deviceSettings)
+
         // The roster rides as plist DATA of UTF-8 JSON, matching JSONEncoder().encode(profiles) on Apple.
         base[ROSTER_KEY] = UserProfile.encodeRoster(roster).toByteArray(Charsets.UTF_8)
         // A plist REAL of epoch SECONDS, matching Date().timeIntervalSince1970 / double(forKey:) on Apple.
@@ -321,6 +330,154 @@ object SettingsBackup {
 
         val bytes = encode(base, bundleId = bundleId, app = app, now = now) ?: return null
         return Base64.getEncoder().encodeToString(bytes)
+    }
+
+    // ------------------------------------------------------------ device app-settings seam (gap 1)
+
+    /**
+     * The storage type of a syncable global setting, so a value round-trips into and out of the plist domain and
+     * back into Android [android.content.SharedPreferences] under the exact type its typed getter expects. This
+     * is what makes an APPLE-authored blob safe to apply here: the plist decodes a bool/int/real/string with no
+     * per-key manifest, and a typed getter (`getInt`, `getFloat`, ...) throws a ClassCastException if the wrong
+     * type is written, so the target type must be known per key rather than guessed from the decoded value.
+     */
+    enum class SettingType { BOOL, INT, FLOAT, STRING, STRING_SET }
+
+    /**
+     * The GLOBAL device settings that ride `doc.settings` cross-device, each under Apple/web's EXACT key (the
+     * same-key mandate) so a value set on one surface round-trips to iOS/tvOS/Mac/web/Android. Deliberately
+     * scoped:
+     *   - PER-PROFILE prefs (track languages `stremiox.tracks.*`, the `stremiox.streaming.*` source filters) are
+     *     NOT here: they travel per profile inside the roster's `PlaybackPrefs`, so carrying the ACTIVE-profile
+     *     flat key here too would cross-contaminate a peer whose active profile differs.
+     *   - DEVICE-LOCAL keys (streaming cache size, server URL, upscaling, DV toggle, download queue/limits, ...)
+     *     are excluded exactly as Apple excludes them (also caught by [isSyncable] as belt-and-braces).
+     *   - The account TOKEN is never here: it lives only in the encrypted session store, never in `vortx_settings`.
+     *   - Keys whose Android VALUE ENCODING is not provably identical to Apple's (e.g. a bool stored as the string
+     *     "0"/"1", or a numeric step stored as a string) are omitted so a type/encoding mismatch can never land a
+     *     value a typed getter would reject.
+     */
+    val SYNCABLE_SETTING_TYPES: Map<String, SettingType> = linkedMapOf(
+        // Player + playback toggles
+        "stremiox.autoAddLibrary" to SettingType.BOOL,
+        "stremiox.directLinksOnly" to SettingType.BOOL,
+        "stremiox.autoSkip" to SettingType.BOOL,
+        "stremiox.autoplayTrailers" to SettingType.BOOL,
+        "stremiox.autoLandscapeInPlayer" to SettingType.BOOL,
+        "stremiox.keepPlayingInBackground" to SettingType.BOOL,
+        "stremiox.communityTrickplay" to SettingType.BOOL,
+        "stremiox.forceSDRTonemap" to SettingType.BOOL,
+        "vortx.player.badSourceAutoRetry" to SettingType.BOOL,
+        "vortx.player.bufferTuning" to SettingType.BOOL,
+        "vortx.player.matchFrameRate" to SettingType.BOOL,
+        "vortx.player.focusPrefetch" to SettingType.BOOL,
+        "vortx.player.adaptiveProbe" to SettingType.BOOL,
+        "vortx.stillWatchingPrompt" to SettingType.BOOL,
+        // Player + playback string choices
+        "stremiox.sub.font" to SettingType.STRING,
+        "stremiox.sub.size" to SettingType.STRING,
+        "stremiox.sub.color" to SettingType.STRING,
+        "stremiox.sub.brightness" to SettingType.STRING,
+        "stremiox.sub.background" to SettingType.STRING,
+        "stremiox.sub.sizeScale" to SettingType.FLOAT,
+        "stremiox.audioOutputMode" to SettingType.STRING,
+        "stremiox.performanceMode" to SettingType.STRING,
+        "stremiox.videoSize" to SettingType.STRING,
+        "stremiox.hdrToneMapMode" to SettingType.STRING,
+        "stremiox.player.seekBarStyle" to SettingType.STRING,
+        "stremiox.trailerLanguage" to SettingType.STRING,
+        "vortx.player.bufferIntent" to SettingType.STRING,
+        "vortx.stillWatchingAfterEpisodes" to SettingType.INT,
+        // Appearance + catalog presentation
+        "stremiox.theme.accent" to SettingType.STRING,
+        "stremiox.theme.oled" to SettingType.BOOL,
+        "stremiox.theme.textScale" to SettingType.FLOAT,
+        "stremiox.catalog.posterWidthPreset" to SettingType.STRING,
+        "stremiox.catalog.posterRadiusPreset" to SettingType.STRING,
+        "stremiox.catalog.landscapeCards" to SettingType.BOOL,
+        "stremiox.catalog.hidePosterLabels" to SettingType.BOOL,
+        // Home / Discover / detail layout
+        "vortx.home.showCuratedRails" to SettingType.BOOL,
+        "vortx.home.showCollectionsHub" to SettingType.BOOL,
+        "vortx.discover.showCollectionsHub" to SettingType.BOOL,
+        "vortx.mergeDiscoverSearch" to SettingType.BOOL,
+        "vortx.detail.showFinancials" to SettingType.BOOL,
+        "vortx.detail.spoilerSafe" to SettingType.BOOL,
+        "vortx.spoilerBlur" to SettingType.BOOL,
+        "vortx.collections.refreshCadence" to SettingType.STRING,
+        "vortx.discover.regionPreference" to SettingType.STRING,
+        "vortx.discover.hiddenCategories" to SettingType.STRING_SET,
+        // Tabs
+        "vortx.tabs.hide.discover" to SettingType.BOOL,
+        "vortx.tabs.hide.live" to SettingType.BOOL,
+        "vortx.tabs.hide.library" to SettingType.BOOL,
+        "vortx.tabs.hide.search" to SettingType.BOOL,
+        // Sync mirror flags + language
+        "stremiox.sync.mirror.addons" to SettingType.BOOL,
+        "stremiox.sync.mirror.library" to SettingType.BOOL,
+        "stremiox.sync.mirror.cw" to SettingType.BOOL,
+        "stremiox.languageOverride" to SettingType.STRING,
+    )
+
+    /**
+     * Convert a `vortx_settings` [android.content.SharedPreferences.getAll] snapshot into the plist-native
+     * `doc.settings` domain values for the [SYNCABLE_SETTING_TYPES] keys this device actually holds. Absent keys
+     * are omitted (never-delete on push), and a stored value whose runtime type does not match the declared
+     * [SettingType] is skipped rather than guessed (fail-soft). FLOAT is emitted as a plist REAL (Double) to match
+     * Apple's `Double` UserDefaults storage; a STRING_SET is emitted as a sorted plist ARRAY (Apple stores an
+     * array), so both directions stay deterministic.
+     */
+    fun plistSettingsFrom(all: Map<String, *>): Map<String, Any> {
+        val out = LinkedHashMap<String, Any>()
+        for ((key, type) in SYNCABLE_SETTING_TYPES) {
+            if (!isSyncable(key)) continue
+            val raw = all[key] ?: continue
+            val encoded: Any = when (type) {
+                SettingType.BOOL -> raw as? Boolean ?: continue
+                SettingType.INT -> (raw as? Int)?.toLong() ?: continue
+                SettingType.FLOAT -> (raw as? Float)?.toDouble() ?: continue
+                SettingType.STRING -> raw as? String ?: continue
+                SettingType.STRING_SET -> {
+                    val set = raw as? Set<*> ?: continue
+                    set.filterIsInstance<String>().sorted()
+                }
+            }
+            out[key] = encoded
+        }
+        return out
+    }
+
+    /**
+     * Decode the [SYNCABLE_SETTING_TYPES] settings out of a pulled `doc.settings` blob, ready to write back into
+     * `vortx_settings` under the exact type each key's getter expects. Returns null when the blob is absent or
+     * unreadable (so the caller applies nothing and never wipes local settings); an empty map means the blob was
+     * readable but carried none of these keys. A key whose decoded plist value cannot coerce to its declared type
+     * is skipped (fail-soft) rather than written under a type a typed getter would reject.
+     */
+    fun settingsFromBlob(blob: Any?): Map<String, BackupValue>? {
+        val domain = domainFromBlob(blob) ?: return null
+        val out = LinkedHashMap<String, BackupValue>()
+        for ((key, type) in SYNCABLE_SETTING_TYPES) {
+            val value = domain[key] ?: continue
+            val decoded: BackupValue? = when (type) {
+                SettingType.BOOL -> (value as? Boolean)?.let(BackupValue::Bool)
+                SettingType.INT -> when (value) {
+                    is Long -> BackupValue.IntValue(value.toInt())
+                    is Int -> BackupValue.IntValue(value)
+                    else -> null
+                }
+                SettingType.FLOAT -> when (value) {
+                    is Double -> BackupValue.FloatValue(value.toFloat())
+                    is Long -> BackupValue.FloatValue(value.toFloat())
+                    else -> null
+                }
+                SettingType.STRING -> (value as? String)?.let(BackupValue::Str)
+                SettingType.STRING_SET ->
+                    (value as? List<*>)?.let { BackupValue.StrSet(it.filterIsInstance<String>().toSet()) }
+            }
+            decoded?.let { out[key] = it }
+        }
+        return out
     }
 
     // ------------------------------------------------------------ file backup (TV-5)
