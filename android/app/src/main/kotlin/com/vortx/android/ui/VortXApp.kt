@@ -71,6 +71,7 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
+import com.vortx.android.player.EpisodeProgressionPolicy
 import com.vortx.android.player.NextEpisodePreloadPolicy
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerScreen
@@ -537,10 +538,17 @@ fun VortXApp(
             // or advanced). Drives WHEN to warm the next episode's source; the warm itself is off-fence in
             // the ViewModel. Invalidated on dispose so a stale attempt cannot survive the player closing.
             val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
-            DisposableEffect(historyIdentity) { onDispose { preloadPolicy.invalidate() } }
+            val episodeProgression = remember(historyIdentity) { EpisodeProgressionPolicy() }
+            DisposableEffect(historyIdentity) {
+                onDispose {
+                    preloadPolicy.invalidate()
+                    episodeProgression.invalidate()
+                }
+            }
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
+            var upNextTarget by remember(playable) { mutableStateOf<EpisodeProgressionPolicy.Target?>(null) }
             // Bad-source ladder surfaces, keyed per playable DELIBERATELY: a successful retry swaps
             // [playing] to the new source's playable, which resets both to false and closes the
             // overlay on its own. The ladder's cross-retry memory (failed sources + the 3-attempt
@@ -604,13 +612,31 @@ fun VortXApp(
                             preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
                         }
                     },
+                    onUpNextWindow = onUpNextWindow@{ pos, dur ->
+                        val next = advanceVm?.nextEpisode() ?: return@onUpNextWindow
+                        val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                        if (episodeProgression.offer(target, pos, dur, ended = false) != null) {
+                            upNext = next
+                            upNextTarget = target
+                        }
+                    },
                     onBack = { playing = null },
                     onError = { playing = null },
                     // Natural end of the stream: offer the next episode when the open series has one,
                     // otherwise keep the old exit back to the detail page.
                     onEnded = {
                         val next = advanceVm?.nextEpisode()
-                        if (next != null) upNext = next else playing = null
+                        if (next == null) {
+                            playing = null
+                        } else {
+                            val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                            if (episodeProgression.offer(target, 0L, 0L, ended = true) != null) {
+                                upNext = next
+                                upNextTarget = target
+                            } else if (upNext == null) {
+                                playing = null
+                            }
+                        }
                     },
                     // Bad source (dead link, stall, or a runtime-mismatch junk file): run the auto-retry
                     // ladder instead of bouncing to the detail page -- the next ranked source resolves
@@ -713,9 +739,27 @@ fun VortXApp(
                         // A countdown-expiry advance is an AUTO-advance: grow the streak so the binge
                         // boundary can fire on the next episode. A manual "Play now" tap or Cancel is
                         // presence, so it resets the streak (Apple's `noteInteraction`). Both paths play.
-                        onAutoAdvance = { autoAdvanceStreak[0]++; advanceVm.playNextEpisode() },
-                        onPlayNow = { autoAdvanceStreak[0] = 0; advanceVm.playNextEpisode() },
-                        onCancel = { autoAdvanceStreak[0] = 0; playing = null },
+                        onAutoAdvance = {
+                            if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.AUTO_ADVANCE) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
+                                autoAdvanceStreak[0]++
+                                advanceVm.playNextEpisode()
+                            }
+                        },
+                        onPlayNow = {
+                            if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.PLAY_NOW) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
+                                autoAdvanceStreak[0] = 0
+                                advanceVm.playNextEpisode()
+                            }
+                        },
+                        onWatchCredits = {
+                            upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.WATCH_CREDITS) }
+                            upNext = null
+                        },
+                        onCancel = {
+                            upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.CANCEL) }
+                            autoAdvanceStreak[0] = 0
+                            playing = null
+                        },
                     )
                 }
                 // The bad-source ladder's surfaces + their resolution collector. Like the Up Next
@@ -1196,6 +1240,7 @@ private fun UpNextOverlay(
     resolving: Boolean,
     onPlayNow: () -> Unit,
     onCancel: () -> Unit,
+    onWatchCredits: () -> Unit,
     /// Fired instead of [onPlayNow] when the COUNTDOWN expires (an automatic advance), so the host can
     /// distinguish an unattended binge from a deliberate "Play now" tap. Both ultimately play the episode.
     onAutoAdvance: () -> Unit = onPlayNow,
@@ -1263,6 +1308,14 @@ private fun UpNextOverlay(
                     fontSize = 14.sp,
                     modifier = Modifier
                         .clickable(onClick = onCancel)
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                )
+                Text(
+                    text = "Watch credits",
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 14.sp,
+                    modifier = Modifier
+                        .clickable(enabled = !resolving && !fired, onClick = onWatchCredits)
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                 )
             }

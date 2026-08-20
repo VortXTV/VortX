@@ -211,6 +211,10 @@ fun PlayerChrome(
     sourceSwitchError: String? = null,
     onSwitchSource: (StreamSource) -> Unit = {},
     onSwitchEpisode: (Episode) -> Unit = {},
+    /// Direct sequential episode transport. The host supplies adjacent episodes after resolving its
+    /// authoritative current episode; the chrome never guesses from source labels or URLs.
+    previousEpisode: Episode? = null,
+    nextEpisode: Episode? = null,
     /// Secondary (dual) subtitle state. [secondarySubtitleAvailable] is mpv-only, so the control is hidden
     /// on the Dolby Vision (ExoPlayer) engine and when fewer than two subtitle tracks exist. When a second
     /// subtitle is active both the primary and secondary tracks read as selected, so the primary sheet
@@ -380,6 +384,12 @@ fun PlayerChrome(
                 // In-player episode picker (series only): the season's episodes, current one highlighted.
                 if (episodeChoices.size > 1) {
                     ChromeIcon(Icons.AutoMirrored.Filled.List, "Episodes") { onInteraction(); openSheet = ControlSheet.EPISODES }
+                }
+                previousEpisode?.let { episode ->
+                    ChromeIcon(Icons.Filled.SkipPrevious, "Previous episode") { onInteraction(); onSwitchEpisode(episode) }
+                }
+                nextEpisode?.let { episode ->
+                    ChromeIcon(Icons.Filled.SkipNext, "Next episode") { onInteraction(); onSwitchEpisode(episode) }
                 }
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
                 // Volume + mute (Apple `stremiox.playerVolume`): the speaker glyph reflects the mute / level

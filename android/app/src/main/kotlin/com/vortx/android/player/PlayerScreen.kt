@@ -148,6 +148,9 @@ fun PlayerScreen(
     /// its next-episode PRELOAD policy (warm the next episode's source before the current one ends). Default
     /// no-op keeps the screen usable in isolation; the phone shell wires it to [NextEpisodePreloadPolicy].
     onWarmNext: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    /// The final-credits window is intentionally separate from EOF: the host can show an Up Next choice
+    /// while the current episode still plays, then fence its decision to the current episode generation.
+    onUpNextWindow: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
     /// How many episodes auto-advanced back-to-back (with no interaction) to reach THIS playback, so the
     /// binge boundary of the "Still watching?" guard can fire. The host counts the streak across the
     /// auto-advance chain and resets it on any manual play. 0 (the default) never trips the binge boundary.
@@ -179,6 +182,7 @@ fun PlayerScreen(
     val currentOnSwitchEpisode by rememberUpdatedState(onSwitchEpisode)
     val currentOnEpisodeSwitched by rememberUpdatedState(onEpisodeSwitched)
     val currentOnWarmNext by rememberUpdatedState(onWarmNext)
+    val currentOnUpNextWindow by rememberUpdatedState(onUpNextWindow)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
     DisposableEffect(sourceSwitchCoordinator, outerPlaybackSessionId) {
@@ -793,7 +797,7 @@ fun PlayerScreen(
     // dead frame would look like a hang); any state flip or interaction tick restarts the countdown.
     LaunchedEffect(controlsVisible, controlsInteractionTick, playerState.isPaused, playerState.isBuffering, effectiveError) {
         if (!controlsVisible || playerState.isPaused || playerState.isBuffering || effectiveError) return@LaunchedEffect
-        delay(CONTROLS_AUTO_HIDE_MS)
+        delay(if (isTvPlayer) TV_CONTROLS_AUTO_HIDE_MS else PHONE_CONTROLS_AUTO_HIDE_MS)
         controlsVisible = false
     }
 
@@ -1053,6 +1057,7 @@ fun PlayerScreen(
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
                 currentOnWarmNext(s.positionMs, s.durationMs)
+                currentOnUpNextWindow(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1325,6 +1330,15 @@ fun PlayerScreen(
                 },
         )
 
+        // The in-player picker already owns the current-season episode order. Derive direct transport from
+        // that exact list rather than source labels, preserving the same resolver/fence as a picker tap.
+        val episodeChoices = remember(episodeOptions, sourceSwitchState.playable.mediaRef) {
+            playerEpisodeChoices(episodeOptions, sourceSwitchState.playable.mediaRef)
+        }
+        val selectedEpisodeIndex = episodeChoices.indexOfFirst { it.selected }
+        val previousEpisode = episodeChoices.getOrNull(selectedEpisodeIndex - 1)?.episode
+        val nextEpisode = episodeChoices.getOrNull(selectedEpisodeIndex + 1)?.episode
+
         PlayerChrome(
             playable = currentPlayable,
             playbackSessionRevision = sourceSwitchState.revision,
@@ -1463,6 +1477,8 @@ fun PlayerScreen(
                     }
                 }
             },
+            previousEpisode = previousEpisode,
+            nextEpisode = nextEpisode,
             // The explicit PiP entry (user action); null on devices/hosts that cannot PiP, which
             // hides the control entirely. Home-press entry rides auto-enter / onUserLeaveHint.
             onEnterPip = if (pip.supported) {
@@ -1818,7 +1834,8 @@ private const val CAST_PROGRESS_WRITEBACK_MS = 5_000L
 
 /// How long the chrome stays up with no interaction while playback is rolling before it auto-hides.
 /// 3.5s sits in the standard mobile-player band (3-4s); paused/buffering/error states never hide.
-private const val CONTROLS_AUTO_HIDE_MS = 3_500L
+private const val PHONE_CONTROLS_AUTO_HIDE_MS = 3_500L
+private const val TV_CONTROLS_AUTO_HIDE_MS = 8_000L
 
 /// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
 /// chrome's auto-hide: while locked the whole point is an undisturbed frame.

@@ -1,6 +1,15 @@
 package com.vortx.android.ui.tv
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -11,6 +20,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.tv.material3.ExperimentalTvMaterial3Api
@@ -25,8 +39,11 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.player.BadSourceAutoRetrySetting
+import com.vortx.android.player.EpisodeProgressionPolicy
+import com.vortx.android.player.NextEpisodePreloadPolicy
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.player.advancePlayerEpisodeHistory
@@ -42,6 +59,7 @@ import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 /// The Android TV shell: a three-state D-pad flow (Home browse -> Detail -> Player) that is the 10-foot
 /// analogue of the phone [com.vortx.android.ui.VortXApp], reusing the exact same seams underneath.
@@ -173,6 +191,17 @@ fun TvApp(
             val playerEpisodeOptions = remember(playerVm, playerSourceState) {
                 playerVm?.playerEpisodeOptions().orEmpty()
             }
+            val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
+            val episodeProgression = remember(historyIdentity) { EpisodeProgressionPolicy() }
+            DisposableEffect(historyIdentity) {
+                onDispose {
+                    preloadPolicy.invalidate()
+                    episodeProgression.invalidate()
+                }
+            }
+            val autoAdvanceStreak = remember { intArrayOf(0) }
+            var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
+            var upNextTarget by remember(playable) { mutableStateOf<EpisodeProgressionPolicy.Target?>(null) }
             var retryingSource by remember(playable) { mutableStateOf(false) }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             val retryPlayback = if (playerVm != null) {
@@ -203,8 +232,11 @@ fun TvApp(
                     playbackHistory.end()
                 }
             }
+            Box(Modifier.fillMaxSize()) {
             PlayerScreen(
                 playable = playable,
+                autoAdvanceCount = autoAdvanceStreak[0],
+                onBingePrompted = { autoAdvanceStreak[0] = 0 },
                 sourceOptions = playerSourceOptions,
                 qualityOptions = playerQualityOptions,
                 episodeOptions = playerEpisodeOptions,
@@ -222,8 +254,41 @@ fun TvApp(
                         acceptedRevision = acceptedRevision,
                     )
                 },
+                onWarmNext = onWarmNext@{ pos, dur ->
+                    val vm = playerVm ?: return@onWarmNext
+                    val next = vm.nextEpisode() ?: return@onWarmNext
+                    val target = NextEpisodePreloadPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                    val attempt = preloadPolicy.evaluate(target, pos, dur, android.os.SystemClock.elapsedRealtime())
+                        ?: return@onWarmNext
+                    appScope.launch {
+                        val prepared = vm.warmNextEpisode(next.id)
+                        preloadPolicy.complete(attempt, prepared, android.os.SystemClock.elapsedRealtime())
+                    }
+                },
+                onUpNextWindow = onUpNextWindow@{ pos, dur ->
+                    val next = playerVm?.nextEpisode() ?: return@onUpNextWindow
+                    val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                    if (episodeProgression.offer(target, pos, dur, ended = false) != null) {
+                        upNext = next
+                        upNextTarget = target
+                    }
+                },
                 onBack = { playing = null },
                 onError = { playing = null },
+                onEnded = {
+                    val next = playerVm?.nextEpisode()
+                    if (next == null) {
+                        playing = null
+                    } else {
+                        val target = EpisodeProgressionPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                        if (episodeProgression.offer(target, 0L, 0L, ended = true) != null) {
+                            upNext = next
+                            upNextTarget = target
+                        } else if (upNext == null) {
+                            playing = null
+                        }
+                    }
+                },
                 onSourceFailed = if (playerVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
                     { positionMs ->
                         retryResumePositionMs = positionMs
@@ -240,6 +305,49 @@ fun TvApp(
                 shareLink = tvStreamShareLink(playable),
                 isTvPlayer = true,
             )
+            val next = upNext
+            if (next != null && playerVm != null) {
+                val nextPlayback by playerVm.playback.collectAsStateWithLifecycle()
+                LaunchedEffect(nextPlayback) {
+                    when (val result = nextPlayback) {
+                        is Playback.Ready -> {
+                            playerVm.clearPlayback()
+                            playing = result.playable
+                        }
+                        is Playback.Failed -> {
+                            playerVm.clearPlayback()
+                            playing = null
+                        }
+                        else -> Unit
+                    }
+                }
+                TvUpNextOverlay(
+                    episode = next,
+                    resolving = nextPlayback is Playback.Resolving,
+                    onAutoAdvance = {
+                        if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.AUTO_ADVANCE) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
+                            autoAdvanceStreak[0]++
+                            playerVm.playNextEpisode()
+                        }
+                    },
+                    onPlayNow = {
+                        if (upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.PLAY_NOW) } == EpisodeProgressionPolicy.Decision.ADVANCE) {
+                            autoAdvanceStreak[0] = 0
+                            playerVm.playNextEpisode()
+                        }
+                    },
+                    onWatchCredits = {
+                        upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.WATCH_CREDITS) }
+                        upNext = null
+                    },
+                    onCancel = {
+                        upNextTarget?.let { episodeProgression.decide(it, EpisodeProgressionPolicy.Intent.CANCEL) }
+                        autoAdvanceStreak[0] = 0
+                        playing = null
+                    },
+                )
+            }
+            }
             return@VortXTheme
         }
 
@@ -313,6 +421,57 @@ fun TvApp(
             }
         }
     }
+}
+
+@Composable
+private fun TvUpNextOverlay(
+    episode: Episode,
+    resolving: Boolean,
+    onPlayNow: () -> Unit,
+    onWatchCredits: () -> Unit,
+    onCancel: () -> Unit,
+    onAutoAdvance: () -> Unit,
+) {
+    var secondsLeft by remember(episode.id) { mutableStateOf(10) }
+    var fired by remember(episode.id) { mutableStateOf(false) }
+    LaunchedEffect(episode.id) {
+        while (secondsLeft > 0) {
+            delay(1_000L)
+            secondsLeft--
+        }
+        if (!fired) {
+            fired = true
+            onAutoAdvance()
+        }
+    }
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomEnd) {
+        Column(
+            modifier = Modifier
+                .padding(40.dp)
+                .background(Color(0xE61A1A1A), RoundedCornerShape(16.dp))
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            androidx.compose.material3.Text("Up Next", color = Color.White.copy(alpha = 0.72f), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            androidx.compose.material3.Text("S${episode.season} E${episode.episode} · ${episode.title}", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                TvUpNextAction(if (resolving || fired) "Starting…" else "Play now · ${secondsLeft}s", enabled = !resolving && !fired, onClick = { fired = true; onPlayNow() })
+                TvUpNextAction("Watch credits", enabled = !resolving && !fired, onClick = onWatchCredits)
+                TvUpNextAction("Cancel", enabled = true, onClick = onCancel)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TvUpNextAction(label: String, enabled: Boolean, onClick: () -> Unit) {
+    androidx.compose.material3.Text(
+        text = label,
+        color = if (enabled) Color.White else Color.White.copy(alpha = 0.5f),
+        fontSize = 17.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier.clickable(enabled = enabled, onClick = onClick).padding(vertical = 8.dp),
+    )
 }
 
 /**
