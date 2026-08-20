@@ -97,11 +97,15 @@ class MemoryKV {
 }
 
 class MemoryStorage {
-  constructor() { this.values = new Map(); }
+  constructor() { this.values = new Map(); this.tail = Promise.resolve(); }
   async get(key) { return this.values.get(key); }
   async put(key, value) { this.values.set(key, structuredClone(value)); }
   async delete(key) { this.values.delete(key); }
-  async transaction(callback) { return callback(this); }
+  transaction(callback) {
+    const result = this.tail.then(() => callback(this));
+    this.tail = result.catch(() => undefined);
+    return result;
+  }
 }
 
 function environment(kv, extra = {}) {
