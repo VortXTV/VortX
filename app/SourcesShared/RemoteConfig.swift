@@ -200,6 +200,9 @@ enum RemoteConfigDefaults {
                                                 // unreachable RemoteConfig is behaviorally identical to today;
                                                 // an explicit remote OFF disables the source with NO app update
                                                 // (its search host, search-api.torbox.app, went DNS-dead).
+    static let featureRefindSources = true      // "Re-find sources" control master gate. Baked ON, so it is on
+                                                // by default; an explicit remote OFF hides the control on every
+                                                // detail screen and the terminal-failure overlay, NO app update.
 }
 
 // MARK: - Decodable schema (decode ALL; wire a subset). Every field Optional; unknown keys ignored.
@@ -227,6 +230,7 @@ struct RemoteConfigData: Decodable {
         let erdbPosters: Bool?
         let collectionsHub: Bool?
         let torBoxSearch: Bool?        // TorBoxSearchSource master gate (baked ON; remote OFF kills the dead path)
+        let refindSources: Bool?       // "Re-find sources" control master gate (baked ON; backend kill switch)
         let skipVortxLayer: Bool?
         let aniSkip: Bool?
         let spoilerBlur: Bool?
@@ -1006,6 +1010,7 @@ actor RemoteConfig {
             put("erdbPosters", f.erdbPosters)
             put("collectionsHub", f.collectionsHub)
             put("torBoxSearch", f.torBoxSearch)
+            put("refindSources", f.refindSources)
             put("skipVortxLayer", f.skipVortxLayer)
             put("aniSkip", f.aniSkip)
             put("spoilerBlur", f.spoilerBlur)

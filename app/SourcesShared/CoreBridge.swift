@@ -84,6 +84,23 @@ final class CoreBridge: ObservableObject {
     }
     private var appleCWMetaRefreshGeneration = 0
     private var appleCWMetaRefreshRequest: AppleCWMetaRefreshRequest?
+
+    /// Re-find sources ("Re-find sources" control). A plain re-Load of the same meta is an engine
+    /// eq_update no-op with ZERO add-on HTTP, so the only way to make expired sources get replaced is
+    /// Unload -> (await the nil meta_details receipt) -> Load. This is the MINIMAL twin of the Apple CW
+    /// authoritative refresh: it carries NO completion receipt and NO Continue-Watching bookkeeping, and
+    /// its `streamID` is OPTIONAL so a MOVIE (no episode stream path) re-finds too. One-shot: once the
+    /// nil receipt re-dispatches the exact Load, the request clears and the ordinary republish takes over.
+    private struct RefindRequest {
+        let generation: Int
+        let type: String
+        let id: String
+        let streamType: String?
+        let streamID: String?
+        var awaitingInvalidation: Bool
+    }
+    private var refindGeneration = 0
+    private var refindRequest: RefindRequest?
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
@@ -1258,6 +1275,34 @@ final class CoreBridge: ObservableObject {
         return generation
     }
 
+    /// Re-find sources: force a FRESH add-on re-query for this exact title/episode so expired sources are
+    /// replaced. Modeled on `beginAppleCWAuthoritativeMetaRefresh` but with an OPTIONAL `streamId` (so
+    /// MOVIES re-find, not just episodes) and WITHOUT the Continue-Watching receipt bookkeeping. A plain
+    /// re-Load of the same meta is an engine eq_update no-op (zero add-on HTTP), so this clears + Unloads
+    /// the resident meta first and only re-dispatches the exact Load on the Unload's nil meta_details
+    /// receipt (see the `refindRequest` arm in `scheduleMetaDetailsRepublish`). The source list empties and
+    /// repaints to its loading state, then refills as the fresh sources land. Main-actor only (called from
+    /// SwiftUI actions), mirroring `beginAppleCWAuthoritativeMetaRefresh`'s synchronous mutation style.
+    func refindSources(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
+        refindGeneration &+= 1
+        refindRequest = RefindRequest(
+            generation: refindGeneration,
+            type: type,
+            id: id,
+            streamType: streamType,
+            streamID: streamId,
+            awaitingInvalidation: true
+        )
+        metaDetailsWork?.cancel()
+        metaDetailsWork = nil
+        let hadDetails = metaDetails != nil
+        metaDetails = nil
+        // Clearing the resident streams IS a ready-stream-set change: bump the source-list epoch so the
+        // model empties, then repaints as the re-queried title lands.
+        if hadDetails { streamsEpoch &+= 1 }
+        dispatch(action: ["action": "Unload"], field: "meta_details")
+    }
+
     /// Cancel a pending Apple terminal refresh when ordinary navigation or player teardown takes ownership
     /// of the shared meta slot. A stale polling Task may return harmlessly, but its bridge request must also
     /// be unable to dispatch a late Load into the newer target.
@@ -1308,6 +1353,9 @@ final class CoreBridge: ObservableObject {
     /// path so the engine fetches that episode's streams.
     func loadMeta(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
         cancelAppleCWMetaRefresh()
+        // A navigation/load takes ownership of the meta slot: drop any pending re-find so its Unload's nil
+        // receipt cannot re-dispatch a stale Load into this new target.
+        refindRequest = nil
         dispatch(action: metaLoadAction(type: type, id: id, streamType: streamType, streamId: streamId),
                  field: "meta_details")
         // If the engine already had this exact meta loaded, ActionLoad is a no-op (eq_update) and no
@@ -1327,6 +1375,7 @@ final class CoreBridge: ObservableObject {
 
     func unloadMeta() {
         cancelAppleCWMetaRefresh()
+        refindRequest = nil
         dispatch(action: ["action": "Unload"], field: "meta_details")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -2761,6 +2810,21 @@ final class CoreBridge: ObservableObject {
                             let streamsChanged = Self.metaDetailsStreamsChanged(current: self.metaDetails, next: details)
                             self.metaDetails = details
                             if streamsChanged { self.streamsEpoch &+= 1 }
+                        }
+                        // Re-find sources: the minimal Unload -> nil -> Load arm, independent of the Apple CW
+                        // authoritative refresh. The Unload's nil meta_details receipt is the only thing that
+                        // opens the exact Load (a same-ID ready re-emit is NOT invalidation). One-shot: clear
+                        // the request as the Load is dispatched, then the ordinary republish above refills the
+                        // source list from the fresh sources as they land.
+                        if let refind = self.refindRequest, refind.awaitingInvalidation, details == nil {
+                            self.refindRequest = nil
+                            self.dispatch(
+                                action: self.metaLoadAction(
+                                    type: refind.type, id: refind.id,
+                                    streamType: refind.streamType, streamId: refind.streamID
+                                ),
+                                field: "meta_details"
+                            )
                         }
                         guard let request = self.appleCWMetaRefreshRequest,
                               let refreshGenerationAtSchedule,

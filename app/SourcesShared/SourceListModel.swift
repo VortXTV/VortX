@@ -224,6 +224,22 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         trigger.send()
     }
 
+    /// Repaint the list back to its loading ("Finding sources...") state for a SAME-id re-find. `setContext`
+    /// only re-arms the deadline and blanks the settled receipt on an IDENTITY change (a new title/episode);
+    /// a "Re-find sources" tap keeps the identity, so without this the section would keep showing the stale
+    /// settled rows while the fresh add-on re-query is in flight. Retire the published signature (so the
+    /// coalesced rebuild runs again even if nothing else moved), blank the settlement receipt, and re-arm the
+    /// settlement deadline for the CURRENT identity. The engine's Unload -> Load then empties and refills the
+    /// ranked rows through the normal `streamsEpoch` path.
+    func beginRefresh() {
+        generation &+= 1
+        pendingSignature = nil
+        publishedSignature = nil
+        publishedSettlement = .waiting
+        resetSettlementDeadline(for: outputIdentity(for: context))
+        trigger.send()
+    }
+
     private func resetSettlementDeadline(for identity: OutputIdentity) {
         settlementDeadlineTask?.cancel()
         settlementDeadlineExpired = false
