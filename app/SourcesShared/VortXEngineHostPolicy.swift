@@ -397,6 +397,7 @@ enum VortXEngineHostPolicy {
     /// per-session capability, so both fields must match before a delayed readiness result can attach.
     struct RemoteMountIdentity: Equatable, Sendable {
         let sessionID: String
+        let mountGeneration: String
         let playlistURL: String
     }
 

@@ -236,12 +236,26 @@ final class VortXRemuxProducerTerminalRelay: @unchecked Sendable {
 /// The fallback surface holds this receipt until the producer's one real terminal edge fires.
 final class VortXRemuxQuiescenceReceipt: @unchecked Sendable {
     private let terminal: VortXRemuxProducerTerminalRelay?
+    private let children: [VortXRemuxQuiescenceReceipt]
 
     init(terminal: VortXRemuxProducerTerminalRelay?) {
         self.terminal = terminal
+        self.children = []
     }
 
-    var isAcknowledged: Bool { terminal?.hasFired ?? true }
+    private init(children: [VortXRemuxQuiescenceReceipt]) {
+        self.terminal = nil
+        self.children = children
+    }
+
+    /// All retiring producers must quiesce; an empty set represents a direct AV route with no remux producer.
+    static func all(_ receipts: [VortXRemuxQuiescenceReceipt]) -> VortXRemuxQuiescenceReceipt {
+        VortXRemuxQuiescenceReceipt(children: receipts)
+    }
+
+    var isAcknowledged: Bool {
+        (terminal?.hasFired ?? true) && children.allSatisfy(\.isAcknowledged)
+    }
 
     func wait(timeout: Duration) async -> Bool {
         let deadline = ContinuousClock.now + timeout

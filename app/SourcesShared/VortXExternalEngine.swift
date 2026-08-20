@@ -239,6 +239,7 @@ final class VortXExternalEngine: @unchecked Sendable {
 
     struct OpenedSession: Sendable {
         let sessionID: String
+        let mountGeneration: String
         /// The full media URL, composed against the host address this client dialled. The host never returns a
         /// URL because it does not know which of its addresses we can reach.
         let playlistURL: URL
@@ -286,6 +287,7 @@ final class VortXExternalEngine: @unchecked Sendable {
             "engine",
             "host session \(opened.sessionID) media=\(mediaAuthority) retain=\(opened.retainsFullTimeline)")
         return OpenedSession(sessionID: opened.sessionID,
+                             mountGeneration: opened.mountGeneration,
                              playlistURL: playlistURL,
                              retainsFullTimeline: opened.retainsFullTimeline,
                              host: hostString,
@@ -315,16 +317,32 @@ final class VortXExternalEngine: @unchecked Sendable {
                           as: VortXEngineProtocol.SessionStatus.self)
     }
 
-    /// Best-effort teardown. Fire and forget: the host reaps an abandoned session on its own timer, so a client
-    /// that dies or loses the network costs it a minute of producer time, not a leak.
-    func close(_ session: OpenedSession) {
+    /// Await an authenticated physical-unwind receipt.  A 2xx response without the exact session and mount
+    /// generation is deliberately rejected: a stale host must never authorize an MPV mount.
+    func closeAndAwaitReceipt(
+        _ session: OpenedSession,
+        timeoutSeconds: TimeInterval = 3
+    ) async -> VortXEngineProtocol.TeardownReceipt? {
         guard let url = controlURL(host: session.host, port: session.port,
-                                   path: VortXEngineProtocol.Path.teardown(session.sessionID)) else { return }
-        let req = request(url, method: "DELETE", body: nil, authorized: true)
-        session_teardown(req)
+                                   path: VortXEngineProtocol.Path.teardown(session.sessionID)) else { return nil }
+        guard let body = try? JSONEncoder().encode(VortXEngineProtocol.TeardownRequest(
+            sessionID: session.sessionID, mountGeneration: session.mountGeneration
+        )) else { return nil }
+        var req = request(url, method: "DELETE", body: body, authorized: true)
+        req.timeoutInterval = max(0.1, timeoutSeconds)
+        guard let receipt = await send(req, as: VortXEngineProtocol.TeardownReceipt.self),
+              VortXEngineProtocol.acceptsTeardownReceipt(
+                receipt,
+                for: VortXEngineProtocol.TeardownRequest(
+                    sessionID: session.sessionID,
+                    mountGeneration: session.mountGeneration)) else { return nil }
+        return receipt
     }
 
-    private func session_teardown(_ req: URLRequest) {
-        session.dataTask(with: req).resume()
+    /// Best-effort shutdown for ordinary title replacement.  AV→MPV fallback uses `closeAndAwaitReceipt`.
+    func close(_ session: OpenedSession) {
+        Task.detached(priority: .utility) { [weak self] in
+            _ = await self?.closeAndAwaitReceipt(session)
+        }
     }
 }

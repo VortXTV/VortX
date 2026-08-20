@@ -822,6 +822,25 @@ check("doc: a cue-less stretch still serves a valid document",
         && Policy.webVTTDocument(cues: []).hasPrefix("WEBVTT"))
 check("doc: a zero-length cue is not written",
       parseVTT(Policy.webVTTDocument(cues: [Cue(start: 2, end: 2, text: "x")])).cues.isEmpty)
+let adjacentSegmentCue = Cue(start: 5, end: 8, text: "Crosses boundary")
+let localSegment = parseVTT(Policy.webVTTDocument(
+    cues: [adjacentSegmentCue], segmentStart: 6, segmentEnd: 12))
+check("doc: a later HLS segment maps local zero to its exact 90 kHz media timestamp",
+      localSegment.header.contains("X-TIMESTAMP-MAP=MPEGTS:540000,LOCAL:00:00:00.000"))
+check("doc: a cue crossing a segment edge is clipped to that segment's local clock",
+      localSegment.cues.first?.time == "00:00:00.000 --> 00:00:02.000")
+let nextLocalSegment = parseVTT(Policy.webVTTDocument(
+    cues: [adjacentSegmentCue], segmentStart: 7, segmentEnd: 12))
+check("doc: adjacent segment copies carry different timeline identities instead of duplicate absolute cues",
+      nextLocalSegment.header != localSegment.header
+        && nextLocalSegment.cues.first?.time == "00:00:00.000 --> 00:00:01.000")
+let firstBoundaryFragment = parseVTT(Policy.webVTTDocument(
+    cues: [adjacentSegmentCue], segmentStart: 0, segmentEnd: 6))
+let secondBoundaryFragment = parseVTT(Policy.webVTTDocument(
+    cues: [adjacentSegmentCue], segmentStart: 6, segmentEnd: 12))
+check("doc: adjacent HLS fragments partition a long cue without a duplicate display interval",
+      firstBoundaryFragment.cues.first?.time == "00:00:05.000 --> 00:00:06.000"
+        && secondBoundaryFragment.cues.first?.time == "00:00:00.000 --> 00:00:02.000")
 
 // MARK: - Served documents, end to end
 

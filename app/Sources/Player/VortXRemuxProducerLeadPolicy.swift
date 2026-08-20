@@ -18,6 +18,11 @@ import Foundation
 /// while `VortXHLSConsumptionWindowPolicy.floor` independently guarantees the behind-frontier history itself
 /// (see that type's own header for the two-pool accounting fix).
 enum VortXRemuxProducerLeadPolicy {
+    /// One ordinary on-device session has one current and one recently superseded retained window, plus the
+    /// operational and safety reservations: `2W + O + H = C`. An unseen producer tail may consume at most one
+    /// window share. This keeps a high-bitrate remux from consuming the bytes reserved for the just-replaced
+    /// playlist while AVPlayer is still legally entitled to read it.
+    static let maximumAheadBytes = VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes
     /// Stop producing once the produced tail is at least this far (in source seconds) ahead of the confirmed
     /// playhead.
     static let pauseAheadSeconds: Double = 90
@@ -26,17 +31,31 @@ enum VortXRemuxProducerLeadPolicy {
     /// every publication cycle as ordinary segment-duration jitter crosses back and forth over a single value.
     static let resumeBelowSeconds: Double = 60
 
+    /// Window publication policy is orthogonal to producer safety. In particular, the anchor-off rollback
+    /// keeps a startup window pinned but must still apply the same local producer bound; only a hosted retaining
+    /// mount and true EOF are exempt.
+    static func shouldDriveProducerGate(consumptionAnchored: Bool,
+                                        retainsFullTimeline: Bool,
+                                        reachedEndOfStream: Bool) -> Bool {
+        _ = consumptionAnchored
+        return !retainsFullTimeline && !reachedEndOfStream
+    }
+
     /// Pure hysteresis decision. `leadSeconds` is `producedEnd - confirmedPlayheadSeconds`; a non-finite value
     /// (playhead not yet known, e.g. before the first playback receipt) fails closed to whatever the CURRENT
     /// state already is, so an unknown clock can never itself start or lift a pause.
-    static func shouldPauseProducer(leadSeconds: Double, currentlyPaused: Bool) -> Bool {
-        guard leadSeconds.isFinite else { return currentlyPaused }
+    static func shouldPauseProducer(leadSeconds: Double,
+                                    aheadBytes: Int? = nil,
+                                    currentlyPaused: Bool) -> Bool {
+        guard leadSeconds.isFinite,
+              aheadBytes.map({ $0 >= 0 }) ?? true else { return currentlyPaused }
+        let overByteBudget = aheadBytes.map { $0 >= maximumAheadBytes } ?? false
         if currentlyPaused {
             // "resume below 60s" (report section 6): resume ONLY once strictly under the resume line, so a
             // lead sitting exactly on it stays paused rather than flapping.
-            return !(leadSeconds < resumeBelowSeconds)
+            return !(leadSeconds < resumeBelowSeconds && !overByteBudget)
         }
-        return leadSeconds >= pauseAheadSeconds
+        return leadSeconds >= pauseAheadSeconds || overByteBudget
     }
 }
 

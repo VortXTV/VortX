@@ -47,9 +47,18 @@ struct PlayerEpisodeStream {
 
 struct PlayerScreen: View {
     #if os(iOS) || os(macOS)
+    private struct DirectAVNoFrameRecovery: Equatable {
+        let url: URL
+        let episodeGeneration: Int
+        let sourceGeneration: Int
+        let resumeGeneration: Int
+        let attemptID: String
+        let mpvLoadToken: PlayerLoadToken?
+    }
     private struct AVToMPVHandoff: Equatable {
         let url: URL
         let episodeGeneration: Int
+        let sourceGeneration: Int
         let resumeGeneration: Int
     }
     #endif
@@ -558,6 +567,8 @@ struct PlayerScreen: View {
     @State private var avToMPVHandoff: AVToMPVHandoff?
     @State private var avToMPVHandoffBlocked = false
     @State private var avToMPVHandoffTask: Task<Void, Never>?
+    /// A direct source gets one AVPlayer -> MPV no-frame opportunity, bound to the exact media identity.
+    @State private var directAVNoFrameRecovery: DirectAVNoFrameRecovery?
     /// The engine routing decision, LATCHED once at playback start (onAppear). Routing inputs are not all
     /// constant (`PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable:)` reads a RemoteConfig snapshot that can
     /// refresh mid-session), and `useAVPlayerEngine` is re-evaluated on every body render, so an unlatched flip
@@ -1661,6 +1672,7 @@ struct PlayerScreen: View {
                     // then cleared here, not a real failure.
                     srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
+                    directAVNoFrameRecovery = nil
                     firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
                     // Deferred libmpv resume seek: the pipeline is now warm (first frame rendered), so this lands
                     // as an ordinary scrub instead of the cold pre-first-frame seek that wedged video output.
@@ -1991,6 +2003,29 @@ struct PlayerScreen: View {
             }
             if provenFromIncomingEngine, let t = avDemotedAt, Date().timeIntervalSince(t) < 2 {
                 srcProbe("endFileError inside the post-demote grace but from the INCOMING engine's own load -> handled, not swallowed reason=\((data as? String) ?? "-")")
+            }
+            if !hasStartedPlaying,
+               let recovery = directAVNoFrameRecovery,
+               recovery.url == (curURL ?? url),
+               recovery.episodeGeneration == episodeSwitchGeneration,
+               recovery.sourceGeneration == sourceSwitchGeneration,
+               recovery.resumeGeneration == resumeRetryGeneration,
+               recovery.mpvLoadToken == loadToken,
+               loadToken == coordinator.player?.activeLoadToken {
+                loadTimeout?.cancel()
+                directAVNoFrameRecovery = nil
+                DiagnosticsLog.log("playback", "fallback attempt=\(recovery.attemptID) stage=mpv-terminal outcome=no-first-frame")
+                if currentPickWasExplicit {
+                    loadErrorMsg = "This source didn't produce playable media. Choose another source."
+                    presentTerminalLoadFailure()
+                    return
+                }
+                if currentPlaybackIsResume, !resumeSourceReresolved,
+                   retryResumeSameSource() { return }
+                if hopToNextSource(reason: "fallback MPV produced no frame") { return }
+                if loadErrorMsg.isEmpty { loadErrorMsg = "This source did not produce playable media." }
+                presentTerminalLoadFailure()
+                return
             }
             #endif
             if !hasStartedPlaying {                  // only flag failures BEFORE playback
@@ -3014,6 +3049,28 @@ struct PlayerScreen: View {
     ///    with the source list, rather than dropping to a 480p different source.
     ///  - Only the AUTO path (Watch Now / resume) hops to another source.
     private func handleStartTimeout() {
+        if let recovery = directAVNoFrameRecovery,
+           recovery.url == (curURL ?? url),
+           recovery.episodeGeneration == episodeSwitchGeneration,
+           recovery.sourceGeneration == sourceSwitchGeneration,
+           recovery.resumeGeneration == resumeRetryGeneration,
+           recovery.mpvLoadToken == coordinator.player?.activeLoadToken,
+           !isAVPlayerActive,
+           !hasStartedPlaying {
+            directAVNoFrameRecovery = nil
+            DiagnosticsLog.log("playback", "source attempt route=libmpv-after-avplayer attempt=\(recovery.attemptID) outcome=no-first-frame")
+            if currentPickWasExplicit {
+                loadErrorMsg = "This source didn't produce playable media. Choose another source."
+                presentTerminalLoadFailure()
+                return
+            }
+            if currentPlaybackIsResume, !resumeSourceReresolved,
+               retryResumeSameSource() { return }
+            if hopToNextSource(reason: "direct AVPlayer and libmpv produced no frame") { return }
+            if loadErrorMsg.isEmpty { loadErrorMsg = "This source did not produce playable media." }
+            presentTerminalLoadFailure()
+            return
+        }
         srcProbe("handleStartTimeout ENTER bufferGraceUsed=\(bufferGraceUsed)/\(maxBufferGraceExtensions) bufferedNow=\(String(format: "%.1f", bufferedTime)) bufferedAtArm=\(String(format: "%.1f", lastBufferedAtWatchdog))")
         // THE HANG: a cold torrent never emits an end-file error (mpv reconnect=1 keeps retrying the
         // peerless loopback URL), so it would buffer forever with no recovery. Warm it up instead of
@@ -3434,7 +3491,18 @@ struct PlayerScreen: View {
         guard let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return }
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
+        let reissueSourceGeneration = sourceSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
+        if !hasStartedPlaying {
+            directAVNoFrameRecovery = DirectAVNoFrameRecovery(
+                url: curURL ?? url,
+                episodeGeneration: reissueEpisodeGeneration,
+                sourceGeneration: reissueSourceGeneration,
+                resumeGeneration: reissueMediaGeneration,
+                attemptID: UUID().uuidString,
+                mpvLoadToken: nil)
+        }
+        let directFallbackAttempt = directAVNoFrameRecovery?.attemptID
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         let engineRequestedResume =
             retiringAVPlayer.pendingRequestedSourcePositionSeconds
@@ -3469,6 +3537,7 @@ struct PlayerScreen: View {
         let handoff = AVToMPVHandoff(
             url: curURL ?? url,
             episodeGeneration: reissueEpisodeGeneration,
+            sourceGeneration: reissueSourceGeneration,
             resumeGeneration: reissueMediaGeneration
         )
         avToMPVHandoff = handoff
@@ -3478,6 +3547,7 @@ struct PlayerScreen: View {
             guard !Task.isCancelled,
                   avToMPVHandoff == handoff,
                   handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
                   handoff.resumeGeneration == resumeRetryGeneration,
                   handoff.url == (curURL ?? url) else { return }
             guard VortXRemuxHandoffPolicy.canMountMPV(
@@ -3508,6 +3578,22 @@ struct PlayerScreen: View {
             guard !Task.isCancelled,
                   let mpv = mounted?.controller,
                   mpv.activeLoadToken == mounted?.token else { return }
+            if let recovery = directAVNoFrameRecovery,
+               recovery.url == handoff.url,
+               recovery.episodeGeneration == handoff.episodeGeneration,
+               recovery.sourceGeneration == handoff.sourceGeneration,
+               recovery.resumeGeneration == handoff.resumeGeneration {
+                directAVNoFrameRecovery = DirectAVNoFrameRecovery(
+                    url: recovery.url,
+                    episodeGeneration: recovery.episodeGeneration,
+                    sourceGeneration: recovery.sourceGeneration,
+                    resumeGeneration: recovery.resumeGeneration,
+                    attemptID: recovery.attemptID,
+                    mpvLoadToken: mounted?.token)
+            }
+            DiagnosticsLog.log(
+                "playback",
+                "fallback attempt=\(directFallbackAttempt ?? "mid-play") stage=mpv-load outcome=issued")
             if followedDeadInput {
                 startLoadTimeout(seconds: avPostDemoteStartTimeoutSeconds)
             } else {
@@ -3526,6 +3612,7 @@ struct PlayerScreen: View {
                   avToMPVHandoff == nil,
                   !avToMPVHandoffBlocked,
                   handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
                   handoff.resumeGeneration == resumeRetryGeneration,
                   handoff.url == (curURL ?? url) else { return nil }
             if let controller = coordinator.player as? MPVMetalViewController,
@@ -4069,6 +4156,7 @@ struct PlayerScreen: View {
             }
             resumeRetryGeneration &+= 1
         }
+        directAVNoFrameRecovery = nil
         srcProbe("switchStream -> host=\(newURL.host ?? "-") userInitiated=\(userInitiated) explicitPick=\(explicitPick) torrent=\(stream.isTorrent ? "Y" : "N")")
         if userInitiated { close() }
         // Cleanly destroy the torrent engine we're leaving BEFORE loading the next source, so engines never

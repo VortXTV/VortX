@@ -2102,13 +2102,13 @@ enum PlayerLiveContractTests {
 
         _ = spool.recordPlaylistGeneration(playlistID: "video-dv", resourceKeys: [], now: 130)
         _ = spool.recordPlaylistGeneration(playlistID: "video-hdr", resourceKeys: [], now: 131)
-        let protectedLease = spool.openResource(v1, now: 150.999)
+        let protectedLease = spool.openResource(v1, now: 146.999)
         check("retention lease: a response can acquire backing immediately before its exact deadline",
               protectedLease != nil)
-        spool.collectExpired(now: 152)
+        spool.collectExpired(now: 148)
         check("retention lease: expiry cannot delete a file beneath an active response",
-              spool.contains(v1) && spool.openResource(v1, now: 152) == nil)
-        protectedLease?.close(now: 152)
+              spool.contains(v1) && spool.openResource(v1, now: 148) == nil)
+        protectedLease?.close(now: 148)
         check("retention lease: terminal callback releases and reclaims an already-expired backing",
               !spool.contains(v1))
 
@@ -2167,6 +2167,33 @@ enum PlayerLiveContractTests {
                   now: .infinity) == nil
                   && nonfinite.playlistGenerationCount(playlistID: "finite") == 1
                   && nonfinite.retentionDeadline(for: finite) == nil)
+
+        guard let recentWindow = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 3,
+            chunkSize: 1,
+            scavengeStaleSessions: false) else {
+            check("retention window: recent-generation fixture is creatable", false)
+            return
+        }
+        let recentlyDeparted = VortXHLSSessionSpool.ResourceKey.video(segmentID: 90)
+        let historicalTail = VortXHLSSessionSpool.ResourceKey.video(segmentID: 91)
+        let windowFixture = recentWindow.spill([
+            .init(key: recentlyDeparted, data: Data([0x90]), durationMilliseconds: 1),
+            .init(key: historicalTail, data: Data([0x91]), durationMilliseconds: 300_000),
+        ])
+            && recentWindow.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: [recentlyDeparted, historicalTail], now: 0) != nil
+            && recentWindow.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: [recentlyDeparted], now: 1) != nil
+            && recentWindow.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: [], now: 3) != nil
+        check("retention window: fixture publishes an oversized start then a current one-millisecond window",
+              windowFixture)
+        check("retention window: departure uses the current small playlist, not an earlier 300-second startup window",
+              recentWindow.retentionDeadline(for: recentlyDeparted) == 3.002)
+        check("retention window: the oversized resource retains only for its own final delivery window",
+              recentWindow.retentionDeadline(for: historicalTail) == 601.001)
     }
 
     /// Scales the production C = 2W + O + H topology down to nine bytes so the real spool coordinator can
@@ -3385,12 +3412,12 @@ enum PlayerLiveContractTests {
         check("wiring: both AVPlayer demotions capture the engine-owned source target before stop",
               sourceContainsInOrder(playerScreenAVDemote, [
                 "pendingRequestedSourcePositionSeconds",
-                "coordinator.player?.stop()",
+                "let quiescence = retiringAVPlayer.stopForMPVFallback()",
                 "engineRequestedResume",
               ])
                   && sourceContainsInOrder(tvPlayerAVDemote, [
                     "pendingRequestedSourcePositionSeconds",
-                    "coordinator.player?.stop()",
+                    "let quiescence = retiringAVPlayer.stopForMPVFallback()",
                     "engineRequestedResume",
                   ]))
         let playerScreenDemotionUsesNewestEngineTarget = sourceContainsInOrder(

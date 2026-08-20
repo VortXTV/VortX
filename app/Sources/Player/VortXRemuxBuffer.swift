@@ -2300,7 +2300,10 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         let length: Int
         let segmentDurationMilliseconds: Int
         var containingPlaylists: Set<String> = []
-        var longestPlaylistDurationMilliseconds = 0
+        /// Longest playlist duration among the generations that most recently stopped naming this resource.
+        /// This is intentionally not a historical maximum: an oversized startup generation must not protect a
+        /// later sliding-window resource for the rest of the title.
+        var departurePlaylistDurationMilliseconds = 0
         var retentionDeadline: TimeInterval?
         var leaseCount = 0
     }
@@ -2308,6 +2311,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     private struct PlaylistState {
         var generation = 0
         var currentKeys: Set<ResourceKey> = []
+        /// Duration of this playlist's latest served generation. A removed resource is retained for the
+        /// generation that actually stopped naming it, not for the longest historical startup playlist.
+        var renderedDurationMilliseconds = 0
     }
 
     private final class LaunchRegistry: @unchecked Sendable {
@@ -3622,6 +3628,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             duration = sum
         }
         var state = playlists[playlistID] ?? PlaylistState()
+        let previousDuration = state.renderedDurationMilliseconds
         let nextKeys = Set(resourceKeys)
         let frontierChanged = state.currentKeys != nextKeys
         let removed = state.currentKeys.subtracting(nextKeys)
@@ -3629,22 +3636,30 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         guard !generationOverflow else { return nil }
         state.generation = nextGeneration
         state.currentKeys = nextKeys
+        state.renderedDurationMilliseconds = duration
 
         var updatedEntries = entries
         for key in nextKeys {
             guard var entry = updatedEntries[key] else { continue }
+            // Once a resource had fully departed and is named again, the old departure window belongs to the
+            // completed generation, not this new live interval.  Keeping it would let a large startup playlist
+            // inflate a later sliding window after the resource has been republished.
+            if entry.containingPlaylists.isEmpty {
+                entry.departurePlaylistDurationMilliseconds = 0
+            }
             entry.containingPlaylists.insert(playlistID)
-            entry.longestPlaylistDurationMilliseconds = max(
-                entry.longestPlaylistDurationMilliseconds, duration)
             entry.retentionDeadline = nil
             updatedEntries[key] = entry
         }
         for key in removed {
             guard var entry = updatedEntries[key] else { continue }
             entry.containingPlaylists.remove(playlistID)
+            entry.departurePlaylistDurationMilliseconds = max(
+                entry.departurePlaylistDurationMilliseconds,
+                previousDuration)
             if entry.containingPlaylists.isEmpty {
                 let (milliseconds, overflow) = entry.segmentDurationMilliseconds
-                    .addingReportingOverflow(entry.longestPlaylistDurationMilliseconds)
+                    .addingReportingOverflow(entry.departurePlaylistDurationMilliseconds)
                 guard !overflow else { return nil }
                 let interval = Double(milliseconds) / 1_000
                 let deadline = now + interval

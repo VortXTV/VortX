@@ -106,6 +106,10 @@ final class VortXEngineHost: @unchecked Sendable {
     private var lifecycleEpoch: UInt64 = 0
     private var boundPortStorage: UInt16 = 0
     private var sessions: [String: HostedSession] = [:]
+    /// Completed teardown acknowledgements make a repeated authenticated DELETE idempotent without pretending
+    /// that a freshly-created session with the same id exists.  Session ids are UUIDs; cap retained receipts
+    /// so a busy host cannot grow this bookkeeping without bound.
+    private var completedTeardowns: [String: VortXEngineProtocol.TeardownReceipt] = [:]
     private var pairing = VortXEnginePairingState()
     private var activityToken: NSObjectProtocol?
     private var reaper: DispatchSourceTimer?
@@ -141,19 +145,24 @@ final class VortXEngineHost: @unchecked Sendable {
 
     private final class HostedSession {
         let id: String
+        let mountGeneration: String
         let capability: String
         let server: VortXRemuxHLSServer
         let retainsFullTimeline: Bool
         var lastContact: TimeInterval
         var readyMarked = false
+        var teardownRequested = false
+        let quiescence: VortXRemuxQuiescenceReceipt
 
-        init(id: String, capability: String, server: VortXRemuxHLSServer,
+        init(id: String, mountGeneration: String, capability: String, server: VortXRemuxHLSServer,
              retainsFullTimeline: Bool, now: TimeInterval) {
             self.id = id
+            self.mountGeneration = mountGeneration
             self.capability = capability
             self.server = server
             self.retainsFullTimeline = retainsFullTimeline
             self.lastContact = now
+            self.quiescence = server.quiescenceReceipt()
         }
     }
 
@@ -693,7 +702,7 @@ final class VortXEngineHost: @unchecked Sendable {
             switch (request.method, verb) {
             case ("GET", "status"):  handleStatus(connection, id: id, now: now, markReady: false)
             case ("POST", "ready"):  handleStatus(connection, id: id, now: now, markReady: true)
-            case ("DELETE", ""):     handleTeardown(connection, id: id)
+            case ("DELETE", ""):     handleTeardown(connection, id: id, body: body)
             default:
                 reply(connection, status: "405 Method Not Allowed",
                       body: VortXEngineProtocol.ErrorBody(error: "method", detail: nil))
@@ -798,7 +807,9 @@ final class VortXEngineHost: @unchecked Sendable {
         // a sliding window, and the client must keep clamping backward seeks in that case.
         let granted = mounted.server.retainsFullTimeline
         let id = UUID().uuidString.lowercased()
-        let session = HostedSession(id: id, capability: capability, server: mounted.server,
+        let mountGeneration = UUID().uuidString.lowercased()
+        let session = HostedSession(id: id, mountGeneration: mountGeneration,
+                                    capability: capability, server: mounted.server,
                                     retainsFullTimeline: granted, now: now)
         // Commit and start in the same serialized lifecycle operation, but never start the producer while
         // holding the host state lock. A stop requested before this operation changes the epoch and rejects it;
@@ -830,6 +841,7 @@ final class VortXEngineHost: @unchecked Sendable {
             "session \(id) hosting \(request.mode.rawValue) on media port \(mounted.server.port) retain=\(granted)\(wantsRetention && !granted ? " (requested but disk declined)" : "")")
         reply(connection, status: "200 OK", body: VortXEngineProtocol.SessionResponse(
             sessionID: id,
+            mountGeneration: mountGeneration,
             mediaPort: Int(mounted.server.port),
             mediaPath: mounted.server.mountResourcePath,
             retainsFullTimeline: granted))
@@ -875,14 +887,88 @@ final class VortXEngineHost: @unchecked Sendable {
             producedEdgeSeconds: session.server.producedEdgeSeconds))
     }
 
-    private func handleTeardown(_ connection: NWConnection, id: String) {
+    private func handleTeardown(_ connection: NWConnection, id: String, body: Data) {
+        guard let request = try? JSONDecoder().decode(VortXEngineProtocol.TeardownRequest.self, from: body),
+              request.version == VortXEngineProtocol.TeardownRequest.currentVersion,
+              request.sessionID == id else {
+            reply(connection, status: "400 Bad Request", body: VortXEngineProtocol.ErrorBody(
+                error: "malformed_teardown", detail: nil))
+            return
+        }
+
         stateLock.lock()
-        let session = sessions.removeValue(forKey: id)
+        if let completed = completedTeardowns[id] {
+            stateLock.unlock()
+            guard completed.mountGeneration == request.mountGeneration else {
+                reply(connection, status: "409 Conflict", body: VortXEngineProtocol.ErrorBody(
+                    error: "stale_mount", detail: nil))
+                return
+            }
+            reply(connection, status: "200 OK", body: completed)
+            return
+        }
+        guard let session = sessions[id] else {
+            stateLock.unlock()
+            reply(connection, status: "404 Not Found", body: VortXEngineProtocol.ErrorBody(
+                error: "no_session", detail: nil))
+            return
+        }
+        guard session.mountGeneration == request.mountGeneration else {
+            stateLock.unlock()
+            reply(connection, status: "409 Conflict", body: VortXEngineProtocol.ErrorBody(
+                error: "stale_mount", detail: nil))
+            return
+        }
+        let firstRequest = !session.teardownRequested
+        session.teardownRequested = true
         stateLock.unlock()
-        session?.server.invalidate()
-        if session != nil { DiagnosticsLog.log("enginehost", "session \(id) torn down by client") }
-        releaseActivityIfIdle()
-        reply(connection, status: "200 OK", body: VortXEngineProtocol.ErrorBody(error: "ok", detail: nil))
+
+        // Keep the session registered until its real terminal edge.  Removing it first would make a 200 mean
+        // only “cancellation was requested”, which is exactly the AV→MPV race this receipt exists to prevent.
+        if firstRequest { session.server.invalidate() }
+        Task.detached(priority: .userInitiated) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            // Leave delivery headroom inside the client's three-second request deadline.  A timeout retains the
+            // session, so a subsequent identical request can still receive a genuine receipt when it unwinds.
+            let quiescent = await session.quiescence.wait(timeout: .seconds(2))
+            guard quiescent else {
+                self.reply(connection, status: "504 Gateway Timeout", body: VortXEngineProtocol.ErrorBody(
+                    error: "teardown_timeout", detail: nil))
+                return
+            }
+            let receipt = VortXEngineProtocol.TeardownReceipt(
+                version: VortXEngineProtocol.TeardownRequest.currentVersion,
+                sessionID: id,
+                mountGeneration: request.mountGeneration,
+                producerQuiescent: true)
+            self.stateLock.lock()
+            let stillCurrent = self.sessions[id] === session
+                && session.mountGeneration == request.mountGeneration
+            if stillCurrent {
+                self.sessions.removeValue(forKey: id)
+                if self.completedTeardowns.count >= 64,
+                   let oldest = self.completedTeardowns.keys.sorted().first {
+                    self.completedTeardowns.removeValue(forKey: oldest)
+                }
+                self.completedTeardowns[id] = receipt
+            }
+            self.stateLock.unlock()
+            if !stillCurrent {
+                self.stateLock.lock()
+                let completed = self.completedTeardowns[id]
+                self.stateLock.unlock()
+                if let completed, completed.mountGeneration == request.mountGeneration {
+                    self.reply(connection, status: "200 OK", body: completed)
+                    return
+                }
+                self.reply(connection, status: "409 Conflict", body: VortXEngineProtocol.ErrorBody(
+                    error: "stale_mount", detail: nil))
+                return
+            }
+            self.releaseActivityIfIdle()
+            DiagnosticsLog.log("enginehost", "session \(id) teardown acknowledged after producer unwind")
+            self.reply(connection, status: "200 OK", body: receipt)
+        }
     }
 
     // MARK: - Replies

@@ -2029,10 +2029,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     /// Retire this AVFoundation route for a same-source mpv fallback. The returned receipt stays valid after
-    /// `stop()` clears the server reference and acknowledges only when any local remux producer has unwound.
+    /// `stop()` clears references and acknowledges only when EVERY retiring input producer has unwound.
     func stopForMPVFallback() -> VortXRemuxQuiescenceReceipt {
-        let receipt = remuxHLSServer?.quiescenceReceipt()
-            ?? VortXRemuxQuiescenceReceipt(terminal: nil)
+        var receipts: [VortXRemuxQuiescenceReceipt] = []
+        if let server = remuxHLSServer { receipts.append(server.quiescenceReceipt()) }
+        if let loader = remuxLoader { receipts.append(loader.quiescenceReceipt()) }
+        if let remote = remuxRemoteMount { receipts.append(remote.quiescenceReceipt()) }
+        let receipt = VortXRemuxQuiescenceReceipt.all(receipts)
         stop()
         return receipt
     }

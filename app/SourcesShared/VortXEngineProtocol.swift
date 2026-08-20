@@ -227,6 +227,9 @@ enum VortXEngineProtocol {
 
     struct SessionResponse: Codable, Sendable, Equatable {
         let sessionID: String
+        /// Opaque, host-issued generation for this exact mount.  A session id alone is not enough to safely
+        /// acknowledge teardown after a delayed request or a host restart.
+        let mountGeneration: String
         /// The port the MEDIA is served on. Distinct from the control port: each session's remux server binds
         /// its own OS-assigned ephemeral port.
         let mediaPort: Int
@@ -240,6 +243,43 @@ enum VortXEngineProtocol {
         /// Whether the host actually granted full-timeline retention. False means the client must keep clamping
         /// backward seeks exactly as it does on-device.
         let retainsFullTimeline: Bool
+    }
+
+    /// Additive teardown handshake.  The protocol major remains compatible; a client that requires this
+    /// receipt refuses an older host rather than treating a successful DELETE as proof of producer unwind.
+    struct TeardownRequest: Codable, Sendable, Equatable {
+        static let currentVersion = 1
+        let version: Int
+        let sessionID: String
+        let mountGeneration: String
+
+        init(sessionID: String, mountGeneration: String) {
+            self.version = Self.currentVersion
+            self.sessionID = sessionID
+            self.mountGeneration = mountGeneration
+        }
+    }
+
+    struct TeardownReceipt: Codable, Sendable, Equatable {
+        let version: Int
+        let sessionID: String
+        let mountGeneration: String
+        /// True only after the host's producer terminal edge released its input/network resources.
+        let producerQuiescent: Bool
+    }
+
+    /// A receipt is a capability to continue the same source in MPV, not merely a successful HTTP result.
+    /// Keep the comparison centralized so every client rejects old, cross-session, cross-mount, and incomplete
+    /// replies identically.
+    static func acceptsTeardownReceipt(
+        _ receipt: TeardownReceipt?,
+        for request: TeardownRequest
+    ) -> Bool {
+        guard let receipt else { return false }
+        return receipt.version == TeardownRequest.currentVersion
+            && receipt.producerQuiescent
+            && receipt.sessionID == request.sessionID
+            && receipt.mountGeneration == request.mountGeneration
     }
 
     // MARK: - Session status

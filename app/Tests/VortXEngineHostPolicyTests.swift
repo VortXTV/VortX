@@ -450,13 +450,16 @@ check("readiness: an older healthy host remains compatible",
         statusReceived: true, healthy: true, initPublished: nil, failed: nil,
         signalingPublished: true, deadlineExpired: false) == .ready)
 
-let mountA = P.RemoteMountIdentity(sessionID: "session-a", playlistURL: "http://mac/a/master.m3u8")
-let mountACopy = P.RemoteMountIdentity(sessionID: "session-a", playlistURL: "http://mac/a/master.m3u8")
-let mountB = P.RemoteMountIdentity(sessionID: "session-b", playlistURL: "http://mac/b/master.m3u8")
+let mountA = P.RemoteMountIdentity(sessionID: "session-a", mountGeneration: "generation-a", playlistURL: "http://mac/a/master.m3u8")
+let mountACopy = P.RemoteMountIdentity(sessionID: "session-a", mountGeneration: "generation-a", playlistURL: "http://mac/a/master.m3u8")
+let mountB = P.RemoteMountIdentity(sessionID: "session-b", mountGeneration: "generation-b", playlistURL: "http://mac/b/master.m3u8")
+let mountStaleGeneration = P.RemoteMountIdentity(sessionID: "session-a", mountGeneration: "generation-old", playlistURL: "http://mac/a/master.m3u8")
 check("identity: an exact session and playlist receipt matches",
       P.readinessReceiptMatches(expected: mountA, received: mountACopy))
 check("identity: a different hosted session cannot attach",
       !P.readinessReceiptMatches(expected: mountA, received: mountB))
+check("identity: a stale mount generation cannot acknowledge a replacement",
+      !P.readinessReceiptMatches(expected: mountA, received: mountStaleGeneration))
 
 check("callback ownership: the exact current mount is accepted",
       P.remoteCallbackIsCurrent(

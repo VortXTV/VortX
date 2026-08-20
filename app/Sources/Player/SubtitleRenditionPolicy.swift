@@ -901,15 +901,32 @@ enum SubtitleRenditionPolicy {
     /// is the identity, but stating it is what makes that explicit to the player rather than assumed.
     /// A cue-less segment still produces a valid document with a header and no cues, which is what a stretch
     /// of film with no dialogue must serve.
-    static func webVTTDocument(cues: [Cue]) -> String {
-        var lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"]
+    /// Renders a self-contained HLS WebVTT segment. Timings are local to the supplied video segment and the
+    /// timestamp map carries their absolute media position. Without this map AVFoundation can retain a cue
+    /// from the previous sliding segment and render its overlapping copy as a second native subtitle.
+    static func webVTTDocument(cues: [Cue], segmentStart: Double? = nil,
+                               segmentEnd: Double? = nil) -> String {
+        let origin = segmentStart.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        let endBoundary: Double? = segmentEnd.flatMap { end in
+            guard end.isFinite, end >= 0, origin.map({ end >= $0 }) ?? true else { return nil }
+            return end
+        }
+        let mpegTimestamp: Int64 = origin.map { seconds in
+            let ticks = (seconds * 90_000).rounded()
+            guard ticks.isFinite, ticks >= 0, ticks <= Double(Int64.max) else { return 0 }
+            return Int64(ticks)
+        } ?? 0
+        var lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:\(mpegTimestamp),LOCAL:00:00:00.000"]
         for cue in cues {
             // A zero-or-negative-length cue is not displayable and some parsers reject the whole document
             // over one, so it is skipped here as a last line of defence even though `cue(payload:...)`
             // already enforces a minimum length.
-            guard cue.end > cue.start else { continue }
+            let start = origin.map { max(0, cue.start - $0) } ?? cue.start
+            let absoluteEnd = endBoundary.map { min(cue.end, $0) } ?? cue.end
+            let end = origin.map { absoluteEnd - $0 } ?? absoluteEnd
+            guard end > start else { continue }
             lines.append("")
-            lines.append("\(timestamp(cue.start)) --> \(timestamp(cue.end))")
+            lines.append("\(timestamp(start)) --> \(timestamp(end))")
             lines.append(cue.text)
         }
         lines.append("")
