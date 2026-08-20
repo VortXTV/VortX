@@ -30,9 +30,16 @@ static int64_t now_ms(void) {
   return ((int64_t) ts.tv_sec * 1000) + ts.tv_nsec / 1000000;
 }
 
-static void set_text(char **target, const char *text) {
+static int set_text(char **target, const char *text) {
   free(*target);
-  *target = text ? strdup(text) : NULL;
+  *target = NULL;
+  if (text == NULL) return 1;
+  size_t length = strlen(text);
+  char *copy = malloc(length + 1);
+  if (copy == NULL) return 0;
+  memcpy(copy, text, length + 1);
+  *target = copy;
+  return 1;
 }
 
 /* JNI's GetStringUTFChars is modified UTF-8. Providers are ordinary UTF-8, including emoji/NUL, so
@@ -195,7 +202,11 @@ static JSValue complete_failure(JSContext *ctx, JSValueConst this_val, int argc,
 static char *exception_text(JSContext *ctx) {
   JSValue exception = JS_GetException(ctx);
   const char *text = JS_ToCString(ctx, exception);
-  char *copy = text ? strdup(text) : strdup("JavaScript execution failed");
+  const char *fallback = "JavaScript execution failed";
+  const char *source = text ? text : fallback;
+  size_t length = strlen(source);
+  char *copy = malloc(length + 1);
+  if (copy != NULL) memcpy(copy, source, length + 1);
   if (text) JS_FreeCString(ctx, text);
   JS_FreeValue(ctx, exception);
   return copy;
@@ -213,18 +224,24 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   char *settings = utf8_from_java(env, settings_json, &settings_length);
   if (source == NULL || tmdb == NULL || media == NULL || settings == NULL) { const char *failure = "{\"ok\":false,\"error\":\"Invalid input\"}"; free(source); free(tmdb); free(media); free(settings); return java_from_utf8(env, failure, strlen(failure)); }
   RunState state = {0};
-  (*env)->GetJavaVM(env, &state.vm);
+  if ((*env)->GetJavaVM(env, &state.vm) != JNI_OK) {
+    free(source); free(tmdb); free(media); free(settings);
+    { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
+  }
   state.host = (*env)->NewGlobalRef(env, host);
   jclass host_class = (*env)->GetObjectClass(env, host);
-  state.fetch = (*env)->GetMethodID(env, host_class, "fetch", "(Ljava/lang/String;Ljava/lang/String;J)Ljava/lang/String;");
-  state.is_cancelled = (*env)->GetMethodID(env, host_class, "isCancelled", "()Z");
-  (*env)->DeleteLocalRef(env, host_class);
+  if (state.host != NULL && host_class != NULL) {
+    state.fetch = (*env)->GetMethodID(env, host_class, "fetch", "(Ljava/lang/String;Ljava/lang/String;J)Ljava/lang/String;");
+    state.is_cancelled = (*env)->GetMethodID(env, host_class, "isCancelled", "()Z");
+  }
+  if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+  if (host_class != NULL) (*env)->DeleteLocalRef(env, host_class);
   state.deadline_ms = now_ms() + timeout_ms;
   JSRuntime *runtime = JS_NewRuntime();
   JSContext *context = runtime ? JS_NewContext(runtime) : NULL;
   if (runtime == NULL || context == NULL || state.fetch == NULL || state.is_cancelled == NULL) {
     if (context) JS_FreeContext(context); if (runtime) JS_FreeRuntime(runtime);
-    (*env)->DeleteGlobalRef(env, state.host);
+    if (state.host != NULL) (*env)->DeleteGlobalRef(env, state.host);
     free(source); free(tmdb); free(media); free(settings);
     { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
   }
@@ -237,10 +254,17 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
   JS_SetPropertyStr(context, global, "__vortx_complete", JS_NewCFunction(context, complete_success, "__vortx_complete", 1));
   JS_SetPropertyStr(context, global, "__vortx_fail", JS_NewCFunction(context, complete_failure, "__vortx_fail", 1));
   JS_FreeValue(context, global);
+  if (source_length > SIZE_MAX - 5000 || tmdb_length > SIZE_MAX - source_length - 5000 ||
+      media_length > SIZE_MAX - source_length - tmdb_length - 5000 ||
+      settings_length > SIZE_MAX - source_length - tmdb_length - media_length - 5000) {
+    JS_FreeContext(context); JS_FreeRuntime(runtime); (*env)->DeleteGlobalRef(env, state.host);
+    free(source); free(tmdb); free(media); free(settings);
+    { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
+  }
   size_t wrapper_size = source_length + tmdb_length + media_length + settings_length + 5000;
   char *wrapper = malloc(wrapper_size);
   if (wrapper == NULL) {
-    JS_FreeContext(context); JS_FreeRuntime(runtime); (*env)->DeleteGlobalRef(env, state.host);
+    JS_FreeContext(context); JS_FreeRuntime(runtime); if (state.host != NULL) (*env)->DeleteGlobalRef(env, state.host);
     free(source); free(tmdb); free(media); free(settings);
     { const char *failure = "{\"ok\":false,\"error\":\"Runtime unavailable\"}"; return java_from_utf8(env, failure, strlen(failure)); }
   }
@@ -249,16 +273,25 @@ Java_com_vortx_android_communityjs_CommunityJsNative_evaluate(
     settings, source, tmdb, media, season, episode);
   JSValue eval = JS_Eval(context, wrapper, strlen(wrapper), "community-provider.js", JS_EVAL_TYPE_GLOBAL);
   free(wrapper);
-  if (JS_IsException(eval)) set_text(&state.error, exception_text(context));
+  if (JS_IsException(eval)) {
+    char *message = exception_text(context);
+    if (message == NULL || !set_text(&state.error, message)) set_text(&state.error, "JavaScript execution failed");
+    free(message);
+  }
   JS_FreeValue(context, eval);
   while (state.error == NULL && state.result == NULL && now_ms() <= state.deadline_ms) {
     JSContext *job_context = NULL;
     int pending = JS_ExecutePendingJob(runtime, &job_context);
-    if (pending < 0) { set_text(&state.error, exception_text(job_context ? job_context : context)); break; }
+    if (pending < 0) {
+      char *message = exception_text(job_context ? job_context : context);
+      if (message == NULL || !set_text(&state.error, message)) set_text(&state.error, "JavaScript execution failed");
+      free(message);
+      break;
+    }
     if (pending == 0) break;
   }
   jstring result = envelope(env, state.result != NULL, state.result ? state.result : "");
-  free(state.result); free(state.error); JS_FreeContext(context); JS_FreeRuntime(runtime); (*env)->DeleteGlobalRef(env, state.host);
+  free(state.result); free(state.error); JS_FreeContext(context); JS_FreeRuntime(runtime); if (state.host != NULL) (*env)->DeleteGlobalRef(env, state.host);
   free(source); free(tmdb); free(media); free(settings);
   return result;
 }

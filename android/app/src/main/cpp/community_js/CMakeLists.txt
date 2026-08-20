@@ -28,3 +28,6 @@ add_library(vortx_community_js SHARED vortx_community_js.c)
 target_include_directories(vortx_community_js PRIVATE ${quickjs_source_SOURCE_DIR})
 target_link_libraries(vortx_community_js quickjs_runtime log m)
 target_compile_options(vortx_community_js PRIVATE -fvisibility=hidden -fstack-protector-strong)
+# The interpreter is an implementation detail. Keep only the Android loader entry point in the dynamic
+# symbol table so no other process component can bind an unintended QuickJS surface.
+target_link_options(vortx_community_js PRIVATE "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map")

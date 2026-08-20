@@ -141,6 +141,7 @@
             android:name=".communityjs.CommunityJsBrokerService"
             android:exported="false"
             android:isolatedProcess="true"
+            android:process=":communityjs"
             android:directBootAware="false" />
 
         <!-- #132 auto-recovery: resume a download parked by a locked-write failure once the user unlocks.

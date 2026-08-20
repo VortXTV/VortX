@@ -68,6 +68,7 @@ android {
         applicationId = "com.vortx.android"
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 187
         versionName = "0.3.14"
 
@@ -320,6 +321,8 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.json.jvm)
     testImplementation(libs.kotlinx.coroutines.test)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }
 
 // =====================================================================================================
