@@ -302,6 +302,7 @@ object SettingsBackup {
         app: String = "VortX",
         activeId: String? = null,
         deviceSettings: Map<String, Any> = emptyMap(),
+        removedDeviceSettings: Set<String> = emptySet(),
         now: Date = Date(),
     ): String? {
         if (roster.isEmpty()) return null                       // never-zero
@@ -319,6 +320,12 @@ object SettingsBackup {
         // key it does not carry at the account's value, so a device missing a setting never wipes the account's
         // copy (the same asymmetric read-merge Apple's `mergedSyncBlob` / `apiKeys` use). Roster keys are written
         // AFTER this, so they always win their own slots; [deviceSettings] never carries a roster key.
+        // A missing key has historically meant "this client does not own this value", so it remains a
+        // no-op.  An entry in [removedDeviceSettings], however, is a ledger-backed explicit user clear:
+        // remove only those known-syncable keys from the carried domain so a stale peer cannot resurrect it.
+        for (key in removedDeviceSettings) {
+            if (key in SYNCABLE_SETTING_TYPES && isSyncable(key)) base.remove(key)
+        }
         base.putAll(deviceSettings)
 
         // The roster rides as plist DATA of UTF-8 JSON, matching JSONEncoder().encode(profiles) on Apple.
@@ -427,9 +434,13 @@ object SettingsBackup {
      * Apple's `Double` UserDefaults storage; a STRING_SET is emitted as a sorted plist ARRAY (Apple stores an
      * array), so both directions stay deterministic.
      */
-    fun plistSettingsFrom(all: Map<String, *>): Map<String, Any> {
+    fun plistSettingsFrom(
+        all: Map<String, *>,
+        includeOnly: Set<String>? = null,
+    ): Map<String, Any> {
         val out = LinkedHashMap<String, Any>()
         for ((key, type) in SYNCABLE_SETTING_TYPES) {
+            if (includeOnly != null && key !in includeOnly) continue
             if (!isSyncable(key)) continue
             val raw = all[key] ?: continue
             val encoded: Any = when (type) {

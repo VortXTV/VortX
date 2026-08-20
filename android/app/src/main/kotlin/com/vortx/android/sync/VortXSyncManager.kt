@@ -685,6 +685,8 @@ class VortXSyncManager(context: Context) {
      */
     private val settingsPrefs: SharedPreferences =
         appContext.getSharedPreferences(SETTINGS_PREFS_FILE, Context.MODE_PRIVATE)
+    /** Per-account value/clear records for the settings blob; see [SettingsSyncLedger]. */
+    private val settingsLedger = SettingsSyncLedger(appContext)
     private val debridKeys = DebridKeys(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
@@ -722,6 +724,19 @@ class VortXSyncManager(context: Context) {
      * still fire, so [requestSyncSoon] hard-gates on this flag exactly like Apple's `isApplyingRemote`.
      */
     @Volatile private var applyingRemote = false
+
+    private val settingsChangeListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key != null && !applyingRemote && key in SettingsBackup.SYNCABLE_SETTING_TYPES) {
+            captureSyncLease()?.let { lease ->
+                settingsLedger.recordLocal(lease.accountId, key, prefs.contains(key))
+                requestSyncSoon()
+            }
+        }
+    }
+
+    init {
+        settingsPrefs.registerOnSharedPreferenceChangeListener(settingsChangeListener)
+    }
 
     private val session: Session? get() = sessionState.value
 
@@ -1423,7 +1438,9 @@ class VortXSyncManager(context: Context) {
         if (!isSyncLeaseCurrent(lease)) return false
         val initial = mergeLocalIntoDoc(lease) ?: return false    // failed pull: never overwrite the account doc
         if (!isSyncLeaseCurrent(lease)) return false
-        return pushDerivedDoc(lease, initial) { mergeLocalIntoDoc(lease) }
+        val accepted = pushDerivedDoc(lease, initial) { mergeLocalIntoDoc(lease) }
+        if (accepted && isSyncLeaseCurrent(lease)) settingsLedger.acknowledgePublished(lease.accountId)
+        return accepted
     }
 
     /**
@@ -1451,6 +1468,11 @@ class VortXSyncManager(context: Context) {
         // ProfileStore is a main-thread store (mirroring Apple's @MainActor); fold + build on Main.
         val published = withContext(Dispatchers.Main) {
             publishIfSyncLeaseCurrent(lease) {
+                settingsLedger.establishBaseline(lease.accountId, settingsPrefs.all)
+                val remoteSettings = settingsLedger.decodeDocument(
+                    doc.optJSONObject("vortx")?.optJSONObject(SETTINGS_LEDGER_KEY),
+                )
+                val settingsMerge = settingsLedger.mergeRemote(lease.accountId, remoteSettings)
                 // UNION the cloud roster into the local one first (never shrinks local), so the block we push
                 // already carries both sides; a cloud-only profile survives the round-trip. Fold under the
                 // remote-apply flag so this union does not self-arm a push.
@@ -1466,6 +1488,17 @@ class VortXSyncManager(context: Context) {
                     resolvedRoster.roster?.let {
                         if (it.isNotEmpty()) store.mergeInRoster(it, resolvedRoster.modifiedSeconds)
                     }
+                    // A peer state record can win only when this device has no dirty local edit. Apply it
+                    // before rebuilding the settings carrier so a retry never re-publishes the older value.
+                    if (settingsMerge.applyRemote.isNotEmpty()) {
+                        applyDeviceSettings(
+                            blob = doc.opt("settings"),
+                            allowedKeys = settingsMerge.applyRemote,
+                            clearedKeys = remoteSettings
+                                .filter { (key, stamp) -> key in settingsMerge.applyRemote && stamp.tombstone }
+                                .keys,
+                        )
+                    }
                 } finally {
                     applyingRemote = false
                 }
@@ -1474,12 +1507,18 @@ class VortXSyncManager(context: Context) {
                     roster = store.profiles,
                     rosterModifiedSeconds = store.rosterModified,
                     bundleId = settingsBundleId,
-                    // gap 1: carry this device's syncable GLOBAL app settings (theme, subtitle style, player
-                    // toggles, home/discover layout, ...) on the SAME channel + keys Apple uses. Local-wins,
-                    // never-delete: only keys this device holds are set; a key it lacks keeps the account's value.
-                    deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
+                    // Only dirty local keys overlay the pulled domain. Explicit clears are carried by the
+                    // ledger and remove the corresponding plist entry rather than masquerading as absence.
+                    deviceSettings = SettingsBackup.plistSettingsFrom(
+                        settingsPrefs.all,
+                        includeOnly = settingsMerge.publishValues,
+                    ),
+                    removedDeviceSettings = settingsMerge.publishTombstones,
                 )?.let { doc.put("settings", it) }
-                doc.put("vortx", VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx")))
+                VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx")).also { vortx ->
+                    vortx.put(SETTINGS_LEDGER_KEY, settingsLedger.encodeForDocument(lease.accountId))
+                    doc.put("vortx", vortx)
+                }
                 // gap 2: mirror this device's connected-service (debrid) keys on doc.apiKeys, read-merge +
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
@@ -1495,11 +1534,17 @@ class VortXSyncManager(context: Context) {
      * Apple's never-wipe restore). Must run inside syncDown's apply window (applyingRemote true) so these
      * SharedPreferences writes cannot arm a self-echo push. Returns true when at least one setting was applied.
      */
-    private fun applyDeviceSettings(blob: Any?): Boolean {
+    private fun applyDeviceSettings(
+        blob: Any?,
+        allowedKeys: Set<String>? = null,
+        clearedKeys: Set<String> = emptySet(),
+    ): Boolean {
         val settings = SettingsBackup.settingsFromBlob(blob) ?: return false
-        if (settings.isEmpty()) return false
+        if (settings.isEmpty() && clearedKeys.isEmpty()) return false
         val editor = settingsPrefs.edit()
+        var changed = false
         for ((key, value) in settings) {
+            if (allowedKeys != null && key !in allowedKeys) continue
             when (value) {
                 is SettingsBackup.BackupValue.Bool -> editor.putBoolean(key, value.value)
                 is SettingsBackup.BackupValue.IntValue -> editor.putInt(key, value.value)
@@ -1508,9 +1553,16 @@ class VortXSyncManager(context: Context) {
                 is SettingsBackup.BackupValue.Str -> editor.putString(key, value.value)
                 is SettingsBackup.BackupValue.StrSet -> editor.putStringSet(key, value.value)
             }
+            changed = true
         }
-        editor.apply()
-        return true
+        for (key in clearedKeys) {
+            if (allowedKeys == null || key in allowedKeys) {
+                editor.remove(key)
+                changed = true
+            }
+        }
+        if (changed) editor.apply()
+        return changed
     }
 
     /**
@@ -1583,6 +1635,21 @@ class VortXSyncManager(context: Context) {
             fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
             fallbackIsLossless = parsed.rosterIsLossless,
         )
+        val hasSettingsLedger = doc.optJSONObject("vortx")?.has(SETTINGS_LEDGER_KEY) == true
+        val remoteSettings = settingsLedger.decodeDocument(
+            doc.optJSONObject("vortx")?.optJSONObject(SETTINGS_LEDGER_KEY),
+        )
+        val settingsMerge = if (hasSettingsLedger) {
+            settingsLedger.mergeRemote(lease.accountId, remoteSettings)
+        } else {
+            // Older Apple/web/Android documents predate the ledger. Preserve their established
+            // set-only restore behaviour; no missing key is interpreted as a tombstone.
+            SettingsSyncLedger.MergeResult(
+                applyRemote = SettingsBackup.SYNCABLE_SETTING_TYPES.keys,
+                publishValues = emptySet(),
+                publishTombstones = emptySet(),
+            )
+        }
         var restored = false
         val published = withContext(Dispatchers.Main) {
             val store = resolveStore() ?: return@withContext false
@@ -1616,7 +1683,14 @@ class VortXSyncManager(context: Context) {
                     // gap 1: adopt the account's GLOBAL app settings (theme, subtitle style, player toggles,
                     // home/discover layout, ...). Never-wipe: only keys the blob carries are written; a key it
                     // omits keeps this device's own value. Under applyingRemote so these writes never arm a push.
-                    if (applyDeviceSettings(doc.opt("settings"))) restored = true
+                    if (applyDeviceSettings(
+                            blob = doc.opt("settings"),
+                            allowedKeys = settingsMerge.applyRemote,
+                            clearedKeys = remoteSettings
+                                .filter { (key, stamp) -> key in settingsMerge.applyRemote && stamp.tombstone }
+                                .keys,
+                        )
+                    ) restored = true
                 } finally {
                     applyingRemote = false
                 }
@@ -2121,5 +2195,6 @@ class VortXSyncManager(context: Context) {
          * here rather than reaching into one store's private constant; every settings store names the same file.
          */
         private const val SETTINGS_PREFS_FILE = "vortx_settings"
+        private const val SETTINGS_LEDGER_KEY = "settingsRevisions"
     }
 }

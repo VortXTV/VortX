@@ -450,6 +450,32 @@ class SettingsBackupInteropTest {
         assertEquals(listOf("one", "two"), rawRebuilt["vortx.future.setting"])
     }
 
+    @Test
+    fun ledgerBackedClearRemovesOnlyTheExplicitSyncableSetting() {
+        val original = blobFromDomain(
+            linkedMapOf(
+                "stremiox.theme.oled" to true,
+                "vortx.future.setting" to "foreign-value",
+                SettingsBackup.ROSTER_KEY to UserProfile.encodeRoster(listOf(profile(name = "Cloud")))
+                    .toByteArray(Charsets.UTF_8),
+                SettingsBackup.MODIFIED_KEY to 1.0,
+            ),
+        )
+
+        val rebuilt = SettingsBackup.settingsBlobFor(
+            pulledBlob = original,
+            roster = listOf(profile(name = "Local")),
+            rosterModifiedSeconds = 2.0,
+            bundleId = "com.vortx.android",
+            removedDeviceSettings = setOf("stremiox.theme.oled", "vortx.future.setting"),
+            now = Date(0L),
+        )
+
+        val domain = rawDomain(rebuilt)
+        assertFalse(domain.containsKey("stremiox.theme.oled"))
+        assertEquals("foreign-value", domain["vortx.future.setting"])
+    }
+
     private fun blobFromDomain(domain: Map<String, Any>): String {
         val bytes = SettingsBackup.encode(
             domain = domain,
