@@ -8,6 +8,8 @@ const STAGED_TAG_PREFIX = "staged:tag:";
 const ROLLBACK_PREFIX = "rollback:";
 const AUDIT_PREFIX = "audit:";
 const QUARANTINE_PREFIX = "quarantine:legacy:";
+const OPERATION_PREFIX = "operation:";
+const ROLLED_BACK_PREFIX = "rolled-back:";
 const ARTIFACT_SCHEMA = 2;
 const MAX_BODY_BYTES = 1_048_576;
 const MAX_PUBLIC_AGE = 120;
@@ -317,7 +319,9 @@ export class FeedCoordinator {
       if (payload.action === "repair") {
         if (current) return failure(409, "repair-active-exists", "integrity repair is only allowed when no durable active receipt exists");
         if (payload.repairReason !== "integrity-repair") return failure(400, "repair-contract", "integrity repair requires the exact repair reason");
-        if (!this.env.LEGACY_REPAIR_GENERATION || payload.expectedLegacyGeneration !== this.env.LEGACY_REPAIR_GENERATION || payload.expectedLegacyGeneration !== payload.manifest.generation) return failure(409, "repair-generation", "integrity repair is restricted to the configured legacy generation");
+        if (!text(payload.operationId, "operationId") || !this.env.LEGACY_OBSERVED_GENERATION || !this.env.LEGACY_OBSERVED_DIGEST || payload.expectedLegacyGeneration !== this.env.LEGACY_OBSERVED_GENERATION || payload.expectedLegacyDigest !== this.env.LEGACY_OBSERVED_DIGEST || payload.manifest.generation === payload.expectedLegacyGeneration) return failure(409, "repair-generation", "integrity repair must bind distinct observed and corrected generations");
+        const observed = await this.env.LEGACY_LASTGOOD?.get("feed:active", { type: "json" });
+        if (!observed || observed?.manifest?.generation !== payload.expectedLegacyGeneration || await sha256(JSON.stringify(canonicalValue(observed))) !== payload.expectedLegacyDigest) return failure(409, "repair-observed", "frozen legacy receipt does not match the observed migration guard");
         const legacy = payload.legacyRelease;
         if (!legacy || String(legacy.releaseId) !== String(payload.manifest.releaseId) || legacy.tag !== payload.manifest.tag || legacy.sourceCommit !== payload.manifest.sourceCommit || legacy.prerelease !== true || legacy.tagCommit !== payload.manifest.sourceCommit) return failure(400, "repair-identity", "integrity repair release identity does not match the immutable receipt");
         if (payload.manifest.prerelease !== true || !Array.isArray(legacy.assetIds) || legacy.assetIds.length !== Object.keys(payload.manifest.assets).length || !Object.values(payload.manifest.assets).every((asset) => legacy.assetIds.includes(Number(asset.assetId)))) return failure(400, "repair-assets", "integrity repair does not bind every immutable release asset");
@@ -327,16 +331,21 @@ export class FeedCoordinator {
         await storage.put(`${STAGED_RELEASE_PREFIX}${payload.manifest.releaseId}`, payload);
         await storage.put(`${STAGED_GENERATION_PREFIX}${payload.manifest.generation}`, payload);
         await storage.put(`${STAGED_TAG_PREFIX}${payload.manifest.tag}`, payload);
-        await storage.put(quarantineKey, { state: "repaired-from-legacy", generation: payload.expectedLegacyGeneration, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
-        await storage.put(`${AUDIT_PREFIX}repair:${payload.manifest.generation}`, { action: "repair", generation: payload.manifest.generation, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
+        await storage.put(quarantineKey, { state: "repaired-from-legacy", generation: payload.expectedLegacyGeneration, observedDigest: payload.expectedLegacyDigest, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
+        await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "repair", operationId: payload.operationId, receiptSha256: payload.receiptSha256 });
+        await storage.put(`${AUDIT_PREFIX}repair:${payload.manifest.generation}`, { action: "repair", operationId: payload.operationId, generation: payload.manifest.generation, observedGeneration: payload.expectedLegacyGeneration, observedDigest: payload.expectedLegacyDigest, receiptSha256: payload.receiptSha256 });
         return jsonResponse({ repaired: true, generation: payload.manifest.generation, releaseId: payload.manifest.releaseId, receiptSha256: payload.receiptSha256 });
       }
       if (payload.action === "promote") {
+        if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "promotion requires a write-once operation ID");
+        if (await storage.get(`${OPERATION_PREFIX}${payload.operationId}`)) return failure(409, "operation-consumed", "promotion operation was already consumed");
         if (payload.expectedActiveGeneration === undefined || payload.expectedActiveGeneration !== currentGeneration) return failure(409, "active-generation-conflict", "active generation changed before promotion");
         const staged = await storage.get(`${STAGED_RELEASE_PREFIX}${payload.releaseId}`);
         if (!staged || staged.manifest.generation !== payload.generation || String(staged.manifest.releaseId) !== String(payload.releaseId)) return failure(404, "staged-generation-missing", "requested staged generation is not present");
+        if (await storage.get(`${ROLLED_BACK_PREFIX}${staged.manifest.generation}`)) return failure(409, "generation-terminal", "a rolled-back generation cannot be promoted again");
         if (currentGeneration === staged.manifest.generation) {
           if (String(current.manifest.releaseId) !== String(staged.manifest.releaseId) || current.receiptSha256 !== staged.receiptSha256) return failure(409, "active-receipt-conflict", "active generation is not the exact staged receipt");
+          await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: currentGeneration, receiptSha256: current.receiptSha256, idempotent: true });
           return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: current.receiptSha256 });
         }
         if (current && Number(staged.manifest.build) < Number(current.manifest.build)) return failure(409, "promote-build-order", "a staged generation cannot downgrade a newer active build");
@@ -344,7 +353,8 @@ export class FeedCoordinator {
         if (current && staged.manifest.tag === current.manifest.tag && Number(staged.manifest.build) !== Number(current.manifest.build)) return failure(409, "promote-tag-build-conflict", "an active release tag is permanently bound to one build");
         if (current) await storage.put(`${ROLLBACK_PREFIX}${payload.generation}`, current);
         await storage.put(ACTIVE_KEY, staged);
-        await storage.put(`${AUDIT_PREFIX}promote:${payload.generation}`, { action: "promote", generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
+        await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, receiptSha256: staged.receiptSha256 });
+        await storage.put(`${AUDIT_PREFIX}promote:${payload.generation}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
         return jsonResponse({ promoted: true, generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
       }
       if (payload.action === "rollback") {
@@ -353,6 +363,7 @@ export class FeedCoordinator {
         const previous = payload.restoreGeneration === "none" ? null : await storage.get(`${ROLLBACK_PREFIX}${payload.expectedCurrentGeneration}`);
         if (payload.restoreGeneration !== "none" && previous?.manifest?.generation !== payload.restoreGeneration) return failure(409, "rollback-target-mismatch", "trusted rollback generation is unavailable");
         if (previous) await storage.put(ACTIVE_KEY, previous); else await storage.delete(ACTIVE_KEY);
+        await storage.put(`${ROLLED_BACK_PREFIX}${payload.expectedCurrentGeneration}`, { generation: payload.expectedCurrentGeneration, restoreGeneration: payload.restoreGeneration });
         await storage.put(`${AUDIT_PREFIX}rollback:${payload.expectedCurrentGeneration}`, { action: "rollback", generation: payload.restoreGeneration });
         return jsonResponse({ rolledBack: true, generation: payload.restoreGeneration });
       }
@@ -378,9 +389,11 @@ async function handlePublic(pathname, env) {
   const response = await coordinatorRequest(new Request("https://coordinator.internal/"), env, { action: "read-active" });
   if (!response.ok) return response;
   const { active } = await response.json();
-  if (!active || !active.manifest?.generation) return failure(503, "feed-unavailable", "no verified feed generation is active");
-  const body = pathname === "/appcast.json" ? active.appcastText : active.sourceText;
-  const generation = active.manifest.generation;
+  const frozen = !active || !active.manifest?.generation ? await env.LEGACY_LASTGOOD?.get("feed:active", { type: "json" }) : null;
+  const selected = active || frozen;
+  if (!selected || !selected.manifest?.generation) return failure(503, "feed-unavailable", "no verified feed generation is active");
+  const body = pathname === "/appcast.json" ? selected.appcastText : selected.sourceText;
+  const generation = selected.manifest.generation;
   return new Response(body, {
     status: 200,
     headers: {

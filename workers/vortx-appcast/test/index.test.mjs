@@ -15,6 +15,12 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+  return value;
+}
+
 function asset(tag, slug, extension, checksumName, byte, assetId) {
   const name = `VortX-${slug}-${tag}-ci.${extension}`;
   const url = `https://github.com/VortXTV/VortX/releases/download/${tag}/${name}`;
@@ -99,7 +105,7 @@ class MemoryStorage {
 }
 
 function environment(kv, extra = {}) {
-  const env = { RELEASE_FEED_RECEIPT_SECRET: SECRET, ...extra };
+  const env = { RELEASE_FEED_RECEIPT_SECRET: SECRET, LEGACY_LASTGOOD: kv, ...extra };
   const state = { storage: new MemoryStorage() };
   env.COORDINATOR = {
     idFromName: () => "release-feed",
@@ -126,7 +132,7 @@ test("staging, promotion, exact bytes, query invariance, and rollback are fail-c
   const staged = await worker.fetch(signedRequest("/__release/receipt", receipt), env);
   assert.equal(staged.status, 200, await staged.text());
   const generation = receipt.manifest.generation;
-  const promoted = await worker.fetch(signedRequest("/__release/receipt", { action: "promote", releaseId: "19", generation, expectedActiveGeneration: null }), env);
+  const promoted = await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "initial-promote", releaseId: "19", generation, expectedActiveGeneration: null }), env);
   assert.equal(promoted.status, 200);
   for (const path of ["/altstore.json", "/vortx-altstore.json", "/appcast.json"]) {
     const response = await worker.fetch(new Request(`https://vortx.tv${path}?cache-bust=old`), env);
@@ -135,7 +141,7 @@ test("staging, promotion, exact bytes, query invariance, and rollback are fail-c
     assert.equal(response.headers.get("cache-control"), "public, max-age=120, s-maxage=120, must-revalidate");
     assert.equal(response.headers.get("x-vortx-feed-generation"), generation);
   }
-  const conflict = await worker.fetch(signedRequest("/__release/receipt", { action: "promote", releaseId: "19", generation, expectedActiveGeneration: "wrong" }), env);
+  const conflict = await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "wrong-promote", releaseId: "19", generation, expectedActiveGeneration: "wrong" }), env);
   assert.equal(conflict.status, 409);
   const rolledBack = await worker.fetch(signedRequest("/__release/receipt", { action: "rollback", expectedCurrentGeneration: generation, restoreGeneration: "none" }), env);
   assert.equal(rolledBack.status, 200);
@@ -167,7 +173,7 @@ test("staging requires an immutable release ID and serializes build order", asyn
   const promoted = await worker.fetch(signedRequest("/__release/receipt", current), env);
   assert.equal(promoted.status, 200);
   const generation = current.manifest.generation;
-  assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", releaseId: "19", generation, expectedActiveGeneration: null }), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "current-promote", releaseId: "19", generation, expectedActiveGeneration: null }), env)).status, 200);
   const older = makeReceipt({ releaseId: "18", build: 220 });
   const olderResponse = await worker.fetch(signedRequest("/__release/receipt", older), env);
   assert.equal(olderResponse.status, 409);
@@ -199,10 +205,15 @@ test("the Durable Object serializes conflicting stages and records a canonical r
 });
 
 test("integrity repair can seed a malformed legacy generation once and never overwrite an active receipt", async () => {
-  const repair = makeReceipt({ releaseId: "18", build: 220 });
+  const kv = new MemoryKV();
+  const legacy = makeReceipt({ releaseId: "18", build: 220, tag: "v0.3.14-beta.18" });
+  await kv.put("feed:active", JSON.stringify(legacy));
+  const repair = makeReceipt({ releaseId: "19", build: 221, tag: "v0.3.14-beta.19" });
   repair.action = "repair";
+  repair.operationId = "repair-legacy";
   repair.repairReason = "integrity-repair";
-  repair.expectedLegacyGeneration = repair.manifest.generation;
+  repair.expectedLegacyGeneration = legacy.manifest.generation;
+  repair.expectedLegacyDigest = sha256(JSON.stringify(canonical(legacy)));
   repair.legacyRelease = {
     releaseId: repair.manifest.releaseId,
     tag: repair.manifest.tag,
@@ -211,21 +222,23 @@ test("integrity repair can seed a malformed legacy generation once and never ove
     prerelease: true,
     assetIds: Object.values(repair.manifest.assets).map((asset) => asset.assetId),
   };
-  const env = environment(new MemoryKV(), { LEGACY_REPAIR_GENERATION: repair.manifest.generation });
+  const env = environment(kv, { LEGACY_OBSERVED_GENERATION: legacy.manifest.generation, LEGACY_OBSERVED_DIGEST: repair.expectedLegacyDigest });
   const seeded = await worker.fetch(signedRequest("/__release/receipt", repair), env);
   assert.equal(seeded.status, 200, await seeded.text());
   const second = await worker.fetch(signedRequest("/__release/receipt", repair), env);
   assert.equal(second.status, 409);
   const publicFeed = await worker.fetch(new Request("https://vortx.tv/altstore.json"), env);
   assert.equal(publicFeed.status, 200);
-  assert.match((await env.__state.storage.get(`quarantine:legacy:${repair.manifest.generation}`)).state, /repaired/);
+  assert.match((await env.__state.storage.get(`quarantine:legacy:${legacy.manifest.generation}`)).state, /repaired/);
 });
 
 test("legacy repair rejects a receipt that is not the configured quarantined generation", async () => {
   const repair = makeReceipt({ releaseId: "18", build: 220 });
   repair.action = "repair";
+  repair.operationId = "repair-wrong";
   repair.repairReason = "integrity-repair";
   repair.expectedLegacyGeneration = "not-the-legacy-generation";
+  repair.expectedLegacyDigest = "0".repeat(64);
   repair.legacyRelease = {
     releaseId: repair.manifest.releaseId,
     tag: repair.manifest.tag,
@@ -234,7 +247,7 @@ test("legacy repair rejects a receipt that is not the configured quarantined gen
     prerelease: true,
     assetIds: Object.values(repair.manifest.assets).map((asset) => asset.assetId),
   };
-  const env = environment(new MemoryKV(), { LEGACY_REPAIR_GENERATION: repair.manifest.generation });
+  const env = environment(new MemoryKV(), { LEGACY_OBSERVED_GENERATION: repair.manifest.generation, LEGACY_OBSERVED_DIGEST: repair.expectedLegacyDigest });
   const response = await worker.fetch(signedRequest("/__release/receipt", repair), env);
   assert.equal(response.status, 409);
   assert.equal(await env.__state.storage.get("active"), undefined);
@@ -246,15 +259,18 @@ test("a promote retry preserves B rollback to A and a staged older generation ca
   const b = makeReceipt({ releaseId: "18", build: 221, tag: "v0.3.14-beta.18" });
   const c = makeReceipt({ releaseId: "19", build: 222, tag: "v0.3.14-beta.19" });
   for (const receipt of [a, b, c]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
-  const promote = (receipt, expected) => worker.fetch(signedRequest("/__release/receipt", { action: "promote", releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: expected }), env);
+  let operation = 0;
+  const promote = (receipt, expected, operationId = `operation-${++operation}`) => worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId, releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: expected }), env);
   assert.equal((await promote(a, null)).status, 200);
-  assert.equal((await promote(b, a.manifest.generation)).status, 200);
+  assert.equal((await promote(b, a.manifest.generation, "captured-b")).status, 200);
   const retry = await promote(b, b.manifest.generation);
   assert.equal(retry.status, 200);
   assert.equal((await retry.json()).idempotent, true);
   assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "rollback", expectedCurrentGeneration: b.manifest.generation, restoreGeneration: a.manifest.generation }), env)).status, 200);
   assert.equal((await promote(c, a.manifest.generation)).status, 200);
+  const replay = await promote(b, a.manifest.generation, "captured-b");
+  assert.equal(replay.status, 409);
   const stale = await promote(b, c.manifest.generation);
   assert.equal(stale.status, 409);
-  assert.match(await stale.text(), /promote-build-order/);
+  assert.match(await stale.text(), /generation-terminal|promote-build-order/);
 });

@@ -40,7 +40,7 @@ def source(build=220):
         "buildVersion": str(build),
         "date": "2026-08-20",
         "localizedDescription": "Known good.",
-        "downloadURL": "https://example.invalid/asset",
+        "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/asset",
         "size": 1,
         "sha256": "f" * 64,
         "minOSVersion": "16.0",

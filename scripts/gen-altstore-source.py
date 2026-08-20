@@ -167,6 +167,20 @@ def current_top_build(source: dict) -> int:
     return builds[0]
 
 
+def current_top_tags(source: dict) -> set[str]:
+    tags = set()
+    for bundle in ("com.stremiox.app.native", "com.stremiox.tv"):
+        app = next(app for app in source["apps"] if app.get("bundleIdentifier") == bundle)
+        url = str(app["versions"][0].get("downloadURL") or "")
+        match = re.search(r"/releases/download/(v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)/", url)
+        if not match:
+            raise MetadataError(f"existing source has no immutable release tag for {bundle}")
+        tags.add(match.group(1))
+    if len(tags) != 1:
+        raise MetadataError(f"existing source Apple top tags disagree: {sorted(tags)}")
+    return tags
+
+
 def make_entry(release: dict, asset: dict, min_os: str, note: str) -> dict:
     tag = release["tagName"]
     name = asset["name"]
@@ -233,6 +247,7 @@ def main() -> None:
         raise MetadataError(f"existing source could not be read: {error}") from error
     validate_existing_source(existing)
     previous_build = current_top_build(existing)
+    previous_tags = current_top_tags(existing)
     releases = recent_releases()
     by_build = {}
     for release in releases:
@@ -244,6 +259,8 @@ def main() -> None:
             raise MetadataError(f"backfill candidates bind build {build} to different tags: {by_build[build]}, {tag}")
         by_build[build] = tag
     newest_build = releases[0]["build"]
+    if newest_build == previous_build and releases[0]["tagName"] not in previous_tags:
+        raise MetadataError(f"backfill build {newest_build} is already bound to existing Apple tag {next(iter(previous_tags))}")
     if newest_build < previous_build:
         raise MetadataError(f"backfill build {newest_build} is older than existing top build {previous_build}")
     rebuilt = build_source(existing, releases)

@@ -8,14 +8,12 @@
  * immutable release assets.
  */
 
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
 function usage(message) {
-  if (message) console.error(`repair-release-feed: ${message}`);
-  console.error("usage: repair-release-feed.mjs --manifest FILE --source FILE --appcast FILE --checksum FILE --expected-generation GENERATION --out FILE [--execute --endpoint URL]");
-  process.exitCode = 2;
+  throw new Error(`${message || "invalid arguments"}; usage: repair-release-feed.mjs --manifest FILE --source FILE --appcast FILE --checksum FILE --legacy-receipt FILE --expected-generation LEGACY_GENERATION --out FILE [--execute --endpoint https://vortx.tv/__release/receipt]`);
 }
 
 function args(argv) {
@@ -31,7 +29,7 @@ function args(argv) {
 }
 
 const options = args(process.argv.slice(2));
-for (const required of ["manifest", "source", "appcast", "checksum", "expected-generation", "out"]) {
+for (const required of ["manifest", "source", "appcast", "checksum", "legacy-receipt", "expected-generation", "out"]) {
   if (!options[required] || options[required] === true) usage(`--${required} is required`);
 }
 let manifest;
@@ -40,9 +38,13 @@ try {
 } catch (error) {
   usage(`invalid manifest: ${error.message}`);
 }
-if (manifest?.schemaVersion !== 2 || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/.test(manifest?.tag || "") || !/^\d+$/.test(String(manifest?.releaseId || "")) || manifest.android !== null || manifest.prerelease !== true || options["expected-generation"] !== manifest.generation) {
+if (manifest?.schemaVersion !== 2 || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/.test(manifest?.tag || "") || !/^\d+$/.test(String(manifest?.releaseId || "")) || manifest.android !== null || manifest.prerelease !== true || options["expected-generation"] === manifest.generation) {
   usage("manifest must be an Apple-only schema 2 immutable release receipt");
 }
+const legacy = JSON.parse(readFileSync(options["legacy-receipt"], "utf8"));
+const canonical = (value) => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value;
+const legacyDigest = createHash("sha256").update(JSON.stringify(canonical(legacy))).digest("hex");
+if (legacy?.manifest?.generation !== options["expected-generation"]) usage("legacy receipt generation does not match the observed generation guard");
 function ghJSON(path) {
   try {
     return JSON.parse(execFileSync("gh", ["api", path], { encoding: "utf8" }));
@@ -82,6 +84,7 @@ const receipt = {
   action: "repair",
   repairReason: "integrity-repair",
   expectedLegacyGeneration: options["expected-generation"],
+  expectedLegacyDigest: legacyDigest,
   legacyRelease: {
     releaseId: String(release.id),
     tag: release.tag_name,
@@ -102,7 +105,7 @@ if (!options.execute) {
 } else {
   const secret = process.env.RELEASE_FEED_RECEIPT_SECRET;
   const endpoint = options.endpoint;
-  if (!secret || !endpoint || endpoint === true || new URL(endpoint).protocol !== "https:") usage("--execute requires RELEASE_FEED_RECEIPT_SECRET and an HTTPS --endpoint");
+  if (!secret || endpoint !== "https://vortx.tv/__release/receipt") usage("--execute requires RELEASE_FEED_RECEIPT_SECRET and the exact production receipt endpoint");
   const signature = createHmac("sha256", secret).update(body).digest("hex");
   const response = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json", "x-vortx-receipt": `sha256=${signature}` }, body });
   const responseBody = await response.text();

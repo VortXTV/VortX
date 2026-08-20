@@ -1026,8 +1026,8 @@ jobs:
           done <<< "$CURRENT_BUILDS"
           [ "$CURRENT_TOP" -le "$BUILD" ] || { echo "::error::main source already leads build $CURRENT_TOP over target $BUILD"; exit 1; }
           if [ "$CURRENT_TOP" -eq "$BUILD" ]; then
-            CURRENT_TAG="$(jq -r '.apps[] | select(.bundleIdentifier == "com.stremiox.app.native") | .versions[0].downloadURL | split("/download/")[1] | split("/")[0]' "$RUNNER_TEMP/previous-source.json")"
-            [ "$CURRENT_TAG" = "$TAG" ] || { echo "::error::main source uses build $BUILD for a different tag"; exit 1; }
+            CURRENT_TAGS="$(jq -r '.apps[] | select(.bundleIdentifier == "com.stremiox.app.native" or .bundleIdentifier == "com.stremiox.tv") | .versions[0].downloadURL | split("/download/")[1] | split("/")[0]' "$RUNNER_TEMP/previous-source.json" | sort -u)"
+            [ "$(wc -l <<<"$CURRENT_TAGS" | tr -d ' ')" = 1 ] && [ "$CURRENT_TAGS" = "$TAG" ] || { echo "::error::main source uses build $BUILD for a different Apple tag"; exit 1; }
           fi
           set +e
           curl -sS --connect-timeout 5 --max-time 10 -D "$RUNNER_TEMP/active.headers" -o /dev/null https://vortx.tv/altstore.json
