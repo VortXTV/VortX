@@ -15,18 +15,18 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function asset(slug, extension, checksumName, byte, assetId) {
-  const name = `VortX-${slug}-${TAG}-ci.${extension}`;
-  const url = `https://github.com/VortXTV/VortX/releases/download/${TAG}/${name}`;
+function asset(tag, slug, extension, checksumName, byte, assetId) {
+  const name = `VortX-${slug}-${tag}-ci.${extension}`;
+  const url = `https://github.com/VortXTV/VortX/releases/download/${tag}/${name}`;
   return { name, checksumName, url, size: byte.length, sha256: sha256(byte), state: "uploaded", assetId };
 }
 
-function makeReceipt({ releaseId = "19", build = BUILD } = {}) {
+function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
   const assets = {
-    ios: asset("iOS", "ipa", "VortX-iOS-ci.ipa", "ios-bytes", 11),
-    tvos: asset("tvOS", "ipa", "VortX-tvOS-ci.ipa", "tvos-bytes", 12),
-    tvosLite: asset("tvOS-lite", "ipa", "VortX-tvOS-lite-ci.ipa", "lite-bytes", 13),
-    mac: asset("macOS", "dmg", "VortX-macOS-ci.dmg", "mac-bytes", 14),
+    ios: asset(tag, "iOS", "ipa", "VortX-iOS-ci.ipa", "ios-bytes", 11),
+    tvos: asset(tag, "tvOS", "ipa", "VortX-tvOS-ci.ipa", "tvos-bytes", 12),
+    tvosLite: asset(tag, "tvOS-lite", "ipa", "VortX-tvOS-lite-ci.ipa", "lite-bytes", 13),
+    mac: asset(tag, "macOS", "dmg", "VortX-macOS-ci.dmg", "mac-bytes", 14),
   };
   const note = "Verified release notes.";
   const source = {
@@ -48,11 +48,11 @@ function makeReceipt({ releaseId = "19", build = BUILD } = {}) {
   const sourceText = `${JSON.stringify(source, null, 2)}\n`;
   const appcast = {
     schemaVersion: 2,
-    _generatedFromTag: TAG,
+    _generatedFromTag: tag,
     _generatedFromCommit: COMMIT,
-    ios: { tag: TAG, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.ios.url, url: assets.ios.url, size: assets.ios.size, sha256: assets.ios.sha256, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
-    tvos: { tag: TAG, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.tvos.url, url: assets.tvos.url, size: assets.tvos.size, sha256: assets.tvos.sha256, altstore: null, artifactType: "ipa" },
-    mac: { tag: TAG, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.mac.url, url: assets.mac.url, size: assets.mac.size, sha256: assets.mac.sha256, altstore: null, artifactType: "dmg" },
+    ios: { tag, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.ios.url, url: assets.ios.url, size: assets.ios.size, sha256: assets.ios.sha256, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
+    tvos: { tag, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.tvos.url, url: assets.tvos.url, size: assets.tvos.size, sha256: assets.tvos.sha256, altstore: null, artifactType: "ipa" },
+    mac: { tag, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.mac.url, url: assets.mac.url, size: assets.mac.size, sha256: assets.mac.sha256, altstore: null, artifactType: "dmg" },
     android: null,
   };
   const appcastText = `${JSON.stringify(appcast, null, 2)}\n`;
@@ -60,7 +60,7 @@ function makeReceipt({ releaseId = "19", build = BUILD } = {}) {
   const feedSha256 = sha256(`${sourceText}\n${appcastText}\n${checksum}`);
   const manifest = {
     schemaVersion: 2,
-    tag: TAG,
+    tag,
     build,
     version: "0.3.14",
     name: "Beta 19",
@@ -68,7 +68,7 @@ function makeReceipt({ releaseId = "19", build = BUILD } = {}) {
     prerelease: true,
     sourceCommit: COMMIT,
     releaseId,
-    generation: `${TAG}:${build}:${feedSha256}`,
+    generation: `${tag}:${build}:${feedSha256}`,
     feedSha256,
     sourceSha256: sha256(sourceText),
     appcastSha256: sha256(appcastText),
@@ -98,8 +98,8 @@ class MemoryStorage {
   async transaction(callback) { return callback(this); }
 }
 
-function environment(kv) {
-  const env = { RELEASE_FEED_RECEIPT_SECRET: SECRET };
+function environment(kv, extra = {}) {
+  const env = { RELEASE_FEED_RECEIPT_SECRET: SECRET, ...extra };
   const state = { storage: new MemoryStorage() };
   env.COORDINATOR = {
     idFromName: () => "release-feed",
@@ -199,14 +199,62 @@ test("the Durable Object serializes conflicting stages and records a canonical r
 });
 
 test("integrity repair can seed a malformed legacy generation once and never overwrite an active receipt", async () => {
-  const env = environment(new MemoryKV());
   const repair = makeReceipt({ releaseId: "18", build: 220 });
   repair.action = "repair";
   repair.repairReason = "integrity-repair";
+  repair.expectedLegacyGeneration = repair.manifest.generation;
+  repair.legacyRelease = {
+    releaseId: repair.manifest.releaseId,
+    tag: repair.manifest.tag,
+    sourceCommit: repair.manifest.sourceCommit,
+    tagCommit: repair.manifest.sourceCommit,
+    prerelease: true,
+    assetIds: Object.values(repair.manifest.assets).map((asset) => asset.assetId),
+  };
+  const env = environment(new MemoryKV(), { LEGACY_REPAIR_GENERATION: repair.manifest.generation });
   const seeded = await worker.fetch(signedRequest("/__release/receipt", repair), env);
   assert.equal(seeded.status, 200, await seeded.text());
   const second = await worker.fetch(signedRequest("/__release/receipt", repair), env);
   assert.equal(second.status, 409);
   const publicFeed = await worker.fetch(new Request("https://vortx.tv/altstore.json"), env);
   assert.equal(publicFeed.status, 200);
+  assert.match((await env.__state.storage.get(`quarantine:legacy:${repair.manifest.generation}`)).state, /repaired/);
+});
+
+test("legacy repair rejects a receipt that is not the configured quarantined generation", async () => {
+  const repair = makeReceipt({ releaseId: "18", build: 220 });
+  repair.action = "repair";
+  repair.repairReason = "integrity-repair";
+  repair.expectedLegacyGeneration = "not-the-legacy-generation";
+  repair.legacyRelease = {
+    releaseId: repair.manifest.releaseId,
+    tag: repair.manifest.tag,
+    sourceCommit: repair.manifest.sourceCommit,
+    tagCommit: repair.manifest.sourceCommit,
+    prerelease: true,
+    assetIds: Object.values(repair.manifest.assets).map((asset) => asset.assetId),
+  };
+  const env = environment(new MemoryKV(), { LEGACY_REPAIR_GENERATION: repair.manifest.generation });
+  const response = await worker.fetch(signedRequest("/__release/receipt", repair), env);
+  assert.equal(response.status, 409);
+  assert.equal(await env.__state.storage.get("active"), undefined);
+});
+
+test("a promote retry preserves B rollback to A and a staged older generation cannot downgrade C", async () => {
+  const env = environment(new MemoryKV());
+  const a = makeReceipt({ releaseId: "17", build: 220, tag: "v0.3.14-beta.17" });
+  const b = makeReceipt({ releaseId: "18", build: 221, tag: "v0.3.14-beta.18" });
+  const c = makeReceipt({ releaseId: "19", build: 222, tag: "v0.3.14-beta.19" });
+  for (const receipt of [a, b, c]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  const promote = (receipt, expected) => worker.fetch(signedRequest("/__release/receipt", { action: "promote", releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: expected }), env);
+  assert.equal((await promote(a, null)).status, 200);
+  assert.equal((await promote(b, a.manifest.generation)).status, 200);
+  const retry = await promote(b, b.manifest.generation);
+  assert.equal(retry.status, 200);
+  assert.equal((await retry.json()).idempotent, true);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "rollback", expectedCurrentGeneration: b.manifest.generation, restoreGeneration: a.manifest.generation }), env)).status, 200);
+  assert.equal((await promote(c, a.manifest.generation)).status, 200);
+  const stale = await promote(b, c.manifest.generation);
+  assert.equal(stale.status, 409);
+  assert.match(await stale.text(), /promote-build-order/);
 });

@@ -919,7 +919,8 @@ jobs:
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
           RELEASE_JSON="$(gh api --paginate -- "repos/$GH_REPO/releases" | jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("release identity is missing or duplicated") end')"
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
-          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing draft"; exit 1; }
+          [[ "$TAG" == *-* ]] || { echo "::error::this lane accepts prerelease tags only"; exit 1; }
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .prerelease == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing prerelease draft"; exit 1; }
           RELEASE_NAME="$(jq -r '.name // .tag_name' <<<"$RELEASE_JSON")"
           RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
           rm -rf feed-artifact
@@ -1011,7 +1012,7 @@ jobs:
             TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"
           done
           [ "$TAG_TYPE" = commit ] && [ "$TAG_SHA" = "$GITHUB_SHA" ] || { echo "::error::tag $TAG is not bound to this immutable build"; exit 1; }
-          gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" | jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true' >/dev/null
+          gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" | jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true and .prerelease == true' >/dev/null
           MAIN_REF="$(gh api -- "repos/$GH_REPO/git/ref/heads/main")"
           MAIN_HEAD="$(jq -er '.object.sha' <<<"$MAIN_REF")"
           MAIN_CONTENT="$(gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=$MAIN_HEAD")"
@@ -1033,6 +1034,19 @@ jobs:
           set -e
           EXPECTED_ACTIVE="$(awk 'tolower($1) == "x-vortx-feed-generation:" {sub(/\r$/, "", $2); print $2}' "$RUNNER_TEMP/active.headers" | tail -1)"
           [ -n "$EXPECTED_ACTIVE" ] || EXPECTED_ACTIVE=none
+          if [ "$EXPECTED_ACTIVE" != none ]; then
+            for ROUTE_FILE in \
+              "https://vortx.tv/altstore.json|$RUNNER_TEMP/previous-edge-source.json" \
+              "https://vortx.tv/vortx-altstore.json|$RUNNER_TEMP/previous-edge-compat.json" \
+              "https://vortx.tv/appcast.json|$RUNNER_TEMP/previous-edge-appcast.json"; do
+              ROUTE="${ROUTE_FILE%%|*}"; FILE="${ROUTE_FILE#*|}"
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$FILE.headers" "$ROUTE" -o "$FILE"
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "$ROUTE?rollback-snapshot=$EXPECTED_ACTIVE" -o "$FILE.query"
+              cmp -s "$FILE" "$FILE.query" || { echo "::error::edge snapshot query bytes differ: $ROUTE"; exit 1; }
+              grep -Fqi "x-vortx-feed-generation: $EXPECTED_ACTIVE" "$FILE.headers" || { echo "::error::edge snapshot generation differs: $ROUTE"; exit 1; }
+            done
+            cmp -s "$RUNNER_TEMP/previous-edge-source.json" "$RUNNER_TEMP/previous-edge-compat.json" || { echo "::error::edge snapshot compatibility bytes differ"; exit 1; }
+          fi
           {
             echo "release_id=$RELEASE_ID"
             echo "build=$BUILD"
@@ -1041,6 +1055,8 @@ jobs:
             echo "previous_source_sha256=$PREVIOUS_SOURCE_SHA256"
           } >> "$GITHUB_OUTPUT"
           echo "PREVIOUS_SOURCE_FILE=$RUNNER_TEMP/previous-source.json" >> "$GITHUB_ENV"
+          echo "PREVIOUS_EDGE_SOURCE_FILE=$RUNNER_TEMP/previous-edge-source.json" >> "$GITHUB_ENV"
+          echo "PREVIOUS_EDGE_APPCAST_FILE=$RUNNER_TEMP/previous-edge-appcast.json" >> "$GITHUB_ENV"
           echo "EXPECTED_MAIN_HEAD=$MAIN_HEAD" >> "$GITHUB_ENV"
           echo "release identity $RELEASE_ID is draft and tag $TAG peels to $TAG_SHA; main top $CURRENT_TOP <= target $BUILD"
 
@@ -1073,7 +1089,7 @@ jobs:
             [ "$FILE" = "out/$EXPECTED_NAME" ] && [ "$LOCAL_SIZE" = "$EXPECTED_SIZE" ] && [ "$LOCAL_SHA" = "$EXPECTED_SHA" ] || { echo "::error::trusted local metadata mismatch for $KEY"; exit 1; }
           done
           RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
-          [ "$(jq -r '.draft' <<<"$RELEASE_JSON")" = true ] || { echo "::error::release was published while draft assets were being attached"; exit 1; }
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release identity changed while draft assets were being attached"; exit 1; }
           register_asset() {
             local name="$1" file="$2" expected_size="$3" expected_sha="$4"
             local count existing_size existing_sha existing_state
@@ -1150,7 +1166,27 @@ jobs:
             if ! jq -e --arg restore "$restore" '.rolledBack == true and .generation == (if $restore == "none" then "none" else $restore end)' <<<"$result" >/dev/null; then
               echo "::error::incident: edge rollback did not verify"
               ROLLBACK_FAILURE=1
+              return 0
             fi
+            if [ "$restore" = none ]; then
+              for ROUTE in https://vortx.tv/altstore.json https://vortx.tv/vortx-altstore.json https://vortx.tv/appcast.json; do
+                STATUS="$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "$ROUTE" || true)"
+                [ "$STATUS" = 503 ] || { echo "::error::incident: edge rollback did not return unavailable for $ROUTE"; ROLLBACK_FAILURE=1; }
+              done
+              return 0
+            fi
+            for ROUTE_FILE in \
+              "https://vortx.tv/altstore.json|$PREVIOUS_EDGE_SOURCE_FILE" \
+              "https://vortx.tv/vortx-altstore.json|$PREVIOUS_EDGE_SOURCE_FILE" \
+              "https://vortx.tv/appcast.json|$PREVIOUS_EDGE_APPCAST_FILE"; do
+              ROUTE="${ROUTE_FILE%%|*}"; EXPECTED_FILE="${ROUTE_FILE#*|}"; BODY="$RUNNER_TEMP/rollback-edge-body"; HEADERS="$RUNNER_TEMP/rollback-edge-headers"
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$HEADERS" "$ROUTE" -o "$BODY" || { echo "::error::incident: edge rollback route unavailable: $ROUTE"; ROLLBACK_FAILURE=1; continue; }
+              cmp -s "$EXPECTED_FILE" "$BODY" || { echo "::error::incident: edge rollback bytes differ: $ROUTE"; ROLLBACK_FAILURE=1; }
+              grep -Fqi "x-vortx-feed-generation: $restore" "$HEADERS" || { echo "::error::incident: edge rollback generation differs: $ROUTE"; ROLLBACK_FAILURE=1; }
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$HEADERS.query" "$ROUTE?rollback-verify=$restore" -o "$BODY.query" || { echo "::error::incident: edge rollback query unavailable: $ROUTE"; ROLLBACK_FAILURE=1; continue; }
+              cmp -s "$EXPECTED_FILE" "$BODY.query" || { echo "::error::incident: edge rollback query bytes differ: $ROUTE"; ROLLBACK_FAILURE=1; }
+              grep -Fqi "x-vortx-feed-generation: $restore" "$HEADERS.query" || { echo "::error::incident: edge rollback query generation differs: $ROUTE"; ROLLBACK_FAILURE=1; }
+            done
           }
           commit_source_bytes() {
             local file="$1" message="$2" expected_head="${3:-}" main_head base_tree source_b64 blob_sha tree_sha commit_sha
@@ -1173,9 +1209,9 @@ jobs:
             current="$RUNNER_TEMP/rollback-current-source.json"
             current_ref="$(gh api -- "repos/$GH_REPO/git/ref/heads/main" 2>/dev/null || true)"
             current_head="$(jq -er '.object.sha' <<<"$current_ref" 2>/dev/null || true)"
-            gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=main" | jq -er '.content' | tr -d '\n' | base64 --decode > "$current" || return 0
+            gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=main" | jq -er '.content' | tr -d '\n' | base64 --decode > "$current" || { echo "::error::incident: cannot read current main source for rollback CAS"; ROLLBACK_FAILURE=1; return 0; }
             if cmp -s "$current" feed-artifact/source.json; then
-              [ -n "$current_head" ] || return 0
+              [ -n "$current_head" ] || { echo "::error::incident: current main ref is unavailable for rollback CAS"; ROLLBACK_FAILURE=1; return 0; }
               if ! commit_source_bytes "$PREVIOUS_SOURCE_FILE" "chore(release): restore verified install feed" "$current_head"; then
                 echo "::error::incident: main-source rollback failed"
                 ROLLBACK_FAILURE=1
@@ -1184,13 +1220,22 @@ jobs:
               echo "::error::source rollback CAS refused because main no longer contains the published feed bytes"
               ROLLBACK_FAILURE=1
             fi
+            RAW_DEADLINE=$(($(date +%s) + 90)); RAW_RESTORED=0
+            while [ "$(date +%s)" -lt "$RAW_DEADLINE" ]; do
+              if curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "https://raw.githubusercontent.com/$GH_REPO/main/altstore/source.json" -o "$RUNNER_TEMP/rollback-raw-source.json" && cmp -s "$PREVIOUS_SOURCE_FILE" "$RUNNER_TEMP/rollback-raw-source.json"; then RAW_RESTORED=1; break; fi
+              sleep 5
+            done
+            [ "$RAW_RESTORED" = 1 ] || { echo "::error::incident: raw main source rollback did not verify"; ROLLBACK_FAILURE=1; }
           }
           rollback_release() {
             local current
             current="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-            if [ -n "$current" ] && [ -n "${PUBLISHED_AT:-}" ] && jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" '.tag_name == $tag and .draft == false and .published_at == $published' <<<"$current" >/dev/null; then
+            if [ -n "$current" ] && [ -n "${PUBLISHED_AT:-}" ] && jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" '.tag_name == $tag and .prerelease == true and .draft == false and .published_at == $published' <<<"$current" >/dev/null; then
               restored="$(gh api --method PATCH -f draft=true -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-              jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true' <<<"$restored" >/dev/null || { echo "::error::incident: GitHub could not restore release $RELEASE_ID to draft"; ROLLBACK_FAILURE=1; }
+              jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == true' <<<"$restored" >/dev/null || { echo "::error::incident: GitHub could not restore release $RELEASE_ID to draft"; ROLLBACK_FAILURE=1; }
+            elif [ -n "${PUBLISHED_AT:-}" ]; then
+              echo "::error::incident: release rollback identity changed before restore"
+              ROLLBACK_FAILURE=1
             fi
           }
           on_failure() {
@@ -1212,7 +1257,7 @@ jobs:
           # public download URLs yet: the release must remain a draft until the
           # main and edge state have both accepted the exact staged bytes.
           RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
-          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true' <<<"$RELEASE_JSON" >/dev/null
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == true' <<<"$RELEASE_JSON" >/dev/null
           for KEY_FILE in \
             "ios:out/VortX-iOS-$TAG-ci.ipa:$IOS_ASSET_ID" \
             "tvos:out/VortX-tvOS-$TAG-ci.ipa:$TVOS_ASSET_ID" \
@@ -1270,7 +1315,7 @@ jobs:
           while [ "$(date +%s)" -lt "$PUBLISH_DEADLINE" ]; do
             gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
             RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
               PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
               PUBLISHED=1
               break
@@ -1322,7 +1367,7 @@ jobs:
           READY=0
           while [ "$(date +%s)" -lt "$READ_DEADLINE" ]; do
             RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
               READY=1
               break
             fi
@@ -1339,7 +1384,8 @@ jobs:
           set -euo pipefail
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
           RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
-          jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag identity changed or release was recreated"; exit 1; }
+          [[ "$EVENT_TAG" == *-* ]] || { echo "::error::published event tag is not a prerelease"; exit 1; }
+          jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag/prerelease identity changed or release was recreated"; exit 1; }
           REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$EVENT_TAG")"
           TAG_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"; TAG_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"; HOPS=0
           while [ "$TAG_TYPE" = tag ]; do HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || exit 1; TAG_OBJECT="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"; TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"; TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"; done

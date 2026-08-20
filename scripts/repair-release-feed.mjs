@@ -9,11 +9,12 @@
  */
 
 import { createHmac } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
 function usage(message) {
   if (message) console.error(`repair-release-feed: ${message}`);
-  console.error("usage: repair-release-feed.mjs --manifest FILE --source FILE --appcast FILE --checksum FILE --out FILE [--execute --endpoint URL]");
+  console.error("usage: repair-release-feed.mjs --manifest FILE --source FILE --appcast FILE --checksum FILE --expected-generation GENERATION --out FILE [--execute --endpoint URL]");
   process.exitCode = 2;
 }
 
@@ -30,7 +31,7 @@ function args(argv) {
 }
 
 const options = args(process.argv.slice(2));
-for (const required of ["manifest", "source", "appcast", "checksum", "out"]) {
+for (const required of ["manifest", "source", "appcast", "checksum", "expected-generation", "out"]) {
   if (!options[required] || options[required] === true) usage(`--${required} is required`);
 }
 let manifest;
@@ -39,13 +40,56 @@ try {
 } catch (error) {
   usage(`invalid manifest: ${error.message}`);
 }
-if (manifest?.schemaVersion !== 2 || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/.test(manifest?.tag || "") || !/^\d+$/.test(String(manifest?.releaseId || "")) || manifest.android !== null) {
+if (manifest?.schemaVersion !== 2 || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/.test(manifest?.tag || "") || !/^\d+$/.test(String(manifest?.releaseId || "")) || manifest.android !== null || manifest.prerelease !== true || options["expected-generation"] !== manifest.generation) {
   usage("manifest must be an Apple-only schema 2 immutable release receipt");
+}
+function ghJSON(path) {
+  try {
+    return JSON.parse(execFileSync("gh", ["api", path], { encoding: "utf8" }));
+  } catch (error) {
+    throw new Error(`immutable GitHub verification failed for ${path}: ${error.message}`);
+  }
+}
+
+function peeledTagCommit(tag) {
+  let ref = ghJSON(`repos/VortXTV/VortX/git/ref/tags/${tag}`);
+  let sha = ref?.object?.sha;
+  let type = ref?.object?.type;
+  for (let hops = 0; type === "tag" && hops < 5; hops += 1) {
+    ref = ghJSON(`repos/VortXTV/VortX/git/tags/${sha}`);
+    sha = ref?.object?.sha;
+    type = ref?.object?.type;
+  }
+  if (type !== "commit" || !/^[a-f0-9]{40}$/i.test(sha || "")) throw new Error("tag did not peel to an immutable commit");
+  return sha;
+}
+
+const release = ghJSON(`repos/VortXTV/VortX/releases/${manifest.releaseId}`);
+if (String(release?.id) !== String(manifest.releaseId) || release?.tag_name !== manifest.tag || release?.draft !== false || release?.prerelease !== true) {
+  throw new Error("release ID, strict prerelease state, or immutable tag does not match the repair manifest");
+}
+const tagCommit = peeledTagCommit(manifest.tag);
+if (tagCommit.toLowerCase() !== manifest.sourceCommit.toLowerCase()) throw new Error("peeled tag commit does not match manifest sourceCommit");
+const remoteAssets = Array.isArray(release.assets) ? release.assets : [];
+for (const asset of Object.values(manifest.assets || {})) {
+  const remote = remoteAssets.filter((candidate) => Number(candidate.id) === Number(asset.assetId) && candidate.name === asset.name);
+  if (remote.length !== 1 || remote[0].state !== "uploaded" || Number(remote[0].size) !== Number(asset.size) || String(remote[0].digest || "").replace(/^sha256:/i, "").toLowerCase() !== String(asset.sha256).toLowerCase()) {
+    throw new Error(`release asset ${asset.name} does not match the immutable repair manifest`);
+  }
 }
 const receipt = {
   schemaVersion: 2,
   action: "repair",
   repairReason: "integrity-repair",
+  expectedLegacyGeneration: options["expected-generation"],
+  legacyRelease: {
+    releaseId: String(release.id),
+    tag: release.tag_name,
+    sourceCommit: manifest.sourceCommit,
+    tagCommit,
+    prerelease: true,
+    assetIds: Object.values(manifest.assets).map((asset) => Number(asset.assetId)),
+  },
   manifest,
   source: readFileSync(options.source, "utf8"),
   appcast: readFileSync(options.appcast, "utf8"),

@@ -116,6 +116,12 @@ class BackfillTests(unittest.TestCase):
             result = MODULE.recent_releases()
         self.assertEqual([item["build"] for item in result], [210, 209])
 
+    def test_equal_build_different_tag_is_rejected_before_any_backfill_write(self):
+        candidates = [release("v0.3.14-beta.18", 220), release("v0.3.14-beta.19", 220)]
+        with patch.object(MODULE, "recent_releases", return_value=candidates):
+            with self.assertRaises(MODULE.MetadataError):
+                MODULE.main()
+
 
 if __name__ == "__main__":
     unittest.main()

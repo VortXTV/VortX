@@ -141,6 +141,9 @@ test("release and manual cut paths both require feed propagation", async () => {
   assert.match(workflow, /name: Atomically activate the staged feed, prove routes, then publish last/);
   assert.match(workflow, /node scripts\/release-feed\.mjs project-build --file app\/project\.yml/);
   assert.match(workflow, /PUBLISH_DEADLINE/);
+  assert.match(workflow, /\.prerelease == true/);
+  assert.match(workflow, /rollback-verify=\$restore/);
+  assert.match(workflow, /rollback-raw-source\.json/);
   assert.match(workflow, /name: Verify the immutable published release and public feed/);
   assert.doesNotMatch(workflow, /if:\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*\n\s*uses: actions\/checkout/);
   const releaseWrite = workflow.slice(workflow.indexOf("  attach-release:"));

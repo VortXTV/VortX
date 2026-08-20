@@ -234,6 +234,15 @@ def main() -> None:
     validate_existing_source(existing)
     previous_build = current_top_build(existing)
     releases = recent_releases()
+    by_build = {}
+    for release in releases:
+        build = release.get("build")
+        tag = release.get("tagName")
+        if not isinstance(build, int) or not isinstance(tag, str):
+            raise MetadataError("backfill candidate lacks immutable build/tag identity")
+        if build in by_build and by_build[build] != tag:
+            raise MetadataError(f"backfill candidates bind build {build} to different tags: {by_build[build]}, {tag}")
+        by_build[build] = tag
     newest_build = releases[0]["build"]
     if newest_build < previous_build:
         raise MetadataError(f"backfill build {newest_build} is older than existing top build {previous_build}")

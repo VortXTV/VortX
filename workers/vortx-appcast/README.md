@@ -23,7 +23,10 @@ artifact with a signer, build, URL, size, and digest is added to the release con
 If a pre-Durable-Object generation must be migrated, prepare a full independently verified receipt
 with `scripts/repair-release-feed.mjs`. The command only writes an unsigned local receipt unless an
 operator supplies both `--execute` and the protected receipt secret. Repair is one-time: it refuses
-to replace an existing durable active generation.
+to replace an existing durable active generation. The deployment environment must also set
+`LEGACY_REPAIR_GENERATION` to the exact independently verified legacy generation; the repair tool
+checks its immutable prerelease release ID, every asset, and the peeled tag commit before writing a
+receipt.
 
 Deploy from the immutable VortX commit that contains this directory. Record the Cloudflare version
 ID before changing the route mapping, then verify all three routes with and without query strings.
