@@ -170,7 +170,10 @@ final class VortXExternalEngine: @unchecked Sendable {
     private func send<T: Decodable>(_ req: URLRequest, as type: T.Type) async -> T? {
         do {
             let (data, response) = try await session.data(for: req)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            // Control replies are metadata, never media.  Refuse a peer that tries to turn status polling into a
+            // large allocation even before JSON decoding; semantic checks below handle the decoded geometry.
+            guard data.count <= 256 * 1024,
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 return nil
             }
             return try JSONDecoder().decode(T.self, from: data)
@@ -319,7 +322,9 @@ final class VortXExternalEngine: @unchecked Sendable {
         if let timeoutSeconds {
             statusRequest.timeoutInterval = max(0.1, timeoutSeconds)
         }
-        return await send(statusRequest, as: VortXEngineProtocol.SessionStatus.self)
+        guard let status = await send(statusRequest, as: VortXEngineProtocol.SessionStatus.self),
+              VortXEngineProtocol.acceptsSessionStatus(status) else { return nil }
+        return status
     }
 
     /// Tell the host our player reached first frame, which widens the producer's lead exactly as the on-device
@@ -328,9 +333,11 @@ final class VortXExternalEngine: @unchecked Sendable {
     func markReady(_ session: OpenedSession) async -> VortXEngineProtocol.SessionStatus? {
         guard let url = controlURL(host: session.host, port: session.port,
                                    path: VortXEngineProtocol.Path.ready(session.sessionID)) else { return nil }
-        return await send(request(url, method: "POST", body: Data("{}".utf8), authorized: true,
-                                  authorizationToken: session.bearerToken),
-                          as: VortXEngineProtocol.SessionStatus.self)
+        guard let status = await send(request(url, method: "POST", body: Data("{}".utf8), authorized: true,
+                                             authorizationToken: session.bearerToken),
+                                      as: VortXEngineProtocol.SessionStatus.self),
+              VortXEngineProtocol.acceptsSessionStatus(status) else { return nil }
+        return status
     }
 
     /// Await an authenticated physical-unwind receipt.  A 2xx response without the exact session and mount

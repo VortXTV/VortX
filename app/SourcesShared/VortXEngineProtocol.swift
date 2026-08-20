@@ -477,6 +477,41 @@ enum VortXEngineProtocol {
         let producedEdgeSeconds: Double
     }
 
+    /// The engine host is a paired peer, but its status is still network input.  Keep every numeric conversion
+    /// and collection traversal behind one finite, bounded admission check so a malformed or incompatible host
+    /// cannot poison player geometry, timeline math, or picker allocation.
+    static func acceptsSessionStatus(_ status: SessionStatus) -> Bool {
+        let maximumTimeline = 7.0 * 24 * 60 * 60
+        let maximumDimension = 16_384
+        let maximumCounter = 1 << 50
+        guard status.durationSeconds.isFinite, status.durationSeconds >= 0,
+              status.durationSeconds <= maximumTimeline,
+              status.timelineOriginSeconds.isFinite, status.timelineOriginSeconds >= 0,
+              status.timelineOriginSeconds <= maximumTimeline,
+              status.frameRate.isFinite, status.frameRate >= 0, status.frameRate <= 240,
+              status.producedEdgeSeconds.isFinite, status.producedEdgeSeconds >= 0,
+              status.producedEdgeSeconds <= maximumTimeline,
+              status.producedSegments >= 0, status.producedSegments <= 200_000,
+              status.producedBytes >= 0, status.producedBytes <= maximumCounter,
+              status.width >= 0, status.width <= maximumDimension,
+              status.height >= 0, status.height <= maximumDimension,
+              (status.bandwidth ?? 0) >= 0, (status.bandwidth ?? 0) <= maximumCounter,
+              status.chapters.count <= 2_000,
+              (status.audioTracks?.count ?? 0) <= 128, (status.subtitleTracks?.count ?? 0) <= 128 else { return false }
+        guard status.chapters.allSatisfy({ $0.start.isFinite && $0.start >= 0 && $0.start <= maximumTimeline
+            && $0.title.unicodeScalars.count <= 512 }),
+              (status.audioTracks ?? []).allSatisfy({ $0.sourceIndex >= 0 && $0.sourceIndex <= 16_384
+                  && $0.channels >= 0 && $0.channels <= 64 && ($0.outputChannels ?? 0) >= 0
+                  && ($0.outputChannels ?? 0) <= 64 && $0.codec.unicodeScalars.count <= 128
+                  && ($0.outputCodec?.unicodeScalars.count ?? 0) <= 128 && $0.language.unicodeScalars.count <= 128
+                  && $0.title.unicodeScalars.count <= 512 }),
+              (status.subtitleTracks ?? []).allSatisfy({ $0.sourceIndex >= 0 && $0.sourceIndex <= 16_384
+                  && ($0.renditionIndex ?? 0) >= 0 && ($0.renditionIndex ?? 0) <= 128
+                  && $0.codec.unicodeScalars.count <= 128 && $0.language.unicodeScalars.count <= 128
+                  && $0.title.unicodeScalars.count <= 512 && ($0.unavailableReason?.unicodeScalars.count ?? 0) <= 512 }) else { return false }
+        return true
+    }
+
     // MARK: - Errors
 
     struct ErrorBody: Codable, Sendable, Equatable {

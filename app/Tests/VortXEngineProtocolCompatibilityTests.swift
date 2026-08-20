@@ -209,6 +209,35 @@ enum VortXEngineProtocolCompatibilityTests {
             VortXEngineProtocol.SessionStatus.self,
             from: JSONEncoder().encode(current))
         precondition(roundTrip == current)
+        // Network status is untrusted even after pairing.  The client must reject values that would overflow
+        // timing/geometry/counter consumers rather than letting a malformed host turn a status poll into a
+        // player-state crash or a huge picker allocation.
+        precondition(VortXEngineProtocol.acceptsSessionStatus(roundTrip))
+        let nonFinite = VortXEngineProtocol.SessionStatus(
+            healthy: current.healthy, durationSeconds: .infinity,
+            timelineOriginSeconds: current.timelineOriginSeconds, frameRate: current.frameRate,
+            chapters: current.chapters, producedSegments: current.producedSegments,
+            producedBytes: current.producedBytes, ended: current.ended,
+            initPublished: current.initPublished, failed: current.failed,
+            signalingPublished: current.signalingPublished, dolbyVision: current.dolbyVision,
+            width: current.width, height: current.height, bandwidth: current.bandwidth,
+            videoRange: current.videoRange, supportsHDRFallback: current.supportsHDRFallback,
+            audioTracks: current.audioTracks, selectedAudioStreamIndex: current.selectedAudioStreamIndex,
+            subtitleTracks: current.subtitleTracks, producedEdgeSeconds: current.producedEdgeSeconds)
+        precondition(!VortXEngineProtocol.acceptsSessionStatus(nonFinite))
+        let excessiveTracks = VortXEngineProtocol.SessionStatus(
+            healthy: current.healthy, durationSeconds: current.durationSeconds,
+            timelineOriginSeconds: current.timelineOriginSeconds, frameRate: current.frameRate,
+            chapters: current.chapters, producedSegments: current.producedSegments,
+            producedBytes: current.producedBytes, ended: current.ended,
+            initPublished: current.initPublished, failed: current.failed,
+            signalingPublished: current.signalingPublished, dolbyVision: current.dolbyVision,
+            width: current.width, height: current.height, bandwidth: current.bandwidth,
+            videoRange: current.videoRange, supportsHDRFallback: current.supportsHDRFallback,
+            audioTracks: Array(repeating: current.audioTracks![0], count: 129),
+            selectedAudioStreamIndex: current.selectedAudioStreamIndex,
+            subtitleTracks: current.subtitleTracks, producedEdgeSeconds: current.producedEdgeSeconds)
+        precondition(!VortXEngineProtocol.acceptsSessionStatus(excessiveTracks))
         precondition(roundTrip.audioTracks?[0].codec == "truehd")
         precondition(roundTrip.audioTracks?[0].activeCodec == "eac3")
         precondition(roundTrip.audioTracks?[0].channels == 8)
