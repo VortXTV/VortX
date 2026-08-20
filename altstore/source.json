@@ -19,6 +19,15 @@
       "versions": [
         {
           "version": "0.3.14",
+          "buildVersion": "220",
+          "date": "2026-08-20",
+          "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-iOS-v0.3.14-beta.18-ci.ipa",
+          "size": 64243010,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
           "buildVersion": "219",
           "date": "2026-08-20",
           "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
@@ -79,15 +88,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.9/VortX-iOS-v0.3.14-beta.9-ci.ipa",
           "size": 62970820,
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "190",
-          "date": "2026-07-23",
-          "localizedDescription": "0.3.14 Beta 8. Same-day hotfix: Dolby Vision plays and starts fast, named audio and subtitle tracks, Singularity source details, and all four ratings everywhere.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.8/VortX-iOS-v0.3.14-beta.8-ci.ipa",
-          "size": 62473219,
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -102,6 +102,15 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "220",
+          "date": "2026-08-20",
+          "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-tvOS-v0.3.14-beta.18-ci.ipa",
+          "size": 63680653,
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "219",
@@ -163,15 +172,6 @@
           "localizedDescription": "0.3.14 Beta 9. Use a Mac as the engine, true Dolby Vision including Profile 7 enhancement layer, Dolby Atmos passthrough, Blu-ray subtitles, our own player engine, tvOS Now Playing, and working QR sign-in.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.9/VortX-tvOS-v0.3.14-beta.9-ci.ipa",
           "size": 62444033,
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "190",
-          "date": "2026-07-23",
-          "localizedDescription": "0.3.14 Beta 8. Same-day hotfix: Dolby Vision plays and starts fast, named audio and subtitle tracks, Singularity source details, and all four ratings everywhere.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.8/VortX-tvOS-v0.3.14-beta.8-ci.ipa",
-          "size": 61934130,
           "minOSVersion": "18.0"
         }
       ]
