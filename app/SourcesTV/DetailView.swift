@@ -1,5 +1,25 @@
 import SwiftUI
 
+/// The only programmatic focus destination on a detail page. It is attached to the visible title/metadata
+/// block rather than an invisible button, so the Up escape has a meaningful accessibility target.
+private enum DetailFocusTarget: Hashable {
+    case top
+}
+
+/// Stable ids shared by movie, series, and episode detail scroll views. The anchor is non-focusable; the
+/// adjacent visible metadata target owns focus after an upward escape.
+private enum DetailFocusAnchor {
+    static let top = "vortx.detail.top"
+}
+
+/// Up is captured only while focus is below the visible hero. Once the semantic top target owns focus, the
+/// event is deliberately allowed to continue to the native tab/menu focus path instead of cycling locally.
+private enum DetailFocusEscapePolicy {
+    static func shouldCaptureUp(topFocused: Bool) -> Bool {
+        !topFocused
+    }
+}
+
 /// Meta detail, driven by the **stremio-core** engine (CoreBridge): a cinematic hero + overview, then
 /// streams (movie) or a season selector with episode thumbnails (series). Streams come from the
 /// engine's `meta_details`, the same complete, per-addon list the official app shows.
@@ -59,6 +79,9 @@ struct DetailView: View {
     /// washed into the page background below the hero so the detail page carries the title's palette
     /// instead of flat canvas. nil (no art / not computed) keeps today's canvas exactly.
     @State private var dominantTint: Color?
+    /// Visible title/metadata focus target used as the deterministic landing point for an Up press from
+    /// languages, action rows, cast, providers, or recommendation rails.
+    @FocusState private var detailFocusTarget: DetailFocusTarget?
 
     /// The route/catalog ID remains `id`. Only engine metadata and stream requests move to this recovered
     /// IMDb ID, so existing catalog/source identity roles continue to receive the raw ID they require.
@@ -472,6 +495,8 @@ struct DetailView: View {
     /// just the languages this title is available in.
     @ViewBuilder private var languageChips: some View {
         if !langChips.isEmpty {
+            // These wrapped rows are display-only, not focus stops. Their count can be 0/1/many; the owning
+            // movie detail page's Up handler remains the single escape route for every lower focusable rail.
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Text("Also available in")
                     .font(Theme.Typography.eyebrow)
@@ -789,6 +814,31 @@ struct DetailView: View {
                                   runtime: m.runtime, overview: m.description, genres: m.genres)
     }
 
+    /// Restore the semantic top of the current detail page after an upward escape. The immediate focus seat
+    /// is paired with a delayed visibility heal because tvOS can apply the scroll and tab-bar layout passes on
+    /// different run-loop turns. No invisible control is inserted and no focus loop is created: the next Up
+    /// from `.top` is intentionally handled by the shell's menu/tab-bar focus graph.
+    private func moveToDetailTop(using proxy: ScrollViewProxy) {
+        withAnimation(.easeOut(duration: 0.25)) {
+            proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)
+        }
+        DispatchQueue.main.async {
+            detailFocusTarget = .top
+            TabBarHealer.heal("detail-focus-top")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            TabBarHealer.heal("detail-focus-top+layout")
+        }
+    }
+
+    /// Only Up is intercepted. Horizontal movement remains owned by each action/content rail, while Down
+    /// keeps the normal focus-engine transfer from the hero into the detail content.
+    private func handleDetailMove(_ direction: MoveCommandDirection, using proxy: ScrollViewProxy) {
+        guard direction == .up,
+              DetailFocusEscapePolicy.shouldCaptureUp(topFocused: detailFocusTarget == .top) else { return }
+        moveToDetailTop(using: proxy)
+    }
+
     /// Series keep the hero + episode-list layout (the page below the hero is full of content).
     private func seriesPage(_ meta: CoreMetaItem, videos: [CoreVideo]) -> some View {
         // VortX's own watched set (the authority), then the same set widened by the optional Trakt episode
@@ -830,23 +880,31 @@ struct DetailView: View {
                 heroTrailerLayer(meta).ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                        Color.clear.frame(height: 0).id(DetailFocusAnchor.top)
                         hero(meta, primaryEpisode: primary?.video, primaryIsResume: primary?.isResume == true,
                              primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
                              orderedEpisodes: ordered,
                              scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } })
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
                                              orderedEpisodes: ordered,
                                              watched: watched,
                                              initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season)
                             .id("detailContent")
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                         castSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                         whereToWatchSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                         collectionSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                         moreLikeThisSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                     }
                     .padding(.bottom, Theme.Space.xl)
                 }
+                .onMoveCommand { handleDetailMove($0, using: proxy) }
             }
         }
         // Show-level watched rollup (issue #143): a series reads as watched once every AIRED, regular-season
@@ -892,56 +950,68 @@ struct DetailView: View {
             // #44: the muted, looping trailer fades in OVER the still backdrop (full-bleed, behind the
             // scrolling content). Non-focusable + no hit-testing, so the focus engine is untouched.
             heroTrailerLayer(m).ignoresSafeArea()
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.xl) {
-                    // FIRST SCREEN: title block up top, action band anchored at the bottom.
-                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                        Spacer().frame(height: 200)   // logo/description move UP (was 380)
-                        VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                            titleOrLogo(m)
-                            metaRow(m)
-                            financialsRow()
-                            releaseDatesRow()
-                            if let d = m.description, !d.isEmpty {
-                                // 5a/6a (build 171): reserve space for a FIXED 3 lines (was an elastic 4)
-                                // so a short synopsis occupies the SAME height as a long one. The block above
-                                // the action band is now length-independent, so the bottom-anchored Watch
-                                // button holds one position across every title and the first screen can no
-                                // longer overflow into a scrolled state that traps the upward focus path.
-                                // Non-focusable, so Watch keeps default focus and the up-path is untouched.
-                                Text(d)
-                                    .font(Theme.Typography.body)
-                                    .foregroundStyle(Theme.Palette.textSecondary)
-                                    .lineLimit(3, reservesSpace: true).lineSpacing(2)
-                                    .frame(maxWidth: 1000, alignment: .leading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.xl) {
+                        Color.clear.frame(height: 0).id(DetailFocusAnchor.top)
+                        // FIRST SCREEN: title block up top, action band anchored at the bottom.
+                        VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                            Spacer().frame(height: 200)   // logo/description move UP (was 380)
+                            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                                titleOrLogo(m)
+                                metaRow(m)
+                                financialsRow()
+                                releaseDatesRow()
+                                if let d = m.description, !d.isEmpty {
+                                    // 5a/6a (build 171): reserve space for a FIXED 3 lines (was an elastic 4)
+                                    // so a short synopsis occupies the SAME height as a long one. The block above
+                                    // the action band is now length-independent, so the bottom-anchored Watch
+                                    // button holds one position across every title and the first screen can no
+                                    // longer overflow into a scrolled state that traps the upward focus path.
+                                    // Non-focusable, so Watch keeps default focus and the up-path is untouched.
+                                    Text(d)
+                                        .font(Theme.Typography.body)
+                                        .foregroundStyle(Theme.Palette.textSecondary)
+                                        .lineLimit(3, reservesSpace: true).lineSpacing(2)
+                                        .frame(maxWidth: 1000, alignment: .leading)
+                                }
+                            }
+                            .focusable()
+                            .focused($detailFocusTarget, equals: .top)
+                            .accessibilityElement(children: .combine)
+                            // Flexible gap pushes the action band down to the bottom of the first screen.
+                            Spacer(minLength: Theme.Space.lg)
+                            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                                languageChips
+                                CoreStreamList(title: m.name,
+                                               meta: PlaybackMeta(libraryId: m.id, videoId: m.id,
+                                                                  type: m.type.isEmpty ? effectiveType : m.type,
+                                                                  name: m.name, poster: m.poster,
+                                                                  season: nil, episode: nil),
+                                               identityRoles: sourceIndexRoles,
+                                               initialStartAtSeconds: validInitialResumeSeconds,
+                                               initialTraktSessionID: initialTraktSessionID,
+                                               secondaryAction: AnyView(trailerChip(m)),
+                                               performRefindLoad: { performMovieRefindLoad() })
+                                    .onMoveCommand { handleDetailMove($0, using: proxy) }
                             }
                         }
-                        // Flexible gap pushes the action band down to the bottom of the first screen.
-                        Spacer(minLength: Theme.Space.lg)
-                        VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                            languageChips
-                            HStack(spacing: Theme.Space.sm) { trailerChip(m) }
-                            CoreStreamList(title: m.name,
-                                           meta: PlaybackMeta(libraryId: m.id, videoId: m.id,
-                                                              type: m.type.isEmpty ? effectiveType : m.type,
-                                                              name: m.name, poster: m.poster,
-                                                              season: nil, episode: nil),
-                                           identityRoles: sourceIndexRoles,
-                                           initialStartAtSeconds: validInitialResumeSeconds,
-                                           initialTraktSessionID: initialTraktSessionID,
-                                           performRefindLoad: { performMovieRefindLoad() })
-                        }
+                        .padding(.horizontal, Theme.Space.screenEdge)
+                        .padding(.bottom, Theme.Space.lg)
+                        .frame(minHeight: Self.firstScreenHeight, alignment: .top)   // first screen ~= one viewport tall (version-safe; no tvOS-17 containerRelativeFrame)
+                        // SECOND SECTION (below the fold): scrolls in only on deliberate down-nav.
+                        castSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
+                        whereToWatchSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
+                        collectionSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
+                        moreLikeThisSection
+                            .onMoveCommand { handleDetailMove($0, using: proxy) }
                     }
-                    .padding(.horizontal, Theme.Space.screenEdge)
-                    .padding(.bottom, Theme.Space.lg)
-                    .frame(minHeight: Self.firstScreenHeight, alignment: .top)   // first screen ~= one viewport tall (version-safe; no tvOS-17 containerRelativeFrame)
-                    // SECOND SECTION (below the fold): scrolls in only on deliberate down-nav.
-                    castSection
-                    whereToWatchSection
-                    collectionSection
-                    moreLikeThisSection
+                    .padding(.bottom, Theme.Space.xl)
                 }
-                .padding(.bottom, Theme.Space.xl)
+                .onMoveCommand { handleDetailMove($0, using: proxy) }
             }
         }
     }
@@ -1127,67 +1197,82 @@ struct DetailView: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             Spacer().frame(height: 380)
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                Text(m.name)
-                    .font(Theme.Typography.hero).tracking(-1.5)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(2).minimumScaleFactor(0.6)
-                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
-                metaRow(m)
-                financialsRow()
-                releaseDatesRow()
-                if let d = m.description, !d.isEmpty {
-                    Text(d)
-                        .font(Theme.Typography.body)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                        .lineLimit(3).lineSpacing(2)
-                        .frame(maxWidth: 1000, alignment: .leading)
+                // This visible title/metadata block is the top focus destination for every lower rail.
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    Text(m.name)
+                        .font(Theme.Typography.hero).tracking(-1.5)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .lineLimit(2).minimumScaleFactor(0.6)
+                        .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                    metaRow(m)
+                    financialsRow()
+                    releaseDatesRow()
+                    if let d = m.description, !d.isEmpty {
+                        Text(d)
+                            .font(Theme.Typography.body)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .lineLimit(3).lineSpacing(2)
+                            .frame(maxWidth: 1000, alignment: .leading)
+                    }
                 }
-                // On-screen focusable anchor: grabs initial focus on push (so Back pops instead of
-                // exiting), and jumps to the episodes / sources below.
+                .focusable()
+                .focused($detailFocusTarget, equals: .top)
+                .accessibilityElement(children: .combine)
+                // Playback and page actions stay below the visible focus anchor, in two semantic rows.
                 VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                    TVDetailActionRail(spacing: Theme.Space.sm) {
-                        if let primaryEpisode {
-                            VStack(spacing: Theme.Space.xs) {
-                                NavigationLink {
-                                    CoreEpisodeStreams(meta: m, video: primaryEpisode,
-                                                       season: primaryEpisode.season ?? 0,
-                                                       episodes: orderedEpisodes,
-                                                       initialStartAtSeconds: primaryResumeSeconds,
-                                                       initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
-                                } label: {
-                                    Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
-                                                              resumeSeconds: primaryResumeSeconds),
-                                          systemImage: "play.fill")
+                    // Keep the playback/navigation row above the secondary integrations row. Each
+                    // row is its own focus section, so up/down moves between semantic groups while
+                    // left/right remains local to the currently focused row.
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        // PRIMARY: play/resume and episode navigation.
+                        TVDetailActionRow(spacing: Theme.Space.sm) {
+                            if let primaryEpisode {
+                                VStack(spacing: Theme.Space.xs) {
+                                    NavigationLink {
+                                        CoreEpisodeStreams(meta: m, video: primaryEpisode,
+                                                           season: primaryEpisode.season ?? 0,
+                                                           episodes: orderedEpisodes,
+                                                           initialStartAtSeconds: primaryResumeSeconds,
+                                                           initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
+                                    } label: {
+                                        Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
+                                                                  resumeSeconds: primaryResumeSeconds),
+                                              systemImage: "play.fill")
+                                    }
+                                    .buttonStyle(PrimaryActionStyle())
+                                    if primaryIsResume, primaryProgress > 0.01 {
+                                        ProgressStripe(value: primaryProgress)
+                                            .padding(.horizontal, Theme.Space.sm)
+                                    }
+                                }
+                                .fixedSize(horizontal: true, vertical: false)
+                            }
+                            if primaryEpisode == nil {
+                                Button(action: scrollToContent) {
+                                    Label(type == "series" ? "Episodes" : "Watch",
+                                          systemImage: type == "series" ? "list.bullet" : "play.fill")
                                 }
                                 .buttonStyle(PrimaryActionStyle())
-                                if primaryIsResume, primaryProgress > 0.01 {
-                                    ProgressStripe(value: primaryProgress)
-                                        .padding(.horizontal, Theme.Space.sm)
+                            } else {
+                                Button(action: scrollToContent) {
+                                    Label("Episodes", systemImage: "list.bullet")
                                 }
+                                .buttonStyle(ChipButtonStyle())
                             }
-                            .fixedSize(horizontal: true, vertical: false)
                         }
-                        if primaryEpisode == nil {
-                            Button(action: scrollToContent) {
-                                Label(type == "series" ? "Episodes" : "Watch",
-                                      systemImage: type == "series" ? "list.bullet" : "play.fill")
-                            }
-                            .buttonStyle(PrimaryActionStyle())
-                        } else {
-                            Button(action: scrollToContent) {
-                                Label("Episodes", systemImage: "list.bullet")
-                            }
-                            .buttonStyle(ChipButtonStyle())
+
+                        // SECONDARY: trailer, library, watchlist, ratings, and optional check-in.
+                        TVDetailActionRow(spacing: Theme.Space.sm) {
+                            trailerChip(m)
+                            LibraryChip()
+                            WatchlistChip()
+                            ratingChip
+                            // "I'm watching this" on Trakt, for a cinema or someone else's TV. A series checks
+                            // into an EPISODE, so it passes the same episode the Play button above would start;
+                            // a movie has none and passes nil. Hidden unless Trakt is connected and the action
+                            // was turned on, so this costs a movie page nothing by default.
+                            TraktCheckinChip(season: primaryEpisode?.season, episode: primaryEpisode?.episode)
                         }
-                        LibraryChip()
-                        WatchlistChip()
-                        ratingChip
-                        trailerChip(m)
-                        // "I'm watching this" on Trakt, for a cinema or someone else's TV. A series checks
-                        // into an EPISODE, so it passes the same episode the Play button above would start;
-                        // a movie has none and passes nil. Hidden unless Trakt is connected and the action
-                        // was turned on, so this costs a movie page nothing by default.
-                        TraktCheckinChip(season: primaryEpisode?.season, episode: primaryEpisode?.episode)
                     }
                 }
                 .padding(.top, Theme.Space.xs)
@@ -1974,6 +2059,8 @@ struct CoreEpisodeStreams: View {
     // the pushed-page twin of the CoreSeasonedEpisodes #7 return-to-episode signal, which only covered the grid.
     @State private var currentVideo: CoreVideo
     @State private var episodeTargetGeneration = 0
+    /// The visible episode title/metadata block is the top escape target for the episode's source list.
+    @FocusState private var episodeFocusTarget: DetailFocusTarget?
 
     init(
         meta: CoreMetaItem,
@@ -2014,31 +2101,55 @@ struct CoreEpisodeStreams: View {
     /// The season the page shows: follows `currentVideo` so a cross-season binge advance re-labels correctly.
     private var shownSeason: Int { currentVideo.season ?? season }
 
+    private func moveToEpisodeTop(using proxy: ScrollViewProxy) {
+        withAnimation(.easeOut(duration: 0.25)) {
+            proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)
+        }
+        DispatchQueue.main.async {
+            episodeFocusTarget = .top
+            TabBarHealer.heal("episode-detail-focus-top")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            TabBarHealer.heal("episode-detail-focus-top+layout")
+        }
+    }
+
+    private func handleEpisodeMove(_ direction: MoveCommandDirection, using proxy: ScrollViewProxy) {
+        guard direction == .up,
+              DetailFocusEscapePolicy.shouldCaptureUp(topFocused: episodeFocusTarget == .top) else { return }
+        moveToEpisodeTop(using: proxy)
+    }
+
     var body: some View {
         ZStack {
             FullBleedBackdrop(url: currentVideo.thumbnail ?? meta.background ?? meta.poster)
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    Spacer().frame(height: 400)   // let the episode still own the top of the screen
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Text(meta.name.uppercased())
-                            .font(Theme.Typography.eyebrow).tracking(1.5)
-                            .foregroundStyle(Theme.Palette.accent)
-                        Text(episodeTitle)
-                            .font(Theme.Typography.screenTitle)
-                            .foregroundStyle(Theme.Palette.textPrimary)
-                            .lineLimit(2).minimumScaleFactor(0.7)
-                            .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
-                        episodeMetaRow
-                        if let overview = currentVideo.overview, !overview.isEmpty {
-                            Text(overview)
-                                .font(Theme.Typography.body)
-                                .foregroundStyle(Theme.Palette.textSecondary)
-                                .lineLimit(4).lineSpacing(2)
-                                .frame(maxWidth: 1000, alignment: .leading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        Color.clear.frame(height: 0).id(DetailFocusAnchor.top)
+                        Spacer().frame(height: 400)   // let the episode still own the top of the screen
+                        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                            Text(meta.name.uppercased())
+                                .font(Theme.Typography.eyebrow).tracking(1.5)
+                                .foregroundStyle(Theme.Palette.accent)
+                            Text(episodeTitle)
+                                .font(Theme.Typography.screenTitle)
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                                .lineLimit(2).minimumScaleFactor(0.7)
+                                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                            episodeMetaRow
+                            if let overview = currentVideo.overview, !overview.isEmpty {
+                                Text(overview)
+                                    .font(Theme.Typography.body)
+                                    .foregroundStyle(Theme.Palette.textSecondary)
+                                    .lineLimit(4).lineSpacing(2)
+                                    .frame(maxWidth: 1000, alignment: .leading)
+                            }
                         }
-                    }
-                    CoreStreamList(title: "\(meta.name) · S\(shownSeason)·E\(currentVideo.episode ?? 0)",
+                        .focusable()
+                        .focused($episodeFocusTarget, equals: .top)
+                        .accessibilityElement(children: .combine)
+                        CoreStreamList(title: "\(meta.name) · S\(shownSeason)·E\(currentVideo.episode ?? 0)",
                                    meta: PlaybackMeta(libraryId: meta.id, videoId: currentVideo.id, type: meta.type,
                                                       name: meta.name, poster: meta.poster,
                                                       season: currentVideo.season, episode: currentVideo.episode),
@@ -2071,9 +2182,12 @@ struct CoreEpisodeStreams: View {
                                        core.refindSources(type: "series", id: meta.id,
                                                           streamType: "series", streamId: currentVideo.id)
                                    })
+                            .onMoveCommand { handleEpisodeMove($0, using: proxy) }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.bottom, Theme.Space.xl)
                 }
-                .padding(.horizontal, Theme.Space.screenEdge)
-                .padding(.bottom, Theme.Space.xl)
+                .onMoveCommand { handleEpisodeMove($0, using: proxy) }
             }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
@@ -2207,6 +2321,11 @@ struct CoreStreamList: View {
     var initialStartAtSeconds: Double? = nil
     /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
     var initialTraktSessionID: TraktSessionID? = nil
+    /// Optional detail action supplied by the mounting page (the movie trailer). It joins the secondary
+    /// row so every action remains in one of the two semantic focus sections instead of forming a stray
+    /// third row above the source controls. `AnyView` keeps this view's generic surface unchanged for the
+    /// live and episodic call sites, which have no secondary page-owned action.
+    var secondaryAction: AnyView? = nil
     /// "Re-find sources": the exact engine `refindSources` call, wired by the mounting page (which owns the
     /// title/episode stream args). This list owns the auxiliary contributors + the `SourceListModel`, so its
     /// own `refindSources()` handler busts the per-title caches and repaints, then invokes this to Unload ->
@@ -2450,7 +2569,11 @@ struct CoreStreamList: View {
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
-                TVDetailActionRail {
+                // The two rows are adjacent and contain no spacer, so tvOS can transfer focus
+                // deterministically up/down while each row owns left/right traversal.
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    // PRIMARY: playback and source selection decisions.
+                    TVDetailActionRow {
                     // Stays FOCUSABLE while gated (a disabled button is unfocusable on tvOS, which
                     // dumped focus onto the Quality chip); the action is simply inert until the
                     // add-ons settle, then the same focused button springs alive in place.
@@ -2552,6 +2675,12 @@ struct CoreStreamList: View {
                         .buttonStyle(ChipButtonStyle())
                     }
 
+                    }
+
+                    // SECONDARY: page actions and optional integrations.
+                    TVDetailActionRow {
+                        if let secondaryAction { secondaryAction }
+
                     // Offline download of the auto-picked best source (#30). Same three-state feedback as
                     // iOS: Download (idle, only when watchReady) / Downloading / Downloaded. Disabled while
                     // sources still settle so it can't queue a half-ranked pick. Hidden for LIVE channels,
@@ -2563,6 +2692,7 @@ struct CoreStreamList: View {
                     LibraryChip()
                     WatchlistChip()
                     ratingChip
+                    }
                 }
                 // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
                 if let reason = StreamRanking.pickReason(best) {
@@ -3607,15 +3737,15 @@ struct CoreStreamList: View {
     }
 }
 
-/// A horizontal, focus-contained action rail for detail-page controls.
+/// One horizontal, focus-contained action row for detail-page controls.
 ///
-/// Detail actions are intentionally kept in one row so the primary Watch action and its related
-/// controls remain adjacent. A regular HStack receives the page's finite width proposal and lets its
-/// children compress; on tvOS that makes longer labels wrap inside otherwise small pills. The scroll
-/// view removes that horizontal constraint, while the intrinsic-width HStack keeps each control legible
-/// and lets the Siri Remote traverse the complete row. `focusSection` keeps left/right navigation in
-/// the rail and preserves the existing up/down path to the page content.
-private struct TVDetailActionRail<Content: View>: View {
+/// Detail actions are split into adjacent semantic rows by their caller. A regular HStack receives the
+/// page's finite width proposal and lets its children compress; on tvOS that makes longer labels wrap
+/// inside otherwise small pills. The scroll view removes that horizontal constraint, while the
+/// intrinsic-width HStack keeps each control legible and lets the Siri Remote traverse the complete row.
+/// `focusSection` keeps left/right navigation local to this row, and adjacent rows in the caller's VStack
+/// provide the reliable up/down transfer between semantic groups.
+private struct TVDetailActionRow<Content: View>: View {
     private let spacing: CGFloat
     private let content: Content
 
