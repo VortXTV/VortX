@@ -9,6 +9,7 @@ import com.vortx.android.sources.ProviderHealth
 import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePrefsSnapshot
 import com.vortx.android.torbox.TorBoxSearchSource
+import com.vortx.android.communityjs.CommunityJsProviderSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,6 +73,7 @@ class SourceListModel(
 
     private var torbox: TorBoxSearchSource? = null
     private var singularity: SourceIndexServeSource? = null
+    private var communityJs: CommunityJsProviderSource? = null
     private var job: Job? = null
     private var publishedSignature: Signature? = null
 
@@ -98,21 +100,28 @@ class SourceListModel(
     /// Wire the model to its per-screen TorBox + Singularity sources and start the coalesced rebuild pipeline.
     /// Idempotent. Paints once immediately (back-navigation can arrive with streams already resident), then
     /// coalesces subsequent input changes. Mirrors Apple `bind`.
-    fun bind(torbox: TorBoxSearchSource, singularity: SourceIndexServeSource) {
+    fun bind(torbox: TorBoxSearchSource, singularity: SourceIndexServeSource) = bind(torbox, singularity, null)
+
+    fun bind(torbox: TorBoxSearchSource, singularity: SourceIndexServeSource, communityJs: CommunityJsProviderSource?) {
         if (job != null) return
         this.torbox = torbox
         this.singularity = singularity
+        this.communityJs = communityJs
         job = scope.launch(Dispatchers.Default) {
             rebuild() // immediate first paint
-            combine(
+            val baseChanges = combine(
                 rawGroups,
                 mediaServerGroups,
                 context,
                 torbox.streams,
                 singularity.streams,
             ) { _, _, _, _, _ -> Unit }
+            val contributorChanges = communityJs?.let { js -> baseChanges.combine(js.groups) { _, _ -> Unit } } ?: baseChanges
+            val settlementChanges = contributorChanges
                 .combine(torbox.settlement) { _, _ -> Unit }
                 .combine(singularity.settlement) { _, _ -> Unit }
+            val allChanges = communityJs?.let { js -> settlementChanges.combine(js.settled) { _, _ -> Unit } } ?: settlementChanges
+            allChanges
                 .conflate()
                 .collect {
                     // Trailing coalesce window: a burst of input changes collapses to the latest, and the
@@ -181,6 +190,7 @@ class SourceListModel(
     private fun rebuild() {
         val tb = torbox ?: return
         val sing = singularity ?: return
+        val js = communityJs
         val ctx = context.value
         val raw = rawGroups.value
         val media = mediaServerGroups.value
@@ -189,18 +199,25 @@ class SourceListModel(
             readEpoch = { sing.epoch },
             readStreams = { sing.streams.value },
         )
+        val jsSnapshot = js?.let { source ->
+            stableContributorSnapshot(
+                readEpoch = { source.epoch.value },
+                readStreams = { source.groups.value },
+            )
+        } ?: ContributorSnapshot(emptyList<StreamGroup>(), 0)
 
         val signature = Signature(
             rawHash = raw.hashCode(),
             mediaHash = media.hashCode(),
             torboxEpoch = torboxSnapshot.epoch,
             singularityEpoch = singularitySnapshot.epoch,
+            communityJsEpoch = jsSnapshot.epoch,
             inputsHash = inputsHash(ctx),
         )
         if (signature == publishedSignature) return // published output already correct: skip the assembly
         publishedSignature = signature
 
-        val assembled = assemble(raw, torboxSnapshot.streams, singularitySnapshot.streams, media, ctx).copy(
+        val assembled = assemble(raw, torboxSnapshot.streams, singularitySnapshot.streams, jsSnapshot.streams, media, ctx).copy(
             torboxEpoch = torboxSnapshot.epoch,
             singularityEpoch = singularitySnapshot.epoch,
         )
@@ -251,6 +268,7 @@ class SourceListModel(
         val mediaHash: Int,
         val torboxEpoch: Int,
         val singularityEpoch: Int,
+        val communityJsEpoch: Int,
         val inputsHash: Int,
     )
 
@@ -292,6 +310,7 @@ class SourceListModel(
             raw: List<StreamGroup>,
             torboxStreams: List<StreamSource>,
             singularityStreams: List<StreamSource>,
+            communityJsGroups: List<StreamGroup>,
             mediaServerGroups: List<StreamGroup>,
             ctx: Context,
         ): SourceListState {
@@ -303,9 +322,12 @@ class SourceListModel(
             // media-server direct-play groups. Final rank order is decided by StreamRanking, not merge order.
             assembled = mergeMediaServer(
                 mediaServerGroups,
-                SourceIndexServeSource.merge(
+                CommunityJsProviderSource.merge(
+                    SourceIndexServeSource.merge(
                     singularityStreams,
                     assembled,
+                    ),
+                    communityJsGroups,
                 ),
             )
 

@@ -182,6 +182,7 @@ class SourceIndexCaptureTest {
             raw = emptyList(),
             torboxStreams = emptyList(),
             singularityStreams = listOf(pooled),
+            communityJsGroups = emptyList(),
             mediaServerGroups = emptyList(),
             ctx = SourceListModel.Context(),
         )
@@ -210,6 +211,7 @@ class SourceIndexCaptureTest {
             raw = raw,
             torboxStreams = emptyList(),
             singularityStreams = emptyList(),
+            communityJsGroups = emptyList(),
             mediaServerGroups = listOf(StreamGroup("Plex", listOf(media))),
             ctx = ctx,
         )

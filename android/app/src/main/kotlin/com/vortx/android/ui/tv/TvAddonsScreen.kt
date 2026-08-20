@@ -78,6 +78,10 @@ internal fun TvAddonsScreen(
     configureAddon?.let { addon ->
         TvAddonConfigureDialog(addon = addon, onDismiss = { configureAddon = null })
     }
+    var showCommunityProviders by remember { mutableStateOf(false) }
+    if (showCommunityProviders) {
+        TvCommunityJsDialog(onDismiss = { showCommunityProviders = false })
+    }
 
     LaunchedEffect(viewModel) {
         viewModel.onScreenEntry()
@@ -115,6 +119,11 @@ internal fun TvAddonsScreen(
                 TvAddonAction(
                     label = stringResource(R.string.addon_discover),
                     onClick = onDiscover,
+                    modifier = Modifier.width(260.dp),
+                )
+                TvAddonAction(
+                    label = "Community JS providers",
+                    onClick = { showCommunityProviders = true },
                     modifier = Modifier.width(260.dp),
                 )
             }

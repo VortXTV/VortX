@@ -47,6 +47,7 @@ import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.torbox.TorBoxSearchSource
+import com.vortx.android.communityjs.CommunityJsProviderSource
 import com.vortx.android.ui.UiState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -271,6 +272,7 @@ class DetailViewModel(
     private val debrid = DebridCoordinator(DebridResolver(debridKeys), debridKeys)
     private val torbox = TorBoxSearchSource(debridKeys)
     private val singularity = SourceIndexServeSource()
+    private val communityJs = CommunityJsProviderSource(app)
     private val sourceSticky = SeriesSourceSticky(app)
     private val sourceModel = SourceListModel(viewModelScope, sourceSticky = sourceSticky)
     private val sourcePrefs = SourcePreferencesStore(app)
@@ -422,7 +424,7 @@ class DetailViewModel(
         // Start the assembly pipeline and bridge its ranked output to [_streams]. The bridge is gated by
         // [sourcesReady] so the coalescer's empty first paint (bind paints once immediately, and every new
         // load resets rawGroups to empty) never overwrites the Loading shimmer or a load Error.
-        sourceModel.bind(torbox, singularity)
+        sourceModel.bind(torbox, singularity, communityJs)
         viewModelScope.launch {
             sourceModel.state.collect { st ->
                 val token = sourceRequestFence.currentToken()
@@ -669,6 +671,14 @@ class DetailViewModel(
             contentId,
             isSignedIn(),
             request.generation,
+        )
+        communityJs.refresh(
+            scope = viewModelScope,
+            imdbId = imdb,
+            mediaType = if (type == MediaType.SERIES) "tv" else "movie",
+            season = season,
+            episode = episodeNum,
+            requestGeneration = request.generation,
         )
         val ctx = buildContext(episodeId, contentId, request, advanceHint)
         lastCtx = ctx

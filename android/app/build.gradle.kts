@@ -440,6 +440,15 @@ android {
     // ndkVersion pins the NDK the cargo-ndk linker uses. Keep in sync with the NDK CI installs.
     ndkVersion = "27.2.12479018"
 
+    // The bounded community-provider host is a separate C library. It deliberately does not share
+    // symbols or build output with the Rust engine JNI library above.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/community_js/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     // In the `full` flavor two native-lib sources coexist: the cargo-ndk Rust output
     // (libstremiox_core.so) and the libmpv AAR (libmpv.so + libplayer.so + libavcodec.so +
     // libc++_shared.so). Both can ship a libc++_shared.so for the same ABI, which makes AGP's jniLibs
