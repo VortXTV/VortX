@@ -68,4 +68,13 @@ class SubtitlePoolContributionTest {
         assertFalse(SubtitlePoolContribution.canUploadEmbedded("https://cdn/movie.mkv"))
         assertFalse(SubtitlePoolContribution.canUploadEmbedded("http://127.0.0.1:11470/stream"))
     }
+
+    @Test
+    fun addOnHoardingRejectsPrivateOrCleartextEndpoints() {
+        assertTrue(SubtitlePoolContribution.isSafeAddonTextUrl("https://subs.example/track?id=1"))
+        assertFalse(SubtitlePoolContribution.isSafeAddonTextUrl("http://subs.example/track"))
+        assertFalse(SubtitlePoolContribution.isSafeAddonTextUrl("https://127.0.0.1:8080/track"))
+        assertFalse(SubtitlePoolContribution.isSafeAddonTextUrl("https://192.168.1.1/track"))
+        assertFalse(SubtitlePoolContribution.isSafeAddonTextUrl("https://localhost/track"))
+    }
 }

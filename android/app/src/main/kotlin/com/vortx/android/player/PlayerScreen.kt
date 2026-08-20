@@ -72,7 +72,11 @@ import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
+import com.vortx.android.trickplay.TmdbImdbResolver
 import com.vortx.android.trickplay.TrickplaySession
+import com.vortx.android.player.subtitles.SubtitlePlaybackIdentity
+import com.vortx.android.player.subtitles.SubtitlePoolClient
+import com.vortx.android.player.subtitles.SubtitlePoolContribution
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -200,8 +204,9 @@ fun PlayerScreen(
     }
     val currentPlayable = sourceSwitchState.playable
     val playbackSessionKey = sourceSwitchState.sessionKey
-    val subtitleContentKey = remember(playbackSessionKey) {
-        subtitleOffsetContentKey(currentPlayable.mediaRef)
+    var resolvedSubtitleRef by remember(playbackSessionKey) { mutableStateOf(currentPlayable.mediaRef) }
+    var subtitleContentKey by remember(playbackSessionKey) {
+        mutableStateOf(subtitleOffsetContentKey(currentPlayable.mediaRef))
     }
 
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
@@ -814,6 +819,94 @@ fun PlayerScreen(
         seekNudgeTargetMs = null
     }
 
+    // Resolve a catalog-only playback identity ONCE before any subtitle consumer runs. A TMDB-backed
+    // title otherwise has no IMDb-shaped add-on video id or community content key, despite being the
+    // same movie/episode the catalog edge can resolve. The resolver is cached and fail-soft; a miss
+    // preserves the original ref so a direct IMDb playback never regresses.
+    LaunchedEffect(playbackSessionKey) {
+        val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
+        val resolved = if (SubtitlePoolContribution.contentKey(ref) == null && ref.tmdb != null) {
+            TmdbImdbResolver.resolveImdbId(
+                context = context.applicationContext,
+                rawId = "tmdb:${ref.tmdb}",
+                seriesHint = ref.isSeries,
+            )?.let { SubtitlePlaybackIdentity.withResolvedImdb(ref, it) }
+        } else {
+            ref
+        }
+        resolvedSubtitleRef = resolved
+        val key = SubtitlePoolContribution.contentKey(resolved)
+        if (key != null && key != subtitleContentKey) {
+            subtitleContentKey = key
+            subtitleDelaySeconds = SubtitleOffsetMemory.savedOffset(context, key) ?: 0.0
+            if (engine.subtitleDelayAvailable && subtitleDelaySeconds != 0.0) {
+                engine.setSubtitleDelay(subtitleDelaySeconds)
+            }
+        }
+    }
+
+    // COMMUNITY SUBTITLE POOL. This is deliberately independent of add-on playback: a pool outage,
+    // account absence, or an identity miss leaves the ordinary embedded/add-on subtitle sheet untouched.
+    // When identity is available we fetch choices, seed a release-scoped timing offset once, and contribute
+    // local embedded text in the background. Every network primitive remains fail-soft in SubtitlePoolClient.
+    var pooledSubtitles by remember(playbackSessionKey) { mutableStateOf<List<SubtitlePoolClient.PooledSubtitle>>(emptyList()) }
+    var subtitlePoolIdentity by remember(playbackSessionKey) { mutableStateOf<SubtitlePlaybackIdentity.PoolIdentity?>(null) }
+    var poolOffsetSeeded by remember(playbackSessionKey) { mutableStateOf(false) }
+    var embeddedUploadStarted by remember(playbackSessionKey) { mutableStateOf(false) }
+    var pendingOffsetPublication by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
+    LaunchedEffect(playbackSessionKey, resolvedSubtitleRef, playerState.durationMs) {
+        val ref = resolvedSubtitleRef ?: return@LaunchedEffect
+        val identity = SubtitlePlaybackIdentity.poolIdentity(
+            ref = ref,
+            durationMs = latestState.durationMs,
+            frameRate = engine.videoFrameProfile()?.fps,
+            releaseName = sourceSwitchState.currentSource?.filename
+                ?: sourceSwitchState.currentSource?.title
+                ?: currentPlayable.title,
+        ) ?: return@LaunchedEffect
+        subtitlePoolIdentity = identity
+        SubtitlePoolContribution.ensureMoatProviderWired()
+        val signedIn = (context.applicationContext as? VortXApplication)?.syncManager?.isSignedIn == true
+        if (!signedIn) return@LaunchedEffect
+        val pooled = SubtitlePoolClient.fetchPooled(
+            contentKey = identity.contentKey,
+            fingerprint = identity.fingerprint,
+            isSignedIn = true,
+        )
+        pooledSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
+            items = pooled.subs,
+            enabled = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).subtitlesOnlyPreferred,
+            preferredLanguages = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current.subtitleLanguages,
+            language = SubtitlePoolClient.PooledSubtitle::lang,
+        )
+        if (!poolOffsetSeeded) {
+            val resolution = SubtitlePoolContribution.resolveOffset(
+                context = context,
+                contentKey = identity.contentKey,
+                poolOffsetMs = pooled.offsetMs,
+                alreadySeeded = false,
+            )
+            poolOffsetSeeded = resolution.seeded
+            if (resolution.seconds != 0.0) {
+                subtitleDelaySeconds = resolution.seconds
+                if (engine.subtitleDelayAvailable) engine.setSubtitleDelay(resolution.seconds)
+            }
+        }
+        if (!embeddedUploadStarted && SubtitlePoolContribution.canUploadEmbedded(currentPlayable.url)) {
+            embeddedUploadStarted = true
+            SubtitlePoolContribution.uploadEmbedded(identity.contentKey, identity.fingerprint, currentPlayable.url)
+        }
+    }
+    LaunchedEffect(playbackSessionKey, pendingOffsetPublication, subtitlePoolIdentity) {
+        val seconds = pendingOffsetPublication ?: return@LaunchedEffect
+        val identity = subtitlePoolIdentity ?: return@LaunchedEffect
+        delay(SUBTITLE_OFFSET_PUBLICATION_DEBOUNCE_MS)
+        if (pendingOffsetPublication == seconds) {
+            SubtitlePoolContribution.captureOffset(identity.contentKey, identity.fingerprint, seconds)
+            pendingOffsetPublication = null
+        }
+    }
+
     // ADD-ON SUBTITLES (the Android port of Apple SubtitleAddons.swift:37 `installedSources` +
     // :54 `fetch`): once per load, union the installed subtitle-capable add-ons (minus any the
     // active profile turned off) and fetch their external tracks for THIS title, keyed by the
@@ -825,9 +918,11 @@ fun PlayerScreen(
     var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
     val mountedAddonSubs = remember(playbackSessionKey) { mutableSetOf<String>() }
     var pendingSubSelectAbove by remember(playbackSessionKey) { mutableStateOf<Int?>(null) }
-    LaunchedEffect(playbackSessionKey) {
+    var pendingAddonHoard by remember(playbackSessionKey) { mutableStateOf<AddonSubtitle?>(null) }
+    var pendingPooledSubtitle by remember(playbackSessionKey) { mutableStateOf<SubtitlePoolClient.PooledSubtitle?>(null) }
+    LaunchedEffect(playbackSessionKey, resolvedSubtitleRef) {
         if (currentPlayable.isTrailer) return@LaunchedEffect
-        val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
+        val ref = resolvedSubtitleRef ?: return@LaunchedEffect
         val (type, videoId) = SubtitleAddonService.queryFor(ref) ?: return@LaunchedEffect
         val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
         val sources = SubtitleAddonService.installedSources(repo.installedAddons().getOrNull().orEmpty())
@@ -850,7 +945,26 @@ fun PlayerScreen(
         if (tracks.size > preMountCount) {
             tracks.lastOrNull()?.let { engine.selectSubtitleTrack(it.id) }
             pendingSubSelectAbove = null
+            pendingAddonHoard?.let { sub ->
+                pendingAddonHoard = null
+                subtitlePoolIdentity?.let { identity ->
+                    SubtitlePoolContribution.hoardAddon(identity.contentKey, identity.fingerprint, sub)
+                }
+            }
         }
+    }
+    // Pool rows are signed/validated by SubtitlePoolClient before they reach this handler. Download to a
+    // local extension-bearing file first, then hand the normal engine adapter a real sidecar path; this lets
+    // both mpv and Media3 mount the exact same user choice without teaching either engine pool networking.
+    LaunchedEffect(playbackSessionKey, pendingPooledSubtitle) {
+        val pooled = pendingPooledSubtitle ?: return@LaunchedEffect
+        val signedIn = (context.applicationContext as? VortXApplication)?.syncManager?.isSignedIn == true
+        val localPath = SubtitlePoolClient.download(context, pooled, isSignedIn = signedIn)
+        if (localPath != null && mountedAddonSubs.add(pooled.url)) {
+            pendingSubSelectAbove = latestState.subtitleTracks.size
+            engine.addExternalSubtitle(localPath)
+        }
+        pendingPooledSubtitle = null
     }
 
     // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
@@ -1373,6 +1487,7 @@ fun PlayerScreen(
                 subtitleDelaySeconds = adjustedPlayerDelay(subtitleDelaySeconds, delta)
                 engine.setSubtitleDelay(subtitleDelaySeconds)
                 SubtitleOffsetMemory.save(context, subtitleDelaySeconds, subtitleContentKey)
+                pendingOffsetPublication = subtitleDelaySeconds
             },
             subtitleStyle = subtitleStyle,
             onChangeSubtitleStyle = { next ->
@@ -1498,8 +1613,14 @@ fun PlayerScreen(
                 // the track (it is selectable from the embedded list above once mounted).
                 if (mountedAddonSubs.add(sub.url)) {
                     pendingSubSelectAbove = latestState.subtitleTracks.size
+                    pendingAddonHoard = sub
                     engine.addExternalSubtitle(sub.url)
                 }
+            },
+            pooledSubtitles = pooledSubtitles,
+            onSelectPooledSubtitle = { sub ->
+                showControls()
+                if (!mountedAddonSubs.contains(sub.url)) pendingPooledSubtitle = sub
             },
             // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
             // recomposition so the checkmarks reflect the current secondary-sid / sid after a pick.
@@ -1696,6 +1817,7 @@ fun PlayerScreen(
                 currentPositionMs = latestState.positionMs,
                 durationMs = latestState.durationMs,
                 emberAccent = emberAccent,
+                existingSegments = skipSegments,
                 onDismiss = { showSkipEditor = false },
             )
         }
@@ -1832,6 +1954,9 @@ private const val SEEK_NUDGE_PILL_AUTO_HIDE_MS = 1_200L
 /// this bounded startup window so ExoPlayer's empty result and chapterless files never create a poll loop.
 private const val CHAPTER_READ_ATTEMPTS = 5
 private const val CHAPTER_READ_RETRY_MS = 400L
+
+/// Collapse a burst of subtitle +/- taps into one pool offset update; local playback applies instantly.
+private const val SUBTITLE_OFFSET_PUBLICATION_DEBOUNCE_MS = 750L
 
 /// Watchdog sampling cadence: once a second, matching the ~1s position republish of both engines, so a
 /// healthy stream is seen advancing on every tick.

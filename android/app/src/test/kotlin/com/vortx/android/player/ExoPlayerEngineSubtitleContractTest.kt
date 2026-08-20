@@ -1,12 +1,26 @@
 package com.vortx.android.player
 
+import androidx.media3.common.MimeTypes
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ExoPlayerEngineSubtitleContractTest {
+
+    @Test
+    fun `extensionless external subtitle uses the safe text fallback`() {
+        assertEquals(
+            MimeTypes.APPLICATION_SUBRIP,
+            externalSubtitleMimeFromUrl("https://provider.example/subtitle/opaque-id?signature=value"),
+        )
+        assertEquals(
+            MimeTypes.TEXT_VTT,
+            externalSubtitleMimeFromUrl("https://provider.example/subtitle.vtt?signature=value"),
+        )
+    }
 
     @Test
     fun `load remembers playable before either media source branch`() {

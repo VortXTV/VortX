@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vortx.android.player.formatTime
 import com.vortx.android.skip.SkipDBClient
+import com.vortx.android.skip.SkipSegment
 import kotlinx.coroutines.launch
 
 /**
@@ -45,6 +46,7 @@ fun SkipSubmitEditor(
     currentPositionMs: Long,
     durationMs: Long,
     emberAccent: Color,
+    existingSegments: List<SkipSegment> = emptyList(),
     onDismiss: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
@@ -86,6 +88,14 @@ fun SkipSubmitEditor(
             submitting = false
             result.onSuccess { done = true }.onFailure { errorText = it.message ?: "Submission failed." }
         }
+    }
+
+    fun loadExisting(segment: SkipSegment) {
+        val draft = SkipEditPolicy.correctionDraft(segment)
+        kind = SkipKind.from(draft.kind)
+        startMs = draft.startMs.coerceIn(0L, upper)
+        endMs = draft.endMs.coerceIn(0L, upper)
+        errorText = null
     }
 
     Box(
@@ -132,6 +142,27 @@ fun SkipSubmitEditor(
                 }
             }
 
+            // A correction uses the exact same validated submit path as a new span. Loading an existing
+            // resolved segment keeps its kind and bounds editable instead of asking the viewer to recreate
+            // it from memory; the final submit remains an ordinary replacement proposal to the service.
+            if (existingSegments.isNotEmpty()) {
+                Text("Correct existing", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    existingSegments.forEach { segment ->
+                        Text(
+                            text = segment.label.removePrefix("Skip "),
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color.White.copy(alpha = 0.10f))
+                                .clickable { loadExisting(segment) }
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                        )
+                    }
+                }
+            }
+
             TimeRow("Start", startMs, emberAccent, onNudge = { nudge(true, it) }, onNow = { startMs = currentPositionMs.coerceIn(0L, upper) })
             TimeRow("End", endMs, emberAccent, onNudge = { nudge(false, it) }, onNow = { endMs = currentPositionMs.coerceIn(0L, upper) })
 
@@ -153,7 +184,16 @@ private enum class SkipKind(val label: String, val wire: String) {
     INTRO("Intro", "intro"),
     RECAP("Recap", "recap"),
     CREDITS("Credits", "outro"),
-    PREVIEW("Preview", "preview"),
+    PREVIEW("Preview", "preview");
+
+    companion object {
+        fun from(kind: SkipSegment.Kind): SkipKind = when (kind) {
+            SkipSegment.Kind.INTRO -> INTRO
+            SkipSegment.Kind.RECAP -> RECAP
+            SkipSegment.Kind.CREDITS -> CREDITS
+            SkipSegment.Kind.PREVIEW -> PREVIEW
+        }
+    }
 }
 
 @Composable

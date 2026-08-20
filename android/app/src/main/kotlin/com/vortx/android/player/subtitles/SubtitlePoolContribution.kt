@@ -4,6 +4,7 @@ import android.content.Context
 import com.vortx.android.model.MediaRef
 import com.vortx.android.moat.MoatToken
 import com.vortx.android.player.AddonSubtitle
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.HttpURLConnection
@@ -157,6 +158,7 @@ object SubtitlePoolContribution {
      * never blocks playback. Mirrors Apple `hoardAddonSubtitle`.
      */
     suspend fun hoardAddon(contentKey: String, fingerprint: String?, sub: AddonSubtitle) {
+        if (!isSafeAddonTextUrl(sub.url)) return
         val text = downloadAddonText(sub.url) ?: return
         if (text.isEmpty()) return
         SubtitlePoolClient.upload(
@@ -169,7 +171,7 @@ object SubtitlePoolContribution {
         )
     }
 
-    /** Bounded, redirect-following GET of an add-on subtitle URL as UTF-8 text, or null on any failure. */
+    /** Bounded GET of an add-on subtitle URL as UTF-8 text, or null on any failure. */
     private suspend fun downloadAddonText(url: String): String? = withContext(Dispatchers.IO) {
         var conn: HttpURLConnection? = null
         try {
@@ -178,7 +180,9 @@ object SubtitlePoolContribution {
                 connectTimeout = ADDON_FETCH_TIMEOUT_MS
                 readTimeout = ADDON_FETCH_TIMEOUT_MS
                 useCaches = false
-                instanceFollowRedirects = true
+                // Do not follow an otherwise safe public URL to an unvalidated redirect target. The optional
+                // contribution path can skip a redirected sidecar; normal subtitle playback is unchanged.
+                instanceFollowRedirects = false
             }
             if (conn.responseCode !in 200..299) return@withContext null
             conn.inputStream.use { input ->
@@ -194,11 +198,36 @@ object SubtitlePoolContribution {
                 }
                 out.toString(Charsets.UTF_8.name())
             }
-        } catch (_: Throwable) {
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
             null
         } finally {
             conn?.disconnect()
         }
+    }
+
+    /**
+     * A subtitle may be mounted from a user-installed add-on, but contribution must never turn that choice
+     * into a request to a loopback or private-network service and then copy its response to the pool.
+     * Only public HTTPS URLs are eligible for the optional hoard step; playback itself remains unchanged.
+     */
+    internal fun isSafeAddonTextUrl(raw: String): Boolean {
+        val uri = runCatching { URI(raw) }.getOrNull() ?: return false
+        if (!uri.scheme.equals("https", ignoreCase = true) || uri.userInfo != null) return false
+        val host = uri.host?.lowercase() ?: return false
+        if (host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return false
+        val numeric = host.removePrefix("[").removeSuffix("]")
+        if (numeric == "::1" || numeric == "0:0:0:0:0:0:0:1") return false
+        if (numeric.startsWith("127.") || numeric.startsWith("10.") || numeric.startsWith("192.168.")) return false
+        if (numeric.startsWith("169.254.") || numeric.startsWith("0.")) return false
+        val parts = numeric.split('.')
+        if (parts.size == 4) {
+            val first = parts[0].toIntOrNull()
+            val second = parts[1].toIntOrNull()
+            if (first == 172 && second != null && second in 16..31) return false
+        }
+        return true
     }
 
     // MARK: - Sync: seed + capture (Apple restoreSubtitleTimingOffsetIfReady + captureSubOffset)

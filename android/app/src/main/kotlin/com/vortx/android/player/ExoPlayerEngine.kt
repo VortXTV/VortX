@@ -255,13 +255,13 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             DefaultMediaSourceFactory(appContext)
         }
 
-        // External sidecar subtitles as side-loaded text tracks on the MediaItem. ExoPlayer needs a
-        // concrete, parseable subtitle MIME (unlike mpv, which sniffs the file), so infer it from the
-        // URL extension and SKIP a sidecar whose type we can't identify rather than attach an
-        // unparseable TEXT_UNKNOWN track. The mpv engine is the primary external-subs path; this is the
-        // fallback engine.
+        // External sidecar subtitles as side-loaded text tracks on the MediaItem. An add-on subtitle URL
+        // commonly has no filename extension (a signed object or an endpoint such as `/subtitle/123`).
+        // Do not silently discard that user-picked track: unknown URLs take the conservative SubRip
+        // fallback, the most broadly accepted plain-text shape. A parser rejection stays isolated to that
+        // one sidecar; skipping it up front made the fallback engine incapable of loading valid subtitles.
         val subtitleConfigs = playable.externalSubtitles.mapNotNull { subUrl ->
-            val mime = subtitleMimeFromUrl(subUrl) ?: return@mapNotNull null
+            val mime = externalSubtitleMimeFromUrl(subUrl)
             MediaItem.SubtitleConfiguration.Builder(Uri.parse(subUrl))
                 .setMimeType(mime)
                 .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
@@ -456,18 +456,6 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     /// something to smuggle in behind this seam.
     override suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = null
 
-    /// Map a sidecar subtitle URL to a Media3-parseable MIME by extension, or null when unknown (skip it).
-    private fun subtitleMimeFromUrl(url: String): String? {
-        val lower = url.substringBefore('?').lowercase()
-        return when {
-            lower.endsWith(".srt") -> MimeTypes.APPLICATION_SUBRIP
-            lower.endsWith(".vtt") -> MimeTypes.TEXT_VTT
-            lower.endsWith(".ssa") || lower.endsWith(".ass") -> MimeTypes.TEXT_SSA
-            lower.endsWith(".ttml") || lower.endsWith(".dfxp") || lower.endsWith(".xml") -> MimeTypes.APPLICATION_TTML
-            else -> null
-        }
-    }
-
     override fun onEnterBackground() {
         // Keep audio going when "keep playing in the background" is on (Apple's default); the detached
         // surface stops video output on its own, so nothing extra is needed for that. Off = pause as before.
@@ -534,6 +522,18 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         const val RESUME_FLOOR_MS = 5_000L
         // The bandwidth-meter seed now comes from AdaptiveTuning.initialBitrateEstimate (measured link when
         // known, else its own 50 Mbps default), so the constant that used to live here moved there.
+    }
+}
+
+/** Map a sidecar subtitle URL to a Media3 MIME; extensionless add-on URLs fall back to SubRip. */
+internal fun externalSubtitleMimeFromUrl(url: String): String {
+    val lower = url.substringBefore('?').lowercase()
+    return when {
+        lower.endsWith(".srt") -> MimeTypes.APPLICATION_SUBRIP
+        lower.endsWith(".vtt") -> MimeTypes.TEXT_VTT
+        lower.endsWith(".ssa") || lower.endsWith(".ass") -> MimeTypes.TEXT_SSA
+        lower.endsWith(".ttml") || lower.endsWith(".dfxp") || lower.endsWith(".xml") -> MimeTypes.APPLICATION_TTML
+        else -> MimeTypes.APPLICATION_SUBRIP
     }
 }
 

@@ -1,5 +1,6 @@
 package com.vortx.android.player.extras
 
+import com.vortx.android.skip.SkipSegment
 import kotlin.math.roundToInt
 
 /**
@@ -39,4 +40,17 @@ object SkipEditPolicy {
         }
         return null
     }
+
+    /** Exact editable values for a resolved span; milliseconds preserve the submit client's contract. */
+    fun correctionDraft(segment: SkipSegment): CorrectionDraft = CorrectionDraft(
+        kind = segment.kind,
+        startMs = (segment.start * 1000.0).roundToInt().toLong(),
+        endMs = (segment.end * 1000.0).roundToInt().toLong(),
+    )
 }
+
+data class CorrectionDraft(
+    val kind: SkipSegment.Kind,
+    val startMs: Long,
+    val endMs: Long,
+)

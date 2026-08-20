@@ -93,6 +93,7 @@ import com.vortx.android.player.extras.StyledScrubber
 import com.vortx.android.model.Episode
 import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.Playable
+import com.vortx.android.player.subtitles.SubtitlePoolClient
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
@@ -192,6 +193,9 @@ fun PlayerChrome(
     /// [onSelectAddonSubtitle]. Empty (the default) leaves the sheet exactly as before.
     addonSubtitles: List<AddonSubtitle> = emptyList(),
     onSelectAddonSubtitle: (AddonSubtitle) -> Unit = {},
+    /** Signed community-pool rows for this release, fetched separately from installed add-on rows. */
+    pooledSubtitles: List<SubtitlePoolClient.PooledSubtitle> = emptyList(),
+    onSelectPooledSubtitle: (SubtitlePoolClient.PooledSubtitle) -> Unit = {},
     /// Community scrub preview: the thumbnail for a playback time (seconds), or null when this title has
     /// no community sheet (the common case for a title nobody has contributed yet, and always so while
     /// offline). MUST be cheap and synchronous -- it is called for every drag frame -- which is exactly
@@ -646,6 +650,19 @@ fun PlayerChrome(
                                 selected = false,
                                 isChoice = true,
                                 onPick = { onSelectAddonSubtitle(sub) },
+                            ),
+                        )
+                    }
+                    // Community-pool subtitles sit after installed add-ons. The host downloads a selected
+                    // row to a validated local file before mounting it, so this sheet remains a pure choice
+                    // surface and the live engine never needs pool credentials or network knowledge.
+                    pooledSubtitles.forEach { sub ->
+                        add(
+                            SheetOption(
+                                label = "${sub.lang} · Community",
+                                selected = false,
+                                isChoice = true,
+                                onPick = { onSelectPooledSubtitle(sub) },
                             ),
                         )
                     }

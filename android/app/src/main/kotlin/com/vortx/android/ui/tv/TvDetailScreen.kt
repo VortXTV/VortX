@@ -33,17 +33,21 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import coil3.compose.AsyncImage
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.catalog.CollectionClient
+import com.vortx.android.catalog.AddonSimilarClient
 import com.vortx.android.catalog.DiscoverRegion
 import com.vortx.android.catalog.FinancialsClient
+import com.vortx.android.catalog.ReleaseDatesClient
 import com.vortx.android.catalog.SimilarClient
 import com.vortx.android.catalog.WatchProvider
 import com.vortx.android.catalog.WatchProvidersClient
@@ -51,6 +55,9 @@ import com.vortx.android.library.WatchlistStore
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.metadata.LocalizedMetadataStore
+import com.vortx.android.metadata.rememberBackdropTint
+import com.vortx.android.ratings.MdbListClient
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ratings.VortXRatingsClient
 import com.vortx.android.ui.UiState
@@ -135,7 +142,9 @@ fun TvDetailScreen(
     Box(modifier = modifier.fillMaxSize().background(colors.canvas)) {
         when (val meta = metaState) {
             is UiState.Loading -> TvDetailLoading(title)
-            is UiState.Error -> TvError(meta.message, onRetry = onBack)
+            // Keep the title in place after a transient catalog failure. Leaving this screen on retry made TV
+            // materially weaker than phone detail and forced the viewer to navigate back and reopen it.
+            is UiState.Error -> TvError(meta.message, onRetry = viewModel::retryMeta)
             is UiState.Success -> TvDetailContent(
                 viewModel = viewModel,
                 detail = meta.data,
@@ -159,6 +168,15 @@ private fun TvDetailContent(
 ) {
     val context = LocalContext.current
     val colors = VortXTheme.colors
+    val localizedEntries by LocalizedMetadataStore.entries.collectAsStateWithLifecycle()
+    val localizedTitle = remember(detail.id, localizedEntries) {
+        LocalizedMetadataStore.title(detail.id) ?: detail.name
+    }
+    val localizedLogo = remember(detail.id, localizedEntries) {
+        LocalizedMetadataStore.logo(detail.id) ?: detail.logo
+    }
+    val backdropUrl = detail.background ?: detail.poster
+    val backdropTint by rememberBackdropTint(backdropUrl)
     val playFocus = remember { FocusRequester() }
     val secondaryFocus = remember { FocusRequester() }
     val initialFocus = remember(detail.id) { TvDetailInitialFocus() }
@@ -205,8 +223,19 @@ private fun TvDetailContent(
         similarItems = emptyList()
         watchProviders = emptyList()
         if (detail.id.startsWith("tt")) {
-            vortxRatings = VortXRatingsClient.ratings(detail.id, detail.type.id)
-            similarItems = SimilarClient.similar(detail.id, detail.type)
+            val vx = VortXRatingsClient.ratings(detail.id, detail.type.id)
+            val needsMore = vx == null || vx.rottenTomatoes == null || vx.metacritic == null
+            val mdb = if (needsMore) MdbListClient.ratings(context, detail.id, detail.type.id) else null
+            val mergedRatings = MdbListRatings(
+                imdb = vx?.imdb ?: mdb?.imdb,
+                rottenTomatoes = vx?.rottenTomatoes ?: mdb?.rottenTomatoes,
+                metacritic = vx?.metacritic ?: mdb?.metacritic,
+                tmdb = vx?.tmdb ?: mdb?.tmdb,
+            )
+            vortxRatings = mergedRatings.takeIf { it.hasAny }
+            val recommendations = SimilarClient.similar(detail.id, detail.type)
+            val addonSimilar = AddonSimilarClient.genreSimilar(detail.type, detail.id, detail.genres, detail.name)
+            similarItems = mergeTvSimilar(recommendations, addonSimilar, detail.id)
             watchProviders =
                 WatchProvidersClient.availability(detail.id, detail.type, DiscoverRegion.effective(context))
                     ?.providers.orEmpty()
@@ -222,12 +251,28 @@ private fun TvDetailContent(
     val showFinancials = discoverPrefs.showFinancials
     var financials by remember(detail.id) { mutableStateOf<FinancialsClient.Financials?>(null) }
     var movieCollection by remember(detail.id) { mutableStateOf<CollectionClient.MovieCollection?>(null) }
+    var releaseDates by remember(detail.id) { mutableStateOf<ReleaseDatesClient.ReleaseDates?>(null) }
     LaunchedEffect(detail.id, detail.type, showFinancials) {
         financials = null
         movieCollection = null
+        releaseDates = null
         if (detail.id.startsWith("tt") && detail.type == MediaType.MOVIE) {
             if (showFinancials) financials = FinancialsClient.financials(detail.id, isSeries = false)
             movieCollection = CollectionClient.collection(detail.id, isSeries = false)
+            releaseDates = ReleaseDatesClient.releaseDates(
+                detail.id,
+                isSeries = false,
+                region = DiscoverRegion.effective(context),
+            )
+        }
+    }
+
+    val hasDescription = !detail.description.isNullOrBlank()
+    var fallbackOverview by remember(detail.id) { mutableStateOf<String?>(null) }
+    LaunchedEffect(detail.id, detail.type, hasDescription) {
+        fallbackOverview = null
+        if (!hasDescription && detail.id.startsWith("tt")) {
+            fallbackOverview = TMDBPersonClient.overview(detail.id, detail.type)
         }
     }
 
@@ -251,10 +296,19 @@ private fun TvDetailContent(
             // The cinematic hero band fills the first screen; episodes + cast scroll up from beneath it.
             Box(modifier = Modifier.fillMaxWidth().height(bandHeight)) {
         TvBackdrop(
-            url = detail.background ?: detail.poster,
+            url = backdropUrl,
             seed = detail.id,
             modifier = Modifier.fillMaxSize(),
         )
+        // Tint the fixed readability scrims with the actual artwork's dominant color. A failed palette read
+        // leaves the existing neutral gradient in place, while a successful read removes the flat dark wash.
+        backdropTint?.let { tint ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Brush.verticalGradient(0f to tint.copy(alpha = 0.36f), 0.65f to Color.Transparent)),
+            )
+        }
         // Left-to-right + bottom scrims so the left-pane text and the right-pane list both stay legible over
         // the artwork.
         Box(
@@ -275,8 +329,19 @@ private fun TvDetailContent(
             // Hero content + Watch CTA.
             Column(modifier = Modifier.weight(0.52f)) {
                 Text(text = detail.type.label.uppercase(), style = VortXTheme.type.eyebrow)
+                localizedLogo?.takeIf { it.isNotBlank() }?.let { logo ->
+                    AsyncImage(
+                        model = logo,
+                        contentDescription = localizedTitle,
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth(0.8f)
+                            .height(72.dp)
+                            .padding(top = VortXTheme.spacing.sm),
+                    )
+                }
                 Text(
-                    text = detail.name,
+                    text = localizedTitle,
                     style = VortXTheme.type.hero,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -295,7 +360,7 @@ private fun TvDetailContent(
                         modifier = Modifier.padding(top = VortXTheme.spacing.sm),
                     )
                 }
-                detail.description?.takeIf { it.isNotBlank() }?.let {
+                (detail.description?.takeIf { it.isNotBlank() } ?: fallbackOverview)?.let {
                     Text(
                         text = it,
                         style = VortXTheme.type.body.copy(color = colors.textSecondary),
@@ -445,6 +510,12 @@ private fun TvDetailContent(
                     modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.xs),
                 )
             }
+            releaseDates?.let { ReleaseDatesClient.releaseDatesText(it) }?.let { text ->
+                TvFinancialsLine(
+                    text = text,
+                    modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.xs),
+                )
+            }
 
             // A series gains a focusable season picker + episode rail beneath the hero. Choosing an episode
             // selects it (loading its sources up top) and scrolls back to the hero where Watch/Resume now
@@ -551,3 +622,16 @@ private fun TvDetailLoading(title: String) {
     }
 }
 
+/** Keep curated recommendations first while filling a sparse rail with deduplicated catalog matches. */
+internal fun mergeTvSimilar(
+    recommendations: List<MetaItem>,
+    catalogMatches: List<MetaItem>,
+    excludingId: String,
+): List<MetaItem> {
+    val seen = HashSet<String>()
+    return buildList(recommendations.size + catalogMatches.size) {
+        (recommendations + catalogMatches).forEach { item ->
+            if (item.id != excludingId && seen.add(item.id)) add(item)
+        }
+    }
+}
