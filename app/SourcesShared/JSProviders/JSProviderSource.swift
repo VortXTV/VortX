@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// A per-detail-view `@StateObject` that runs the user's installed community JS providers for the current title
 /// and publishes their streams as extra source GROUPS (one per provider) to MERGE into the source list. The
@@ -35,6 +36,7 @@ final class JSProviderSource: ObservableObject {
     /// re-runs the providers.
     private var cache: [String: [CoreStreamSourceGroup]] = [:]
     private var task: Task<Void, Never>?
+    private var gateSubscription: AnyCancellable?
 
     // Injection seams (defaults read the real store / runtime / TMDB path; tests can substitute).
     typealias Gate = @MainActor () -> Bool
@@ -72,6 +74,13 @@ final class JSProviderSource: ObservableObject {
         self.settingsFor = settingsFor
         self.resolveTMDB = resolveTMDB
         self.runProvider = runProvider
+        // A local OFF is an immediate revocation, not merely a condition checked on the next detail refresh.
+        // Cancel the native interpreter, discard its identity cache, and publish an empty contribution at once.
+        gateSubscription = JSProviderStore.shared.$userEnabled.dropFirst().sink { [weak self] enabled in
+            guard !enabled else { return }
+            self?.cache.removeAll()
+            self?.clearResults()
+        }
     }
 
     // MARK: Settlement (mirrors TorBoxSearchSource)
