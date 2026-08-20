@@ -19,6 +19,15 @@
       "versions": [
         {
           "version": "0.3.14",
+          "buildVersion": "219",
+          "date": "2026-08-20",
+          "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-iOS-v0.3.14-beta.17-ci.ipa",
+          "size": 64227247,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
           "buildVersion": "218",
           "date": "2026-08-19",
           "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
@@ -93,6 +102,15 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "219",
+          "date": "2026-08-20",
+          "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-tvOS-v0.3.14-beta.17-ci.ipa",
+          "size": 63660824,
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "218",
