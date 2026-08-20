@@ -100,8 +100,13 @@ interface PlayerEngine {
     fun selectAudioTrack(id: Int)
     fun selectSubtitleTrack(id: Int?)
 
-    /// Mount an additional external subtitle file at runtime and offset its timing (seconds, +/-).
-    fun addExternalSubtitle(url: String)
+    /**
+     * Mount an external subtitle as one playback-owned operation.  The caller supplies the identity it
+     * captured when the row was selected; an engine must reject it if its current source has changed.
+     * This prevents a slow download from adding a sidecar to a subsequently selected episode.
+     */
+    suspend fun addExternalSubtitle(request: ExternalSubtitleRequest): ExternalSubtitleMountResult =
+        ExternalSubtitleMountResult.Rejected("External subtitle mounting is unavailable")
     fun setSubtitleDelay(seconds: Double)
 
     /// Select a SECOND subtitle track shown alongside the primary (libmpv `secondary-sid`), for language
@@ -191,6 +196,18 @@ interface PlayerEngine {
     /// chrome's aspect/zoom toggle takes effect without rebuilding the surface.
     @Composable
     fun VideoSurface(modifier: Modifier, emberArgb: Int, scaleMode: VideoScaleMode)
+}
+
+data class ExternalSubtitleRequest(
+    val url: String,
+    val playbackSessionId: String,
+    val sourceUrl: String,
+    val loadToken: Long,
+)
+
+sealed interface ExternalSubtitleMountResult {
+    data class Mounted(val request: ExternalSubtitleRequest) : ExternalSubtitleMountResult
+    data class Rejected(val reason: String) : ExternalSubtitleMountResult
 }
 
 /// How the video fills the surface: [FIT] letterboxes to preserve the whole frame (default), [ZOOM]

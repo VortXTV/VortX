@@ -54,6 +54,10 @@ object SubtitleEmbeddedExtractor {
 
     /** Guard the per-sample read buffer so a hostile/oversized sample cannot balloon memory. */
     private const val MAX_SAMPLE_BYTES = 1 shl 20 // 1 MiB, matches the pool text codec's practical ceiling
+    private const val MAX_TRACKS = 16
+    private const val MAX_CUES_PER_TRACK = 10_000
+    private const val MAX_CUE_CHARS = 8_192
+    private const val MAX_TOTAL_TEXT_CHARS = 900_000
 
     /**
      * TEXT subtitle MIME types the platform demuxes and this extractor understands, mapped to how a sample's
@@ -111,7 +115,7 @@ object SubtitleEmbeddedExtractor {
     /** Select every text subtitle track and build a per-track cue accumulator keyed by track index. */
     private fun selectTextTracks(extractor: MediaExtractor): Map<Int, CueBuilder> {
         val builders = linkedMapOf<Int, CueBuilder>()
-        for (i in 0 until extractor.trackCount) {
+        for (i in 0 until minOf(extractor.trackCount, MAX_TRACKS)) {
             val format = runCatching { extractor.getTrackFormat(i) }.getOrNull() ?: continue
             val mime = format.getString(MediaFormat.KEY_MIME)?.lowercase() ?: continue
             if (mime !in TEXT_MIME_TYPES) continue
@@ -263,9 +267,20 @@ object SubtitleEmbeddedExtractor {
         val assPreTextCommas: Int,
     ) {
         private val cues = mutableListOf<Cue>()
+        private var totalChars = 0
 
         fun add(startMs: Long, endMs: Long, text: String) {
-            cues.add(Cue(startMs = maxOf(0L, startMs), endMs = maxOf(startMs, endMs), text = text))
+            if (cues.size >= MAX_CUES_PER_TRACK || totalChars >= MAX_TOTAL_TEXT_CHARS) return
+            val normalized = text.replace('\u0000', ' ').trim().take(MAX_CUE_CHARS)
+            if (normalized.isEmpty()) return
+            val bounded = normalized.take((MAX_TOTAL_TEXT_CHARS - totalChars).coerceAtLeast(0))
+            if (bounded.isEmpty()) return
+            val start = startMs.coerceAtLeast(0L)
+            // MediaExtractor is authoritative for sample start but normally has no cue end. We make the
+            // fallback explicit and monotonic rather than pretending a packet's duration is a real timing.
+            val end = endMs.coerceAtLeast(start + 1L)
+            cues.add(Cue(startMs = start, endMs = end, text = bounded))
+            totalChars += bounded.length
         }
 
         /** Serialize accumulated cues to an SRT (or VTT) string, sorted by start time. Mirrors Apple `finish`. */

@@ -77,6 +77,7 @@ import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.player.subtitles.SubtitlePlaybackIdentity
 import com.vortx.android.player.subtitles.SubtitlePoolClient
 import com.vortx.android.player.subtitles.SubtitlePoolContribution
+import com.vortx.android.player.subtitles.SubtitlePoolAuthority
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -85,6 +86,14 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
+
+private data class PendingSubtitleMount(
+    val remoteUrl: String,
+    val addon: AddonSubtitle?,
+    val sessionId: String,
+    val sourceUrl: String,
+    val token: Long,
+)
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -868,11 +877,15 @@ fun PlayerScreen(
         SubtitlePoolContribution.ensureMoatProviderWired()
         val signedIn = (context.applicationContext as? VortXApplication)?.syncManager?.isSignedIn == true
         if (!signedIn) return@LaunchedEffect
+        val authority = SubtitlePoolAuthority.capture(context) ?: return@LaunchedEffect
         val pooled = SubtitlePoolClient.fetchPooled(
             contentKey = identity.contentKey,
             fingerprint = identity.fingerprint,
             isSignedIn = true,
+            context = context,
+            authority = authority,
         )
+        if (!authority.isCurrent(context)) return@LaunchedEffect
         pooledSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
             items = pooled.subs,
             enabled = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).subtitlesOnlyPreferred,
@@ -894,15 +907,16 @@ fun PlayerScreen(
         }
         if (!embeddedUploadStarted && SubtitlePoolContribution.canUploadEmbedded(currentPlayable.url)) {
             embeddedUploadStarted = true
-            SubtitlePoolContribution.uploadEmbedded(identity.contentKey, identity.fingerprint, currentPlayable.url)
+            SubtitlePoolContribution.uploadEmbedded(context, authority, identity.contentKey, identity.fingerprint, currentPlayable.url)
         }
     }
     LaunchedEffect(playbackSessionKey, pendingOffsetPublication, subtitlePoolIdentity) {
         val seconds = pendingOffsetPublication ?: return@LaunchedEffect
         val identity = subtitlePoolIdentity ?: return@LaunchedEffect
+        val authority = SubtitlePoolAuthority.capture(context) ?: return@LaunchedEffect
         delay(SUBTITLE_OFFSET_PUBLICATION_DEBOUNCE_MS)
-        if (pendingOffsetPublication == seconds) {
-            SubtitlePoolContribution.captureOffset(identity.contentKey, identity.fingerprint, seconds)
+        if (pendingOffsetPublication == seconds && authority.isCurrent(context)) {
+            SubtitlePoolContribution.captureOffset(context, authority, identity.contentKey, identity.fingerprint, seconds)
             pendingOffsetPublication = null
         }
     }
@@ -919,7 +933,8 @@ fun PlayerScreen(
     val mountedAddonSubs = remember(playbackSessionKey) { mutableSetOf<String>() }
     var pendingSubSelectAbove by remember(playbackSessionKey) { mutableStateOf<Int?>(null) }
     var pendingAddonHoard by remember(playbackSessionKey) { mutableStateOf<AddonSubtitle?>(null) }
-    var pendingPooledSubtitle by remember(playbackSessionKey) { mutableStateOf<SubtitlePoolClient.PooledSubtitle?>(null) }
+    var pendingSubtitleMount by remember(playbackSessionKey) { mutableStateOf<PendingSubtitleMount?>(null) }
+    var subtitleMountToken by remember(playbackSessionKey) { mutableStateOf(0L) }
     LaunchedEffect(playbackSessionKey, resolvedSubtitleRef) {
         if (currentPlayable.isTrailer) return@LaunchedEffect
         val ref = resolvedSubtitleRef ?: return@LaunchedEffect
@@ -948,23 +963,35 @@ fun PlayerScreen(
             pendingAddonHoard?.let { sub ->
                 pendingAddonHoard = null
                 subtitlePoolIdentity?.let { identity ->
-                    SubtitlePoolContribution.hoardAddon(identity.contentKey, identity.fingerprint, sub)
+                    SubtitlePoolAuthority.capture(context)?.let { authority ->
+                        SubtitlePoolContribution.hoardAddon(context, authority, identity.contentKey, identity.fingerprint, sub)
+                    }
                 }
             }
         }
     }
-    // Pool rows are signed/validated by SubtitlePoolClient before they reach this handler. Download to a
-    // local extension-bearing file first, then hand the normal engine adapter a real sidecar path; this lets
-    // both mpv and Media3 mount the exact same user choice without teaching either engine pool networking.
-    LaunchedEffect(playbackSessionKey, pendingPooledSubtitle) {
-        val pooled = pendingPooledSubtitle ?: return@LaunchedEffect
-        val signedIn = (context.applicationContext as? VortXApplication)?.syncManager?.isSignedIn == true
-        val localPath = SubtitlePoolClient.download(context, pooled, isSignedIn = signedIn)
-        if (localPath != null && mountedAddonSubs.add(pooled.url)) {
+    // A remote subtitle is never given directly to an engine. The request owns the source/session/token that
+    // selected it, obtains an immutable authority before I/O, and proves both are still current before it can
+    // change player state. Replacing a pending request cancels the prior LaunchedEffect automatically.
+    LaunchedEffect(playbackSessionKey, pendingSubtitleMount) {
+        val pending = pendingSubtitleMount ?: return@LaunchedEffect
+        val authority = SubtitlePoolAuthority.capture(context) ?: return@LaunchedEffect
+        val localPath = SubtitlePoolContribution.prepareExternalSubtitle(context, pending.remoteUrl, authority) ?: return@LaunchedEffect
+        if (!authority.isCurrent(context) || pending.token != subtitleMountToken || pending.sourceUrl != currentPlayable.url) return@LaunchedEffect
+        val result = engine.addExternalSubtitle(
+            ExternalSubtitleRequest(
+                url = localPath,
+                playbackSessionId = pending.sessionId,
+                sourceUrl = pending.sourceUrl,
+                loadToken = pending.token,
+            ),
+        )
+        if (result is ExternalSubtitleMountResult.Mounted && pending.token == subtitleMountToken && authority.isCurrent(context)) {
+            mountedAddonSubs.add(pending.remoteUrl)
             pendingSubSelectAbove = latestState.subtitleTracks.size
-            engine.addExternalSubtitle(localPath)
+            pendingAddonHoard = pending.addon
         }
-        pendingPooledSubtitle = null
+        if (pendingSubtitleMount?.token == pending.token) pendingSubtitleMount = null
     }
 
     // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
@@ -1611,16 +1638,30 @@ fun PlayerScreen(
                 showControls()
                 // Mount once per URL: a re-pick of an already-mounted subtitle would only duplicate
                 // the track (it is selectable from the embedded list above once mounted).
-                if (mountedAddonSubs.add(sub.url)) {
-                    pendingSubSelectAbove = latestState.subtitleTracks.size
-                    pendingAddonHoard = sub
-                    engine.addExternalSubtitle(sub.url)
+                if (!mountedAddonSubs.contains(sub.url)) {
+                    subtitleMountToken += 1L
+                    pendingSubtitleMount = PendingSubtitleMount(
+                        remoteUrl = sub.url,
+                        addon = sub,
+                        sessionId = playbackSessionKey.toString(),
+                        sourceUrl = currentPlayable.url,
+                        token = subtitleMountToken,
+                    )
                 }
             },
             pooledSubtitles = pooledSubtitles,
             onSelectPooledSubtitle = { sub ->
                 showControls()
-                if (!mountedAddonSubs.contains(sub.url)) pendingPooledSubtitle = sub
+                if (!mountedAddonSubs.contains(sub.url)) {
+                    subtitleMountToken += 1L
+                    pendingSubtitleMount = PendingSubtitleMount(
+                        remoteUrl = sub.url,
+                        addon = null,
+                        sessionId = playbackSessionKey.toString(),
+                        sourceUrl = currentPlayable.url,
+                        token = subtitleMountToken,
+                    )
+                }
             },
             // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
             // recomposition so the checkmarks reflect the current secondary-sid / sid after a pick.

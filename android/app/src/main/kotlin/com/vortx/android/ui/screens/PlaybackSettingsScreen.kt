@@ -48,6 +48,7 @@ import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
+import com.vortx.android.moat.MoatConsent
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.DiskCacheSetting
@@ -122,6 +123,7 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var defaultVolume by remember { mutableStateOf(PlayerVolumeSettings.volume(appContext)) }
     var stillWatchingPrompt by remember { mutableStateOf(StillWatchingSettings.promptEnabled(appContext)) }
     var stillWatchingAfter by remember { mutableStateOf(StillWatchingSettings.afterEpisodes(appContext)) }
+    var communityPoolConsent by remember { mutableStateOf(MoatConsent.contributeAndConsume(appContext)) }
 
     var skipProvider by remember {
         // SkipConfig.init MUST run before the first read/write here. SkipConfig holds its SharedPreferences
@@ -335,6 +337,21 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 RejectTermsEditor(
                     terms = trackPrefs.rejectTerms,
                     onChange = { updateTracks(trackPrefs.copy(rejectTerms = it)) },
+                )
+            }
+
+            SettingsSection(
+                title = "Community improvements",
+                footer = "This is an all-or-nothing choice. When enabled, VortX may contribute anonymized playback, source metadata, and full subtitle dialogue; when disabled it neither contributes nor uses community subtitle results.",
+            ) {
+                ToggleRow(
+                    label = "Community subtitles and improvements",
+                    detail = MoatConsent.DISCLOSURE,
+                    checked = communityPoolConsent,
+                    onCheckedChange = {
+                        communityPoolConsent = it
+                        MoatConsent.setContribute(appContext, it)
+                    },
                 )
             }
 

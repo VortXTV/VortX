@@ -4,12 +4,10 @@ import android.content.Context
 import com.vortx.android.model.MediaRef
 import com.vortx.android.moat.MoatToken
 import com.vortx.android.player.AddonSubtitle
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.net.HttpURLConnection
 import java.net.URI
-import java.net.URL
+import java.io.File
 
 /**
  * The consumer that turns the community-subtitle FOUNDATION units (SubtitlePoolClient, SubtitleReleaseFingerprint,
@@ -33,7 +31,6 @@ object SubtitlePoolContribution {
 
     /** Matches SubtitlePoolClient.SUBTITLE_BODY_MAX_BYTES: the worker's fixed 1 MiB text ceiling. */
     private const val ADDON_TEXT_MAX_BYTES = 1024 * 1024
-    private const val ADDON_FETCH_TIMEOUT_MS = 15_000
 
     private val subtitleFormats = setOf("srt", "vtt", "ass")
 
@@ -98,6 +95,18 @@ object SubtitlePoolContribution {
         return if (ext in subtitleFormats) ext else "srt"
     }
 
+    /**
+     * Convert an add-on or pool sidecar into a private, extension-bearing local file before an engine sees it.
+     * The namespace is an immutable account/session authority hash, so sign-out and opt-out can evict all
+     * previous material without guessing which remote URL was selected.
+     */
+    suspend fun prepareExternalSubtitle(context: Context, rawUrl: String, authority: SubtitlePoolAuthority): String? {
+        if (!authority.isCurrent(context)) return null
+        val namespace = authority.cacheNamespace()
+        val path = SubtitleSidecarTransport.fetch(context, rawUrl, namespace) ?: return null
+        return path.takeIf { authority.isCurrent(context) }
+    }
+
     // MARK: - Contribution: embedded text (Apple uploadEmbeddedSubtitlesIfNeeded)
 
     /**
@@ -106,12 +115,14 @@ object SubtitlePoolContribution {
      * [SubtitleEmbeddedExtractor]). Best-effort, fail-soft; the caller latches "once per session". Mirrors Apple
      * `uploadEmbeddedSubtitlesIfNeeded`.
      */
-    suspend fun uploadEmbedded(contentKey: String, fingerprint: String?, input: String) {
+    suspend fun uploadEmbedded(context: Context, authority: SubtitlePoolAuthority, contentKey: String, fingerprint: String?, input: String) {
+        if (!authority.isCurrent(context)) return
         if (!canUploadEmbedded(input)) return
         val tracks = withContext(Dispatchers.IO) {
             runCatching { SubtitleEmbeddedExtractor.extractTextSubtitles(input) }.getOrDefault(emptyList())
         }
         for (track in tracks) {
+            if (!authority.isCurrent(context)) return
             if (track.cueCount <= 0) continue
             SubtitlePoolClient.upload(
                 contentKey = contentKey,
@@ -120,6 +131,8 @@ object SubtitlePoolContribution {
                 origin = "embedded",
                 format = track.format,
                 text = track.srt,
+                context = context,
+                authority = authority,
             )
         }
     }
@@ -132,12 +145,14 @@ object SubtitlePoolContribution {
      * upload. Best-effort, fail-soft.
      */
     suspend fun uploadRecognizedImageSubtitles(
+        context: Context,
+        authority: SubtitlePoolAuthority,
         contentKey: String,
         fingerprint: String?,
         lang: String,
         cues: List<SubtitleImageOcr.RecognizedCue>,
     ) {
-        if (!SubtitleImageOcr.isAvailable) return
+        if (!authority.isCurrent(context) || !SubtitleImageOcr.isAvailable) return
         val srt = SubtitleImageOcr.serializeSrt(cues)
         if (srt.isEmpty()) return
         SubtitlePoolClient.upload(
@@ -147,6 +162,8 @@ object SubtitlePoolContribution {
             origin = "embedded",
             format = "srt",
             text = srt,
+            context = context,
+            authority = authority,
         )
     }
 
@@ -157,9 +174,11 @@ object SubtitlePoolContribution {
      * the next viewer gets it without hitting the add-on. Best-effort, off-thread, size-capped, fail-soft;
      * never blocks playback. Mirrors Apple `hoardAddonSubtitle`.
      */
-    suspend fun hoardAddon(contentKey: String, fingerprint: String?, sub: AddonSubtitle) {
+    suspend fun hoardAddon(context: Context, authority: SubtitlePoolAuthority, contentKey: String, fingerprint: String?, sub: AddonSubtitle) {
+        if (!authority.isCurrent(context)) return
         if (!isSafeAddonTextUrl(sub.url)) return
-        val text = downloadAddonText(sub.url) ?: return
+        val text = downloadAddonText(context, authority, sub.url) ?: return
+        if (!authority.isCurrent(context)) return
         if (text.isEmpty()) return
         SubtitlePoolClient.upload(
             contentKey = contentKey,
@@ -168,43 +187,18 @@ object SubtitlePoolContribution {
             origin = "addon",
             format = subtitleFormatFromUrl(sub.url),
             text = text,
+            context = context,
+            authority = authority,
         )
     }
 
     /** Bounded GET of an add-on subtitle URL as UTF-8 text, or null on any failure. */
-    private suspend fun downloadAddonText(url: String): String? = withContext(Dispatchers.IO) {
-        var conn: HttpURLConnection? = null
-        try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = ADDON_FETCH_TIMEOUT_MS
-                readTimeout = ADDON_FETCH_TIMEOUT_MS
-                useCaches = false
-                // Do not follow an otherwise safe public URL to an unvalidated redirect target. The optional
-                // contribution path can skip a redirected sidecar; normal subtitle playback is unchanged.
-                instanceFollowRedirects = false
-            }
-            if (conn.responseCode !in 200..299) return@withContext null
-            conn.inputStream.use { input ->
-                val out = java.io.ByteArrayOutputStream()
-                val buffer = ByteArray(16 * 1024)
-                var total = 0
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read < 0) break
-                    total += read
-                    if (total > ADDON_TEXT_MAX_BYTES) return@withContext null
-                    out.write(buffer, 0, read)
-                }
-                out.toString(Charsets.UTF_8.name())
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            null
-        } finally {
-            conn?.disconnect()
-        }
+    private suspend fun downloadAddonText(context: Context, authority: SubtitlePoolAuthority, url: String): String? {
+        val path = SubtitleSidecarTransport.fetch(context, url, authority.cacheNamespace()) ?: return null
+        if (!authority.isCurrent(context)) return null
+        return runCatching { File(path).readText(Charsets.UTF_8) }
+            .getOrNull()
+            ?.takeIf { it.toByteArray(Charsets.UTF_8).size in 1..ADDON_TEXT_MAX_BYTES && authority.isCurrent(context) }
     }
 
     /**
@@ -251,8 +245,9 @@ object SubtitlePoolContribution {
      * learns the right offset for this rip. No-op for an invalid/out-of-bounds offset (the same
      * `abs(seconds) <= 120` guard Apple applies). Best-effort, fail-soft. Mirrors Apple `captureSubOffset`.
      */
-    suspend fun captureOffset(contentKey: String, fingerprint: String?, offsetSeconds: Double) {
+    suspend fun captureOffset(context: Context, authority: SubtitlePoolAuthority, contentKey: String, fingerprint: String?, offsetSeconds: Double) {
+        if (!authority.isCurrent(context)) return
         val offsetMs = SubtitleAutoResync.captureOffsetMs(offsetSeconds) ?: return
-        SubtitlePoolClient.postOffset(contentKey = contentKey, lang = "", fingerprint = fingerprint, offsetMs = offsetMs)
+        SubtitlePoolClient.postOffset(contentKey = contentKey, lang = "", fingerprint = fingerprint, offsetMs = offsetMs, context = context, authority = authority)
     }
 }

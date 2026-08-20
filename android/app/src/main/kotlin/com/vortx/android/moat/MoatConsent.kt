@@ -1,6 +1,7 @@
 package com.vortx.android.moat
 
 import android.content.Context
+import com.vortx.android.player.subtitles.SubtitleSidecarTransport
 
 /**
  * The single "give-to-get" consent gate for VortX's community data pool. The Kotlin port of Apple
@@ -36,7 +37,7 @@ object MoatConsent {
      * `MoatConsent.disclosure`. Generic on purpose: it reveals nothing about the pool's design, only that
      * anonymized playback + source metadata may be collected to improve results. Keep this wording opaque.
      */
-    const val DISCLOSURE = "VortX may collect anonymized playback and source metadata to improve results."
+    const val DISCLOSURE = "VortX may collect anonymized playback, source metadata, and subtitle dialogue to improve results."
 
     /**
      * The shared player-adjacent settings file, the same store [com.vortx.android.trickplay.CommunityTrickplay]
@@ -49,10 +50,26 @@ object MoatConsent {
      * before the value, matching Apple's `object(forKey:) == nil -> true`. When it returns false the device is
      * fully out of the pool, in both directions.
      */
+    @Volatile private var generation: Long = 0L
+
+    data class Snapshot(val enabled: Boolean, val generation: Long)
+
+    /**
+     * Capture one consent authority before asynchronous community work. Callers must compare a fresh
+     * [snapshot] before every publication so a revoked choice wins over an already-running request.
+     */
+    fun snapshot(context: Context): Snapshot = synchronized(this) {
+        Snapshot(contributeAndConsume(context), generation)
+    }
+
+    fun isCurrent(context: Context, expected: Snapshot): Boolean = synchronized(this) {
+        expected.enabled && generation == expected.generation && contributeAndConsume(context)
+    }
+
     fun contributeAndConsume(context: Context): Boolean {
         val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
-        if (!prefs.contains(KEY)) return true
-        return prefs.getBoolean(KEY, true)
+        if (!prefs.contains(KEY)) return false
+        return prefs.getBoolean(KEY, false)
     }
 
     /**
@@ -62,10 +79,14 @@ object MoatConsent {
      * [contributeAndConsume] returns the stored value instead of the unset default (on).
      */
     fun setContribute(context: Context, enabled: Boolean) {
-        context.applicationContext
-            .getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY, enabled)
-            .apply()
+        synchronized(this) {
+            context.applicationContext
+                .getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY, enabled)
+                .apply()
+            generation += 1L
+            if (!enabled) SubtitleSidecarTransport.clear(context.applicationContext)
+        }
     }
 }

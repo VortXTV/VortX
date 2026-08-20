@@ -15,6 +15,8 @@ import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.PlayerChapter
 import com.vortx.android.player.PlayerEngine
+import com.vortx.android.player.ExternalSubtitleMountResult
+import com.vortx.android.player.ExternalSubtitleRequest
 import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
@@ -83,6 +85,9 @@ class MpvPlayer private constructor(
     /// thread, reset on [load].
     @Volatile
     private var playbackStarted: Boolean = false
+
+    @Volatile
+    private var activeSourceUrl: String? = null
 
     /// The resume position (ms) to seek to ONCE the pipeline is warm, or 0 for none. A pre-first-frame
     /// absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold and wedges video output
@@ -238,6 +243,7 @@ class MpvPlayer private constructor(
     }
 
     override fun load(playable: Playable) {
+        activeSourceUrl = playable.url
         // Fresh terminal flags for the new file, and isBuffering=true as the CONNECTING state: from
         // loadfile until the first frame (PLAYBACK_RESTART) or a failed open (END_FILE error branch),
         // the chrome shows its spinner instead of a silent black frame. mpv only starts reporting
@@ -363,7 +369,15 @@ class MpvPlayer private constructor(
         mpv.setPropertyString(PROP_SID, id?.toString() ?: "no")
     }
 
-    override fun addExternalSubtitle(url: String) { mpv.command(arrayOf("sub-add", url)) }
+    override suspend fun addExternalSubtitle(request: ExternalSubtitleRequest): ExternalSubtitleMountResult {
+        if (activeSourceUrl != request.sourceUrl) {
+            return ExternalSubtitleMountResult.Rejected("Playback source changed")
+        }
+        return runCatching {
+            mpv.command(arrayOf("sub-add", request.url))
+            ExternalSubtitleMountResult.Mounted(request)
+        }.getOrElse { ExternalSubtitleMountResult.Rejected("Subtitle mount failed") }
+    }
 
     override fun setSubtitleDelay(seconds: Double) { mpv.setPropertyString(PROP_SUB_DELAY, seconds.toString()) }
 

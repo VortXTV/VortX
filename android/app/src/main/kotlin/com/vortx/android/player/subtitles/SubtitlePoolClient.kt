@@ -100,14 +100,16 @@ object SubtitlePoolClient {
         lang: String? = null,
         fingerprint: String? = null,
         isSignedIn: Boolean = false,
+        context: Context? = null,
+        authority: SubtitlePoolAuthority? = null,
     ): PooledResult {
-        if (!isValidContentKey(contentKey) || !featureCommunitySubtitles || !isSignedIn) {
+        if (!isValidContentKey(contentKey) || !featureCommunitySubtitles || !isSignedIn || !authorityCurrent(context, authority)) {
             return PooledResult(emptyList(), null)
         }
         val moat = runCatching { moatTokenProvider?.invoke(isSignedIn) }.getOrNull()
         val url = indexUrl(contentKey, lang, fingerprint) ?: return PooledResult(emptyList(), null)
         val body = signedGet(url, moat, INDEX_RESPONSE_MAX_BYTES) ?: return PooledResult(emptyList(), null)
-        return parseSubsResponse(body, contentKey)
+        return if (authorityCurrent(context, authority)) parseSubsResponse(body, contentKey) else PooledResult(emptyList(), null)
     }
 
     // MARK: - Download the sub text: GET <pooled.url>
@@ -118,20 +120,20 @@ object SubtitlePoolClient {
      * host), so pool-hosted sub text stays VortX-only. Timeout comes from the RemoteConfig
      * `subtitle.downloadTimeoutMs` tunable (baked 12 s), matching Apple.
      */
-    suspend fun download(context: Context, pooled: PooledSubtitle, isSignedIn: Boolean = false): String? {
-        if (!isValidDownloadURL(pooled.url, pooled.contentKey, pooled.format) || !featureCommunitySubtitles) {
+    suspend fun download(context: Context, pooled: PooledSubtitle, isSignedIn: Boolean = false, authority: SubtitlePoolAuthority? = null): String? {
+        if (!isValidDownloadURL(pooled.url, pooled.contentKey, pooled.format) || !featureCommunitySubtitles || !authorityCurrent(context, authority)) {
             return null
         }
         val cacheDir = context.applicationContext.cacheDir
         val name = "vortx-poolsub-${stableHash(pooled.url)}.${pooled.format}"
         val target = File(cacheDir, name)
         // Session-scoped reuse: if we already fetched this URL to a still-present file, hand it back.
-        if (target.exists() && target.length() > 0) return target.absolutePath
+        if (target.exists() && target.length() > 0) return target.absolutePath.takeIf { authorityCurrent(context, authority) }
 
         val moat = runCatching { moatTokenProvider?.invoke(isSignedIn) }.getOrNull()
         val timeout = RemoteConfig.current().subtitleDownloadTimeout
         val data = signedGetBytes(pooled.url, moat, SUBTITLE_BODY_MAX_BYTES, timeout) ?: return null
-        if (data.isEmpty()) return null
+        if (data.isEmpty() || !authorityCurrent(context, authority)) return null
         return runCatching {
             val tmp = File.createTempFile("vortx-poolsub-", ".${pooled.format}", cacheDir)
             tmp.writeBytes(data)
@@ -157,8 +159,10 @@ object SubtitlePoolClient {
         origin: String,
         format: String,
         text: String,
+        context: Context? = null,
+        authority: SubtitlePoolAuthority? = null,
     ) {
-        if (!featureCommunitySubtitles || !featureSubtitleUpload) return
+        if (!featureCommunitySubtitles || !featureSubtitleUpload || !authorityCurrent(context, authority)) return
         if (!isValidContentKey(contentKey)) return
         val maxBytes = minOf(RemoteConfig.current().subtitleUploadMaxBytes, SUBTITLE_BODY_MAX_BYTES)
         val bytes = text.toByteArray(Charsets.UTF_8).size
@@ -172,7 +176,7 @@ object SubtitlePoolClient {
             put("text", text)
             if (!fingerprint.isNullOrEmpty()) put("fingerprint", fingerprint)
         }
-        signedPost("subs", body)
+        if (authorityCurrent(context, authority)) signedPost("subs", body)
     }
 
     // MARK: - Post a learned offset: POST /offset (signed)
@@ -182,8 +186,8 @@ object SubtitlePoolClient {
      * `features.subtitleSync`. The worker buckets `offset_ms` server-side; we send the raw value. Result
      * ignored. Matches Apple.
      */
-    suspend fun postOffset(contentKey: String, lang: String, fingerprint: String?, offsetMs: Int) {
-        if (!featureSubtitleSync) return
+    suspend fun postOffset(contentKey: String, lang: String, fingerprint: String?, offsetMs: Int, context: Context? = null, authority: SubtitlePoolAuthority? = null) {
+        if (!featureSubtitleSync || !authorityCurrent(context, authority)) return
         if (!isValidContentKey(contentKey)) return
         val body = JSONObject().apply {
             put("content_key", contentKey)
@@ -191,7 +195,7 @@ object SubtitlePoolClient {
             put("offset_ms", offsetMs)
             if (!fingerprint.isNullOrEmpty()) put("fingerprint", fingerprint)
         }
-        signedPost("offset", body)
+        if (authorityCurrent(context, authority)) signedPost("offset", body)
     }
 
     // MARK: - Feature gates
@@ -202,6 +206,9 @@ object SubtitlePoolClient {
         get() = RemoteConfig.isFeatureOn("subtitleSync", RemoteConfigDefaults.FEATURE_SUBTITLE_SYNC)
     private val featureSubtitleUpload: Boolean
         get() = RemoteConfig.isFeatureOn("subtitleUpload", RemoteConfigDefaults.FEATURE_SUBTITLE_UPLOAD)
+
+    private fun authorityCurrent(context: Context?, authority: SubtitlePoolAuthority?): Boolean =
+        context != null && authority != null && authority.isCurrent(context)
 
     // MARK: - URL builders + validation (mirrors Apple exactly)
 

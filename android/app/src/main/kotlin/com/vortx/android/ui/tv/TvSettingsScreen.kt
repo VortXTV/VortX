@@ -83,6 +83,7 @@ import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
 import com.vortx.android.trickplay.CommunityTrickplay
+import com.vortx.android.moat.MoatConsent
 import com.vortx.android.ui.viewmodel.AccountViewModel
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.home.HomeRailPreferences
@@ -196,6 +197,7 @@ fun TvSettingsScreen(
     // Community scrub previews (trickplay contribution). The read side existed on the same key Apple writes
     // (`stremiox.communityTrickplay`); this row is its first writer via the new [CommunityTrickplay.setEnabled].
     var communityScrub by remember { mutableStateOf(CommunityTrickplay.isEnabled(appContext)) }
+    var communityPoolConsent by remember { mutableStateOf(MoatConsent.contributeAndConsume(appContext)) }
     // The 10-foot settings search: filters which sections render. Blank shows everything.
     var settingsQuery by remember { mutableStateOf("") }
 
@@ -539,6 +541,16 @@ fun TvSettingsScreen(
                             TopShelfSettings.setShowContinueWatching(appContext, next)
                             // Turning it off clears the rows now; turning it on lets the next CW update publish.
                             if (!next) WatchNextPublisher.clearOwnedRows(appContext)
+                        },
+                    )
+                    TvToggleRow(
+                        label = "Community subtitles and improvements",
+                        detail = "Share anonymized playback, source metadata, and full subtitle dialogue; turning this off also stops community subtitle reads.",
+                        checked = communityPoolConsent,
+                        onToggle = {
+                            val next = !communityPoolConsent
+                            communityPoolConsent = next
+                            MoatConsent.setContribute(appContext, next)
                         },
                     )
                 }

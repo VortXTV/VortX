@@ -32,6 +32,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.ratings.MdbListRatings
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import java.net.URI
 
 /// The 10-foot detail-breadth rails for the TV Detail page, the couch analogue of the phone
 /// [com.vortx.android.ui.screens.DetailScreen]'s `RatingsRow`, `WhereToWatchRail`, and `SimilarRail`, and the
@@ -113,9 +114,10 @@ fun TvWhereToWatchRail(providers: List<WatchProvider>, modifier: Modifier = Modi
                             .background(TV_WATCH_PROVIDER_PLATE),
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (!provider.logoUrl.isNullOrBlank()) {
+                        val logo = tvSafeProviderLogo(provider.logoUrl)
+                        if (logo != null) {
                             AsyncImage(
-                                model = provider.logoUrl,
+                                model = logo,
                                 contentDescription = provider.name,
                                 contentScale = ContentScale.Fit,
                                 modifier = Modifier.fillMaxSize().padding(8.dp),
@@ -138,6 +140,24 @@ fun TvWhereToWatchRail(providers: List<WatchProvider>, modifier: Modifier = Modi
             }
         }
     }
+}
+
+/**
+ * Coil is a renderer, not an origin policy. Watch-provider logos come from remote catalog metadata, so reject
+ * cleartext, user-info, loopback, and private numeric endpoints before rendering. Hostname DNS vetting stays
+ * in the fetching layer; this synchronous UI gate makes unsafe literals impossible even before a request is
+ * constructed.
+ */
+internal fun tvSafeProviderLogo(raw: String?): String? {
+    val uri = raw?.let { runCatching { URI(it) }.getOrNull() } ?: return null
+    if (!uri.scheme.equals("https", true) || uri.userInfo != null || uri.port !in setOf(-1, 443)) return null
+    val host = uri.host?.lowercase() ?: return null
+    if (host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local") ||
+        host == "::1" || host.startsWith("127.") || host.startsWith("10.") || host.startsWith("192.168.") ||
+        host.startsWith("169.254.")) return null
+    val parts = host.split('.')
+    if (parts.size == 4 && parts[0] == "172" && parts[1].toIntOrNull() in 16..31) return null
+    return raw
 }
 
 /// The warm near-white plate behind a Where-to-Watch provider mark: TMDB provider logos are dark / brand-hued

@@ -19,6 +19,7 @@ import androidx.media3.common.Player
 import androidx.media3.extractor.metadata.id3.ChapterFrame
 import androidx.media3.extractor.metadata.id3.TextInformationFrame
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
@@ -206,7 +207,16 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
-    override fun load(playable: Playable) {
+    private data class ExternalSubtitleRestore(
+        val positionMs: Long,
+        val playWhenReady: Boolean,
+        val speed: Float,
+        val selectionParameters: TrackSelectionParameters,
+    )
+
+    override fun load(playable: Playable) = load(playable, restore = null)
+
+    private fun load(playable: Playable, restore: ExternalSubtitleRestore?) {
         lastPlayable = playable
         // A fresh stream starts with no chapters; the ID3 frames for the new file repopulate the store.
         chapterStore.clear()
@@ -232,8 +242,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
                 .createMediaSource(MediaItem.fromUri(playable.audioUrl))
             player.setMediaSource(MergingMediaSource(videoSource, audioSource))
-            player.playWhenReady = true
-            if (playable.startPositionMs > 0L) player.seekTo(playable.startPositionMs)
+            player.playWhenReady = restore?.playWhenReady ?: true
+            player.setPlaybackSpeed(restore?.speed ?: 1f)
+            restore?.let { player.trackSelectionParameters = it.selectionParameters }
+            val position = restore?.positionMs ?: playable.startPositionMs
+            if (position > 0L) player.seekTo(position)
             player.prepare()
             return
         }
@@ -276,12 +289,15 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // applied per-load by creating the MediaSource here. DefaultMediaSourceFactory still handles the
         // sidecar SubtitleConfigurations on the MediaItem (it merges them as side-loaded text tracks).
         player.setMediaSource(mediaSourceFactory.createMediaSource(item))
-        player.playWhenReady = true
+        player.playWhenReady = restore?.playWhenReady ?: true
+        player.setPlaybackSpeed(restore?.speed ?: 1f)
+        restore?.let { player.trackSelectionParameters = it.selectionParameters }
         // RESUME ADMISSION (Apple PlayerScreen.swift:1812): honour a resume only past a >5s floor. The
         // last-10s tail guard is enforced by the primary libmpv lane (which knows the duration by the first
         // frame); ExoPlayer seeks into a not-yet-known duration here and clamps a past-end seek itself, so
         // the floor is the meaningful gate on this lane.
-        if (playable.startPositionMs > RESUME_FLOOR_MS) player.seekTo(playable.startPositionMs)
+        val position = restore?.positionMs ?: playable.startPositionMs
+        if (position > RESUME_FLOOR_MS || restore != null && position > 0L) player.seekTo(position)
         player.prepare()
     }
 
@@ -335,13 +351,27 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // Volume level saved across a mute so unmute restores it (ExoPlayer has one volume, no separate mute).
     private var preMuteVolume: Float = 1f
 
-    override fun addExternalSubtitle(url: String) {
-        val base = lastPlayable ?: return
-        val updated = base.copy(externalSubtitles = base.externalSubtitles + url)
-        lastPlayable = updated
-        val resume = player.currentPosition
-        load(updated)
-        if (resume > 0L) player.seekTo(resume)
+    override suspend fun addExternalSubtitle(request: ExternalSubtitleRequest): ExternalSubtitleMountResult {
+        val base = lastPlayable ?: return ExternalSubtitleMountResult.Rejected("No active playback")
+        if (base.url != request.sourceUrl) {
+            return ExternalSubtitleMountResult.Rejected("Playback source changed")
+        }
+        if (base.externalSubtitles.contains(request.url)) {
+            return ExternalSubtitleMountResult.Mounted(request)
+        }
+
+        // Replacing a MediaSource is the only Media3 route for a new sidecar. Capture the complete
+        // viewer-facing transport/track state first; `load` honours startPosition but otherwise starts
+        // playing and would silently erase a paused viewer's selections.
+        val restore = ExternalSubtitleRestore(
+            positionMs = player.currentPosition.coerceAtLeast(0L),
+            playWhenReady = player.playWhenReady,
+            speed = player.playbackParameters.speed,
+            selectionParameters = player.trackSelectionParameters,
+        )
+        val updated = base.copy(externalSubtitles = base.externalSubtitles + request.url)
+        load(updated, restore)
+        return ExternalSubtitleMountResult.Mounted(request)
     }
 
     override fun setSubtitleDelay(seconds: Double) { /* not supported on ExoPlayer; mpv-only control */ }
