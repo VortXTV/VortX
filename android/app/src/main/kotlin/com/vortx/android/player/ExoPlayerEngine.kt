@@ -237,7 +237,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // sidecar SubtitleConfigurations on the MediaItem (it merges them as side-loaded text tracks).
         player.setMediaSource(mediaSourceFactory.createMediaSource(item))
         player.playWhenReady = true
-        if (playable.startPositionMs > 0L) player.seekTo(playable.startPositionMs)
+        // RESUME ADMISSION (Apple PlayerScreen.swift:1812): honour a resume only past a >5s floor. The
+        // last-10s tail guard is enforced by the primary libmpv lane (which knows the duration by the first
+        // frame); ExoPlayer seeks into a not-yet-known duration here and clamps a past-end seek itself, so
+        // the floor is the meaningful gate on this lane.
+        if (playable.startPositionMs > RESUME_FLOOR_MS) player.seekTo(playable.startPositionMs)
         player.prepare()
     }
 
@@ -471,6 +475,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         const val POSITION_POLL_MS = 1_000L
         const val MIN_SPEED = 0.25f
         const val MAX_SPEED = 4.0f
+        /// Resume floor (Apple `resumeSeconds > 5`): a resume under 5s starts the title over instead.
+        const val RESUME_FLOOR_MS = 5_000L
         // The bandwidth-meter seed now comes from AdaptiveTuning.initialBitrateEstimate (measured link when
         // known, else its own 50 Mbps default), so the constant that used to live here moved there.
     }

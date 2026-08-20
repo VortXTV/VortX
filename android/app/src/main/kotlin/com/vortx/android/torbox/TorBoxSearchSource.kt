@@ -3,6 +3,7 @@ package com.vortx.android.torbox
 import android.util.Log
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.debrid.ProviderCircuitBreaker
 import com.vortx.android.engine.SourceContributorSettlement
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
@@ -55,6 +56,12 @@ object TorBoxSearch {
 
     private const val TAG = "torbox-search"
     private const val BASE = "https://search-api.torbox.app"
+
+    /// The HEALTHY account host, used ONLY as the A1 resilience fallback when [BASE] never answers (its DNS
+    /// went dead). Its torrent search is live and used by other clients; it returns torrent rows only (no
+    /// usenet). Never the primary path: the public index at [BASE] is what this source is built around.
+    /// Mirrors the Apple `fallbackBase`.
+    private const val FALLBACK_BASE = "https://api.torbox.app"
     private const val TIMEOUT_MS = 12_000
     private val client = OkHttpClient.Builder()
         .connectTimeout(TIMEOUT_MS.toLong(), TimeUnit.MILLISECONDS)
@@ -118,12 +125,103 @@ object TorBoxSearch {
             val usenet = async { fetch("usenet", imdbId, season, episode, apiKey, authorizeAndIssue) }
             val torrents = async { fetch("torrents", imdbId, season, episode, apiKey, authorizeAndIssue) }
             val (u, t) = awaitAll(usenet, torrents)
+            val combined = u.streams + t.streams
+            val rateLimited = u.rateLimited || t.rateLimited
+            val transportError = u.transportError || t.transportError
+            // A1 resilience: [BASE] (search-api.torbox.app) is the DNS-dead host. When neither leg completed and
+            // we have nothing to show, fall back ONCE to the HEALTHY host's torrent search so a TorBox user
+            // still gets torrent sources instead of a silent nothing. A completed fallback (even an empty 200)
+            // clears the transportError signal, so the caller caches it and resets its consecutive-transport
+            // streak; a fallback that also fails to complete returns null and we fall through to the existing
+            // transportError path (offline blip self-heals on the next open). Mirrors the Apple `streams`.
+            if (transportError && combined.isEmpty()) {
+                val fallback = fetchFallbackTorrents(imdbId, apiKey, authorizeAndIssue)
+                if (fallback != null) {
+                    return@coroutineScope Result(fallback, rateLimited, transportError = false)
+                }
+            }
             Result(
-                streams = u.streams + t.streams,
-                rateLimited = u.rateLimited || t.rateLimited,
-                transportError = u.transportError || t.transportError,
+                streams = combined,
+                rateLimited = rateLimited,
+                transportError = transportError,
             )
         }
+    }
+
+    /// A1 resilience fallback. [BASE] (the public index this source normally uses) is the dead host; the
+    /// ACCOUNT host [FALLBACK_BASE] is healthy and exposes a torrent search other clients use. When the index
+    /// never answers, hit the healthy host ONCE for TORRENT rows (no usenet) so a TorBox user still gets
+    /// sources. Bearer-auth, bounded, fail-soft, credential-fenced. Returns null ONLY when the fallback itself
+    /// never completes / answers non-2xx / decodes to a non-object body (so [streams] falls through to the
+    /// existing transportError path); a 200 with no torrents returns an empty list (a completed empty
+    /// response), which the caller treats as a real "no results". Mirrors the Apple `fallbackTorrentSearch`.
+    private suspend fun fetchFallbackTorrents(
+        imdbId: String,
+        apiKey: String,
+        authorizeAndIssue: (() -> Unit) -> Boolean,
+    ): List<StreamSource>? = suspendCancellableCoroutine { continuation ->
+        if (!imdbId.startsWith("tt") || apiKey.isEmpty()) {
+            continuation.resume(null)
+            return@suspendCancellableCoroutine
+        }
+        val request = Request.Builder()
+            .url("$FALLBACK_BASE/v1/api/torrents/search?query=${enc(imdbId)}")
+            .header("Authorization", "Bearer $apiKey")
+            .header("Accept", "application/json")
+            .get()
+            .build()
+        val call = client.newCall(request)
+        val completed = AtomicBoolean(false)
+
+        fun complete(result: List<StreamSource>?) {
+            if (completed.compareAndSet(false, true)) continuation.resume(result)
+        }
+
+        continuation.invokeOnCancellation {
+            completed.set(true)
+            call.cancel()
+        }
+        val callback = object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                complete(null)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = runCatching {
+                    response.use {
+                        // Non-2xx or an unparseable (non-object) body => null so the caller keeps the
+                        // transportError path; a 200 object with no torrents => a completed empty list.
+                        if (!it.isSuccessful) return@use null
+                        val mapped = parseFallbackTorrents(it.body?.string().orEmpty())
+                        if (mapped != null) {
+                            Log.i(TAG, "search-api unreachable; healthy-host fallback returned ${mapped.size} torrent row(s)")
+                        }
+                        mapped
+                    }
+                }.getOrNull()
+                complete(result)
+            }
+        }
+
+        val issued = runCatching {
+            authorizeAndIssue { call.enqueue(callback) }
+        }.getOrDefault(false)
+        if (!issued) complete(null)
+    }
+
+    /// Tolerant org.json decode of the healthy host's torrent search. TorBox wraps payloads under `data`,
+    /// which is either a torrents array directly or an object carrying a `torrents` array. A body that is not
+    /// a JSON object at all returns null (a decode failure the caller treats as "fallback unavailable"); every
+    /// other shape degrades to an empty list rather than throwing. Mirrors the Apple `FallbackResponse`.
+    private fun parseFallbackTorrents(body: String): List<StreamSource>? {
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
+        val items = ArrayList<Item>()
+        when (val data = root.opt("data")) {
+            is JSONArray -> appendArray(data, items)
+            is JSONObject -> appendArray(data.optJSONArray("torrents"), items)
+            else -> Unit
+        }
+        return items.mapNotNull { streamFrom(it) }
     }
 
     /// One `GET /{kind}/imdb_id:{id}` call, bounded and fail-soft. The id-type prefix must be `imdb_id:`
@@ -434,7 +532,12 @@ class TorBoxSearchSource private constructor(
     private var inFlightKey: String? = null
     private var inFlightGeneration: Long = -1L
     private val cache = HashMap<String, List<StreamSource>>()
-    private var cooldownUntilMs: Long? = null
+    // The 429/transport-error backoff is NOT instance state anymore: it lives in the shared
+    // [ProviderCircuitBreaker], keyed by (provider, contentId). This class is rebuilt per detail screen, so a
+    // `cooldownUntilMs` kept HERE was forgotten every time a screen was torn down and rebuilt (every
+    // navigation away and back), letting the next screen re-fire the request that just got rate-limited.
+    // `shouldAttempt`/`recordFailure`/`recordSuccess` below are the replacement; every instance shares the
+    // same breaker state. Mirrors the Apple TorBoxSearchSource circuit-breaker port.
     private var job: Job? = null
     private var activeCredentialRevision: Long? = null
 
@@ -482,10 +585,6 @@ class TorBoxSearchSource private constructor(
                 _settlement.value = SourceContributorSettlement(requestGeneration, settled = false)
                 return
             }
-            if ((cooldownUntilMs ?: 0L) > System.currentTimeMillis()) {
-                _settlement.value = SourceContributorSettlement(requestGeneration, settled = true)
-                return
-            }
 
             job?.cancel()
             inFlightKey = fetchKey
@@ -494,6 +593,16 @@ class TorBoxSearchSource private constructor(
             scope.launch(start = CoroutineStart.LAZY) {
                 val ownerJob = coroutineContext[Job]
                 try {
+                    // Ask the SHARED breaker, not instance state: an open circuit here means some earlier
+                    // caller (possibly a now-dead screen) already saw TorBox back off for this exact content
+                    // id, and that memory must survive this screen's own lifetime. `shouldAttempt` also grants
+                    // at most one half-open probe once the cooldown elapses, so this refresh may be the probe
+                    // owner even while the circuit was open a moment ago. On a closed circuit the `finally`
+                    // block releases the in-flight slot and publishes the terminal settlement.
+                    if (!ProviderCircuitBreaker.shared.shouldAttempt(DebridService.TOR_BOX.id, fetchKey)) {
+                        Log.i(TAG, "circuit open for id=$canonicalImdbId, skipping fetch")
+                        return@launch
+                    }
                     val result = fetchStreams(canonicalImdbId, season, episode, key) { issue ->
                         authorizeAndIssue(credential, issue)
                     }
@@ -530,15 +639,34 @@ class TorBoxSearchSource private constructor(
                             return@synchronized
                         }
                         if (result.rateLimited) {
-                            // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT
-                            // cache the empty result, so it re-fetches once the cooldown lifts.
-                            cooldownUntilMs = System.currentTimeMillis() + COOLDOWN_MS
+                            // Over the TorBox scraper allowance. A 429 IS a completed HTTP response (the host
+                            // is reachable), so this trips the breaker on the FIRST occurrence rather than
+                            // accumulating a streak; do NOT cache the empty result, so it re-fetches once the
+                            // cooldown lifts.
+                            ProviderCircuitBreaker.shared.recordFailure(
+                                DebridService.TOR_BOX.id,
+                                fetchKey,
+                                ProviderCircuitBreaker.Phase.DISCOVER,
+                                ProviderCircuitBreaker.FailureReason.HttpStatus(429),
+                            )
                             Log.i(TAG, "rate-limited (scraper cooldown) for id=$canonicalImdbId, backing off ~15m")
                         } else if (result.transportError) {
-                            // The request never completed (offline / network failure). Do NOT cache the empty
-                            // result and do NOT set a cooldown, so the next meta change re-fetches.
+                            // The request never completed (offline / network failure / a DNS-dead host). Do NOT
+                            // cache the empty result. A single blip must self-heal immediately on the next
+                            // attempt (the breaker only trips after a PERSISTENT streak for a plain transport
+                            // failure), so a dead host is probed occasionally instead of firing failing lookups
+                            // on every open.
+                            ProviderCircuitBreaker.shared.recordFailure(
+                                DebridService.TOR_BOX.id,
+                                fetchKey,
+                                ProviderCircuitBreaker.Phase.DISCOVER,
+                                ProviderCircuitBreaker.FailureReason.Other("transport"),
+                            )
                             Log.i(TAG, "transport error for id=$canonicalImdbId, not caching, will retry")
                         } else {
+                            // A completed HTTP response with results (or a legit empty 200): the host is
+                            // reachable, so reset the breaker before caching.
+                            ProviderCircuitBreaker.shared.recordSuccess(DebridService.TOR_BOX.id, fetchKey)
                             Log.i(TAG, "fetched ${result.streams.size} stream(s) for id=$canonicalImdbId")
                             cache[fetchKey] = result.streams
                             if (shownKey == fetchKey) publishLocked(result.streams)
@@ -596,7 +724,6 @@ class TorBoxSearchSource private constructor(
         shownGeneration = -1L
         publishedContentId = null
         cache.clear()
-        cooldownUntilMs = null
         if (_streams.value.isNotEmpty()) publishLocked(emptyList())
     }
 
@@ -666,7 +793,6 @@ class TorBoxSearchSource private constructor(
 
     companion object {
         private const val TAG = "torbox-search"
-        private const val COOLDOWN_MS = 15L * 60L * 1000L
 
         /// The pure merge: append the fetched search streams as one extra group, deduped against the streams
         /// already present (by infoHash for torrents, nzbUrl for usenet, url otherwise). Returns [groups]

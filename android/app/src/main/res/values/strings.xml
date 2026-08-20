@@ -67,6 +67,10 @@
     <string name="downloads_channel_description">Progress for titles you save for offline viewing.</string>
     <string name="downloads_notification_title">Downloading</string>
 
+    <!-- New-episode alerts (F5). User-visible channel copy in Settings > Apps > VortX > Notifications. -->
+    <string name="new_episode_channel_name">New episodes</string>
+    <string name="new_episode_channel_description">Alerts when a series in your Library has a new episode.</string>
+
     <!-- In-player source, quality, and chapter navigation. Shared by phone and Android TV chrome. -->
     <string name="player_sources">Sources</string>
     <string name="player_sources_action_description">Choose playback source</string>
@@ -149,6 +153,11 @@
     <string name="addon_update_confirm_message">This add-on is already installed. Update it to its latest manifest?</string>
     <string name="addon_update_confirm_button">Update</string>
     <string name="addon_update_confirm_cancel">Cancel</string>
+
+    <!-- Add-on management entries: QR pairing, the community store, and per-add-on configure. -->
+    <string name="addon_install_by_qr">Install by QR</string>
+    <string name="addon_discover">Discover add-ons</string>
+    <string name="addon_configure">Configure</string>
 
     <!-- Collections Hub. These strings are shared by the phone and TV presentations. -->
     <string name="collections_title">Collections</string>

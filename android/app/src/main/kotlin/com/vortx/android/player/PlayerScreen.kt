@@ -148,6 +148,14 @@ fun PlayerScreen(
     /// its next-episode PRELOAD policy (warm the next episode's source before the current one ends). Default
     /// no-op keeps the screen usable in isolation; the phone shell wires it to [NextEpisodePreloadPolicy].
     onWarmNext: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    /// How many episodes auto-advanced back-to-back (with no interaction) to reach THIS playback, so the
+    /// binge boundary of the "Still watching?" guard can fire. The host counts the streak across the
+    /// auto-advance chain and resets it on any manual play. 0 (the default) never trips the binge boundary.
+    /// Mirrors Apple `consecutiveAutoAdvances` (PlayerScreen.swift:2064).
+    autoAdvanceCount: Int = 0,
+    /// Fired once when the binge boundary raised the "Still watching?" prompt, so the host resets its
+    /// auto-advance streak (Apple's `noteInteraction` clears `consecutiveAutoAdvances` on Continue).
+    onBingePrompted: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -206,6 +214,36 @@ fun PlayerScreen(
     // new stream (keyed on the playback session). See the timer effect and the end-of-stream gate below.
     var sleepMinutes by remember(playbackSessionKey) { mutableStateOf<Int?>(null) }
     var sleepAtEpisodeEnd by remember(playbackSessionKey) { mutableStateOf(false) }
+
+    // SEEK STEP (Apple `stremiox.seekStep`): the ms step every discrete relative seek uses -- the transport
+    // +/- buttons, the double-tap gesture, the TV remote FF/RW keys, and the hidden-chrome D-pad nudge.
+    // Read once per session; a change takes effect on the next play, like Apple's @AppStorage.
+    val seekStepMs = remember(playbackSessionKey) { SeekStepSetting.stepMs(context) }
+    val seekStepSeconds = remember(seekStepMs) { (seekStepMs / 1000L).toInt() }
+
+    // DEFAULT VOLUME + MUTE (Apple `stremiox.playerVolume` / `stremiox.playerMuted`), host-tracked so the
+    // in-player slider stays reactive. Applied to the live engine at load (below); the slider / mute button
+    // and the swipe gesture write through here and persist, so the level rides the same key Apple uses.
+    var playerVolume by remember(playbackSessionKey) { mutableStateOf(PlayerVolumeSettings.volume(context)) }
+    var playerMuted by remember(playbackSessionKey) { mutableStateOf(PlayerVolumeSettings.muted(context)) }
+
+    // STILL WATCHING (Apple `vortx.stillWatchingPrompt` / `vortx.stillWatchingAfterEpisodes`). The prompt is
+    // up (playback paused, awaiting Continue / Stop); the idle deadline is pushed forward on every
+    // interaction. Read once per session, like Apple's @AppStorage.
+    val stillWatchingEnabled = remember(playbackSessionKey) { StillWatchingSettings.promptEnabled(context) }
+    val stillWatchingAfterEpisodes = remember(playbackSessionKey) { StillWatchingSettings.afterEpisodes(context) }
+    var stillWatchingPrompt by remember(playbackSessionKey) { mutableStateOf(false) }
+    // Wall-clock (elapsedRealtime) idle deadline, a single-element holder so re-arming it never itself
+    // recomposes. Mirrors Apple's `idleDeadline`.
+    val idleDeadline = remember(playbackSessionKey) {
+        longArrayOf(SystemClock.elapsedRealtime() + StillWatchingSettings.IDLE_TIMEOUT_MS)
+    }
+
+    // HIDDEN-CHROME D-PAD SEEK NUDGE: while the chrome is hidden, Left/Right does a small seek and shows a
+    // floating time pill (not the whole transport bar). [seekNudgeTargetMs] is the predicted target the pill
+    // shows; [seekNudgeTick] re-arms its auto-hide. Mirrors Apple's `hiddenSeek` floating-time affordance.
+    var seekNudgeTargetMs by remember(playbackSessionKey) { mutableStateOf<Long?>(null) }
+    var seekNudgeTick by remember(playbackSessionKey) { mutableStateOf(0) }
 
     // CONTROLS AUTO-HIDE. The chrome (top scrim + title + transport bar) previously had no visibility
     // state at all, so it was drawn permanently over the video. Now: visible on entry, auto-hidden after
@@ -403,6 +441,56 @@ fun PlayerScreen(
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
+    // DEFAULT VOLUME + MUTE applied to the live engine at load (Apple `applyPersistedVolume`): the mount
+    // begins at the engine default (100%), so restore the viewer's chosen level. Keyed on the engine so a
+    // source switch / fail-soft demotion (which re-mount the engine) re-applies it. Idempotent per engine.
+    LaunchedEffect(engine) {
+        engine.setVolume(playerVolume)
+        engine.setMuted(playerMuted)
+    }
+    // Set the live volume from the slider / swipe (0..100), persist it, and un-mute on any raise above 0
+    // (moving the control is an intent to hear audio). Mirrors Apple `setPlayerVolume`.
+    fun setPlayerVolume(v: Double) {
+        val clamped = v.coerceIn(0.0, 100.0)
+        playerVolume = clamped
+        engine.setVolume(clamped)
+        PlayerVolumeSettings.setVolume(context, clamped)
+        if (clamped > 0.0 && playerMuted) {
+            playerMuted = false
+            engine.setMuted(false)
+            PlayerVolumeSettings.setMuted(context, false)
+        }
+    }
+    // Toggle mute on the live engine + persist; unmuting to a 0 level bumps to full so audio is actually
+    // heard (Apple `togglePlayerMute`).
+    fun togglePlayerMute() {
+        val next = !playerMuted
+        playerMuted = next
+        engine.setMuted(next)
+        PlayerVolumeSettings.setMuted(context, next)
+        if (!next && playerVolume <= 0.0) {
+            playerVolume = 100.0
+            engine.setVolume(100.0)
+            PlayerVolumeSettings.setVolume(context, 100.0)
+        }
+    }
+
+    // STILL WATCHING re-arm: every interaction (any showControls / D-pad / transport action bumps
+    // [controlsInteractionTick]) pushes the idle deadline forward, so an attended session never trips the
+    // prompt. Mirrors Apple `noteInteraction`.
+    LaunchedEffect(controlsInteractionTick) {
+        idleDeadline[0] = SystemClock.elapsedRealtime() + StillWatchingSettings.IDLE_TIMEOUT_MS
+    }
+    // BINGE BOUNDARY: this playback was reached by N back-to-back auto-advances with no interaction, so
+    // pause and ask instead of rolling on. Runs once at mount; the host resets its streak via
+    // [onBingePrompted]. Mirrors Apple presenting the prompt at the binge boundary (PlayerScreen.swift:2065).
+    LaunchedEffect(playbackSessionKey) {
+        if (StillWatchingPolicy.shouldPromptOnBinge(stillWatchingEnabled, autoAdvanceCount, stillWatchingAfterEpisodes)) {
+            onBingePrompted()
+            runCatching { engine.pause() }
+            stillWatchingPrompt = true
+        }
+    }
     // GOOGLE CAST (the CAST lane, Android's AirPlay equivalent). Conceptually mirrors the Apple AirPlay
     // handoff: while a receiver is connected the local engine YIELDS (pauses, so it stops decoding and
     // consuming the source), the current stream (URL + subtitles + start position) plays on the receiver,
@@ -599,6 +687,32 @@ fun PlayerScreen(
     // the watchdog's stall verdict OR the runtime-mismatch verdict.
     val effectiveError = playerState.hasError || stallError || runtimeMismatch
 
+    // STILL WATCHING idle guard: a single long-lived poll re-checks the deadline; when the session looks
+    // unattended AND is actually playing (never paused / buffering / errored / already-prompting), pause and
+    // raise the prompt. Mirrors Apple `startIdleWatch` / `maybePromptStillWatching`.
+    LaunchedEffect(playbackSessionKey) {
+        while (true) {
+            delay(StillWatchingSettings.IDLE_POLL_MS)
+            val s = latestState
+            val shouldPrompt = StillWatchingPolicy.shouldPromptOnIdle(
+                enabled = stillWatchingEnabled,
+                alreadyPrompting = stillWatchingPrompt,
+                // A duration or a non-zero position both prove real playback started (mpv/ExoPlayer publish
+                // one or the other once the first frame lands).
+                hasStartedPlaying = s.durationMs > 0L || s.positionMs > 0L,
+                isPaused = s.isPaused,
+                isBuffering = s.isBuffering,
+                hasError = effectiveError,
+                nowMs = SystemClock.elapsedRealtime(),
+                idleDeadlineMs = idleDeadline[0],
+            )
+            if (shouldPrompt) {
+                runCatching { engine.pause() }
+                stillWatchingPrompt = true
+            }
+        }
+    }
+
     // PICTURE-IN-PICTURE (issue #77). The handle keeps the hosting activity's PiP params live
     // (aspect ratio from the real video size, auto-enter armed only while actually rolling, the
     // play/pause RemoteAction tracking the paused state) and reports [PlayerPipHandle.isInPip] so
@@ -658,6 +772,14 @@ fun PlayerScreen(
         if (!controlsLocked || !unlockHintVisible) return@LaunchedEffect
         delay(UNLOCK_HINT_AUTO_HIDE_MS)
         unlockHintVisible = false
+    }
+
+    // The hidden-chrome D-pad seek pill auto-hides shortly after each nudge; a fresh nudge re-arms it via
+    // [seekNudgeTick]. Kept brief -- the pill is a quick confirmation, not persistent chrome.
+    LaunchedEffect(seekNudgeTick) {
+        if (seekNudgeTargetMs == null) return@LaunchedEffect
+        delay(SEEK_NUDGE_PILL_AUTO_HIDE_MS)
+        seekNudgeTargetMs = null
     }
 
     // ADD-ON SUBTITLES (the Android port of Apple SubtitleAddons.swift:37 `installedSources` +
@@ -1020,12 +1142,12 @@ fun PlayerScreen(
                     }
                     Key.MediaFastForward -> {
                         showControls()
-                        engine.seekBy(DOUBLE_TAP_SEEK_MS)
+                        engine.seekBy(seekStepMs)
                         return@onKeyEvent true
                     }
                     Key.MediaRewind -> {
                         showControls()
-                        engine.seekBy(-DOUBLE_TAP_SEEK_MS)
+                        engine.seekBy(-seekStepMs)
                         return@onKeyEvent true
                     }
                     else -> Unit
@@ -1048,6 +1170,18 @@ fun PlayerScreen(
                 if (!controlsVisible) {
                     // Back must keep meaning "leave the player", never be swallowed into a reveal.
                     if (event.key == Key.Back || event.key == Key.Escape) return@onKeyEvent false
+                    // HIDDEN-CHROME D-PAD NUDGE: Left/Right does a small seek and shows a floating time pill
+                    // WITHOUT raising the whole transport bar, so a quick correction stays unobtrusive.
+                    // Mirrors Apple's `hiddenSeek`.
+                    if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
+                        val forward = event.key == Key.DirectionRight
+                        val delta = if (forward) seekStepMs else -seekStepMs
+                        engine.seekBy(delta)
+                        // The pill shows the predicted target; the engine clamps the real seek to the file.
+                        seekNudgeTargetMs = (latestState.positionMs + delta).coerceAtLeast(0L)
+                        seekNudgeTick++
+                        return@onKeyEvent true
+                    }
                     showControls()
                     true
                 } else {
@@ -1078,8 +1212,10 @@ fun PlayerScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .pointerInput(engine, controlsLocked, pip.isInPip) {
-                    if (pip.isInPip) return@pointerInput
+                .pointerInput(engine, controlsLocked, pip.isInPip, stillWatchingPrompt) {
+                    // The Still Watching modal owns the surface while it is up: no bare-video tap should
+                    // toggle the chrome or seek underneath it.
+                    if (pip.isInPip || stillWatchingPrompt) return@pointerInput
                     if (controlsLocked) {
                         // Locked: taps only reveal the unlock affordance; the double-tap seek is
                         // deliberately absent so no gesture can move playback.
@@ -1091,21 +1227,25 @@ fun PlayerScreen(
                             },
                             onDoubleTap = { offset ->
                                 val forward = offset.x >= size.width / 2
-                                engine.seekBy(if (forward) DOUBLE_TAP_SEEK_MS else -DOUBLE_TAP_SEEK_MS)
+                                // The double-tap step follows the viewer's Skip step (Apple `stremiox.seekStep`).
+                                engine.seekBy(if (forward) seekStepMs else -seekStepMs)
                                 showControls()
                             },
                         )
                     }
                 }
-                .pointerInput(engine, controlsLocked, pip.isInPip, effectiveError) {
-                    if (controlsLocked || pip.isInPip || effectiveError) return@pointerInput
+                .pointerInput(engine, controlsLocked, pip.isInPip, effectiveError, stillWatchingPrompt) {
+                    if (controlsLocked || pip.isInPip || effectiveError || stillWatchingPrompt) return@pointerInput
                     detectPlayerDragGestures(
                         currentPositionMs = { latestState.positionMs },
                         currentDurationMs = { latestState.durationMs },
                         currentBrightness = { windowBrightnessFraction(hostActivity) },
-                        currentVolumeFraction = { streamVolumeFraction(audioManager) },
+                        // RIGHT-HALF SWIPE now drives the APP (engine) volume, not the system STREAM_MUSIC
+                        // level, so the in-player slider, the mute button and the swipe all move one value
+                        // (Apple `stremiox.playerVolume`). setPlayerVolume persists + un-mutes on a raise.
+                        currentVolumeFraction = { (playerVolume / 100.0).toFloat() },
                         onBrightness = { setWindowBrightnessFraction(hostActivity, it) },
-                        onVolumeFraction = { setStreamVolumeFraction(audioManager, it) },
+                        onVolumeFraction = { setPlayerVolume((it * 100.0)) },
                         onSeekCommit = { target ->
                             showControls()
                             engine.seekTo(target)
@@ -1128,7 +1268,27 @@ fun PlayerScreen(
                 stallError -> playerState.copy(hasError = true)
                 else -> playerState
             },
-            dolbyVisionAvailable = displaySupportsDolbyVision(context),
+            // DV BADGE HONESTY (Apple: the badge is earned only by the true-DV lane): show DOLBY VISION only
+            // when this is a DV source, the live engine is the DV lane (ExoPlayer), AND the panel presents
+            // DV. On the libmpv lane a DV source is tone-mapped to HDR10, so no DV badge there -- the
+            // Dynamic range row below tells the honest truth instead.
+            dolbyVisionAvailable = currentPlayable.isDolbyVision &&
+                engine is ExoPlayerEngine &&
+                displaySupportsDolbyVision(context),
+            // The honest dynamic-range line for the Playback Info sheet: true DV on the DV lane, else the
+            // "HDR10 tone-mapped from Dolby Vision" truth for a DV source on the libmpv lane. Null (omit the
+            // row) for a non-DV source, whose codec/HDR is already shown by the engine stats.
+            dynamicRange = when {
+                !currentPlayable.isDolbyVision -> null
+                engine is ExoPlayerEngine && displaySupportsDolbyVision(context) -> "Dolby Vision"
+                else -> "HDR10 (tone-mapped from Dolby Vision)"
+            },
+            seekStepMs = seekStepMs,
+            seekStepSeconds = seekStepSeconds,
+            playerVolume = playerVolume,
+            playerMuted = playerMuted,
+            onSetVolume = { setPlayerVolume(it) },
+            onToggleMute = { togglePlayerMute() },
             emberAccent = emberAccent,
             speed = speed,
             scaleMode = scaleMode,
@@ -1335,6 +1495,48 @@ fun PlayerScreen(
         // release/cancel and on entering PiP.
         PlayerGestureHudOverlay(hud = gestureHud, emberAccent = emberAccent)
 
+        // The hidden-chrome D-pad seek pill: a small floating time chip at top-centre showing the jump
+        // target, without raising the whole transport bar. Withheld in PiP (video-only).
+        seekNudgeTargetMs?.takeIf { !pip.isInPip }?.let { target ->
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 24.dp)
+                    .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                Text(
+                    text = if (playerState.durationMs > 0L) {
+                        "${formatTime(target)} / ${formatTime(playerState.durationMs)}"
+                    } else {
+                        formatTime(target)
+                    },
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                )
+            }
+        }
+
+        // STILL WATCHING modal: pauses playback and asks after a long idle stretch or a binge boundary.
+        // Drawn near-last so it sits above the chrome; the tap/drag layers stand down while it is up.
+        // Withheld in PiP (the tiny window is video-only).
+        if (stillWatchingPrompt && !pip.isInPip) {
+            StillWatchingOverlay(
+                emberAccent = emberAccent,
+                onContinue = {
+                    stillWatchingPrompt = false
+                    idleDeadline[0] = SystemClock.elapsedRealtime() + StillWatchingSettings.IDLE_TIMEOUT_MS
+                    if (latestState.isPaused) runCatching { engine.play() }
+                    showControls()
+                },
+                onStop = {
+                    stillWatchingPrompt = false
+                    currentOnBack()
+                },
+            )
+        }
+
         // The lock's single interactive surface: a small glass pill, revealed by any tap/key while
         // locked and auto-hidden again. Drawn LAST so it sits above the tap layer and is the one
         // thing a finger can actually hit.
@@ -1495,8 +1697,6 @@ internal tailrec fun Context.findActivity(): Activity? = when (this) {
     else -> null
 }
 
-/// The double-tap relative-seek step (ms). Matches the transport bar's Replay10/Forward10 buttons.
-private const val DOUBLE_TAP_SEEK_MS = 10_000L
 
 /// How often watch progress is written back while casting, matching the receiver's ~1s progress cadence
 /// closely enough for Continue Watching while staying light. Uses the SAME onProgress path as local
@@ -1510,6 +1710,10 @@ private const val CONTROLS_AUTO_HIDE_MS = 3_500L
 /// How long the locked player's "Tap to unlock" pill stays up after each reveal. Shorter than the
 /// chrome's auto-hide: while locked the whole point is an undisturbed frame.
 private const val UNLOCK_HINT_AUTO_HIDE_MS = 2_500L
+
+/// How long the hidden-chrome D-pad seek pill stays up after each nudge. Brief: it is a quick
+/// confirmation of the jump, not persistent chrome.
+private const val SEEK_NUDGE_PILL_AUTO_HIDE_MS = 1_200L
 
 /// Chapter metadata can trail the first duration publication by a few demux ticks. Read it only during
 /// this bounded startup window so ExoPlayer's empty result and chapterless files never create a poll loop.

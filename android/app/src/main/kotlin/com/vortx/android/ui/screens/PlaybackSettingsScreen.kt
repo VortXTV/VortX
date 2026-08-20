@@ -54,6 +54,9 @@ import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
+import com.vortx.android.player.PlayerVolumeSettings
+import com.vortx.android.player.SeekStepSetting
+import com.vortx.android.player.StillWatchingSettings
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.skip.SkipConfig
 import com.vortx.android.ui.components.Chip
@@ -115,6 +118,10 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var trailerLanguageDialog by remember { mutableStateOf(false) }
     var autoSkip by remember { mutableStateOf(PlaybackBehaviorSettings.autoSkip(appContext)) }
     var autoAddLibrary by remember { mutableStateOf(AutoAddLibrarySetting.isEnabled(appContext)) }
+    var seekStep by remember { mutableStateOf(SeekStepSetting.current(appContext)) }
+    var defaultVolume by remember { mutableStateOf(PlayerVolumeSettings.volume(appContext)) }
+    var stillWatchingPrompt by remember { mutableStateOf(StillWatchingSettings.promptEnabled(appContext)) }
+    var stillWatchingAfter by remember { mutableStateOf(StillWatchingSettings.afterEpisodes(appContext)) }
 
     var skipProvider by remember {
         // SkipConfig.init MUST run before the first read/write here. SkipConfig holds its SharedPreferences
@@ -170,6 +177,63 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         onClick = {
                             audioMode = mode
                             AudioOutputMode.setCurrent(appContext, mode)
+                        },
+                    )
+                }
+            }
+
+            SettingsSection(
+                title = "Player controls",
+                footer = "Skip step sets how far the +/- buttons, a double-tap, and the remote fast-forward " +
+                    "jump. Default volume is the level a new playback starts at, and the in-player slider " +
+                    "moves the same value.",
+            ) {
+                PickerRow(
+                    label = "Skip step",
+                    options = SeekStepSetting.choices,
+                    selectedId = seekStep,
+                    onSelect = {
+                        seekStep = it
+                        SeekStepSetting.setCurrent(appContext, it)
+                    },
+                )
+                PickerRow(
+                    label = "Default volume",
+                    options = PlayerVolumeSettings.pickerSteps(appContext).map { pct ->
+                        pct.toString() to if (pct == 100) "Max" else "$pct%"
+                    },
+                    selectedId = defaultVolume.roundToInt().toString(),
+                    onSelect = {
+                        val pct = it.toIntOrNull() ?: return@PickerRow
+                        defaultVolume = pct.toDouble()
+                        PlayerVolumeSettings.setVolume(appContext, pct.toDouble())
+                    },
+                )
+            }
+
+            SettingsSection(
+                title = "Still watching",
+                footer = "Pauses and asks if you are still watching after a long idle stretch or many " +
+                    "auto-played episodes. Turn off to keep playing.",
+            ) {
+                ToggleRow(
+                    label = "Still watching prompt",
+                    detail = null,
+                    checked = stillWatchingPrompt,
+                    onCheckedChange = {
+                        stillWatchingPrompt = it
+                        StillWatchingSettings.setPromptEnabled(appContext, it)
+                    },
+                )
+                if (stillWatchingPrompt) {
+                    PickerRow(
+                        label = "Ask after this many episodes",
+                        options = StillWatchingSettings.afterEpisodesChoices.map { it.toString() to it.toString() },
+                        selectedId = stillWatchingAfter.toString(),
+                        onSelect = {
+                            val count = it.toIntOrNull() ?: return@PickerRow
+                            stillWatchingAfter = count
+                            StillWatchingSettings.setAfterEpisodes(appContext, count)
                         },
                     )
                 }

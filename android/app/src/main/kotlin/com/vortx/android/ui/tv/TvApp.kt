@@ -255,6 +255,13 @@ fun TvApp(
                             playingMeta = loadedMeta
                             playing = resolved
                         },
+                        // A Person-page filmography tile (opened from the detail's cast rail) resolves a
+                        // title and opens it as a fresh detail, reusing the SAME detail slot the browse wall
+                        // uses -- the couch analogue of the phone actor -> film walk.
+                        onOpenTitle = {
+                            detailGeneration += 1
+                            detail = it
+                        },
                     )
                 }
             } else {
@@ -269,6 +276,7 @@ fun TvApp(
                         detailGeneration += 1
                         detail = it
                     },
+                    syncManager = syncManager,
                 )
             }
         }

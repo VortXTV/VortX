@@ -40,6 +40,7 @@ import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.MetaItem
+import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -80,18 +81,28 @@ fun TvShell(
     auth: AuthRepository,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
+    syncManager: VortXSyncManager? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
     var destination by remember { mutableStateOf(TvDestination.HOME) }
 
-    // The Live TV tab honors the SAME cross-platform "Show Live TV tab" preference the phone shell reads
-    // (TabBarPrefs, key `vortx.tabs.hide.live`): hidden -> the destination drops from the rail, and if it
-    // was the active surface the shell falls back to Home. The other destinations are always shown on TV
-    // (their per-tab hide toggles are a broader TV parity item, unchanged here).
+    // Every rail tab (except the always-present Home + Settings) honors the SAME cross-platform "Show <tab>"
+    // preferences the phone shell reads (TabBarPrefs, keys `vortx.tabs.hide.discover|live|library|search`):
+    // a hidden tab drops from the rail, and if it was the active surface the shell falls back to Home. This
+    // is the couch analogue of the phone Tab bar screen, driven by the exact same keys so a change on either
+    // form factor moves the same value.
     val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
     val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
-    val destinations = remember(hiddenTabs.hideLive) {
-        TvDestination.entries.filter { it != TvDestination.LIVE || !hiddenTabs.hideLive }
+    val destinations = remember(hiddenTabs) {
+        TvDestination.entries.filter { dest ->
+            when (dest) {
+                TvDestination.DISCOVER -> !hiddenTabs.hideDiscover
+                TvDestination.LIVE -> !hiddenTabs.hideLive
+                TvDestination.LIBRARY -> !hiddenTabs.hideLibrary
+                TvDestination.SEARCH -> !hiddenTabs.hideSearch
+                TvDestination.HOME, TvDestination.SETTINGS -> true
+            }
+        }
     }
     LaunchedEffect(destinations) {
         if (destination !in destinations) destination = TvDestination.HOME
@@ -137,7 +148,7 @@ fun TvShell(
                 TvDestination.SEARCH ->
                     TvSearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, signedIn = signedIn)
                 TvDestination.SETTINGS ->
-                    TvSettingsScreen(repo = repo)
+                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager)
             }
         }
     }

@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -17,12 +18,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -33,10 +39,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.library.WatchlistStore
+import com.vortx.android.person.CastMember
+import com.vortx.android.person.PersonSeed
+import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
@@ -44,6 +55,7 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 internal enum class TvDetailFocusTarget {
     WATCH,
@@ -96,6 +108,7 @@ fun TvDetailScreen(
     onBack: () -> Unit,
     onPlay: (Playable, MetaDetail) -> Unit,
     modifier: Modifier = Modifier,
+    onOpenTitle: (MetaItem) -> Unit = {},
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
@@ -123,6 +136,7 @@ fun TvDetailScreen(
                 streamsState = streamsState,
                 playback = playback,
                 watchlisted = watchlisted,
+                onOpenTitle = onOpenTitle,
             )
         }
     }
@@ -135,6 +149,7 @@ private fun TvDetailContent(
     streamsState: UiState<List<com.vortx.android.model.StreamGroup>>,
     playback: Playback,
     watchlisted: Boolean,
+    onOpenTitle: (MetaItem) -> Unit,
 ) {
     val context = LocalContext.current
     val colors = VortXTheme.colors
@@ -147,7 +162,42 @@ private fun TvDetailContent(
     val trailerModifier = if (hasTrailer) Modifier.focusRequester(secondaryFocus) else Modifier
     val saveModifier = if (hasTrailer) Modifier else Modifier.focusRequester(secondaryFocus)
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    // Selected season/episode come from the SAME [DetailViewModel] the phone drives, so choosing a season or
+    // episode below retargets the hero Watch/Resume + the source list, exactly as the phone screen does.
+    val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
+    val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
+
+    // View-local Person overlay + TMDB cast enrichment, mirroring the phone [DetailScreen] (held in the view,
+    // not the shared ViewModel -- the credits fetch is view-local on iOS/tvOS too). Credits come from VortX's
+    // keyless, signed catalog edge, keyed off the meta's imdb id and reset per title.
+    var personTarget by remember(detail.id) { mutableStateOf<PersonSeed?>(null) }
+    var castMembers by remember(detail.id) { mutableStateOf<List<CastMember>>(emptyList()) }
+    LaunchedEffect(detail.id, detail.type) {
+        castMembers = emptyList()
+        if (detail.id.startsWith("tt")) {
+            castMembers = TMDBPersonClient.credits(detail.id, detail.type)
+        }
+    }
+
+    val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+
+    // A tapped cast tile takes over the whole detail body with the Person page, mirroring the phone overlay.
+    val openPerson = personTarget
+    if (openPerson != null) {
+        TvPersonOverlay(
+            seed = openPerson,
+            onOpenTitle = { onOpenTitle(it); personTarget = null },
+            onBack = { personTarget = null },
+        )
+        return
+    }
+
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val bandHeight = maxHeight
+        Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState)) {
+            // The cinematic hero band fills the first screen; episodes + cast scroll up from beneath it.
+            Box(modifier = Modifier.fillMaxWidth().height(bandHeight)) {
         TvBackdrop(
             url = detail.background ?: detail.poster,
             seed = detail.id,
@@ -292,6 +342,33 @@ private fun TvDetailContent(
                 )
                 TvSourceList(streamsState = streamsState, onPlaySource = viewModel::play)
             }
+        }
+            }
+
+            // A series gains a focusable season picker + episode rail beneath the hero. Choosing an episode
+            // selects it (loading its sources up top) and scrolls back to the hero where Watch/Resume now
+            // targets it; the per-episode + per-season watched toggles route through the ViewModel's
+            // profile-aware history writes.
+            if (detail.type == MediaType.SERIES && detail.videos.isNotEmpty()) {
+                TvSeasonEpisodeSection(
+                    detail = detail,
+                    selectedSeason = selectedSeason,
+                    selectedEpisodeId = selectedEpisodeId,
+                    onSelectSeason = viewModel::selectSeason,
+                    onSelectEpisode = { episodeId ->
+                        viewModel.selectEpisode(episodeId)
+                        scope.launch { scrollState.animateScrollTo(0) }
+                    },
+                    onToggleWatched = viewModel::setVideoWatched,
+                    onMarkSeasonWatched = viewModel::setSeasonWatched,
+                )
+            }
+
+            TvCastCreditsSection(
+                detail = detail,
+                castMembers = castMembers,
+                onPersonTap = { personTarget = it },
+            )
         }
     }
 

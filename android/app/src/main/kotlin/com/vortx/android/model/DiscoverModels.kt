@@ -73,6 +73,13 @@ data class InstalledAddon(
     /// the `SubtitleAddons.swift:37` union filter): this add-on can be queried for external subtitle
     /// tracks at play time by [com.vortx.android.player.SubtitleAddonService].
     val providesSubtitles: Boolean = false,
+    /// The manifest declares at least one catalog (mirrors Apple `CoreDescriptor.hasCatalogs`): drives the
+    /// "Catalogs" capability label and nothing else here.
+    val hasCatalogs: Boolean = false,
+    /// The manifest declares a web configuration page (`behaviorHints.configurable == true`, Apple
+    /// `CoreDescriptor.isConfigurable`): the Add-ons row shows a Configure chip that opens
+    /// [configureUrl] (browser on phone, QR on TV).
+    val isConfigurable: Boolean = false,
     /// Turned OFF for the ACTIVE profile (the per-profile overlay, Apple `Profiles.swift:348
     /// toggleAddon`): still installed account-wide, but excluded from this profile's Home board rows
     /// and stream-source groups. Stamped by the repository from
@@ -84,4 +91,30 @@ data class InstalledAddon(
     /// `CoreDescriptor.host`).
     val host: String
         get() = runCatching { java.net.URI(transportUrl).host ?: transportUrl }.getOrDefault(transportUrl)
+
+    /// The add-on's configuration page: the manifest URL with the trailing `manifest.json` swapped for
+    /// `configure` (the Stremio convention, Apple `CoreDescriptor.configureURL`). Null when the add-on
+    /// declares no configuration page. Opens in a browser on phone; the TV Configure sheet shows it as a QR.
+    val configureUrl: String?
+        get() {
+            if (!isConfigurable) return null
+            return if (transportUrl.endsWith("/manifest.json")) {
+                transportUrl.dropLast("manifest.json".length) + "configure"
+            } else {
+                transportUrl
+            }
+        }
+
+    /// "Catalogs · Streams · Metadata · Subtitles", the resource kinds the add-on exposes (Apple
+    /// `CoreDescriptor.capabilities`). "Add-on" when it declares none of them.
+    val capabilities: String
+        get() {
+            val caps = buildList {
+                if (hasCatalogs) add("Catalogs")
+                if (providesStreams) add("Streams")
+                if (providesMeta) add("Metadata")
+                if (providesSubtitles) add("Subtitles")
+            }
+            return if (caps.isEmpty()) "Add-on" else caps.joinToString(" · ")
+        }
 }

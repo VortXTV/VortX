@@ -1,6 +1,10 @@
 package com.vortx.android.ui.tv
 
+import android.Manifest
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -54,10 +58,26 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.BuildConfig
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.skip.SkipConfig
+import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.ui.prefs.TabBarPrefs
+import com.vortx.android.ui.screens.AccountContent
+import com.vortx.android.ui.screens.IntegrationsScreen
+import com.vortx.android.ui.screens.MetadataKeysScreen
+import com.vortx.android.ui.viewmodel.AccountViewModel
+import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.home.HomeRailPreferences
+import com.vortx.android.notifications.NewEpisodeNotifications
+import com.vortx.android.update.UpdateAvailableBanner
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
 import com.vortx.android.player.AudioOutputMode
@@ -74,6 +94,8 @@ import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.viewmodel.AddonPairingViewModel
+import com.vortx.android.ui.viewmodel.AddonStoreViewModel
 import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 
@@ -100,13 +122,26 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 /// to its own separate account is not wired on Android yet, so a
 /// [ProfileStore.select] returning `SwitchAccount` / `NeedsSignIn` is surfaced as a note.
 @Composable
-fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
+fun TvSettingsScreen(
+    repo: CatalogRepository,
+    modifier: Modifier = Modifier,
+    auth: AuthRepository = PreviewAuthRepository(),
+    syncManager: VortXSyncManager? = null,
+) {
     val appContext = LocalContext.current.applicationContext
     val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val trackStore = remember(appContext) {
         TrackPreferencesStore(appContext, PerformanceMode.isConstrainedDevice(appContext))
     }
+    // The tab-visibility store is the SAME one the phone Tab bar screen and the TV shell read (TabBarPrefs,
+    // keys `vortx.tabs.hide.*`); toggling here moves the exact value the rail filters on.
+    val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
+    val tabState by tabBarPrefs.state.collectAsStateWithLifecycle()
+    // The crowd skip-provider choice is a preference (`stremiox.skipProvider`), the same key/default the
+    // player read path uses; init is idempotent.
+    LaunchedEffect(appContext) { SkipConfig.init(appContext) }
+    var skipProvider by remember { mutableStateOf(SkipConfig.provider) }
     var route by remember { mutableStateOf(TvSettingsRoute.ROOT) }
     val settingsListState = rememberLazyListState()
     val debridServicesFocus = remember { FocusRequester() }
@@ -130,6 +165,12 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
     // TV-2: the Play Next "Continue Watching" row Show/Hide toggle. Seeded from the same key the publisher
     // reads; turning it off clears the published rows immediately (an on flip republishes on the next CW tick).
     var showCwOnHome by remember { mutableStateOf(TopShelfSettings.showContinueWatching(appContext)) }
+    // New-episode alerts (F5), same key `stremiox.notifyNewEpisodes` as every other surface. Enabling arms
+    // the library sweep and (API 33+) requests POST_NOTIFICATIONS in context.
+    var notifyNewEpisodes by remember { mutableStateOf(NewEpisodeNotifications.isEnabled(appContext)) }
+    val notifyPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* the schedule already stands; the post is permission-gated at fire time */ }
 
     val store = ProfileStore.sharedOrNull()
     // Bumped after a switch to force a fresh read of the plain (non-observable) store fields.
@@ -153,6 +194,32 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
             tvAddonsFocusTarget(TvAddonsFocusEvent.BACK_TO_SETTINGS) == TvAddonsFocusTarget.SETTINGS_ADDONS
     }
 
+    if (route == TvSettingsRoute.ADDON_STORE) {
+        BackHandler { route = TvSettingsRoute.ADDONS }
+        val storeVm: AddonStoreViewModel = viewModel<AddonStoreViewModel>(
+            factory = StremioXViewModelFactory(repo = repo),
+        )
+        TvAddonStoreScreen(
+            viewModel = storeVm,
+            onBack = { route = TvSettingsRoute.ADDONS },
+            modifier = modifier,
+        )
+        return
+    }
+
+    if (route == TvSettingsRoute.ADDON_PAIRING) {
+        BackHandler { route = TvSettingsRoute.ADDONS }
+        val pairingVm: AddonPairingViewModel = viewModel<AddonPairingViewModel>(
+            factory = StremioXViewModelFactory(repo = repo),
+        )
+        TvAddonPairingScreen(
+            viewModel = pairingVm,
+            onBack = { route = TvSettingsRoute.ADDONS },
+            modifier = modifier,
+        )
+        return
+    }
+
     if (route == TvSettingsRoute.ADDONS) {
         BackHandler { returnFromAddons() }
         val addonsVm: AddonsViewModel = viewModel<AddonsViewModel>(
@@ -161,6 +228,8 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
         TvAddonsScreen(
             viewModel = addonsVm,
             onBack = ::returnFromAddons,
+            onDiscover = { route = TvSettingsRoute.ADDON_STORE },
+            onInstallByQr = { route = TvSettingsRoute.ADDON_PAIRING },
             modifier = modifier,
         )
         return
@@ -188,6 +257,44 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
             onBack = { route = TvSettingsRoute.ROOT },
             modifier = modifier,
         )
+        return
+    }
+
+    if (route == TvSettingsRoute.ACCOUNT) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        TvAccountRoute(
+            repo = repo,
+            auth = auth,
+            syncManager = syncManager,
+            onBack = { route = TvSettingsRoute.ROOT },
+            modifier = modifier,
+        )
+        return
+    }
+
+    if (route == TvSettingsRoute.IMPORT_STREMIO) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        TvStremioImportRoute(
+            repo = repo,
+            auth = auth,
+            onBack = { route = TvSettingsRoute.ROOT },
+            modifier = modifier,
+        )
+        return
+    }
+
+    if (route == TvSettingsRoute.INTEGRATIONS) {
+        // Trakt / SIMKL. IntegrationsScreen is self-contained (drives the auth singletons directly), so it
+        // needs no repository or ViewModel -- reused verbatim from the phone.
+        BackHandler { route = TvSettingsRoute.ROOT }
+        IntegrationsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.METADATA) {
+        // TMDB / OMDB metadata keys. Self-contained like Integrations; reused verbatim from the phone.
+        BackHandler { route = TvSettingsRoute.ROOT }
+        MetadataKeysScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
         return
     }
 
@@ -236,6 +343,31 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
             }
 
             item {
+                TvSettingsSection("Account") {
+                    TvSettingsNavigationRow(
+                        label = "Account & sign-in",
+                        detail = "Sign in to VortX by scanning a code for cross-device sync, or connect Stremio.",
+                        onClick = { route = TvSettingsRoute.ACCOUNT },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "Import from Stremio",
+                        detail = "Sign in to Stremio to bring in your library and add-ons.",
+                        onClick = { route = TvSettingsRoute.IMPORT_STREMIO },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "Trakt & SIMKL",
+                        detail = "Connect Trakt or SIMKL to scrobble and sync watched history.",
+                        onClick = { route = TvSettingsRoute.INTEGRATIONS },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "Metadata keys",
+                        detail = "Add your own TMDB / OMDB keys for ratings and artwork.",
+                        onClick = { route = TvSettingsRoute.METADATA },
+                    )
+                }
+            }
+
+            item {
                 TvSettingsSection("Appearance") {
                     TvSettingsNavigationRow(
                         label = "Customize Home",
@@ -277,6 +409,19 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
                             val next = !autoAdd
                             autoAdd = next
                             AutoAddLibrarySetting.setEnabled(appContext, next)
+                        },
+                    )
+                    TvToggleRow(
+                        label = "New episode alerts",
+                        detail = "Notify me when a series in my Library has a new episode.",
+                        checked = notifyNewEpisodes,
+                        onToggle = {
+                            val next = !notifyNewEpisodes
+                            notifyNewEpisodes = next
+                            NewEpisodeNotifications.setEnabled(appContext, next)
+                            if (next && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                notifyPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            }
                         },
                     )
                 }
@@ -348,6 +493,54 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
             }
 
             item {
+                TvSettingsSection("Subtitle font") {
+                    SubtitleStyle.fonts.forEach { (id, label) ->
+                        TvOptionRow(
+                            label = label,
+                            detail = null,
+                            selected = subtitleStyle.fontId == id,
+                            onClick = {
+                                subtitleStyle = subtitleStyle.copy(fontId = id)
+                                SubtitleStyle.save(appContext, subtitleStyle)
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                TvSettingsSection("Subtitle size") {
+                    SubtitleStyle.sizes.forEach { (id, label) ->
+                        TvOptionRow(
+                            label = label,
+                            detail = null,
+                            selected = subtitleStyle.sizeId == id,
+                            onClick = {
+                                subtitleStyle = subtitleStyle.copy(sizeId = id)
+                                SubtitleStyle.save(appContext, subtitleStyle)
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                TvSettingsSection("Subtitle background") {
+                    SubtitleStyle.backgrounds.forEach { (id, label) ->
+                        TvOptionRow(
+                            label = label,
+                            detail = null,
+                            selected = subtitleStyle.backgroundId == id,
+                            onClick = {
+                                subtitleStyle = subtitleStyle.copy(backgroundId = id)
+                                SubtitleStyle.save(appContext, subtitleStyle)
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
                 TvSettingsSection("External subtitles") {
                     TvToggleRow(
                         label = "Only preferred external subtitles",
@@ -408,6 +601,51 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
             }
 
             item {
+                TvSettingsSection("Skip provider") {
+                    tvSkipProviderOptions.forEach { (id, copy) ->
+                        TvOptionRow(
+                            label = copy.first,
+                            detail = copy.second,
+                            selected = id == skipProvider,
+                            onClick = {
+                                skipProvider = id
+                                SkipConfig.setProvider(id)
+                            },
+                        )
+                    }
+                }
+            }
+
+            item {
+                TvSettingsSection("Tabs") {
+                    TvToggleRow(
+                        label = "Show Discover tab",
+                        detail = null,
+                        checked = !tabState.hideDiscover,
+                        onToggle = { tabBarPrefs.setDiscoverVisible(tabState.hideDiscover) },
+                    )
+                    TvToggleRow(
+                        label = "Show Live TV tab",
+                        detail = "Channels from your installed Live TV add-ons.",
+                        checked = !tabState.hideLive,
+                        onToggle = { tabBarPrefs.setLiveVisible(tabState.hideLive) },
+                    )
+                    TvToggleRow(
+                        label = "Show Library tab",
+                        detail = null,
+                        checked = !tabState.hideLibrary,
+                        onToggle = { tabBarPrefs.setLibraryVisible(tabState.hideLibrary) },
+                    )
+                    TvToggleRow(
+                        label = "Show Search tab",
+                        detail = "Home and Settings always stay. Hiding the current tab returns you to Home.",
+                        checked = !tabState.hideSearch,
+                        onToggle = { tabBarPrefs.setSearchVisible(tabState.hideSearch) },
+                    )
+                }
+            }
+
+            item {
                 TvSettingsSection("Performance") {
                     PerformanceMode.Override.entries.forEach { option ->
                         TvOptionRow(
@@ -425,6 +663,9 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
 
             item {
                 TvSettingsSection("About") {
+                    // The passive "update available" banner (sideloaded, no store channel). Renders nothing
+                    // when up to date or dismissed; focusing + selecting it opens the install channel.
+                    UpdateAvailableBanner()
                     TvSettingsNavigationRow(
                         label = "What's New",
                         detail = "VortX ${BuildConfig.VERSION_NAME}",
@@ -475,11 +716,21 @@ fun TvSettingsScreen(repo: CatalogRepository, modifier: Modifier = Modifier) {
 internal enum class TvSettingsRoute {
     ROOT,
     ADDONS,
+    ADDON_STORE,
+    ADDON_PAIRING,
     DEBRID,
     WHATS_NEW,
-    CUSTOMIZE_HOME;
+    CUSTOMIZE_HOME,
+    ACCOUNT,
+    IMPORT_STREMIO,
+    INTEGRATIONS,
+    METADATA;
 
-    internal fun back(): TvSettingsRoute = ROOT
+    internal fun back(): TvSettingsRoute = when (this) {
+        // The store + pairing screens are nested under Add-ons; Back returns there, not to the root.
+        ADDON_STORE, ADDON_PAIRING -> ADDONS
+        else -> ROOT
+    }
 }
 
 /// The active profile, shown large above the switcher (avatar + name + a Kids marker), so "who is watching"
@@ -862,10 +1113,82 @@ private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = t
 @Composable
 private fun TvSettingsFootnote() {
     Text(
-        text = "Creating, renaming, and deleting profiles, plus account, integrations, media " +
-            "servers, advanced subtitle styling, source ranking, and downloads, are managed in the VortX phone and " +
-            "tablet app.",
+        text = "Creating, renaming, and deleting profiles, plus media servers, source ranking, " +
+            "downloads, and library transfer, are managed in the VortX phone and tablet app.",
         style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
         modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.sm),
     )
+}
+
+/// The crowd skip-database choices. The ids are the EXACT strings [SkipConfig.provider] stores (and that
+/// [com.vortx.android.skip.SkipTimestampService] selects a leg from), matching the phone
+/// PlaybackSettingsScreen's `skipProviderOptions` and the Apple `SkipTimestampService.provider` values.
+/// "both" is first because it is the stored default.
+private val tvSkipProviderOptions: List<Pair<String, Pair<String, String>>> = listOf(
+    "both" to ("Both" to "Ask both databases. The widest coverage, and the default."),
+    "theintrodb" to ("TheIntroDB" to "Ask TheIntroDB only."),
+    "skipdb" to ("SkipDB" to "Ask SkipDB only."),
+)
+
+/// The account / sign-in route: the 10-foot [TvLoginScreen] built with the SAME view models the phone Settings
+/// rows drive. The VortX side ([VortXAccountViewModel]) needs the app-process [VortXSyncManager] and is only
+/// built when one is available; the Stremio side ([AccountViewModel]) rides the shared [AuthRepository].
+@Composable
+private fun TvAccountRoute(
+    repo: CatalogRepository,
+    auth: AuthRepository,
+    syncManager: VortXSyncManager?,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val stremioVm: AccountViewModel = viewModel(
+        factory = StremioXViewModelFactory(repo = repo, auth = auth),
+    )
+    val vortxVm: VortXAccountViewModel? = if (syncManager != null) {
+        viewModel(factory = StremioXViewModelFactory(repo = repo, syncManager = syncManager))
+    } else {
+        null
+    }
+    TvLoginScreen(
+        vortxViewModel = vortxVm,
+        stremioViewModel = stremioVm,
+        onBack = onBack,
+        modifier = modifier,
+    )
+}
+
+/// The Import-from-Stremio route: the phone [AccountContent] (Stremio sign-in / import, driven by the shared
+/// [AccountViewModel] over [AuthRepository]) inside 10-foot chrome. Reused verbatim so the import flow and its
+/// credential handling can never drift from the phone.
+@Composable
+private fun TvStremioImportRoute(
+    repo: CatalogRepository,
+    auth: AuthRepository,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    BackHandler { onBack() }
+    val stremioVm: AccountViewModel = viewModel(
+        factory = StremioXViewModelFactory(repo = repo, auth = auth),
+    )
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(TvDimens.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+            Text("Import from Stremio", style = VortXTheme.type.sectionTitle)
+            Text(
+                "Sign in to your Stremio account to import its library and add-ons. VortX stays your " +
+                    "primary account.",
+                style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
+            )
+        }
+        AccountContent(
+            viewModel = stremioVm,
+            modifier = Modifier.widthIn(max = TvDimens.formMaxWidth).fillMaxWidth(),
+        )
+    }
 }

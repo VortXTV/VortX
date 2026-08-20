@@ -72,6 +72,8 @@ class StremioXViewModelFactory(
             SearchViewModel(repo, SearchHistoryStore(context)) as T
         }
         modelClass.isAssignableFrom(AddonsViewModel::class.java) -> AddonsViewModel(repo) as T
+        modelClass.isAssignableFrom(AddonStoreViewModel::class.java) -> AddonStoreViewModel(repo) as T
+        modelClass.isAssignableFrom(AddonPairingViewModel::class.java) -> AddonPairingViewModel(repo) as T
         modelClass.isAssignableFrom(AccountViewModel::class.java) -> AccountViewModel(auth) as T
         modelClass.isAssignableFrom(VortXAccountViewModel::class.java) -> {
             // The app-process VortXSyncManager (VortXApplication.syncManager): the E2E VortX account +

@@ -605,6 +605,60 @@ internal class DebridCoordinator(
         return ResumeResolution(storedUrl.orEmpty(), refreshed = false)
     }
 
+    // ------------------------------------------------------------------------------------------------
+    // Browsable debrid cloud library (aggregate)
+    // ------------------------------------------------------------------------------------------------
+
+    /// Every configured provider's cloud library, keyed by service, queried CONCURRENTLY (the resolver legs
+    /// run on [Dispatchers.IO] under a [supervisorScope]). FAIL-SOFT: with no key the map is empty; a provider
+    /// that errors or is empty simply does not appear (its per-provider catch collapses to no entry), so the
+    /// browse UI hides that section rather than erroring. Mirrors the Apple `DebridCoordinator.cloudLibrary`.
+    suspend fun cloudLibrary(
+        expectedOwner: DebridOwnerToken? = keys.ownerToken(),
+    ): Map<DebridService, List<DebridResolver.DebridLibraryItem>> {
+        val owner = expectedOwner ?: return emptyMap()
+        if (!keys.isCurrent(owner)) return emptyMap()
+        val services = keys.configuredServices(owner)
+        if (services.isEmpty()) return emptyMap()
+        val collected: Map<DebridService, List<DebridResolver.DebridLibraryItem>> = supervisorScope {
+            val deferreds = services.map { service ->
+                service to async(Dispatchers.IO) {
+                    try {
+                        resolver.listCloudLibrary(service, owner)
+                    } catch (cancel: CancellationException) {
+                        throw cancel
+                    } catch (error: Exception) {
+                        emptyList()
+                    }
+                }
+            }
+            // await() is a suspend call, so collect in a plain loop (the supervisorScope block IS a suspend
+            // context), matching the [cacheCheck] fan-out above; keep only providers that returned items.
+            val out = LinkedHashMap<DebridService, List<DebridResolver.DebridLibraryItem>>()
+            for ((service, deferred) in deferreds) {
+                val items = deferred.await()
+                if (items.isNotEmpty()) out[service] = items
+            }
+            out
+        }
+        return collected.takeIf { keys.isCurrent(owner) }.orEmpty()
+    }
+
+    /// Resolve a chosen library item to a direct, streamable URL through its own provider's resolve leg.
+    /// Throws [DebridResolver.DebridException.NoKey] when that provider is no longer configured; other
+    /// [DebridResolver.DebridException]s when the file is gone. Mirrors the Apple `resolveLibraryItem`.
+    suspend fun resolveLibraryItem(
+        item: DebridResolver.DebridLibraryItem,
+        expectedOwner: DebridOwnerToken? = null,
+    ): String {
+        val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridResolver.DebridException.NoKey
+        if (!keys.isCurrent(owner)) throw DebridResolver.DebridException.OwnerChanged
+        if (!keys.isConfigured(item.service, owner)) throw DebridResolver.DebridException.NoKey
+        return resolver.resolveLibraryItem(item, owner).also {
+            if (!keys.isCurrent(owner)) throw DebridResolver.DebridException.OwnerChanged
+        }
+    }
+
     private companion object {
         const val TAG = "DebridCoordinator"
 

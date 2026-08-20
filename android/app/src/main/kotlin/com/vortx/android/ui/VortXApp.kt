@@ -76,6 +76,7 @@ import com.vortx.android.player.PlayerScreen
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
+import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.components.Wordmark
 import com.vortx.android.ui.gallery.GalleryScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
@@ -84,11 +85,15 @@ import com.vortx.android.ui.prefs.TabSlot
 import com.vortx.android.ui.prefs.isVisible
 import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
+import com.vortx.android.ui.screens.AddonPairingScreen
+import com.vortx.android.ui.screens.AddonStoreScreen
 import com.vortx.android.ui.screens.AddonsScreen
 import com.vortx.android.ui.screens.AppearanceScreen
+import com.vortx.android.stats.WatchStatsScreen
 import com.vortx.android.ui.screens.BackupRestoreScreen
 import com.vortx.android.ui.screens.CustomizeHomeScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
+import com.vortx.android.ui.screens.DebridLibraryScreen
 import com.vortx.android.ui.screens.DetailScreen
 import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadQueueScreen
@@ -120,6 +125,8 @@ import com.vortx.android.ui.theme.vortxGlassPanel
 import com.vortx.android.ui.theme.vortxGlassProminent
 import com.vortx.android.ui.theme.vortxGlassStrip
 import com.vortx.android.ui.viewmodel.AccountViewModel
+import com.vortx.android.ui.viewmodel.AddonPairingViewModel
+import com.vortx.android.ui.viewmodel.AddonStoreViewModel
 import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
@@ -230,6 +237,11 @@ fun VortXApp(
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
+        // "Still watching?" binge streak: consecutive auto-advanced episodes with no manual play between
+        // them, so the player can raise the prompt at the binge boundary (Apple `consecutiveAutoAdvances`).
+        // Incremented on each Up Next AUTO-advance (countdown expiry), reset on any manual play. A one-element
+        // holder so bumping it never itself recomposes.
+        val autoAdvanceStreak = remember { intArrayOf(0) }
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
             detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
         )
@@ -245,6 +257,10 @@ fun VortXApp(
         var showAccount by remember { mutableStateOf(false) }
         var showVortxAccount by remember { mutableStateOf(false) }
         var showAddons by remember { mutableStateOf(false) }
+        // Nested under Add-ons: the community store browser and the Install-by-QR pairing sheet. Checked
+        // BEFORE the showAddons overlay so they render on top, and cleared on Back to reveal Add-ons.
+        var showAddonStore by remember { mutableStateOf(false) }
+        var showAddonPairing by remember { mutableStateOf(false) }
         var showIntegrations by remember { mutableStateOf(false) }
         var showMediaServers by remember { mutableStateOf(false) }
         var showDownloads by remember { mutableStateOf(false) }
@@ -256,6 +272,7 @@ fun VortXApp(
         var showMetadataKeys by remember { mutableStateOf(false) }
         var showHomeDiscover by remember { mutableStateOf(false) }
         var showDebridKeys by remember { mutableStateOf(false) }
+        var showDebridLibrary by remember { mutableStateOf(false) }
         var restoreDebridServicesFocus by remember { mutableStateOf(false) }
         val settingsScrollState = rememberScrollState()
         val debridServicesFocusRequester = remember { FocusRequester() }
@@ -266,6 +283,7 @@ fun VortXApp(
         var showAppearance by remember { mutableStateOf(false) }
         var showCustomizeHome by remember { mutableStateOf(false) }
         var showTabBar by remember { mutableStateOf(false) }
+        var showWatchStats by remember { mutableStateOf(false) }
         var showWhatsNew by remember { mutableStateOf(false) }
         // Cold-launch "Who's watching?" picker (ACC-3): shown once per launch only when there is a real
         // choice (more than one profile, not yet picked). Seeded from ProfileStore.needsPicker at first
@@ -280,6 +298,8 @@ fun VortXApp(
             showAccount = false
             showVortxAccount = false
             showAddons = false
+            showAddonStore = false
+            showAddonPairing = false
             showIntegrations = false
             showMediaServers = false
             showDownloads = false
@@ -289,6 +309,7 @@ fun VortXApp(
             showMetadataKeys = false
             showHomeDiscover = false
             showDebridKeys = false
+            showDebridLibrary = false
             restoreDebridServicesFocus = false
             showLiveTv = false
             showLibraryTransfer = false
@@ -296,6 +317,7 @@ fun VortXApp(
             showProfiles = false
             showAppearance = false
             showCustomizeHome = false
+            showWatchStats = false
             showWhatsNew = false
             showTabBar = false
             detailGeneration += 1
@@ -346,6 +368,13 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        // The once-per-launch "update available" popup (sideloaded Android has no store channel). A Dialog,
+        // so it floats above whatever screen is showing rather than replacing it; driven by UpdateChecker's
+        // prompt flow (set by the launch/hourly check for a newer stable build). Placed after the cold-launch
+        // profile picker so it never stacks on top of it. UpdateChecker.start() is kicked in
+        // VortXApplication.onCreate, so this only observes.
+        UpdatePromptHost()
+
         // The debug-only design-system gallery (S02) is the topmost overlay when open, above even the
         // detail/player layers below; it is a review tool, not part of the product navigation graph.
         if (showGallery) {
@@ -382,6 +411,12 @@ fun VortXApp(
                 prefs = tabBarPrefs,
                 onBack = { showTabBar = false },
             )
+            return@VortXTheme
+        }
+
+        if (showWatchStats) {
+            BackHandler { showWatchStats = false }
+            WatchStatsScreen(onBack = { showWatchStats = false })
             return@VortXTheme
         }
 
@@ -497,6 +532,9 @@ fun VortXApp(
             Box {
                 PlayerScreen(
                     playable = playable,
+                    // "Still watching?" binge boundary: how many episodes auto-advanced to reach this one.
+                    autoAdvanceCount = autoAdvanceStreak[0],
+                    onBingePrompted = { autoAdvanceStreak[0] = 0 },
                     sourceOptions = playerSourceOptions,
                     qualityOptions = playerQualityOptions,
                     episodeOptions = playerEpisodeOptions,
@@ -625,8 +663,12 @@ fun VortXApp(
                     UpNextOverlay(
                         episode = nextEp,
                         resolving = nextPlayback is Playback.Resolving,
-                        onPlayNow = { advanceVm.playNextEpisode() },
-                        onCancel = { playing = null },
+                        // A countdown-expiry advance is an AUTO-advance: grow the streak so the binge
+                        // boundary can fire on the next episode. A manual "Play now" tap or Cancel is
+                        // presence, so it resets the streak (Apple's `noteInteraction`). Both paths play.
+                        onAutoAdvance = { autoAdvanceStreak[0]++; advanceVm.playNextEpisode() },
+                        onPlayNow = { autoAdvanceStreak[0] = 0; advanceVm.playNextEpisode() },
+                        onCancel = { autoAdvanceStreak[0] = 0; playing = null },
                     )
                 }
                 // The bad-source ladder's surfaces + their resolution collector. Like the Up Next
@@ -701,10 +743,33 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showAddonStore) {
+            // Nested under Add-ons > Discover: the community collection browser. Rendered on top of the
+            // Add-ons overlay; Back reveals Add-ons again.
+            BackHandler { showAddonStore = false }
+            val storeVm: AddonStoreViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            AddonStoreScreen(viewModel = storeVm, onBack = { showAddonStore = false })
+            return@VortXTheme
+        }
+
+        if (showAddonPairing) {
+            // Nested under Add-ons > Install by QR: the keyboardless pairing sheet (show a QR, a phone
+            // pastes manifest URLs, this device installs each).
+            BackHandler { showAddonPairing = false }
+            val pairingVm: AddonPairingViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            AddonPairingScreen(viewModel = pairingVm, onBack = { showAddonPairing = false })
+            return@VortXTheme
+        }
+
         if (showAddons) {
             BackHandler { showAddons = false }
             val addonsVm: AddonsViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
-            AddonsScreen(viewModel = addonsVm, onBack = { showAddons = false })
+            AddonsScreen(
+                viewModel = addonsVm,
+                onBack = { showAddons = false },
+                onDiscover = { showAddonStore = true },
+                onInstallByQr = { showAddonPairing = true },
+            )
             return@VortXTheme
         }
 
@@ -745,7 +810,7 @@ fun VortXApp(
                 // A local download carries no catalog meta here, so the played title has no library
                 // identity: clear the binding rather than let the previous play's meta ride along. Auto-add
                 // then skips this play (Apple's `let m = curMeta` skip).
-                onPlay = { playing = it; playingMeta = null },
+                onPlay = { playing = it; playingMeta = null; autoAdvanceStreak[0] = 0 },
                 onManageQueue = { showDownloadQueue = true },
             )
             return@VortXTheme
@@ -793,6 +858,24 @@ fun VortXApp(
                 keys = debridKeys,
                 accountIdentity = debridAccountIdentity,
                 onBack = closeDebridKeys,
+            )
+            return@VortXTheme
+        }
+
+        if (showDebridLibrary) {
+            // Settings > Debrid > Your cloud: browse + play what is already in the user's debrid accounts.
+            // Self-contained like the other settings overlays: it builds its own DebridCoordinator off the
+            // shared [debridKeys] and hands a resolved DIRECT url up to the same `playing` slot the Downloads
+            // screen uses, so a chosen cloud item covers everything with the standard player.
+            BackHandler { showDebridLibrary = false }
+            DebridLibraryScreen(
+                keys = debridKeys,
+                onPlay = {
+                    playing = it
+                    playingMeta = null
+                    showDebridLibrary = false
+                },
+                onBack = { showDebridLibrary = false },
             )
             return@VortXTheme
         }
@@ -873,6 +956,7 @@ fun VortXApp(
                     onPlay = { playable, loadedMeta ->
                         playingMeta = loadedMeta
                         playing = playable
+                        autoAdvanceStreak[0] = 0
                     },
                 )
             }
@@ -976,8 +1060,10 @@ fun VortXApp(
                         restoreDebridServicesFocus = false
                         showDebridKeys = true
                     },
+                    onDebridLibraryClick = { showDebridLibrary = true },
                     onLibraryClick = { showLibraryTransfer = true },
                     onBackupClick = { showBackup = true },
+                    onWatchStatsClick = { showWatchStats = true },
                     onWhatsNewClick = { showWhatsNew = true },
                     settingsScrollState = settingsScrollState,
                     debridServicesFocusRequester = debridServicesFocusRequester,
@@ -1000,12 +1086,16 @@ private fun UpNextOverlay(
     resolving: Boolean,
     onPlayNow: () -> Unit,
     onCancel: () -> Unit,
+    /// Fired instead of [onPlayNow] when the COUNTDOWN expires (an automatic advance), so the host can
+    /// distinguish an unattended binge from a deliberate "Play now" tap. Both ultimately play the episode.
+    onAutoAdvance: () -> Unit = onPlayNow,
 ) {
     var secondsLeft by remember(episode.id) { mutableStateOf(UP_NEXT_COUNTDOWN_S) }
     // Latched once the advance has been kicked (countdown expiry OR the Play-now tap), so neither path
     // can double-fire the other.
     var fired by remember(episode.id) { mutableStateOf(false) }
     val currentOnPlayNow by rememberUpdatedState(onPlayNow)
+    val currentOnAutoAdvance by rememberUpdatedState(onAutoAdvance)
     LaunchedEffect(episode.id) {
         while (secondsLeft > 0) {
             delay(1_000)
@@ -1013,7 +1103,7 @@ private fun UpNextOverlay(
         }
         if (!fired) {
             fired = true
-            currentOnPlayNow()
+            currentOnAutoAdvance()
         }
     }
     Box(Modifier.fillMaxSize()) {

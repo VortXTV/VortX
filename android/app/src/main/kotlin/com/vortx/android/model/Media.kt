@@ -576,6 +576,20 @@ data class Playable(
     /// gates are NOT suppressed: a junk-length file still cannot mark watched, scrobble a watch, or
     /// feed the community pool, forced or not.
     val userForcedSource: Boolean = false,
+    /// Now-Playing artwork URL for the system media session / lockscreen card (the episode still, else
+    /// the title poster). Decoded off-thread by [com.vortx.android.player.PlayerMediaSession]; null when
+    /// none is known (an ad-hoc link, a download without art), in which case the card shows no artwork.
+    /// Mirrors the Apple `NowPlayingCenter` artwork, which the player fills from the same catalog art.
+    val posterUrl: String? = null,
+    /// True when this is a LIVE / durationless stream (a TV channel, an events feed). The system session
+    /// gates its transport on this (a live stream never reports a real duration, so seek commands are
+    /// withheld and the session must not sit in a permanent BUFFERING state). Mirrors the Apple
+    /// `NowPlayingPolicy.effectivelyLive`. Default false keeps every VOD stream unchanged.
+    val isLive: Boolean = false,
+    /// The human episode title for a series play ("Ozymandias"), used as the Now-Playing TITLE line so the
+    /// lockscreen shows the episode, not the show. Null for a movie / live / trailer. The show name rides
+    /// [MediaRef.title]; the SxxEyy tag is derived from [MediaRef]. Mirrors Apple's Now-Playing metadata.
+    val episodeTitle: String? = null,
 )
 
 /// Provider-agnostic description of the title being scrobbled, resolved ONCE at play time and handed to

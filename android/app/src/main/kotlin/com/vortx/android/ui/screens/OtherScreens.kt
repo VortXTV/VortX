@@ -77,6 +77,7 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
+import com.vortx.android.update.UpdateAvailableBanner
 
 /// Discover (S04, DESIGN-SYSTEM.md §4 "Discover / Search"): type switch -> catalog chips -> genre
 /// chips (when the selected catalog declares one) -> dense poster grid -> "Load more". Every chip
@@ -372,9 +373,11 @@ fun SettingsScreen(
     onMetadataKeysClick: () -> Unit,
     onHomeDiscoverClick: () -> Unit,
     onDebridKeysScreenClick: () -> Unit,
+    onDebridLibraryClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
     onBackupClick: () -> Unit,
+    onWatchStatsClick: () -> Unit,
     onWhatsNewClick: () -> Unit,
     settingsScrollState: ScrollState,
     debridServicesFocusRequester: FocusRequester,
@@ -420,6 +423,9 @@ fun SettingsScreen(
             .padding(VortXTheme.spacing.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
+        // The passive "update available" banner (sideloaded Android has no store channel). Renders nothing
+        // when up to date or when the user dismissed this build; tapping it opens the install channel.
+        UpdateAvailableBanner()
         // Profiles first: it answers "who is watching" and is the entry to the "Who's watching?" switcher that
         // makes the whole multi-profile subsystem reachable.
         SettingRow(VortXIcons.profiles, "Profiles", profilesValue, onClick = onProfilesClick)
@@ -436,6 +442,9 @@ fun SettingsScreen(
             "Rows, collections, spoilers",
             onClick = onHomeDiscoverClick,
         )
+        // New-episode alerts (F5, Apple's `stremiox.notifyNewEpisodes`). An inline toggle rather than a
+        // sub-screen: it is a single on/off with nothing to configure. Owns the POST_NOTIFICATIONS request.
+        NewEpisodeAlertsRow()
         SettingRow(
             VortXIcons.listBullet,
             "Tab bar",
@@ -465,6 +474,9 @@ fun SettingsScreen(
             onClick = onDebridKeysScreenClick,
             modifier = Modifier.focusRequester(debridServicesFocusRequester),
         )
+        // Browse-your-debrid-cloud: list + play what is already in the connected debrid accounts, no add-on
+        // needed. Mirrors the Apple Settings "Your cloud" entry (DebridLibraryView).
+        SettingRow(VortXIcons.playCircle, "Your cloud", "Play from debrid", onClick = onDebridLibraryClick)
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.
@@ -482,6 +494,10 @@ fun SettingsScreen(
         // Backup: a device-wide settings backup to a file (profiles included), distinct from the Library
         // export above (which carries saved titles only). Neither routes through account sync.
         SettingRow(VortXIcons.download, "Backup", "Settings to a file", onClick = onBackupClick)
+        // Watch Stats: a read-only "year in review" over the ACTIVE profile's existing watch history
+        // (com.vortx.android.stats). It reads the engine buckets (owner) or the private overlay (shared
+        // profile) per the history boundary and never writes any watched state.
+        SettingRow(VortXIcons.checkmarkCircle, "Watch Stats", "Your year in review", onClick = onWatchStatsClick)
         SettingRow(
             VortXIcons.checkmarkCircle,
             "What's New",

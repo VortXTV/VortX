@@ -228,6 +228,14 @@ interface CatalogRepository {
     /// `!addon.isProtected` gate.
     suspend fun removeAddon(addon: InstalledAddon): Result<Unit>
 
+    /// Change an installed add-on's manifest URL in place (the Add-ons row's Change-URL chip, Apple
+    /// `EditAddonURLView`): installs [newUrl] FIRST, then removes [oldAddon] WITHOUT tombstoning it, so a
+    /// failed install never leaves you with neither add-on, and the swapped-out URL stays re-addable on
+    /// every device (a removal tombstone would wrongly suppress it). A no-op when [newUrl] normalizes to
+    /// the same transport URL. The [Result.failure] message is user-facing. Default installs via
+    /// [installAddon] so the offline preview satisfies the contract unchanged.
+    suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String): Result<Unit> = installAddon(newUrl)
+
     /// Turn an installed add-on on/off for the ACTIVE profile (the Add-ons screen's eye toggle,
     /// Apple `AddonsView.swift:424` -> `Profiles.swift:348 toggleAddon`). A per-profile RENDER-LAYER
     /// overlay, never an engine/account change: a disabled add-on stays installed but is excluded

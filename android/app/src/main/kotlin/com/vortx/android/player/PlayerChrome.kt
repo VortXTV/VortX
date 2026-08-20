@@ -27,10 +27,14 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.Audiotrack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Forward10
+import androidx.compose.material.icons.filled.Forward30
+import androidx.compose.material.icons.filled.Replay30
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Pause
@@ -96,6 +100,19 @@ fun PlayerChrome(
     playable: Playable,
     state: PlayerState,
     dolbyVisionAvailable: Boolean,
+    /// The honest dynamic-range line for the Playback Info sheet ("Dolby Vision" on the DV lane, "HDR10
+    /// (tone-mapped from Dolby Vision)" for a DV source on the libmpv lane). Null omits the row.
+    dynamicRange: String? = null,
+    /// The relative-seek step (ms + whole seconds) for the transport +/- buttons, from the viewer's Skip
+    /// step setting (Apple `stremiox.seekStep`). Defaults keep the chrome usable in isolation at 10s.
+    seekStepMs: Long = 10_000L,
+    seekStepSeconds: Int = 10,
+    /// In-player volume (0..100) + mute, driving the engine at [onSetVolume] / [onToggleMute] (Apple
+    /// `stremiox.playerVolume` / `stremiox.playerMuted`). The same value the right-half swipe moves.
+    playerVolume: Double = 100.0,
+    playerMuted: Boolean = false,
+    onSetVolume: (Double) -> Unit = {},
+    onToggleMute: () -> Unit = {},
     emberAccent: Color,
     speed: Float,
     scaleMode: VideoScaleMode,
@@ -282,6 +299,17 @@ fun PlayerChrome(
                     ChromeIcon(Icons.AutoMirrored.Filled.List, "Episodes") { onInteraction(); openSheet = ControlSheet.EPISODES }
                 }
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
+                // Volume + mute (Apple `stremiox.playerVolume`): the speaker glyph reflects the mute / level
+                // state; opening it shows the slider + mute toggle.
+                ChromeIcon(
+                    icon = if (playerMuted || playerVolume <= 0.0) {
+                        Icons.AutoMirrored.Filled.VolumeOff
+                    } else {
+                        Icons.AutoMirrored.Filled.VolumeUp
+                    },
+                    description = "Volume",
+                    tint = if (playerMuted || playerVolume <= 0.0) emberAccent else Color.White,
+                ) { onInteraction(); openSheet = ControlSheet.VOLUME }
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
                 ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
                 if (chapters.isNotEmpty()) {
@@ -327,6 +355,8 @@ fun PlayerChrome(
             onTogglePause = onTogglePause,
             onSeek = onSeek,
             onSeekBy = onSeekBy,
+            seekStepMs = seekStepMs,
+            seekStepSeconds = seekStepSeconds,
             onInteraction = onInteraction,
             scrubPreview = scrubPreview,
             modifier = Modifier
@@ -463,6 +493,14 @@ fun PlayerChrome(
                     )
                 },
                 emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.VOLUME -> VolumeSheet(
+                volume = playerVolume,
+                muted = playerMuted,
+                emberAccent = emberAccent,
+                onSetVolume = onSetVolume,
+                onToggleMute = onToggleMute,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
             ControlSheet.SUBTITLE -> ControlSelectionSheet(
@@ -707,7 +745,7 @@ fun PlayerChrome(
             )
             ControlSheet.INFO -> ControlSelectionSheet(
                 title = "Playback Info",
-                options = playbackInfoOptions(playable, currentSource, playbackInfo()),
+                options = playbackInfoOptions(playable, currentSource, dynamicRange, playbackInfo()),
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
@@ -777,6 +815,7 @@ private enum class ControlSheet {
     EPISODES,
     VIDEO,
     AUDIO,
+    VOLUME,
     SUBTITLE,
     SECOND_SUBTITLE,
     SUBTITLE_SETTINGS,
@@ -811,10 +850,6 @@ private val ENGINE_CHOICES: List<Triple<PlayerEngineRouter.Override, String, Str
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
-
-/// The relative-seek step (ms) for the transport's Replay10/Forward10 buttons. 10s matches the icon
-/// glyphs and the host's double-tap gesture step.
-private const val SEEK_STEP_MS = 10_000L
 
 private data class SheetOption(
     val label: String,
@@ -872,10 +907,14 @@ private fun sleepStatusDetail(minutes: Int?, atEpisodeEnd: Boolean): String = wh
 private fun playbackInfoOptions(
     playable: Playable,
     currentSource: StreamSource?,
+    dynamicRange: String?,
     stats: List<Pair<String, String>>,
 ): List<SheetOption> = buildList {
     add(SheetOption("Now Playing", false, enabled = false, isHeader = true))
     add(SheetOption(playable.title, false, enabled = false))
+    // The honest dynamic-range line: true Dolby Vision on the DV lane, or "HDR10 (tone-mapped from Dolby
+    // Vision)" for a DV source on the libmpv lane, so the app never claims DV over tone-mapped pixels.
+    dynamicRange?.let { add(SheetOption("Dynamic range", false, detail = it, enabled = false)) }
     currentSource?.let { src ->
         add(SheetOption("Source", false, enabled = false, isHeader = true))
         val release = src.title.lineSequence().firstOrNull()?.trim().orEmpty().ifBlank { src.addon }
@@ -1187,6 +1226,98 @@ private fun ControlSelectionSheet(
     }
 }
 
+/// The in-player Volume sheet: a horizontal level slider (0..100) plus a Mute toggle, driving the engine
+/// through [onSetVolume] / [onToggleMute] (the same value the right-half swipe moves). A lightweight glass
+/// panel matching the other control sheets. Mirrors the Apple in-player volume slider + mute.
+@Composable
+private fun VolumeSheet(
+    volume: Double,
+    muted: Boolean,
+    emberAccent: Color,
+    onSetVolume: (Double) -> Unit,
+    onToggleMute: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.4f))
+            .clickable(onClick = onDismiss),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .vortxGlassPanel(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = "Volume",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp,
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = if (muted || volume <= 0.0) {
+                        Icons.AutoMirrored.Filled.VolumeOff
+                    } else {
+                        Icons.AutoMirrored.Filled.VolumeUp
+                    },
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clickable(onClick = onToggleMute),
+                )
+                Slider(
+                    value = (volume / 100.0).toFloat().coerceIn(0f, 1f),
+                    onValueChange = { onSetVolume((it * 100.0)) },
+                    colors = SliderDefaults.colors(
+                        thumbColor = emberAccent,
+                        activeTrackColor = emberAccent,
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 12.dp),
+                )
+                Text(
+                    text = "${(volume).roundToInt()}%",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    modifier = Modifier.width(44.dp),
+                )
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .clickable(role = Role.Button, onClick = onToggleMute)
+                    .padding(vertical = 10.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = if (muted) "Unmute" else "Mute",
+                    color = if (muted) emberAccent else Color.White,
+                    fontWeight = if (muted) FontWeight.SemiBold else FontWeight.Normal,
+                    fontSize = 15.sp,
+                    modifier = Modifier.weight(1f),
+                )
+                if (muted) {
+                    Icon(
+                        imageVector = Icons.Filled.Check,
+                        contentDescription = null,
+                        tint = emberAccent,
+                        modifier = Modifier.size(20.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// The error fallback overlay: a centered message + a "Choose another source" action that returns to the
 /// ranked source list, plus a plain back. Shown when [PlayerState.hasError] is set.
 @Composable
@@ -1249,6 +1380,8 @@ private fun TransportBar(
     onTogglePause: () -> Unit,
     onSeek: (Long) -> Unit,
     onSeekBy: (Long) -> Unit,
+    seekStepMs: Long = 10_000L,
+    seekStepSeconds: Int = 10,
     /// Reported on every scrub drag frame so the host's auto-hide timer cannot expire mid-gesture and
     /// yank the slider out from under the finger. No-op by default.
     onInteraction: () -> Unit = {},
@@ -1307,19 +1440,23 @@ private fun TransportBar(
                     tint = Color.White,
                 )
             }
-            // The +/-10s jump controls (the relative seek the scrubber physically cannot do: 10s of a
-            // 2h film is under a pixel of slider travel). Gated like the slider on a known duration.
-            IconButton(onClick = { onSeekBy(-SEEK_STEP_MS) }, enabled = duration > 0L) {
+            // The +/-N jump controls (the relative seek the scrubber physically cannot do: 10s of a 2h film
+            // is under a pixel of slider travel). The step follows the viewer's Skip step (Apple
+            // `stremiox.seekStep`); the glyph picks the nearest available Replay/Forward icon. Gated like the
+            // slider on a known duration.
+            val backIcon = if (seekStepSeconds >= 30) Icons.Filled.Replay30 else Icons.Filled.Replay10
+            val forwardIcon = if (seekStepSeconds >= 30) Icons.Filled.Forward30 else Icons.Filled.Forward10
+            IconButton(onClick = { onSeekBy(-seekStepMs) }, enabled = duration > 0L) {
                 Icon(
-                    imageVector = Icons.Filled.Replay10,
-                    contentDescription = "Back 10 seconds",
+                    imageVector = backIcon,
+                    contentDescription = "Back $seekStepSeconds seconds",
                     tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
                 )
             }
-            IconButton(onClick = { onSeekBy(SEEK_STEP_MS) }, enabled = duration > 0L) {
+            IconButton(onClick = { onSeekBy(seekStepMs) }, enabled = duration > 0L) {
                 Icon(
-                    imageVector = Icons.Filled.Forward10,
-                    contentDescription = "Forward 10 seconds",
+                    imageVector = forwardIcon,
+                    contentDescription = "Forward $seekStepSeconds seconds",
                     tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
                 )
             }

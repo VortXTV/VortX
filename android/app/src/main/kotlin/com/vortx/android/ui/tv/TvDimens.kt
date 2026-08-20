@@ -34,4 +34,9 @@ object TvDimens {
     /// the longest label ("Discover") beside its glyph at 10-foot legibility, without eating the browse
     /// wall to its right.
     val railWidth = 232.dp
+
+    /// Max width for a centred single-column form (the sign-in card stack). A full-bleed form field reads as
+    /// an uncomfortably long line at 10 feet, so the sign-in blocks are capped and centred like a portrait
+    /// column on a wide set.
+    val formMaxWidth = 760.dp
 }

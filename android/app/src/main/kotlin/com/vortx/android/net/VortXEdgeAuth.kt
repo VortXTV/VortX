@@ -2,6 +2,7 @@ package com.vortx.android.net
 
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -52,6 +53,9 @@ object VortXEdgeAuth {
     private const val TS_HEADER = "X-VX-Ts"
     private const val SIG_HEADER = "X-VX-Sig"
     private const val KID_HEADER = "X-VX-Kid"
+
+    /** Body-hash header for the body-bound signing variant ([signingHeadersIncludingBody]). Matches Apple. */
+    private const val BODY_HEADER = "X-VX-Body"
 
     /**
      * Query-param names for the header-less signing variant ([signedUrl]). These MUST match the workers'
@@ -148,6 +152,39 @@ object VortXEdgeAuth {
         return SigningHeaders(ts = ts, kid = KEY_ID, sig = sig)
     }
 
+    /** The body-bound signing header values (adds [bodyHash]) for a gated host, or null when non-gated. */
+    data class BodySigningHeaders(val ts: String, val kid: String, val bodyHash: String, val sig: String)
+
+    /**
+     * Compute the body-bound signing headers, the Kotlin port of Apple `VortXEdgeAuth.signIncludingBody`.
+     * The body hash is sent explicitly (`X-VX-Body`) and included in the HMAC message AFTER the timestamp,
+     * so a valid signature cannot be replayed with a changed body (used by add-on QR pairing
+     * acknowledgements). `message = METHOD\npath\nts\nSHA256hex(body)`. Returns null for a non-gated host.
+     * Never throws.
+     */
+    fun signingHeadersIncludingBody(method: String, url: URL, body: ByteArray): BodySigningHeaders? {
+        val host = url.host ?: return null
+        if (host !in GATED_HOSTS) return null
+        val m = method.uppercase()
+        val ts = (System.currentTimeMillis() / 1000L).toString()
+        val bodyHash = sha256Hex(body)
+        val sig = hexSignatureOfMessage("$m\n${signedPath(url)}\n$ts\n$bodyHash")
+        return BodySigningHeaders(ts = ts, kid = KEY_ID, bodyHash = bodyHash, sig = sig)
+    }
+
+    /** The header name constants the body-bound signer stamps, so a caller can set all four headers. */
+    fun bodyHeaderName(): String = BODY_HEADER
+    fun tsHeaderName(): String = TS_HEADER
+    fun kidHeaderName(): String = KID_HEADER
+    fun sigHeaderName(): String = SIG_HEADER
+
+    private fun sha256Hex(data: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(data)
+        val sb = StringBuilder(digest.size * 2)
+        for (b in digest) sb.append("%02x".format(b.toInt() and 0xFF))
+        return sb.toString()
+    }
+
     /**
      * Return a QUERY-signed copy of [url] for header-less asset loads (Coil `AsyncImage` / `<img>` GETs
      * that cannot attach `X-VX-*` headers). Appends `vts` / `vkid` / `vsig`, where `vsig` is the SAME
@@ -238,8 +275,11 @@ object VortXEdgeAuth {
      * Data())`. The header path stamps it regardless (identical wire shape in observe + enforce), while
      * [signedUrl] fails open before ever reaching here.
      */
-    private fun hexSignature(method: String, signedPath: String, ts: String): String {
-        val message = "$method\n$signedPath\n$ts"
+    private fun hexSignature(method: String, signedPath: String, ts: String): String =
+        hexSignatureOfMessage("$method\n$signedPath\n$ts")
+
+    /** Lowercase-hex `HMAC-SHA256(key, message)` over an already-assembled message (see [hexSignature]). */
+    private fun hexSignatureOfMessage(message: String): String {
         val keyBytes = if (secret.isEmpty()) ByteArray(HMAC_BLOCK_SIZE) else secret.toByteArray(Charsets.UTF_8)
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(keyBytes, "HmacSHA256"))

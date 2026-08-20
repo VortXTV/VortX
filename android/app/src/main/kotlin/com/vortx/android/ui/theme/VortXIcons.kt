@@ -18,9 +18,11 @@ import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.LiveTv
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreHoriz
@@ -59,6 +61,13 @@ object VortXIcons {
 
     val chevronDown: ImageVector = Icons.Filled.KeyboardArrowDown
     val chevronLeft: ImageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft
+
+    /// SF `chevron.right` — a nav-row disclosure (Discover add-ons, Configure). AutoMirrored so it flips in
+    /// an RTL layout, like [chevronLeft].
+    val chevronRight: ImageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight
+
+    /// SF `qrcode` — the Install-by-QR / Configure-by-QR affordance. `QrCode2` is Material's QR glyph.
+    val qrCode: ImageVector = Icons.Filled.QrCode2
 
     /// SF `chevron.up` — the reorder-upward affordance in the Sources order list. NOT AutoMirrored: up is
     /// up in an RTL layout too, unlike [chevronLeft].

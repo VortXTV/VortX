@@ -1,11 +1,14 @@
 package com.vortx.android.ui.screens
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -44,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -74,7 +78,13 @@ import kotlin.math.roundToInt
 /// browser remain separate parity work.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun AddonsScreen(
+    viewModel: AddonsViewModel,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+    onDiscover: () -> Unit = {},
+    onInstallByQr: () -> Unit = {},
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val urlInput by viewModel.urlInput.collectAsStateWithLifecycle()
     val installing by viewModel.installing.collectAsStateWithLifecycle()
@@ -82,9 +92,20 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
     val health by viewModel.health.collectAsStateWithLifecycle()
     val pendingUpdate by viewModel.pendingUpdate.collectAsStateWithLifecycle()
     val colors = VortXTheme.colors
+    val context = LocalContext.current
 
     LaunchedEffect(viewModel) {
         viewModel.onScreenEntry()
+    }
+
+    // Change-URL sheet state (Apple `EditAddonURLView`): the add-on being edited, or null when closed.
+    var changeUrlAddon by remember { mutableStateOf<InstalledAddon?>(null) }
+    changeUrlAddon?.let { addon ->
+        ChangeAddonUrlDialog(
+            addon = addon,
+            viewModel = viewModel,
+            onDismiss = { changeUrlAddon = null },
+        )
     }
 
     // Update-if-installed confirm (SRC-8, Apple `AddonsView` confirmationDialog): pasting a URL that is
@@ -179,6 +200,15 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
                                 enabled = !installing && urlInput.isNotBlank(),
                                 onClick = viewModel::install,
                             )
+                            // Install by QR: pair a phone once, then paste as many add-on URLs there as you
+                            // like and install each here. Handy without a keyboard, offered on every platform
+                            // (Apple `AddonsView` "Install by QR").
+                            Chip(
+                                label = "Install by QR",
+                                selected = false,
+                                leadingIcon = VortXIcons.qrCode,
+                                onClick = onInstallByQr,
+                            )
                         }
                         installMessage?.let { (message, failed) ->
                             Text(
@@ -186,6 +216,24 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
                                 style = VortXTheme.type.label.copy(color = if (failed) colors.danger else colors.textSecondary),
                             )
                         }
+                    }
+                }
+            }
+            item {
+                // Discover add-ons: browse the community collection and install with one tap (Apple
+                // `AddonsView.discoverLink` -> `AddonStoreView`).
+                SurfaceCard(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(onClick = onDiscover)
+                            .padding(VortXTheme.spacing.md),
+                        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(VortXIcons.discover, contentDescription = null, tint = colors.accent)
+                        Text("Discover add-ons", style = VortXTheme.type.cardTitle, modifier = Modifier.weight(1f))
+                        Icon(VortXIcons.chevronRight, contentDescription = null, tint = colors.textTertiary)
                     }
                 }
             }
@@ -214,6 +262,8 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
                                 health = health[AddonHealthStore.normalizeUrl(addon.transportUrl)] ?: AddonHealth.Unknown,
                                 onToggle = { viewModel.toggleAddon(addon) },
                                 onRemove = { viewModel.remove(addon) },
+                                onConfigure = { addon.configureUrl?.let { openInBrowser(context, it) } },
+                                onChangeUrl = { changeUrlAddon = addon },
                             )
                         }
                     }
@@ -223,73 +273,181 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun AddonRow(
     addon: InstalledAddon,
     health: AddonHealth,
     onToggle: () -> Unit,
     onRemove: () -> Unit,
+    onConfigure: () -> Unit,
+    onChangeUrl: () -> Unit,
 ) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
-        Row(
+        // Info row + a separate actions row (mirrors Apple `AddonsView.addonRow`): the fixed-size action
+        // chips never steal width from the name/detail column, so a narrow phone wraps them instead of
+        // clipping Remove off the edge.
+        Column(
             modifier = Modifier.padding(VortXTheme.spacing.md),
-            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         ) {
-            // Info block dims when the add-on is turned OFF for this profile, so the state reads at
-            // a glance even before the eye icon does.
-            Box(
-                modifier = Modifier
-                    .size(48.dp)
-                    .alpha(if (addon.isDisabled) 0.45f else 1f),
-                contentAlignment = Alignment.Center,
-            ) {
-                if (addon.logo.isNullOrBlank()) {
-                    Icon(VortXIcons.addon, contentDescription = null, tint = colors.accent)
-                } else {
-                    AsyncImage(
-                        model = addon.logo,
-                        contentDescription = addon.name,
-                        modifier = Modifier.fillMaxSize(),
+            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+                // Info block dims when the add-on is turned OFF for this profile, so the state reads at
+                // a glance even before the eye icon does.
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .alpha(if (addon.isDisabled) 0.45f else 1f),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (addon.logo.isNullOrBlank()) {
+                        Icon(VortXIcons.addon, contentDescription = null, tint = colors.accent)
+                    } else {
+                        AsyncImage(
+                            model = addon.logo,
+                            contentDescription = addon.name,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .alpha(if (addon.isDisabled) 0.45f else 1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(addon.name, style = VortXTheme.type.cardTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        text = listOfNotNull(
+                            if (addon.isDisabled) "Off" else null,
+                            addon.capabilities,
+                            addon.host,
+                        ).joinToString(" · "),
+                        style = VortXTheme.type.label.copy(color = colors.textTertiary),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
+                    AddonHealthIndicator(health)
                 }
             }
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .alpha(if (addon.isDisabled) 0.45f else 1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                Text(addon.name, style = VortXTheme.type.cardTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(
-                    text = listOfNotNull(
-                        if (addon.isDisabled) "Off" else null,
-                        if (addon.providesStreams) "Streams" else null,
-                        addon.host,
-                    ).joinToString(" · "),
-                    style = VortXTheme.type.label.copy(color = colors.textTertiary),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                AddonHealthIndicator(health)
-            }
-            if (!addon.isProtected) {
-                // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls
-                // account-wide -- the same eye / eye-slash pair as Apple `AddonsView.swift:424-428`,
-                // gated the same way (protected defaults have no toggle).
-                IconButton(onClick = onToggle) {
-                    Icon(
-                        imageVector = if (addon.isDisabled) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                        contentDescription = if (addon.isDisabled) "Turn on ${addon.name}" else "Turn off ${addon.name}",
-                        tint = if (addon.isDisabled) colors.textTertiary else colors.accent,
+            // Actions wrap (Apple `addonActionChips`): Configure shows for any configurable add-on; the
+            // Change-URL / eye / Remove trio is gated on !isProtected (protected defaults are not editable).
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                if (addon.isConfigurable) {
+                    Chip(
+                        label = "Configure",
+                        selected = false,
+                        leadingIcon = VortXIcons.sources,
+                        onClick = onConfigure,
                     )
                 }
-                IconButton(onClick = onRemove) {
-                    Icon(VortXIcons.delete, contentDescription = "Remove ${addon.name}", tint = colors.danger)
+                if (!addon.isProtected) {
+                    Chip(
+                        label = "Change URL",
+                        selected = false,
+                        leadingIcon = VortXIcons.link,
+                        onClick = onChangeUrl,
+                    )
+                    // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls
+                    // account-wide -- the same eye / eye-slash pair as Apple `AddonsView.swift:424-428`,
+                    // gated the same way (protected defaults have no toggle).
+                    IconButton(onClick = onToggle) {
+                        Icon(
+                            imageVector = if (addon.isDisabled) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                            contentDescription = if (addon.isDisabled) "Turn on ${addon.name}" else "Turn off ${addon.name}",
+                            tint = if (addon.isDisabled) colors.textTertiary else colors.accent,
+                        )
+                    }
+                    IconButton(onClick = onRemove) {
+                        Icon(VortXIcons.delete, contentDescription = "Remove ${addon.name}", tint = colors.danger)
+                    }
                 }
             }
         }
     }
+}
+
+/// Open [url] in the phone's browser (Apple `ConfigureAddonView` phone path opens the config page in a
+/// browser). The add-on hands back a NEW manifest URL after configuration, which the user pastes into
+/// "Install an add-on".
+private fun openInBrowser(context: android.content.Context, url: String) {
+    runCatching {
+        context.startActivity(
+            android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(url))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    }
+}
+
+/// The Change-URL sheet (Apple `EditAddonURLView`): replace an installed add-on's manifest URL, for
+/// example after reconfiguring it. The ViewModel installs the new URL first, then drops the old without
+/// tombstoning; on success this dismisses, on failure it shows the error inline.
+@Composable
+private fun ChangeAddonUrlDialog(
+    addon: InstalledAddon,
+    viewModel: AddonsViewModel,
+    onDismiss: () -> Unit,
+) {
+    val colors = VortXTheme.colors
+    val changing by viewModel.changingUrl.collectAsStateWithLifecycle()
+    val message by viewModel.changeUrlMessage.collectAsStateWithLifecycle()
+    val doneToken by viewModel.changeUrlDone.collectAsStateWithLifecycle()
+    var url by remember { mutableStateOf(addon.transportUrl) }
+    var submittedToken by remember { mutableStateOf(doneToken) }
+
+    LaunchedEffect(addon.transportUrl) { viewModel.onChangeUrlOpen() }
+    // A successful swap bumps changeUrlDone; close the sheet once when that happens.
+    LaunchedEffect(doneToken) {
+        if (doneToken != submittedToken) {
+            submittedToken = doneToken
+            onDismiss()
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!changing) onDismiss() },
+        title = { Text("Change add-on URL", style = VortXTheme.type.cardTitle) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                Text(addon.name, style = VortXTheme.type.label.copy(color = colors.textSecondary))
+                Text(
+                    "Replace this add-on's manifest URL, for example after reconfiguring it. The new URL is " +
+                        "installed first, then the old one removed.",
+                    style = VortXTheme.type.label.copy(color = colors.textSecondary),
+                )
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it },
+                    placeholder = { Text("https://…/manifest.json", style = VortXTheme.type.body) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = colors.accent,
+                        unfocusedBorderColor = colors.hairline,
+                        cursorColor = colors.accent,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                message?.let { (text, failed) ->
+                    if (failed) Text(text, style = VortXTheme.type.label.copy(color = colors.danger))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { viewModel.changeAddonUrl(addon, url) },
+                enabled = !changing && url.isNotBlank() && url.trim() != addon.transportUrl,
+            ) {
+                Text(if (changing) "Updating…" else "Update", color = colors.accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !changing) {
+                Text("Cancel", color = colors.textSecondary)
+            }
+        },
+        containerColor = colors.surface2,
+    )
 }
 
 @Composable

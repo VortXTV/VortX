@@ -10,6 +10,12 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **Play usenet sources with your own provider, no debrid needed.** A new Settings screen, Usenet provider, lets you enter your own usenet account (host, port, username, password, connection count, and SSL). Once it is set, a bare-NZB source plays on the device straight from your provider, streamed through the NNTP engine already built into the app's streaming server, with no debrid account required. Your login is held only in this device's keychain, is never written to a preference, a backup, or the encrypted account sync, and the only place it is ever sent is the app's own on-device server at 127.0.0.1. Debrid usenet through TorBox is unchanged and takes over automatically for anyone without a provider set, so nothing changes if you do not use this; you can also configure both, in which case a source your provider is missing still falls back to TorBox. A source your provider cannot fully retrieve, for example one with missing segments, is skipped with a clear message instead of spinning. Apple TV, iPhone, iPad, and Mac. The Lite Apple TV build stays debrid-only.
 
+### Android notifications and updates
+
+**New episode alerts.** A series you keep in your Library now pings you when its next episode drops. A background sweep checks each followed show's upcoming air dates and schedules a local notification for the soonest one, with no server push. It is on by default and can be turned off under Settings, on both the phone and Android TV, on the same setting as every other platform. Turning it on asks for notification permission the first time. Alerts respect the active profile, so a show followed under one profile never pings while another profile is watching. Android phone, tablet, and TV.
+
+**Tells you when a new version is out.** Because the Android app is sideloaded, it now checks for a newer build on launch and offers it: an update banner in Settings and a one-time popup at launch, both linking to the download. It never downloads or installs anything on its own, and a build you dismiss stays quiet until a newer one ships. Android phone, tablet, and TV.
+
 ### Android add-ons
 
 **Installed add-ons show whether each one is reachable.** The Add-ons list now checks every add-on's manifest when it opens and marks each row Online, Slow, or Unreachable, so a source that has gone dark is visible at a glance instead of only failing when you try to play. The checks are bounded and run in the background, and a Re-check status action forces a fresh pass. The same status rows and action are on Android TV. Android phone, tablet, and TV.
@@ -17,6 +23,10 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Re-adding an add-on you already have offers to update it.** Pasting the manifest URL of an add-on that is already installed used to silently reinstall it. It now asks first, and updating it to its latest manifest is a deliberate choice that reports Updated rather than Installed. Android phone, tablet, and TV.
 
 **An add-on you remove stays removed.** Removing an add-on is now remembered, so one that the engine re-seeds on its own, the way it restores its default optional add-ons after a reset, does not quietly come back. Installing the same add-on again clears that memory, and the essential built-in add-ons are never affected. Android phone, tablet, and TV.
+
+### Android watch stats
+
+**Your year in review.** A new Watch Stats screen in Settings turns your existing watch history into a personal recap: total hours watched, how many movies, series, and episodes you got through, your longest binge, your top genres by time spent, and your most-watched titles. A scope picker switches between all-time and any year you have history for. It is read-only, computed entirely on the device from history that is already there, and never changes a watched mark or resume point. It reads the right history for whoever is watching, the account library for the main profile and a shared profile's own private history for everyone else, so one profile never sees another's numbers. Android phone and tablet.
 
 ### Android player controls
 
@@ -65,6 +75,16 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Auto-delete watched downloads.** Downloads settings add an Auto-delete watched downloads switch, saved and synced across your devices. Android.
 
 **Manage the download queue.** The Downloads screen now opens a queue manager: pending downloads are grouped Downloading, Up next, Paused, and Failed, you can move a waiting item earlier or later, pause or resume or retry one, and set how many downloads run at once (raising the cap starts more right away, lowering it never interrupts one already in progress). It also shows where downloads are kept on the device and how much space they use. Android phone, tablet, and TV.
+
+### Android TV
+
+**Sign in from the couch.** Android TV now has its own sign-in screen. Scan the code with a phone or browser already signed in to VortX and the TV joins your account without typing anything on the remote, so your add-ons, library, and cross-device sync are there straight away. You can still connect a Stremio account to bring in its library, either by scanning its code or with a password. Reachable from Settings. Android TV.
+
+**Browse seasons and episodes on the detail page.** A series detail page on Android TV now has a focusable season picker and an episode list beneath the hero. Pick a season, choose an episode to load its sources and target Watch at it, and mark any episode, or a whole season, watched or unwatched from the remote. Watched state is kept per profile, exactly as on the phone. Android TV.
+
+**Cast and crew, with tappable people.** The detail page now shows a Cast & Crew rail. Select a cast member to open their page with a biography and filmography, and open any of their titles from there. Android TV.
+
+**Deeper TV settings.** Android TV Settings now includes the account and integrations block (sign-in, Import from Stremio, Trakt and SIMKL, and Metadata keys), the full subtitle style controls (font, size, color, brightness, and background), a skip-provider picker, and show/hide switches for the Discover, Live TV, Library, and Search tabs. Every control writes the same setting the phone does. Android TV.
 
 ### Player (Beta 17)
 

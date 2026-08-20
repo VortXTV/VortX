@@ -1733,6 +1733,13 @@ class EngineStremioRepository(
     }
 
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
+        // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
+        // debrid key). Refuse it here at the install boundary with configuration guidance, mirroring Apple
+        // `CoreBridge.installAddonConfirmed`'s Beta 17 fix -- otherwise normalizing to /configure/manifest.json
+        // installs a DEAD default that returns no sources on every title.
+        if (AddonConfiguration.isConfigurationPageUrl(url)) {
+            throw IllegalStateException(AddonConfiguration.NEEDS_CONFIGURATION_MESSAGE)
+        }
         val normalized = normalizedAddonUrl(url)
             ?: throw IllegalArgumentException("Enter a valid add-on URL (https://…/manifest.json).")
         // The engine has no HTTP-fetch action for a bare add-on URL (mirrors Apple: CoreBridge.installAddon
@@ -1755,6 +1762,21 @@ class EngineStremioRepository(
         // resets the engine to exactly those, so a tombstone would wrongly suppress an essential default
         // forever (SRC-2, Apple `CoreBridge.uninstallAddon` -> `AddonTombstones.tombstone`).
         if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)
+    }
+
+    override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String): Result<Unit> = runCatching {
+        // Install the NEW URL first so a failed install never leaves the user with neither add-on (Apple
+        // `EditAddonURLView.update`). installAddon already carries the /configure + validity guards and
+        // upserts by transport URL, so this reuses it verbatim.
+        installAddon(newUrl).getOrThrow()
+        // If the new URL normalized to the SAME transport URL as the old one, the install was an in-place
+        // update -- there is no distinct old descriptor to drop.
+        val newNormalized = normalizedAddonUrl(newUrl)
+        if (newNormalized != null && newNormalized == oldAddon.transportUrl) return@runCatching
+        // Change-URL is a REPLACE, not a removal: drop the old URL but do NOT tombstone it, so the same URL
+        // stays re-addable on every device (a removal tombstone would wrongly suppress it). Mirrors Apple
+        // `CoreBridge.uninstallAddon(_, tombstone: false)`.
+        StremioCoreNative.dispatch(EngineActions.uninstallAddon(oldAddon.rawDescriptorJson))
     }
 
     /// Trim + validate scheme + ensure a `/manifest.json` suffix, mirroring Apple

@@ -25,7 +25,9 @@ import com.vortx.android.iptv.IPTVPlaylists
 import com.vortx.android.iptv.iptvCleanupActions
 import com.vortx.android.iptv.launchIPTVStartupCleanup
 import com.vortx.android.mediaserver.MediaServerRepository
+import com.vortx.android.notifications.NewEpisodeNotifications
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.update.UpdateChecker
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.CoroutineScope
@@ -100,6 +102,14 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
             .onFailure { Log.w(TAG, "Media-server store init failed; the feature stays dormant", it) }
         startIPTVCleanupReplay()
         initDownloads()
+        // New-episode alerts (F5): (re)arm the WorkManager library sweep if the user has alerts on (default
+        // ON), so a followed show pings even with no UI opened. Fail-soft: never break app start.
+        runCatching { NewEpisodeNotifications.scheduleSweepIfEnabled(this) }
+            .onFailure { Log.w(TAG, "New-episode sweep scheduling failed; alerts stay dormant this launch", it) }
+        // In-app update checker: poll vortx.tv/appcast.json for a newer sideload build, driving the Settings
+        // banner and the once-per-launch popup. Idempotent + off the critical path.
+        runCatching { UpdateChecker.start(this) }
+            .onFailure { Log.w(TAG, "Update check could not start this launch", it) }
     }
 
     private fun startIPTVCleanupReplay() {

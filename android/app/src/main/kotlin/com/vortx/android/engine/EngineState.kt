@@ -742,6 +742,8 @@ internal object EngineState {
                 providesStreams = addonDeclaresResource(manifest, "stream"),
                 providesMeta = addonDeclaresResource(manifest, "meta"),
                 providesSubtitles = addonDeclaresResource(manifest, "subtitles"),
+                hasCatalogs = (manifest.optJSONArray("catalogs")?.length() ?: 0) > 0,
+                isConfigurable = manifest.optJSONObject("behaviorHints")?.optBoolean("configurable", false) ?: false,
                 rawDescriptorJson = addon.toString(),
             )
         }

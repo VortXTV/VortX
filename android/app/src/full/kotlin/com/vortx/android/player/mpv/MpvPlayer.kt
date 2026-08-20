@@ -83,6 +83,15 @@ class MpvPlayer private constructor(
     @Volatile
     private var playbackStarted: Boolean = false
 
+    /// The resume position (ms) to seek to ONCE the pipeline is warm, or 0 for none. A pre-first-frame
+    /// absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold and wedges video output
+    /// (a blank frame + a frozen timer), so [load] stashes the resume here instead of seeking inline and
+    /// [consumePendingResumeSeek] applies it at the first rendered frame. Volatile: written on [load] and
+    /// read/cleared on the mpv event thread. Mirrors Apple `pendingLibmpvResumeSeek`
+    /// (app/Sources/PlayerScreen.swift:1845 stash -> :1654 first-frame apply).
+    @Volatile
+    private var pendingResumeSeekMs: Long = 0L
+
     private val observer = object : MPVLib.EventObserver {
         override fun eventProperty(name: String) {
             // Format-less "changed" signal. track-list has no scalar value, so re-read it here.
@@ -98,7 +107,12 @@ class MpvPlayer private constructor(
                 PROP_TIME_POS -> {
                     // A position advancing past zero is proof the demuxer/decoder delivered real data
                     // (belt-and-suspenders alongside PLAYBACK_RESTART for the END_FILE discriminator).
-                    if (value > 0.0) playbackStarted = true
+                    if (value > 0.0) {
+                        playbackStarted = true
+                        // RESUME WATCHDOG: if PLAYBACK_RESTART was missed, a real position advance is the
+                        // fallback signal that the pipeline is warm enough to apply the deferred resume seek.
+                        consumePendingResumeSeek()
+                    }
                     _state.value = _state.value.copy(positionMs = (value * 1000).toLong().coerceAtLeast(0L))
                 }
                 PROP_DURATION -> _state.value = _state.value.copy(durationMs = (value * 1000).toLong().coerceAtLeast(0L))
@@ -130,6 +144,10 @@ class MpvPlayer private constructor(
                     // Playback (re)started: the first frame is rendering. Marks real playback for the
                     // END_FILE discriminator and ends the "connecting" state ([load] set isBuffering=true).
                     playbackStarted = true
+                    // The pipeline is now warm, so a stashed resume seek lands as an ordinary warm scrub
+                    // instead of the cold pre-first-frame seek that wedged video output. No-op after the
+                    // first apply (idempotent) and for a non-resume load. Mirrors Apple's first-frame apply.
+                    consumePendingResumeSeek()
                     _state.value = _state.value.copy(isBuffering = false)
                 }
                 MPVLib.Event.END_FILE -> {
@@ -262,10 +280,34 @@ class MpvPlayer private constructor(
             mpv.command(arrayOf("sub-add", sub))
         }
 
-        // Resume position: seek after load. mpv seeks accept an absolute time in seconds.
-        if (playable.startPositionMs > 0L) {
-            mpv.command(arrayOf("seek", (playable.startPositionMs / 1000.0).toString(), "absolute"))
-        }
+        // Resume position: DEFER the seek to the first rendered frame rather than issuing it here. A
+        // pre-first-frame absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold and
+        // wedges video output (a blank frame + a frozen timer); stashing it and applying it at
+        // PLAYBACK_RESTART (or the first observed position advance, the resume watchdog) lands it as an
+        // ordinary warm scrub, which is proven to render. Mirrors the Apple fix
+        // (app/Sources/PlayerScreen.swift:1845 stash -> :1654 first-frame apply). Cleared on every load
+        // so a switch/reload never inherits the previous file's resume.
+        pendingResumeSeekMs = if (playable.startPositionMs > 0L) playable.startPositionMs else 0L
+    }
+
+    /// Apply the deferred resume seek once the pipeline is warm (first frame rendered, or the first
+    /// position advance as the watchdog). The pending value is cleared BEFORE the seek so the two trigger
+    /// signals (PLAYBACK_RESTART + the first `time-pos` advance) can never double-apply it; both run on the
+    /// single mpv event thread, so no lock is needed. A no-op for a non-resume load. Mirrors Apple
+    /// consuming `pendingLibmpvResumeSeek` at the FIRST FRAME.
+    private fun consumePendingResumeSeek() {
+        val target = pendingResumeSeekMs
+        if (target <= 0L) return
+        pendingResumeSeekMs = 0L
+        // RESUME ADMISSION (Apple PlayerScreen.swift:1812 `resumeSeconds > 5, resumeSeconds < d - 10`):
+        // only honour a resume past a >5s floor and clear of the last 10s, so a barely-started or
+        // all-but-finished title starts over instead of snapping to a position 5s from the credits. The
+        // duration is known by the first frame; when it is not yet, only the floor applies (the tail guard
+        // is gated on a positive duration), which the later position advance never re-triggers.
+        if (target <= RESUME_FLOOR_MS) return
+        val durationMs = _state.value.durationMs
+        if (durationMs > 0L && target >= durationMs - RESUME_TAIL_GUARD_MS) return
+        mpv.command(arrayOf("seek", (target / 1000.0).toString(), "absolute"))
     }
 
     override fun play() { mpv.setPropertyString(PROP_PAUSE, "no") }
@@ -615,6 +657,11 @@ class MpvPlayer private constructor(
         /// Final tile quality, 0.7 == Apple's `kCGImageDestinationLossyCompressionQuality: 0.7` on both of
         /// its capture paths. Kept identical so an Android-contributed tile matches an Apple one.
         private const val CAPTURE_JPEG_QUALITY = 70
+
+        /// Resume admission bounds (Apple `resumeSeconds > 5, resumeSeconds < d - 10`): resume only past a
+        /// 5s floor and clear of the last 10s, so a barely-started or all-but-finished title starts over.
+        private const val RESUME_FLOOR_MS = 5_000L
+        private const val RESUME_TAIL_GUARD_MS = 10_000L
 
         // Per-file read-ahead: local torrent/loopback vs remote debrid/CDN (mirrors Apple loadFile).
         // LOCAL stays a conservative flat cap (a torrent/loopback stream buffers in the streaming server's

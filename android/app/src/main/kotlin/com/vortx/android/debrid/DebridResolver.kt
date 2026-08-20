@@ -117,6 +117,31 @@ internal class DebridResolver(private val keys: DebridKeys) {
     /// A series episode target, for picking the right file in a season pack. Null for movies.
     data class Episode(val season: Int, val episode: Int)
 
+    /// One item ALREADY in the user's debrid cloud (a finished torrent / stored file), surfaced by the
+    /// browsable-library feature so it can be listed and played straight from the account (no add-on, no
+    /// re-download). The resolution fields are opaque to the UI and interpreted ONLY by the owning provider's
+    /// resolve leg ([resolveLibraryItem]): each provider stores what its own leg needs (a torrent+file id, a
+    /// link to unlock, or an already-direct link). Mirrors the Apple `DebridLibraryItem`.
+    data class DebridLibraryItem(
+        /// Stable, provider-scoped id for the list UI: "<service.id>:<providerId>".
+        val id: String,
+        val service: DebridService,
+        val name: String,
+        /// Total bytes, or 0 when the provider omitted a size.
+        val size: Long,
+        /// Epoch millis when it was added to the cloud, or null when the provider omitted / an unparseable
+        /// timestamp (Apple's `added: Date?`).
+        val addedEpochMillis: Long?,
+        /// The provider's own item id (torrent / magnet / file id) in string form, for the resolve leg.
+        val providerId: String,
+        /// A chosen file id inside the item, when the list step already picked one (TorBox).
+        val fileId: Int?,
+        /// A restricted link the provider must unlock/unrestrict to a direct URL (AllDebrid).
+        val restrictedLink: String?,
+        /// An already-direct, immediately playable link (Premiumize stream link).
+        val directLink: String?,
+    )
+
     /// Resolve a raw torrent (infoHash [+ magnet]) to a DIRECT, playable HTTPS URL through the first
     /// configured provider (or a specific [service]). Returns null on ANY failure (no key, not cached,
     /// no file, provider/network error) so the caller falls soft to today's behavior.
@@ -140,9 +165,11 @@ internal class DebridResolver(private val keys: DebridKeys) {
         val mag = magnet?.takeIf { it.isNotBlank() } ?: buildMagnet(hash, trackers)
         return try {
             withContext(Dispatchers.IO) {
-                resolveWithIdsInternal(chosen, hash, mag, fileIdx, episode, owner)
-                    .also { requireCurrentOwner(owner) }
-                    .url
+                withBreaker(chosen.id, hash, ProviderCircuitBreaker.Phase.RESOLVE) {
+                    resolveWithIdsInternal(chosen, hash, mag, fileIdx, episode, owner)
+                        .also { requireCurrentOwner(owner) }
+                        .url
+                }
             }
         } catch (cancel: CancellationException) {
             throw cancel
@@ -180,8 +207,10 @@ internal class DebridResolver(private val keys: DebridKeys) {
         val hash = infoHash.trim().lowercase()
         val mag = magnet?.takeIf { it.isNotBlank() } ?: buildMagnet(hash, trackers)
         return withContext(Dispatchers.IO) {
-            resolveWithIdsInternal(service, hash, mag, fileIdx, episode, owner)
-                .also { requireCurrentOwner(owner) }
+            withBreaker(service.id, hash, ProviderCircuitBreaker.Phase.RESOLVE) {
+                resolveWithIdsInternal(service, hash, mag, fileIdx, episode, owner)
+                    .also { requireCurrentOwner(owner) }
+            }
         }
     }
 
@@ -203,36 +232,41 @@ internal class DebridResolver(private val keys: DebridKeys) {
         if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
         if (!keys.isConfigured(service, owner)) throw DebridException.NoKey
         val hash = infoHash.trim().lowercase()
-        // TorBox fast path: mint a fresh link from the stored ids with no re-add. Any DEBRID-side failure
-        // (evicted file, provider blip, transient auth, not-ready) is recoverable by the full re-add below,
-        // so fall through on all of them; only a genuine cancellation aborts.
-        if (service == DebridService.TOR_BOX && torrentId != null && fileId != null) {
-            try {
-                val url = requestForOwner(owner) {
-                    torBoxRequestDl(
-                        TORBOX_BASE,
-                        keys.key(DebridService.TOR_BOX, owner),
-                        torrentId,
-                        fileId,
-                    )
+        withBreaker(service.id, hash, ProviderCircuitBreaker.Phase.DOWNLOAD) {
+            // TorBox fast path: mint a fresh link from the stored ids with no re-add. Any DEBRID-side failure
+            // (evicted file, provider blip, transient auth, not-ready) is recoverable by the full re-add
+            // below, so fall through (null) on all of them; only a genuine cancellation or an owner change
+            // aborts. A fast-path failure that the re-add then recovers is NOT counted against the breaker
+            // (the whole block still succeeds).
+            val fast = if (service == DebridService.TOR_BOX && torrentId != null && fileId != null) {
+                try {
+                    requestForOwner(owner) {
+                        torBoxRequestDl(
+                            TORBOX_BASE,
+                            keys.key(DebridService.TOR_BOX, owner),
+                            torrentId,
+                            fileId,
+                        )
+                    }.also { requireCurrentOwner(owner) }
+                } catch (cancel: CancellationException) {
+                    throw cancel
+                } catch (error: DebridException) {
+                    if (error === DebridException.OwnerChanged) throw error
+                    Log.d(TAG, "torbox reresolve fast-path failed (${error.message}); re-adding")
+                    null
                 }
-                requireCurrentOwner(owner)
-                return@withContext url
-            } catch (cancel: CancellationException) {
-                throw cancel
-            } catch (error: DebridException) {
-                if (error === DebridException.OwnerChanged) throw error
-                Log.d(TAG, "torbox reresolve fast-path failed (${error.message}); re-adding")
+            } else {
+                null
             }
+            fast ?: resolveWithIdsInternal(
+                service,
+                hash,
+                buildMagnet(hash, emptyList()),
+                fileIdx,
+                episode,
+                owner,
+            ).also { requireCurrentOwner(owner) }.url
         }
-        resolveWithIdsInternal(
-            service,
-            hash,
-            buildMagnet(hash, emptyList()),
-            fileIdx,
-            episode,
-            owner,
-        ).also { requireCurrentOwner(owner) }.url
     }
 
     /// Build a minimal magnet from an [infoHash] (+ optional [trackers]) for the coordinator's failover
@@ -859,44 +893,48 @@ internal class DebridResolver(private val keys: DebridKeys) {
         val apiKey = keys.key(DebridService.TOR_BOX, owner)
         if (apiKey.isEmpty()) throw DebridException.NoKey
         val base = USENET_BASE
+        // The breaker source is the stream's stable usenet identity (the authoritative NZB md5 when its
+        // emitter carried one, else the nzb link), matching the Apple `breakerSource = knownHash ?? nzbUrl`.
+        withBreaker(DebridService.TOR_BOX.id, knownHash ?: nzbUrl, ProviderCircuitBreaker.Phase.RESOLVE) {
+            // 1. Add the nzb (JSON body; post_processing default -1). Idempotent: TorBox returns the existing
+            //    download id if the same nzb is already in the user's usenet list.
+            val created = requestForOwner(owner) {
+                postJson(
+                    "$base/createusenetdownload",
+                    apiKey,
+                    JSONObject().put("link", nzbUrl).put("post_processing", -1),
+                )
+            }
+            var usenetId = created.optJSONObject("data")?.optIntOrNull("usenetdownload_id")
 
-        // 1. Add the nzb (JSON body; post_processing default -1). Idempotent: TorBox returns the existing
-        //    download id if the same nzb is already in the user's usenet list.
-        val created = requestForOwner(owner) {
-            postJson(
-                "$base/createusenetdownload",
-                apiKey,
-                JSONObject().put("link", nzbUrl).put("post_processing", -1),
-            )
+            // 2. Poll mylist until the download is finished + present (cached should be ~1 poll).
+            var files = emptyList<DebridFile>()
+            val immediate = usenetId?.let { id ->
+                optionalRequestForOwner(owner) { usenetItem(base, apiKey, id) }
+                    ?.takeIf(::torBoxReady)
+            }
+            if (immediate != null) {
+                files = torBoxFiles(immediate)
+            } else {
+                val polled = usenetPollByHash(
+                    base,
+                    apiKey,
+                    usenetId,
+                    knownHash?.lowercase() ?: usenetIdentifier(nzbUrl),
+                    owner,
+                )
+                usenetId = polled.first
+                files = polled.second
+            }
+            val id = usenetId ?: throw DebridException.NotReady
+
+            // 3. Pick the file, honoring fileMustInclude, then the shared semantic episode/movie heuristic.
+            val pick = pickUsenetFile(files, fileMustInclude, fileIdx, episode)
+                ?: throw DebridException.NoMatchingFile
+
+            // 4. Request the direct stream URL.
+            requestForOwner(owner) { usenetRequestDl(base, apiKey, id, pick.id) }
         }
-        var usenetId = created.optJSONObject("data")?.optIntOrNull("usenetdownload_id")
-
-        // 2. Poll mylist until the download is finished + present (cached should be ~1 poll).
-        var files = emptyList<DebridFile>()
-        val immediate = usenetId?.let { id ->
-            optionalRequestForOwner(owner) { usenetItem(base, apiKey, id) }
-                ?.takeIf(::torBoxReady)
-        }
-        if (immediate != null) {
-            files = torBoxFiles(immediate)
-        } else {
-            val polled = usenetPollByHash(
-                base,
-                apiKey,
-                usenetId,
-                knownHash?.lowercase() ?: usenetIdentifier(nzbUrl),
-                owner,
-            )
-            usenetId = polled.first
-            files = polled.second
-        }
-        val id = usenetId ?: throw DebridException.NotReady
-
-        // 3. Pick the file, honoring fileMustInclude, then the shared semantic episode/movie heuristic.
-        val pick = pickUsenetFile(files, fileMustInclude, fileIdx, episode) ?: throw DebridException.NoMatchingFile
-
-        // 4. Request the direct stream URL.
-        requestForOwner(owner) { usenetRequestDl(base, apiKey, id, pick.id) }
     }
 
     /// File pick with the usenet-specific [mustInclude] regex applied FIRST (when present + it matches a
@@ -970,6 +1008,260 @@ internal class DebridResolver(private val keys: DebridKeys) {
     }
 
     // ------------------------------------------------------------------------------------------------
+    // Browsable debrid cloud library. Lists what is ALREADY in the user's configured debrid accounts (finished
+    // torrents / stored files) and resolves a chosen item to a direct URL on demand, with no add-on and no
+    // re-download. Mirrors the Apple per-provider `listCloudLibrary` / `resolveLibraryItem`. Both throw a
+    // [DebridException] on failure; the [DebridCoordinator] aggregate catches per-provider so one dead provider
+    // simply hides its section rather than erroring the whole browse.
+    // ------------------------------------------------------------------------------------------------
+
+    /// List what is already in [service]'s cloud (finished torrents / stored files), each carrying enough to
+    /// resolve to a direct URL on demand. Empty with no key. Throws on a provider/network error. Runs on IO.
+    suspend fun listCloudLibrary(
+        service: DebridService,
+        expectedOwner: DebridOwnerToken? = null,
+    ): List<DebridLibraryItem> {
+        val owner = expectedOwner ?: keys.ownerToken() ?: return emptyList()
+        if (!keys.isCurrent(owner)) return emptyList()
+        if (!keys.isConfigured(service, owner)) return emptyList()
+        return withContext(Dispatchers.IO) {
+            when (service) {
+                DebridService.TOR_BOX -> torBoxLibrary(owner)
+                DebridService.REAL_DEBRID -> realDebridLibrary(owner)
+                DebridService.ALL_DEBRID -> allDebridLibrary(owner)
+                DebridService.PREMIUMIZE -> premiumizeLibrary(owner)
+            }.also { requireCurrentOwner(owner) }
+        }
+    }
+
+    /// Resolve one previously-listed [DebridLibraryItem] to a direct, streamable URL through its own provider.
+    /// Throws [DebridException.NoKey] when that provider is no longer configured; other [DebridException]s when
+    /// the file is gone. Runs on IO. Mirrors the Apple `resolveLibraryItem`.
+    suspend fun resolveLibraryItem(
+        item: DebridLibraryItem,
+        expectedOwner: DebridOwnerToken? = null,
+    ): String {
+        val owner = expectedOwner ?: keys.ownerToken() ?: throw DebridException.NoKey
+        if (!keys.isCurrent(owner)) throw DebridException.OwnerChanged
+        if (!keys.isConfigured(item.service, owner)) throw DebridException.NoKey
+        return withContext(Dispatchers.IO) {
+            when (item.service) {
+                DebridService.TOR_BOX -> torBoxResolveLibrary(item, owner)
+                DebridService.REAL_DEBRID -> realDebridResolveLibrary(item, owner)
+                DebridService.ALL_DEBRID -> allDebridResolveLibrary(item, owner)
+                DebridService.PREMIUMIZE -> premiumizeResolveLibrary(item)
+            }.also { requireCurrentOwner(owner) }
+        }
+    }
+
+    /// Real-Debrid cloud: `GET /torrents?limit=200` is a top-level JSON array; `status == "downloaded"` means
+    /// finished + playable. Mirrors the Apple RealDebridResolver.listCloudLibrary.
+    private suspend fun realDebridLibrary(owner: DebridOwnerToken): List<DebridLibraryItem> {
+        val apiKey = keys.key(DebridService.REAL_DEBRID, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val rows = requestForOwner(owner) { getJsonArray("$RD_BASE/torrents?limit=200", apiKey) }
+        val out = ArrayList<DebridLibraryItem>()
+        for (i in 0 until rows.length()) {
+            val r = rows.optJSONObject(i) ?: continue
+            if (r.optString("status") != "downloaded") continue
+            val id = r.optStringOrNull("id") ?: continue
+            out += DebridLibraryItem(
+                id = "${DebridService.REAL_DEBRID.id}:$id",
+                service = DebridService.REAL_DEBRID,
+                name = r.optStringOrNull("filename") ?: "Untitled",
+                size = r.optLong("bytes", 0L),
+                addedEpochMillis = parseIsoMillis(r.optStringOrNull("added")),
+                providerId = id,
+                fileId = null,
+                restrictedLink = null,
+                directLink = null,
+            )
+        }
+        return out
+    }
+
+    /// RD resolve: `/torrents/info/{id}` `links` align 1:1 with the SELECTED files, in file order, so pick the
+    /// largest video among the selected files and unrestrict its aligned link. Mirrors the Apple RD
+    /// resolveLibraryItem.
+    private suspend fun realDebridResolveLibrary(item: DebridLibraryItem, owner: DebridOwnerToken): String {
+        val apiKey = keys.key(DebridService.REAL_DEBRID, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val info = requestForOwner(owner) { getJson("$RD_BASE/torrents/info/${item.providerId}", apiKey) }
+        val links = info.optJSONArray("links") ?: throw DebridException.NotReady
+        if (links.length() == 0) throw DebridException.NotReady
+        val filesArr = info.optJSONArray("files")
+        val selected = ArrayList<DebridFile>()
+        if (filesArr != null) {
+            for (i in 0 until filesArr.length()) {
+                val f = filesArr.optJSONObject(i) ?: continue
+                if (f.optInt("selected", 0) != 1) continue
+                val path = f.optString("path")
+                selected += DebridFile(
+                    id = selected.size,
+                    name = path,
+                    shortName = path.substringAfterLast('/'),
+                    size = f.optLong("bytes", 0L),
+                )
+            }
+        }
+        val pick = DebridFileSelection.pick(selected, episode = null, providerFileIdx = null)
+            ?.takeIf { it.id in 0 until links.length() }
+            ?: throw DebridException.NoMatchingFile
+        val restricted = links.optStringOrNull(pick.id) ?: throw DebridException.NotReady
+        val un = requestForOwner(owner) {
+            postForm("$RD_BASE/unrestrict/link", apiKey, mapOf("link" to restricted))
+        }
+        return un.optStringOrNull("download") ?: throw DebridException.Provider("no download url")
+    }
+
+    /// TorBox cloud: `GET /mylist?bypass_cache=true` -> `data` array; a row is playable when [torBoxReady].
+    /// Picks the file that would stream (largest video; no episode target for a bare browse). Mirrors the Apple
+    /// TorBoxResolver.listCloudLibrary.
+    private suspend fun torBoxLibrary(owner: DebridOwnerToken): List<DebridLibraryItem> {
+        val apiKey = keys.key(DebridService.TOR_BOX, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val env = requestForOwner(owner) { getJson("$TORBOX_BASE/mylist?bypass_cache=true", apiKey) }
+        val data = env.optJSONArray("data") ?: return emptyList()
+        val out = ArrayList<DebridLibraryItem>()
+        for (i in 0 until data.length()) {
+            val row = data.optJSONObject(i) ?: continue
+            if (!torBoxReady(row)) continue
+            val files = torBoxFiles(row)
+            val pick = DebridFileSelection.pick(files, episode = null, providerFileIdx = null) ?: continue
+            val rowId = row.optIntOrNull("id") ?: continue
+            val name = (row.optStringOrNull("name") ?: pick.shortName).ifEmpty { "Untitled" }
+            val declared = row.optLong("size", 0L)
+            out += DebridLibraryItem(
+                id = "${DebridService.TOR_BOX.id}:$rowId",
+                service = DebridService.TOR_BOX,
+                name = name,
+                size = if (declared > 0) declared else files.sumOf { it.size },
+                addedEpochMillis = parseIsoMillis(row.optStringOrNull("created_at")),
+                providerId = rowId.toString(),
+                fileId = pick.id,
+                restrictedLink = null,
+                directLink = null,
+            )
+        }
+        return out
+    }
+
+    /// TorBox resolve: mint a direct link from the stored torrent+file id; if the list step picked no file
+    /// (defensive), fetch the item and pick the largest video first. Mirrors the Apple TorBox
+    /// resolveLibraryItem.
+    private suspend fun torBoxResolveLibrary(item: DebridLibraryItem, owner: DebridOwnerToken): String {
+        val apiKey = keys.key(DebridService.TOR_BOX, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val tid = item.providerId.toIntOrNull() ?: throw DebridException.Provider("bad torrent id")
+        val fileId = item.fileId ?: run {
+            val row = requestForOwner(owner) { torBoxItem(TORBOX_BASE, apiKey, tid) }
+            val pick = DebridFileSelection.pick(torBoxFiles(row), episode = null, providerFileIdx = null)
+                ?: throw DebridException.NoMatchingFile
+            pick.id
+        }
+        return requestForOwner(owner) { torBoxRequestDl(TORBOX_BASE, apiKey, tid, fileId) }
+    }
+
+    /// AllDebrid cloud: the list form of `/magnet/status` returns `data.magnets` as an ARRAY; `statusCode == 4`
+    /// is Ready. Picks the file from the link list and carries its restricted link for the on-demand unlock.
+    /// Mirrors the Apple AllDebridResolver.listCloudLibrary.
+    private suspend fun allDebridLibrary(owner: DebridOwnerToken): List<DebridLibraryItem> {
+        val apiKey = keys.key(DebridService.ALL_DEBRID, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val env = requestForOwner(owner) { getJsonQueryAuth(adUrl(AD_BASE, "/magnet/status", apiKey)) }
+        if (env.optString("status") != "success") return emptyList()
+        val magnets = env.optJSONObject("data")?.optJSONArray("magnets") ?: return emptyList()
+        val out = ArrayList<DebridLibraryItem>()
+        for (i in 0 until magnets.length()) {
+            val m = magnets.optJSONObject(i) ?: continue
+            if (m.optIntOrNull("statusCode") != 4) continue   // 4 = Ready
+            val links = adLinks(m)
+            if (links.isEmpty()) continue
+            val files = links.mapIndexed { idx, l ->
+                DebridFile(id = idx, name = l.filename, shortName = l.filename.substringAfterLast('/'), size = l.size)
+            }
+            val pick = DebridFileSelection.pick(files, episode = null, providerFileIdx = null)
+                ?.takeIf { it.id in links.indices } ?: continue
+            val mid = m.optIntOrNull("id") ?: 0
+            val name = (m.optStringOrNull("filename") ?: pick.shortName).ifEmpty { "Untitled" }
+            val declared = m.optLong("size", 0L)
+            out += DebridLibraryItem(
+                id = "${DebridService.ALL_DEBRID.id}:$mid",
+                service = DebridService.ALL_DEBRID,
+                name = name,
+                size = if (declared > 0) declared else links.sumOf { it.size },
+                addedEpochMillis = m.optIntOrNull("uploadDate")?.let { it.toLong() * 1000L },
+                providerId = mid.toString(),
+                fileId = null,
+                restrictedLink = links[pick.id].link,
+                directLink = null,
+            )
+        }
+        return out
+    }
+
+    /// AD resolve: unlock the item's stored restricted link into a direct URL. Mirrors the Apple AllDebrid
+    /// resolveLibraryItem.
+    private suspend fun allDebridResolveLibrary(item: DebridLibraryItem, owner: DebridOwnerToken): String {
+        val apiKey = keys.key(DebridService.ALL_DEBRID, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val restricted = item.restrictedLink ?: throw DebridException.NoMatchingFile
+        val un = requestForOwner(owner) {
+            getJsonQueryAuth(adUrl(AD_BASE, "/link/unlock", apiKey, "link" to restricted))
+        }
+        return un.optJSONObject("data")?.optStringOrNull("link") ?: throw DebridException.Provider("unlock")
+    }
+
+    /// Premiumize cloud: `GET /folder/list` (root) returns files that already carry a direct `stream_link` /
+    /// `link`. Skips subfolders; keeps video files (or anything with a stream link). Mirrors the Apple
+    /// PremiumizeResolver.listCloudLibrary.
+    private suspend fun premiumizeLibrary(owner: DebridOwnerToken): List<DebridLibraryItem> {
+        val apiKey = keys.key(DebridService.PREMIUMIZE, owner)
+        if (apiKey.isEmpty()) throw DebridException.OwnerChanged
+        val env = requestForOwner(owner) { getJsonQueryAuth("$PM_BASE/folder/list?apikey=${enc(apiKey)}") }
+        if (env.optString("status") != "success") return emptyList()
+        val content = env.optJSONArray("content") ?: return emptyList()
+        val out = ArrayList<DebridLibraryItem>()
+        for (i in 0 until content.length()) {
+            val e = content.optJSONObject(i) ?: continue
+            if (e.optString("type") != "file") continue   // skip subfolders (root browse only)
+            val streamLink = e.optStringOrNull("stream_link")
+            val direct = streamLink ?: e.optStringOrNull("link") ?: continue
+            val name = e.optStringOrNull("name") ?: "Untitled"
+            // Video files only: reuse DebridFile.isVideo (extension / mimetype heuristic).
+            val looksVideo = DebridFile(0, name, name.substringAfterLast('/'), 0L).isVideo
+            if (!looksVideo && streamLink == null) continue
+            val eid = e.optStringOrNull("id")
+            out += DebridLibraryItem(
+                id = "${DebridService.PREMIUMIZE.id}:${eid ?: direct}",
+                service = DebridService.PREMIUMIZE,
+                name = name,
+                size = e.optLong("size", 0L),
+                addedEpochMillis = e.optIntOrNull("created_at")?.let { it.toLong() * 1000L },
+                providerId = eid.orEmpty(),
+                fileId = null,
+                restrictedLink = null,
+                directLink = direct,
+            )
+        }
+        return out
+    }
+
+    /// PM resolve: Premiumize folder files are already direct, so no extra unrestrict round trip. Mirrors the
+    /// Apple PremiumizeResolver.resolveLibraryItem.
+    private fun premiumizeResolveLibrary(item: DebridLibraryItem): String =
+        item.directLink ?: throw DebridException.Provider("no link")
+
+    /// Cross-provider timestamp parse for the browsable library: RD/TorBox emit ISO-8601 strings (with or
+    /// without fractional seconds); AllDebrid/Premiumize emit Unix seconds (handled at their call sites). Any
+    /// unparseable value yields null so the row simply omits the "added" line. Mirrors the Apple `DebridDate`.
+    private fun parseIsoMillis(iso: String?): Long? {
+        if (iso.isNullOrEmpty()) return null
+        return runCatching { java.time.OffsetDateTime.parse(iso).toInstant().toEpochMilli() }.getOrNull()
+            ?: runCatching { java.time.Instant.parse(iso).toEpochMilli() }.getOrNull()
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // Shared file-pick policy lives in DebridFileSelection so its fail-closed episode behavior is covered by
     // pure JVM tests. Provider-local arrays are never indexed with raw stream fileIdx provenance.
     // ------------------------------------------------------------------------------------------------
@@ -1013,6 +1305,59 @@ internal class DebridResolver(private val keys: DebridKeys) {
     } catch (error: Exception) {
         if (error === DebridException.OwnerChanged) throw error
         null
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Provider circuit breaker (shared, process-lifetime). Guards EVERY resolve/download entry point here (the
+    // single choke all callers funnel through: the DebridCoordinator's failover race + CW resume AND the
+    // engine's direct play-time resolve in EngineStremioRepository), so a provider/source pair that has been
+    // failing has a shared, cross-screen memory of that and a leg fails fast with NO network instead of
+    // re-hammering a provider some OTHER caller already learned is down for this hash. Mirrors the Apple
+    // DebridCoordinator breaker guards (app/SourcesShared/DebridResolver.swift ~1289-1418); on Android the
+    // resolver is the shared choke, so the guard lives here rather than in the coordinator.
+    // ------------------------------------------------------------------------------------------------
+
+    /// Consult the shared breaker for (provider, sourceId); on an OPEN circuit throw [DebridException.Provider]
+    /// with NO network, so a fail-soft caller falls through. Record the outcome around [block]: a success
+    /// resets the circuit, a real provider failure trips it. A cancellation (a raced / timed-out leg) or an
+    /// owner/session change ([DebridException.OwnerChanged]) is an app-side race, not the provider's fault, so
+    /// neither is recorded.
+    private suspend fun <T> withBreaker(
+        provider: String,
+        sourceId: String,
+        phase: ProviderCircuitBreaker.Phase,
+        block: suspend () -> T,
+    ): T {
+        if (!ProviderCircuitBreaker.shared.shouldAttempt(provider, sourceId)) {
+            throw DebridException.Provider("circuit open, backing off $provider")
+        }
+        val result = try {
+            block()
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (error: Exception) {
+            if (error !== DebridException.OwnerChanged) {
+                ProviderCircuitBreaker.shared.recordFailure(provider, sourceId, phase, breakerReason(error))
+            }
+            throw error
+        }
+        ProviderCircuitBreaker.shared.recordSuccess(provider, sourceId)
+        return result
+    }
+
+    /// Best-effort classification of a thrown provider error into a breaker reason. The HTTP layer throws
+    /// `DebridException.Provider("HTTP <code>")` (rendered "provider error: HTTP <code>") on a non-2xx, so a
+    /// numeric suffix is parsed back into a status code; anything else (a transport failure, invalid key,
+    /// not-ready, no-file, decode failure, ...) falls to a best-effort text bucket. Pure + total: never
+    /// throws, always returns SOME reason. Mirrors the Apple `breakerReason(for:)`.
+    private fun breakerReason(error: Exception): ProviderCircuitBreaker.FailureReason {
+        val message = error.message.orEmpty()
+        val marker = message.indexOf("HTTP ")
+        if (marker >= 0) {
+            val code = message.substring(marker + "HTTP ".length).takeWhile { it.isDigit() }.toIntOrNull()
+            if (code != null) return ProviderCircuitBreaker.FailureReason.HttpStatus(code)
+        }
+        return ProviderCircuitBreaker.FailureReason.Other(error::class.simpleName ?: "error")
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -1165,6 +1510,32 @@ internal class DebridResolver(private val keys: DebridKeys) {
             val text = stream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
             if (code !in 200..299) throw DebridException.Provider("HTTP $code")
             return runCatching { JSONObject(text) }.getOrElse {
+                throw DebridException.Provider("decode: ${it.message}")
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /// A Bearer-auth GET whose 2xx body is a TOP-LEVEL JSON ARRAY (Real-Debrid `/torrents`), not an object.
+    /// Same status-code mapping as [getJson]/[execute].
+    private suspend fun getJsonArray(urlString: String, bearer: String): JSONArray {
+        val conn = open(urlString)
+        conn.requestMethod = "GET"
+        conn.setRequestProperty("Authorization", "Bearer $bearer")
+        return sendCancellable(conn) { executeArray(conn) }
+    }
+
+    /// Read the response, mapping status codes to [DebridException], then parse the body as a JSON ARRAY. The
+    /// array twin of [execute]; the body is always read so the connection releases cleanly.
+    private fun executeArray(conn: HttpURLConnection): JSONArray {
+        try {
+            val code = conn.responseCodeSafe()
+            if (code == 401 || code == 403) throw DebridException.InvalidKey
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val text = stream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
+            if (code !in 200..299) throw DebridException.Provider("HTTP $code")
+            return runCatching { JSONArray(text) }.getOrElse {
                 throw DebridException.Provider("decode: ${it.message}")
             }
         } finally {

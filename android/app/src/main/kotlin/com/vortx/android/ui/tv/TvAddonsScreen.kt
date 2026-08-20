@@ -16,7 +16,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,11 +64,20 @@ internal fun TvAddonsScreen(
     viewModel: AddonsViewModel,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    onDiscover: () -> Unit = {},
+    onInstallByQr: () -> Unit = {},
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val health by viewModel.health.collectAsStateWithLifecycle()
     val installed = (state as? UiState.Success)?.data.orEmpty()
     val backFocus = remember { FocusRequester() }
+
+    // Per-add-on Configure QR (Apple `ConfigureAddonView` tvOS path): TV has no browser, so it shows the
+    // add-on's configuration page as a QR to finish on a phone. Null when no Configure sheet is open.
+    var configureAddon by remember { mutableStateOf<InstalledAddon?>(null) }
+    configureAddon?.let { addon ->
+        TvAddonConfigureDialog(addon = addon, onDismiss = { configureAddon = null })
+    }
 
     LaunchedEffect(viewModel) {
         viewModel.onScreenEntry()
@@ -91,6 +102,20 @@ internal fun TvAddonsScreen(
                 Text(
                     stringResource(R.string.addon_health_tv_description),
                     style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
+                )
+            }
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+                TvAddonAction(
+                    label = stringResource(R.string.addon_install_by_qr),
+                    onClick = onInstallByQr,
+                    modifier = Modifier.width(260.dp),
+                )
+                TvAddonAction(
+                    label = stringResource(R.string.addon_discover),
+                    onClick = onDiscover,
+                    modifier = Modifier.width(260.dp),
                 )
             }
         }
@@ -123,6 +148,11 @@ internal fun TvAddonsScreen(
                             health = health[AddonHealthStore.normalizeUrl(addon.transportUrl)]
                                 ?: AddonHealth.Unknown,
                             onClick = { if (!addon.isProtected) viewModel.toggleAddon(addon) },
+                            onConfigure = if (addon.isConfigurable) {
+                                { configureAddon = addon }
+                            } else {
+                                null
+                            },
                         )
                     }
                 }
@@ -149,63 +179,77 @@ private fun TvAddonRow(
     addon: InstalledAddon,
     health: AddonHealth,
     onClick: () -> Unit,
+    onConfigure: (() -> Unit)? = null,
 ) {
     val colors = VortXTheme.colors
-    Surface(
-        onClick = onClick,
+    Row(
         modifier = Modifier.fillMaxWidth(),
-        shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
-        colors = ClickableSurfaceDefaults.colors(
-            containerColor = colors.surface1,
-            contentColor = colors.textPrimary,
-            focusedContainerColor = colors.surface3,
-            focusedContentColor = colors.textPrimary,
-        ),
-        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
-        border = ClickableSurfaceDefaults.border(
-            focusedBorder = Border(
-                border = BorderStroke(2.dp, colors.accentBright),
-                shape = VortXShapes.control,
-            ),
-        ),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
-            ) {
-                Text(
-                    addon.name,
-                    style = VortXTheme.type.cardTitle,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    listOfNotNull(
-                        if (addon.isDisabled) stringResource(R.string.addon_state_off) else null,
-                        if (addon.providesStreams) stringResource(R.string.addon_capability_streams) else null,
-                        addon.host,
-                    ).joinToString(" · "),
-                    style = VortXTheme.type.label.copy(color = colors.textTertiary),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                AddonHealthIndicator(health)
-            }
-            Spacer(Modifier.width(VortXTheme.spacing.md))
-            Text(
-                when {
-                    addon.isProtected -> stringResource(R.string.addon_health_managed)
-                    addon.isDisabled -> stringResource(R.string.addon_health_turn_on)
-                    else -> stringResource(R.string.addon_health_turn_off)
-                },
-                style = VortXTheme.type.label.copy(
-                    color = colors.textSecondary,
-                    fontWeight = FontWeight.Medium,
+        Surface(
+            onClick = onClick,
+            modifier = Modifier.weight(1f),
+            shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
+            colors = ClickableSurfaceDefaults.colors(
+                containerColor = colors.surface1,
+                contentColor = colors.textPrimary,
+                focusedContainerColor = colors.surface3,
+                focusedContentColor = colors.textPrimary,
+            ),
+            scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
+            border = ClickableSurfaceDefaults.border(
+                focusedBorder = Border(
+                    border = BorderStroke(2.dp, colors.accentBright),
+                    shape = VortXShapes.control,
                 ),
+            ),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                ) {
+                    Text(
+                        addon.name,
+                        style = VortXTheme.type.cardTitle,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        listOfNotNull(
+                            if (addon.isDisabled) stringResource(R.string.addon_state_off) else null,
+                            addon.capabilities,
+                            addon.host,
+                        ).joinToString(" · "),
+                        style = VortXTheme.type.label.copy(color = colors.textTertiary),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    AddonHealthIndicator(health)
+                }
+                Spacer(Modifier.width(VortXTheme.spacing.md))
+                Text(
+                    when {
+                        addon.isProtected -> stringResource(R.string.addon_health_managed)
+                        addon.isDisabled -> stringResource(R.string.addon_health_turn_on)
+                        else -> stringResource(R.string.addon_health_turn_off)
+                    },
+                    style = VortXTheme.type.label.copy(
+                        color = colors.textSecondary,
+                        fontWeight = FontWeight.Medium,
+                    ),
+                )
+            }
+        }
+        if (onConfigure != null) {
+            TvAddonAction(
+                label = stringResource(R.string.addon_configure),
+                onClick = onConfigure,
+                modifier = Modifier.width(200.dp),
             )
         }
     }

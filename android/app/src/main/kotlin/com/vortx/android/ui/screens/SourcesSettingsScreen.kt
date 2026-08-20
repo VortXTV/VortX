@@ -130,6 +130,20 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 }
             }
 
+            // Smart source selection: the ported chips + live preview (the Android twin of Apple's
+            // SourceFilterChipsView). The criterion chips write the SAME store keys the granular controls
+            // below do, so a chip and any remaining detailed control stay in step.
+            SettingsSection(
+                title = "Smart source selection",
+                footer = null,
+            ) {
+                SmartSourceSelectionSection(
+                    ui = ui,
+                    store = store,
+                    onMutate = { block -> mutate(block) },
+                )
+            }
+
             SettingsSection(
                 title = "Source order",
                 footer = "Sources are grouped strongest-first in this order. Turn on \"Use add-on order\" to " +
@@ -193,37 +207,15 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     selectedId = formatSizeId(ui.maxFileSizeGB),
                     onSelect = { id -> mutate { maxFileSizeGB = id.toDouble() } },
                 )
-                ToggleRow(
-                    label = "HDR only",
-                    detail = "Keep only HDR, HDR10+ or Dolby Vision sources.",
-                    checked = ui.hdrOnly,
-                    onCheckedChange = { value -> mutate { hdrOnly = value } },
-                )
-                ToggleRow(
-                    label = "Hide AV1",
-                    detail = "AV1 has no hardware decode on many devices, so it can stutter.",
-                    checked = ui.excludeAV1,
-                    onCheckedChange = { value -> mutate { excludeAV1 = value } },
-                )
-                ToggleRow(
-                    label = "Hide unlabelled resolutions",
-                    detail = "Hide sources that do not advertise a resolution at all.",
-                    checked = ui.hideUnknownResolution,
-                    onCheckedChange = { value -> mutate { hideUnknownResolution = value } },
-                )
+                // HDR only / Hide AV1 / Hide unlabelled resolutions moved to the Smart source selection chips
+                // above (HDR / DV, AV1, Stated quality). They write the same store keys.
             }
 
             SettingsSection(
                 title = "Availability",
-                footer = "Instant sources start immediately: a cached debrid file, a direct link, or your " +
-                    "own media server.",
+                footer = "Direct links start immediately. Instant-only, dead-torrent, and audio-language " +
+                    "filters live in the Smart source selection chips above.",
             ) {
-                ToggleRow(
-                    label = "Instant only",
-                    detail = "Hide anything that would need to download first.",
-                    checked = ui.instantOnly,
-                    onCheckedChange = { value -> mutate { instantOnly = value } },
-                )
                 ToggleRow(
                     label = "Direct links only",
                     detail = "Hide unresolved torrents; keep direct, resolved debrid, and media-server links.",
@@ -232,18 +224,6 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         directLinksOnly = value
                         PlaybackBehaviorSettings.setDirectLinksOnly(appContext, value)
                     },
-                )
-                ToggleRow(
-                    label = "Hide dead torrents",
-                    detail = "Hide torrents with no seeders.",
-                    checked = ui.hideDeadTorrents,
-                    onCheckedChange = { value -> mutate { hideDeadTorrents = value } },
-                )
-                ToggleRow(
-                    label = "My audio languages only",
-                    detail = "Hide sources that do not carry one of your Playback audio languages.",
-                    checked = ui.preferredAudioOnly,
-                    onCheckedChange = { value -> mutate { preferredAudioOnly = value } },
                 )
             }
 
@@ -297,36 +277,8 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 )
             }
 
-            SettingsSection(
-                title = "Excluded sources",
-                footer = "What happens to a source that matches your Exclude list.",
-            ) {
-                avoidOptions.forEach { (id, copy) ->
-                    val (label, detail) = copy
-                    OptionRow(
-                        label = label,
-                        detail = detail,
-                        selected = id == ui.avoidBehavior,
-                        onClick = { mutate { avoidBehavior = id } },
-                    )
-                }
-            }
-
-            SettingsSection(
-                title = "Smart selection",
-                footer = "Applies when you tap an episode. The hero Watch button always plays your best " +
-                    "source.",
-            ) {
-                // Apple's exact toggle wording (SourceFilterChipsView.swift:225-231), so the same setting
-                // reads the same on every platform.
-                ToggleRow(
-                    label = "Auto-pick my best source",
-                    detail = "Play the top-ranked source straight away instead of opening the source " +
-                        "list. Back out of the player any time to see the full source list.",
-                    checked = ui.autoPickBest,
-                    onCheckedChange = { value -> mutate { autoPickBest = value } },
-                )
-            }
+            // Excluded-source behavior (Hide / Rank) and Auto-pick best moved to the Smart source selection
+            // chips above; they write the same `avoidBehavior` / `autoPickBest` store keys.
 
             // Pinned sources (#15): long-press a source on any title to pin it; this clears them all.
             // Mirrors Apple iOSSettingsView.swift:953-956 (shown only when at least one pin exists).
@@ -355,8 +307,9 @@ fun SourcesSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 // ---------------------------------------------------------------------------------------------------
 
 /// An immutable read of every preference this screen drives. Mirrors the store field-for-field so a
-/// re-read after any write is the single way the UI learns what changed.
-private data class SourcesPrefsUi(
+/// re-read after any write is the single way the UI learns what changed. `internal` (not `private`) so the
+/// [SmartSourceSelectionSection] chips in this package can read the same snapshot.
+internal data class SourcesPrefsUi(
     val typeOrder: List<SourceType>,
     val useAddonOrder: Boolean,
     val excludeKeywords: String,
@@ -457,12 +410,6 @@ private val safetyOptions: List<Pair<String, Pair<String, String>>> = listOf(
     "off" to ("Off" to "Show every source."),
     "balanced" to ("Balanced" to "Hide obvious junk: cams, mislabelled files."),
     "strict" to ("Strict" to "Also hide sources whose size cannot hold the resolution they claim."),
-)
-
-/// Ids are the exact strings StreamRanking.kt:378/:577 branches on: "rank" demotes, anything else hides.
-private val avoidOptions: List<Pair<String, Pair<String, String>>> = listOf(
-    "hide" to ("Hide them" to "Excluded sources do not appear at all."),
-    "rank" to ("Just rank them lower" to "Excluded sources still appear, at the bottom."),
 )
 
 // ---------------------------------------------------------------------------------------------------

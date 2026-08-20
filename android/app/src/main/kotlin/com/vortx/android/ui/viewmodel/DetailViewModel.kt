@@ -877,6 +877,9 @@ class DetailViewModel(
                             startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
+                            posterUrl = nowPlayingPoster(episode),
+                            isLive = isLivePlayback(),
+                            episodeTitle = episode?.title?.takeIf { it.isNotBlank() },
                             ),
                         )
                     }
@@ -921,6 +924,9 @@ class DetailViewModel(
                 playable = resolved.copy(
                     mediaRef = ref,
                     expectedDurationMs = expectedRuntimeMs(),
+                    posterUrl = nowPlayingPoster(episode),
+                    isLive = isLivePlayback(),
+                    episodeTitle = episode?.title?.takeIf { it.isNotBlank() },
                 ),
                 commitGate = sourceSwitchCommitGate,
                 commitAuthorityIsCurrent = {
@@ -1027,6 +1033,9 @@ class DetailViewModel(
                         startPositionMs = 0L,
                         mediaRef = mediaRef,
                         expectedDurationMs = expectedRuntimeMs(),
+                        posterUrl = nowPlayingPoster(target),
+                        isLive = isLivePlayback(),
+                        episodeTitle = target?.title?.takeIf { it.isNotBlank() },
                     ),
                     resolvedSource = source,
                     commitGate = sourceSwitchCommitGate,
@@ -1241,6 +1250,9 @@ class DetailViewModel(
                             startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
+                            posterUrl = nowPlayingPoster(episode),
+                            isLive = isLivePlayback(),
+                            episodeTitle = episode?.title?.takeIf { it.isNotBlank() },
                         ),
                     )
                 },
@@ -1334,6 +1346,21 @@ class DetailViewModel(
         val year = detail.releaseInfo?.take(4)?.toIntOrNull()
         return buildMediaRef(type = type, metaId = id, episode = episode, title = detail.name, year = year)
     }
+
+    /// Now-Playing artwork for the system media session / lockscreen card: the chosen episode's still
+    /// (series) else the title poster. Attached on the resolved [Playable] alongside [mediaRef] so the
+    /// media session ([com.vortx.android.player.PlayerMediaSession]) can decode it off-thread. Mirrors
+    /// the Apple player filling `NowPlayingItem.artworkURL` from the same catalog art.
+    private fun nowPlayingPoster(episode: Episode?): String? {
+        val detail = (_meta.value as? UiState.Success)?.data
+        return episode?.thumbnail?.takeIf { it.isNotBlank() }
+            ?: detail?.poster?.takeIf { it.isNotBlank() }
+    }
+
+    /// Whether this play is a LIVE / durationless stream (a TV channel, an events feed). Rides the
+    /// [Playable] so the media session withholds a bogus duration + scrub bar. Mirrors Apple
+    /// `NowPlayingItem.isLive` / the `effectivelyLive` gate.
+    private fun isLivePlayback(): Boolean = com.vortx.android.model.LiveTypes.contains(type.id)
 
     /// The best source across ALL loaded groups (the labeled "Watch" pick). Prefers [SourceListModel]'s own
     /// assembled best (ranked with the same prefs/pin/continuity the list is), falling back to ranking the

@@ -107,6 +107,14 @@ class AddonsViewModel(
     fun install() {
         val url = _urlInput.value.trim()
         if (url.isEmpty() || _installing.value) return
+        // A pasted /configure PAGE is not an installable manifest (it mints a per-user manifest only after
+        // sign-in + debrid key). Guide the user to finish configuration rather than installing a dead copy
+        // (Apple `AddonsView.install`'s Beta 17 guard). The repository repeats this as a backstop; here it
+        // also avoids the wasted fetch and the misleading Update prompt.
+        if (com.vortx.android.engine.AddonConfiguration.isConfigurationPageUrl(url)) {
+            _installMessage.value = com.vortx.android.engine.AddonConfiguration.NEEDS_CONFIGURATION_MESSAGE to true
+            return
+        }
         // Already installed? Offer to UPDATE (re-fetch the manifest) instead of a silent re-install (SRC-8,
         // Apple `AddonsView.install`). Match on the engine's normalized transport URL, the exact key the
         // installed list carries. A repository that does not normalize (the offline preview) returns null and
@@ -152,6 +160,44 @@ class AddonsViewModel(
         viewModelScope.launch {
             repo.removeAddon(addon)
             load()
+        }
+    }
+
+    /// The Change-URL sheet's live outcome, or null while it is idle. `first` = user-facing text,
+    /// `second` = true when the swap FAILED (the sheet stays open so the user can correct the URL);
+    /// a success clears it and the sheet dismisses. Mirrors Apple `EditAddonURLView.message`.
+    private val _changeUrlMessage = MutableStateFlow<Pair<String, Boolean>?>(null)
+    val changeUrlMessage: StateFlow<Pair<String, Boolean>?> = _changeUrlMessage.asStateFlow()
+
+    private val _changingUrl = MutableStateFlow(false)
+    val changingUrl: StateFlow<Boolean> = _changingUrl.asStateFlow()
+
+    /// Signals the Change-URL sheet to dismiss after a successful swap. The screen collects this and
+    /// closes its sheet; a plain incrementing token avoids a stale re-dismiss on recomposition.
+    private val _changeUrlDone = MutableStateFlow(0)
+    val changeUrlDone: StateFlow<Int> = _changeUrlDone.asStateFlow()
+
+    fun onChangeUrlOpen() {
+        _changeUrlMessage.value = null
+    }
+
+    /// Swap an installed add-on's manifest URL (Apple `EditAddonURLView.update`): install the new URL
+    /// first, then drop the old without tombstoning. On success the sheet dismisses; on failure it stays
+    /// open with the error so the user can fix the URL.
+    fun changeAddonUrl(addon: InstalledAddon, newUrl: String) {
+        val trimmed = newUrl.trim()
+        if (trimmed.isEmpty() || trimmed == addon.transportUrl || _changingUrl.value) return
+        viewModelScope.launch {
+            _changingUrl.value = true
+            _changeUrlMessage.value = null
+            repo.changeAddonUrl(addon, trimmed).fold(
+                onSuccess = {
+                    _changeUrlDone.value += 1
+                    load()
+                },
+                onFailure = { _changeUrlMessage.value = (it.message ?: "Couldn't change that add-on's URL.") to true },
+            )
+            _changingUrl.value = false
         }
     }
 
