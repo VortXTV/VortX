@@ -201,6 +201,11 @@ final class VortXRemuxProducerTerminalRelay: @unchecked Sendable {
     private var fired = false
     private var handler: (@Sendable () -> Void)?
 
+    var hasFired: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return fired
+    }
+
     func install(_ handler: @escaping @Sendable () -> Void) {
         lock.lock()
         if fired {
@@ -224,6 +229,42 @@ final class VortXRemuxProducerTerminalRelay: @unchecked Sendable {
         handler = nil
         lock.unlock()
         callback?()
+    }
+}
+
+/// A cancellation request is not proof that a remux has released its input connection and producer slot.
+/// The fallback surface holds this receipt until the producer's one real terminal edge fires.
+final class VortXRemuxQuiescenceReceipt: @unchecked Sendable {
+    private let terminal: VortXRemuxProducerTerminalRelay?
+
+    init(terminal: VortXRemuxProducerTerminalRelay?) {
+        self.terminal = terminal
+    }
+
+    var isAcknowledged: Bool { terminal?.hasFired ?? true }
+
+    func wait(timeout: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while !isAcknowledged, !Task.isCancelled, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return isAcknowledged
+    }
+}
+
+/// Pure handoff gates. A replacement mpv mount is permitted only after the outgoing producer has unwound;
+/// preparation is forbidden once the route has left AVFoundation.
+enum VortXRemuxHandoffPolicy {
+    static func canMountMPV(routeStillCurrent: Bool, producerQuiescent: Bool) -> Bool {
+        routeStillCurrent && producerQuiescent
+    }
+
+    static func canRetainPreparedTransport(
+        avRouteActive: Bool,
+        handoffPending: Bool,
+        taskCancelled: Bool
+    ) -> Bool {
+        avRouteActive && !handoffPending && !taskCancelled
     }
 }
 

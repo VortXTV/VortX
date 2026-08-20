@@ -46,6 +46,13 @@ struct PlayerEpisodeStream {
 }
 
 struct PlayerScreen: View {
+    #if os(iOS) || os(macOS)
+    private struct AVToMPVHandoff: Equatable {
+        let url: URL
+        let episodeGeneration: Int
+        let resumeGeneration: Int
+    }
+    #endif
     let url: URL
     let title: String
     var headers: [String: String]? = nil                    // behaviorHints.proxyHeaders for header-gated CDNs
@@ -547,6 +554,10 @@ struct PlayerScreen: View {
     @State private var srcProbeLoadStart = Date()
     #if os(iOS) || os(macOS)
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
+    /// No MPV surface is constructed until the retiring AV/remux route acknowledges producer unwind.
+    @State private var avToMPVHandoff: AVToMPVHandoff?
+    @State private var avToMPVHandoffBlocked = false
+    @State private var avToMPVHandoffTask: Task<Void, Never>?
     /// The engine routing decision, LATCHED once at playback start (onAppear). Routing inputs are not all
     /// constant (`PlayerEngineRouter.dvRemuxEnabled(dvDisplayCapable:)` reads a RemoteConfig snapshot that can
     /// refresh mid-session), and `useAVPlayerEngine` is re-evaluated on every body render, so an unlatched flip
@@ -789,7 +800,7 @@ struct PlayerScreen: View {
     /// override (Always libmpv / Prefer AVPlayer) still wins. On an AVPlayer load failure we fall back to libmpv
     /// for this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text.
     private var useAVPlayerEngine: Bool {
-        if avEngineFailed { return false }   // an AVPlayer load failure fell back to libmpv for this stream
+        if avEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
         if let forced = manualEngineAVPlayer { return forced }   // P3: the viewer's mid-title engine pick wins over the latch
         return engineLatch ?? routedToAVPlayer
     }
@@ -907,7 +918,9 @@ struct PlayerScreen: View {
     /// Coordinator and feed the same `handleProperty`, so the surrounding overlay drives either unchanged.
     @ViewBuilder private var playerSurface: some View {
         #if os(iOS) || os(macOS)
-        if useAVPlayerEngine {
+        if avToMPVHandoff != nil || avToMPVHandoffBlocked {
+            Color.black.ignoresSafeArea()
+        } else if useAVPlayerEngine {
             AVPlayerEngineView(coordinator: coordinator)
                 // Pass the launching stream's Dolby Vision flag (same plumbing as mpvSurface and the tvOS
                 // surface). Without it the first iOS/macOS native-DV MP4/MOV mount never armed the DV
@@ -939,9 +952,10 @@ struct PlayerScreen: View {
         MPVMetalPlayerView(coordinator: coordinator)
             // libmpv KEEPS the proxied initialPlayback tuple: the embedded server applies per-stream headers
             // server-side (the official-Stremio path picky CDNs need) and rewrites HLS playlists for mpv.
-            .play(initialPlayback.url, headers: initialPlayback.headers, audioSidecar: audioSidecarURL,
-                  isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
-            .live(initialIsLive)
+            .play(mpvSurfacePlayback.url, headers: mpvSurfacePlayback.headers,
+                  audioSidecar: mpvSurfacePlayback.audioSidecar,
+                  isDolbyVision: mpvSurfacePlayback.isDolbyVision)
+            .live(mpvSurfacePlayback.live)
             .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
             .ignoresSafeArea()
     }
@@ -2474,6 +2488,27 @@ struct PlayerScreen: View {
     private var initialPlayback: (url: URL, headers: [String: String]?) {
         playback(for: url, headers: headers)
     }
+
+    /// A post-AV fallback must construct MPV with the source that is current at the handoff boundary.
+    /// Loading the immutable launch tuple first can first-frame a previous source before a deferred correction.
+    private var mpvSurfacePlayback: (url: URL, headers: [String: String]?, audioSidecar: URL?, live: Bool, isDolbyVision: Bool) {
+        #if os(iOS) || os(macOS)
+        let usesFallbackSource = avEngineFailed
+        #else
+        let usesFallbackSource = false
+        #endif
+        let activeURL = usesFallbackSource ? (curURL ?? url) : url
+        let activeHeaders = usesFallbackSource ? curHeaders : headers
+        let input = playback(for: activeURL, headers: activeHeaders)
+        return (
+            input.url,
+            input.headers,
+            activeURL == url ? audioSidecarURL : nil,
+            usesFallbackSource ? isLive : initialIsLive,
+            StreamRanking.isDolbyVision(usesFallbackSource ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? ""))
+        )
+    }
+
     private func playback(for u: URL, headers h: [String: String]?) -> (url: URL, headers: [String: String]?) {
         if let h, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: u, headers: h) {
             return (proxied, nil)
@@ -2894,6 +2929,9 @@ struct PlayerScreen: View {
             bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         }
         autoRetryTask?.cancel()
+        #if os(iOS) || os(macOS)
+        avToMPVHandoffBlocked = false
+        #endif
         srcProbe("retryLoad reload-in-place (resetAutoRetries=\(resetAutoRetries)) host=\((curURL ?? url).host ?? "-")")
         let resume = retryResumeTarget()
         withAnimation { loadFailed = false }
@@ -3393,30 +3431,27 @@ struct PlayerScreen: View {
         let followedDeadInput = demoteFollowedDeadInput
         demoteFollowedDeadInput = false
         srcProbe("demoteAVPlayerToMPV (AVPlayer -> libmpv, SAME url, silent=\(silent), NOT a hop)")
+        guard let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return }
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
-        let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         let engineRequestedResume =
-            (coordinator.player as? AVPlayerEngineController)?.pendingRequestedSourcePositionSeconds
+            retiringAVPlayer.pendingRequestedSourcePositionSeconds
         // Real DV-profile evidence from the outgoing AVPlayer's own remux parse (#148), captured for the
         // SAME reason as engineRequestedResume above: stop() below tears the remux session down, so this
         // MUST read before it. Feeds the fresh mpv mount's pre-probe colour fallback via the Coordinator
         // (MPVMetalPlayerView.makeController copies it onto the new controller).
         coordinator.dolbyVisionFallbackInfo =
-            (coordinator.player as? AVPlayerEngineController)?.dolbyVisionFallbackInfo ?? .unknown
+            retiringAVPlayer.dolbyVisionFallbackInfo
         // Engine of origin for the `avDemotedAt` grace (W2-A item 3a; tvOS twin in TVPlayerView). Captured
         // BEFORE stop() clears the engine's active token: this is the exact load the grace exists to swallow.
-        demotedEngineLoadToken = coordinator.player?.activeLoadToken
-        // Fully tear down the outgoing AVFoundation engine BEFORE flipping `avEngineFailed` mounts the libmpv
-        // surface, so the old AVPlayer decoder cannot straddle into the mpv mount (the player-teardown-straddle
-        // that has jetsam-hung the device). Mirrors the tvOS twin's order. stop() is idempotent with the
-        // SwiftUI dismantle path.
-        coordinator.player?.stop()
+        demotedEngineLoadToken = retiringAVPlayer.activeLoadToken
+        // Invalidation makes a prepared next-episode transport logically dead, but its producer can be queued
+        // behind the current one. Cancel it before the current producer emits its terminal receipt.
+        invalidatePreparedEpisode(reason: "AV-to-mpv handoff")
+        let quiescence = retiringAVPlayer.stopForMPVFallback()
         clearCachedAudioOutputTruth()
-        avEngineFailed = true
-        avDemotedAt = Date()
         // An engine-owned target is a newer explicit seek and is authoritative in BOTH directions. In
         // particular, a backward MediaRemote, chapter, or skip seek from 3600s to 600s must not be replaced by
         // the stale 3600s chrome clock. Retire the old anti-regression floor first; nudgeResume arms a new floor
@@ -3431,49 +3466,78 @@ struct PlayerScreen: View {
         } else {
             resume = max(resumeSeconds, suppressedResumeFloor ?? 0)
         }
-        if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
-            showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
-        }
-        // Treat the mpv mount as a fresh load: full timeout window, no stale error/overlay state.
-        appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
-        buffering = true; loadFailed = false; loadErrorMsg = ""
-        // The outgoing AVPlayer mount already had a first frame (or never got one); either way this fresh
-        // mpv mount earns its own. Without clearing it, elapsedSinceFirstFrame keeps measuring from the
-        // OUTGOING engine's stale timestamp instead of the incoming mpv leg's.
-        firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil   // fresh mount: no deferred resume seek from the outgoing mount
-        subtitleLoadingURL = nil   // self-heal: an in-flight subtitle load died with the AVPlayer engine; a stranded latch would gate every later pick
-        srcProbeLoadStart = Date()   // [src-probe] fresh mpv mount: re-anchor the elapsed clock
-        // RE-BASELINE the first-buffer grace for the mpv leg (tvOS twin does the same). `handleStartTimeout`
-        // only extends while `bufferedTime > lastBufferedAtWatchdog + 0.25`, and both of those carry the
-        // OUTGOING AVPlayer leg's numbers across the demote: a stale high-water edge (and a grace count already
-        // spent on the AV leg) makes the +20s extension unreachable, which is precisely the safety valve the
-        // shortened budget below depends on.
-        bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
-        bufferedTime = 0   // fresh mount: clear the buffered-ahead band until mpv's demuxer re-reports
-        // The mpv leg gets its own SHORTER deadline (W2-A item 3b) ONLY when this demote followed positive
-        // dead-input evidence: `avEngineFailed` above is exactly what disarms the re-armed progress-aware
-        // watchdog, so without this the only owner of the post-demote load is the plain 30s timer, and 15s of
-        // stall plus 30s of mpv on a url that never delivered a byte is the wait worth cutting. A renderer-only
-        // demote (#76: AVFoundation cannot demux a source libmpv plays) keeps the full 30s. Not a wall either
-        // way: handleStartTimeout still EXTENDS by 20s whenever the buffered edge advanced.
-        if followedDeadInput {
-            startLoadTimeout(seconds: avPostDemoteStartTimeoutSeconds)
-        } else {
-            startLoadTimeout()
-        }
-        if resume > 5 { nudgeResume(to: resume) }
-        // The fresh mpv mount auto-loads the LAUNCH url; if this session had switched sources, re-point it at
-        // the ACTIVE one once the controller exists.
-        if let cu = curURL, cu != url || pendingAdvance?.issued == true {
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(400))
-                guard avEngineFailed, !Task.isCancelled, curURL == cu,
-                      reissueEpisodeGeneration == episodeSwitchGeneration,
-                      reissueMediaGeneration == resumeRetryGeneration,
-                      reissuePendingVideoID == pendingAdvance?.meta.videoId else { return }
-                loadIntoPlayer(cu, headers: curHeaders, live: isLive)
+        let handoff = AVToMPVHandoff(
+            url: curURL ?? url,
+            episodeGeneration: reissueEpisodeGeneration,
+            resumeGeneration: reissueMediaGeneration
+        )
+        avToMPVHandoff = handoff
+        avToMPVHandoffTask?.cancel()
+        avToMPVHandoffTask = Task { @MainActor in
+            let quiescent = await quiescence.wait(timeout: .seconds(2))
+            guard !Task.isCancelled,
+                  avToMPVHandoff == handoff,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url) else { return }
+            guard VortXRemuxHandoffPolicy.canMountMPV(
+                routeStillCurrent: true,
+                producerQuiescent: quiescent
+            ) else {
+                avToMPVHandoff = nil
+                avToMPVHandoffBlocked = true
+                loadErrorMsg = "Playback cleanup did not complete. Try another source."
+                presentTerminalLoadFailure()
+                return
             }
+            // The replacement view receives the live tuple before controller creation; only then may MPV own
+            // a new load token and its first-frame watchdog.
+            appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
+            buffering = true; loadFailed = false; loadErrorMsg = ""
+            firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil
+            subtitleLoadingURL = nil
+            srcProbeLoadStart = Date()
+            bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
+            avToMPVHandoff = nil
+            avEngineFailed = true
+            avDemotedAt = Date()
+            if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
+                showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
+            }
+            let mounted = await awaitReplacementMPVMount(for: handoff)
+            guard !Task.isCancelled,
+                  let mpv = mounted?.controller,
+                  mpv.activeLoadToken == mounted?.token else { return }
+            if followedDeadInput {
+                startLoadTimeout(seconds: avPostDemoteStartTimeoutSeconds)
+            } else {
+                startLoadTimeout()
+            }
+            if resume > 5 { nudgeResume(to: resume) }
         }
+    }
+
+    private func awaitReplacementMPVMount(
+        for handoff: AVToMPVHandoff
+    ) async -> (controller: MPVMetalViewController, token: PlayerLoadToken)? {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !Task.isCancelled, ContinuousClock.now < deadline {
+            guard !playbackExited,
+                  avToMPVHandoff == nil,
+                  !avToMPVHandoffBlocked,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url) else { return nil }
+            if let controller = coordinator.player as? MPVMetalViewController,
+               let token = controller.activeLoadToken {
+                return (controller, token)
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        avToMPVHandoffBlocked = true
+        loadErrorMsg = "The replacement player did not start."
+        presentTerminalLoadFailure()
+        return nil
     }
 
     /// User-invoked mid-title engine swap (P3, #76). Generalizes `demoteAVPlayerToMPV` into a bidirectional,
@@ -3915,6 +3979,11 @@ struct PlayerScreen: View {
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
         clearCachedAudioOutputTruth()
+        #if os(iOS) || os(macOS)
+        avToMPVHandoffTask?.cancel()
+        avToMPVHandoff = nil
+        avToMPVHandoffBlocked = false
+        #endif
         deferredResumeAttempt.invalidate()
         currentPickWasExplicit = explicitPick
         currentPlaybackIsResume = false
@@ -7274,6 +7343,7 @@ struct PlayerScreen: View {
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
         #if os(iOS) || os(macOS)
         avStartWatchdog?.cancel()
+        avToMPVHandoffTask?.cancel()
         #endif
         if assetSanityAccepted {
             scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)

@@ -880,7 +880,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // StreamRanking.isDolbyVision signal the router routes on, BEFORE this loadFile (and re-set before a
         // source-switch loadFile), so a genuine DV source under Auto still remuxes; `forceRemux` still covers
         // the DV-only hev1/dvhe post-attach repair regardless of the flag.
-        let wantsDVRemux = forceRemux || (contentIsDolbyVision && PlayerEngineRouter.shouldDVRemux(url: url))
+        let dvRemuxEnabled = PlayerEngineRouter.dvRemuxEnabled(
+            dvDisplayCapable: DVDisplaySupport.isCapable)
+        let wantsDVRemux = dvRemuxEnabled
+            && (forceRemux || (contentIsDolbyVision && PlayerEngineRouter.shouldDVRemux(url: url)))
         forceRemux = false
         // #147 (the remaining item): PLAIN (non-DV) remux lane. A NON-DV MKV can only reach this engine on
         // explicit AVPlayer intent (the "Prefer AVPlayer" override, the in-player engine pick, or the reactive
@@ -893,6 +896,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // path behaves exactly as before #147. Flag-gated via PlayerEngineRouter.plainRemuxEnabled
         // (UserDefaults stremiox.plainRemux > RemoteConfig features.plainRemux > baked ON).
         let wantsPlainRemux = !wantsDVRemux && !contentIsDolbyVision && VortXRemuxHLSServer.deliveryEnabled
+            && PlayerEngineRouter.plainRemuxEnabled()
             && (forcePlainRemux || PlayerEngineRouter.shouldPlainRemux(url: url))
         forcePlainRemux = false
         let wantsRemux = wantsDVRemux || wantsPlainRemux
@@ -2022,6 +2026,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         remuxAudioRejectTerms = nil
         configuredAudioSourceIndex = nil
         hasConfiguredAudioSourceIndex = false
+    }
+
+    /// Retire this AVFoundation route for a same-source mpv fallback. The returned receipt stays valid after
+    /// `stop()` clears the server reference and acknowledges only when any local remux producer has unwound.
+    func stopForMPVFallback() -> VortXRemuxQuiescenceReceipt {
+        let receipt = remuxHLSServer?.quiescenceReceipt()
+            ?? VortXRemuxQuiescenceReceipt(terminal: nil)
+        stop()
+        return receipt
     }
 
     /// Tear down the DV-for-MKV remux session (stop the remux thread + the local HLS server / unblock any

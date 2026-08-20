@@ -134,6 +134,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         stream.buffer.status().failure
     }
 
+    /// Captured before `invalidate()`: terminal acknowledgement means the producer has actually unwound,
+    /// not merely that cancellation was requested.
+    func quiescenceReceipt() -> VortXRemuxQuiescenceReceipt {
+        VortXRemuxQuiescenceReceipt(terminal: producerTerminalRelay)
+    }
+
     /// True only after the remux producer has closed the source and published its terminal index state.
     /// AVPlayer can emit an item-end notification at the current tail of a still-growing playlist, so callers
     /// must use this receipt before translating that notification into content EOF.
@@ -438,6 +444,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     private func producerRequestWasRejected() {
         DiagnosticsLog.log("binge", "prepared-remux phase=rejected reason=arbitration")
+        // A queued request can be rejected before `stream.start()`, so no run-defer exists to publish the
+        // terminal edge. The same idempotent relay is the authoritative quiescence receipt for both paths.
+        producerTerminalRelay.fire()
         invalidate()
     }
 

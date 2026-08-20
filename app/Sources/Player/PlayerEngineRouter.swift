@@ -95,11 +95,13 @@ enum PlayerEngineRouter {
     /// lane, and on a DV-capable display that lane's whole point is true Dolby Vision. Before this, an explicit
     /// AVPlayer pick with the DV-for-MKV toggle Off sent a DV MKV through the PLAIN remux (a container re-wrap
     /// with no RPU handling), so the viewer got AVPlayer and no Dolby Vision, with nothing on screen saying so.
-    /// The toggle keeps governing the AUTO path alone, where it is the user's standing preference; an explicit
-    /// per-session pick outranks it. Non-DV-capable displays are untouched: without a panel that can present
-    /// DV there is nothing to attempt, so they keep tone-mapping exactly as before.
+    /// This is a transport safety switch, so it governs every route including an explicit per-session pick.
+    /// Non-DV-capable displays are untouched: without a panel that can present DV there is nothing to attempt,
+    /// so they keep tone-mapping exactly as before.
     static func dvRemuxEngaged(dvDisplayCapable: Bool, override: Override = currentOverride) -> Bool {
-        if override == .avfoundation, dvDisplayCapable { return true }
+        // The user/fleet remux switch is an absolute transport kill switch. An explicit AVPlayer preference
+        // may still choose a directly playable MP4/HLS route, but it must never resurrect a disabled remux.
+        _ = override
         return dvRemuxEnabled(dvDisplayCapable: dvDisplayCapable)
     }
 
@@ -107,7 +109,7 @@ enum PlayerEngineRouter {
     /// user-visible picture change (true DV vs tone-mapped HDR10), so the log names the value AND what decided
     /// it rather than leaving a reader to re-derive it from the absence of other evidence.
     static func dvRemuxRouteDescription(dvDisplayCapable: Bool, override: Override = currentOverride) -> String {
-        if override == .avfoundation, dvDisplayCapable { return "dvRemux=on(explicit-avplayer)" }
+        _ = override
         let resolution = dvRemuxResolution(dvDisplayCapable: dvDisplayCapable)
         return "dvRemux=\(resolution.enabled ? "on" : "off")(\(resolution.source.rawValue))"
     }
@@ -149,14 +151,27 @@ enum PlayerEngineRouter {
         // iOS only (AVAssetDownloadURLSession is unavailable on tvOS and native macOS), so it never fires there.
         if url.isFileURL, url.pathExtension.lowercased() == "movpkg" { return .avfoundation }
 
-        // (2) Explicit user override wins for non-torrents. NOTE: an `.mpv` override short-circuits BEFORE
+        // (2) Explicit user override wins for non-torrents, subject to the remux kill switches. NOTE: an `.mpv` override short-circuits BEFORE
         // the DV rules below, silently disabling the true-DV remux lane for Dolby Vision streams. This
         // function runs per render, so the guardrail message for that case (DiagnosticsLog + one-shot
         // in-player notice) lives in the chrome at play start (TVPlayerView.onAppear), not here.
         switch override {
-        case .mpv:          return .mpv
-        case .avfoundation: return .avfoundation
-        case .auto:         break
+        case .mpv:
+            return .mpv
+        case .avfoundation:
+            // Raw AVPlayer is allowed only for a container it can serve directly. An MKV reaches it only
+            // through an enabled remux lane; with either local or fleet kill switch off it stays on libmpv.
+            if isAVPlayerContainer(url) || isHLS(url) { return .avfoundation }
+            if isDolbyVision,
+               dvRemuxEnabled(dvDisplayCapable: dvDisplayCapable),
+               isDVRemuxCandidate(url) { return .avfoundation }
+            if !isDolbyVision,
+               plainRemuxDelivery,
+               plainRemuxEnabled(),
+               isPlainRemuxCandidate(url) { return .avfoundation }
+            return .mpv
+        case .auto:
+            break
         }
 
         // (3) Dolby Vision -> AVPlayer for true DV passthrough (libmpv/MoltenVK only tone-maps DV to SDR),
@@ -342,9 +357,8 @@ enum PlayerEngineRouter {
     /// `dvDisplayCapable` defaults to the live `DVDisplaySupport` read so the caller need not pass it; the same
     /// value the router used at play-start routing time.
     ///
-    /// Gated on `dvRemuxEngaged`, not `dvRemuxEnabled`: an EXPLICIT "Prefer AVPlayer" pick engages the lane on a
-    /// DV-capable display whatever the toggle says (see `dvRemuxEngaged`), so forcing AVPlayer by hand attempts
-    /// true Dolby Vision instead of quietly landing on the plain container re-wrap.
+    /// Gated on `dvRemuxEngaged`: the explicit AVPlayer pick may select a directly playable native container,
+    /// but cannot revive a remux route disabled by the local or fleet transport switch.
     @MainActor
     static func shouldDVRemux(url: URL, dvDisplayCapable: Bool) -> Bool {
         dvRemuxEngaged(dvDisplayCapable: dvDisplayCapable) && isDVRemuxCandidate(url)
