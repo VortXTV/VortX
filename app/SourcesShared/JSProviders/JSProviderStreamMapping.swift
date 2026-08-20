@@ -38,7 +38,7 @@ enum JSProviderStreamMapping {
     /// (M1 targets direct/HLS providers, per design 6.1).
     static func coreStream(from dict: [String: Any], providerID: String, providerName: String) -> CoreStream? {
         guard let url = (dict["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !url.isEmpty, url.count <= 2_048, let parsedURL = URL(string: url),
+              !url.isEmpty, url.utf8.count <= 16 * 1024, let parsedURL = URL(string: url),
               JSProviderURLPolicy.default.isAllowed(parsedURL) else { return nil }
 
         let quality = (dict["quality"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -80,9 +80,12 @@ enum JSProviderStreamMapping {
     private static func stringHeaders(_ raw: Any?) -> [String: String]? {
         guard let dict = raw as? [String: Any] else { return nil }
         var out: [String: String] = [:]
-        for (k, v) in dict.prefix(32) {
-            guard k.count <= 128, !k.contains("\r"), !k.contains("\n") else { continue }
-            if let s = v as? String, s.count <= 2_048, !s.contains("\r"), !s.contains("\n") { out[k] = s }
+        var total = 0
+        let denied: Set<String> = ["host", "content-length", "transfer-encoding", "connection", "upgrade", "proxy-connection", "keep-alive", "te", "trailer"]
+        for (k, v) in dict.prefix(24) {
+            let token = k.unicodeScalars.allSatisfy { ($0.value >= 33 && $0.value <= 126) && !"()<>@,;:\\\"/[]?={} \t".unicodeScalars.contains($0) }
+            guard token, !denied.contains(k.lowercased()) else { continue }
+            if let s = v as? String, s.utf8.count <= 8 * 1024, !s.contains("\r"), !s.contains("\n") { total += k.utf8.count + s.utf8.count; guard total <= 16 * 1024 else { break }; out[k] = s }
             else if let n = v as? NSNumber { out[k] = n.stringValue }
         }
         return out.isEmpty ? nil : out

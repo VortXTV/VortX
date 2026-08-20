@@ -35,8 +35,10 @@ struct JSProviderURLPolicy: Sendable {
         guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
         if deniedHosts.contains(host) { return false }
         if host == "localhost" || host.hasSuffix(".localhost") || host.hasSuffix(".local") { return false }
-        // Bracketed / bare IPv6 loopback.
-        if host == "::1" || host == "[::1]" { return false }
+        let normalizedIPv6 = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        // IPv6 loopback, unspecified, unique-local, and link-local literals.
+        if normalizedIPv6 == "::" || normalizedIPv6 == "::1" || normalizedIPv6.hasPrefix("fc") ||
+            normalizedIPv6.hasPrefix("fd") || ["fe8", "fe9", "fea", "feb"].contains(where: { normalizedIPv6.hasPrefix($0) }) { return false }
         if Self.isBlockedIPv4(host) { return false }
         return true
     }

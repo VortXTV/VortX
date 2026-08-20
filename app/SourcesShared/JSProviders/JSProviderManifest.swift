@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// The community provider registry format: a remote `manifest.json` listing one or more bundled provider
 /// `.js` files. VortX ships NO curated or bundled provider list; the user pastes their OWN manifest URL and
@@ -21,6 +22,7 @@ struct JSProviderManifest: Decodable, Equatable {
         let version: String?
         let supportedTypes: [String]?
         let filename: String
+        let sha256: String
         let enabled: Bool?
         let hasSettings: Bool?
         let contentLanguage: [String]?
@@ -51,7 +53,8 @@ struct JSProviderManifest: Decodable, Equatable {
             let typesAreSafe = !types.isEmpty && types.allSatisfy {
                 ["movie", "tv"].contains($0.lowercased())
             }
-            return idIsSafe && filenameIsSafe && typesAreSafe
+            let digestIsSafe = sha256.range(of: "^[A-Fa-f0-9]{64}$", options: .regularExpression) != nil
+            return idIsSafe && filenameIsSafe && typesAreSafe && digestIsSafe
         }
     }
 }
@@ -65,6 +68,7 @@ struct JSInstalledProvider: Equatable, Identifiable {
     let supportedTypes: [String]
     let hasSettings: Bool
     let code: String
+    let codeDigest: String
 
     func supports(mediaType: String) -> Bool {
         supportedTypes.map { $0.lowercased() }.contains(mediaType.lowercased())
@@ -84,6 +88,7 @@ enum JSProviderManifestLoader {
         case invalidEntries
         case providerFetchFailed(id: String, status: Int)
         case providerTooLarge(id: String)
+        case providerDigestMismatch(id: String)
     }
 
     private static let maximumManifestBytes = 256 * 1024
@@ -125,7 +130,7 @@ enum JSProviderManifestLoader {
     static func manifestURL(from raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let url = URL(string: trimmed),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              url.scheme?.lowercased() == "https",
               url.user == nil, url.password == nil,
               JSProviderURLPolicy.default.isAllowed(url) else { return nil }
         if url.lastPathComponent.lowercased() == "manifest.json" { return url }
@@ -173,7 +178,7 @@ enum JSProviderManifestLoader {
     }
 
     /// Fetch one provider's pre-built JS text.
-    static func fetchProviderCode(for entry: JSProviderManifest.Entry, manifestURL: URL) async -> Result<String, LoadError> {
+    static func fetchProviderCode(for entry: JSProviderManifest.Entry, manifestURL: URL) async -> Result<(code: String, digest: String), LoadError> {
         guard let url = providerURL(for: entry, manifestURL: manifestURL),
               await JSProviderURLPolicy.default.isAllowedResolved(url) else {
             return .failure(.providerFetchFailed(id: entry.id, status: 0))
@@ -193,7 +198,11 @@ enum JSProviderManifestLoader {
         guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
             return .failure(.providerFetchFailed(id: entry.id, status: code))
         }
-        return .success(text)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        guard digest.caseInsensitiveCompare(entry.sha256) == .orderedSame else {
+            return .failure(.providerDigestMismatch(id: entry.id))
+        }
+        return .success((text, digest))
     }
 
     /// Fetch the manifest and every enabled provider's code, returning the installable set. Failed providers are
@@ -206,14 +215,15 @@ enum JSProviderManifestLoader {
         }
         var installed: [JSInstalledProvider] = []
         for entry in manifest.scrapers where entry.isEnabled {
-            if case let .success(code) = await fetchProviderCode(for: entry, manifestURL: manifestURL) {
+            if case let .success((code, digest)) = await fetchProviderCode(for: entry, manifestURL: manifestURL) {
                 installed.append(JSInstalledProvider(
                     id: entry.id,
                     name: entry.displayName,
                     version: entry.version,
                     supportedTypes: entry.supportedTypes ?? ["movie", "tv"],
                     hasSettings: entry.supportsSettings,
-                    code: code
+                    code: code,
+                    codeDigest: digest
                 ))
             }
         }

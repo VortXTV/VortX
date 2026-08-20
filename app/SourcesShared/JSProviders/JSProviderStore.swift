@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// The install + enablement state for community JS providers, and the master gate.
 ///
@@ -135,7 +136,7 @@ final class JSProviderStore: ObservableObject {
 
     private struct CachedIndexEntry: Codable {
         let id: String; let name: String; let version: String?
-        let supportedTypes: [String]; let hasSettings: Bool; let file: String
+        let supportedTypes: [String]; let hasSettings: Bool; let file: String; let codeDigest: String
     }
 
     @discardableResult
@@ -150,7 +151,7 @@ final class JSProviderStore: ObservableObject {
             guard let data = p.code.data(using: .utf8),
                   (try? data.write(to: url, options: .atomic)) != nil else { return false }
             index.append(CachedIndexEntry(id: p.id, name: p.name, version: p.version,
-                                          supportedTypes: p.supportedTypes, hasSettings: p.hasSettings, file: file))
+                                          supportedTypes: p.supportedTypes, hasSettings: p.hasSettings, file: file, codeDigest: p.codeDigest))
         }
         guard let data = try? JSONEncoder().encode(index),
               (try? data.write(to: dir.appendingPathComponent("index.json"), options: .atomic)) != nil else { return false }
@@ -166,12 +167,20 @@ final class JSProviderStore: ObservableObject {
     private static func loadCachedProviders() -> [JSInstalledProvider] {
         guard let dir = cacheDirectory(),
               let data = try? Data(contentsOf: dir.appendingPathComponent("index.json")),
-              let index = try? JSONDecoder().decode([CachedIndexEntry].self, from: data) else { return [] }
+              let index = try? JSONDecoder().decode([CachedIndexEntry].self, from: data),
+              index.count <= JSProviderManifest.maximumEntries else { return [] }
         return index.compactMap { entry in
-            guard let code = try? String(contentsOf: dir.appendingPathComponent(entry.file), encoding: .utf8),
-                  !code.isEmpty else { return nil }
+            let fileURL = dir.appendingPathComponent(entry.file).standardizedFileURL
+            guard entry.id.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", options: .regularExpression) != nil,
+                  entry.file.range(of: "^[A-Za-z0-9._-]+\\.js$", options: .regularExpression) != nil,
+                  fileURL.deletingLastPathComponent() == dir.standardizedFileURL,
+                  let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true,
+                  let code = try? String(contentsOf: fileURL, encoding: .utf8), code.utf8.count <= 2 * 1024 * 1024,
+                  !code.isEmpty,
+                  SHA256.hash(data: Data(code.utf8)).map({ String(format: "%02x", $0) }).joined().caseInsensitiveCompare(entry.codeDigest) == .orderedSame else { return nil }
             return JSInstalledProvider(id: entry.id, name: entry.name, version: entry.version,
-                                       supportedTypes: entry.supportedTypes, hasSettings: entry.hasSettings, code: code)
+                                       supportedTypes: entry.supportedTypes, hasSettings: entry.hasSettings, code: code, codeDigest: entry.codeDigest)
         }
     }
 
@@ -201,6 +210,7 @@ final class JSProviderStore: ObservableObject {
         case .invalidEntries: return "That manifest contains unsupported provider entries."
         case let .providerFetchFailed(id, status): return "Failed to fetch provider \(id) (HTTP \(status))."
         case let .providerTooLarge(id): return "Provider \(id) is too large."
+        case let .providerDigestMismatch(id): return "Provider \(id) did not match its manifest digest."
         }
     }
 }

@@ -219,6 +219,7 @@ targets:
         codeSign: true
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
         CURRENT_PROJECT_VERSION: "220"
@@ -326,6 +327,7 @@ targets:
         embed: false
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         # VortxEngine module discovery. The vortx-ffi xcframework nests its header + module.modulemap
@@ -445,6 +447,7 @@ targets:
         basedOnDependencyAnalysis: false
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
@@ -560,6 +563,7 @@ targets:
         embed: true
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         # VortxEngine module discovery, same as VortXiOSNative: the xcframework nests its header +

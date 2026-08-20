@@ -1,13 +1,13 @@
 // VortX community JS provider runtime preamble.
 //
-// This file is the host-API shim that a bare JavaScriptCore context does NOT provide. The native
-// runtime (JSProviderRuntime.swift) creates a FRESH JSContext per provider call, injects a small set
+// This file is the host-API shim that the native interpreter does not provide. The native
+// runtime creates a fresh bounded interpreter per provider call, injects a small set
 // of native primitives (all names prefixed `__vortx_native_*`), captures the two bundled libraries as
 // `globalThis.__vortx_cryptojs` / `globalThis.__vortx_cheerio`, evaluates THIS file, then calls
 // `__vortx_run(...)`. Everything a compatible community provider expects (fetch, axios, a gated require that
 // only yields cheerio + crypto-js, console, timers, JSON/Date/Math, encode/decodeURIComponent, URL /
 // URLSearchParams, atob/btoa, TextEncoder/TextDecoder, module/exports/global + a window alias,
-// globalThis.SCRAPER_SETTINGS / SCRAPER_ID, and an injected TMDB_API_KEY) is assembled HERE, on top of
+// globalThis.SCRAPER_SETTINGS / SCRAPER_ID) is assembled HERE, on top of
 // those primitives, so the provider contract is a strict superset of the community host contract and
 // unmodified providers load.
 //
@@ -367,7 +367,7 @@
   // scope with the sandbox destructured into locals, and locate `getStreams` the same three ways.
   // Runs whatever the provider returns (sync or Promise) and pipes the settled result back to the
   // native completion primitives, JSON-serialized. This is the strict-superset entry point.
-  G.__vortx_run = function (code, paramsJSON, settingsJSON, scraperId, tmdbKey) {
+  G.__vortx_run = function (code, paramsJSON, settingsJSON, scraperId) {
     try {
       var params = JSON.parse(paramsJSON || '{}');
       var settings = {};
@@ -394,13 +394,11 @@
         URL_VALIDATION_ENABLED: (typeof G.URL_VALIDATION_ENABLED === 'boolean') ? G.URL_VALIDATION_ENABLED : true,
       };
 
-      var runner = new Function('sandbox', 'params', 'PRIMARY_KEY', 'TMDB_API_KEY', [
+      var runner = new Function('sandbox', 'params', [
         "const { console, setTimeout, clearTimeout, setInterval, clearInterval, Promise, JSON, Date, Math,",
         "        parseInt, parseFloat, isNaN, isFinite, encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,",
         "        require, axios, fetch, URL, URLSearchParams, atob, btoa, TextEncoder, TextDecoder,",
         "        module, exports, global, URL_VALIDATION_ENABLED } = sandbox;",
-        "global.PRIMARY_KEY = PRIMARY_KEY; global.TMDB_API_KEY = TMDB_API_KEY;",
-        "if (typeof window !== 'undefined') { window.PRIMARY_KEY = PRIMARY_KEY; window.TMDB_API_KEY = TMDB_API_KEY; }",
         code,
         "if (typeof getStreams === 'function') {",
         "  return getStreams(params.tmdbId, params.mediaType, params.season, params.episode);",
@@ -411,8 +409,7 @@
         "} else { throw new Error('No getStreams function found in scraper'); }",
       ].join('\n'));
 
-      var result = runner(sandbox, params, (typeof G.PRIMARY_KEY === 'string' ? G.PRIMARY_KEY : ''),
-        (typeof tmdbKey === 'string' && tmdbKey) ? tmdbKey : (typeof G.TMDB_API_KEY === 'string' ? G.TMDB_API_KEY : ''));
+      var result = runner(sandbox, params);
 
       Promise.resolve(result).then(function (streams) {
         var arr = Array.isArray(streams) ? streams : [];

@@ -60,8 +60,7 @@ final class JSProviderSource: ObservableObject {
         runProvider: @escaping RunProvider = { provider, tmdbId, mediaType, season, episode, settingsJSON in
             let invocation = JSProviderRuntime.Invocation(
                 providerID: provider.id, code: provider.code, tmdbId: tmdbId, mediaType: mediaType,
-                season: season, episode: episode, settingsJSON: settingsJSON,
-                tmdbKey: ApiKeys.effectiveTMDBKey()
+                season: season, episode: episode, settingsJSON: settingsJSON
             )
             let result = await JSProviderRuntime.shared.getStreams(invocation)
             if case let .success(streams) = result { return streams }
@@ -151,7 +150,7 @@ final class JSProviderSource: ObservableObject {
             }
 
             // Run each applicable provider in turn; each is independently fail-soft, and each runs off-main in
-            // its own disposable JavaScriptCore VM (the await suspends here and resumes on the main actor).
+            // its own disposable bounded interpreter (the await suspends here and resumes on the main actor).
             // Sequential keeps at most one provider VM alive at a time on the device.
             var built: [CoreStreamSourceGroup] = []
             for provider in providers where provider.supports(mediaType: mediaType) {
@@ -167,6 +166,9 @@ final class JSProviderSource: ObservableObject {
                 completedKey: fetchKey, shownKey: self.shownKey, inFlightKey: self.inFlightKey,
                 canceled: Task.isCancelled
             ) else { return }
+            // The rollout can be withdrawn while a bounded interpreter is running. Recheck immediately before
+            // publication and discard both result and session cache when it is no longer effective.
+            guard self.gate() else { self.clearResults(); return }
             self.inFlightKey = nil
             self.task = nil
             self.cache[fetchKey] = built

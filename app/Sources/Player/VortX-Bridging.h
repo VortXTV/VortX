@@ -1,4 +1,5 @@
 #import <AVFoundation/AVFoundation.h>
+#import "../../SourcesShared/JSProviders/QuickJS/VortXQuickJSBridge.h"
 
 // macOS 26 (Tahoe) SwiftUI toolbar-crash guard. Swallows the NSException thrown by
 // NSToolbar's private -_insertNewItemWithItemIdentifier:... under SwiftUI's
