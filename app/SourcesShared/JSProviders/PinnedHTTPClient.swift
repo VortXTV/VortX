@@ -2,19 +2,15 @@ import Foundation
 import Network
 import Security
 
-/// A deliberately small HTTPS/HTTP1.1 transport for untrusted community add-on traffic. It resolves a host
-/// exactly once, rejects a mixed or non-public answer set, then gives Network.framework a numeric peer while
-/// retaining the original hostname for both TLS SNI and HTTP Host. No URLSession is involved, so it cannot
-/// perform a second resolver lookup after this policy decision.
+/// A small HTTPS/HTTP1.1 transport for untrusted community add-on traffic. Resolution happens once,
+/// then each vetted numeric peer is attempted without allowing Network.framework to resolve the hostname again.
 enum PinnedHTTPClient {
     struct Limits: Sendable, Equatable {
         var maximumHeaderBytes = 32 * 1024
         var maximumBodyBytes = 16 * 1024 * 1024
         var maximumWireBytes = 17 * 1024 * 1024
-        /// Retained control-plane responses stay small; forwarded media has a separate hard ceiling so a
-        /// malicious origin cannot hold a route forever while normal feature-length streams still work.
-        var maximumStreamBytes = 8 * 1024 * 1024 * 1024
         var timeout: TimeInterval = 20
+        var idleTimeout: TimeInterval = 10
     }
 
     struct Endpoint: Equatable, Sendable {
@@ -44,30 +40,19 @@ enum PinnedHTTPClient {
         let body: Data
     }
 
-    /// The portion of a response that is safe to retain while a potentially very large body is forwarded.
-    /// Streaming callers must never need to accumulate the media body just to inspect status or ranges.
     struct ResponseHead: Sendable, Equatable {
         let statusCode: Int
         let headers: [String: String]
     }
 
     enum Failure: Error, Equatable {
-        case invalidURL
-        case unsafeResolution
-        case unsupportedMethod
-        case unsafeHeader
-        case requestTooLarge
-        case malformedResponse
-        case responseTooLarge
-        case redirect(Int)
-        case timedOut
-        case cancelled
-        case connectionFailed
+        case invalidURL, unsafeResolution, unsupportedMethod, unsafeHeader, requestTooLarge
+        case malformedResponse, responseTooLarge, redirect(Int), timedOut, cancelled, connectionFailed
     }
 
     typealias Resolver = @Sendable (_ host: String) throws -> [String]
 
-    static func endpoint(for url: URL, answers: [String]) throws -> Endpoint {
+    static func endpoints(for url: URL, answers: [String]) throws -> [Endpoint] {
         guard url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty,
               !answers.isEmpty, answers.allSatisfy(JSProviderURLPolicy.isPublicNumericAddress) else {
             throw Failure.unsafeResolution
@@ -76,7 +61,15 @@ enum PinnedHTTPClient {
         guard explicitPort == nil || (1...65_535).contains(explicitPort!) else { throw Failure.invalidURL }
         let port = UInt16(explicitPort ?? 443)
         let hostHeader = explicitPort == nil || explicitPort == 443 ? host : "\(host):\(port)"
-        return Endpoint(address: answers.sorted()[0], port: port, tlsServerName: host, hostHeader: hostHeader)
+        return Array(Set(answers)).sorted().map {
+            Endpoint(address: $0, port: port, tlsServerName: host, hostHeader: hostHeader)
+        }
+    }
+
+    /// Kept for focused callers that need a stable representative endpoint. Network operations use `endpoints`.
+    static func endpoint(for url: URL, answers: [String]) throws -> Endpoint {
+        guard let endpoint = try endpoints(for: url, answers: answers).first else { throw Failure.unsafeResolution }
+        return endpoint
     }
 
     static let systemResolver: Resolver = { host in
@@ -84,8 +77,6 @@ enum PinnedHTTPClient {
         return addresses
     }
 
-    /// Constructs the exact bytes written after a pinned TLS connection is ready. Percent-encoded path and
-    /// query bytes retain their original ordering; neither URLComponents nor a dictionary reconstructs them.
     static func requestBytes(for request: Request, endpoint: Endpoint, limits: Limits = .init()) throws -> Data {
         guard request.method == "GET" || request.method == "HEAD" else { throw Failure.unsupportedMethod }
         let forbidden = Set(["host", "content-length", "transfer-encoding", "connection", "upgrade", "proxy-connection"])
@@ -106,42 +97,39 @@ enum PinnedHTTPClient {
 
     static func execute(_ request: Request, limits: Limits = .init(), resolver: @escaping Resolver = PinnedHTTPClient.systemResolver) async throws -> Response {
         try Task.checkCancellation()
-        guard request.url.scheme?.lowercased() == "https", JSProviderURLPolicy.default.isAllowed(request.url), let host = request.url.host else {
-            throw Failure.invalidURL
-        }
-        let endpoint = try endpoint(for: request.url, answers: resolver(host))
-        let bytes = try requestBytes(for: request, endpoint: endpoint, limits: limits)
+        let (peers, bytes) = try prepare(request, limits: limits, resolver: resolver)
         return try await withTimeout(limits.timeout) {
-            try await exchange(bytes: bytes, endpoint: endpoint, limits: limits)
+            try await firstSuccessful(peers) { endpoint in
+                try await exchange(bytes: bytes, endpoint: endpoint, limits: limits, method: request.method)
+            }
         }
     }
 
-    /// Opens one exact-peer HTTPS connection and forwards body bytes only after the consumer has accepted
-    /// the response head. The next upstream receive is not scheduled until `onBody` returns, providing
-    /// natural backpressure all the way to the loopback client.
-    static func stream(
-        _ request: Request,
-        limits: Limits = .init(),
-        resolver: @escaping Resolver = PinnedHTTPClient.systemResolver,
-        onHead: @escaping @Sendable (ResponseHead) async throws -> Void,
-        onBody: @escaping @Sendable (Data) async throws -> Void
-    ) async throws {
+    /// Peers are retried only before a response head reaches the consumer: retrying after a head would create
+    /// two downstream HTTP responses for one client request.
+    static func stream(_ request: Request, limits: Limits = .init(), resolver: @escaping Resolver = PinnedHTTPClient.systemResolver,
+                       onHead: @escaping @Sendable (ResponseHead) async throws -> Void,
+                       onBody: @escaping @Sendable (Data) async throws -> Void) async throws {
         try Task.checkCancellation()
-        guard request.url.scheme?.lowercased() == "https", JSProviderURLPolicy.default.isAllowed(request.url), let host = request.url.host else {
-            throw Failure.invalidURL
+        let (peers, bytes) = try prepare(request, limits: limits, resolver: resolver)
+        try await withTimeout(limits.timeout) {
+            var lastFailure: Error = Failure.connectionFailed
+            for endpoint in peers {
+                try Task.checkCancellation()
+                let operation = StreamingConnection(connection: makeConnection(endpoint), request: bytes, method: request.method,
+                                                   limits: limits, onHead: onHead, onBody: onBody)
+                do { try await operation.run(); return }
+                catch {
+                    if operation.didDeliverHead { throw error }
+                    lastFailure = error
+                }
+            }
+            throw lastFailure
         }
-        let endpoint = try endpoint(for: request.url, answers: resolver(host))
-        let bytes = try requestBytes(for: request, endpoint: endpoint, limits: limits)
-        let tls = NWProtocolTLS.Options()
-        sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, endpoint.tlsServerName)
-        sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
-        let parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
-        parameters.prohibitExpensivePaths = false
-        let connection = NWConnection(host: NWEndpoint.Host(endpoint.address), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: parameters)
-        try await StreamingConnection(connection: connection, request: bytes, limits: limits, onHead: onHead, onBody: onBody).run()
     }
 
     static func withTimeout<T: Sendable>(_ timeout: TimeInterval, operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        guard timeout > 0, timeout.isFinite else { throw Failure.timedOut }
         do {
             return try await withThrowingTaskGroup(of: T.self) { group in
                 group.addTask { try await operation() }
@@ -159,52 +147,38 @@ enum PinnedHTTPClient {
         }
     }
 
-    private static func exchange(bytes: Data, endpoint: Endpoint, limits: Limits) async throws -> Response {
-        let tls = NWProtocolTLS.Options()
-        sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, endpoint.tlsServerName)
-        sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
-        let parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
-        parameters.prohibitExpensivePaths = false
-        let port = NWEndpoint.Port(rawValue: endpoint.port)!
-        let connection = NWConnection(host: NWEndpoint.Host(endpoint.address), port: port, using: parameters)
-        return try await ConnectionOperation(connection: connection, request: bytes, limits: limits).run()
+    static func firstSuccessful<T: Sendable>(_ endpoints: [Endpoint], attempt: @escaping @Sendable (Endpoint) async throws -> T) async throws -> T {
+        var lastFailure: Error = Failure.connectionFailed
+        for endpoint in endpoints {
+            try Task.checkCancellation()
+            do { return try await attempt(endpoint) }
+            catch is CancellationError { throw Failure.cancelled }
+            catch { lastFailure = error }
+        }
+        throw lastFailure
     }
 
-    static func decodeResponse(_ wire: Data, limits: Limits) throws -> Response? {
+    static func decodeResponse(_ wire: Data, limits: Limits, method: String = "GET", isComplete: Bool = false) throws -> Response? {
         guard wire.count <= limits.maximumWireBytes else { throw Failure.responseTooLarge }
-        guard let separator = wire.range(of: Data("\r\n\r\n".utf8)) else {
-            if wire.count > limits.maximumHeaderBytes { throw Failure.responseTooLarge }
-            return nil
+        guard let parsed = try decodeHead(wire, limits: limits) else { return nil }
+        switch try bodyFraming(method: method, head: parsed.head) {
+        case .none:
+            return Response(statusCode: parsed.head.statusCode, headers: parsed.head.headers, body: Data())
+        case .chunked:
+            guard let decoded = try decodeChunked(parsed.body, limit: limits.maximumBodyBytes) else { return nil }
+            return Response(statusCode: parsed.head.statusCode, headers: parsed.head.headers, body: decoded)
+        case let .contentLength(expected):
+            guard expected <= limits.maximumBodyBytes else { throw Failure.responseTooLarge }
+            guard parsed.body.count >= expected else { return nil }
+            return Response(statusCode: parsed.head.statusCode, headers: parsed.head.headers, body: Data(parsed.body.prefix(expected)))
+        case .closeDelimited:
+            guard isComplete else { return nil }
+            guard parsed.body.count <= limits.maximumBodyBytes else { throw Failure.responseTooLarge }
+            return Response(statusCode: parsed.head.statusCode, headers: parsed.head.headers, body: parsed.body)
         }
-        guard separator.lowerBound <= limits.maximumHeaderBytes,
-              let headerText = String(data: wire[..<separator.lowerBound], encoding: .utf8) else { throw Failure.malformedResponse }
-        let lines = headerText.components(separatedBy: "\r\n")
-        guard let status = lines.first?.split(separator: " "), status.count >= 2, let code = Int(status[1]), (100...599).contains(code) else {
-            throw Failure.malformedResponse
-        }
-        var headers: [String: String] = [:]
-        for line in lines.dropFirst() {
-            guard let colon = line.firstIndex(of: ":") else { throw Failure.malformedResponse }
-            let key = String(line[..<colon]).lowercased()
-            guard isHTTPToken(key) else { throw Failure.malformedResponse }
-            headers[key] = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-        }
-        let body = Data(wire[separator.upperBound...])
-        if headers["transfer-encoding"]?.lowercased() == "chunked" {
-            guard let decoded = try decodeChunked(body, limit: limits.maximumBodyBytes) else { return nil }
-            return Response(statusCode: code, headers: headers, body: decoded)
-        }
-        if let value = headers["content-length"] {
-            guard let expected = Int(value), expected >= 0 else { throw Failure.malformedResponse }
-            if expected > limits.maximumBodyBytes { throw Failure.responseTooLarge }
-            guard body.count >= expected else { return nil }
-            return Response(statusCode: code, headers: headers, body: Data(body.prefix(expected)))
-        }
-        guard body.count <= limits.maximumBodyBytes else { throw Failure.responseTooLarge }
-        return Response(statusCode: code, headers: headers, body: body)
     }
 
-    fileprivate static func decodeHead(_ wire: Data, limits: Limits) throws -> (head: ResponseHead, body: Data)? {
+    static func decodeHead(_ wire: Data, limits: Limits) throws -> (head: ResponseHead, body: Data)? {
         guard wire.count <= limits.maximumWireBytes else { throw Failure.responseTooLarge }
         guard let separator = wire.range(of: Data("\r\n\r\n".utf8)) else {
             if wire.count > limits.maximumHeaderBytes { throw Failure.responseTooLarge }
@@ -219,29 +193,35 @@ enum PinnedHTTPClient {
         for line in lines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { throw Failure.malformedResponse }
             let key = String(line[..<colon]).lowercased()
-            guard isHTTPToken(key) else { throw Failure.malformedResponse }
             let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-            guard !value.contains("\r"), !value.contains("\n") else { throw Failure.malformedResponse }
-            if headers[key] != nil { throw Failure.malformedResponse }
+            guard isHTTPToken(key), !value.contains("\r"), !value.contains("\n"), headers[key] == nil else {
+                throw Failure.malformedResponse
+            }
             headers[key] = value
         }
         return (ResponseHead(statusCode: code, headers: headers), Data(wire[separator.upperBound...]))
     }
 
-    private static func decodeChunked(_ body: Data, limit: Int) throws -> Data? {
-        var cursor = body.startIndex
-        var output = Data()
-        while true {
-            guard let lineEnd = body.range(of: Data("\r\n".utf8), options: [], in: cursor..<body.endIndex),
-                  let text = String(data: body[cursor..<lineEnd.lowerBound], encoding: .ascii),
-                  let size = Int(text.split(separator: ";", maxSplits: 1)[0], radix: 16), size >= 0 else { return nil }
-            cursor = lineEnd.upperBound
-            guard body.distance(from: cursor, to: body.endIndex) >= size + 2 else { return nil }
-            if size == 0 { return output }
-            guard output.count + size <= limit else { throw Failure.responseTooLarge }
-            output.append(body[cursor..<body.index(cursor, offsetBy: size)])
-            cursor = body.index(cursor, offsetBy: size + 2)
+    static func bodyFraming(method: String, head: ResponseHead) throws -> BodyFraming {
+        if method.uppercased() == "HEAD" || (100...199).contains(head.statusCode) || head.statusCode == 204 || head.statusCode == 304 { return .none }
+        let transferEncoding = try parseTransferEncoding(head.headers["transfer-encoding"])
+        if transferEncoding != nil, head.headers["content-length"] != nil { throw Failure.malformedResponse }
+        if transferEncoding != nil { return .chunked }
+        if let value = head.headers["content-length"] {
+            guard !value.isEmpty, value.unicodeScalars.allSatisfy({ (48...57).contains($0.value) }), let length = Int(value) else {
+                throw Failure.malformedResponse
+            }
+            return .contentLength(length)
         }
+        return .closeDelimited
+    }
+
+    static func parseTransferEncoding(_ value: String?) throws -> Bool? {
+        guard let value else { return nil }
+        let tokens = value.split(separator: ",", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard !tokens.isEmpty, tokens.allSatisfy({ isHTTPToken($0) }) else { throw Failure.malformedResponse }
+        guard tokens.count == 1, tokens[0].caseInsensitiveCompare("chunked") == .orderedSame else { throw Failure.malformedResponse }
+        return true
     }
 
     static func isHTTPToken(_ value: String) -> Bool {
@@ -251,38 +231,198 @@ enum PinnedHTTPClient {
                 (65...90).contains(scalar.value) || (94...122).contains(scalar.value) || scalar.value == 124 || scalar.value == 126
         }
     }
+
+    private static func prepare(_ request: Request, limits: Limits, resolver: Resolver) throws -> ([Endpoint], Data) {
+        guard request.url.scheme?.lowercased() == "https", JSProviderURLPolicy.default.isAllowed(request.url), let host = request.url.host else {
+            throw Failure.invalidURL
+        }
+        let peers = try endpoints(for: request.url, answers: resolver(host))
+        return (peers, try requestBytes(for: request, endpoint: peers[0], limits: limits))
+    }
+
+    private static func exchange(bytes: Data, endpoint: Endpoint, limits: Limits, method: String) async throws -> Response {
+        try await ConnectionOperation(connection: makeConnection(endpoint), request: bytes, method: method, limits: limits).run()
+    }
+
+    private static func makeConnection(_ endpoint: Endpoint) -> NWConnection {
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, endpoint.tlsServerName)
+        sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
+        let parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        parameters.prohibitExpensivePaths = false
+        return NWConnection(host: NWEndpoint.Host(endpoint.address), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: parameters)
+    }
+
+    private static func decodeChunked(_ body: Data, limit: Int) throws -> Data? {
+        var chunkLimits = Limits()
+        chunkLimits.maximumBodyBytes = limit
+        var framer = StreamFramer(method: "GET", limits: chunkLimits)
+        var output = Data()
+        for event in try framer.consume(Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".utf8) + body, endOfStream: false) {
+            if case let .body(bytes) = event {
+                guard output.count <= limit - bytes.count else { throw Failure.responseTooLarge }
+                output.append(bytes)
+            }
+        }
+        return framer.isComplete ? output : nil
+    }
+
+    enum BodyFraming: Sendable, Equatable { case none, contentLength(Int), chunked, closeDelimited }
+}
+
+/// Incremental framing emits every available chunk prefix immediately; it never buffers a declared chunk body.
+struct StreamFramer: Sendable {
+    enum Event: Sendable, Equatable { case head(PinnedHTTPClient.ResponseHead), body(Data), complete }
+
+    private let method: String
+    private let limits: PinnedHTTPClient.Limits
+    private var head: PinnedHTTPClient.ResponseHead?
+    private var framing: PinnedHTTPClient.BodyFraming?
+    private var pending = Data()
+    private var contentRemaining: Int?
+    private var chunkRemaining: Int?
+    private var awaitingChunkTerminator = false
+    private var readingTrailers = false
+    private(set) var isComplete = false
+
+    init(method: String, limits: PinnedHTTPClient.Limits) { self.method = method; self.limits = limits }
+    var bufferedByteCount: Int { pending.count }
+
+    mutating func consume(_ bytes: Data, endOfStream: Bool) throws -> [Event] {
+        guard !isComplete else { return [] }
+        pending.append(bytes)
+        var events: [Event] = []
+        if head == nil {
+            guard let parsed = try PinnedHTTPClient.decodeHead(pending, limits: limits) else {
+                if endOfStream { throw PinnedHTTPClient.Failure.malformedResponse }
+                return events
+            }
+            head = parsed.head; pending = parsed.body
+            framing = try PinnedHTTPClient.bodyFraming(method: method, head: parsed.head)
+            events.append(.head(parsed.head))
+            if framing == PinnedHTTPClient.BodyFraming.none { return complete(events) }
+        }
+        guard let framing else { return events }
+        switch framing {
+        case let .contentLength(length):
+            if contentRemaining == nil { contentRemaining = length }
+            if let remaining = contentRemaining, !pending.isEmpty {
+                let count = min(remaining, pending.count)
+                if count > 0 { events.append(.body(Data(pending.prefix(count)))); pending.removeFirst(count); contentRemaining = remaining - count }
+            }
+            if contentRemaining == 0 { return complete(events) }
+        case .chunked:
+            try consumeChunked(into: &events)
+            if isComplete { return events }
+        case .closeDelimited:
+            if !pending.isEmpty { events.append(.body(pending)); pending.removeAll(keepingCapacity: false) }
+            if endOfStream { return complete(events) }
+        case .none:
+            return complete(events)
+        }
+        if endOfStream { throw PinnedHTTPClient.Failure.malformedResponse }
+        return events
+    }
+
+    private mutating func consumeChunked(into events: inout [Event]) throws {
+        while true {
+            if readingTrailers {
+                guard let trailerEnd = trailerEnd() else {
+                    guard pending.count <= limits.maximumHeaderBytes else { throw PinnedHTTPClient.Failure.responseTooLarge }
+                    return
+                }
+                try validateTrailers(Data(pending.prefix(trailerEnd)))
+                pending.removeFirst(trailerEnd)
+                isComplete = true
+                pending.removeAll(keepingCapacity: false)
+                events.append(.complete)
+                return
+            }
+            if awaitingChunkTerminator {
+                guard pending.count >= 2 else { return }
+                let start = pending.startIndex
+                guard pending[start] == 13, pending[pending.index(after: start)] == 10 else {
+                    throw PinnedHTTPClient.Failure.malformedResponse
+                }
+                pending.removeFirst(2); awaitingChunkTerminator = false; chunkRemaining = nil
+                continue
+            }
+            if chunkRemaining == nil {
+                guard let end = pending.range(of: Data("\r\n".utf8)) else {
+                    guard pending.count <= 1024 else { throw PinnedHTTPClient.Failure.malformedResponse }
+                    return
+                }
+                let line = Data(pending[pending.startIndex..<end.lowerBound])
+                pending.removeFirst(pending.distance(from: pending.startIndex, to: end.upperBound))
+                let size = try chunkSize(line)
+                if size == 0 { readingTrailers = true; continue }
+                chunkRemaining = size
+            }
+            guard let remaining = chunkRemaining, !pending.isEmpty else { return }
+            let count = min(remaining, pending.count)
+            events.append(.body(Data(pending.prefix(count))))
+            pending.removeFirst(count); chunkRemaining = remaining - count
+            if chunkRemaining == 0 { awaitingChunkTerminator = true }
+        }
+    }
+
+    private mutating func complete(_ events: [Event]) -> [Event] {
+        guard !isComplete else { return events }
+        isComplete = true; pending.removeAll(keepingCapacity: false)
+        return events + [.complete]
+    }
+
+    private func chunkSize(_ line: Data) throws -> Int {
+        guard let text = String(data: line, encoding: .ascii) else { throw PinnedHTTPClient.Failure.malformedResponse }
+        let sizeToken = text.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        guard !sizeToken.isEmpty, sizeToken.unicodeScalars.allSatisfy({
+            (48...57).contains($0.value) || (65...70).contains($0.value) || (97...102).contains($0.value)
+        }), let size = Int(sizeToken, radix: 16), size >= 0 else { throw PinnedHTTPClient.Failure.malformedResponse }
+        return size
+    }
+
+    private func trailerEnd() -> Int? {
+        if pending.starts(with: Data("\r\n".utf8)) { return 2 }
+        return pending.range(of: Data("\r\n\r\n".utf8)).map {
+            pending.distance(from: pending.startIndex, to: $0.upperBound)
+        }
+    }
+
+    private func validateTrailers(_ bytes: Data) throws {
+        guard bytes != Data("\r\n".utf8), let text = String(data: bytes, encoding: .ascii) else { return }
+        for line in text.split(separator: "\r\n", omittingEmptySubsequences: true) {
+            guard let colon = line.firstIndex(of: ":"), PinnedHTTPClient.isHTTPToken(String(line[..<colon])) else {
+                throw PinnedHTTPClient.Failure.malformedResponse
+            }
+        }
+    }
 }
 
 private final class ConnectionOperation: @unchecked Sendable {
     private let connection: NWConnection
     private let request: Data
+    private let method: String
     private let limits: PinnedHTTPClient.Limits
     private let queue = DispatchQueue(label: "PinnedHTTPClient.connection")
     private var buffer = Data()
     private var continuation: CheckedContinuation<PinnedHTTPClient.Response, Error>?
+    private var idleTimer: DispatchWorkItem?
     private var finished = false
     private let lock = NSLock()
 
-    init(connection: NWConnection, request: Data, limits: PinnedHTTPClient.Limits) {
-        self.connection = connection
-        self.request = request
-        self.limits = limits
+    init(connection: NWConnection, request: Data, method: String, limits: PinnedHTTPClient.Limits) {
+        self.connection = connection; self.request = request; self.method = method; self.limits = limits
     }
 
     func run() async throws -> PinnedHTTPClient.Response {
         try Task.checkCancellation()
         return try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<PinnedHTTPClient.Response, Error>) in
                 lock.lock()
-                if finished {
-                    lock.unlock()
-                    continuation.resume(throwing: PinnedHTTPClient.Failure.cancelled)
-                    return
-                }
-                self.continuation = continuation
-                lock.unlock()
+                guard !finished else { lock.unlock(); continuation.resume(throwing: PinnedHTTPClient.Failure.cancelled); return }
+                self.continuation = continuation; lock.unlock()
                 connection.stateUpdateHandler = { [weak self] state in self?.stateChanged(state) }
-                connection.start(queue: queue)
+                connection.start(queue: queue); armIdle()
             }
         }, onCancel: { self.finish(.failure(PinnedHTTPClient.Failure.cancelled)) })
     }
@@ -290,87 +430,86 @@ private final class ConnectionOperation: @unchecked Sendable {
     private func stateChanged(_ state: NWConnection.State) {
         switch state {
         case .ready:
+            armIdle()
             connection.send(content: request, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 if error != nil { self.finish(.failure(PinnedHTTPClient.Failure.connectionFailed)); return }
                 self.receiveNext()
             })
-        case .failed, .waiting:
-            finish(.failure(PinnedHTTPClient.Failure.connectionFailed))
-        case .cancelled:
-            finish(.failure(PinnedHTTPClient.Failure.cancelled))
-        default:
-            break
+        case .failed, .waiting: finish(.failure(PinnedHTTPClient.Failure.connectionFailed))
+        case .cancelled: finish(.failure(PinnedHTTPClient.Failure.cancelled))
+        default: break
         }
     }
 
     private func receiveNext() {
+        armIdle()
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] content, _, complete, error in
             guard let self else { return }
+            self.disarmIdle()
             if let content { self.buffer.append(content) }
             do {
-                if let response = try PinnedHTTPClient.decodeResponse(self.buffer, limits: self.limits) {
+                if let response = try PinnedHTTPClient.decodeResponse(self.buffer, limits: self.limits, method: self.method, isComplete: complete) {
                     self.finish(.success(response)); return
                 }
-                if complete { self.finish(.failure(PinnedHTTPClient.Failure.malformedResponse)); return }
                 if error != nil { self.finish(.failure(PinnedHTTPClient.Failure.connectionFailed)); return }
+                if complete { self.finish(.failure(PinnedHTTPClient.Failure.malformedResponse)); return }
                 self.receiveNext()
             } catch { self.finish(.failure(error)) }
         }
     }
 
+    private func armIdle() {
+        guard limits.idleTimeout > 0, limits.idleTimeout.isFinite else { return }
+        let timer = DispatchWorkItem { [weak self] in self?.finish(.failure(PinnedHTTPClient.Failure.timedOut)) }
+        lock.lock(); guard !finished else { lock.unlock(); return }
+        idleTimer?.cancel(); idleTimer = timer; lock.unlock()
+        queue.asyncAfter(deadline: .now() + limits.idleTimeout, execute: timer)
+    }
+
+    private func disarmIdle() { lock.lock(); idleTimer?.cancel(); idleTimer = nil; lock.unlock() }
+
     private func finish(_ result: Result<PinnedHTTPClient.Response, Error>) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !finished else { return }
-        finished = true
-        connection.cancel()
-        continuation?.resume(with: result)
-        continuation = nil
+        lock.lock(); guard !finished else { lock.unlock(); return }
+        finished = true; idleTimer?.cancel(); idleTimer = nil
+        let continuation = self.continuation; self.continuation = nil; lock.unlock()
+        connection.cancel(); continuation?.resume(with: result)
     }
 }
 
-/// Separate from `ConnectionOperation`: that type intentionally retains small control-plane responses,
-/// while this one never retains a media body after it has been acknowledged by its consumer.
 private final class StreamingConnection: @unchecked Sendable {
     private let connection: NWConnection
     private let request: Data
+    private let method: String
     private let limits: PinnedHTTPClient.Limits
     private let onHead: @Sendable (PinnedHTTPClient.ResponseHead) async throws -> Void
     private let onBody: @Sendable (Data) async throws -> Void
     private let queue = DispatchQueue(label: "PinnedHTTPClient.stream")
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Error>?
+    private var workerTask: Task<Void, Never>?
+    private var idleTimer: DispatchWorkItem?
+    private var framer: StreamFramer
+    private var deliveredHead = false
     private var finished = false
-    private var head: PinnedHTTPClient.ResponseHead?
-    private var pending = Data()
-    private var remaining: Int?
-    private var chunkRemaining: Int?
-    private var streamedBytes = 0
 
-    init(
-        connection: NWConnection,
-        request: Data,
-        limits: PinnedHTTPClient.Limits,
-        onHead: @escaping @Sendable (PinnedHTTPClient.ResponseHead) async throws -> Void,
-        onBody: @escaping @Sendable (Data) async throws -> Void
-    ) {
-        self.connection = connection
-        self.request = request
-        self.limits = limits
-        self.onHead = onHead
-        self.onBody = onBody
+    init(connection: NWConnection, request: Data, method: String, limits: PinnedHTTPClient.Limits,
+         onHead: @escaping @Sendable (PinnedHTTPClient.ResponseHead) async throws -> Void,
+         onBody: @escaping @Sendable (Data) async throws -> Void) {
+        self.connection = connection; self.request = request; self.method = method; self.limits = limits
+        self.onHead = onHead; self.onBody = onBody; self.framer = StreamFramer(method: method, limits: limits)
     }
+
+    var didDeliverHead: Bool { lock.lock(); defer { lock.unlock() }; return deliveredHead }
 
     func run() async throws {
         try Task.checkCancellation()
         try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                lock.lock()
-                self.continuation = continuation
-                lock.unlock()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock(); guard !finished else { lock.unlock(); continuation.resume(throwing: PinnedHTTPClient.Failure.cancelled); return }
+                self.continuation = continuation; lock.unlock()
                 connection.stateUpdateHandler = { [weak self] state in self?.stateChanged(state) }
-                connection.start(queue: queue)
+                connection.start(queue: queue); armIdle()
             }
         }, onCancel: { self.finish(.failure(PinnedHTTPClient.Failure.cancelled)) })
     }
@@ -378,125 +517,72 @@ private final class StreamingConnection: @unchecked Sendable {
     private func stateChanged(_ state: NWConnection.State) {
         switch state {
         case .ready:
+            armIdle()
             connection.send(content: request, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
-                if error != nil { self.finish(.failure(PinnedHTTPClient.Failure.connectionFailed)) }
-                else { self.receiveNext() }
+                if error != nil { self.finish(.failure(PinnedHTTPClient.Failure.connectionFailed)) } else { self.receiveNext() }
             })
-        case .failed, .waiting:
-            finish(.failure(PinnedHTTPClient.Failure.connectionFailed))
-        case .cancelled:
-            finish(.failure(PinnedHTTPClient.Failure.cancelled))
-        default:
-            break
+        case .failed, .waiting: finish(.failure(PinnedHTTPClient.Failure.connectionFailed))
+        case .cancelled: finish(.failure(PinnedHTTPClient.Failure.cancelled))
+        default: break
         }
     }
 
     private func receiveNext() {
+        armIdle()
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] content, _, complete, error in
             guard let self else { return }
-            Task { [weak self] in
-                guard let self else { return }
-                do {
+            self.disarmIdle()
+            self.processCallback(content: content ?? Data(), complete: complete, error: error)
+        }
+    }
+
+    /// The sole callback task is retained here and cancelled by `finish`; a new receive starts only after it ends.
+    private func processCallback(content: Data, complete: Bool, error: NWError?) {
+        lock.lock(); guard !finished else { lock.unlock(); return }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try Task.checkCancellation()
+                let events = try self.framer.consume(content, endOfStream: complete)
+                for event in events {
                     try Task.checkCancellation()
-                    if let content { self.pending.append(content) }
-                    try await self.consume(complete: complete)
-                    if self.isFinished { return }
-                    if error != nil { self.finish(.failure(PinnedHTTPClient.Failure.connectionFailed)); return }
-                    if complete {
-                        if self.head != nil, self.remaining == nil, self.chunkRemaining == nil, self.pending.isEmpty {
-                            self.finish(.success(()))
-                        } else {
-                            self.finish(.failure(PinnedHTTPClient.Failure.malformedResponse))
-                        }
-                        return
+                    switch event {
+                    case let .head(head): self.markHeadDelivered(); try await self.onHead(head)
+                    case let .body(bytes): if !bytes.isEmpty { try await self.onBody(bytes) }
+                    case .complete: self.finish(.success(())); return
                     }
-                    self.receiveNext()
-                } catch is CancellationError {
-                    self.finish(.failure(PinnedHTTPClient.Failure.cancelled))
-                } catch {
-                    self.finish(.failure(error))
                 }
-            }
+                if error != nil { self.finish(.failure(PinnedHTTPClient.Failure.connectionFailed)); return }
+                if complete { self.finish(.failure(PinnedHTTPClient.Failure.malformedResponse)); return }
+                if !self.isFinished { self.receiveNext() }
+            } catch is CancellationError { self.finish(.failure(PinnedHTTPClient.Failure.cancelled)) }
+            catch { self.finish(.failure(error)) }
         }
-    }
-
-    private func consume(complete: Bool) async throws {
-        if head == nil {
-            guard let parsed = try PinnedHTTPClient.decodeHead(pending, limits: limits) else { return }
-            head = parsed.head
-            pending = parsed.body
-            if let value = parsed.head.headers["content-length"] {
-                guard let length = Int(value), length >= 0, length <= limits.maximumStreamBytes else { throw PinnedHTTPClient.Failure.responseTooLarge }
-                remaining = length
-            } else if parsed.head.headers["transfer-encoding"]?.lowercased() == "chunked" {
-                remaining = nil
-            } else if parsed.head.statusCode == 204 || parsed.head.statusCode == 304 {
-                remaining = 0
-            }
-            try await onHead(parsed.head)
-            if remaining == 0 { finish(.success(())); return }
-        }
-
-        guard let head else { return }
-        if head.headers["transfer-encoding"]?.lowercased() == "chunked" {
-            try await consumeChunked()
-        } else if let remaining {
-            guard pending.count <= remaining else { throw PinnedHTTPClient.Failure.malformedResponse }
-            if !pending.isEmpty { try await forward(pending); self.remaining = remaining - pending.count; pending.removeAll(keepingCapacity: true) }
-            if self.remaining == 0 { finish(.success(())) }
-        } else if !pending.isEmpty {
-            try await forward(pending)
-            pending.removeAll(keepingCapacity: true)
-        }
-        _ = complete
-    }
-
-    private func consumeChunked() async throws {
-        while true {
-            if chunkRemaining == nil {
-                guard let end = pending.range(of: Data("\r\n".utf8)) else {
-                    guard pending.count <= 1024 else { throw PinnedHTTPClient.Failure.malformedResponse }
-                    return
-                }
-                guard let line = String(data: pending[..<end.lowerBound], encoding: .ascii),
-                      let size = Int(line.split(separator: ";", maxSplits: 1)[0], radix: 16), size >= 0,
-                      size <= limits.maximumStreamBytes else { throw PinnedHTTPClient.Failure.malformedResponse }
-                pending.removeSubrange(..<end.upperBound)
-                if size == 0 {
-                    // Trailer fields are irrelevant to a loopback media response. The terminating CRLF is
-                    // sufficient; reject only an unbounded trailer rather than retaining it.
-                    if let end = pending.range(of: Data("\r\n\r\n".utf8)) { pending.removeSubrange(..<end.upperBound) }
-                    finish(.success(())); return
-                }
-                chunkRemaining = size
-            }
-            guard let size = chunkRemaining, pending.count >= size + 2 else { return }
-            let payload = Data(pending.prefix(size))
-            let suffix = pending.index(pending.startIndex, offsetBy: size)
-            guard pending[suffix] == 13, pending[pending.index(after: suffix)] == 10 else { throw PinnedHTTPClient.Failure.malformedResponse }
-            pending.removeSubrange(..<pending.index(suffix, offsetBy: 2))
-            chunkRemaining = nil
-            try await forward(payload)
-        }
-    }
-
-    private func forward(_ bytes: Data) async throws {
-        guard streamedBytes <= limits.maximumStreamBytes - bytes.count else { throw PinnedHTTPClient.Failure.responseTooLarge }
-        streamedBytes += bytes.count
-        if !bytes.isEmpty { try await onBody(bytes) }
+        workerTask = task; lock.unlock()
     }
 
     private var isFinished: Bool { lock.lock(); defer { lock.unlock() }; return finished }
 
+    private func markHeadDelivered() {
+        lock.lock(); deliveredHead = true; lock.unlock()
+    }
+
+    private func armIdle() {
+        guard limits.idleTimeout > 0, limits.idleTimeout.isFinite else { return }
+        let timer = DispatchWorkItem { [weak self] in self?.finish(.failure(PinnedHTTPClient.Failure.timedOut)) }
+        lock.lock(); guard !finished else { lock.unlock(); return }
+        idleTimer?.cancel(); idleTimer = timer; lock.unlock()
+        queue.asyncAfter(deadline: .now() + limits.idleTimeout, execute: timer)
+    }
+
+    private func disarmIdle() { lock.lock(); idleTimer?.cancel(); idleTimer = nil; lock.unlock() }
+
     private func finish(_ result: Result<Void, Error>) {
-        lock.lock()
-        guard !finished else { lock.unlock(); return }
-        finished = true
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        connection.cancel()
-        continuation?.resume(with: result)
+        lock.lock(); guard !finished else { lock.unlock(); return }
+        finished = true; idleTimer?.cancel(); idleTimer = nil
+        let task = workerTask; workerTask = nil
+        let continuation = self.continuation; self.continuation = nil; lock.unlock()
+        task?.cancel(); connection.cancel(); continuation?.resume(with: result)
     }
 }
