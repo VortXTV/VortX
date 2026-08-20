@@ -612,6 +612,9 @@ struct iOSDetailView: View {
     // Media servers (Plex/Jellyfin/Emby): resolves this movie on the user's connected servers and merges the
     // direct-play hits as their own tier. Empty (list unchanged) with no server connected (dormant).
     @StateObject private var mediaServers = MediaServerSource()
+    // User-installed community JavaScript add-ons. Dormant unless both the rollout and this device's toggle
+    // are enabled, then merged through the same guarded source lifecycle as the other auxiliary contributors.
+    @StateObject private var jsProvider = JSProviderSource()
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline-download state for the hero "Download" affordance (#30)
     // Batch episode downloads (#119): the coordinator publishes the walk's status/summary; the two
@@ -938,9 +941,9 @@ struct iOSDetailView: View {
             // Wire the source-list model to this screen's sources (idempotent; nudges a refresh on
             // re-appear). The model owns assembly + ranking off-main from here on.
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
-                            mediaServers: mediaServers, debridCache: debridCache)
+                            mediaServers: mediaServers, debridCache: debridCache, jsProvider: jsProvider)
             if effectiveType == "series" {
-                torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults()
+                torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults(); jsProvider.clearResults()
                 // A series detail loads meta only; streams load per-episode from iOSEpisodeStreams.
                 if meta == nil { core.loadMeta(type: effectiveType, id: metaRequestID) }
             } else if meta != nil {
@@ -971,7 +974,7 @@ struct iOSDetailView: View {
         // this cannot loop.
         .onChange(of: meta?.type) { _ in
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
-            else { torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults() }
+            else { torboxSearch.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults(); jsProvider.clearResults() }
         }
         .onChange(of: meta?.id) { _ in
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
@@ -1016,7 +1019,7 @@ struct iOSDetailView: View {
             if effectiveType != "series" {
                 AuxiliarySourcePipeline.refresh(
                     target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-                    isSignedIn: VortXSyncManager.shared.isSignedIn
+                    isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
                 )
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
                                      publicationTarget: mediaServerTarget)
@@ -1027,7 +1030,7 @@ struct iOSDetailView: View {
             if effectiveType != "series" {
                 AuxiliarySourcePipeline.refresh(
                     target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-                    isSignedIn: VortXSyncManager.shared.isSignedIn
+                    isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
                 )
                 mediaServers.refresh(imdb: titleIdentity.titleID, title: meta?.name,
                                      publicationTarget: mediaServerTarget)
@@ -2453,6 +2456,7 @@ struct iOSDetailView: View {
     private func refindMovieSources() {
         guard refindEnabled else { return }
         torboxSearch.invalidateCachedResult(for: auxiliaryTarget)
+        jsProvider.invalidateCachedResult(for: auxiliaryTarget)
         mediaServers.invalidateCache()
         sourceIndex.clearResults()
         sourceList.beginRefresh()
@@ -2596,7 +2600,7 @@ struct iOSDetailView: View {
                                     providerByHash: [String: String] = [:]) {
         AuxiliarySourcePipeline.refresh(
             target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-            isSignedIn: VortXSyncManager.shared.isSignedIn
+            isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
         )
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
@@ -4008,6 +4012,8 @@ struct iOSEpisodeStreams: View {
     @StateObject private var sourceIndex = SourceIndexServeSource()
     // Media servers (Plex/Jellyfin/Emby) for THIS episode: direct-play hits resolved by SxEy. Dormant with no server.
     @StateObject private var mediaServers = MediaServerSource()
+    // User-installed community JavaScript add-ons for this exact episode target.
+    @StateObject private var jsProvider = JSProviderSource()
     /// Separate episode-preparation contributors. The visible episode source list keeps owning the three
     /// objects above while the player prepares a later episode behind it.
     @StateObject private var preloadTorboxSearch = TorBoxSearchSource()
@@ -4097,7 +4103,7 @@ struct iOSEpisodeStreams: View {
         .onAppear {
             // Wire the source-list model to this episode's sources (idempotent; see SourceListModel).
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
-                            mediaServers: mediaServers, debridCache: debridCache)
+                            mediaServers: mediaServers, debridCache: debridCache, jsProvider: jsProvider)
             // Load THIS episode's streams. The series meta is often ALREADY loaded (from the detail page)
             // WITHOUT this episode's stream path, so guarding on meta id alone skipped the stream request
             // entirely and the source list stayed empty ("no sources" / "no stream add-ons responded").
@@ -4130,7 +4136,7 @@ struct iOSEpisodeStreams: View {
         .onAppear {
             AuxiliarySourcePipeline.refresh(
                 target: episodeTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-                isSignedIn: VortXSyncManager.shared.isSignedIn
+                isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
             )
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
                                  title: meta.name, publicationTarget: mediaServerTarget)
@@ -4139,7 +4145,7 @@ struct iOSEpisodeStreams: View {
         .onChange(of: shownVideo.id) { _ in
             AuxiliarySourcePipeline.refresh(
                 target: episodeTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-                isSignedIn: VortXSyncManager.shared.isSignedIn
+                isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
             )
             mediaServers.refresh(imdb: showIdentity.titleID, season: auxiliarySeason, episode: auxiliaryEpisode,
                                  title: meta.name, publicationTarget: mediaServerTarget)
@@ -4285,6 +4291,7 @@ struct iOSEpisodeStreams: View {
     private func refindEpisodeSources() {
         guard refindEnabled else { return }
         torboxSearch.invalidateCachedResult(for: episodeTarget)
+        jsProvider.invalidateCachedResult(for: episodeTarget)
         mediaServers.invalidateCache()
         sourceIndex.clearResults()
         sourceList.beginRefresh()
@@ -4797,7 +4804,7 @@ struct iOSEpisodeStreams: View {
                                     providerByHash: [String: String] = [:]) {
         AuxiliarySourcePipeline.refresh(
             target: episodeTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-            isSignedIn: VortXSyncManager.shared.isSignedIn
+            isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
         )
         // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
         // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.

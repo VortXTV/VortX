@@ -6,7 +6,9 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.14 (unreleased)
 
-### Usenet
+### Community JavaScript add-ons (foundation, off by default)
+
+**On-device runtime for community JavaScript add-ons, Apple.** You can paste your own manifest URL to add compatible community JavaScript providers. A provider runs on your device and can contribute sources from your own connection to the normal source list. Each call uses an isolated JavaScriptCore sandbox with a hard time limit and no access to app data. Manifest and provider downloads are capped, redirects and private-network addresses are refused, and results use the same ranking, filtering, and playback-header path as other sources. This ships dark: it is off unless both the device and service rollout enable it, and it does nothing on an untouched install. Apple TV, iPhone, iPad, and Mac include the installation and management flow.
 
 **Play usenet sources with your own provider, no debrid needed.** A new Settings screen, Usenet provider, lets you enter your own usenet account (host, port, username, password, connection count, and SSL). Once it is set, a bare-NZB source plays on the device straight from your provider, streamed through the NNTP engine already built into the app's streaming server, with no debrid account required. Your login is held only in this device's keychain, is never written to a preference, a backup, or the encrypted account sync, and the only place it is ever sent is the app's own on-device server at 127.0.0.1. Debrid usenet through TorBox is unchanged and takes over automatically for anyone without a provider set, so nothing changes if you do not use this; you can also configure both, in which case a source your provider is missing still falls back to TorBox. A source your provider cannot fully retrieve, for example one with missing segments, is skipped with a clear message instead of spinning. Apple TV, iPhone, iPad, and Mac. The Lite Apple TV build stays debrid-only.
 

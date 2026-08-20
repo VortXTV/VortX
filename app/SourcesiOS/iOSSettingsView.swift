@@ -617,8 +617,9 @@ struct iOSSettingsView: View {
                 }
             }
             NavigationLink("VortX account & sync") { SyncSettingsView() }
-            // Optional imports and services that enrich VortX (Stremio, Trakt, SIMKL, Nuvio).
+            // Optional imports and services that enrich VortX.
             NavigationLink("Integrations") { IntegrationsSettingsView() }
+            NavigationLink("Community JavaScript add-ons") { CommunityJSProvidersSettingsView() }
             NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
@@ -2060,7 +2061,7 @@ private enum SettingsSearchSection: CaseIterable {
         switch self {
         case .profiles: return ["profile", "avatar", "pin", "switch profile", "add profile"]
         case .language: return ["app language", "system default", "localization", "translation"]
-        case .account: return ["vortx account", "sync", "sign in", "integrations", "stremio", "trakt", "simkl",
+        case .account: return ["vortx account", "sync", "sign in", "integrations", "community javascript", "manifest", "provider", "stremio", "trakt", "simkl",
                                "import", "metadata", "tmdb", "mdblist", "fanart", "debrid", "real-debrid",
                                "poster artwork", "erdb", "ratings", "iptv", "live tv", "playlist",
                                "media server", "plex", "jellyfin", "emby", "api key"]

@@ -442,9 +442,13 @@ struct SettingsView: View {
                     }
                     .buttonStyle(ChipButtonStyle(selected: false))
                 }
-                // Optional imports and services that enrich VortX (Stremio, Trakt, SIMKL, Nuvio).
+                // Optional imports and services that enrich VortX.
                 NavigationLink { IntegrationsSettingsView() } label: {
                     Label("Integrations", systemImage: "square.stack.3d.up")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { CommunityJSProvidersSettingsView() } label: {
+                    Label("Community JavaScript add-ons", systemImage: "curlybraces.square")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { StremioImportView() } label: {

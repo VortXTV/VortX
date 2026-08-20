@@ -1734,11 +1734,24 @@ enum AuxiliarySourcePipeline {
         target: SourceIndexIdentity.TargetResolution,
         torBox: TorBoxSearchSource,
         sourceIndex: SourceIndexServeSource,
-        isSignedIn: Bool
+        isSignedIn: Bool,
+        jsProvider: JSProviderSource? = nil
     ) {
         let call = Call(resolution: target)
         torBox.refresh(call: call)
         sourceIndex.refresh(call: call, isSignedIn: isSignedIn)
+        // Optional: the community JS provider source (default nil; ships dark behind its own gate). Refreshed
+        // through the SAME typed Call so its imdb->tmdb resolution keys on the exact validated page target.
+        jsProvider?.refresh(call: call)
+    }
+
+    @MainActor
+    static func jsProviderMerged(
+        into groups: [CoreStreamSourceGroup],
+        target: SourceIndexIdentity.TargetResolution,
+        jsProvider: JSProviderSource
+    ) -> [CoreStreamSourceGroup] {
+        jsProvider.merged(into: groups, call: Call(resolution: target))
     }
 
     @MainActor

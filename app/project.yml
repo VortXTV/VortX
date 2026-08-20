@@ -295,6 +295,14 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
+        optional: true
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -395,6 +403,14 @@ targets:
       # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
       # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
       - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
         optional: true
         type: folder
         buildPhase: resources
@@ -499,6 +515,14 @@ targets:
       # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
       # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
       - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
         optional: true
         type: folder
         buildPhase: resources
@@ -652,6 +676,14 @@ targets:
       # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
       # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
       - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
         optional: true
         type: folder
         buildPhase: resources

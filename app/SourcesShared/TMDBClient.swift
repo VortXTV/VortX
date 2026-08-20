@@ -42,6 +42,22 @@ enum TMDBClient {
         }
     }
 
+    /// Resolve an IMDb `tt...` id to its numeric TMDB id, via TMDB `/find`. `type` is the stremio type
+    /// ("movie" or "series"). Requires the effective TMDB key; nil on no result / any transient error. Used by
+    /// the community JS provider runtime, which keys on a numeric TMDB id (VortX keys everything else on IMDb).
+    static func tmdbNumericID(imdbID: String, type: String) async -> Int? {
+        guard imdbID.hasPrefix("tt") else { return nil }
+        let key = ApiKeys.effectiveTMDBKey()
+        let media = (type == "series") ? "tv" : "movie"
+        guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)") else { return nil }
+        // Prefer the requested media bucket; fall back to the other so a mis-typed page still resolves.
+        let buckets = media == "tv" ? ["tv_results", "movie_results"] : ["movie_results", "tv_results"]
+        for bucket in buckets {
+            if let first = (found[bucket] as? [[String: Any]])?.first, let id = first["id"] as? Int { return id }
+        }
+        return nil
+    }
+
     /// A streaming/rent/buy provider a title is available on, for the "Where to watch" row.
     struct WatchProvider: Identifiable, Hashable {
         let name: String

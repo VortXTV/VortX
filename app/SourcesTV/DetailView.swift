@@ -2293,6 +2293,10 @@ struct CoreStreamList: View {
     // Media servers (Plex/Jellyfin/Emby): resolves this title on the user's connected servers and merges the
     // direct-play hits as their own tier. Empty (list unchanged) with no server connected (dormant).
     @StateObject private var mediaServers = MediaServerSource()
+    // Community JavaScript add-ons (JSProviderSource): run the user's installed provider code on-device
+    // and merges their streams. DARK by default: empty (list unchanged) unless the OFF-by-default master gate
+    // (RemoteConfig flag + device toggle) is on AND a manifest is installed.
+    @StateObject private var jsProvider = JSProviderSource()
     // Stremio account (api.strem.io). NOTE: the source-index SERVE read is gated on the VORTX-SYNC account
     // (VortXSyncManager, the moat-token identity), NOT this one -- see refreshSourceIndex().
     @EnvironmentObject private var account: StremioAccount
@@ -2686,10 +2690,10 @@ struct CoreStreamList: View {
         // before loading a replacement, and SourceListModel checks the same token again before merging.
         .onAppear {
             sourceList.bind(core: core, torbox: torboxSearch, singularity: sourceIndex,
-                            mediaServers: mediaServers, debridCache: debridCache)
+                            mediaServers: mediaServers, debridCache: debridCache, jsProvider: jsProvider)
             AuxiliarySourcePipeline.refresh(
                 target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-                isSignedIn: VortXSyncManager.shared.isSignedIn
+                isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
             )
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTarget)
@@ -2698,7 +2702,7 @@ struct CoreStreamList: View {
         .onChange(of: mediaServerTarget) { _ in
             AuxiliarySourcePipeline.refresh(
                 target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-                isSignedIn: VortXSyncManager.shared.isSignedIn
+                isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
             )
             mediaServers.refresh(imdb: titleIdentity.titleID, season: meta?.season, episode: meta?.episode,
                                  title: meta?.name, publicationTarget: mediaServerTarget)
@@ -2933,7 +2937,7 @@ struct CoreStreamList: View {
         ) else { return }
         AuxiliarySourcePipeline.refresh(
             target: auxiliaryTarget, torBox: torboxSearch, sourceIndex: sourceIndex,
-            isSignedIn: VortXSyncManager.shared.isSignedIn
+            isSignedIn: VortXSyncManager.shared.isSignedIn, jsProvider: jsProvider
         )
         guard let target = SourceIndexIdentity.validatedTarget(auxiliaryTarget) else { return }
         // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
