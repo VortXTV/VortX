@@ -29,8 +29,9 @@ glyphs the chosen style cannot draw, so your Latin subtitles keep their look.
 **Community subtitle groundwork.** The foundation for VortX's community subtitle pool landed: a signed,
 fail-soft client that can read subtitles other viewers have contributed for the same title, learn a per-release
 sync offset and apply it automatically, and contribute embedded or add-on subtitle text back so the next viewer
-benefits. Your own manual sync nudge always wins and teaches the pool the right offset for that exact release. A
-later update wires this into the subtitle picker; today it ships as the tested groundwork behind it.
+benefits. Your own manual sync nudge always wins and teaches the pool the right offset for that exact release.
+The read, contribution, and sync steps are now assembled into one tested coordinator that also connects the
+account moat token, so a later update only has to wire it into the subtitle picker.
 
 **Subtitle contribution: embedded text extraction.** A finished local download's own text subtitle tracks
 (SubRip, WebVTT, mov_text, and SSA/ASS) can now be pulled out into a clean SRT/VTT and contributed to the
