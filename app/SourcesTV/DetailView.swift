@@ -1,40 +1,9 @@
 import SwiftUI
 
-/// Semantic focus regions used by the detail-page graph. The top/row cases are attached to visible controls;
-/// `shell` records the terminal handoff but is never installed as a hidden focus target.
-// Internal because CoreStreamList's memberwise initializer carries the focus bridge between this file's
-// detail-page owners. It remains a file-local implementation type in practice; no other source file imports it.
-enum DetailFocusRegion: Hashable {
-    case top
-    case primary
-    case secondary
-    case lower
-    case shell
-}
-
 /// Stable ids shared by movie, series, and episode detail scroll views. The anchor is non-focusable; the
 /// adjacent visible metadata target owns focus after an upward escape.
 private enum DetailFocusAnchor {
     static let top = "vortx.detail.top"
-}
-
-/// Production Up graph. Action rows are handled by their nearest row scope; lower rails enter the nearest
-/// available action row. The top target deliberately hands the next Up to the native shell/menu graph.
-private enum DetailFocusEscapePolicy {
-    static func nextUp(from region: DetailFocusRegion, hasSecondary: Bool) -> DetailFocusRegion? {
-        switch region {
-        case .secondary:
-            return .primary
-        case .primary:
-            return .top
-        case .lower:
-            return hasSecondary ? .secondary : .primary
-        case .top:
-            return .shell
-        case .shell:
-            return nil
-        }
-    }
 }
 
 /// Optional move-command scope used by action rows. The modifier is omitted when a caller has no detail
@@ -62,7 +31,6 @@ struct DetailView: View {
     var initialTraktSessionID: TraktSessionID? = nil
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
-    @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (Trailer)
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized detail title/logo override
@@ -875,11 +843,14 @@ struct DetailView: View {
     /// shell/menu focus graph. Horizontal movement and Down are never intercepted.
     private func handleDetailMove(_ direction: MoveCommandDirection,
                                   from region: DetailFocusRegion,
-                                  hasSecondary: Bool = true,
                                   using proxy: ScrollViewProxy) {
         detailFocusRegion = region
         guard direction == .up,
-              let next = DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: hasSecondary) else { return }
+              let next = TVDetailActionFocusPolicy.destination(
+                from: region,
+                direction: .up,
+                state: TVDetailActionFocusPolicy.persistentTitleActions
+              ) else { return }
         switch next {
         case .top, .primary, .secondary:
             focusDetailRegion(next, using: proxy)
@@ -1328,13 +1299,12 @@ struct DetailView: View {
                         TVDetailActionRow(spacing: Theme.Space.sm,
                                           accessibilityLabel: String(localized: "Trailer and title actions"),
                                           onMoveCommand: { direction in onDetailMove(direction, .secondary) }) {
+                            // Library is the permanent secondary focus anchor. Trailer availability can change
+                            // while metadata resolves, so it remains a neighbour rather than owning focus.
+                            LibraryChip()
+                                .focused($detailFocusTarget, equals: .secondary)
                             if hasFullTrailer(m) {
                                 trailerChip(m)
-                                    .focused($detailFocusTarget, equals: .secondary)
-                                LibraryChip()
-                            } else {
-                                LibraryChip()
-                                    .focused($detailFocusTarget, equals: .secondary)
                             }
                             WatchlistChip()
                             ratingChip
@@ -2247,7 +2217,11 @@ struct CoreEpisodeStreams: View {
                                    initialTraktSessionID: initialTraktSessionID,
                                    onDetailMove: { direction, region in
                                        guard direction == .up,
-                                             DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: true) == .top else { return }
+                                             TVDetailActionFocusPolicy.destination(
+                                                from: region,
+                                                direction: .up,
+                                                state: TVDetailActionFocusPolicy.persistentTitleActions
+                                             ) == .top else { return }
                                        moveToEpisodeTop(using: proxy)
                                    },
                                    // Re-find sources: same per-episode stream args this page's loadMeta uses.
@@ -2446,7 +2420,6 @@ struct CoreStreamList: View {
     }
 
     @EnvironmentObject private var core: CoreBridge
-    @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
     @State private var sourceContributionTask: Task<Void, Never>? = nil
@@ -2583,18 +2556,18 @@ struct CoreStreamList: View {
     /// and the native focus engine owns the complete path. Left/right and Down return immediately to the native
     /// focus engine.
     private func sourceMoveHandler(from region: DetailFocusRegion,
-                                   hasSecondary: Bool) -> ((MoveCommandDirection) -> Void)? {
+                                   state: TVDetailActionState) -> ((MoveCommandDirection) -> Void)? {
         guard onDetailMove != nil else { return nil }
         return { direction in
-            handleSourceMove(direction, from: region, hasSecondary: hasSecondary)
+            handleSourceMove(direction, from: region, state: state)
         }
     }
 
     private func handleSourceMove(_ direction: MoveCommandDirection,
                                   from region: DetailFocusRegion,
-                                  hasSecondary: Bool) {
+                                  state: TVDetailActionState) {
         guard direction == .up,
-              let next = DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: hasSecondary) else { return }
+              let next = TVDetailActionFocusPolicy.destination(from: region, direction: .up, state: state) else { return }
         switch next {
         case .secondary:
             if let parentFocusTarget {
@@ -2690,7 +2663,13 @@ struct CoreStreamList: View {
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
         // button hostage: the timeout opens the gate anyway.
         let watchReady = sourceList.isSettled
-        let hasSecondaryRow = !isLive || secondaryAction != nil || best != nil
+        let actionState = TVDetailActionState(
+            isLive: isLive,
+            hasTrailer: secondaryAction != nil,
+            best: best == nil ? .absent : (watchReady ? .ready : .settling),
+            download: downloadChipState()
+        )
+        let actionRows = TVDetailActionFocusPolicy.rows(for: actionState)
 
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Singularity renders INLINE ONLY: its merged group flows through the ranked list like any
@@ -2704,7 +2683,7 @@ struct CoreStreamList: View {
             // PRIMARY: playback and source selection decisions. The same semantic row remains mounted while
             // the source state changes from loading -> ready -> failed, so its focus target never disappears.
             TVDetailActionRow(accessibilityLabel: String(localized: "Playback and source actions"),
-                              onMoveCommand: sourceMoveHandler(from: .primary, hasSecondary: !isLive)) {
+                              onMoveCommand: sourceMoveHandler(from: .primary, state: actionState)) {
                 if let best, watchReady {
                     // Once the complete source set is settled this is the real primary action. While it
                     // is settling, the branch below is a focusable status view rather than an announced
@@ -2842,37 +2821,25 @@ struct CoreStreamList: View {
                 }
             }
 
-            // SECONDARY: page actions and optional integrations. This row is independent of `best`, so the
-            // movie trailer is available in loading, nil-best, no-source, and failed-source states too.
-            if hasSecondaryRow {
+            // SECONDARY: source-independent title actions are permanently mounted. Library is first and owns
+            // this row's focus seat, so Trailer and Download may appear or disappear without invalidating a
+            // focused target during a source refresh.
+            if actionRows.showsSecondary {
                 TVDetailActionRow(accessibilityLabel: String(localized: "Download and title actions"),
-                                  onMoveCommand: sourceMoveHandler(from: .secondary, hasSecondary: !isLive)) {
-                    if let secondaryAction {
-                        focusSecondary(secondaryAction)
-                    } else if let best, !isLive {
-                        focusSecondary(downloadChip(ready: watchReady) {
-                            requestDownload { Task { await downloadBest(best) } }
-                        })
-                    } else {
+                                  onMoveCommand: sourceMoveHandler(from: .secondary, state: actionState)) {
+                    if actionRows.showsLibrary {
                         focusSecondary(LibraryChip())
                     }
-
-                    if let best {
-                        // Best-dependent controls follow the independent first action. The first secondary
-                        // control is focused above, preventing a duplicate visible target in this row.
-                        if let secondaryAction {
-                            if !isLive {
-                                downloadChip(ready: watchReady) {
-                                    requestDownload { Task { await downloadBest(best) } }
-                                }
-                            }
-                            LibraryChip()
-                        } else if !isLive {
-                            LibraryChip()
-                        }
-                        WatchlistChip()
-                        ratingChip
+                    if actionRows.showsTrailer, let secondaryAction {
+                        secondaryAction
                     }
+                    if actionRows.showsDownload, let best {
+                        downloadChip(ready: watchReady) {
+                            requestDownload { Task { await downloadBest(best) } }
+                        }
+                    }
+                    WatchlistChip()
+                    ratingChip
                 }
             }
 
@@ -2905,8 +2872,7 @@ struct CoreStreamList: View {
                     // The source column is its own focus section, and its one Up owner returns to the nearest
                     // semantic action row. There is no page-level duplicate handler to swallow top -> shell.
                     .focusSection()
-                    .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower,
-                                                                                   hasSecondary: !isLive)))
+                    .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower, state: actionState)))
                 }
             } else {
                 // Error/no-source status is a lower region. Its single handler covers Re-find as well as the
@@ -2921,21 +2887,13 @@ struct CoreStreamList: View {
                         .buttonStyle(ChipButtonStyle())
                     }
                 }
-                .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower,
-                                                                               hasSecondary: !isLive)))
+                .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower, state: actionState)))
             }
         }
         // Greedy width so the column never shrinks to its widest child. Without this, the Watch-Now state
         // (just two buttons + a status line, no full-width row yet) collapsed to button-width and an
         // enclosing ScrollView centered it, the "black bar with two buttons in the middle" bug.
         .frame(maxWidth: .infinity, alignment: .leading)
-        // A conditional live secondary row can disappear when a source refresh removes `best`. Clear its
-        // stale focus target immediately and return to the persistent primary status/action target.
-        .onChange(of: hasSecondaryRow) { visible in
-            guard !visible else { return }
-            sourceFocusTarget = nil
-            watchFocused = true
-        }
         // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
         // first focusable view, which on the movie page is the Trailer chip laid out higher up.
         .defaultFocus($watchFocused, true)
@@ -3056,9 +3014,8 @@ struct CoreStreamList: View {
     /// The offline-download state for this list's video id, derived from `DownloadStore`. Mirrors iOS's
     /// `downloadChipState`: no record -> offer a download, an active record -> "Downloading", a completed
     /// record -> "Downloaded". Returns `.none` when there is no `meta` (e.g. a bare Search call site).
-    private enum DownloadChipState { case none, inProgress, done }
-
-    private func downloadChipState() -> DownloadChipState {
+    private func downloadChipState() -> TVDetailDownloadState {
+        guard !isLive else { return .unavailable }
         guard let videoId = meta?.videoId,
               let record = downloads.records.first(where: { $0.videoId == videoId && $0.state != .failed }) else { return .none }
         return record.state == .completed ? .done : .inProgress
@@ -3083,6 +3040,8 @@ struct CoreStreamList: View {
                 }
             case .none:
                 Label("Download", systemImage: "arrow.down.circle")
+            case .unavailable:
+                EmptyView()
             }
         }
         .buttonStyle(ChipButtonStyle())

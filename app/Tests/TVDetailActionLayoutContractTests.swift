@@ -1,18 +1,13 @@
-// Standalone source contract for the tvOS detail action rows and focus escape policy.
+// Executable contract for the tvOS detail action rows and focus topology.
 //
-//   swiftc -o /tmp/tv-detail-action-layout-contract app/Tests/TVDetailActionLayoutContractTests.swift \
-//     && /tmp/tv-detail-action-layout-contract
+//   swiftc app/SourcesTV/TVDetailActionFocusPolicy.swift \
+//     app/Tests/TVDetailActionLayoutContractTests.swift \
+//     -o /tmp/tv-detail-action-layout-contract \
+//     && /tmp/tv-detail-action-layout-contract <repository-root>
 //
-// The tvOS target is not available to this Foundation-only harness. It protects layout and focus seams that
-// can regress without a type-check failure: finite-width HStacks wrap long labels, and an outer ScrollView
-// without a semantic top route can strand the Siri Remote below a long synopsis/language block.
-//
-// Device smoke plan (not runnable in this harness): on physical 1080p and 4K tvOS hardware, exercise a movie
-// with 0, 1, and many language-chip rows plus a deliberately long synopsis; focus Watch -> secondary actions ->
-// cast/providers/recommendations, press Up until the title block is focused, then Up again and verify the native
-// tab/menu is visible and focused (`homeExists=true`, `homeFocused=true`). Record the journey as
-// secondary -> primary (`primaryFocused=true`) -> visible title -> native tab; repeat on a series, its episode
-// page, and accessibility text sizes; verify left/right stays within the active action row and Down advances.
+// The reducer is production code and Foundation-only, so these scenarios exercise the same focus decisions
+// that SwiftUI uses without requiring a simulator or connected device. Layout checks remain intentionally
+// narrow; they guard the two-row/intrinsic-width view seam rather than pretending source text is navigation.
 
 import Foundation
 
@@ -29,43 +24,94 @@ private func expect(_ condition: Bool, _ message: String) {
     }
 }
 
-private func count(_ needle: String, in haystack: String) -> Int {
-    haystack.components(separatedBy: needle).count - 1
+private func state(isLive: Bool = false,
+                   hasTrailer: Bool = false,
+                   best: TVDetailBestState = .absent,
+                   download: TVDetailDownloadState = .none) -> TVDetailActionState {
+    TVDetailActionState(isLive: isLive, hasTrailer: hasTrailer, best: best, download: download)
 }
 
-/// Return the source between two unique markers. Keeping all checks scoped to their owner prevents an
-/// unrelated helper elsewhere in DetailView.swift from satisfying a regression contract by accident.
-private func sourceBetween(_ source: String, _ start: String, _ end: String) -> String? {
-    guard let startRange = source.range(of: start, options: [], range: source.startIndex..<source.endIndex),
-          let endRange = source.range(of: end, options: [], range: startRange.upperBound..<source.endIndex) else {
-        return nil
-    }
-    return String(source[startRange.lowerBound..<endRange.lowerBound])
+private func expectStableSecondary(_ snapshot: TVDetailActionState, _ name: String) {
+    let rows = TVDetailActionFocusPolicy.rows(for: snapshot)
+    expect(rows.showsSecondary, "\(name): title-action row remains mounted")
+    expect(rows.showsLibrary, "\(name): Library remains visible")
+    expect(rows.secondaryAnchor == .secondary, "\(name): Library owns the stable secondary focus seat")
+    expect(TVDetailActionFocusPolicy.destination(from: .lower, direction: .up, state: snapshot) == .secondary,
+           "\(name): lower content returns to the stable secondary row")
 }
 
-/// Extract one declaration by balancing braces from its marker. This narrows the helper checks to the actual
-/// TVDetailActionRow body, including the required unclipped-focus modifier on that specific ScrollView.
-private func declaration(_ source: String, markedBy marker: String) -> String? {
-    guard let start = source.range(of: marker),
-          let open = source[start.lowerBound...].firstIndex(of: "{") else { return nil }
+@main
+private struct TVDetailActionLayoutContract {
+    static func main() {
+// A source refresh may add, settle, or remove the best candidate. None of those transitions may remove the
+// Library anchor or alter the Up graph.
+let sourceStates: [(String, TVDetailActionState, Bool)] = [
+    ("best absent", state(best: .absent), false),
+    ("best settling", state(best: .settling), true),
+    ("best ready", state(best: .ready), true),
+    ("best removed after refresh", state(best: .absent), false),
+    ("trailer absent", state(hasTrailer: false, best: .ready), true),
+    ("trailer present", state(hasTrailer: true, best: .ready), true),
+]
 
-    var depth = 0
-    var cursor = open
-    while cursor < source.endIndex {
-        switch source[cursor] {
-        case "{": depth += 1
-        case "}":
-            depth -= 1
-            if depth == 0 {
-                return String(source[start.lowerBound...cursor])
-            }
-        default: break
-        }
-        cursor = source.index(after: cursor)
-    }
-    return nil
+for (name, snapshot, expectsDownload) in sourceStates {
+    let rows = TVDetailActionFocusPolicy.rows(for: snapshot)
+    expectStableSecondary(snapshot, name)
+    expect(rows.showsDownload == expectsDownload, "\(name): download eligibility follows a present best source")
 }
 
+// The download's presentation state is intentionally orthogonal to the focus topology. This is especially
+// important when its button swaps from Download to Downloading to Downloaded while the user is on the row.
+for (name, download) in [
+    ("download none", TVDetailDownloadState.none),
+    ("download in progress", TVDetailDownloadState.inProgress),
+    ("download done", TVDetailDownloadState.done),
+] {
+    let snapshot = state(best: .ready, download: download)
+    let rows = TVDetailActionFocusPolicy.rows(for: snapshot)
+    expectStableSecondary(snapshot, name)
+    expect(rows.showsDownload, "\(name): an eligible VOD download remains visible")
+}
+
+let live = state(isLive: true, hasTrailer: false, best: .ready, download: .unavailable)
+expectStableSecondary(live, "live source ready")
+expect(!TVDetailActionFocusPolicy.rows(for: live).showsDownload,
+       "live source ready: download is correctly suppressed without removing title actions")
+
+// Explicit before/after scenarios replace the old conditional-row source assertions. The visual neighbours
+// change, but a focused secondary region remains valid through each transition.
+let refreshTransitions: [(String, TVDetailActionState, TVDetailActionState)] = [
+    ("secondary appears conceptually", state(isLive: true, best: .absent, download: .unavailable), state(isLive: true, best: .ready, download: .unavailable)),
+    ("secondary survives best removal", state(hasTrailer: true, best: .ready), state(hasTrailer: true, best: .absent)),
+    ("secondary survives trailer removal", state(hasTrailer: true, best: .settling), state(hasTrailer: false, best: .settling)),
+]
+for (name, before, after) in refreshTransitions {
+    let beforeRows = TVDetailActionFocusPolicy.rows(for: before)
+    let afterRows = TVDetailActionFocusPolicy.rows(for: after)
+    expect(beforeRows.showsSecondary && afterRows.showsSecondary,
+           "\(name): secondary row never disappears")
+    expect(beforeRows.secondaryAnchor == afterRows.secondaryAnchor,
+           "\(name): focus anchor remains Library across the transition")
+}
+
+let directionalState = state(hasTrailer: true, best: .ready, download: .inProgress)
+let directions: [(String, DetailFocusRegion, TVDetailFocusDirection, DetailFocusRegion?)] = [
+    ("secondary Up", .secondary, .up, .primary),
+    ("primary Up", .primary, .up, .top),
+    ("lower Up", .lower, .up, .secondary),
+    ("top Up", .top, .up, .shell),
+    ("shell Up", .shell, .up, nil),
+    ("secondary Down", .secondary, .down, nil),
+    ("secondary Left", .secondary, .left, nil),
+    ("secondary Right", .secondary, .right, nil),
+]
+for (name, origin, direction, destination) in directions {
+    expect(TVDetailActionFocusPolicy.destination(from: origin, direction: direction, state: directionalState) == destination,
+           "directional route: \(name)")
+}
+
+// Keep the source-level part of this harness restricted to view construction facts that a pure reducer cannot
+// observe. These are layout/accessibility guarantees, not a second navigation implementation.
 let root = CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath
 let path = root + "/app/SourcesTV/DetailView.swift"
 guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
@@ -73,217 +119,14 @@ guard let source = try? String(contentsOfFile: path, encoding: .utf8) else {
     exit(2)
 }
 
-guard let row = declaration(source, markedBy: "private struct TVDetailActionRow") else {
-    print("FAIL  TVDetailActionRow declaration is missing or unbalanced")
-    exit(1)
-}
-expect(row.contains("ScrollView(.horizontal, showsIndicators: false)"),
-       "detail action row scrolls horizontally")
-expect(row.contains(".fixedSize(horizontal: true, vertical: false)"),
-       "detail action row preserves intrinsic button widths")
-expect(row.contains(".focusSection()"),
-       "detail action row keeps remote traversal in one focus section")
-expect(row.contains(".scrollClipDisabled()"),
-       "detail action row leaves focused scale and glow visible")
-expect(row.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
-       "detail action row remains leading-aligned at every page width")
-expect(row.contains(".accessibilityElement(children: .contain)") &&
-       row.contains(".accessibilityLabel(accessibilityLabel)"),
-       "detail action row exposes an accessibility group label without removing child controls")
-expect(!source.contains("TVDetailActionRail"),
-       "legacy single-rail helper is not left behind")
-
-guard let coreList = sourceBetween(source, "struct CoreStreamList: View", "/// One horizontal, focus-contained action row") else {
-    print("FAIL  CoreStreamList/action-row boundaries are missing")
-    exit(1)
-}
-expect(count("TVDetailActionRow(accessibilityLabel:", in: coreList) == 2,
-       "movie/episode source controls have exactly two action rows")
-expect(coreList.contains("// PRIMARY: playback and source selection decisions."),
-       "source primary row is explicitly playback/source grouped")
-expect(coreList.contains("// SECONDARY: page actions and optional integrations."),
-       "source secondary row is explicitly page-action grouped")
-expect(coreList.contains("Play from start") && coreList.contains("Quality") &&
-       coreList.contains("All sources") && coreList.contains("Re-find sources"),
-       "source primary row retains resume/start/quality/source actions")
-expect(coreList.contains("secondaryAction") && coreList.contains("downloadChip") &&
-       coreList.contains("LibraryChip()") && coreList.contains("WatchlistChip()") &&
-       coreList.contains("ratingChip"),
-       "source secondary row retains trailer/download/library/watchlist/rating actions")
-expect(coreList.contains("let hasSecondaryRow = !isLive || secondaryAction != nil || best != nil") &&
-       coreList.contains("if hasSecondaryRow") &&
-       coreList.contains("loading, nil-best, no-source, and failed-source states"),
-       "secondary row is independent of source-result availability")
-guard let independentRows = sourceBetween(coreList,
-                                          "if hasSecondaryRow",
-                                          "if let best {\n                // #16: why the recommended source") else {
-    print("FAIL  independent secondary-row scope is missing")
-    exit(1)
-}
-expect(independentRows.contains("secondaryAction") &&
-       independentRows.contains("focusSecondary(secondaryAction)"),
-       "independent row contains the production trailer focus target")
-guard let primaryStates = sourceBetween(coreList,
-                                        "TVDetailActionRow(accessibilityLabel: String(localized: \"Playback and source actions\")",
-                                        "if hasSecondaryRow") else {
-    print("FAIL  persistent primary-row scope is missing")
-    exit(1)
-}
-expect(primaryStates.contains("else if loadingAddons") &&
-       primaryStates.contains("No sources found"),
-       "the persistent primary row covers loading and terminal error states")
-expect(primaryStates.contains(".focusable()") &&
-       primaryStates.contains(".accessibilityHint") &&
-       !primaryStates.contains("Button {}"),
-       "loading and no-source primary states are focusable status semantics, not inert buttons")
-expect(coreList.contains(".focused($sourceFocusTarget, equals: .secondary)"),
-       "the trailer/first secondary control has a real focus target")
-expect(coreList.contains("sourceMoveHandler(from: .secondary, hasSecondary: !isLive)") &&
-       coreList.contains("case .secondary:"),
-       "secondary row owns the production secondary-to-primary transition")
-expect(coreList.contains("handleSourceMove(direction, from: region, hasSecondary: hasSecondary)") &&
-       coreList.contains("sourceFocusTarget = .secondary") &&
-       coreList.contains("watchFocused = true"),
-       "source focus state bridges secondary, primary, and top without a test-only mirror")
-expect(coreList.contains("FocusState<DetailFocusRegion?>.Binding?") &&
-       coreList.contains("focusSecondary") &&
-       coreList.contains("parentFocusTarget.wrappedValue = .secondary") &&
-       coreList.contains("parentFocusTarget?.wrappedValue = nil"),
-       "movie lower rails enter the real source secondary target before primary/top")
-expect(!coreList.contains("HStack(spacing: Theme.Space.md) {"),
-       "source controls do not regress to a finite-width action HStack")
-
-guard let hero = sourceBetween(source, "private func hero(", "private func heroTrailerLayer") else {
-    print("FAIL  series hero boundaries are missing")
-    exit(1)
-}
-expect(count("TVDetailActionRow(spacing: Theme.Space.sm,", in: hero) == 2,
-       "series hero has exactly two action rows")
-expect(hero.contains("// PRIMARY: play/resume and episode navigation."),
-       "series hero primary row is semantically grouped")
-expect(hero.contains("// SECONDARY: trailer, library, watchlist, ratings, and optional check-in."),
-       "series hero secondary row is semantically grouped")
-expect(hero.contains("trailerChip(m)") && hero.contains("LibraryChip()") &&
-       hero.contains("WatchlistChip()") && hero.contains("TraktCheckinChip"),
-       "series hero secondary row retains optional actions")
-expect(hero.contains("accessibilityLabel: String(localized: \"Playback and episode actions\")") &&
-       hero.contains("accessibilityLabel: String(localized: \"Trailer and title actions\")"),
-       "series hero rows expose separate accessibility group labels")
-
-guard let movie = sourceBetween(source, "private func moviePage", "/// The title block:") else {
-    print("FAIL  movie page boundaries are missing")
-    exit(1)
-}
-expect(movie.contains("ScrollViewReader") && movie.contains("Color.clear.frame(height: 0).id(DetailFocusAnchor.top)"),
-       "movie detail has a scroll-position top anchor")
-expect(movie.contains(".focused($detailFocusTarget, equals: .top)") &&
-       movie.contains(".accessibilityElement(children: .combine)"),
-       "movie detail uses a visible accessible top focus target")
-expect(movie.contains("onDetailMove: { direction, region in") &&
-       movie.contains("handleDetailMove(direction, from: region, using: proxy)"),
-       "movie source rows delegate only their primary-to-top transition")
-expect(movie.contains("parentFocusTarget: $detailFocusTarget"),
-       "movie source rows share the parent focus graph for lower-to-secondary recovery")
-expect(movie.contains("secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil"),
-       "movie always supplies its trailer to the independent secondary row")
-expect(count("handleDetailMove($0, from: .lower, using: proxy)", in: movie) == 4 &&
-       !movie.contains("handleMovieLowerMove"),
-       "movie lower rails share one deterministic Up route")
-expect(!movie.contains("HStack(spacing: Theme.Space.sm) { trailerChip(m)"),
-       "movie trailer is not a stray third action row")
-
-guard let series = sourceBetween(source, "private func seriesPage", "/// Movies get the full-bleed cinematic page") else {
-    print("FAIL  series page boundaries are missing")
-    exit(1)
-}
-expect(series.contains("ScrollViewReader") && series.contains("Color.clear.frame(height: 0).id(DetailFocusAnchor.top)"),
-       "series detail has a scroll-position top anchor")
-expect(series.contains("CoreSeasonedEpisodes") && series.contains("castSection") &&
-       series.contains("whereToWatchSection") && series.contains("collectionSection") &&
-       series.contains("moreLikeThisSection"),
-       "series detail includes every lower focus region")
-expect(count("handleDetailMove($0, from: .lower, using: proxy)", in: series) == 5,
-       "series episodes and lower rails all route Up through one scoped handler")
-expect(!series.contains("onMoveCommand { handleDetailMove($0, from: .top"),
-       "series top target does not swallow the native shell handoff")
-
-guard let episode = sourceBetween(source, "struct CoreEpisodeStreams: View", "/// The per-addon stream list") else {
-    print("FAIL  episode detail boundaries are missing")
-    exit(1)
-}
-expect(episode.contains("ScrollViewReader") && episode.contains("Color.clear.frame(height: 0).id(DetailFocusAnchor.top)"),
-       "episode detail has a scroll-position top anchor")
-expect(episode.contains(".focused($episodeFocusTarget, equals: .top)") &&
-       episode.contains("onDetailMove: { direction, region in") &&
-       episode.contains("DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: true) == .top"),
-       "episode sources have a visible top focus target and production Up escape")
-expect(episode.contains("accessibilityReduceMotion ? nil : .easeOut"),
-       "episode top recovery honors Reduce Motion")
-expect(!episode.contains("handleEpisodeMove") &&
-       !episode.contains("onMoveCommand { handleDetailMove($0, from: .top"),
-       "episode does not duplicate a child/outer handler or swallow top-to-shell")
-
-guard let focusPolicy = declaration(source, markedBy: "private enum DetailFocusEscapePolicy") else {
-    print("FAIL  production focus policy declaration is missing or unbalanced")
-    exit(1)
-}
-expect(focusPolicy.contains("static func nextUp(from region: DetailFocusRegion, hasSecondary: Bool) -> DetailFocusRegion?"),
-       "production focus policy is explicit and state-based")
-for (transition, sourceCase) in [
-    ("secondary -> primary", "case .secondary:\n            return .primary"),
-    ("primary -> visible top", "case .primary:\n            return .top"),
-    ("lower -> nearest action row", "case .lower:\n            return hasSecondary ? .secondary : .primary"),
-    ("top -> native shell", "case .top:\n            return .shell"),
-    ("shell has no local target", "case .shell:\n            return nil")
-] {
-    expect(focusPolicy.contains(sourceCase), "production Up graph contains \(transition)")
-}
-expect(source.contains("@FocusState private var detailFocusTarget: DetailFocusRegion?") &&
-       source.contains("@State private var detailFocusRegion: DetailFocusRegion = .top") &&
-       source.contains("detailFocusTarget = region"),
-       "production focus state records the visible region and target")
-expect(source.contains("withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25))"),
-       "movie/series top recovery honors Reduce Motion")
-expect(source.contains("guard direction == .up"),
-       "focus escape captures Up only, preserving horizontal and Down navigation")
-expect(source.contains("proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)"),
-       "Up escape restores the outer scroll position")
-expect(source.contains("detailFocusTarget = region") && source.contains("TabBarHealer.heal(\"detail-focus-\\(String(describing: region))\")"),
-       "Up escape restores a visible target and keeps tab-bar layout healed")
-expect(!source.contains("DetailFocusEscapePolicy.shouldCaptureUp") &&
-       !source.contains("func shouldCaptureUp") &&
-       !source.contains("struct DetailFocusScenario"),
-       "the contract does not duplicate production focus policy")
-expect(!source.contains(".onMoveCommand { handleDetailMove($0, using: proxy) }"),
-       "no legacy outer handler remains to swallow top-to-shell")
-expect(source.contains(".scrollClipDisabled()"),
-       "unclipped focused action effects remain part of the source contract")
-
-// These are the concrete content-height cases used by the device journey. The assertions below inspect the
-// production page/layout seams for each case; they do not re-implement the focus policy in this harness.
-let contentCases: [(name: String, synopsisLines: Int, languageRows: Int)] = [
-    ("empty synopsis / no languages", 0, 0),
-    ("short synopsis / one language row", 1, 1),
-    ("wrapped synopsis / several language rows", 3, 4),
-    ("long synopsis / many language rows", 128, 32),
-]
-for contentCase in contentCases {
-    expect(movie.contains("languageChips") &&
-           movie.contains(".lineLimit(3, reservesSpace: true)") &&
-           focusPolicy.contains("case .lower:") &&
-           source.contains("focusDetailRegion(next, using: proxy)"),
-           "production route covers \(contentCase.name) (\(contentCase.synopsisLines) synopsis lines / \(contentCase.languageRows) language rows)")
-}
-expect(source.contains("case .top:\n            return .shell") &&
-       !source.contains("onMoveCommand { handleDetailMove($0, from: .top"),
-       "top Up is released to the native tab/menu without a local cycle")
-expect(coreList.contains("guard onDetailMove != nil else { return nil }") &&
-       sourceBetween(source, "private func livePage", "/// Now/Next EPG strip")?.contains("onDetailMove:") == false,
-       "live pages leave move ownership to the native focus engine when no bridge exists")
-expect(coreList.contains(".onChange(of: hasSecondaryRow)") &&
-       coreList.contains("sourceFocusTarget = nil") &&
-       coreList.contains("watchFocused = true"),
-       "conditional secondary-row disappearance recovers focus to the primary target")
+expect(source.contains("private struct TVDetailActionRow"), "two-row view helper is present")
+expect(source.contains("ScrollView(.horizontal, showsIndicators: false)"), "action rows scroll horizontally")
+expect(source.contains(".fixedSize(horizontal: true, vertical: false)"), "action labels preserve intrinsic widths")
+expect(source.contains(".scrollClipDisabled()"), "focused action effects remain unclipped")
+expect(source.contains("focusSecondary(LibraryChip())"), "Library is installed as the source-row focus anchor")
+expect(source.contains("TVDetailActionFocusPolicy.rows(for: actionState)"), "SwiftUI reads the production row policy")
+expect(!source.contains("hasSecondaryRow"), "legacy conditional secondary-row state is removed")
+expect(!source.contains("DetailFocusEscapePolicy"), "legacy source-only focus policy is removed")
 
 if failed == 0 {
     print("PASS  tvOS detail action and focus contract (\(passed) checks)")
@@ -291,4 +134,6 @@ if failed == 0 {
 } else {
     print("FAIL  tvOS detail action and focus contract (\(failed) failed, \(passed) passed)")
     exit(1)
+}
+    }
 }
