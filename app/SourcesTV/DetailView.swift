@@ -1145,7 +1145,7 @@ struct DetailView: View {
                 // On-screen focusable anchor: grabs initial focus on push (so Back pops instead of
                 // exiting), and jumps to the episodes / sources below.
                 VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                    HStack(spacing: Theme.Space.sm) {
+                    TVDetailActionRail(spacing: Theme.Space.sm) {
                         if let primaryEpisode {
                             VStack(spacing: Theme.Space.xs) {
                                 NavigationLink {
@@ -1188,7 +1188,6 @@ struct DetailView: View {
                         // a movie has none and passes nil. Hidden unless Trakt is connected and the action
                         // was turned on, so this costs a movie page nothing by default.
                         TraktCheckinChip(season: primaryEpisode?.season, episode: primaryEpisode?.episode)
-                        Spacer(minLength: 0)
                     }
                 }
                 .padding(.top, Theme.Space.xs)
@@ -2451,7 +2450,7 @@ struct CoreStreamList: View {
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
-                HStack(spacing: Theme.Space.md) {
+                TVDetailActionRail {
                     // Stays FOCUSABLE while gated (a disabled button is unfocusable on tvOS, which
                     // dumped focus onto the Quality chip); the action is simply inert until the
                     // add-ons settle, then the same focused button springs alive in place.
@@ -3605,6 +3604,42 @@ struct CoreStreamList: View {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
         URLSession.shared.dataTask(with: request).resume()
+    }
+}
+
+/// A horizontal, focus-contained action rail for detail-page controls.
+///
+/// Detail actions are intentionally kept in one row so the primary Watch action and its related
+/// controls remain adjacent. A regular HStack receives the page's finite width proposal and lets its
+/// children compress; on tvOS that makes longer labels wrap inside otherwise small pills. The scroll
+/// view removes that horizontal constraint, while the intrinsic-width HStack keeps each control legible
+/// and lets the Siri Remote traverse the complete row. `focusSection` keeps left/right navigation in
+/// the rail and preserves the existing up/down path to the page content.
+private struct TVDetailActionRail<Content: View>: View {
+    private let spacing: CGFloat
+    private let content: Content
+
+    init(spacing: CGFloat = Theme.Space.md, @ViewBuilder content: () -> Content) {
+        self.spacing = spacing
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: spacing) {
+                content
+            }
+            // The horizontal scroll view supplies an unconstrained width. Keep the row at its
+            // natural width so buttons never receive a smaller proposal that would wrap their labels.
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, Theme.Space.xs)
+            .padding(.vertical, Theme.Space.xs)
+        }
+        // Focused controls scale beyond their layout bounds; keep the rail's glow and focus ring
+        // visible at the viewport edge while the row scrolls.
+        .scrollClipDisabled()
+        .focusSection()
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
