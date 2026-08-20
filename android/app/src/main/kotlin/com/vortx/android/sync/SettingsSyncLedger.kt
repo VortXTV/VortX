@@ -82,16 +82,41 @@ internal class SettingsSyncLedger(context: Context) {
     }
 
     /**
-     * Fold remote state before applying the pulled plist. Dirty local entries always win this merge;
-     * otherwise a newer stamp wins, with device id as a deterministic equal-clock tiebreak.
+     * Preview remote state before applying the pulled plist. Dirty local entries always win this merge;
+     * otherwise a newer stamp wins, with device id as a deterministic equal-clock tiebreak. The caller
+     * must call [commitRemote] only after every selected remote value has been synchronously written.
+     *
+     * Keeping this side-effect free is intentional: persisting a winning remote revision before its value
+     * has reached SharedPreferences lets a crash or malformed carrier suppress the only retry.
      */
     fun mergeRemote(accountId: String, remote: Map<String, Stamp>): MergeResult {
         if (accountId.isBlank()) return MergeResult(emptySet(), emptySet(), emptySet())
         synchronized(lock) {
             val local = read(accountId)
             val folded = foldRecords(local, remote)
-            write(accountId, folded.records)
             return resultFor(folded.records, folded.applyRemote)
+        }
+    }
+
+    /**
+     * Durably accept only remote revisions whose values (or clears) were committed by the caller.
+     * A fresh local edit wins even if it occurs between preview and commit.
+     */
+    fun commitRemote(accountId: String, remote: Map<String, Stamp>, appliedKeys: Set<String>) {
+        if (accountId.isBlank() || appliedKeys.isEmpty()) return
+        synchronized(lock) {
+            val local = read(accountId)
+            var changed = false
+            for (key in appliedKeys) {
+                val candidate = remote[key] ?: continue
+                if (!isLedgerable(key)) continue
+                val current = local[key]
+                if (current == null || (!current.dirty && compare(candidate, current) > 0)) {
+                    local[key] = candidate.copy(dirty = false)
+                    changed = true
+                }
+            }
+            if (changed) write(accountId, local)
         }
     }
 
@@ -100,26 +125,30 @@ internal class SettingsSyncLedger(context: Context) {
         resultFor(read(accountId), emptySet())
     }
 
-    /** A successful account-document PUT acknowledges every dirty record in this account scope. */
-    fun acknowledgePublished(accountId: String) {
+    /** Snapshot the dirty revisions that are actually represented by a candidate document. */
+    fun publicationSnapshot(accountId: String): Map<String, Stamp> = synchronized(lock) {
+        read(accountId).filterValues { it.dirty }
+    }
+
+    /**
+     * A successful PUT acknowledges only the dirty revisions encoded for that PUT. A later local edit has
+     * a distinct stamp and remains dirty, even when it happened while the request was in flight.
+     */
+    fun acknowledgePublished(accountId: String, published: Map<String, Stamp>) {
         if (accountId.isBlank()) return
         synchronized(lock) {
             val all = read(accountId)
-            val acknowledged = all.mapValues { (_, stamp) -> stamp.copy(dirty = false) }
-            write(accountId, acknowledged)
+            val acknowledged = acknowledgeRecords(all, published)
+            if (acknowledged != all) write(accountId, acknowledged)
         }
     }
 
-    fun encodeForDocument(accountId: String): JSONObject = synchronized(lock) {
-        JSONObject().also { out ->
-            for ((key, stamp) in read(accountId)) {
-                out.put(key, JSONObject().apply {
-                    put("clock", stamp.clock)
-                    put("device", stamp.device)
-                    put("tombstone", stamp.tombstone)
-                })
-            }
-        }
+    /**
+     * Read-merge our known revisions onto the raw cloud block. Unknown/future revisions are retained verbatim;
+     * known entries absent from an older partial ledger are preserved until this client has a local revision.
+     */
+    fun encodeForDocument(accountId: String, existing: JSONObject?): JSONObject = synchronized(lock) {
+        mergeDocumentRevisions(existing, read(accountId))
     }
 
     fun decodeDocument(raw: JSONObject?): Map<String, Stamp> {
@@ -137,6 +166,8 @@ internal class SettingsSyncLedger(context: Context) {
                 clock = clock,
                 device = device,
                 tombstone = entry.optBoolean("tombstone", false),
+                // Cloud revisions describe acknowledged state. A remote sender's local-pending bit, if one
+                // appears from a future client, must never suppress local conflict resolution on this device.
                 dirty = false,
             )
         }
@@ -162,17 +193,13 @@ internal class SettingsSyncLedger(context: Context) {
     private fun read(accountId: String): MutableMap<String, Stamp> {
         val raw = prefs.getString(KEY_RECORDS_PREFIX + accountId, null) ?: return linkedMapOf()
         val objectValue = runCatching { JSONObject(raw) }.getOrNull() ?: return linkedMapOf()
-        return decodeDocument(objectValue).toMutableMap()
+        return decodeStored(objectValue).toMutableMap()
     }
 
     private fun write(accountId: String, records: Map<String, Stamp>) {
         prefs.edit().putString(KEY_RECORDS_PREFIX + accountId, JSONObject().also { out ->
             for ((key, stamp) in records) {
-                out.put(key, JSONObject().apply {
-                    put("clock", stamp.clock)
-                    put("device", stamp.device)
-                    put("tombstone", stamp.tombstone)
-                })
+                out.put(key, encodeStamp(stamp, includeDirty = true))
             }
         }.toString()).commit()
     }
@@ -206,5 +233,61 @@ internal class SettingsSyncLedger(context: Context) {
             left.tombstone != right.tombstone -> left.tombstone.compareTo(right.tombstone)
             else -> 0
         }
+
+        internal fun acknowledgeRecords(
+            records: Map<String, Stamp>,
+            published: Map<String, Stamp>,
+        ): Map<String, Stamp> = records.mapValues { (key, current) ->
+            val sent = published[key]
+            if (current.dirty && sent != null && sameRevision(current, sent)) current.copy(dirty = false) else current
+        }
+
+        internal fun decodeStored(raw: JSONObject?): Map<String, Stamp> {
+            raw ?: return emptyMap()
+            val result = linkedMapOf<String, Stamp>()
+            val keys = raw.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (!isLedgerableStatic(key)) continue
+                val entry = raw.optJSONObject(key) ?: continue
+                val clock = entry.optLong("clock", -1L)
+                val device = entry.optString("device", "")
+                if (clock < 0L || device.isBlank()) continue
+                result[key] = Stamp(
+                    clock = clock,
+                    device = device,
+                    tombstone = entry.optBoolean("tombstone", false),
+                    dirty = entry.optBoolean("dirty", false),
+                )
+            }
+            return result
+        }
+
+        /** Preserve unknown document entries while replacing only revisions this client owns. */
+        internal fun mergeDocumentRevisions(
+            existing: JSONObject?,
+            local: Map<String, Stamp>,
+        ): JSONObject = JSONObject(existing?.toString() ?: "{}").also { out ->
+            for ((key, stamp) in local) out.put(key, encodeStamp(stamp, includeDirty = false))
+        }
+
+        /** Keys not named by a partial revision map retain legacy set-only carrier behaviour. */
+        internal fun unrevisionedKeys(
+            carrierKeys: Set<String>,
+            revisions: Map<String, Stamp>,
+        ): Set<String> = carrierKeys.filterTo(linkedSetOf()) { it !in revisions && isLedgerableStatic(it) }
+
+        private fun encodeStamp(stamp: Stamp, includeDirty: Boolean): JSONObject = JSONObject().apply {
+            put("clock", stamp.clock)
+            put("device", stamp.device)
+            put("tombstone", stamp.tombstone)
+            if (includeDirty) put("dirty", stamp.dirty)
+        }
+
+        private fun sameRevision(left: Stamp, right: Stamp): Boolean =
+            left.clock == right.clock && left.device == right.device && left.tombstone == right.tombstone
+
+        private fun isLedgerableStatic(key: String): Boolean =
+            key in SettingsBackup.SYNCABLE_SETTING_TYPES && SettingsBackup.isSyncable(key)
     }
 }
