@@ -7,8 +7,10 @@ import { after, before, test } from "node:test";
 
 import {
   assertAssetFile,
+  assertAppcast,
   assertMonotonic,
   assertSource,
+  buildReleaseFeedArtifact,
   fetchJSON,
   main,
   releaseAssetURL,
@@ -21,8 +23,10 @@ const BUILD = 221;
 const VERSION = "0.3.14";
 const IOS_URL = releaseAssetURL(TAG, "iOS");
 const TVOS_URL = releaseAssetURL(TAG, "tvOS");
+const MAC_URL = `https://github.com/VortXTV/VortX/releases/download/${TAG}/VortX-macOS-${TAG}-ci.dmg`;
 const IOS_SHA = "1".repeat(64);
 const TVOS_SHA = "2".repeat(64);
+const MAC_SHA = "3".repeat(64);
 
 function entry({ build = BUILD, url, size, sha256, minOSVersion }) {
   return {
@@ -52,12 +56,18 @@ const expected = {
   tag: TAG,
   build: BUILD,
   version: VERSION,
+  name: "Beta 19",
+  notes: "Beta release notes.",
+  prerelease: true,
   iosSize: 101,
   tvosSize: 202,
+  macSize: 303,
   iosSha256: IOS_SHA,
   tvosSha256: TVOS_SHA,
+  macSha256: MAC_SHA,
   iosURL: IOS_URL,
   tvosURL: TVOS_URL,
+  macURL: MAC_URL,
 };
 
 let temp;
@@ -86,10 +96,12 @@ before(async () => {
     }
     if (url.pathname === "/appcast") {
       response.end(JSON.stringify({
+        schemaVersion: 2,
         _generatedFromTag: TAG,
-        ios: { build: BUILD, ipa: IOS_URL, size: 101, sha256: IOS_SHA, altstore: "https://vortx.tv/altstore.json" },
-        tvos: { build: BUILD, ipa: TVOS_URL, size: 202, sha256: TVOS_SHA, altstore: "https://vortx.tv/altstore.json" },
-        mac: { build: BUILD, ipa: "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.19/VortX-macOS-v0.3.14-beta.19-ci.dmg", size: 303, sha256: "3".repeat(64), altstore: "https://vortx.tv/altstore.json" },
+        _generatedFromCommit: "a".repeat(40),
+        ios: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: IOS_URL, url: IOS_URL, size: 101, sha256: IOS_SHA, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
+        tvos: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: TVOS_URL, url: TVOS_URL, size: 202, sha256: TVOS_SHA, altstore: null, artifactType: "ipa" },
+        mac: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: MAC_URL, url: MAC_URL, size: 303, sha256: MAC_SHA, altstore: null, artifactType: "dmg" },
         android: null,
       }));
       return;
@@ -114,10 +126,16 @@ test("Beta 10 build mismatch is rejected instead of advertising the wrong binary
 
 test("release and manual cut paths both require feed propagation", async () => {
   const workflow = await readFile(new URL("../../.github/workflows/release-tvos.yml", import.meta.url), "utf8");
-  assert.match(workflow, /concurrency:\s*\n\s+group:\s*vortx-release-attachments/);
-  assert.match(workflow, /name: Update altstore\/source\.json and push to main/);
+  assert.match(workflow, /concurrency:\s*\n\s+group:\s*vortx-release-\$\{\{ inputs\.release_tag \}\}/);
+  assert.match(workflow, /name: Build the content-addressed release feed artifact/);
+  assert.match(workflow, /name: Attach only exact draft assets and create the authenticated staged receipt/);
+  assert.match(workflow, /publish_release/);
+  assert.match(workflow, /name: Publish the verified draft, promote the exact edge generation, and prove public bytes/);
+  assert.match(workflow, /name: Verify the immutable published release and public feed/);
   assert.doesNotMatch(workflow, /if:\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*\n\s*uses: actions\/checkout/);
-  assert.doesNotMatch(workflow, /name: Update altstore\/source\.json and push to main[\s\S]{0,240}if:\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]/);
+  const releaseWrite = workflow.slice(workflow.indexOf("  attach-release:"));
+  assert.doesNotMatch(releaseWrite, /gh release upload/);
+  assert.doesNotMatch(releaseWrite, /--clobber/);
 });
 
 test("out-of-order publication is rejected when main already leads", () => {
@@ -139,7 +157,7 @@ test("query variants must not return a stale generation", async () => {
       compatibilityURL: `${baseURL}/compat`,
       attempts: 1,
     }),
-    /different JSON bodies/,
+    /exact staged source|route-byte-drift/,
   );
 });
 
@@ -154,7 +172,7 @@ test("public route must advertise a bounded cache policy", async () => {
       compatibilityURL: `${baseURL}/compat`,
       attempts: 1,
     }),
-    /bounded cache-control/,
+    /bounded cache-control|unsafe cache-control/,
   );
 });
 
@@ -191,7 +209,12 @@ test("rollback restores the last known-good feed", async () => {
   const backup = join(temp, "rollback-source.previous.json");
   await writeFile(file, "new-generation\n");
   await writeFile(backup, "known-good-generation\n");
-  main(["rollback", "--file", file, "--backup", backup]);
+  await writeFile(`${file}.generation`, "new-generation\n");
+  await writeFile(`${backup}.generation`, "known-good-generation\n");
+  main(["rollback", "--file", file, "--backup", backup,
+    "--expected-current-sha256", sha256File(file),
+    "--expected-generation", "new-generation",
+    "--restore-generation", "known-good-generation"]);
   assert.equal(await readFile(file, "utf8"), "known-good-generation\n");
 });
 
@@ -207,4 +230,57 @@ test("public routes pass current schema, asset metadata, and appcast checks", as
     attempts: 1,
   });
   assert.equal(result.appcast._generatedFromTag, TAG);
+});
+
+test("appcast must state Android null until a signed artifact exists", () => {
+  const appcast = {
+    schemaVersion: 2,
+    _generatedFromTag: TAG,
+    ios: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: IOS_URL, url: IOS_URL, size: 101, sha256: IOS_SHA, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
+    tvos: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: TVOS_URL, url: TVOS_URL, size: 202, sha256: TVOS_SHA, altstore: null, artifactType: "ipa" },
+    mac: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: MAC_URL, url: MAC_URL, size: 303, sha256: MAC_SHA, altstore: null, artifactType: "dmg" },
+  };
+  assert.throws(() => assertAppcast(appcast, expected), /Android/);
+});
+
+test("content-addressed artifact records exact local bytes and keeps Android null", async () => {
+  const sourceTemplate = join(temp, "source-template.json");
+  const output = join(temp, "feed-artifact");
+  const files = {
+    ios: join(temp, "ios.ipa"),
+    tvos: join(temp, "tvos.ipa"),
+    lite: join(temp, "lite.ipa"),
+    mac: join(temp, "mac.dmg"),
+    checksum: join(temp, "checksums.txt"),
+  };
+  await writeFile(sourceTemplate, `${JSON.stringify(sourceFixture({ build: 220 }), null, 2)}\n`);
+  await writeFile(files.ios, "ios-content");
+  await writeFile(files.tvos, "tvos-content");
+  await writeFile(files.lite, "lite-content");
+  await writeFile(files.mac, "mac-content");
+  const local = Object.values(files).slice(0, 4);
+  await writeFile(files.checksum, `${local.map((file) => `${sha256File(file)}  out/${file.split("/").pop()}`).join("\n")}\n`);
+  const result = buildReleaseFeedArtifact({
+    tag: TAG,
+    build: BUILD,
+    sourceCommit: "a".repeat(40),
+    sourceTemplate,
+    output,
+    iosFile: files.ios,
+    tvosFile: files.tvos,
+    tvosLiteFile: files.lite,
+    macFile: files.mac,
+    checksumFile: files.checksum,
+    name: "Beta 19",
+    note: "Beta release notes.",
+  });
+  assert.equal(result.manifest.android, null);
+  assert.equal(result.manifest.assets.ios.state, "trusted-local");
+  assert.equal(result.manifest.assets.mac.url, MAC_URL);
+  assert.equal(JSON.parse(await readFile(join(output, "source.json"), "utf8")).apps[0].versions[0].buildVersion, "221");
+  const appcast = JSON.parse(await readFile(join(output, "appcast.json"), "utf8"));
+  assertAppcast(appcast, { ...expected, iosSize: 11, tvosSize: 12, macSize: 11, iosSha256: sha256File(files.ios), tvosSha256: sha256File(files.tvos), macSha256: sha256File(files.mac) });
+  assert.equal(appcast.ios.altstore, "https://vortx.tv/altstore.json");
+  assert.equal(appcast.tvos.altstore, null);
+  assert.equal(appcast.mac.artifactType, "dmg");
 });
