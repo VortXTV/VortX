@@ -228,10 +228,20 @@ final class JSProviderSource: ObservableObject {
         into groups: [CoreStreamSourceGroup]
     ) -> [CoreStreamSourceGroup] {
         guard authorization != nil, !extra.isEmpty else { return groups }
-        var seenURLs: Set<String> = []
-        for g in groups { for s in g.streams { if let u = s.url { seenURLs.insert(u) } } }
+        // Identical URLs with different authorized request headers are distinct playback contracts. Collapsing
+        // them loses signed-session semantics and can turn a usable source into a 403.
+        func key(_ stream: CoreStream) -> String? {
+            guard let url = stream.url else { return nil }
+            let headers = (stream.requestHeaders ?? [:]).sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value)" }.joined(separator: "\u{1F}")
+            return "\(url)\u{1E}\(headers)"
+        }
+        var seenURLs = Set(groups.flatMap(\.streams).compactMap(key))
         let fresh = extra.compactMap { g -> CoreStreamSourceGroup? in
-            let streams = g.streams.filter { s in s.url.map { !seenURLs.contains($0) } ?? true }
+            let streams = g.streams.filter { stream in
+                guard let streamKey = key(stream) else { return true }
+                return seenURLs.insert(streamKey).inserted
+            }
             guard !streams.isEmpty else { return nil }
             return CoreStreamSourceGroup(id: g.id, addon: g.addon, streams: streams)
         }

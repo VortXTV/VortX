@@ -1368,6 +1368,10 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// engine JSON WITHOUT the key decodes byte-identically; set only by `MediaServerSource`'s synthetic mapping.
     let vortxProvider: String?
 
+    /// Community JavaScript results must use the guarded routing contract before any direct URL reaches a
+    /// player, download, subtitle, or warm path. Other stream classes preserve their established routing.
+    var isCommunityJavaScriptProvider: Bool { vortxProvider?.hasPrefix("jsplugin:") == true }
+
     var id: String { (url ?? externalUrl ?? infoHash ?? nzbUrl ?? "?") + "#" + (name ?? "") + (description ?? "") }
     var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
 
