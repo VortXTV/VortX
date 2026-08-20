@@ -41,6 +41,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.ui.screens.PersonScreen
+import com.vortx.android.ui.screens.spoilerVeiled
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -68,6 +69,9 @@ fun TvSeasonEpisodeSection(
     onSelectEpisode: (String) -> Unit,
     onToggleWatched: (Episode, Boolean) -> Unit,
     onMarkSeasonWatched: (Int, Boolean) -> Unit,
+    spoilerSafe: Boolean,
+    revealedEpisodeIds: Set<String>,
+    onRevealEpisode: (String) -> Unit,
 ) {
     val seasons = remember(detail.videos) {
         detail.videos.map { it.season }.distinct().sorted()
@@ -122,11 +126,15 @@ fun TvSeasonEpisodeSection(
         ) {
             itemsIndexed(episodes, key = { _, ep -> ep.id }) { _, episode ->
                 val watched = episode.id in detail.watchedVideoIds
+                val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
                 TvEpisodeCard(
                     episode = episode,
                     watched = watched,
+                    veiled = veiled,
                     isCurrent = episode.id == selectedEpisodeId,
-                    onSelect = { onSelectEpisode(episode.id) },
+                    onSelect = {
+                        if (veiled) onRevealEpisode(episode.id) else onSelectEpisode(episode.id)
+                    },
                     onToggleWatched = { onToggleWatched(episode, !watched) },
                 )
             }
@@ -143,6 +151,7 @@ fun TvSeasonEpisodeSection(
 private fun TvEpisodeCard(
     episode: Episode,
     watched: Boolean,
+    veiled: Boolean,
     isCurrent: Boolean,
     onSelect: () -> Unit,
     onToggleWatched: () -> Unit,
@@ -178,13 +187,24 @@ private fun TvEpisodeCard(
                         .clip(VortXShapes.card)
                         .background(colors.surface2),
                 ) {
-                    if (!episode.thumbnail.isNullOrBlank()) {
+                    if (!veiled && !episode.thumbnail.isNullOrBlank()) {
                         AsyncImage(
                             model = episode.thumbnail,
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize(),
                         )
+                    }
+                    if (veiled) {
+                        Box(
+                            modifier = Modifier.fillMaxSize().background(colors.surface2),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "Spoiler — select to reveal",
+                                style = VortXTheme.type.label.copy(color = colors.textSecondary),
+                            )
+                        }
                     }
                     if (watched) {
                         Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
@@ -217,13 +237,13 @@ private fun TvEpisodeCard(
                         style = VortXTheme.type.label.copy(color = colors.textSecondary),
                     )
                     Text(
-                        text = episode.title,
+                        text = if (veiled) "Episode ${episode.episode}" else episode.title,
                         style = VortXTheme.type.body.copy(fontWeight = FontWeight.SemiBold),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.padding(top = 2.dp),
                     )
-                    episode.overview?.takeIf { it.isNotBlank() }?.let {
+                    episode.overview?.takeIf { it.isNotBlank() && !veiled }?.let {
                         Text(
                             text = it,
                             style = VortXTheme.type.label.copy(color = colors.textTertiary),

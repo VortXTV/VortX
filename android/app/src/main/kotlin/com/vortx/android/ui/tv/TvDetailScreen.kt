@@ -249,6 +249,8 @@ private fun TvDetailContent(
     // `DetailView.swift`'s `loadFinancials` + `loadCollection`.
     val discoverPrefs = remember(context) { HomeDiscoverPreferences(context) }
     val showFinancials = discoverPrefs.showFinancials
+    val spoilerSafe = discoverPrefs.spoilerSafe
+    var revealedEpisodeIds by remember(detail.id) { mutableStateOf<Set<String>>(emptySet()) }
     var financials by remember(detail.id) { mutableStateOf<FinancialsClient.Financials?>(null) }
     var movieCollection by remember(detail.id) { mutableStateOf<CollectionClient.MovieCollection?>(null) }
     var releaseDates by remember(detail.id) { mutableStateOf<ReleaseDatesClient.ReleaseDates?>(null) }
@@ -533,6 +535,9 @@ private fun TvDetailContent(
                     },
                     onToggleWatched = viewModel::setVideoWatched,
                     onMarkSeasonWatched = viewModel::setSeasonWatched,
+                    spoilerSafe = spoilerSafe,
+                    revealedEpisodeIds = revealedEpisodeIds,
+                    onRevealEpisode = { episodeId -> revealedEpisodeIds = revealedEpisodeIds + episodeId },
                 )
             }
 
