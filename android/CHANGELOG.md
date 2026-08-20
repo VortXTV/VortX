@@ -32,6 +32,12 @@ sync offset and apply it automatically, and contribute embedded or add-on subtit
 benefits. Your own manual sync nudge always wins and teaches the pool the right offset for that exact release. A
 later update wires this into the subtitle picker; today it ships as the tested groundwork behind it.
 
+**Subtitle contribution: embedded text extraction.** A finished local download's own text subtitle tracks
+(SubRip, WebVTT, mov_text, and SSA/ASS) can now be pulled out into a clean SRT/VTT and contributed to the
+community pool, so a viewer on a different rip that lacks that language benefits, matching the Apple app. It
+runs only on local files and never on a stream, so it can never make the player re-download a file it is
+already playing.
+
 **A scrubber that finally looks like the Apple app.** The progress bar now honours your Seek Bar Style
 choice (fourteen looks, from Classic and Minimal to Wave, Ripple, Comet, Liquid, and Spectrum), animating
 from a continuous clock so a wave really travels. It draws a faint grey buffered-ahead band so you can see
