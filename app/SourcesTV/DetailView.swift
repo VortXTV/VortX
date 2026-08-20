@@ -1311,10 +1311,10 @@ struct DetailView: View {
                                 Button(action: scrollToContent) {
                                     Label(type == "series" ? "Episodes" : "Watch",
                                           systemImage: type == "series" ? "list.bullet" : "play.fill")
-                                    }
-                                    .buttonStyle(PrimaryActionStyle())
-                                    .focused($detailFocusTarget, equals: .primary)
-                                } else {
+                                }
+                                .buttonStyle(PrimaryActionStyle())
+                                .focused($detailFocusTarget, equals: .primary)
+                            } else {
                                 Button(action: scrollToContent) {
                                     Label("Episodes", systemImage: "list.bullet")
                                 }
