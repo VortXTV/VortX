@@ -87,6 +87,9 @@ expect(row.contains(".scrollClipDisabled()"),
        "detail action row leaves focused scale and glow visible")
 expect(row.contains(".frame(maxWidth: .infinity, alignment: .leading)"),
        "detail action row remains leading-aligned at every page width")
+expect(row.contains(".accessibilityElement(children: .contain)") &&
+       row.contains(".accessibilityLabel(accessibilityLabel)"),
+       "detail action row exposes an accessibility group label without removing child controls")
 expect(!source.contains("TVDetailActionRail"),
        "legacy single-rail helper is not left behind")
 
@@ -94,7 +97,7 @@ guard let coreList = sourceBetween(source, "struct CoreStreamList: View", "/// O
     print("FAIL  CoreStreamList/action-row boundaries are missing")
     exit(1)
 }
-expect(count("TVDetailActionRow(onMoveCommand:", in: coreList) == 2,
+expect(count("TVDetailActionRow(accessibilityLabel:", in: coreList) == 2,
        "movie/episode source controls have exactly two action rows")
 expect(coreList.contains("// PRIMARY: playback and source selection decisions."),
        "source primary row is explicitly playback/source grouped")
@@ -107,35 +110,46 @@ expect(coreList.contains("secondaryAction") && coreList.contains("downloadChip")
        coreList.contains("LibraryChip()") && coreList.contains("WatchlistChip()") &&
        coreList.contains("ratingChip"),
        "source secondary row retains trailer/download/library/watchlist/rating actions")
-expect(coreList.contains("if secondaryAction != nil || best != nil") &&
+expect(coreList.contains("let hasSecondaryRow = !isLive || secondaryAction != nil || best != nil") &&
+       coreList.contains("if hasSecondaryRow") &&
        coreList.contains("loading, nil-best, no-source, and failed-source states"),
        "secondary row is independent of source-result availability")
 guard let independentRows = sourceBetween(coreList,
-                                          "if secondaryAction != nil || best != nil",
-                                          "if let reason = StreamRanking.pickReason(best)") else {
+                                          "if hasSecondaryRow",
+                                          "if let best {\n                // #16: why the recommended source") else {
     print("FAIL  independent secondary-row scope is missing")
     exit(1)
 }
 expect(independentRows.contains("secondaryAction") &&
-       independentRows.contains("focused($sourceFocusTarget, equals: .secondary)"),
+       independentRows.contains("focusSecondary(secondaryAction)"),
        "independent row contains the production trailer focus target")
 guard let primaryStates = sourceBetween(coreList,
-                                        "TVDetailActionRow(onMoveCommand:",
-                                        "if secondaryAction != nil || best != nil") else {
+                                        "TVDetailActionRow(accessibilityLabel: String(localized: \"Playback and source actions\")",
+                                        "if hasSecondaryRow") else {
     print("FAIL  persistent primary-row scope is missing")
     exit(1)
 }
 expect(primaryStates.contains("else if loadingAddons") &&
        primaryStates.contains("No sources found"),
        "the persistent primary row covers loading and terminal error states")
+expect(primaryStates.contains(".focusable()") &&
+       primaryStates.contains(".accessibilityHint") &&
+       !primaryStates.contains("Button {}"),
+       "loading and no-source primary states are focusable status semantics, not inert buttons")
 expect(coreList.contains(".focused($sourceFocusTarget, equals: .secondary)"),
        "the trailer/first secondary control has a real focus target")
-expect(coreList.contains("handleSourceMove(direction, from: .secondary, hasSecondary: true)"),
+expect(coreList.contains("sourceMoveHandler(from: .secondary, hasSecondary: !isLive)") &&
+       coreList.contains("case .secondary:"),
        "secondary row owns the production secondary-to-primary transition")
-expect(coreList.contains("handleSourceMove(direction, from: .primary") &&
+expect(coreList.contains("handleSourceMove(direction, from: region, hasSecondary: hasSecondary)") &&
        coreList.contains("sourceFocusTarget = .secondary") &&
        coreList.contains("watchFocused = true"),
        "source focus state bridges secondary, primary, and top without a test-only mirror")
+expect(coreList.contains("FocusState<DetailFocusRegion?>.Binding?") &&
+       coreList.contains("focusSecondary") &&
+       coreList.contains("parentFocusTarget.wrappedValue = .secondary") &&
+       coreList.contains("parentFocusTarget?.wrappedValue = nil"),
+       "movie lower rails enter the real source secondary target before primary/top")
 expect(!coreList.contains("HStack(spacing: Theme.Space.md) {"),
        "source controls do not regress to a finite-width action HStack")
 
@@ -152,6 +166,9 @@ expect(hero.contains("// SECONDARY: trailer, library, watchlist, ratings, and op
 expect(hero.contains("trailerChip(m)") && hero.contains("LibraryChip()") &&
        hero.contains("WatchlistChip()") && hero.contains("TraktCheckinChip"),
        "series hero secondary row retains optional actions")
+expect(hero.contains("accessibilityLabel: String(localized: \"Playback and episode actions\")") &&
+       hero.contains("accessibilityLabel: String(localized: \"Trailer and title actions\")"),
+       "series hero rows expose separate accessibility group labels")
 
 guard let movie = sourceBetween(source, "private func moviePage", "/// The title block:") else {
     print("FAIL  movie page boundaries are missing")
@@ -165,9 +182,12 @@ expect(movie.contains(".focused($detailFocusTarget, equals: .top)") &&
 expect(movie.contains("onDetailMove: { direction, region in") &&
        movie.contains("handleDetailMove(direction, from: region, using: proxy)"),
        "movie source rows delegate only their primary-to-top transition")
+expect(movie.contains("parentFocusTarget: $detailFocusTarget"),
+       "movie source rows share the parent focus graph for lower-to-secondary recovery")
 expect(movie.contains("secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil"),
        "movie always supplies its trailer to the independent secondary row")
-expect(count("handleMovieLowerMove($0, using: proxy)", in: movie) == 4,
+expect(count("handleDetailMove($0, from: .lower, using: proxy)", in: movie) == 4 &&
+       !movie.contains("handleMovieLowerMove"),
        "movie lower rails share one deterministic Up route")
 expect(!movie.contains("HStack(spacing: Theme.Space.sm) { trailerChip(m)"),
        "movie trailer is not a stray third action row")
@@ -197,6 +217,8 @@ expect(episode.contains(".focused($episodeFocusTarget, equals: .top)") &&
        episode.contains("onDetailMove: { direction, region in") &&
        episode.contains("DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: true) == .top"),
        "episode sources have a visible top focus target and production Up escape")
+expect(episode.contains("accessibilityReduceMotion ? nil : .easeOut"),
+       "episode top recovery honors Reduce Motion")
 expect(!episode.contains("handleEpisodeMove") &&
        !episode.contains("onMoveCommand { handleDetailMove($0, from: .top"),
        "episode does not duplicate a child/outer handler or swallow top-to-shell")
@@ -220,6 +242,8 @@ expect(source.contains("@FocusState private var detailFocusTarget: DetailFocusRe
        source.contains("@State private var detailFocusRegion: DetailFocusRegion = .top") &&
        source.contains("detailFocusTarget = region"),
        "production focus state records the visible region and target")
+expect(source.contains("withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25))"),
+       "movie/series top recovery honors Reduce Motion")
 expect(source.contains("guard direction == .up"),
        "focus escape captures Up only, preserving horizontal and Down navigation")
 expect(source.contains("proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)"),
@@ -247,12 +271,19 @@ for contentCase in contentCases {
     expect(movie.contains("languageChips") &&
            movie.contains(".lineLimit(3, reservesSpace: true)") &&
            focusPolicy.contains("case .lower:") &&
-           source.contains("focusDetailRegion(.top, using: proxy)"),
+           source.contains("focusDetailRegion(next, using: proxy)"),
            "production route covers \(contentCase.name) (\(contentCase.synopsisLines) synopsis lines / \(contentCase.languageRows) language rows)")
 }
 expect(source.contains("case .top:\n            return .shell") &&
        !source.contains("onMoveCommand { handleDetailMove($0, from: .top"),
        "top Up is released to the native tab/menu without a local cycle")
+expect(coreList.contains("guard onDetailMove != nil else { return nil }") &&
+       sourceBetween(source, "private func livePage", "/// Now/Next EPG strip")?.contains("onDetailMove:") == false,
+       "live pages leave move ownership to the native focus engine when no bridge exists")
+expect(coreList.contains(".onChange(of: hasSecondaryRow)") &&
+       coreList.contains("sourceFocusTarget = nil") &&
+       coreList.contains("watchFocused = true"),
+       "conditional secondary-row disappearance recovers focus to the primary target")
 
 if failed == 0 {
     print("PASS  tvOS detail action and focus contract (\(passed) checks)")

@@ -2,7 +2,9 @@ import SwiftUI
 
 /// Semantic focus regions used by the detail-page graph. The top/row cases are attached to visible controls;
 /// `shell` records the terminal handoff but is never installed as a hidden focus target.
-private enum DetailFocusRegion: Hashable {
+// Internal because CoreStreamList's memberwise initializer carries the focus bridge between this file's
+// detail-page owners. It remains a file-local implementation type in practice; no other source file imports it.
+enum DetailFocusRegion: Hashable {
     case top
     case primary
     case secondary
@@ -853,7 +855,9 @@ struct DetailView: View {
             detailFocusTarget = nil
             return
         }
-        withAnimation(.easeOut(duration: 0.25)) {
+        // Focus recovery is a navigation aid, not a decorative transition. Respect the user's
+        // Reduce Motion setting while still restoring the same top anchor and visible focus target.
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) {
             proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)
         }
         DispatchQueue.main.async {
@@ -884,14 +888,6 @@ struct DetailView: View {
             // handler, so the real top -> shell transition remains native and cannot be swallowed here.
             detailFocusRegion = next
         }
-    }
-
-    /// Movie lower rails have no hero action row of their own: the source list owns primary/secondary focus.
-    /// Their first Up therefore returns directly to the visible movie metadata anchor.
-    private func handleMovieLowerMove(_ direction: MoveCommandDirection, using proxy: ScrollViewProxy) {
-        guard direction == .up else { return }
-        detailFocusRegion = .lower
-        focusDetailRegion(.top, using: proxy)
     }
 
     /// Series keep the hero + episode-list layout (the page below the hero is full of content).
@@ -940,7 +936,11 @@ struct DetailView: View {
                              primaryResumeSeconds: primaryResumeSeconds,
                              primaryProgress: primaryProgress,
                              orderedEpisodes: ordered,
-                             scrollToContent: { withAnimation { proxy.scrollTo("detailContent", anchor: .top) } },
+                             scrollToContent: {
+                                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) {
+                                     proxy.scrollTo("detailContent", anchor: .top)
+                                 }
+                             },
                              onDetailMove: { direction, region in
                                  handleDetailMove(direction, from: region, using: proxy)
                              })
@@ -1051,6 +1051,7 @@ struct DetailView: View {
                                                onDetailMove: { direction, region in
                                                    handleDetailMove(direction, from: region, using: proxy)
                                                },
+                                               parentFocusTarget: $detailFocusTarget,
                                                performRefindLoad: { performMovieRefindLoad() })
                             }
                         }
@@ -1059,13 +1060,13 @@ struct DetailView: View {
                         .frame(minHeight: Self.firstScreenHeight, alignment: .top)   // first screen ~= one viewport tall (version-safe; no tvOS-17 containerRelativeFrame)
                         // SECOND SECTION (below the fold): scrolls in only on deliberate down-nav.
                         castSection
-                            .onMoveCommand { handleMovieLowerMove($0, using: proxy) }
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         whereToWatchSection
-                            .onMoveCommand { handleMovieLowerMove($0, using: proxy) }
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         collectionSection
-                            .onMoveCommand { handleMovieLowerMove($0, using: proxy) }
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         moreLikeThisSection
-                            .onMoveCommand { handleMovieLowerMove($0, using: proxy) }
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                     }
                     .padding(.bottom, Theme.Space.xl)
                 }
@@ -1284,6 +1285,7 @@ struct DetailView: View {
                     VStack(alignment: .leading, spacing: Theme.Space.sm) {
                         // PRIMARY: play/resume and episode navigation.
                         TVDetailActionRow(spacing: Theme.Space.sm,
+                                          accessibilityLabel: String(localized: "Playback and episode actions"),
                                           onMoveCommand: { direction in onDetailMove(direction, .primary) }) {
                             if let primaryEpisode {
                                 VStack(spacing: Theme.Space.xs) {
@@ -1324,6 +1326,7 @@ struct DetailView: View {
 
                         // SECONDARY: trailer, library, watchlist, ratings, and optional check-in.
                         TVDetailActionRow(spacing: Theme.Space.sm,
+                                          accessibilityLabel: String(localized: "Trailer and title actions"),
                                           onMoveCommand: { direction in onDetailMove(direction, .secondary) }) {
                             if hasFullTrailer(m) {
                                 trailerChip(m)
@@ -2118,6 +2121,7 @@ struct CoreEpisodeStreams: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
     @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (binge-advance refresh)
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
 
     // The episode this page currently SHOWS. Seeded from the pushed `video`, but re-pointed on player dismissal
     // when continuous play advanced past it: this page stays mounted behind the player (no onAppear re-fires), so
@@ -2170,7 +2174,9 @@ struct CoreEpisodeStreams: View {
     private var shownSeason: Int { currentVideo.season ?? season }
 
     private func moveToEpisodeTop(using proxy: ScrollViewProxy) {
-        withAnimation(.easeOut(duration: 0.25)) {
+        // Keep programmatic episode-top recovery deterministic without animating for users who
+        // requested reduced motion.
+        withAnimation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.25)) {
             proxy.scrollTo(DetailFocusAnchor.top, anchor: .top)
         }
         DispatchQueue.main.async {
@@ -2394,6 +2400,9 @@ struct CoreStreamList: View {
     /// Parent detail focus graph callback. The source list owns its action/lower row transitions; it invokes
     /// this only when the primary row must hand focus to the visible metadata/top target.
     var onDetailMove: ((MoveCommandDirection, DetailFocusRegion) -> Void)? = nil
+    /// Movie lower rails live outside this child view, so they share the movie page's visible focus state for
+    /// the source secondary row. Episode pages leave this nil and use the source-local focus state instead.
+    var parentFocusTarget: FocusState<DetailFocusRegion?>.Binding? = nil
     /// "Re-find sources": the exact engine `refindSources` call, wired by the mounting page (which owns the
     /// title/episode stream args). This list owns the auxiliary contributors + the `SourceListModel`, so its
     /// own `refindSources()` handler busts the per-title caches and repaints, then invokes this to Unload ->
@@ -2462,8 +2471,8 @@ struct CoreStreamList: View {
     // on Trailer. The earlier takes set `.defaultFocus($watchFocused, true)` but ONLY bound $watchFocused to
     // the READY button (`if let best`), which does not exist on first appear while sources are still loading
     // - so defaultFocus had no target and tvOS fell back to the first focusable (the trailer chip). This
-    // take binds $watchFocused to the loading AND no-sources buttons too, so the target always exists and
-    // focus follows the one primary-action slot as it transitions loading -> ready, plus a one-shot
+    // take binds $watchFocused to the loading AND no-sources status targets too, so the target always exists
+    // and focus follows the one primary-action slot as it transitions loading -> ready, plus a one-shot
     // programmatic seat (.task below) as belt-and-suspenders over defaultFocus (only a hint tvOS can drop).
     // It only sets WHERE focus lands; it does not touch the RemoteCatcher model.
     @FocusState private var watchFocused: Bool
@@ -2570,7 +2579,17 @@ struct CoreStreamList: View {
 
     /// Source-page row graph. The row handler is the only move-command owner inside CoreStreamList: it moves
     /// secondary -> primary locally, lower -> the nearest available row, and delegates primary -> top to the
-    /// mounting detail page. Left/right and Down return immediately to the native focus engine.
+    /// mounting detail page. When the mounting page has no bridge (the live page), the returned handler is nil
+    /// and the native focus engine owns the complete path. Left/right and Down return immediately to the native
+    /// focus engine.
+    private func sourceMoveHandler(from region: DetailFocusRegion,
+                                   hasSecondary: Bool) -> ((MoveCommandDirection) -> Void)? {
+        guard onDetailMove != nil else { return nil }
+        return { direction in
+            handleSourceMove(direction, from: region, hasSecondary: hasSecondary)
+        }
+    }
+
     private func handleSourceMove(_ direction: MoveCommandDirection,
                                   from region: DetailFocusRegion,
                                   hasSecondary: Bool) {
@@ -2578,15 +2597,32 @@ struct CoreStreamList: View {
               let next = DetailFocusEscapePolicy.nextUp(from: region, hasSecondary: hasSecondary) else { return }
         switch next {
         case .secondary:
-            watchFocused = false
-            sourceFocusTarget = .secondary
+            if let parentFocusTarget {
+                sourceFocusTarget = nil
+                parentFocusTarget.wrappedValue = .secondary
+            } else {
+                watchFocused = false
+                sourceFocusTarget = .secondary
+            }
         case .primary:
+            parentFocusTarget?.wrappedValue = nil
             sourceFocusTarget = nil
             watchFocused = true
         case .top:
             onDetailMove?(direction, .primary)
         case .lower, .shell:
             break
+        }
+    }
+
+    /// Use the mounting movie page's focus graph when supplied; otherwise keep episode focus local to the
+    /// source list. A single control must not carry two active FocusState bindings during a row transition.
+    @ViewBuilder
+    private func focusSecondary<Content: View>(_ content: Content) -> some View {
+        if let parentFocusTarget {
+            content.focused(parentFocusTarget, equals: .secondary)
+        } else {
+            content.focused($sourceFocusTarget, equals: .secondary)
         }
     }
 
@@ -2654,6 +2690,7 @@ struct CoreStreamList: View {
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
         // button hostage: the timeout opens the gate anyway.
         let watchReady = sourceList.isSettled
+        let hasSecondaryRow = !isLive || secondaryAction != nil || best != nil
 
         return AnyView(VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Singularity renders INLINE ONLY: its merged group flows through the ranked list like any
@@ -2666,32 +2703,63 @@ struct CoreStreamList: View {
             // source request.
             // PRIMARY: playback and source selection decisions. The same semantic row remains mounted while
             // the source state changes from loading -> ready -> failed, so its focus target never disappears.
-            TVDetailActionRow(onMoveCommand: { direction in
-                handleSourceMove(direction, from: .primary,
-                                 hasSecondary: secondaryAction != nil || best != nil)
-            }) {
-                if let best {
-                    // Stays FOCUSABLE while gated (a disabled button is unfocusable on tvOS, which
-                    // dumped focus onto the Quality chip); the action is simply inert until the
-                    // add-ons settle, then the same focused button springs alive in place.
-                    Button { if watchReady { playBest(best, in: groups) } } label: {
-                        if watchReady {
-                            // watchLabel derives from the EXACT stream this button plays, so it
-                            // can never promise a quality it doesn't deliver. A saved resume position
-                            // turns the lead-in into "Resume · 1:03" (playback already seeks there).
-                            let lead = resumeSeconds.flatMap(resumeTimecode).map { "\(String(localized: "Resume"))  ·  \($0)  ·  " } ?? String(localized: "Watch in ")
-                            Label { Text(verbatim: "\(lead)\(StreamRanking.watchLabel(best))") } icon: { Image(systemName: "play.fill") }
-                        } else {
-                            HStack(spacing: Theme.Space.sm) {
-                                ProgressView().tint(Theme.Palette.onAccent)
-                                Text(verbatim: String(localized: "Finding best…  \(addons.loaded)/\(addons.total)"))
-                            }
-                        }
+            TVDetailActionRow(accessibilityLabel: String(localized: "Playback and source actions"),
+                              onMoveCommand: sourceMoveHandler(from: .primary, hasSecondary: !isLive)) {
+                if let best, watchReady {
+                    // Once the complete source set is settled this is the real primary action. While it
+                    // is settling, the branch below is a focusable status view rather than an announced
+                    // Button whose action would do nothing.
+                    Button { playBest(best, in: groups) } label: {
+                        // watchLabel derives from the EXACT stream this button plays, so it
+                        // can never promise a quality it doesn't deliver. A saved resume position
+                        // turns the lead-in into "Resume · 1:03" (playback already seeks there).
+                        let lead = resumeSeconds.flatMap(resumeTimecode).map { "\(String(localized: "Resume"))  ·  \($0)  ·  " } ?? String(localized: "Watch in ")
+                        Label { Text(verbatim: "\(lead)\(StreamRanking.watchLabel(best))") } icon: { Image(systemName: "play.fill") }
                     }
                     .buttonStyle(PrimaryActionStyle())
-                    .opacity(watchReady ? 1 : 0.55)
                     .focused($watchFocused)   // FIX H: target of the page's default focus
+                } else if best != nil {
+                    // A best candidate exists, but the complete source set is still settling. Keep a
+                    // visible/focusable status target in the primary row without exposing an inert action.
+                    HStack(spacing: Theme.Space.sm) {
+                        ProgressView().tint(Theme.Palette.onAccent)
+                        Text(verbatim: String(localized: "Finding best…  \(addons.loaded)/\(addons.total)"))
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .focusable()
+                    .focused($watchFocused)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(String(localized: "Finding best"))
+                    .accessibilityHint(String(localized: "Sources are still being ranked."))
+                } else if loadingAddons {
+                    // The primary action slot remains present while sources are loading, so the source row's
+                    // focus graph never points at a disappearing target. This is status, not a fake button.
+                    HStack(spacing: Theme.Space.sm) {
+                        ProgressView().tint(Theme.Palette.onAccent)
+                        Text(addons.total > 0 ? "Finding sources…  \(addons.loaded)/\(addons.total)" : "Finding sources…")
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .focusable()
+                    .focused($watchFocused)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(String(localized: "Finding sources"))
+                    .accessibilityHint(String(localized: "Sources are still loading."))
+                } else {
+                    // Done, nothing playable: a focusable status keeps the primary row in the graph, while
+                    // the optional Re-find control below remains the meaningful recovery action.
+                    HStack(spacing: Theme.Space.sm) {
+                        Image(systemName: "exclamationmark.triangle")
+                        Text("No sources found")
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+                    .focusable()
+                    .focused($watchFocused)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(String(localized: "No sources found"))
+                    .accessibilityHint(String(localized: "Use Re-find sources to try again."))
+                }
 
+                if let best, watchReady {
                     // "Play from start" (backlog E): a secondary chip beside the primary "Resume · 1:03",
                     // shown only when a saved resume position exists. Plays the SAME best source the primary
                     // Watch/Resume would (never re-runs source selection, per the play-from-start invariant),
@@ -2771,44 +2839,22 @@ struct CoreStreamList: View {
                         }
                         .buttonStyle(ChipButtonStyle())
                     }
-                } else if loadingAddons {
-                    // The primary action slot remains present while sources are loading, so the source row's
-                    // focus graph never points at a disappearing target.
-                    Button {} label: {
-                        HStack(spacing: Theme.Space.sm) {
-                            ProgressView().tint(Theme.Palette.onAccent)
-                            Text(addons.total > 0 ? "Finding sources…  \(addons.loaded)/\(addons.total)" : "Finding sources…")
-                        }
-                    }
-                    .buttonStyle(PrimaryActionStyle())
-                    .focused($watchFocused)
-                } else {
-                    // Done, nothing playable: a greyed (disabled-looking) primary slot remains focusable so the
-                    // trailer/secondary row and the native shell still have deterministic Up destinations.
-                    Button {} label: { Label("No sources found", systemImage: "exclamationmark.triangle") }
-                        .buttonStyle(PrimaryActionStyle())
-                        .opacity(0.55)
-                        .focused($watchFocused)
                 }
             }
 
             // SECONDARY: page actions and optional integrations. This row is independent of `best`, so the
             // movie trailer is available in loading, nil-best, no-source, and failed-source states too.
-            if secondaryAction != nil || best != nil {
-                TVDetailActionRow(onMoveCommand: { direction in
-                    handleSourceMove(direction, from: .secondary, hasSecondary: true)
-                }) {
+            if hasSecondaryRow {
+                TVDetailActionRow(accessibilityLabel: String(localized: "Download and title actions"),
+                                  onMoveCommand: sourceMoveHandler(from: .secondary, hasSecondary: !isLive)) {
                     if let secondaryAction {
-                        secondaryAction
-                            .focused($sourceFocusTarget, equals: .secondary)
+                        focusSecondary(secondaryAction)
                     } else if let best, !isLive {
-                        downloadChip(ready: watchReady) {
+                        focusSecondary(downloadChip(ready: watchReady) {
                             requestDownload { Task { await downloadBest(best) } }
-                        }
-                        .focused($sourceFocusTarget, equals: .secondary)
+                        })
                     } else {
-                        LibraryChip()
-                            .focused($sourceFocusTarget, equals: .secondary)
+                        focusSecondary(LibraryChip())
                     }
 
                     if let best {
@@ -2859,9 +2905,8 @@ struct CoreStreamList: View {
                     // The source column is its own focus section, and its one Up owner returns to the nearest
                     // semantic action row. There is no page-level duplicate handler to swallow top -> shell.
                     .focusSection()
-                    .modifier(DetailMoveCommandHandler(action: { direction in
-                        handleSourceMove(direction, from: .lower, hasSecondary: true)
-                    }))
+                    .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower,
+                                                                                   hasSecondary: !isLive)))
                 }
             } else {
                 // Error/no-source status is a lower region. Its single handler covers Re-find as well as the
@@ -2876,15 +2921,21 @@ struct CoreStreamList: View {
                         .buttonStyle(ChipButtonStyle())
                     }
                 }
-                .modifier(DetailMoveCommandHandler(action: { direction in
-                    handleSourceMove(direction, from: .lower, hasSecondary: secondaryAction != nil)
-                }))
+                .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower,
+                                                                               hasSecondary: !isLive)))
             }
         }
         // Greedy width so the column never shrinks to its widest child. Without this, the Watch-Now state
         // (just two buttons + a status line, no full-width row yet) collapsed to button-width and an
         // enclosing ScrollView centered it, the "black bar with two buttons in the middle" bug.
         .frame(maxWidth: .infinity, alignment: .leading)
+        // A conditional live secondary row can disappear when a source refresh removes `best`. Clear its
+        // stale focus target immediately and return to the persistent primary status/action target.
+        .onChange(of: hasSecondaryRow) { visible in
+            guard !visible else { return }
+            sourceFocusTarget = nil
+            watchFocused = true
+        }
         // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
         // first focusable view, which on the movie page is the Trailer chip laid out higher up.
         .defaultFocus($watchFocused, true)
@@ -3878,13 +3929,16 @@ struct CoreStreamList: View {
 /// provide the reliable up/down transfer between semantic groups.
 private struct TVDetailActionRow<Content: View>: View {
     private let spacing: CGFloat
+    private let accessibilityLabel: String
     private let onMoveCommand: ((MoveCommandDirection) -> Void)?
     private let content: Content
 
     init(spacing: CGFloat = Theme.Space.md,
+         accessibilityLabel: String,
          onMoveCommand: ((MoveCommandDirection) -> Void)? = nil,
          @ViewBuilder content: () -> Content) {
         self.spacing = spacing
+        self.accessibilityLabel = accessibilityLabel
         self.onMoveCommand = onMoveCommand
         self.content = content()
     }
@@ -3905,6 +3959,8 @@ private struct TVDetailActionRow<Content: View>: View {
         .scrollClipDisabled()
         .focusSection()
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(accessibilityLabel)
         .modifier(DetailMoveCommandHandler(action: onMoveCommand))
     }
 }
