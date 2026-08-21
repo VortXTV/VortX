@@ -2372,6 +2372,8 @@ struct iOSDetailView: View {
             play: { stream, url in Task { await playStream(stream, url: url) } },
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
+            sessionAudioLanguages: sourceList.sessionAudioLanguages,
+            onSessionAudioLanguageChange: { sourceList.sessionAudioLanguages = $0 },
             download: movieDownloadHandler,
             isSuspended: suspended,
             refind: refindEnabled ? { refindMovieSources() } : nil
@@ -3305,6 +3307,8 @@ struct iOSDetailView: View {
             play: { stream, url in Task { await playLiveStream(stream, url: url) } },
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
+            sessionAudioLanguages: sourceList.sessionAudioLanguages,
+            onSessionAudioLanguageChange: { sourceList.sessionAudioLanguages = $0 },
             isSuspended: suspended,
             refind: refindEnabled ? { refindMovieSources() } : nil
         )
@@ -4310,6 +4314,8 @@ struct iOSEpisodeStreams: View {
             playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
+            sessionAudioLanguages: sourceList.sessionAudioLanguages,
+            onSessionAudioLanguageChange: { sourceList.sessionAudioLanguages = $0 },
             download: episodeDownloadHandler,
             isSuspended: presentation != nil,
             refind: refindEnabled ? { refindEpisodeSources() } : nil
@@ -5366,6 +5372,11 @@ struct iOSSourceList: View {
     /// Resolution tiers, computed once off-main by SourceListModel; the control bar's Quality picker first level.
     /// Defaults empty so an omitting caller renders no Quality menu rather than re-ranking on every body eval.
     var resolutionTiers: [String] = []
+    /// Session audio-language filter (ISO codes) + its setter, owned by the parent detail view's
+    /// `SourceListModel`. Read for the menu label/highlight; written on selection. Optional so call sites
+    /// that do not show the audio picker (or lack a model) simply omit them.
+    var sessionAudioLanguages: [String]? = nil
+    var onSessionAudioLanguageChange: (([String]?) -> Void)? = nil
     /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
@@ -5683,11 +5694,11 @@ struct iOSSourceList: View {
     /// preferred audio languages; picking a language re-ranks the list so releases carrying that audio float
     /// up. Session-scoped only: it writes `SourceListModel.sessionAudioLanguages`, never the profile pref.
     @ViewBuilder private var audioLanguageMenu: some View {
-        let selected = sourceList.sessionAudioLanguages?.first
+        let selected = sessionAudioLanguages?.first
         Menu {
-            Button("Auto") { sourceList.sessionAudioLanguages = nil }
+            Button("Auto") { onSessionAudioLanguageChange?(nil) }
             ForEach(TrackPreferences.commonLanguages, id: \.id) { lang in
-                Button(lang.label) { sourceList.sessionAudioLanguages = [lang.id] }
+                Button(lang.label) { onSessionAudioLanguageChange?([lang.id]) }
             }
         } label: {
             Label(selected.flatMap { code in TrackPreferences.commonLanguages.first(where: { $0.id == code })?.label } ?? "Audio",
@@ -5910,6 +5921,7 @@ extension iOSSourceList: Equatable {
             && lhs.states == rhs.states
             && lhs.bestStream == rhs.bestStream
             && lhs.resolutionTiers == rhs.resolutionTiers
+            && lhs.sessionAudioLanguages == rhs.sessionAudioLanguages
             && lhs.groups == rhs.groups
     }
 }
