@@ -144,6 +144,18 @@ class MetalLayer: CAMetalLayer {
     // Delivery receives a leased texture on success, or nil if the GPU scale could not be submitted.
     // Caller MUST release a successful lease after its final texture read.
     private var captureDelivery: CaptureDelivery?
+    // Private staging copy of the drawable, reused across captures. Rebuilt whenever device,
+    // size, or format change. Protected by captureLock.
+    private var captureStageTexture: MTLTexture?
+
+    /// Pixel formats vetted end to end for the inline capture scale. The CAMetalLayer format is
+    /// chosen by MoltenVK/mpv and can change across SDR/HDR display-mode switches; a format outside
+    /// this set skips the capture cleanly instead of risking an uncatchable MPS validation abort
+    /// (MTLReportFailure -> SIGABRT on the VO thread; the #188 Apple TV HD crash class). HDR-path
+    /// captures therefore skip by design, mirroring the existing 4K-DV hard skip.
+    private static let captureSafePixelFormats: Set<MTLPixelFormat> = [
+        .bgra8Unorm, .bgra8Unorm_srgb, .rgba8Unorm, .rgba8Unorm_srgb
+    ]
 
     func setupCaptureQueue(_ queue: MTLCommandQueue) {
         captureLock.lock()
@@ -152,6 +164,7 @@ class MetalLayer: CAMetalLayer {
         // updateCapturePipeline calls this when CAMetalLayer moves to a different device. Never
         // carry a texture allocated by the old device into the new command queue.
         captureTexture = nil
+        captureStageTexture = nil
         captureLock.unlock()
     }
 
@@ -160,7 +173,27 @@ class MetalLayer: CAMetalLayer {
     /// handler must release its lease after the final texture read.
     /// Replaces any pending unserviced handler (best-effort, no backlog); that replaced handler is
     /// fired with nil so its caller's in-flight guard is never left stuck.
+    /// Apple TV HD gate (#188 crash closure): this capture path scales the CAMetalLayer
+    /// drawable's texture with MPS on mpv's VO thread, inside nextDrawable(). On the A8-class
+    /// GPU (Apple TV HD, pre-Apple3 Metal family) that first post-start capture aborts the
+    /// process inside Metal validation (SIGABRT via MTLReportFailure/MPSImage): three identical
+    /// field crashes, each seconds after first frame, on add-on streams where community
+    /// trickplay is unavailable and on-device capture is the fallback. Apple3+ hardware has no
+    /// observed instance of this, so capture stays enabled there unchanged. On gated devices
+    /// the request fails cleanly (handler(nil)); the caller already treats nil as "no frame
+    /// this tick", so the only cost is no on-device trickplay thumbnails on Apple TV HD.
+    /// Kept as a dependency-free static so the standalone harness below still compiles
+    /// MetalLayer.swift alone; the caller logs the gate firing.
+    static func inlineDrawableCaptureAllowed(device: MTLDevice?) -> Bool {
+        guard let device else { return true }
+        return device.supportsFamily(.apple3)
+    }
+
     func requestCapture(maxWidth: Int, handler: @escaping (MetalCaptureTextureLease?) -> Void) {
+        guard Self.inlineDrawableCaptureAllowed(device: device) else {
+            handler(nil)
+            return
+        }
         let delivery = CaptureDelivery(handler: handler)
         captureLock.lock()
         let previous = captureDelivery
@@ -212,6 +245,61 @@ class MetalLayer: CAMetalLayer {
                     delivery.complete(succeeded: false)
                     return d
                 }
+                // Fail-closed gates BEFORE any encode (the #188 SIGABRT class): an MPS validation
+                // failure is a fatal MTLReportFailure abort on mpv's VO thread, so every input to
+                // the inline scale must be proven safe up front rather than caught afterwards.
+                // 1) Degenerate drawables: MoltenVK transiently presents 1x1 drawables; scaling
+                //    from one is meaningless and can trip validation.
+                // 2) Unvetted pixel formats: see captureSafePixelFormats above.
+                guard src.width > 2, src.height > 2,
+                      MetalLayer.captureSafePixelFormats.contains(src.pixelFormat) else {
+                    captureLeaseState.release(token: leaseToken)
+                    delivery.complete(succeeded: false)
+                    return d
+                }
+                // Interpose a private staging copy so MPS never samples the drawable texture
+                // directly. Drawable storage is frame-aliased and transient across tvOS HDMI
+                // display-mode switches; sampling it mid-transition is the crash hazard. The blit
+                // rides the SAME command buffer, so ordering guarantees the scale sees stable bytes.
+                captureLock.lock()
+                var stagedCandidate = captureStageTexture
+                captureLock.unlock()
+                let staged: MTLTexture
+                if let t = stagedCandidate,
+                   ObjectIdentifier(t.device) == ObjectIdentifier(queue.device),
+                   t.width == src.width,
+                   t.height == src.height,
+                   t.pixelFormat == src.pixelFormat {
+                    staged = t
+                } else {
+                    let stageDesc = MTLTextureDescriptor.texture2DDescriptor(
+                        pixelFormat: src.pixelFormat,
+                        width: src.width,
+                        height: src.height,
+                        mipmapped: false
+                    )
+                    stageDesc.usage = [.shaderRead]
+                    stageDesc.storageMode = .private
+                    guard let fresh = queue.device.makeTexture(descriptor: stageDesc) else {
+                        captureLeaseState.release(token: leaseToken)
+                        delivery.complete(succeeded: false)
+                        return d
+                    }
+                    fresh.label = "VortX capture stage \(src.width)x\(src.height)"
+                    stagedCandidate = fresh
+                    captureLock.lock()
+                    captureStageTexture = fresh
+                    captureLock.unlock()
+                    staged = fresh
+                }
+                if let blit = cmd.makeBlitCommandEncoder() {
+                    blit.copy(from: src, to: staged)
+                    blit.endEncoding()
+                } else {
+                    captureLeaseState.release(token: leaseToken)
+                    delivery.complete(succeeded: false)
+                    return d
+                }
                 let targetWidth = min(src.width, maxWidth)
                 let targetHeight = max(1, Int(
                     (Double(src.height) * Double(targetWidth) / Double(src.width)).rounded()
@@ -247,7 +335,7 @@ class MetalLayer: CAMetalLayer {
                 if let dst {
                     // MPS keeps the source pixel format, so HDR captures retain the same component
                     // representation while the GPU writes only the requested thumbnail dimensions.
-                    scaler.encode(commandBuffer: cmd, sourceTexture: src, destinationTexture: dst)
+                    scaler.encode(commandBuffer: cmd, sourceTexture: staged, destinationTexture: dst)
                     delivery.prepare(
                         texture: dst,
                         leaseState: captureLeaseState,

@@ -110,6 +110,9 @@ final class MPVMetalViewController: PlatformViewController {
     }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
     private lazy var captureQueueState = CaptureQueueState(queue: captureQueue)
+    /// One-time breadcrumb for the Apple TV HD capture gate (#188). Main-thread confined:
+    /// captureFrameJPEGData is only invoked from the main-actor player views.
+    private var loggedUnsupportedGPUCaptureGate = false
     // Tracks the Metal device for which the capture queue/scaler were built. Drawable size and format
     // are handled lazily inside MetalLayer because the bounded target follows each capture request.
     private var capturePipelineDevice: ObjectIdentifier?
@@ -3541,6 +3544,18 @@ final class MPVMetalViewController: PlatformViewController {
         // not be set yet (especially on tvOS); calling here retries until everything is ready.
         // updateCapturePipeline is a no-op once the queue matches the current Metal device.
         updateCapturePipeline()
+        // Apple TV HD gate (#188): on pre-Apple3 GPUs the drawable-sourced MPS scale inside
+        // nextDrawable() aborts the process, so MetalLayer refuses captures there. Log the gate
+        // once so field diagnostics show WHY thumbnails are absent on that device class.
+        if !MetalLayer.inlineDrawableCaptureAllowed(device: metalLayer.device) {
+            if !loggedUnsupportedGPUCaptureGate {
+                loggedUnsupportedGPUCaptureGate = true
+                DiagnosticsLog.log(
+                    "tp",
+                    "on-device trickplay capture disabled: pre-Apple3 GPU (Apple TV HD class); drawable-sourced MPS scale unsafe there"
+                )
+            }
+        }
         // requestCapture schedules a bounded GPU scale for the next nextDrawable() call on mpv's VO thread.
         // handler(nil) is called immediately by MetalLayer if the scale cannot be submitted, so
         // the caller's in-flight guard is always released even when the pipeline isn't ready yet.
