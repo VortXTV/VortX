@@ -49,10 +49,11 @@ on:
         required: false
         default: ""
 
-# Workflow-wide default is READ-ONLY: the build job executes repo-controlled code (scripts/*,
-# app/scripts/*, the xcodegen'd build phases), so it must never hold write authority on the repo.
-# The ONLY contents:write consumer is the isolated `attach-release` job below, which overrides
-# this default for itself alone, runs no repo-controlled code, and holds no environment.
+# Workflow-wide default is READ-ONLY: repo-controlled build code (scripts/*, app/scripts/*,
+# the xcodegen'd build phases) must never hold blanket write authority. Two narrowly scoped
+# exceptions override this default for themselves alone: `build-tvos` (draft-release fail-closed
+# verification inside the approved engine-ci environment) and `attach-release` (asset attachment,
+# feed promotion, publication; runs no repo-controlled code).
 permissions:
   contents: read
 
@@ -65,11 +66,14 @@ jobs:
     # outside the approved build lanes. Release events intentionally skip this job and run only the
     # immutable published-release verifier below.
     #
-    # Read-only-build vs release-write split: this job runs under the workflow-default
-    # `contents: read`, so none of the repo-controlled build code it executes can touch the repo or
-    # its releases. Release-asset attachment lives in the separate `attach-release` job below,
-    # which alone gets `contents: write` and consumes this job's output strictly through the
-    # artifact handoff.
+    # Read-only-build vs release-write split (amended): the feed-artifact lane inside this
+    # job must fail-closed VERIFY the target prerelease draft (id, tag, draft/prerelease bits)
+    # before any release bytes are built, and GitHub only exposes draft releases to
+    # `contents: write` tokens. This job therefore carries `contents: write`, reachable only
+    # through the manually approved `engine-ci` environment gate above. Asset attachment,
+    # feed promotion, and publication remain isolated in `attach-release` below.
+    permissions:
+      contents: write
     environment: engine-ci
     # Pin the known-good arm64 lane explicitly. `macos-latest` is a moving alias, while macos-15
     # tops out below the Xcode 26.6 / tvOS SDK 26.5 release floor enforced below.
