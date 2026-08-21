@@ -208,8 +208,10 @@ final class CoreBridge: ObservableObject {
     /// official/protected is uninstalled from the engine and dropped from the published set, so a
     /// dashboard deletion is honored the instant the engine re-surfaces it, on every ctx path, not only
     /// on sync-down. A genuine fresh RE-install later still works: `installAddon` (the single hardened
-    /// installer every UI routes through) calls `AddonTombstones.forget` on a successful explicit install,
-    /// so the URL leaves the set before the engine re-emits ctx and is therefore NOT suppressed here.
+    /// installer every UI routes through) calls `AddonTombstones.forget` BEFORE dispatching InstallAddon
+    /// (#205), so the URL has already left the set when this function sees the new ctx and the add-on is
+    /// NOT suppressed here. The same holds for an explicit Stremio reconnect (`signedInWithLegacyAuthKey`
+    /// clears the removal set before the account import).
     private func refreshAddons() {
         let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
         // A synced order can arrive before OR after the final add-on hydrate. Keep the full-range intent
@@ -426,14 +428,20 @@ final class CoreBridge: ObservableObject {
             "manifest": manifest,
             "flags": ["official": false, "protected": false],
         ]
+        // Clear any prior removal tombstone BEFORE dispatching the install (#205): refreshAddons fires on
+        // the ctx change InstallAddon produces, and it uninstalls any non-protected ctx add-on that is
+        // still in the durable removal set. Forgetting only AFTER confirmation (the old order) meant the
+        // freshly installed add-on was suppressed and uninstalled in that same ctx cycle, confirmation
+        // could never succeed, the tombstone was never cleared, and every retry of a previously removed
+        // URL failed with "Install did not confirm". An explicit user install is intent to have the
+        // add-on, the same authority the Library add path uses to supersede LibraryTombstones. If the
+        // install itself fails, the user can remove the add-on again, which re-tombstones it.
+        AddonTombstones.forget(identityURL.absoluteString)
         dispatchCtx(["action": "InstallAddon", "args": descriptor])
 
         guard await awaitAddonInstalled(identity, replacingManifest: previousManifest, expectedManifest: manifest) else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
         }
-        // Only a confirmed install clears a prior removal tombstone. A dropped/unconfirmed dispatch must not
-        // mutate durable cross-device removal authority.
-        AddonTombstones.forget(identityURL.absoluteString)
         return .installed
     }
 
@@ -812,6 +820,15 @@ final class CoreBridge: ObservableObject {
     /// profile's slot). When the engine still holds ANOTHER profile's session, this routes through
     /// the switch path instead, because bootstrapAuth would see "logged in" and keep the old session.
     func signedInWithLegacyAuthKey() {
+        // Explicit Stremio reconnect = explicit import intent (#205): the user is deliberately pulling
+        // this account's add-ons back in, so prior local removal tombstones must not suppress them
+        // (refreshAddons uninstalls any non-protected ctx add-on still in the removal set, so the
+        // import would report "0 add-ons" forever for any add-on the user once deleted here).
+        // Background pulls (launch recovery, periodic refresh) never route through this function, so
+        // ordinary removal-sticks behavior is unchanged everywhere else.
+        for removedURL in AddonTombstones.all() {
+            AddonTombstones.forget(removedURL)
+        }
         if isLoggedIn(), let key = Keychain.string(activeTokenAccount), !key.isEmpty {
             switchAccount(token: key)
         } else {
