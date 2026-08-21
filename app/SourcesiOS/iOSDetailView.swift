@@ -5642,6 +5642,7 @@ struct iOSSourceList: View {
                     .opacity(loading ? 0.55 : 1)
 
                     qualityMenu
+                    audioLanguageMenu
                 }
             }
             HStack(spacing: Theme.Space.sm) {
@@ -5676,6 +5677,23 @@ struct iOSSourceList: View {
             }
             .buttonStyle(ChipButtonStyle())
         }
+    }
+
+    /// Session audio-language filter, one level (unlike the two-level Quality menu). "Auto" = the profile's
+    /// preferred audio languages; picking a language re-ranks the list so releases carrying that audio float
+    /// up. Session-scoped only: it writes `SourceListModel.sessionAudioLanguages`, never the profile pref.
+    @ViewBuilder private var audioLanguageMenu: some View {
+        let selected = sourceList.sessionAudioLanguages?.first
+        Menu {
+            Button("Auto") { sourceList.sessionAudioLanguages = nil }
+            ForEach(TrackPreferences.commonLanguages, id: \.id) { lang in
+                Button(lang.label) { sourceList.sessionAudioLanguages = [lang.id] }
+            }
+        } label: {
+            Label(selected.flatMap { code in TrackPreferences.commonLanguages.first(where: { $0.id == code })?.label } ?? "Audio",
+                  systemImage: "captions.bubble")
+        }
+        .buttonStyle(ChipButtonStyle(selected: selected != nil))
     }
 
     // MARK: Per-add-on filter chips

@@ -271,11 +271,16 @@ struct TrackPreferences: Equatable {
         return out.isEmpty ? ["en"] : out
     }
 
+    /// Session-scoped audio-language filter for the pre-play source picker. When non-nil, `current` uses this
+    /// list instead of the persisted `audioLanguages` for the duration of the task-local scope. Installed
+    /// inside the detached rank (`Task.detached` does not inherit task-locals); nil = the profile preference.
+    @TaskLocal static var audioLanguagesOverride: [String]? = nil
+
     /// Current preferences: device languages plus sensible defaults until the user customizes them.
     static var current: TrackPreferences {
         let d = UserDefaults.standard
         return TrackPreferences(
-            audioLanguages: list(d.string(forKey: Key.audio)) ?? deviceLanguages,
+            audioLanguages: audioLanguagesOverride ?? list(d.string(forKey: Key.audio)) ?? deviceLanguages,
             subtitleLanguages: list(d.string(forKey: Key.subtitle)) ?? deviceLanguages,
             forcedPolicy: ForcedPolicy(rawValue: d.string(forKey: Key.forced) ?? "") ?? .forced,
             rejectTerms: list(d.string(forKey: Key.reject)) ?? ["commentary", "sdh"]

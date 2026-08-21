@@ -47,6 +47,11 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// Published in the same main-actor transaction as the ranked rows it describes. Auto-pick reads this
     /// receipt instead of independently polling one subset of contributors.
     @Published private var publishedSettlement: SourceSettlementDecision = .waiting
+    /// Session-scoped audio-language filter (ISO codes) chosen in the pre-play picker. Non-nil overrides the
+    /// persisted `TrackPreferences.audioLanguages` for RANKING only (the profile preference is never mutated).
+    /// Setting it changes `inputsHash`, which retriggers the detached rank with the override installed as a
+    /// task-local. nil = profile preference.
+    @Published var sessionAudioLanguages: [String]? = nil
 
     var groups: [CoreStreamSourceGroup] {
         publishedIdentity == outputIdentity(for: context) ? publishedGroups : []
@@ -78,6 +83,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         var continuity: String?      // remembered quality signature for the best() pick (nil for live)
         var pin: ResolvedPin?        // resolved pinned source, from the view's SourcePinStore lookup
         var prefsSignature = ""      // SourcePreferences.rankingSignature (filter/rank settings)
+        var sessionAudioLanguages: [String]? = nil   // session audio filter (ISO codes); nil = profile pref
         var isKids = false           // Kids content guard state (read inside applyUserFilters)
         var directLinksOnly = false  // drop torrent sources entirely
         var disabledAddons: Set<String> = []   // per-profile disabled add-on bases
@@ -203,6 +209,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         next.continuity = continuity
         next.pin = pin
         next.prefsSignature = SourcePreferences.shared.rankingSignature
+        next.sessionAudioLanguages = sessionAudioLanguages
         next.isKids = ProfileStore.activeIsKids()
         next.directLinksOnly = PlaybackSettings.directLinksOnly
         next.disabledAddons = ProfileStore.activeDisabledAddons()
@@ -300,6 +307,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         hasher.combine(ctx.continuity)
         hasher.combine(String(describing: ctx.pin))
         hasher.combine(ctx.prefsSignature)
+        hasher.combine(ctx.sessionAudioLanguages)
         hasher.combine(ctx.isKids)
         hasher.combine(ctx.directLinksOnly)
         hasher.combine(ctx.disabledAddons)
@@ -417,6 +425,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             // mutable SourcePreferences singleton across threads. withValue binds it for this synchronous
             // scope only; existing main-actor StreamRanking callers install nothing and read the live singleton.
             let (ranked, rankedBest, rankedTiers, rankedResOpts) =
+                TrackPreferences.$audioLanguagesOverride.withValue(ctx.sessionAudioLanguages) {
                 SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
                     let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
                     let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
@@ -425,6 +434,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                                                   debridCachedHashes: cachedHashes)
                     return (groups, best, StreamRanking.tiers(groups), StreamRanking.resolutionOptions(groups))
                 }
+            }
             let streamCount = ranked.reduce(0) { $0 + $1.streams.count }
 
             await MainActor.run {

@@ -2435,6 +2435,7 @@ struct CoreStreamList: View {
     private static let sourceWindowStep = 100
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
+    @State private var showAudioLanguagePicker = false   // session audio-language filter dialog
     @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
     /// Focus anchors are visible action controls: Watch/Resume owns `.primary`, and the first secondary action
     /// owns `.secondary`. Setting either target performs a real row transition; no dummy button is inserted.
@@ -2801,6 +2802,19 @@ struct CoreStreamList: View {
                                     Button(option.label) { play(option.stream) }
                                 }
                             }
+                        }
+                    }
+
+                    // Session audio-language filter: one level (Auto + the curated language list). Picking a
+                    // language re-ranks the list so releases carrying that audio float up; Auto = profile pref.
+                    Button { showAudioLanguagePicker = true } label: {
+                        Label("Audio", systemImage: "captions.bubble")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: sourceList.sessionAudioLanguages != nil))
+                    .confirmationDialog("Pick audio language", isPresented: $showAudioLanguagePicker, titleVisibility: .visible) {
+                        Button("Auto") { sourceList.sessionAudioLanguages = nil }
+                        ForEach(TrackPreferences.commonLanguages, id: \.id) { lang in
+                            Button(lang.label) { sourceList.sessionAudioLanguages = [lang.id] }
                         }
                     }
 
