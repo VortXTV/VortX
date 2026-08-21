@@ -3095,15 +3095,6 @@ final class MPVMetalViewController: PlatformViewController {
         subtitleFileCache[remote] = local
     }
 
-    /// Shared URLSession with a small on-disk/in-memory URLCache so cacheable provider responses are reused
-    /// across picks even before our own file cache is populated. A few MB is plenty for text subtitles.
-    private static let subtitleSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.urlCache = URLCache(memoryCapacity: 2 * 1024 * 1024, diskCapacity: 8 * 1024 * 1024, diskPath: "stremiox-subs")
-        config.requestCachePolicy = .returnCacheDataElseLoad
-        return URLSession(configuration: config)
-    }()
-
     /// Per-pick network timeout and retry count for subtitle downloads. Hardcoded constants for now (a later
     /// pass may move these to RemoteConfig); 12s is snappy without giving up on a slow-but-alive provider, and
     /// ONE retry rescues a transient timeout / flaky first connection.
@@ -3208,30 +3199,39 @@ final class MPVMetalViewController: PlatformViewController {
     /// to `done` on failure/success. Retries ONCE on a failed/empty/timed-out response before giving up.
     private static func downloadSubtitle(_ remote: URL, timeout: TimeInterval, retriesLeft: Int,
                                          done: @escaping (URL?) -> Void) {
-        var request = URLRequest(url: remote)
-        request.timeoutInterval = timeout
-        request.cachePolicy = .returnCacheDataElseLoad
-        subtitleSession.dataTask(with: request) { data, response, _ in
-            let statusOK = (response as? HTTPURLResponse).map { (200 ..< 400).contains($0.statusCode) } ?? true
-            guard statusOK, let data, !data.isEmpty,
-                  data.count <= maximumExternalSubtitleBytes else {
+        // Route through the pinned transport (resolve-once, connect to a vetted numeric peer) so an add-on
+        // subtitle hostname cannot re-resolve to a private address between validation and the socket open.
+        // Plain-HTTP subtitle URLs fail closed here, exactly like the AVPlayer overlay path (SubtitleFileFetcher).
+        guard remote.scheme?.lowercased() == "https" else { done(nil); return }
+        Task.detached(priority: .utility) {
+            var limits = PinnedHTTPClient.Limits()
+            limits.maximumBodyBytes = maximumExternalSubtitleBytes
+            limits.maximumStreamBytes = maximumExternalSubtitleBytes
+            limits.maximumWireBytes = maximumExternalSubtitleBytes + 32 * 1024
+            limits.timeout = max(0.1, timeout)
+            do {
+                let response = try await PinnedHTTPClient.execute(.init(url: remote), limits: limits)
+                // Redirects fail closed (the pinned transport does not follow them) and the body is
+                // budget-bounded before it is written to disk.
+                guard (200 ..< 300).contains(response.statusCode),
+                      !response.body.isEmpty,
+                      response.body.count <= maximumExternalSubtitleBytes else { done(nil); return }
+                let ext = subtitleExtension(for: remote, contentType: response.headers["content-type"])
+                // Deterministic, content-addressed filename so the same subtitle reuses one on-disk file all session
+                // AND two distinct URLs never collide onto the same file (a 64-bit `hashValue` gives no such
+                // guarantee, which would let one track's file serve the other's cached entry).
+                let digest = SHA256.hash(data: Data(remote.absoluteString.utf8))
+                let name = "stremiox-sub-\(digest.map { String(format: "%02x", $0) }.joined()).\(ext)"
+                let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+                guard (try? response.body.write(to: tmp)) != nil else { done(nil); return }
+                rememberSubtitleFile(remote, tmp)
+                done(tmp)
+            } catch {
                 if retriesLeft > 0 {
                     downloadSubtitle(remote, timeout: timeout, retriesLeft: retriesLeft - 1, done: done)
                 } else { done(nil) }
-                return
             }
-            let ext = subtitleExtension(for: remote,
-                                        contentType: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type"))
-            // Deterministic, content-addressed filename so the same subtitle reuses one on-disk file all session
-            // AND two distinct URLs never collide onto the same file (a 64-bit `hashValue` gives no such
-            // guarantee, which would let one track's file serve the other's cached entry).
-            let digest = SHA256.hash(data: Data(remote.absoluteString.utf8))
-            let name = "stremiox-sub-\(digest.map { String(format: "%02x", $0) }.joined()).\(ext)"
-            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
-            guard (try? data.write(to: tmp)) != nil else { done(nil); return }
-            rememberSubtitleFile(remote, tmp)
-            done(tmp)
-        }.resume()
+        }
     }
 
     /// Best-effort subtitle file extension so mpv parses the downloaded bytes (it sniffs format too, but a
