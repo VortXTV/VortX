@@ -374,18 +374,23 @@ final class SubtitleCueRenderer {
     }
 }
 
-/// Downloads external subtitle bytes for the AVPlayer overlay path, reusing the SAME cache policy as the
-/// libmpv subtitle loader: a shared URLSession with a small on-disk/in-memory URLCache, a 12s-style timeout, and
-/// ONE retry on a failed/empty response. It returns the raw `Data` (the AVPlayer path parses cues in-process,
+/// Downloads external subtitle bytes for the AVPlayer overlay path. Remote fetches go through the pinned
+/// untrusted-content transport (`PinnedHTTPClient`): the hostname is resolved once, every answer is validated
+/// as public, and the socket connects to the vetted numeric peer while the original hostname is preserved for
+/// TLS SNI and the HTTP Host header. The address inspected by policy is therefore the address used by the
+/// socket, so a rebinding host cannot swap the peer after validation. Redirects fail closed (the transport
+/// does not follow them), plain HTTP fails closed (HTTPS only), and non-2xx or empty bodies fail closed. One
+/// retry on a failed/empty response. It returns the raw `Data` (the AVPlayer path parses cues in-process,
 /// unlike libmpv which is handed a local file path). A `file://` URL (used by the community-pool path, which
 /// already downloaded to disk) is read straight off disk with no network.
 enum SubtitleFileFetcher {
     private static let maximumBytes = 2 * 1024 * 1024
-    private static let maximumRedirects = 3
+    private static let maximumHeaderBytes = 32 * 1024
 
     /// Fetch the subtitle bytes for `url`, calling `done` on a background thread with the data (or nil on
-    /// failure). `file://` URLs read from disk; http(s) URLs download with a timeout + one retry.
-    static func fetch(_ url: URL, timeout: TimeInterval, done: @escaping (Data?) -> Void) {
+    /// failure). `file://` URLs read from disk; https URLs download through the pinned transport with a
+    /// timeout + one retry.
+    static func fetch(_ url: URL, timeout: TimeInterval, done: @escaping @Sendable (Data?) -> Void) {
         if url.isFileURL {
             guard let data = try? Data(contentsOf: url), data.count <= maximumBytes else { done(nil); return }
             done(data)
@@ -395,97 +400,37 @@ enum SubtitleFileFetcher {
         download(url, timeout: timeout, retriesLeft: 1, done: done)
     }
 
-    private static func download(_ url: URL, timeout: TimeInterval, retriesLeft: Int, done: @escaping (Data?) -> Void) {
-        StreamingFetch(url: url, timeout: timeout) { data in
-            guard let data, !data.isEmpty else {
+    private static func download(_ url: URL, timeout: TimeInterval, retriesLeft: Int, done: @escaping @Sendable (Data?) -> Void) {
+        // The pinned transport is HTTPS-only by design. Plain HTTP subtitle URLs fail closed rather than
+        // falling back to a transport that re-resolves the hostname at connect time.
+        guard url.scheme?.lowercased() == "https" else { done(nil); return }
+        Task.detached(priority: .utility) {
+            var limits = PinnedHTTPClient.Limits()
+            limits.maximumBodyBytes = maximumBytes
+            limits.maximumStreamBytes = maximumBytes
+            limits.maximumWireBytes = maximumBytes + maximumHeaderBytes
+            limits.timeout = max(0.1, timeout)
+            do {
+                let response = try await PinnedHTTPClient.execute(.init(url: url), limits: limits)
+                // Redirects (3xx) fail closed: the pinned transport does not follow them, and following
+                // would require repeating the full resolve/vet/pin sequence for every hop.
+                guard (200..<300).contains(response.statusCode),
+                      !response.body.isEmpty,
+                      response.body.count <= maximumBytes else { done(nil); return }
+                done(response.body)
+            } catch {
                 if retriesLeft > 0 { download(url, timeout: timeout, retriesLeft: retriesLeft - 1, done: done) }
                 else { done(nil) }
-                return
             }
-            done(data)
-        }.start()
+        }
     }
 
-    /// URLSession's convenience `data(for:)` buffers an entire response before the caller can compare its size.
-    /// This delegate owns a hard receive-time ceiling and validates every redirect before a byte of the new peer
-    /// is accepted.  The receiver owns its session until exactly one terminal callback releases both.
-    private final class StreamingFetch: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
-        private let url: URL
-        private let timeout: TimeInterval
-        private let completion: (Data?) -> Void
-        private var data = Data()
-        private var responseOK = false
-        private var redirectCount = 0
-        private var finished = false
-        private var session: URLSession?
-
-        init(url: URL, timeout: TimeInterval, completion: @escaping (Data?) -> Void) {
-            self.url = url; self.timeout = max(0.1, timeout); self.completion = completion
-        }
-
-        func start() {
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = timeout
-            config.timeoutIntervalForResource = timeout
-            config.waitsForConnectivity = false
-            config.httpShouldSetCookies = false
-            config.urlCache = nil
-            let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-            self.session = session
-            var request = URLRequest(url: url)
-            request.timeoutInterval = timeout
-            request.cachePolicy = .reloadIgnoringLocalCacheData
-            session.dataTask(with: request).resume()
-        }
-
-        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
-                        didReceive response: URLResponse,
-                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-            guard let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode),
-                  response.expectedContentLength < 0 || response.expectedContentLength <= Int64(maximumBytes) else {
-                completionHandler(.cancel); return
-            }
-            responseOK = true
-            completionHandler(.allow)
-        }
-
-        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
-            guard !finished, responseOK, data.count <= maximumBytes - chunk.count else {
-                dataTask.cancel(); finish(nil); return
-            }
-            data.append(chunk)
-        }
-
-        func urlSession(_ session: URLSession, task: URLSessionTask,
-                        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
-                        completionHandler: @escaping (URLRequest?) -> Void) {
-            redirectCount += 1
-            guard redirectCount <= maximumRedirects, let next = request.url, SubtitleRemoteURLPolicy.accepts(next) else {
-                completionHandler(nil); return
-            }
-            completionHandler(request)
-        }
-
-        func urlSession(_ session: URLSession, task: URLSessionTask,
-                        didCompleteWithError error: Error?) {
-            finish(error == nil && responseOK && !data.isEmpty ? data : nil)
-        }
-
-        private func finish(_ result: Data?) {
-            guard !finished else { return }
-            finished = true
-            session?.invalidateAndCancel()
-            session = nil
-            completion(result)
-        }
-    }
 }
 
-/// A subtitle URL is content supplied by an add-on, not a trusted app endpoint.  Reject non-web schemes and
-/// direct private/loopback/link-local targets before URLSession can be induced to fetch a local service.  The
-/// URLSession delegate above re-applies the same policy to every redirect; hostnames remain URLSession's own
-/// connection target so this check never substitutes a proxy or rewrites the requested authority.
+/// A subtitle URL is content supplied by an add-on, not a trusted app endpoint. Reject non-web schemes and
+/// direct private/loopback/link-local literals before any network work. This is the cheap pre-filter: the
+/// pinned transport re-validates the hostname itself (every DNS answer must be public) and connects to the
+/// vetted numeric peer, so this pre-filter is defense-in-depth and never the only gate.
 private enum SubtitleRemoteURLPolicy {
     static func accepts(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
