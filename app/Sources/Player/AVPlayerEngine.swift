@@ -2466,9 +2466,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
         SubtitleFileFetcher.fetch(remote, timeout: timeout) { [weak self] data in
             guard let data else { finish(false); return }
-            let cues = SubtitleCueRenderer.parse(data: data)
-            guard !cues.isEmpty else { finish(false); return }
             Task { @MainActor in
+                // SubtitleCueRenderer is main-actor isolated (the engine owns it), so parse on the
+                // main actor. The parser is budget-bounded (max 2 MiB input, capped cue count), so
+                // this stays off the hot playback path.
+                let cues = SubtitleCueRenderer.parse(data: data)
+                guard !cues.isEmpty else { finish(false); return }
                 guard let self,
                       self.owns(requestItem, loadToken: requestToken) else {
                     finish(false)
