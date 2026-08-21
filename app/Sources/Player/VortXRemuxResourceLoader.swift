@@ -33,14 +33,19 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     private static let placeholderLength: Int64 = 1 << 42   // ~4 TiB, far past any real movie
 
     private let stream: VortXMKVRemuxStream
+    /// The legacy path has the same physical-unwind contract as the HLS path.  `invalidate()` only asks
+    /// the stream to stop; this relay fires when its input and producer thread are actually gone.
+    private let producerTerminalRelay: VortXRemuxProducerTerminalRelay
     private let queue = DispatchQueue(label: "vortx.dvremux.loader")
     private var invalidated = false
     private let invalidateLock = NSLock()
 
     /// Build a loader that will drive `stream`. The caller starts the stream (or we start it lazily on the
     /// first request) and mounts an `AVURLAsset(url:)` whose scheme is `vortxremux`.
-    init(stream: VortXMKVRemuxStream) {
+    init(stream: VortXMKVRemuxStream,
+         producerTerminalRelay: VortXRemuxProducerTerminalRelay = VortXRemuxProducerTerminalRelay()) {
         self.stream = stream
+        self.producerTerminalRelay = producerTerminalRelay
         super.init()
     }
 
@@ -55,17 +60,24 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         guard var comps = URLComponents(url: input, resolvingAgainstBaseURL: false) else { return nil }
         comps.scheme = scheme
         guard let assetURL = comps.url else { return nil }
+        let terminal = VortXRemuxProducerTerminalRelay()
         let stream = VortXMKVRemuxStream(
             input: input.absoluteString,
             headers: headers,
             selectedAudioStreamIndex: selectedAudioStreamIndex,
             preferredAudioLanguages: preferredAudioLanguages,
-            audioRejectTerms: audioRejectTerms)
-        return (VortXRemuxResourceLoader(stream: stream), assetURL)
+            audioRejectTerms: audioRejectTerms,
+            onProducerTerminal: { terminal.fire() })
+        return (VortXRemuxResourceLoader(stream: stream, producerTerminalRelay: terminal), assetURL)
     }
 
     /// Begin remuxing. Call once before / as the asset is mounted.
     func start() { stream.start() }
+
+    /// Receipt retained before invalidation so a replacement MPV mount never races the legacy producer.
+    func quiescenceReceipt() -> VortXRemuxQuiescenceReceipt {
+        VortXRemuxQuiescenceReceipt(terminal: producerTerminalRelay)
+    }
 
     /// F3: forward the engine's first-frame readiness to the buffer so its producer lead widens from the
     /// reduced pre-ready value to the full lead. Called from AVPlayerEngine's readyToPlay handler.

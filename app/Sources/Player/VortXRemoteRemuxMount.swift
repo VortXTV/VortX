@@ -59,6 +59,10 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     private var invalidated = false
     private var poller: Task<Void, Never>?
     private var readyMarked = false
+    /// One exact remote close is shared by ordinary invalidation and an AV→MPV physical-quiescence handoff.
+    /// Repeating DELETEs may receive the same idempotent host receipt, but we never create competing local
+    /// waiters that could race their deadlines.
+    private var teardownReceipt: VortXRemuxQuiescenceReceipt?
 
     private init(session: VortXExternalEngine.OpenedSession,
                  engine: VortXExternalEngine,
@@ -68,6 +72,7 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         self.playlistURL = session.playlistURL
         self.identity = VortXEngineHostPolicy.RemoteMountIdentity(
             sessionID: session.sessionID,
+            mountGeneration: session.mountGeneration,
             playlistURL: session.playlistURL.absoluteString)
         self.retainsFullTimeline = session.retainsFullTimeline
         self.onLost = onLost
@@ -276,9 +281,8 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
             failed: status.failed ?? !status.healthy)
     }
 
-    /// Stop polling and tell the host to release the session. Idempotent, and best-effort on the wire: a host
-    /// reaps an abandoned session on its own timer, so a client that dies costs it a minute of producer time
-    /// rather than leaking one.
+    /// Stop polling and request release. Ordinary replacement remains best effort; AV→MPV fallback calls
+    /// `quiescenceReceipt()` before this invalidation and will fail closed unless the exact remote receipt lands.
     func invalidate() {
         lock.lock()
         let already = invalidated
@@ -288,7 +292,26 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         lock.unlock()
         guard !already else { return }
         task?.cancel()
-        engine.close(session)
+        _ = quiescenceReceipt()
+    }
+
+    /// A remote producer cannot be observed locally.  This receipt polls only the authenticated, generation-
+    /// bound control acknowledgement; no HTTP 200 or listener cancellation is considered proof by itself.
+    func quiescenceReceipt() -> VortXRemuxQuiescenceReceipt {
+        lock.lock()
+        if let teardownReceipt {
+            lock.unlock()
+            return teardownReceipt
+        }
+        let terminal = VortXRemuxProducerTerminalRelay()
+        let receipt = VortXRemuxQuiescenceReceipt(terminal: terminal)
+        teardownReceipt = receipt
+        lock.unlock()
+        Task.detached(priority: .userInitiated) { [engine, session] in
+            guard await engine.closeAndAwaitReceipt(session) != nil else { return }
+            terminal.fire()
+        }
+        return receipt
     }
 }
 #endif

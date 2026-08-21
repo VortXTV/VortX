@@ -1206,6 +1206,41 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     /// 256 GiB covers several concurrent sessions with room to spare, and having ANY finite cap keeps the
     /// accounting arithmetic meaningful (see `retentionCapacity`).
     static let hostedMaximumCapacityBytes = 256 * 1024 * 1024 * 1024
+    /// A retained session must leave room for other household viewers.  This is also charged by the global
+    /// volume ledger below, so concurrent sessions cannot each independently promise the same free space.
+    static let hostedPerSessionMaximumBytes = 64 * 1024 * 1024 * 1024
+
+    private final class HostedVolumeReservation {
+        private final class Ledger: @unchecked Sendable {
+            let lock = NSLock()
+            var reservedByParent: [String: Int] = [:]
+        }
+        private static let ledger = Ledger()
+        private let parentKey: String
+        private let bytes: Int
+        private var released = false
+
+        static func acquire(parent: URL, bytes: Int, available: Int) -> HostedVolumeReservation? {
+            guard bytes > 0, available >= bytes else { return nil }
+            let key = parent.standardizedFileURL.path
+            ledger.lock.lock(); defer { ledger.lock.unlock() }
+            let held = ledger.reservedByParent[key] ?? 0
+            guard held >= 0, held <= available, bytes <= available - held else { return nil }
+            ledger.reservedByParent[key] = held + bytes
+            return HostedVolumeReservation(parentKey: key, bytes: bytes)
+        }
+
+        private init(parentKey: String, bytes: Int) { self.parentKey = parentKey; self.bytes = bytes }
+        func release() {
+            Self.ledger.lock.lock(); defer { Self.ledger.lock.unlock() }
+            guard !released else { return }
+            released = true
+            let remaining = max(0, (Self.ledger.reservedByParent[parentKey] ?? 0) - bytes)
+            if remaining == 0 { Self.ledger.reservedByParent.removeValue(forKey: parentKey) }
+            else { Self.ledger.reservedByParent[parentKey] = remaining }
+        }
+        deinit { release() }
+    }
 
     /// The byte ceiling for a session that retains its ENTIRE produced timeline instead of sliding a window.
     ///
@@ -2300,7 +2335,10 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         let length: Int
         let segmentDurationMilliseconds: Int
         var containingPlaylists: Set<String> = []
-        var longestPlaylistDurationMilliseconds = 0
+        /// Longest playlist duration among the generations that most recently stopped naming this resource.
+        /// This is intentionally not a historical maximum: an oversized startup generation must not protect a
+        /// later sliding-window resource for the rest of the title.
+        var departurePlaylistDurationMilliseconds = 0
         var retentionDeadline: TimeInterval?
         var leaseCount = 0
     }
@@ -2308,6 +2346,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     private struct PlaylistState {
         var generation = 0
         var currentKeys: Set<ResourceKey> = []
+        /// Duration of this playlist's latest served generation. A removed resource is retained for the
+        /// generation that actually stopped naming it, not for the longest historical startup playlist.
+        var renderedDurationMilliseconds = 0
     }
 
     private final class LaunchRegistry: @unchecked Sendable {
@@ -2356,6 +2397,9 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     private let parentDirectory: URL
     private let sessionName: String
     private let capacityBytes: Int
+    /// Reserved only by a full-timeline hosted spool. Released at physical cleanup (or deinit), never merely
+    /// when cancellation is requested while files/leases can still be alive.
+    private let hostedVolumeReservation: AnyObject?
     private let chunkSize: Int
     private let failureInjection: FailureInjection?
     private let lock = NSLock()
@@ -2396,10 +2440,12 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
           capacityBytes: Int = VortXHLSSessionSpool.defaultCapacityBytes,
           chunkSize: Int = VortXHLSSessionSpool.defaultChunkBytes,
           failureInjection: FailureInjection? = nil,
-          scavengeStaleSessions: Bool = true) {
+          scavengeStaleSessions: Bool = true,
+          hostedVolumeReservation: AnyObject? = nil) {
         guard capacityBytes > 0, chunkSize > 0 else { return nil }
         self.parentDirectory = parentDirectory
         self.capacityBytes = capacityBytes
+        self.hostedVolumeReservation = hostedVolumeReservation
         self.chunkSize = chunkSize
         self.failureInjection = failureInjection
         if case .cleanupRemove(let failures) = failureInjection {
@@ -2453,7 +2499,11 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
         let parent = support.appendingPathComponent("VortXHLS", isDirectory: true)
         guard let capacity = retentionCapacity(parentDirectory: parent) else { return nil }
-        return VortXHLSSessionSpool(parentDirectory: parent, capacityBytes: capacity)
+        let perSession = min(capacity, hostedPerSessionMaximumBytes)
+        guard let reservation = HostedVolumeReservation.acquire(parent: parent, bytes: perSession,
+                                                                available: capacity) else { return nil }
+        return VortXHLSSessionSpool(parentDirectory: parent, capacityBytes: perSession,
+                                    hostedVolumeReservation: reservation)
     }
 
     deinit {
@@ -3622,6 +3672,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             duration = sum
         }
         var state = playlists[playlistID] ?? PlaylistState()
+        let previousDuration = state.renderedDurationMilliseconds
         let nextKeys = Set(resourceKeys)
         let frontierChanged = state.currentKeys != nextKeys
         let removed = state.currentKeys.subtracting(nextKeys)
@@ -3629,22 +3680,30 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         guard !generationOverflow else { return nil }
         state.generation = nextGeneration
         state.currentKeys = nextKeys
+        state.renderedDurationMilliseconds = duration
 
         var updatedEntries = entries
         for key in nextKeys {
             guard var entry = updatedEntries[key] else { continue }
+            // Once a resource had fully departed and is named again, the old departure window belongs to the
+            // completed generation, not this new live interval.  Keeping it would let a large startup playlist
+            // inflate a later sliding window after the resource has been republished.
+            if entry.containingPlaylists.isEmpty {
+                entry.departurePlaylistDurationMilliseconds = 0
+            }
             entry.containingPlaylists.insert(playlistID)
-            entry.longestPlaylistDurationMilliseconds = max(
-                entry.longestPlaylistDurationMilliseconds, duration)
             entry.retentionDeadline = nil
             updatedEntries[key] = entry
         }
         for key in removed {
             guard var entry = updatedEntries[key] else { continue }
             entry.containingPlaylists.remove(playlistID)
+            entry.departurePlaylistDurationMilliseconds = max(
+                entry.departurePlaylistDurationMilliseconds,
+                previousDuration)
             if entry.containingPlaylists.isEmpty {
                 let (milliseconds, overflow) = entry.segmentDurationMilliseconds
-                    .addingReportingOverflow(entry.longestPlaylistDurationMilliseconds)
+                    .addingReportingOverflow(entry.departurePlaylistDurationMilliseconds)
                 guard !overflow else { return nil }
                 let interval = Double(milliseconds) / 1_000
                 let deadline = now + interval
@@ -3979,6 +4038,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         if shouldLeave {
             Self.launchRegistry.leave(parent: parentDirectory, sessionName: sessionName)
         }
+        if removed { (hostedVolumeReservation as? HostedVolumeReservation)?.release() }
     }
 
     private static func scavengePriorLaunches(parent: URL, keeping launch: URL) {

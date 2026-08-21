@@ -25,11 +25,27 @@ struct SubtitleCue {
 /// on malformed input (bad lines are skipped, blank cues dropped).
 @MainActor
 final class SubtitleCueRenderer {
+    /// These are parser and renderer budgets, not format preferences.  They keep a malicious or accidentally
+    /// enormous community subtitle from turning one foreground playback tick into unbounded allocation/work.
+    static let maximumInputBytes = 2 * 1024 * 1024
+    static let maximumInputScalars = 2 * 1024 * 1024
+    static let maximumCueCount = 12_000
+    static let maximumCueTextScalars = 4_096
+    static let maximumTimelineSeconds: TimeInterval = 7 * 24 * 60 * 60
+    static let maximumCueDuration: TimeInterval = 120
+    static let maximumSimultaneousCues = 3
+    static let maximumManualOffset: TimeInterval = 120
     /// Active cues, sorted by start. Empty when no external sub is loaded (the overlay then shows nothing).
     private(set) var cues: [SubtitleCue] = []
     /// Manual sync offset in seconds. Positive pushes subtitles LATER (matches libmpv `sub-delay`): a cue at
     /// media time T is shown when `clock - offset` is inside [start, end], i.e. it appears `offset` seconds later.
-    var offset: TimeInterval = 0
+    var offset: TimeInterval = 0 {
+        didSet {
+            if !offset.isFinite { offset = 0 }
+            else if offset > Self.maximumManualOffset { offset = Self.maximumManualOffset }
+            else if offset < -Self.maximumManualOffset { offset = -Self.maximumManualOffset }
+        }
+    }
 
     /// Resume cursor into `cues` for forward playback: the index of the earliest cue that could still be active.
     /// Because playback advances monotonically, a remembered cursor makes the lookup near-O(1) instead of walking
@@ -41,7 +57,7 @@ final class SubtitleCueRenderer {
 
     /// Replace the loaded cues (e.g. after parsing a freshly downloaded file). Resets the search cursor.
     func load(cues newCues: [SubtitleCue]) {
-        cues = newCues.sorted { $0.start < $1.start }
+        cues = Self.boundedCues(newCues)
         searchHint = 0
         lastLookupTime = -.infinity
     }
@@ -82,13 +98,14 @@ final class SubtitleCueRenderer {
     /// Parse SRT or WebVTT bytes into cues. Format is detected from content (a leading `WEBVTT` header ⇒ VTT),
     /// but the timestamp grammar is unified so a mislabeled file still parses. Returns [] on undecodable data.
     static func parse(data: Data) -> [SubtitleCue] {
-        guard let text = decodeText(data) else { return [] }
+        guard !data.isEmpty, data.count <= maximumInputBytes, let text = decodeText(data) else { return [] }
         return parse(text: text)
     }
 
     /// Parse subtitle TEXT (already decoded) into cues. Robust to CRLF/CR, BOM, WEBVTT headers, NOTE/STYLE/REGION
     /// blocks, numeric SRT indices, and cue identifiers; malformed blocks are skipped, never fatal.
     static func parse(text raw: String) -> [SubtitleCue] {
+        guard raw.unicodeScalars.count <= maximumInputScalars else { return [] }
         // Normalize newlines and strip a leading BOM so line splitting is predictable across providers.
         var text = raw
         if text.first == "\u{FEFF}" { text.removeFirst() }
@@ -107,7 +124,9 @@ final class SubtitleCueRenderer {
         var cues: [SubtitleCue] = []
         // Split into blocks on blank lines; each block is one cue (optionally with an index / id first line).
         let blocks = text.components(separatedBy: "\n\n")
+        guard blocks.count <= maximumCueCount * 3 else { return [] }
         for rawBlock in blocks {
+            guard cues.count < maximumCueCount else { break }
             var lines = rawBlock.components(separatedBy: "\n")
             // Drop the WEBVTT header and any VTT metadata block (NOTE / STYLE / REGION) wholesale.
             if let first = lines.first {
@@ -122,10 +141,14 @@ final class SubtitleCueRenderer {
             guard let (start, end) = parseTiming(lines[timingIdx]) else { continue }
             let bodyLines = Array(lines[(timingIdx + 1)...])
             let cleaned = cleanText(bodyLines.joined(separator: "\n"))
-            guard !cleaned.isEmpty, end > start else { continue }
+            guard !cleaned.isEmpty, cleaned.unicodeScalars.count <= maximumCueTextScalars,
+                  start.isFinite, end.isFinite, start >= 0, end > start,
+                  start <= maximumTimelineSeconds,
+                  end - start <= maximumCueDuration,
+                  end <= maximumTimelineSeconds else { continue }
             cues.append(SubtitleCue(start: start, end: end, text: cleaned))
         }
-        return stripLeakedASSMetadata(from: cues.sorted { $0.start < $1.start })
+        return boundedCues(stripLeakedASSMetadata(from: cues))
     }
 
     /// Parse ASS / SSA script text into cues (Gap 5). Reads the `[Events]` section: the `Format:` line names the
@@ -138,6 +161,7 @@ final class SubtitleCueRenderer {
         var inEvents = false
         var cues: [SubtitleCue] = []
         for rawLine in text.components(separatedBy: "\n") {
+            guard cues.count < maximumCueCount else { break }
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("[") {   // section header: [Events] enables Dialogue parsing, any other disables it
                 inEvents = line.lowercased().hasPrefix("[events]")
@@ -160,12 +184,39 @@ final class SubtitleCueRenderer {
                                        omittingEmptySubsequences: false).map(String.init)
             guard fields.count > textIdx, fields.count > startIdx, fields.count > endIdx else { continue }
             guard let start = parseTimestamp(fields[startIdx]), let end = parseTimestamp(fields[endIdx]),
-                  end > start else { continue }
+                  start.isFinite, end.isFinite, start >= 0, end > start,
+                  start <= maximumTimelineSeconds, end <= maximumTimelineSeconds,
+                  end - start <= maximumCueDuration else { continue }
             let cleaned = cleanASSText(fields[textIdx])
-            guard !cleaned.isEmpty else { continue }
+            guard !cleaned.isEmpty, cleaned.unicodeScalars.count <= maximumCueTextScalars else { continue }
             cues.append(SubtitleCue(start: start, end: end, text: cleaned))
         }
-        return cues.sorted { $0.start < $1.start }
+        return boundedCues(cues)
+    }
+
+    /// Sweep in timeline order with a bounded active set.  At most three overlay labels can ever be useful on
+    /// one bottom-centre surface; retaining more does not improve rendering and makes later clock lookups
+    /// attacker-amplifiable.  Sorting is the one O(n log n) step; the sweep itself is O(n), unlike repeatedly
+    /// scanning all overlapping prior cues.
+    private static func boundedCues(_ raw: [SubtitleCue]) -> [SubtitleCue] {
+        let ordered = raw.filter {
+            $0.start.isFinite && $0.end.isFinite && $0.start >= 0 && $0.end > $0.start
+                && $0.end - $0.start <= maximumCueDuration && $0.end <= maximumTimelineSeconds
+                && !$0.text.isEmpty && $0.text.unicodeScalars.count <= maximumCueTextScalars
+        }.sorted {
+            $0.start == $1.start ? ($0.end == $1.end ? $0.text < $1.text : $0.end < $1.end) : $0.start < $1.start
+        }
+        var accepted: [SubtitleCue] = []
+        accepted.reserveCapacity(min(ordered.count, maximumCueCount))
+        var active: [SubtitleCue] = []
+        for cue in ordered {
+            guard accepted.count < maximumCueCount else { break }
+            active.removeAll { $0.end <= cue.start }
+            guard active.count < maximumSimultaneousCues else { continue }
+            accepted.append(cue)
+            active.append(cue)
+        }
+        return accepted
     }
 
     /// Flatten one ASS Dialogue Text field to plain display text: convert `\N` / `\n` hard breaks to newlines
@@ -329,39 +380,133 @@ final class SubtitleCueRenderer {
 /// unlike libmpv which is handed a local file path). A `file://` URL (used by the community-pool path, which
 /// already downloaded to disk) is read straight off disk with no network.
 enum SubtitleFileFetcher {
-    private static let session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.urlCache = URLCache(memoryCapacity: 2 * 1024 * 1024, diskCapacity: 8 * 1024 * 1024, diskPath: "stremiox-subs-av")
-        config.requestCachePolicy = .returnCacheDataElseLoad
-        return URLSession(configuration: config)
-    }()
+    private static let maximumBytes = 2 * 1024 * 1024
+    private static let maximumRedirects = 3
 
     /// Fetch the subtitle bytes for `url`, calling `done` on a background thread with the data (or nil on
     /// failure). `file://` URLs read from disk; http(s) URLs download with a timeout + one retry.
     static func fetch(_ url: URL, timeout: TimeInterval, done: @escaping (Data?) -> Void) {
         if url.isFileURL {
-            done(try? Data(contentsOf: url))
+            guard let data = try? Data(contentsOf: url), data.count <= maximumBytes else { done(nil); return }
+            done(data)
             return
         }
+        guard SubtitleRemoteURLPolicy.accepts(url) else { done(nil); return }
         download(url, timeout: timeout, retriesLeft: 1, done: done)
     }
 
     private static func download(_ url: URL, timeout: TimeInterval, retriesLeft: Int, done: @escaping (Data?) -> Void) {
-        var request = URLRequest(url: url)
-        request.timeoutInterval = timeout
-        request.cachePolicy = .returnCacheDataElseLoad
-        session.dataTask(with: request) { data, response, _ in
-            // Only a genuine 2xx body is a subtitle; a non-HTTP response (nil cast) or an unexpected 3xx that
-            // slips past URLSession's auto-redirect falls into the retry/nil path rather than being parsed.
-            let statusOK = (response as? HTTPURLResponse).map { (200 ..< 300).contains($0.statusCode) } ?? false
-            guard statusOK, let data, !data.isEmpty else {
-                if retriesLeft > 0 {
-                    download(url, timeout: timeout, retriesLeft: retriesLeft - 1, done: done)
-                } else { done(nil) }
+        StreamingFetch(url: url, timeout: timeout) { data in
+            guard let data, !data.isEmpty else {
+                if retriesLeft > 0 { download(url, timeout: timeout, retriesLeft: retriesLeft - 1, done: done) }
+                else { done(nil) }
                 return
             }
             done(data)
-        }.resume()
+        }.start()
+    }
+
+    /// URLSession's convenience `data(for:)` buffers an entire response before the caller can compare its size.
+    /// This delegate owns a hard receive-time ceiling and validates every redirect before a byte of the new peer
+    /// is accepted.  The receiver owns its session until exactly one terminal callback releases both.
+    private final class StreamingFetch: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
+        private let url: URL
+        private let timeout: TimeInterval
+        private let completion: (Data?) -> Void
+        private var data = Data()
+        private var responseOK = false
+        private var redirectCount = 0
+        private var finished = false
+        private var session: URLSession?
+
+        init(url: URL, timeout: TimeInterval, completion: @escaping (Data?) -> Void) {
+            self.url = url; self.timeout = max(0.1, timeout); self.completion = completion
+        }
+
+        func start() {
+            let config = URLSessionConfiguration.ephemeral
+            config.timeoutIntervalForRequest = timeout
+            config.timeoutIntervalForResource = timeout
+            config.waitsForConnectivity = false
+            config.httpShouldSetCookies = false
+            config.urlCache = nil
+            let session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+            self.session = session
+            var request = URLRequest(url: url)
+            request.timeoutInterval = timeout
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            session.dataTask(with: request).resume()
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  response.expectedContentLength < 0 || response.expectedContentLength <= Int64(maximumBytes) else {
+                completionHandler(.cancel); return
+            }
+            responseOK = true
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+            guard !finished, responseOK, data.count <= maximumBytes - chunk.count else {
+                dataTask.cancel(); finish(nil); return
+            }
+            data.append(chunk)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            redirectCount += 1
+            guard redirectCount <= maximumRedirects, let next = request.url, SubtitleRemoteURLPolicy.accepts(next) else {
+                completionHandler(nil); return
+            }
+            completionHandler(request)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        didCompleteWithError error: Error?) {
+            finish(error == nil && responseOK && !data.isEmpty ? data : nil)
+        }
+
+        private func finish(_ result: Data?) {
+            guard !finished else { return }
+            finished = true
+            session?.invalidateAndCancel()
+            session = nil
+            completion(result)
+        }
+    }
+}
+
+/// A subtitle URL is content supplied by an add-on, not a trusted app endpoint.  Reject non-web schemes and
+/// direct private/loopback/link-local targets before URLSession can be induced to fetch a local service.  The
+/// URLSession delegate above re-applies the same policy to every redirect; hostnames remain URLSession's own
+/// connection target so this check never substitutes a proxy or rewrites the requested authority.
+private enum SubtitleRemoteURLPolicy {
+    static func accepts(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              url.user == nil, url.password == nil, url.fragment == nil,
+              let host = url.host, !host.isEmpty else { return false }
+        return isPublicLiteral(host)
+    }
+
+    private static func isPublicLiteral(_ host: String) -> Bool {
+        let text = host.lowercased()
+        if text == "localhost" || text.hasSuffix(".localhost") { return false }
+        if text.contains(":") {
+            return !(text == "::" || text == "::1" || text.hasPrefix("fe80:")
+                || text.hasPrefix("fc") || text.hasPrefix("fd") || text.hasPrefix("ff"))
+        }
+        let parts = text.split(separator: ".")
+        guard parts.count == 4, let a = Int(parts[0]), let b = Int(parts[1]) else { return true }
+        if a == 0 || a == 10 || a == 127 || a >= 224 || (a == 169 && b == 254)
+            || (a == 172 && (16...31).contains(b)) || (a == 192 && b == 168)
+            || (a == 100 && (64...127).contains(b)) { return false }
+        return true
     }
 }
 

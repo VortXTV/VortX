@@ -261,6 +261,16 @@ RemoteConfig.snapshot.features["plainRemux"] = true
 check(PlayerEngineRouter.plainRemuxEnabled(), "flag: RemoteConfig true enables")
 UserDefaults.standard.set(false, forKey: PlayerEngineRouter.plainRemuxKey)
 check(!PlayerEngineRouter.plainRemuxEnabled(), "flag: explicit local OFF beats a remote ON")
+check(PlayerEngineRouter.engine(for: konrepoMKV, isTorrent: false, isDolbyVision: false,
+                                override: .avfoundation, dvDisplayCapable: true) == .mpv,
+      "plain-remux kill switch blocks explicit AVPlayer from constructing a Matroska remux")
+check(PlayerEngineRouter.engine(for: plainMP4, isTorrent: false, isDolbyVision: false,
+                                override: .avfoundation, dvDisplayCapable: true) == .avfoundation,
+      "remux kill switch still permits explicitly requested native MP4 AVPlayer")
+UserDefaults.standard.set(false, forKey: PlayerEngineRouter.dvRemuxKey)
+check(PlayerEngineRouter.engine(for: dvMKV, isTorrent: false, isDolbyVision: true,
+                                override: .avfoundation, dvDisplayCapable: true) == .mpv,
+      "DV-remux kill switch blocks explicit AVPlayer from constructing a Dolby Vision remux")
 resetFlags()
 
 // 8. HLS delivery rollback disables the plain lane entirely (it has no legacy-loader form).

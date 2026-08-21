@@ -151,7 +151,8 @@ final class VortXExternalEngine: @unchecked Sendable {
         VortXEngineHostPolicy.httpURL(host: host, port: port, path: path)
     }
 
-    private func request(_ url: URL, method: String, body: Data?, authorized: Bool) -> URLRequest {
+    private func request(_ url: URL, method: String, body: Data?, authorized: Bool,
+                         authorizationToken: String? = nil) -> URLRequest {
         var req = URLRequest(url: url)
         req.httpMethod = method
         if let body {
@@ -159,7 +160,7 @@ final class VortXExternalEngine: @unchecked Sendable {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        if authorized, let token {
+        if authorized, let token = authorizationToken ?? token {
             req.setValue(VortXEngineProtocol.bearer(token),
                          forHTTPHeaderField: VortXEngineProtocol.authorizationHeader)
         }
@@ -169,7 +170,10 @@ final class VortXExternalEngine: @unchecked Sendable {
     private func send<T: Decodable>(_ req: URLRequest, as type: T.Type) async -> T? {
         do {
             let (data, response) = try await session.data(for: req)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            // Control replies are metadata, never media.  Refuse a peer that tries to turn status polling into a
+            // large allocation even before JSON decoding; semantic checks below handle the decoded geometry.
+            guard data.count <= 256 * 1024,
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 return nil
             }
             return try JSONDecoder().decode(T.self, from: data)
@@ -239,12 +243,16 @@ final class VortXExternalEngine: @unchecked Sendable {
 
     struct OpenedSession: Sendable {
         let sessionID: String
+        let mountGeneration: String
         /// The full media URL, composed against the host address this client dialled. The host never returns a
         /// URL because it does not know which of its addresses we can reach.
         let playlistURL: URL
         let retainsFullTimeline: Bool
         let host: String
         let port: Int
+        /// Immutable authority captured at session creation.  Later pairing changes must never send a bearer
+        /// minted by host B to a session still addressed to host A.
+        let bearerToken: String
     }
 
     /// Ask the host to build a remux and return where to fetch it. Returns nil for every failure, which the
@@ -257,8 +265,16 @@ final class VortXExternalEngine: @unchecked Sendable {
                      preferredAudioLanguages: [String]? = nil,
                      audioRejectTerms: [String]? = nil) async -> OpenedSession? {
         guard case .external(let hostString, let port) = mountPlan,
+              let bearerToken = token,
               let url = controlURL(host: hostString, port: port,
                                    path: VortXEngineProtocol.Path.session) else { return nil }
+        // Preflight the exact v2 control contract before creating a producer.  A v1 host cannot return the
+        // generation-bound physical-quiescence receipt, so opening first would create an orphaned producer.
+        guard let info = await info(host: VortXEngineHostPolicy.authority(host: hostString, port: port)),
+              info.capabilities.contains(.remux) else {
+            DiagnosticsLog.log("engine", "host session refused: missing v2 remux capability")
+            return nil
+        }
         let payload = VortXEngineProtocol.SessionRequest(
             input: input.absoluteString,
             headers: headers,
@@ -269,7 +285,8 @@ final class VortXExternalEngine: @unchecked Sendable {
             preferredAudioLanguages: preferredAudioLanguages,
             audioRejectTerms: audioRejectTerms)
         guard let body = try? JSONEncoder().encode(payload),
-              let opened = await send(request(url, method: "POST", body: body, authorized: true),
+              let opened = await send(request(url, method: "POST", body: body, authorized: true,
+                                              authorizationToken: bearerToken),
                                       as: VortXEngineProtocol.SessionResponse.self) else {
             DiagnosticsLog.log("engine", "host session request failed; falling back to on-device")
             return nil
@@ -286,10 +303,12 @@ final class VortXExternalEngine: @unchecked Sendable {
             "engine",
             "host session \(opened.sessionID) media=\(mediaAuthority) retain=\(opened.retainsFullTimeline)")
         return OpenedSession(sessionID: opened.sessionID,
+                             mountGeneration: opened.mountGeneration,
                              playlistURL: playlistURL,
                              retainsFullTimeline: opened.retainsFullTimeline,
                              host: hostString,
-                             port: port)
+                             port: port,
+                             bearerToken: bearerToken)
     }
 
     func status(
@@ -298,11 +317,14 @@ final class VortXExternalEngine: @unchecked Sendable {
     ) async -> VortXEngineProtocol.SessionStatus? {
         guard let url = controlURL(host: session.host, port: session.port,
                                    path: VortXEngineProtocol.Path.status(session.sessionID)) else { return nil }
-        var statusRequest = request(url, method: "GET", body: nil, authorized: true)
+        var statusRequest = request(url, method: "GET", body: nil, authorized: true,
+                                    authorizationToken: session.bearerToken)
         if let timeoutSeconds {
             statusRequest.timeoutInterval = max(0.1, timeoutSeconds)
         }
-        return await send(statusRequest, as: VortXEngineProtocol.SessionStatus.self)
+        guard let status = await send(statusRequest, as: VortXEngineProtocol.SessionStatus.self),
+              VortXEngineProtocol.acceptsSessionStatus(status) else { return nil }
+        return status
     }
 
     /// Tell the host our player reached first frame, which widens the producer's lead exactly as the on-device
@@ -311,20 +333,40 @@ final class VortXExternalEngine: @unchecked Sendable {
     func markReady(_ session: OpenedSession) async -> VortXEngineProtocol.SessionStatus? {
         guard let url = controlURL(host: session.host, port: session.port,
                                    path: VortXEngineProtocol.Path.ready(session.sessionID)) else { return nil }
-        return await send(request(url, method: "POST", body: Data("{}".utf8), authorized: true),
-                          as: VortXEngineProtocol.SessionStatus.self)
+        guard let status = await send(request(url, method: "POST", body: Data("{}".utf8), authorized: true,
+                                             authorizationToken: session.bearerToken),
+                                      as: VortXEngineProtocol.SessionStatus.self),
+              VortXEngineProtocol.acceptsSessionStatus(status) else { return nil }
+        return status
     }
 
-    /// Best-effort teardown. Fire and forget: the host reaps an abandoned session on its own timer, so a client
-    /// that dies or loses the network costs it a minute of producer time, not a leak.
-    func close(_ session: OpenedSession) {
+    /// Await an authenticated physical-unwind receipt.  A 2xx response without the exact session and mount
+    /// generation is deliberately rejected: a stale host must never authorize an MPV mount.
+    func closeAndAwaitReceipt(
+        _ session: OpenedSession,
+        timeoutSeconds: TimeInterval = 3
+    ) async -> VortXEngineProtocol.TeardownReceipt? {
         guard let url = controlURL(host: session.host, port: session.port,
-                                   path: VortXEngineProtocol.Path.teardown(session.sessionID)) else { return }
-        let req = request(url, method: "DELETE", body: nil, authorized: true)
-        session_teardown(req)
+                                   path: VortXEngineProtocol.Path.teardown(session.sessionID)) else { return nil }
+        guard let body = try? JSONEncoder().encode(VortXEngineProtocol.TeardownRequest(
+            sessionID: session.sessionID, mountGeneration: session.mountGeneration
+        )) else { return nil }
+        var req = request(url, method: "DELETE", body: body, authorized: true,
+                          authorizationToken: session.bearerToken)
+        req.timeoutInterval = max(0.1, timeoutSeconds)
+        guard let receipt = await send(req, as: VortXEngineProtocol.TeardownReceipt.self),
+              VortXEngineProtocol.acceptsTeardownReceipt(
+                receipt,
+                for: VortXEngineProtocol.TeardownRequest(
+                    sessionID: session.sessionID,
+                    mountGeneration: session.mountGeneration)) else { return nil }
+        return receipt
     }
 
-    private func session_teardown(_ req: URLRequest) {
-        session.dataTask(with: req).resume()
+    /// Best-effort shutdown for ordinary title replacement.  AV→MPV fallback uses `closeAndAwaitReceipt`.
+    func close(_ session: OpenedSession) {
+        Task.detached(priority: .utility) { [weak self] in
+            _ = await self?.closeAndAwaitReceipt(session)
+        }
     }
 }

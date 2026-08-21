@@ -3,9 +3,11 @@
 // The policy and engine signal are dependency-free production declarations. Extract both exact declarations,
 // then compile them with this harness:
 //
-//   sed -n '/^enum TVAVStartWatchdogPolicy {/,/^\\/\\/\\/ Full-screen libmpv player/p' \
+//   sed -n '/^enum TVAVStartWatchdogPolicy {/,/^\\/\\/\\/ The direct AVPlayer no-frame path/p' \
 //     app/SourcesTV/TVPlayerView.swift | sed '$d' > /tmp/tv-av-start-watchdog-policy.swift && \
-//   sed -n '/^struct AVPlayerRemuxStartupSignal:/,/^\\/\\/\\/ AVFoundation implementation/p' \
+//   sed -n '/^enum TVPlaybackStartPolicy {/,/^\\/\\/\\/ Full-screen libmpv player/p' \
+//     app/SourcesTV/TVPlayerView.swift | sed '$d' >> /tmp/tv-av-start-watchdog-policy.swift && \
+//   sed -n '/^struct AVPlayerRemuxStartupSignal:/,/^\\/\\/ MARK: - Stall telemetry episode/p' \
 //     app/Sources/Player/AVPlayerEngine.swift | sed '$d' >> /tmp/tv-av-start-watchdog-policy.swift && \
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/tv-av-start-watchdog-policy-test \

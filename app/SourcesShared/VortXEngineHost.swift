@@ -1,6 +1,7 @@
 #if os(macOS)
 import Foundation
 import Network
+import Darwin
 
 /// THE ENGINE HOST: the Mac side of external engine mode.
 ///
@@ -106,6 +107,16 @@ final class VortXEngineHost: @unchecked Sendable {
     private var lifecycleEpoch: UInt64 = 0
     private var boundPortStorage: UInt16 = 0
     private var sessions: [String: HostedSession] = [:]
+    /// Completed teardown acknowledgements make a repeated authenticated DELETE idempotent without pretending
+    /// that a freshly-created session with the same id exists.  Session ids are UUIDs; cap retained receipts
+    /// so a busy host cannot grow this bookkeeping without bound.
+    /// A completed receipt remains owned by the same paired principal that created the session.  A receipt is
+    /// a capability to change playback engines; it must never become a bearer-independent lookup token.
+    private struct CompletedTeardown {
+        let principalID: String
+        let receipt: VortXEngineProtocol.TeardownReceipt
+    }
+    private var completedTeardowns: [String: CompletedTeardown] = [:]
     private var pairing = VortXEnginePairingState()
     private var activityToken: NSObjectProtocol?
     private var reaper: DispatchSourceTimer?
@@ -141,19 +152,29 @@ final class VortXEngineHost: @unchecked Sendable {
 
     private final class HostedSession {
         let id: String
+        let mountGeneration: String
         let capability: String
+        /// Stable paired-device identity captured at creation.  Tokens may be rotated by a re-pair, but a
+        /// session never changes owner part-way through its lifetime.
+        let principalID: String
         let server: VortXRemuxHLSServer
         let retainsFullTimeline: Bool
         var lastContact: TimeInterval
         var readyMarked = false
+        var teardownRequested = false
+        let quiescence: VortXRemuxQuiescenceReceipt
 
-        init(id: String, capability: String, server: VortXRemuxHLSServer,
+        init(id: String, mountGeneration: String, capability: String, principalID: String,
+             server: VortXRemuxHLSServer,
              retainsFullTimeline: Bool, now: TimeInterval) {
             self.id = id
+            self.mountGeneration = mountGeneration
             self.capability = capability
+            self.principalID = principalID
             self.server = server
             self.retainsFullTimeline = retainsFullTimeline
             self.lastContact = now
+            self.quiescence = server.quiescenceReceipt()
         }
     }
 
@@ -668,14 +689,14 @@ final class VortXEngineHost: @unchecked Sendable {
         // Everything below requires a token.
         guard let header = request.headers[VortXEngineProtocol.authorizationHeader.lowercased()],
               let token = VortXEngineProtocol.token(fromAuthorization: header),
-              pairingRegistry.authorize(token: token, now: wall) != nil else {
+              let principal = pairingRegistry.authorize(token: token, now: wall) else {
             reply(connection, status: "401 Unauthorized",
                   body: VortXEngineProtocol.ErrorBody(error: "unauthorized", detail: "pair this device first"))
             return
         }
 
         if request.path == VortXEngineProtocol.Path.session, request.method == "POST" {
-            handleCreateSession(connection, body: body, now: now)
+            handleCreateSession(connection, body: body, now: now, principalID: principal.clientID)
             return
         }
 
@@ -691,9 +712,9 @@ final class VortXEngineHost: @unchecked Sendable {
             }
             let verb = parts.count > 1 ? parts[1] : ""
             switch (request.method, verb) {
-            case ("GET", "status"):  handleStatus(connection, id: id, now: now, markReady: false)
-            case ("POST", "ready"):  handleStatus(connection, id: id, now: now, markReady: true)
-            case ("DELETE", ""):     handleTeardown(connection, id: id)
+            case ("GET", "status"):  handleStatus(connection, id: id, now: now, markReady: false, principalID: principal.clientID)
+            case ("POST", "ready"):  handleStatus(connection, id: id, now: now, markReady: true, principalID: principal.clientID)
+            case ("DELETE", ""):     handleTeardown(connection, id: id, body: body, principalID: principal.clientID)
             default:
                 reply(connection, status: "405 Method Not Allowed",
                       body: VortXEngineProtocol.ErrorBody(error: "method", detail: nil))
@@ -735,9 +756,11 @@ final class VortXEngineHost: @unchecked Sendable {
         }
     }
 
-    private func handleCreateSession(_ connection: NWConnection, body: Data, now: TimeInterval) {
+    private func handleCreateSession(_ connection: NWConnection, body: Data, now: TimeInterval,
+                                     principalID: String) {
         guard let request = try? JSONDecoder().decode(VortXEngineProtocol.SessionRequest.self, from: body),
-              let input = URL(string: request.input) else {
+              let input = VortXEngineRemoteInputPolicy.validatedURL(request.input),
+              VortXEngineRemoteInputPolicy.accepts(headers: request.headers) else {
             reply(connection, status: "400 Bad Request",
                   body: VortXEngineProtocol.ErrorBody(error: "malformed", detail: nil))
             return
@@ -798,7 +821,9 @@ final class VortXEngineHost: @unchecked Sendable {
         // a sliding window, and the client must keep clamping backward seeks in that case.
         let granted = mounted.server.retainsFullTimeline
         let id = UUID().uuidString.lowercased()
-        let session = HostedSession(id: id, capability: capability, server: mounted.server,
+        let mountGeneration = UUID().uuidString.lowercased()
+        let session = HostedSession(id: id, mountGeneration: mountGeneration,
+                                    capability: capability, principalID: principalID, server: mounted.server,
                                     retainsFullTimeline: granted, now: now)
         // Commit and start in the same serialized lifecycle operation, but never start the producer while
         // holding the host state lock. A stop requested before this operation changes the epoch and rejects it;
@@ -830,18 +855,23 @@ final class VortXEngineHost: @unchecked Sendable {
             "session \(id) hosting \(request.mode.rawValue) on media port \(mounted.server.port) retain=\(granted)\(wantsRetention && !granted ? " (requested but disk declined)" : "")")
         reply(connection, status: "200 OK", body: VortXEngineProtocol.SessionResponse(
             sessionID: id,
+            mountGeneration: mountGeneration,
             mediaPort: Int(mounted.server.port),
             mediaPath: mounted.server.mountResourcePath,
             retainsFullTimeline: granted))
     }
 
-    private func handleStatus(_ connection: NWConnection, id: String, now: TimeInterval, markReady: Bool) {
+    private func handleStatus(_ connection: NWConnection, id: String, now: TimeInterval, markReady: Bool,
+                              principalID: String) {
         stateLock.lock()
         let session = sessions[id]
-        session?.lastContact = now
-        if markReady, let session, !session.readyMarked { session.readyMarked = true }
+        let ownsSession = session?.principalID == principalID
+        if ownsSession { session?.lastContact = now }
+        if ownsSession, markReady, let session, !session.readyMarked { session.readyMarked = true }
         stateLock.unlock()
-        guard let session else {
+        // Deliberately use the same 404 for a foreign and unknown id: a paired household device should not
+        // gain a session-existence oracle for another paired device.
+        guard let session, ownsSession else {
             reply(connection, status: "404 Not Found",
                   body: VortXEngineProtocol.ErrorBody(error: "no_session", detail: nil))
             return
@@ -875,14 +905,105 @@ final class VortXEngineHost: @unchecked Sendable {
             producedEdgeSeconds: session.server.producedEdgeSeconds))
     }
 
-    private func handleTeardown(_ connection: NWConnection, id: String) {
+    private func handleTeardown(_ connection: NWConnection, id: String, body: Data, principalID: String) {
+        // A v1 client cannot validate a receipt.  Still accept its bodyless DELETE as cleanup so an upgrade
+        // does not strand an old session; v2 clients preflight and never rely on this path for a handoff.
+        if body.isEmpty {
+            stateLock.lock()
+            let legacySession = sessions[id]
+            stateLock.unlock()
+            guard let legacySession, legacySession.principalID == principalID else {
+                reply(connection, status: "404 Not Found", body: VortXEngineProtocol.ErrorBody(
+                    error: "no_session", detail: nil))
+                return
+            }
+            legacySession.server.invalidate()
+            reply(connection, status: "204 No Content", body: Data())
+            return
+        }
+        guard let request = try? JSONDecoder().decode(VortXEngineProtocol.TeardownRequest.self, from: body),
+              request.version == VortXEngineProtocol.TeardownRequest.currentVersion,
+              request.sessionID == id else {
+            reply(connection, status: "400 Bad Request", body: VortXEngineProtocol.ErrorBody(
+                error: "malformed_teardown", detail: nil))
+            return
+        }
+
         stateLock.lock()
-        let session = sessions.removeValue(forKey: id)
+        if let completed = completedTeardowns[id] {
+            stateLock.unlock()
+            guard completed.principalID == principalID,
+                  completed.receipt.mountGeneration == request.mountGeneration else {
+                reply(connection, status: "409 Conflict", body: VortXEngineProtocol.ErrorBody(
+                    error: "stale_mount", detail: nil))
+                return
+            }
+            reply(connection, status: "200 OK", body: completed.receipt)
+            return
+        }
+        guard let session = sessions[id], session.principalID == principalID else {
+            stateLock.unlock()
+            reply(connection, status: "404 Not Found", body: VortXEngineProtocol.ErrorBody(
+                error: "no_session", detail: nil))
+            return
+        }
+        guard session.mountGeneration == request.mountGeneration else {
+            stateLock.unlock()
+            reply(connection, status: "409 Conflict", body: VortXEngineProtocol.ErrorBody(
+                error: "stale_mount", detail: nil))
+            return
+        }
+        let firstRequest = !session.teardownRequested
+        session.teardownRequested = true
         stateLock.unlock()
-        session?.server.invalidate()
-        if session != nil { DiagnosticsLog.log("enginehost", "session \(id) torn down by client") }
-        releaseActivityIfIdle()
-        reply(connection, status: "200 OK", body: VortXEngineProtocol.ErrorBody(error: "ok", detail: nil))
+
+        // Keep the session registered until its real terminal edge.  Removing it first would make a 200 mean
+        // only “cancellation was requested”, which is exactly the AV→MPV race this receipt exists to prevent.
+        if firstRequest { session.server.invalidate() }
+        Task.detached(priority: .userInitiated) { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            // Leave delivery headroom inside the client's three-second request deadline.  A timeout retains the
+            // session, so a subsequent identical request can still receive a genuine receipt when it unwinds.
+            let quiescent = await session.quiescence.wait(timeout: .seconds(2))
+            guard quiescent else {
+                self.reply(connection, status: "504 Gateway Timeout", body: VortXEngineProtocol.ErrorBody(
+                    error: "teardown_timeout", detail: nil))
+                return
+            }
+            let receipt = VortXEngineProtocol.TeardownReceipt(
+                version: VortXEngineProtocol.TeardownRequest.currentVersion,
+                sessionID: id,
+                mountGeneration: request.mountGeneration,
+                producerQuiescent: true)
+            self.stateLock.lock()
+            let stillCurrent = self.sessions[id] === session
+                && session.mountGeneration == request.mountGeneration
+            if stillCurrent {
+                self.sessions.removeValue(forKey: id)
+                if self.completedTeardowns.count >= 64,
+                   let oldest = self.completedTeardowns.keys.sorted().first {
+                    self.completedTeardowns.removeValue(forKey: oldest)
+                }
+                self.completedTeardowns[id] = CompletedTeardown(principalID: principalID, receipt: receipt)
+            }
+            self.stateLock.unlock()
+            if !stillCurrent {
+                self.stateLock.lock()
+                let completed = self.completedTeardowns[id]
+                self.stateLock.unlock()
+                if let completed, completed.principalID == principalID,
+                   completed.receipt.mountGeneration == request.mountGeneration {
+                    self.reply(connection, status: "200 OK", body: completed.receipt)
+                    return
+                }
+                self.reply(connection, status: "409 Conflict", body: VortXEngineProtocol.ErrorBody(
+                    error: "stale_mount", detail: nil))
+                return
+            }
+            self.releaseActivityIfIdle()
+            DiagnosticsLog.log("enginehost", "session \(id) teardown acknowledged after producer unwind")
+            self.reply(connection, status: "200 OK", body: receipt)
+        }
     }
 
     // MARK: - Replies
@@ -900,6 +1021,111 @@ final class VortXEngineHost: @unchecked Sendable {
         let short = info?["CFBundleShortVersionString"] as? String ?? "0"
         let build = info?["CFBundleVersion"] as? String ?? "0"
         return "\(short) (\(build))"
+    }
+}
+
+/// Admission policy for a URL the engine host will fetch.  The control listener is deliberately capable of
+/// receiving authenticated requests from several paired household devices; it must not therefore become a
+/// generic proxy to the host's loopback, LAN, link-local or NAT64-reachable private services.
+///
+/// Resolution happens immediately before a session is constructed, rather than when a URL is decoded.  DNS
+/// records can change between those two operations, and a hostname with even one private answer is rejected.
+/// FFmpeg is configured without a proxy by the normal source path; redirects are not accepted by this control
+/// policy because a redirect target cannot be verified as the same public peer before the producer fetches it.
+private enum VortXEngineRemoteInputPolicy {
+    static let maximumURLScalars = 8_192
+    static let maximumHeaders = 32
+    static let maximumHeaderNameScalars = 128
+    static let maximumHeaderValueScalars = 4_096
+    static let maximumHeaderAggregateBytes = 16 * 1024
+    private static let hopByHop = Set([
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+        "trailer", "transfer-encoding", "upgrade", "host", "content-length"
+    ])
+
+    static func validatedURL(_ raw: String) -> URL? {
+        guard raw.unicodeScalars.count <= maximumURLScalars,
+              let url = URL(string: raw),
+              let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              url.user == nil, url.password == nil,
+              let host = url.host, !host.isEmpty,
+              url.fragment == nil,
+              isPublicResolution(host) else { return nil }
+        return url
+    }
+
+    static func accepts(headers: [String: String]?) -> Bool {
+        guard let headers else { return true }
+        guard headers.count <= maximumHeaders else { return false }
+        var aggregate = 0
+        for (rawName, value) in headers {
+            let name = rawName.lowercased()
+            guard rawName.unicodeScalars.count <= maximumHeaderNameScalars,
+                  value.unicodeScalars.count <= maximumHeaderValueScalars,
+                  !hopByHop.contains(name),
+                  rawName.unicodeScalars.allSatisfy({ scalar in
+                      scalar.value == 45 || (scalar.value >= 48 && scalar.value <= 57)
+                          || (scalar.value >= 65 && scalar.value <= 90)
+                          || (scalar.value >= 97 && scalar.value <= 122)
+                  }),
+                  !value.contains("\r"), !value.contains("\n") else { return false }
+            aggregate += rawName.utf8.count + value.utf8.count + 4
+            guard aggregate <= maximumHeaderAggregateBytes else { return false }
+        }
+        return true
+    }
+
+    private static func isPublicResolution(_ host: String) -> Bool {
+        var hints = addrinfo(ai_flags: AI_ADDRCONFIG, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM,
+                             ai_protocol: IPPROTO_TCP, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil,
+                             ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let first = result else { return false }
+        defer { freeaddrinfo(first) }
+        var cursor: UnsafeMutablePointer<addrinfo>? = first
+        var found = false
+        while let node = cursor {
+            var storage = sockaddr_storage()
+            memcpy(&storage, node.pointee.ai_addr, Int(node.pointee.ai_addrlen))
+            var numeric = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(UnsafePointer(withUnsafePointer(to: &storage) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 } }),
+                              socklen_t(node.pointee.ai_addrlen), &numeric, socklen_t(numeric.count), nil, 0,
+                              NI_NUMERICHOST) == 0 else { return false }
+            let text = String(cString: numeric)
+            guard isPublicNumericAddress(text) else { return false }
+            found = true
+            cursor = node.pointee.ai_next
+        }
+        return found
+    }
+
+    /// Reject every non-global class, including IPv4 embedded in IPv6/NAT64 textual forms.  This intentionally
+    /// fail-closes on unfamiliar special-use ranges; a media URL can always be fetched locally instead.
+    private static func isPublicNumericAddress(_ text: String) -> Bool {
+        let stripped = text.split(separator: "%", maxSplits: 1).first.map(String.init) ?? text
+        if stripped.contains(":") {
+            let lower = stripped.lowercased()
+            if lower == "::" || lower == "::1" || lower.hasPrefix("fe80:") || lower.hasPrefix("fc") || lower.hasPrefix("fd") || lower.hasPrefix("ff") { return false }
+            // IPv4-mapped and NAT64 forms retain their final dotted IPv4 component.  Do not let a private
+            // address tunnel through an otherwise globally-routed IPv6 prefix.
+            if let dotted = lower.split(separator: ":").last, dotted.contains("."), !isPublicIPv4(String(dotted)) { return false }
+            return true
+        }
+        return isPublicIPv4(stripped)
+    }
+
+    private static func isPublicIPv4(_ text: String) -> Bool {
+        let parts = text.split(separator: ".")
+        guard parts.count == 4, let a = Int(parts[0]), let b = Int(parts[1]), let c = Int(parts[2]),
+              let d = Int(parts[3]), [a, b, c, d].allSatisfy({ (0...255).contains($0) }) else { return false }
+        if a == 0 || a == 10 || a == 127 || a >= 224 { return false }
+        if a == 169 && b == 254 { return false }
+        if a == 172 && (16...31).contains(b) { return false }
+        if a == 192 && b == 168 { return false }
+        if a == 100 && (64...127).contains(b) { return false }
+        if a == 192 && b == 0 && c == 0 { return false }
+        if a == 198 && (b == 18 || b == 19) { return false }
+        return true
     }
 }
 

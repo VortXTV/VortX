@@ -209,6 +209,35 @@ enum VortXEngineProtocolCompatibilityTests {
             VortXEngineProtocol.SessionStatus.self,
             from: JSONEncoder().encode(current))
         precondition(roundTrip == current)
+        // Network status is untrusted even after pairing.  The client must reject values that would overflow
+        // timing/geometry/counter consumers rather than letting a malformed host turn a status poll into a
+        // player-state crash or a huge picker allocation.
+        precondition(VortXEngineProtocol.acceptsSessionStatus(roundTrip))
+        let nonFinite = VortXEngineProtocol.SessionStatus(
+            healthy: current.healthy, durationSeconds: .infinity,
+            timelineOriginSeconds: current.timelineOriginSeconds, frameRate: current.frameRate,
+            chapters: current.chapters, producedSegments: current.producedSegments,
+            producedBytes: current.producedBytes, ended: current.ended,
+            initPublished: current.initPublished, failed: current.failed,
+            signalingPublished: current.signalingPublished, dolbyVision: current.dolbyVision,
+            width: current.width, height: current.height, bandwidth: current.bandwidth,
+            videoRange: current.videoRange, supportsHDRFallback: current.supportsHDRFallback,
+            audioTracks: current.audioTracks, selectedAudioStreamIndex: current.selectedAudioStreamIndex,
+            subtitleTracks: current.subtitleTracks, producedEdgeSeconds: current.producedEdgeSeconds)
+        precondition(!VortXEngineProtocol.acceptsSessionStatus(nonFinite))
+        let excessiveTracks = VortXEngineProtocol.SessionStatus(
+            healthy: current.healthy, durationSeconds: current.durationSeconds,
+            timelineOriginSeconds: current.timelineOriginSeconds, frameRate: current.frameRate,
+            chapters: current.chapters, producedSegments: current.producedSegments,
+            producedBytes: current.producedBytes, ended: current.ended,
+            initPublished: current.initPublished, failed: current.failed,
+            signalingPublished: current.signalingPublished, dolbyVision: current.dolbyVision,
+            width: current.width, height: current.height, bandwidth: current.bandwidth,
+            videoRange: current.videoRange, supportsHDRFallback: current.supportsHDRFallback,
+            audioTracks: Array(repeating: current.audioTracks![0], count: 129),
+            selectedAudioStreamIndex: current.selectedAudioStreamIndex,
+            subtitleTracks: current.subtitleTracks, producedEdgeSeconds: current.producedEdgeSeconds)
+        precondition(!VortXEngineProtocol.acceptsSessionStatus(excessiveTracks))
         precondition(roundTrip.audioTracks?[0].codec == "truehd")
         precondition(roundTrip.audioTracks?[0].activeCodec == "eac3")
         precondition(roundTrip.audioTracks?[0].channels == 8)
@@ -295,6 +324,48 @@ enum VortXEngineProtocolCompatibilityTests {
         precondition(decodedLegacyStatus.audioTracks?.first?.activeCodec == "truehd")
         precondition(decodedLegacyStatus.audioTracks?.first?.outputChannels == nil)
         precondition(decodedLegacyStatus.audioTracks?.first?.activeChannels == 8)
+
+        let teardownRequest = VortXEngineProtocol.TeardownRequest(
+            sessionID: "session-a",
+            mountGeneration: "mount-a")
+        let exactTeardownReceipt = VortXEngineProtocol.TeardownReceipt(
+            version: VortXEngineProtocol.TeardownRequest.currentVersion,
+            sessionID: "session-a",
+            mountGeneration: "mount-a",
+            producerQuiescent: true)
+        let roundTripTeardownRequest = try JSONDecoder().decode(
+            VortXEngineProtocol.TeardownRequest.self,
+            from: JSONEncoder().encode(teardownRequest))
+        let roundTripTeardownReceipt = try JSONDecoder().decode(
+            VortXEngineProtocol.TeardownReceipt.self,
+            from: JSONEncoder().encode(exactTeardownReceipt))
+        precondition(roundTripTeardownRequest == teardownRequest)
+        precondition(roundTripTeardownReceipt == exactTeardownReceipt)
+        precondition(VortXEngineProtocol.acceptsTeardownReceipt(
+            exactTeardownReceipt, for: teardownRequest))
+        // A repeat of the same immutable receipt is the protocol's idempotent success case.
+        precondition(VortXEngineProtocol.acceptsTeardownReceipt(
+            exactTeardownReceipt, for: teardownRequest))
+        precondition(!VortXEngineProtocol.acceptsTeardownReceipt(nil, for: teardownRequest))
+        precondition(!VortXEngineProtocol.acceptsTeardownReceipt(
+            .init(version: 0, sessionID: "session-a", mountGeneration: "mount-a", producerQuiescent: true),
+            for: teardownRequest))
+        precondition(!VortXEngineProtocol.acceptsTeardownReceipt(
+            .init(version: 1, sessionID: "session-b", mountGeneration: "mount-a", producerQuiescent: true),
+            for: teardownRequest))
+        precondition(!VortXEngineProtocol.acceptsTeardownReceipt(
+            .init(version: 1, sessionID: "session-a", mountGeneration: "mount-b", producerQuiescent: true),
+            for: teardownRequest))
+        precondition(!VortXEngineProtocol.acceptsTeardownReceipt(
+            .init(version: 1, sessionID: "session-a", mountGeneration: "mount-a", producerQuiescent: false),
+            for: teardownRequest))
+        let oldHostSessionResponse = Data(
+            """
+            {"sessionID":"session-a","mediaPort":1234,"mediaPath":"/master.m3u8","retainsFullTimeline":false}
+            """.utf8)
+        precondition((try? JSONDecoder().decode(
+            VortXEngineProtocol.SessionResponse.self,
+            from: oldHostSessionResponse)) == nil)
 
         print("VortXEngineProtocolCompatibilityTests: ALL PASS")
     }

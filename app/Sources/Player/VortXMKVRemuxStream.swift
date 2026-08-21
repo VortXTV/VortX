@@ -95,6 +95,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// this stream only checks it at closed-segment boundaries. See `VortXRemuxProducerLeadPolicy` for why this
     /// is a SEPARATE gate from `preparationGate` rather than a reuse of it.
     let producerLeadGate = VortXRemuxProducerLeadGate()
+    /// A closed-segment receipt is the only safe point to re-evaluate the local consumer's producer lead.
+    /// The server installs this before `start()`, and the closure never receives an open or unproven fragment.
+    var onHLSSegmentPublished: (@Sendable (VortXHLSSegment) -> Void)?
 
     /// F1: stable heap cell the INPUT context's `interrupt_callback` polls to abort a blocking network
     /// open/read/reconnect-sleep the instant cancel() fires. Without it a demote on a STALLED CDN leaves the
@@ -606,7 +609,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 of: VortXHLSWindow(segments: [segment])) else { return false }
             let selected = SubtitleRenditionPolicy.normalizedCues(
                 normalized, overlapping: segment.start, end: segment.end)
-            let data = Data(SubtitleRenditionPolicy.webVTTDocument(cues: selected).utf8)
+            let data = Data(SubtitleRenditionPolicy.webVTTDocument(
+                cues: selected,
+                segmentStart: segment.start,
+                segmentEnd: segment.end).utf8)
             guard hlsSpool.spill([.init(
                 key: key, data: data, durationMilliseconds: duration)]) else { return false }
         }
@@ -3977,6 +3983,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
         _hlsSegments.append(videoSegment)
         hlsLock.unlock()
+        onHLSSegmentPublished?(videoSegment)
         if let audioResource, audioResource.segmentID == idx {
             registerAlternateAudioResource(audioResource)
         }

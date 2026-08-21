@@ -2,6 +2,7 @@
 //
 //   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
 //     -o /tmp/producer-lead-policy-test \
+//     app/Sources/Player/VortXRemuxBuffer.swift \
 //     app/Sources/Player/VortXRemuxProducerLeadPolicy.swift \
 //     app/Tests/VortXRemuxProducerLeadPolicyTests.swift && /tmp/producer-lead-policy-test
 //
@@ -11,6 +12,16 @@
 // while genuinely paused, so this suite only calls it in states proven not to block).
 
 import Foundation
+
+/// Standalone harness stubs for the buffer's configuration and failure funnel.
+struct RemoteConfig {
+    struct Snapshot { let dvRemuxWindowMiB: Int }
+    static let snapshot = Snapshot(dvRemuxWindowMiB: 64)
+}
+
+enum DiagnosticsLog {
+    static func log(_ tag: String, _ message: String) {}
+}
 
 @MainActor private var failures = 0
 
@@ -36,6 +47,10 @@ enum VortXRemuxProducerLeadPolicyTests {
         gateStartsUnpausedAndTracksSetPaused()
         gateSetPausedIsIdempotent()
         gateCancelForcesUnpausedAndSticks()
+        highThroughputProducerCannotConsumeTheRetainedWindowBudget()
+        clocklessStartupStillHonoursByteReservation()
+        monotonicLedgerRejectsStaleReceipts()
+        anchorModeCannotBypassTheProducerGate()
 
         print("===== FAILURES: \(failures) =====")
         exit(failures == 0 ? 0 : 1)
@@ -114,5 +129,68 @@ enum VortXRemuxProducerLeadPolicyTests {
         check("cancel() forces isPaused false even from a paused state", !gate.isPaused)
         gate.setPaused(true)
         check("setPaused(true) after cancel() is a no-op (never re-parks a torn-down session)", !gate.isPaused)
+    }
+
+    static func highThroughputProducerCannotConsumeTheRetainedWindowBudget() {
+        // 86,444,640 bit/s is the declared field-stream bandwidth. A 6-second segment at that rate is about
+        // 64.8 MiB; a producer that checks only every playlist reload reaches the 1 GiB spool near 144 s.
+        let bytesPerSecond = 86_444_640 / 8
+        let segmentBytes = bytesPerSecond * 6
+        var aheadBytes = 0
+        var paused = false
+        var producedSeconds = 0.0
+        for _ in 0..<30 {
+            if !paused {
+                aheadBytes += segmentBytes
+                producedSeconds += 6
+            }
+            paused = VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: producedSeconds,
+                aheadBytes: aheadBytes,
+                currentlyPaused: paused)
+        }
+        check("86 Mb/s producer parks before the 1 GiB session spool can freeze its tail",
+              paused && aheadBytes <= VortXRemuxProducerLeadPolicy.maximumAheadBytes + segmentBytes)
+        check("byte budget leaves both retained-generation windows and operating headroom intact",
+              VortXRemuxProducerLeadPolicy.maximumAheadBytes
+                <= VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes)
+    }
+
+    static func anchorModeCannotBypassTheProducerGate() {
+        check("anchor-on local remux drives the producer gate",
+              VortXRemuxProducerLeadPolicy.shouldDriveProducerGate(
+                consumptionAnchored: true, retainsFullTimeline: false, reachedEndOfStream: false))
+        check("anchor-off fast producer still drives the gate before it can freeze the consumer tail",
+              VortXRemuxProducerLeadPolicy.shouldDriveProducerGate(
+                consumptionAnchored: false, retainsFullTimeline: false, reachedEndOfStream: false))
+        check("only host retention and real EOF exempt the producer gate",
+              !VortXRemuxProducerLeadPolicy.shouldDriveProducerGate(
+                consumptionAnchored: false, retainsFullTimeline: true, reachedEndOfStream: false)
+                && !VortXRemuxProducerLeadPolicy.shouldDriveProducerGate(
+                    consumptionAnchored: false, retainsFullTimeline: false, reachedEndOfStream: true))
+    }
+
+    static func clocklessStartupStillHonoursByteReservation() {
+        check("unknown playhead cannot bypass the producer byte cap",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: .nan,
+                aheadBytes: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                currentlyPaused: false))
+        check("unknown playhead cannot release a byte-cap pause",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: .nan,
+                aheadBytes: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                currentlyPaused: true))
+    }
+
+    static func monotonicLedgerRejectsStaleReceipts() {
+        var ledger = VortXRemuxProducerLeadLedger()
+        ledger.recordProduced(.init(id: 11, end: 12, byteLength: 100))
+        ledger.recordProduced(.init(id: 10, end: 6, byteLength: 100))
+        ledger.recordPlayback(8)
+        ledger.recordPlayback(4)
+        check("producer ledger keeps the newest physical boundary", ledger.producedEnd == 12)
+        check("producer ledger never rolls its consumer frontier back", ledger.playbackSeconds == 8)
+        check("producer ledger retains exactly the still-ahead byte reservation", ledger.outstandingBytes == 100)
     }
 }

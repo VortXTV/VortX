@@ -18,6 +18,11 @@ import Foundation
 /// while `VortXHLSConsumptionWindowPolicy.floor` independently guarantees the behind-frontier history itself
 /// (see that type's own header for the two-pool accounting fix).
 enum VortXRemuxProducerLeadPolicy {
+    /// One ordinary on-device session has one current and one recently superseded retained window, plus the
+    /// operational and safety reservations: `2W + O + H = C`. An unseen producer tail may consume at most one
+    /// window share. This keeps a high-bitrate remux from consuming the bytes reserved for the just-replaced
+    /// playlist while AVPlayer is still legally entitled to read it.
+    static let maximumAheadBytes = VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes
     /// Stop producing once the produced tail is at least this far (in source seconds) ahead of the confirmed
     /// playhead.
     static let pauseAheadSeconds: Double = 90
@@ -26,18 +31,83 @@ enum VortXRemuxProducerLeadPolicy {
     /// every publication cycle as ordinary segment-duration jitter crosses back and forth over a single value.
     static let resumeBelowSeconds: Double = 60
 
+    /// Window publication policy is orthogonal to producer safety. In particular, the anchor-off rollback
+    /// keeps a startup window pinned but must still apply the same local producer bound; only a hosted retaining
+    /// mount and true EOF are exempt.
+    static func shouldDriveProducerGate(consumptionAnchored: Bool,
+                                        retainsFullTimeline: Bool,
+                                        reachedEndOfStream: Bool) -> Bool {
+        _ = consumptionAnchored
+        return !retainsFullTimeline && !reachedEndOfStream
+    }
+
     /// Pure hysteresis decision. `leadSeconds` is `producedEnd - confirmedPlayheadSeconds`; a non-finite value
-    /// (playhead not yet known, e.g. before the first playback receipt) fails closed to whatever the CURRENT
-    /// state already is, so an unknown clock can never itself start or lift a pause.
-    static func shouldPauseProducer(leadSeconds: Double, currentlyPaused: Bool) -> Bool {
+    /// (playhead not yet known, e.g. before the first playback receipt) still honours the physical byte
+    /// reservation.  A clockless startup is exactly when a fast remux used to fill the spool, so an unknown
+    /// clock may never lift a byte-cap pause.
+    static func shouldPauseProducer(leadSeconds: Double,
+                                    aheadBytes: Int? = nil,
+                                    currentlyPaused: Bool) -> Bool {
+        guard aheadBytes.map({ $0 >= 0 }) ?? true else { return currentlyPaused }
+        let overByteBudget = aheadBytes.map { $0 >= maximumAheadBytes } ?? false
+        if overByteBudget { return true }
         guard leadSeconds.isFinite else { return currentlyPaused }
         if currentlyPaused {
             // "resume below 60s" (report section 6): resume ONLY once strictly under the resume line, so a
             // lead sitting exactly on it stays paused rather than flapping.
-            return !(leadSeconds < resumeBelowSeconds)
+            return !(leadSeconds < resumeBelowSeconds && !overByteBudget)
         }
-        return leadSeconds >= pauseAheadSeconds
+        return leadSeconds >= pauseAheadSeconds || overByteBudget
     }
+}
+
+/// A single serialized frontier for producer-boundary and consumer-clock receipts.  It deliberately keeps
+/// only the not-yet-consumed byte ledger instead of repeatedly copying the complete HLS window.  Receipt
+/// ordering is monotonic: an old boundary or an old playhead can never reverse a newer gate decision.
+struct VortXRemuxProducerLeadLedger: Sendable {
+    struct Segment: Sendable {
+        let id: Int
+        let end: Double
+        let byteLength: Int
+    }
+
+    private var segments: [Segment] = []
+    private var firstUnconsumed = 0
+    private var latestSegmentID = -1
+    private var latestPlayhead: Double?
+    private var aheadBytes = 0
+
+    mutating func recordProduced(_ segment: Segment) {
+        guard segment.id > latestSegmentID,
+              segment.end.isFinite,
+              segment.byteLength >= 0 else { return }
+        latestSegmentID = segment.id
+        segments.append(segment)
+        if latestPlayhead.map({ segment.end > $0 }) ?? true {
+            let (next, overflow) = aheadBytes.addingReportingOverflow(segment.byteLength)
+            aheadBytes = overflow ? Int.max : next
+        }
+    }
+
+    mutating func recordPlayback(_ seconds: Double) {
+        guard seconds.isFinite, seconds >= 0,
+              latestPlayhead.map({ seconds >= $0 }) ?? true else { return }
+        latestPlayhead = seconds
+        while firstUnconsumed < segments.count, segments[firstUnconsumed].end <= seconds {
+            aheadBytes -= segments[firstUnconsumed].byteLength
+            firstUnconsumed += 1
+        }
+        // A bounded compact keeps this O(1) amortized across a full title.
+        if firstUnconsumed > 128, firstUnconsumed * 2 >= segments.count {
+            segments.removeFirst(firstUnconsumed)
+            firstUnconsumed = 0
+        }
+    }
+
+    var producedEnd: Double? { segments.last?.end }
+    var playbackSeconds: Double? { latestPlayhead }
+    var outstandingBytes: Int { max(0, aheadBytes) }
+    var outstandingSegmentCount: Int { max(0, segments.count - firstUnconsumed) }
 }
 
 /// Repeatable pause/resume gate for producer-lead backpressure. Unlike `VortXRemuxPreparationGate` (a

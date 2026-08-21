@@ -29,7 +29,8 @@ enum VortXEngineProtocol {
 
     /// Bumped only for a BREAKING change. Additive fields do not move it. A client refuses a host whose major
     /// version it does not know rather than guessing at a shape.
-    static let version = 1
+    // v2 makes the generation-bound teardown receipt mandatory before a client starts a replacement decoder.
+    static let version = 2
 
     static let basePath = "/engine/v1"
 
@@ -227,6 +228,9 @@ enum VortXEngineProtocol {
 
     struct SessionResponse: Codable, Sendable, Equatable {
         let sessionID: String
+        /// Opaque, host-issued generation for this exact mount.  A session id alone is not enough to safely
+        /// acknowledge teardown after a delayed request or a host restart.
+        let mountGeneration: String
         /// The port the MEDIA is served on. Distinct from the control port: each session's remux server binds
         /// its own OS-assigned ephemeral port.
         let mediaPort: Int
@@ -240,6 +244,43 @@ enum VortXEngineProtocol {
         /// Whether the host actually granted full-timeline retention. False means the client must keep clamping
         /// backward seeks exactly as it does on-device.
         let retainsFullTimeline: Bool
+    }
+
+    /// Additive teardown handshake.  The protocol major remains compatible; a client that requires this
+    /// receipt refuses an older host rather than treating a successful DELETE as proof of producer unwind.
+    struct TeardownRequest: Codable, Sendable, Equatable {
+        static let currentVersion = 2
+        let version: Int
+        let sessionID: String
+        let mountGeneration: String
+
+        init(sessionID: String, mountGeneration: String) {
+            self.version = Self.currentVersion
+            self.sessionID = sessionID
+            self.mountGeneration = mountGeneration
+        }
+    }
+
+    struct TeardownReceipt: Codable, Sendable, Equatable {
+        let version: Int
+        let sessionID: String
+        let mountGeneration: String
+        /// True only after the host's producer terminal edge released its input/network resources.
+        let producerQuiescent: Bool
+    }
+
+    /// A receipt is a capability to continue the same source in MPV, not merely a successful HTTP result.
+    /// Keep the comparison centralized so every client rejects old, cross-session, cross-mount, and incomplete
+    /// replies identically.
+    static func acceptsTeardownReceipt(
+        _ receipt: TeardownReceipt?,
+        for request: TeardownRequest
+    ) -> Bool {
+        guard let receipt else { return false }
+        return receipt.version == TeardownRequest.currentVersion
+            && receipt.producerQuiescent
+            && receipt.sessionID == request.sessionID
+            && receipt.mountGeneration == request.mountGeneration
     }
 
     // MARK: - Session status
@@ -434,6 +475,41 @@ enum VortXEngineProtocol {
         /// The furthest source second produced so far. On a full-timeline session everything from
         /// `timelineOriginSeconds` to here is seekable; without it, only the sliding window is.
         let producedEdgeSeconds: Double
+    }
+
+    /// The engine host is a paired peer, but its status is still network input.  Keep every numeric conversion
+    /// and collection traversal behind one finite, bounded admission check so a malformed or incompatible host
+    /// cannot poison player geometry, timeline math, or picker allocation.
+    static func acceptsSessionStatus(_ status: SessionStatus) -> Bool {
+        let maximumTimeline = 7.0 * 24 * 60 * 60
+        let maximumDimension = 16_384
+        let maximumCounter = 1 << 50
+        guard status.durationSeconds.isFinite, status.durationSeconds >= 0,
+              status.durationSeconds <= maximumTimeline,
+              status.timelineOriginSeconds.isFinite, status.timelineOriginSeconds >= 0,
+              status.timelineOriginSeconds <= maximumTimeline,
+              status.frameRate.isFinite, status.frameRate >= 0, status.frameRate <= 240,
+              status.producedEdgeSeconds.isFinite, status.producedEdgeSeconds >= 0,
+              status.producedEdgeSeconds <= maximumTimeline,
+              status.producedSegments >= 0, status.producedSegments <= 200_000,
+              status.producedBytes >= 0, status.producedBytes <= maximumCounter,
+              status.width >= 0, status.width <= maximumDimension,
+              status.height >= 0, status.height <= maximumDimension,
+              (status.bandwidth ?? 0) >= 0, (status.bandwidth ?? 0) <= maximumCounter,
+              status.chapters.count <= 2_000,
+              (status.audioTracks?.count ?? 0) <= 128, (status.subtitleTracks?.count ?? 0) <= 128 else { return false }
+        guard status.chapters.allSatisfy({ $0.start.isFinite && $0.start >= 0 && $0.start <= maximumTimeline
+            && $0.title.unicodeScalars.count <= 512 }),
+              (status.audioTracks ?? []).allSatisfy({ $0.sourceIndex >= 0 && $0.sourceIndex <= 16_384
+                  && $0.channels >= 0 && $0.channels <= 64 && ($0.outputChannels ?? 0) >= 0
+                  && ($0.outputChannels ?? 0) <= 64 && $0.codec.unicodeScalars.count <= 128
+                  && ($0.outputCodec?.unicodeScalars.count ?? 0) <= 128 && $0.language.unicodeScalars.count <= 128
+                  && $0.title.unicodeScalars.count <= 512 }),
+              (status.subtitleTracks ?? []).allSatisfy({ $0.sourceIndex >= 0 && $0.sourceIndex <= 16_384
+                  && ($0.renditionIndex ?? 0) >= 0 && ($0.renditionIndex ?? 0) <= 128
+                  && $0.codec.unicodeScalars.count <= 128 && $0.language.unicodeScalars.count <= 128
+                  && $0.title.unicodeScalars.count <= 512 && ($0.unavailableReason?.unicodeScalars.count ?? 0) <= 512 }) else { return false }
+        return true
     }
 
     // MARK: - Errors
