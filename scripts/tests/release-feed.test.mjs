@@ -146,6 +146,12 @@ test("release and manual cut paths both require feed propagation", async () => {
   assert.match(workflow, /rollback-raw-source\.json/);
   assert.match(workflow, /name: Verify the immutable published release and public feed/);
   assert.doesNotMatch(workflow, /if:\s*github\.event_name\s*==\s*['"]workflow_dispatch['"]\s*\n\s*uses: actions\/checkout/);
+  // The promotion must carry a deterministic, write-once operation ID and the promote/publish lane
+  // must be gated by publish_release so that publish_release:false can never reach draft=false.
+  assert.match(workflow, /OPERATION_ID="promote:\$RELEASE_ID:\$FEED_GENERATION"/);
+  assert.match(workflow, /operationId:\$oid/);
+  assert.match(workflow, /promote-body\.json/);
+  assert.match(workflow, /if:\s*inputs\.publish_release == true/);
   const releaseWrite = workflow.slice(workflow.indexOf("  attach-release:"));
   assert.doesNotMatch(releaseWrite, /gh release upload/);
   assert.doesNotMatch(releaseWrite, /--clobber/);

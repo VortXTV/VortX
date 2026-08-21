@@ -1273,9 +1273,24 @@ jobs:
           gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$CHECKSUM_ASSET_ID" > "$RUNNER_TEMP/draft-checksums.txt"
           cmp -s out/SHA256SUMS-ci.txt "$RUNNER_TEMP/draft-checksums.txt" || { echo "::error::authenticated draft checksum bytes differ"; exit 1; }
           commit_source_bytes feed-artifact/source.json "chore(release): publish verified install feed" "$EXPECTED_MAIN_HEAD"
-          PROMOTE_BODY="$(jq -cn --arg rid "$RELEASE_ID" --arg generation "$FEED_GENERATION" --arg expected "$EXPECTED_ACTIVE" '{action:"promote",releaseId:$rid,generation:$generation,expectedActiveGeneration:(if $expected == "none" then null else $expected end)}')"
+          OPERATION_ID="promote:$RELEASE_ID:$FEED_GENERATION"
+          PROMOTE_BODY="$(jq -cn --arg oid "$OPERATION_ID" --arg rid "$RELEASE_ID" --arg generation "$FEED_GENERATION" --arg expected "$EXPECTED_ACTIVE" '{action:"promote",operationId:$oid,releaseId:$rid,generation:$generation,expectedActiveGeneration:(if $expected == "none" then null else $expected end)}')"
           PROMOTE_SIGNATURE="$(printf '%s' "$PROMOTE_BODY" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
-          PROMOTE_RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$PROMOTE_SIGNATURE" --data-binary "$PROMOTE_BODY" https://vortx.tv/__release/receipt)"
+          # Retry the EXACT same signed bytes on transport/5xx loss so a committed-but-unacknowledged
+          # promotion is answered idempotently instead of being replayed as a new operation.
+          PROMOTE_RESPONSE=""
+          PROMOTE_STATUS=""
+          PROMOTE_DEADLINE=$(($(date +%s) + 90))
+          while [ "$(date +%s)" -lt "$PROMOTE_DEADLINE" ]; do
+            PROMOTE_STATUS="$(curl --silent --show-error --connect-timeout 5 --max-time 20 -o "$RUNNER_TEMP/promote-body.json" -w '%{http_code}' -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$PROMOTE_SIGNATURE" --data-binary "$PROMOTE_BODY" https://vortx.tv/__release/receipt 2>/dev/null || true)"
+            PROMOTE_RESPONSE="$(cat "$RUNNER_TEMP/promote-body.json" 2>/dev/null || true)"
+            if [ "$PROMOTE_STATUS" = "200" ]; then break; fi
+            case "$PROMOTE_STATUS" in
+              400|404|409) break ;;
+              *) sleep 10 ;;
+            esac
+          done
+          [ "$PROMOTE_STATUS" = "200" ] || { echo "::error::promotion did not succeed (HTTP $PROMOTE_STATUS): $PROMOTE_RESPONSE"; exit 1; }
           jq -e --arg generation "$FEED_GENERATION" '.promoted == true and .generation == $generation' <<<"$PROMOTE_RESPONSE" >/dev/null
           PROMOTED=1
           DEADLINE=$(($(date +%s) + 270))

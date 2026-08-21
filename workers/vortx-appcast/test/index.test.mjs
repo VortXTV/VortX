@@ -153,6 +153,35 @@ test("staging, promotion, exact bytes, query invariance, and rollback are fail-c
   assert.equal(unavailable.status, 503);
 });
 
+test("a replayed promote is idempotent while the exact target is active and 409 after rollback", async () => {
+  const kv = new MemoryKV();
+  const env = environment(kv);
+  const receipt = makeReceipt();
+  const staged = await worker.fetch(signedRequest("/__release/receipt", receipt), env);
+  assert.equal(staged.status, 200, await staged.text());
+  const generation = receipt.manifest.generation;
+  const payload = { action: "promote", operationId: "promote:19:target-generation", releaseId: "19", generation, expectedActiveGeneration: null };
+  const first = await worker.fetch(signedRequest("/__release/receipt", payload), env);
+  assert.equal(first.status, 200);
+  // Simulate a lost response: the first call committed in DO storage but the caller never observed
+  // it. Retrying the exact same signed bytes must return an idempotent success, not a consume-409.
+  const retry = await worker.fetch(signedRequest("/__release/receipt", payload), env);
+  assert.equal(retry.status, 200);
+  const retryBody = await retry.json();
+  assert.equal(retryBody.idempotent, true);
+  assert.equal(retryBody.generation, generation);
+  // After a rollback of that same operation, the exact same bytes must fail closed with 409,
+  // because the previous generation is no longer the active one for that operation.
+  const rolledBack = await worker.fetch(signedRequest("/__release/receipt", { action: "rollback", expectedCurrentGeneration: generation, restoreGeneration: "none" }), env);
+  assert.equal(rolledBack.status, 200);
+  const conflict = await worker.fetch(signedRequest("/__release/receipt", payload), env);
+  // After rollback the generation is terminal, so the replay must fail closed (409), never a false
+  // idempotent 200. generation-terminal is the specific fail-closed answer for a rolled-back gen.
+  assert.equal(conflict.status, 409);
+  const conflictBody = await conflict.json();
+  assert.equal(conflictBody.error, "generation-terminal");
+});
+
 test("unsigned or malformed staged generations never reach the public routes", async () => {
   const kv = new MemoryKV();
   const env = environment(kv);

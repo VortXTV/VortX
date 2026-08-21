@@ -338,14 +338,29 @@ export class FeedCoordinator {
       }
       if (payload.action === "promote") {
         if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "promotion requires a write-once operation ID");
-        if (await storage.get(`${OPERATION_PREFIX}${payload.operationId}`)) return failure(409, "operation-consumed", "promotion operation was already consumed");
-        if (payload.expectedActiveGeneration === undefined || payload.expectedActiveGeneration !== currentGeneration) return failure(409, "active-generation-conflict", "active generation changed before promotion");
         const staged = await storage.get(`${STAGED_RELEASE_PREFIX}${payload.releaseId}`);
         if (!staged || staged.manifest.generation !== payload.generation || String(staged.manifest.releaseId) !== String(payload.releaseId)) return failure(404, "staged-generation-missing", "requested staged generation is not present");
         if (await storage.get(`${ROLLED_BACK_PREFIX}${staged.manifest.generation}`)) return failure(409, "generation-terminal", "a rolled-back generation cannot be promoted again");
+        const priorOperation = await storage.get(`${OPERATION_PREFIX}${payload.operationId}`);
+        if (priorOperation) {
+          const sameOperation =
+            priorOperation.action === "promote" &&
+            String(priorOperation.releaseId) === String(payload.releaseId) &&
+            priorOperation.generation === payload.generation &&
+            priorOperation.receiptSha256 === staged.receiptSha256;
+          const exactTargetIsActive =
+            currentGeneration === staged.manifest.generation &&
+            String(current?.manifest?.releaseId) === String(staged.manifest.releaseId) &&
+            current?.receiptSha256 === staged.receiptSha256;
+          if (!sameOperation || !exactTargetIsActive) {
+            return failure(409, "operation-state-conflict", "promotion operation cannot be replayed in the current state");
+          }
+          return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: current.receiptSha256 });
+        }
+        if (payload.expectedActiveGeneration === undefined || payload.expectedActiveGeneration !== currentGeneration) return failure(409, "active-generation-conflict", "active generation changed before promotion");
         if (currentGeneration === staged.manifest.generation) {
           if (String(current.manifest.releaseId) !== String(staged.manifest.releaseId) || current.receiptSha256 !== staged.receiptSha256) return failure(409, "active-receipt-conflict", "active generation is not the exact staged receipt");
-          await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: currentGeneration, receiptSha256: current.receiptSha256, idempotent: true });
+          await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: currentGeneration, releaseId: payload.releaseId, receiptSha256: current.receiptSha256, idempotent: true });
           return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: current.receiptSha256 });
         }
         if (current && Number(staged.manifest.build) < Number(current.manifest.build)) return failure(409, "promote-build-order", "a staged generation cannot downgrade a newer active build");
@@ -353,7 +368,7 @@ export class FeedCoordinator {
         if (current && staged.manifest.tag === current.manifest.tag && Number(staged.manifest.build) !== Number(current.manifest.build)) return failure(409, "promote-tag-build-conflict", "an active release tag is permanently bound to one build");
         if (current) await storage.put(`${ROLLBACK_PREFIX}${payload.generation}`, current);
         await storage.put(ACTIVE_KEY, staged);
-        await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, receiptSha256: staged.receiptSha256 });
+        await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, releaseId: payload.releaseId, receiptSha256: staged.receiptSha256 });
         await storage.put(`${AUDIT_PREFIX}promote:${payload.generation}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
         return jsonResponse({ promoted: true, generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
       }
