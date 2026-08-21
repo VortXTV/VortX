@@ -6,6 +6,14 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.14 (unreleased)
 
+### Apple: source picker, localization, and subtitle hardening
+
+**Pick an audio language from the source picker.** A new Audio control next to Quality filters and re-ranks the source list by audio language, so a release that carries your chosen language floats up without changing your saved preference; Auto keeps your profile's preferred audio languages. The choice is for this session only and is never saved. Apple TV, iPhone, iPad, and Mac.
+
+**Home and Discover catalog titles translate as whole phrases.** Titles like Popular Shows were translated word by word in English order, which reads wrong in French; Popular Shows now becomes Séries populaires, Featured Movies becomes Films à la une, and the new and trending rows follow the same correct order. Languages without a phrase translation keep their previous wording. French.
+
+**External subtitles use the hardened transport everywhere.** The built-in player's subtitle download re-resolved a subtitle hostname at connection time, which a hostile host could redirect; it now resolves once and connects only to the exact vetted address, with size limits and no redirects, the same way the other player already did. Apple TV, iPhone, iPad, and Mac.
+
 ### Usenet
 
 **Play usenet sources with your own provider, no debrid needed.** A new Settings screen, Usenet provider, lets you enter your own usenet account (host, port, username, password, connection count, and SSL). Once it is set, a bare-NZB source plays on the device straight from your provider, streamed through the NNTP engine already built into the app's streaming server, with no debrid account required. Your login is held only in this device's keychain, is never written to a preference, a backup, or the encrypted account sync, and the only place it is ever sent is the app's own on-device server at 127.0.0.1. Debrid usenet through TorBox is unchanged and takes over automatically for anyone without a provider set, so nothing changes if you do not use this; you can also configure both, in which case a source your provider is missing still falls back to TorBox. A source your provider cannot fully retrieve, for example one with missing segments, is skipped with a clear message instead of spinning. Apple TV, iPhone, iPad, and Mac. The Lite Apple TV build stays debrid-only.
