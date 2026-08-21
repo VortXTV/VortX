@@ -1,7 +1,7 @@
 name: Release apps (iOS + tvOS + macOS)
 
 # Builds the iOS + tvOS IPAs and the native macOS app from source on GitHub's
-# runners and attaches them to the release (issue #7). The app sources, scripts,
+# runners and hands the immutable bytes to the draft release lane (issue #7). The app sources, scripts,
 # NodeMobile + fonts (this repo's vendor release), and server.js (Stremio's CDN)
 # are public; the two ENGINE crates (stremiox-core, vortx-core) are PRIVATE
 # (moved out of the public tree in 33ff9b5) and are fetched below at pinned
@@ -39,6 +39,11 @@ on:
         description: "Optional one-line blurb for the AltStore/SideStore update entry. Leave blank to derive it from the release name."
         required: false
         default: ""
+      publish_release:
+        description: "After draft asset and staged-feed verification, publish this existing draft release as the final write."
+        required: false
+        type: boolean
+        default: false
 
 # Workflow-wide default is READ-ONLY: the build job executes repo-controlled code (scripts/*,
 # app/scripts/*, the xcodegen'd build phases), so it must never hold write authority on the repo.
@@ -49,17 +54,12 @@ permissions:
 
 jobs:
   build-tvos:
-    # Environment gate for the token-bearing job (trust boundary): the `engine-ci` environment
-    # carries explicit deployment protection policies: BRANCH entries (beta, main, ci/engine-token)
-    # PLUS a `v*` TAG policy. Environment policies match REFS, and a branch entry never matches a
-    # tag ref, so the two entry lanes are distinct: branch-ref runs (push / dispatch on a listed
-    # branch) enter via the branch entries, while release-event runs, which execute on the tag's
-    # ref, enter via the `v*` tag policy. A run started from any OTHER ref blocks at this gate
-    # before any step executes, making ENGINE_REPO_TOKEN unreachable outside those refs. The
-    # ci/engine-token branch entry is TEMPORARY, for proof runs on the CI branch, and is removed at
-    # integration. Moving the ENGINE_REPO_TOKEN secret itself INTO the environment (value re-entry)
-    # is a queued owner step; until then the gate still stops arbitrary-ref jobs from ever reaching
-    # the fetch steps that read it.
+    if: github.event_name != 'release'
+    # Environment gate for the token-bearing build job (trust boundary): the `engine-ci` environment
+    # carries explicit deployment protection policies for branch and tag build refs. A run started
+    # from any other ref blocks before any build step executes, keeping ENGINE_REPO_TOKEN unreachable
+    # outside the approved build lanes. Release events intentionally skip this job and run only the
+    # immutable published-release verifier below.
     #
     # Read-only-build vs release-write split: this job runs under the workflow-default
     # `contents: read`, so none of the repo-controlled build code it executes can touch the repo or
@@ -867,7 +867,7 @@ jobs:
               -- "$VAULT_TAG" \
               || { echo "::error::could not create private symbols release $VAULT_TAG in $VAULT"; exit 1; }
           fi
-          gh release upload -R "$VAULT" --clobber -- "$VAULT_TAG" "$BUNDLE"
+          gh release upload -R "$VAULT" -- "$VAULT_TAG" "$BUNDLE"
           echo "private dSYM retention complete: $VAULT $VAULT_TAG"
 
       - name: Package the IPAs
@@ -900,11 +900,42 @@ jobs:
           hdiutil create -volname "VortX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/VortX-macOS-ci.dmg
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
 
-      # Upload on manual runs (inspection artifact) AND on release events, where it is the ONLY
-      # handoff to the attach-release job below: the read-only build job never touches the release
-      # itself, so everything the write job attaches must travel through this artifact.
-      - name: Upload artifact (manual runs + handoff to attach-release)
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'release'
+      # Build the feed from the exact immutable tag checkout while this job still has read-only
+      # authority. The later release-write job receives only these bytes and never executes a
+      # repository script or checks out a mutable branch with contents:write.
+      - name: Build the content-addressed release feed artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag)
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ALTSTORE_NOTE: ${{ inputs.altstore_note }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+          [[ "$TAG" =~ $TAG_RE ]] || { echo "::error::release tag $TAG is not strict"; exit 1; }
+          BUILD="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
+          [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
+          RELEASE_JSON="$(gh api --paginate -- "repos/$GH_REPO/releases" | jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("release identity is missing or duplicated") end')"
+          RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
+          [[ "$TAG" == *-* ]] || { echo "::error::this lane accepts prerelease tags only"; exit 1; }
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .prerelease == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing prerelease draft"; exit 1; }
+          RELEASE_NAME="$(jq -r '.name // .tag_name' <<<"$RELEASE_JSON")"
+          RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
+          rm -rf feed-artifact
+          node scripts/release-feed.mjs build-artifact \
+            --tag "$TAG" --build "$BUILD" --source-commit "$GITHUB_SHA" \
+            --source-template altstore/source.json --output feed-artifact \
+            --ios-file out/VortX-iOS-ci.ipa --tvos-file out/VortX-tvOS-ci.ipa \
+            --tvos-lite-file out/VortX-tvOS-lite-ci.ipa --mac-file out/VortX-macOS-ci.dmg \
+            --checksum-file out/SHA256SUMS-ci.txt --date "$(date -u +%F)" \
+            --name "$RELEASE_NAME" --note "${ALTSTORE_NOTE:-$RELEASE_BODY}" --release-id "$RELEASE_ID"
+          jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" --arg id "$RELEASE_ID" '.tag == $tag and .sourceCommit == $commit and (.releaseId | tostring) == $id and .android == null' feed-artifact/manifest.json >/dev/null
+          test -s feed-artifact/source.json -a -s feed-artifact/appcast.json -a -s feed-artifact/manifest.json -a -s feed-artifact/SHA256SUMS-ci.txt
+
+      - name: Upload the immutable app handoff
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: VortX-tvOS-ci
@@ -915,231 +946,484 @@ jobs:
             out/VortX-macOS-ci.dmg
             out/SHA256SUMS-ci.txt
 
-  # Isolated release-write job: the ONLY job in this workflow with `contents: write`. Least
-  # privilege by construction: it does NOT check out the repo (so it executes no repo-controlled
-  # code with write authority) and it consumes the build strictly through the artifact handoff from
-  # the read-only build job above. Asset upload needs no macOS, so this runs on the cheap pinned
-  # Linux image.
-  #
-  # Approval gate: this job runs in the `release-approval` environment, which the owner configures
-  # with a REQUIRED REVIEWER, so an actual release write pauses for human approval before any asset
-  # is attached. That environment is DISTINCT from the build job's `engine-ci` and holds NO secrets
-  # (no ENGINE_REPO_TOKEN, no build secrets): it exists only to carry the approval policy, so this
-  # write job still cannot reach the token or the build secrets.
-  #
-  # Arbitrary-ref guard: a `release` event runs on the tag's own ref and is bound to the built
-  # commit by the tag-commit binding step below. A `workflow_dispatch` can be launched from any ref,
-  # so the dispatch lane ADDITIONALLY requires the run's ref to be EXACTLY the immutable release tag
-  # (refs/tags/<release_tag>), never a mutable branch: the dispatch must be started AT the tag, so
-  # github.sha is the tag's own commit and the tag-commit binding below is tautological instead of
-  # trusting a branch tip that can move between dispatch and attach. This in-workflow check is
-  # defense in depth; the real enforcement is the environment's required reviewer plus the
-  # tag/branch protection the owner configures.
+      - name: Upload the immutable feed handoff
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: VortX-release-feed
+          path: feed-artifact
+  # The release write lane is draft-only until every trusted local byte and the staged edge receipt
+  # pass. It is keyed by release tag so independent cuts cannot cancel one another's pending work.
+  # It never checks out a branch or executes a repository script with contents:write.
   attach-release:
     needs: [build-tvos]
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag))
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag)
+    concurrency:
+      group: vortx-release-${{ inputs.release_tag }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     environment: release-approval
     permissions:
       contents: write
-    timeout-minutes: 15
+    timeout-minutes: 35
     steps:
-      - name: Download the built apps (handoff from the build job)
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0 (resolved read-only via git ls-remote)
+      - name: Download the built apps
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: VortX-tvOS-ci
           path: out
 
-      # Tag-commit binding (fail closed): a tag NAME is an operator/event string, never authority.
-      # Before anything is written, prove that (a) the tag belongs to an EXISTING release (for
-      # workflow_dispatch this is what stops a free-text release_tag from minting a write; for
-      # release events it is trivially true) and (b) the tag's ref, peeled through any annotated
-      # tag objects to its ultimate commit, points at EXACTLY the commit this run built
-      # (github.sha). This also catches a tag force-moved between the trigger and this job. Any
-      # resolution failure or mismatch aborts before the upload step can run.
-      - name: Verify the release tag points at the built commit (fail closed)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # gh runs in a job with NO repo checkout, so it cannot infer the repository from git;
-          # without this the upload dies with "fatal: not a git repository" (beta.7 attach failure).
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
-        run: |
-          set -euo pipefail
-          if [ -z "${TAG:-}" ]; then
-            echo "::error::no tag name available (empty release_tag / missing release tag_name)"
-            exit 1
-          fi
-          # STRICT release-tag grammar, fail closed. The previous shape check accepted any
-          # [A-Za-z0-9._-] string, which STILL lets CLI-option-shaped values through (e.g.
-          # "--help" or "-R"): gh would consume those as flags rather than as a tag. Require a real
-          # release tag -- vMAJOR.MINOR.PATCH with an optional -prerelease -- anchored end to end, so
-          # an option-shaped or otherwise malformed value can never reach a gh call. (Regex kept in a
-          # variable and used unquoted: the bash idiom that avoids [[ =~ ]] escaping pitfalls.) Every
-          # gh call below ALSO gets a `--` option terminator as belt-and-braces, so the tag text can
-          # never be parsed as an option even if this grammar is later loosened.
-          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
-          if ! [[ "$TAG" =~ $TAG_RE ]]; then
-            echo "::error::release tag '$TAG' is not a strict release tag (want vMAJOR.MINOR.PATCH[-prerelease]); refusing to resolve it"
-            exit 1
-          fi
-          # (a) The tag must name an EXISTING release (draft OR published), not just any git tag.
-          # IMPORTANT: the /releases/tags/{tag} endpoint returns ONLY PUBLISHED releases and 404s on a
-          # draft, which is exactly how we cut (create a draft, build, attach, then publish). That 404
-          # used to abort this job on every cut and force a manual attach. List releases instead (that
-          # endpoint DOES include drafts) and require an exact tag_name match. The upload step below
-          # already resolves drafts by tag (gh release upload), so once this guard passes the write works.
-          if ! gh api --paginate --jq ".[] | select(.tag_name == \"${TAG}\") | .tag_name" \
-                -- "repos/${GITHUB_REPOSITORY}/releases" | grep -qx -- "${TAG}"; then
-            echo "::error::no existing release (draft or published) found for tag '$TAG'; refusing to create or write anything"
-            exit 1
-          fi
-          # (b) Resolve the tag ref and peel annotated tag objects (an annotated tag's ref points
-          # at a tag OBJECT, not the commit; nested tag objects are legal, so peel with a bound).
-          ref_json="$(gh api -- "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}")"
-          sha="$(jq -r '.object.sha' <<<"$ref_json")"
-          otype="$(jq -r '.object.type' <<<"$ref_json")"
-          hops=0
-          while [ "$otype" = "tag" ]; do
-            hops=$((hops + 1))
-            if [ "$hops" -gt 5 ]; then
-              echo "::error::tag '$TAG' nests more than 5 tag objects; refusing"
-              exit 1
-            fi
-            tag_json="$(gh api -- "repos/${GITHUB_REPOSITORY}/git/tags/${sha}")"
-            sha="$(jq -r '.object.sha' <<<"$tag_json")"
-            otype="$(jq -r '.object.type' <<<"$tag_json")"
-          done
-          if [ "$otype" != "commit" ]; then
-            echo "::error::tag '$TAG' ultimately points at a '$otype' object, not a commit; refusing"
-            exit 1
-          fi
-          if [ "$sha" != "$GITHUB_SHA" ]; then
-            echo "::error::tag '$TAG' points at commit $sha but this run built $GITHUB_SHA; refusing to attach assets built from a different commit"
-            exit 1
-          fi
-          echo "tag-commit binding verified: $TAG peels to $sha == github.sha"
+      - name: Download the immutable feed artifact
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: VortX-release-feed
+          path: feed-artifact
 
-      - name: Attach the CI builds to the release
+      - name: Bind the draft release, tag commit, and monotonic source before any write
+        id: identity
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # gh runs in a job with NO repo checkout, so it cannot infer the repository from git;
-          # without this the upload dies with "fatal: not a git repository" (beta.7 attach failure).
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
-          # Re-assert the strict release-tag grammar here (defense in depth: the verify step above
-          # already gates the job on it, but this step re-derives TAG and spends it in shell paths
-          # and gh calls, so it must not run on anything but a real release tag).
           TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
-          if [ -z "${TAG:-}" ] || ! [[ "$TAG" =~ $TAG_RE ]]; then
-            echo "::error::release tag '$TAG' is not a strict release tag; refusing to attach"
+          if [ -z "$TAG" ] || ! [[ "$TAG" =~ $TAG_RE ]]; then
+            echo "::error::release tag '$TAG' is not strict"
             exit 1
           fi
+          MANIFEST=feed-artifact/manifest.json
+          jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" \
+            '.tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
+          BUILD="$(jq -er '.build' "$MANIFEST")"
+          [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::feed artifact build is not numeric"; exit 1; }
+          RELEASE_JSON="$(gh api --paginate -- "repos/$GH_REPO/releases" | jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("release identity is missing or duplicated") end')"
+          RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
+          jq -e --arg id "$RELEASE_ID" '(.releaseId | tostring) == $id' "$MANIFEST" >/dev/null || { echo "::error::draft release identity differs from the immutable feed artifact"; exit 1; }
+          [ "$(jq -r '.draft' <<<"$RELEASE_JSON")" = true ] || { echo "::error::release $RELEASE_ID is not a draft; refusing asset writes"; exit 1; }
+          REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$TAG")"
+          TAG_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          TAG_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          HOPS=0
+          while [ "$TAG_TYPE" = tag ]; do
+            HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || { echo "::error::tag object nesting is excessive"; exit 1; }
+            TAG_OBJECT="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"
+            TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"
+            TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"
+          done
+          [ "$TAG_TYPE" = commit ] && [ "$TAG_SHA" = "$GITHUB_SHA" ] || { echo "::error::tag $TAG is not bound to this immutable build"; exit 1; }
+          gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" | jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == true and .prerelease == true' >/dev/null
+          MAIN_REF="$(gh api -- "repos/$GH_REPO/git/ref/heads/main")"
+          MAIN_HEAD="$(jq -er '.object.sha' <<<"$MAIN_REF")"
+          MAIN_CONTENT="$(gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=$MAIN_HEAD")"
+          printf '%s' "$MAIN_CONTENT" | jq -er '.content' | tr -d '\n' | base64 --decode > "$RUNNER_TEMP/previous-source.json"
+          PREVIOUS_SOURCE_SHA256="$(shasum -a 256 "$RUNNER_TEMP/previous-source.json" | awk '{print $1}')"
+          CURRENT_BUILDS="$(jq -r '.apps[] | select(.bundleIdentifier == "com.stremiox.app.native" or .bundleIdentifier == "com.stremiox.tv") | .versions[0].buildVersion' "$RUNNER_TEMP/previous-source.json")"
+          CURRENT_TOP=0
+          while IFS= read -r CURRENT_BUILD; do
+            [[ "$CURRENT_BUILD" =~ ^[0-9]+$ ]] || { echo "::error::main source has a non-numeric top build"; exit 1; }
+            if [ "$CURRENT_BUILD" -gt "$CURRENT_TOP" ]; then CURRENT_TOP="$CURRENT_BUILD"; fi
+          done <<< "$CURRENT_BUILDS"
+          [ "$CURRENT_TOP" -le "$BUILD" ] || { echo "::error::main source already leads build $CURRENT_TOP over target $BUILD"; exit 1; }
+          if [ "$CURRENT_TOP" -eq "$BUILD" ]; then
+            CURRENT_TAGS="$(jq -r '.apps[] | select(.bundleIdentifier == "com.stremiox.app.native" or .bundleIdentifier == "com.stremiox.tv") | .versions[0].downloadURL | split("/download/")[1] | split("/")[0]' "$RUNNER_TEMP/previous-source.json" | sort -u)"
+            [ "$(wc -l <<<"$CURRENT_TAGS" | tr -d ' ')" = 1 ] && [ "$CURRENT_TAGS" = "$TAG" ] || { echo "::error::main source uses build $BUILD for a different Apple tag"; exit 1; }
+          fi
+          set +e
+          curl -sS --connect-timeout 5 --max-time 10 -D "$RUNNER_TEMP/active.headers" -o /dev/null https://vortx.tv/altstore.json
+          set -e
+          EXPECTED_ACTIVE="$(awk 'tolower($1) == "x-vortx-feed-generation:" {sub(/\r$/, "", $2); print $2}' "$RUNNER_TEMP/active.headers" | tail -1)"
+          [ -n "$EXPECTED_ACTIVE" ] || EXPECTED_ACTIVE=none
+          if [ "$EXPECTED_ACTIVE" != none ]; then
+            for ROUTE_FILE in \
+              "https://vortx.tv/altstore.json|$RUNNER_TEMP/previous-edge-source.json" \
+              "https://vortx.tv/vortx-altstore.json|$RUNNER_TEMP/previous-edge-compat.json" \
+              "https://vortx.tv/appcast.json|$RUNNER_TEMP/previous-edge-appcast.json"; do
+              ROUTE="${ROUTE_FILE%%|*}"; FILE="${ROUTE_FILE#*|}"
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$FILE.headers" "$ROUTE" -o "$FILE"
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "$ROUTE?rollback-snapshot=$EXPECTED_ACTIVE" -o "$FILE.query"
+              cmp -s "$FILE" "$FILE.query" || { echo "::error::edge snapshot query bytes differ: $ROUTE"; exit 1; }
+              grep -Fqi "x-vortx-feed-generation: $EXPECTED_ACTIVE" "$FILE.headers" || { echo "::error::edge snapshot generation differs: $ROUTE"; exit 1; }
+            done
+            cmp -s "$RUNNER_TEMP/previous-edge-source.json" "$RUNNER_TEMP/previous-edge-compat.json" || { echo "::error::edge snapshot compatibility bytes differ"; exit 1; }
+          fi
+          {
+            echo "release_id=$RELEASE_ID"
+            echo "build=$BUILD"
+            echo "expected_active=$EXPECTED_ACTIVE"
+            echo "main_head=$MAIN_HEAD"
+            echo "previous_source_sha256=$PREVIOUS_SOURCE_SHA256"
+          } >> "$GITHUB_OUTPUT"
+          echo "PREVIOUS_SOURCE_FILE=$RUNNER_TEMP/previous-source.json" >> "$GITHUB_ENV"
+          echo "PREVIOUS_EDGE_SOURCE_FILE=$RUNNER_TEMP/previous-edge-source.json" >> "$GITHUB_ENV"
+          echo "PREVIOUS_EDGE_APPCAST_FILE=$RUNNER_TEMP/previous-edge-appcast.json" >> "$GITHUB_ENV"
+          echo "EXPECTED_MAIN_HEAD=$MAIN_HEAD" >> "$GITHUB_ENV"
+          echo "release identity $RELEASE_ID is draft and tag $TAG peels to $TAG_SHA; main top $CURRENT_TOP <= target $BUILD"
+
+      - name: Attach only exact draft assets and create the authenticated staged receipt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+          EXPECTED_ACTIVE: ${{ steps.identity.outputs.expected_active }}
+          RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
+        run: |
+          set -euo pipefail
+          [ -n "${RELEASE_FEED_RECEIPT_SECRET:-}" ] || { echo "::error::RELEASE_FEED_RECEIPT_SECRET is not configured"; exit 1; }
           mv out/VortX-tvOS-ci.ipa "out/VortX-tvOS-$TAG-ci.ipa"
           mv out/VortX-tvOS-lite-ci.ipa "out/VortX-tvOS-lite-$TAG-ci.ipa"
           mv out/VortX-iOS-ci.ipa "out/VortX-iOS-$TAG-ci.ipa"
           mv out/VortX-macOS-ci.dmg "out/VortX-macOS-$TAG-ci.dmg"
-          shasum -a 256 "out/VortX-tvOS-$TAG-ci.ipa" "out/VortX-tvOS-lite-$TAG-ci.ipa" "out/VortX-iOS-$TAG-ci.ipa" "out/VortX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
-          # `--clobber` before `--`, then the tag and files as positionals: with the terminator the
-          # tag can never be parsed as a flag even if the grammar above is ever relaxed.
-          gh release upload --clobber -- "$TAG" \
-            "out/VortX-tvOS-$TAG-ci.ipa" \
-            "out/VortX-tvOS-lite-$TAG-ci.ipa" \
-            "out/VortX-iOS-$TAG-ci.ipa" \
-            "out/VortX-macOS-$TAG-ci.dmg" \
-            out/SHA256SUMS-ci.txt
-          # Remove the older .zip mac asset if this tag had one from a previous run.
-          gh release delete-asset -y -- "$TAG" "VortX-macOS-$TAG-ci.zip" 2>/dev/null || true
+          cmp -s feed-artifact/SHA256SUMS-ci.txt out/SHA256SUMS-ci.txt || { echo "::error::feed checksum file differs from the trusted build handoff"; exit 1; }
+          for KEY_FILE in \
+            "ios:out/VortX-iOS-$TAG-ci.ipa" \
+            "tvos:out/VortX-tvOS-$TAG-ci.ipa" \
+            "tvosLite:out/VortX-tvOS-lite-$TAG-ci.ipa" \
+            "mac:out/VortX-macOS-$TAG-ci.dmg"; do
+            KEY="${KEY_FILE%%:*}"; FILE="${KEY_FILE#*:}"
+            EXPECTED_NAME="$(jq -er --arg key "$KEY" '.assets[$key].name' feed-artifact/manifest.json)"
+            EXPECTED_SIZE="$(jq -er --arg key "$KEY" '.assets[$key].size' feed-artifact/manifest.json)"
+            EXPECTED_SHA="$(jq -er --arg key "$KEY" '.assets[$key].sha256' feed-artifact/manifest.json)"
+            LOCAL_SIZE="$(wc -c <"$FILE" | tr -d ' ')"; LOCAL_SHA="$(shasum -a 256 "$FILE" | awk '{print $1}')"
+            [ "$FILE" = "out/$EXPECTED_NAME" ] && [ "$LOCAL_SIZE" = "$EXPECTED_SIZE" ] && [ "$LOCAL_SHA" = "$EXPECTED_SHA" ] || { echo "::error::trusted local metadata mismatch for $KEY"; exit 1; }
+          done
+          RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release identity changed while draft assets were being attached"; exit 1; }
+          register_asset() {
+            local name="$1" file="$2" expected_size="$3" expected_sha="$4"
+            local count existing_size existing_sha existing_state
+            count="$(jq --arg n "$name" '[.assets[] | select(.name == $n)] | length' <<<"$RELEASE_JSON")"
+            if [ "$count" -gt 1 ]; then echo "::error::duplicate release assets named $name"; exit 1; fi
+            if [ "$count" -eq 1 ]; then
+              existing_size="$(jq -er --arg n "$name" '.assets[] | select(.name == $n) | .size' <<<"$RELEASE_JSON")"
+              existing_sha="$(jq -er --arg n "$name" '.assets[] | select(.name == $n) | (.digest // "") | sub("^sha256:"; "") | ascii_downcase' <<<"$RELEASE_JSON")"
+              existing_state="$(jq -er --arg n "$name" '.assets[] | select(.name == $n) | .state' <<<"$RELEASE_JSON")"
+              [ "$existing_state" = uploaded ] && [ "$existing_size" = "$expected_size" ] && [ "$existing_sha" = "$expected_sha" ] || { echo "::error::existing draft asset $name differs; refusing replacement"; exit 1; }
+            else
+              gh api --method POST --header "Content-Type: application/octet-stream" --input "$file" -- "repos/$GH_REPO/releases/$RELEASE_ID/assets?name=$name" >/dev/null
+              RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
+            fi
+            jq -e --arg n "$name" --arg sha "$expected_sha" --argjson size "$expected_size" --argjson rid "$RELEASE_ID" \
+              '.assets | map(select(.name == $n and .state == "uploaded" and .size == $size and .id > 0 and ((.digest // "") | sub("^sha256:"; "") | ascii_downcase) == $sha)) | length == 1' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release API metadata did not match trusted $name"; exit 1; }
+            REGISTERED_ID="$(jq -er --arg n "$name" '.assets[] | select(.name == $n) | .id' <<<"$RELEASE_JSON")"
+          }
+          IOS_NAME="$(jq -er '.assets.ios.name' feed-artifact/manifest.json)"; IOS_SIZE="$(jq -er '.assets.ios.size' feed-artifact/manifest.json)"; IOS_SHA="$(jq -er '.assets.ios.sha256' feed-artifact/manifest.json)"
+          TVOS_NAME="$(jq -er '.assets.tvos.name' feed-artifact/manifest.json)"; TVOS_SIZE="$(jq -er '.assets.tvos.size' feed-artifact/manifest.json)"; TVOS_SHA="$(jq -er '.assets.tvos.sha256' feed-artifact/manifest.json)"
+          LITE_NAME="$(jq -er '.assets.tvosLite.name' feed-artifact/manifest.json)"; LITE_SIZE="$(jq -er '.assets.tvosLite.size' feed-artifact/manifest.json)"; LITE_SHA="$(jq -er '.assets.tvosLite.sha256' feed-artifact/manifest.json)"
+          MAC_NAME="$(jq -er '.assets.mac.name' feed-artifact/manifest.json)"; MAC_SIZE="$(jq -er '.assets.mac.size' feed-artifact/manifest.json)"; MAC_SHA="$(jq -er '.assets.mac.sha256' feed-artifact/manifest.json)"
+          register_asset "$IOS_NAME" "out/$IOS_NAME" "$IOS_SIZE" "$IOS_SHA"; IOS_ID="$REGISTERED_ID"
+          register_asset "$TVOS_NAME" "out/$TVOS_NAME" "$TVOS_SIZE" "$TVOS_SHA"; TVOS_ID="$REGISTERED_ID"
+          register_asset "$LITE_NAME" "out/$LITE_NAME" "$LITE_SIZE" "$LITE_SHA"; LITE_ID="$REGISTERED_ID"
+          register_asset "$MAC_NAME" "out/$MAC_NAME" "$MAC_SIZE" "$MAC_SHA"; MAC_ID="$REGISTERED_ID"
+          register_asset "SHA256SUMS-ci.txt" out/SHA256SUMS-ci.txt "$(wc -c <out/SHA256SUMS-ci.txt | tr -d ' ')" "$(shasum -a 256 out/SHA256SUMS-ci.txt | awk '{print $1}')"; CHECKSUM_ID="$REGISTERED_ID"
+          jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" \
+            '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
+            feed-artifact/manifest.json > "$RUNNER_TEMP/receipt-manifest.json"
+          jq -c --slurpfile manifest "$RUNNER_TEMP/receipt-manifest.json" --rawfile source feed-artifact/source.json --rawfile appcast feed-artifact/appcast.json --rawfile checksum feed-artifact/SHA256SUMS-ci.txt \
+            '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > "$RUNNER_TEMP/feed-receipt.json"
+          SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary <"$RUNNER_TEMP/feed-receipt.json" | od -An -tx1 | tr -d ' \n')"
+          RECEIPT_RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS \
+            -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" \
+            --data-binary @"$RUNNER_TEMP/feed-receipt.json" https://vortx.tv/__release/receipt)"
+          jq -e --arg generation "$(jq -er '.generation' feed-artifact/manifest.json)" '.staged == true and .generation == $generation' <<<"$RECEIPT_RESPONSE" >/dev/null
+          for ASSET_ID_FILE in "$IOS_ID:out/$IOS_NAME" "$TVOS_ID:out/$TVOS_NAME" "$LITE_ID:out/$LITE_NAME" "$MAC_ID:out/$MAC_NAME" "$CHECKSUM_ID:out/SHA256SUMS-ci.txt"; do
+            ASSET_ID="${ASSET_ID_FILE%%:*}"; FILE="${ASSET_ID_FILE#*:}"
+            gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$ASSET_ID" > "$RUNNER_TEMP/draft-$ASSET_ID"
+            cmp -s "$FILE" "$RUNNER_TEMP/draft-$ASSET_ID" || { echo "::error::authenticated draft bytes differ for asset $ASSET_ID"; exit 1; }
+          done
+          {
+            echo "FEED_GENERATION=$(jq -er '.generation' feed-artifact/manifest.json)"
+            echo "IOS_ASSET_ID=$IOS_ID"; echo "TVOS_ASSET_ID=$TVOS_ID"; echo "LITE_ASSET_ID=$LITE_ID"; echo "MAC_ASSET_ID=$MAC_ID"; echo "CHECKSUM_ASSET_ID=$CHECKSUM_ID"
+          } >> "$GITHUB_ENV"
+          if [ "${{ inputs.publish_release }}" != true ]; then
+            echo "draft release $RELEASE_ID is attached and feed generation $FEED_GENERATION is staged; publication remains an explicit final step"
+            exit 0
+          fi
 
-      # Keep the AltStore / SideStore source in lockstep with every cut. Sideload auto-update is a
-      # PULL: each installed app polls .../main/altstore/source.json and compares its top versions[]
-      # entry to what is installed. Nothing used to write that file, so it froze at Beta 12 (build
-      # 207) through Beta 15 and every app polled it and saw "no update". These two steps advance it
-      # on every approved cut. Idempotent: a re-attach or the publish re-trigger produces no diff.
-      - name: Check out main to update the AltStore source
-        # Only on the canonical cut path (workflow_dispatch attach). The release-published
-        # re-trigger rebuilds and re-attaches assets, but must not re-run the source update: that
-        # would land a redundant commit and overwrite any hand-supplied note with the generated one.
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          path: srcrepo
-          fetch-depth: 0
-          persist-credentials: true
-      - name: Update altstore/source.json and push to main
-        if: github.event_name == 'workflow_dispatch'
+      - name: Atomically activate the staged feed, prove routes, then publish last
+        if: inputs.publish_release == true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
-          ALTSTORE_NOTE: ${{ inputs.altstore_note }}
+          TAG: ${{ inputs.release_tag }}
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+          EXPECTED_ACTIVE: ${{ steps.identity.outputs.expected_active }}
+          RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
+        run: |
+          set -Eeuo pipefail
+          PROMOTED=0
+          SOURCE_COMMITTED=0
+          ROLLBACK_FAILURE=0
+          rollback_edge() {
+            [ "$PROMOTED" = 1 ] || return 0
+            local restore="$EXPECTED_ACTIVE"
+            [ "$restore" = none ] && restore=none
+            local body signature result
+            body="$(jq -cn --arg generation "$FEED_GENERATION" --arg restore "$restore" '{action:"rollback",expectedCurrentGeneration:$generation,restoreGeneration:$restore}')"
+            signature="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
+            result="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$signature" --data-binary "$body" https://vortx.tv/__release/receipt || true)"
+            if ! jq -e --arg restore "$restore" '.rolledBack == true and .generation == (if $restore == "none" then "none" else $restore end)' <<<"$result" >/dev/null; then
+              echo "::error::incident: edge rollback did not verify"
+              ROLLBACK_FAILURE=1
+              return 0
+            fi
+            if [ "$restore" = none ]; then
+              for ROUTE in https://vortx.tv/altstore.json https://vortx.tv/vortx-altstore.json https://vortx.tv/appcast.json; do
+                STATUS="$(curl -sS --connect-timeout 5 --max-time 15 -o /dev/null -w '%{http_code}' "$ROUTE" || true)"
+                [ "$STATUS" = 503 ] || { echo "::error::incident: edge rollback did not return unavailable for $ROUTE"; ROLLBACK_FAILURE=1; }
+              done
+              return 0
+            fi
+            for ROUTE_FILE in \
+              "https://vortx.tv/altstore.json|$PREVIOUS_EDGE_SOURCE_FILE" \
+              "https://vortx.tv/vortx-altstore.json|$PREVIOUS_EDGE_SOURCE_FILE" \
+              "https://vortx.tv/appcast.json|$PREVIOUS_EDGE_APPCAST_FILE"; do
+              ROUTE="${ROUTE_FILE%%|*}"; EXPECTED_FILE="${ROUTE_FILE#*|}"; BODY="$RUNNER_TEMP/rollback-edge-body"; HEADERS="$RUNNER_TEMP/rollback-edge-headers"
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$HEADERS" "$ROUTE" -o "$BODY" || { echo "::error::incident: edge rollback route unavailable: $ROUTE"; ROLLBACK_FAILURE=1; continue; }
+              cmp -s "$EXPECTED_FILE" "$BODY" || { echo "::error::incident: edge rollback bytes differ: $ROUTE"; ROLLBACK_FAILURE=1; }
+              grep -Fqi "x-vortx-feed-generation: $restore" "$HEADERS" || { echo "::error::incident: edge rollback generation differs: $ROUTE"; ROLLBACK_FAILURE=1; }
+              curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$HEADERS.query" "$ROUTE?rollback-verify=$restore" -o "$BODY.query" || { echo "::error::incident: edge rollback query unavailable: $ROUTE"; ROLLBACK_FAILURE=1; continue; }
+              cmp -s "$EXPECTED_FILE" "$BODY.query" || { echo "::error::incident: edge rollback query bytes differ: $ROUTE"; ROLLBACK_FAILURE=1; }
+              grep -Fqi "x-vortx-feed-generation: $restore" "$HEADERS.query" || { echo "::error::incident: edge rollback query generation differs: $ROUTE"; ROLLBACK_FAILURE=1; }
+            done
+          }
+          commit_source_bytes() {
+            local file="$1" message="$2" expected_head="${3:-}" main_head base_tree source_b64 blob_sha tree_sha commit_sha
+            main_head="$(gh api --jq '.object.sha' -- "repos/$GH_REPO/git/ref/heads/main")"
+            if [ -n "$expected_head" ] && [ "$main_head" != "$expected_head" ]; then
+              echo "::error::main moved from the guarded head $expected_head to $main_head; refusing feed overwrite"
+              return 1
+            fi
+            base_tree="$(gh api --jq '.tree.sha' -- "repos/$GH_REPO/git/commits/$main_head")"
+            source_b64="$(base64 <"$file" | tr -d '\n')"
+            blob_sha="$(jq -cn --arg content "$source_b64" '{content:$content,encoding:"base64"}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/blobs")"
+            tree_sha="$(jq -cn --arg base "$base_tree" --arg blob "$blob_sha" '{base_tree:$base,tree:[{path:"altstore/source.json",mode:"100644",type:"blob",sha:$blob}]}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/trees")"
+            commit_sha="$(jq -cn --arg message "$message" --arg tree "$tree_sha" --arg parent "$main_head" '{message:$message,tree:$tree,parents:[$parent]}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/commits")"
+            jq -cn --arg sha "$commit_sha" '{sha:$sha,force:false}' | gh api --method PATCH --input - --jq '.object.sha' -- "repos/$GH_REPO/git/refs/heads/main" >/dev/null
+            SOURCE_COMMITTED=1
+          }
+          rollback_source() {
+            [ "$SOURCE_COMMITTED" = 1 ] || return 0
+            local current current_ref current_head
+            current="$RUNNER_TEMP/rollback-current-source.json"
+            current_ref="$(gh api -- "repos/$GH_REPO/git/ref/heads/main" 2>/dev/null || true)"
+            current_head="$(jq -er '.object.sha' <<<"$current_ref" 2>/dev/null || true)"
+            gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=main" | jq -er '.content' | tr -d '\n' | base64 --decode > "$current" || { echo "::error::incident: cannot read current main source for rollback CAS"; ROLLBACK_FAILURE=1; return 0; }
+            if cmp -s "$current" feed-artifact/source.json; then
+              [ -n "$current_head" ] || { echo "::error::incident: current main ref is unavailable for rollback CAS"; ROLLBACK_FAILURE=1; return 0; }
+              if ! commit_source_bytes "$PREVIOUS_SOURCE_FILE" "chore(release): restore verified install feed" "$current_head"; then
+                echo "::error::incident: main-source rollback failed"
+                ROLLBACK_FAILURE=1
+              fi
+            else
+              echo "::error::source rollback CAS refused because main no longer contains the published feed bytes"
+              ROLLBACK_FAILURE=1
+            fi
+            RAW_DEADLINE=$(($(date +%s) + 90)); RAW_RESTORED=0
+            while [ "$(date +%s)" -lt "$RAW_DEADLINE" ]; do
+              if curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "https://raw.githubusercontent.com/$GH_REPO/main/altstore/source.json" -o "$RUNNER_TEMP/rollback-raw-source.json" && cmp -s "$PREVIOUS_SOURCE_FILE" "$RUNNER_TEMP/rollback-raw-source.json"; then RAW_RESTORED=1; break; fi
+              sleep 5
+            done
+            [ "$RAW_RESTORED" = 1 ] || { echo "::error::incident: raw main source rollback did not verify"; ROLLBACK_FAILURE=1; }
+          }
+          rollback_release() {
+            local current
+            current="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            if [ -n "$current" ] && [ -n "${PUBLISHED_AT:-}" ] && jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" '.tag_name == $tag and .prerelease == true and .draft == false and .published_at == $published' <<<"$current" >/dev/null; then
+              restored="$(gh api --method PATCH -f draft=true -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+              jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == true' <<<"$restored" >/dev/null || { echo "::error::incident: GitHub could not restore release $RELEASE_ID to draft"; ROLLBACK_FAILURE=1; }
+            elif [ -n "${PUBLISHED_AT:-}" ]; then
+              echo "::error::incident: release rollback identity changed before restore"
+              ROLLBACK_FAILURE=1
+            fi
+          }
+          on_failure() {
+            local status=$?
+            if [ "$status" -ne 0 ]; then
+              set +e
+              rollback_edge
+              rollback_source
+              rollback_release
+              set -e
+              if [ "$ROLLBACK_FAILURE" = 1 ]; then
+                echo "::error::incident: release rollback was incomplete; do not retry blindly"
+              fi
+            fi
+            exit "$status"
+          }
+          trap on_failure EXIT
+          # The draft asset API proof happened before staging. Do not fetch the
+          # public download URLs yet: the release must remain a draft until the
+          # main and edge state have both accepted the exact staged bytes.
+          RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == true' <<<"$RELEASE_JSON" >/dev/null
+          for KEY_FILE in \
+            "ios:out/VortX-iOS-$TAG-ci.ipa:$IOS_ASSET_ID" \
+            "tvos:out/VortX-tvOS-$TAG-ci.ipa:$TVOS_ASSET_ID" \
+            "tvosLite:out/VortX-tvOS-lite-$TAG-ci.ipa:$LITE_ASSET_ID" \
+            "mac:out/VortX-macOS-$TAG-ci.dmg:$MAC_ASSET_ID"; do
+            KEY="${KEY_FILE%%:*}"; REMAINDER="${KEY_FILE#*:}"; FILE="${REMAINDER%%:*}"; ASSET_ID="${REMAINDER#*:}"
+            NAME="$(jq -er --arg key "$KEY" '.assets[$key].name' feed-artifact/manifest.json)"; URL="$(jq -er --arg key "$KEY" '.assets[$key].url' feed-artifact/manifest.json)"; SIZE="$(jq -er --arg key "$KEY" '.assets[$key].size' feed-artifact/manifest.json)"; SHA="$(jq -er --arg key "$KEY" '.assets[$key].sha256' feed-artifact/manifest.json)"
+            API_DIGEST="$(jq -er --argjson id "$ASSET_ID" '.assets[] | select(.id == $id) | (.digest // "") | sub("^sha256:"; "") | ascii_downcase' <<<"$RELEASE_JSON")"
+            API_SIZE="$(jq -er --argjson id "$ASSET_ID" '.assets[] | select(.id == $id) | .size' <<<"$RELEASE_JSON")"
+            API_NAME="$(jq -er --argjson id "$ASSET_ID" '.assets[] | select(.id == $id) | .name' <<<"$RELEASE_JSON")"
+            [ "$API_NAME" = "$NAME" ] && [ "$API_SIZE" = "$SIZE" ] && [ "$API_DIGEST" = "$SHA" ] || { echo "::error::release API asset metadata differs for $KEY"; exit 1; }
+          done
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$CHECKSUM_ASSET_ID" > "$RUNNER_TEMP/draft-checksums.txt"
+          cmp -s out/SHA256SUMS-ci.txt "$RUNNER_TEMP/draft-checksums.txt" || { echo "::error::authenticated draft checksum bytes differ"; exit 1; }
+          commit_source_bytes feed-artifact/source.json "chore(release): publish verified install feed" "$EXPECTED_MAIN_HEAD"
+          OPERATION_ID="promote:$RELEASE_ID:$FEED_GENERATION"
+          PROMOTE_BODY="$(jq -cn --arg oid "$OPERATION_ID" --arg rid "$RELEASE_ID" --arg generation "$FEED_GENERATION" --arg expected "$EXPECTED_ACTIVE" '{action:"promote",operationId:$oid,releaseId:$rid,generation:$generation,expectedActiveGeneration:(if $expected == "none" then null else $expected end)}')"
+          PROMOTE_SIGNATURE="$(printf '%s' "$PROMOTE_BODY" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
+          # Retry the EXACT same signed bytes on transport/5xx loss so a committed-but-unacknowledged
+          # promotion is answered idempotently instead of being replayed as a new operation.
+          PROMOTE_RESPONSE=""
+          PROMOTE_STATUS=""
+          PROMOTE_DEADLINE=$(($(date +%s) + 90))
+          while [ "$(date +%s)" -lt "$PROMOTE_DEADLINE" ]; do
+            PROMOTE_STATUS="$(curl --silent --show-error --connect-timeout 5 --max-time 20 -o "$RUNNER_TEMP/promote-body.json" -w '%{http_code}' -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$PROMOTE_SIGNATURE" --data-binary "$PROMOTE_BODY" https://vortx.tv/__release/receipt 2>/dev/null || true)"
+            PROMOTE_RESPONSE="$(cat "$RUNNER_TEMP/promote-body.json" 2>/dev/null || true)"
+            if [ "$PROMOTE_STATUS" = "200" ]; then break; fi
+            case "$PROMOTE_STATUS" in
+              400|404|409) break ;;
+              *) sleep 10 ;;
+            esac
+          done
+          [ "$PROMOTE_STATUS" = "200" ] || { echo "::error::promotion did not succeed (HTTP $PROMOTE_STATUS): $PROMOTE_RESPONSE"; exit 1; }
+          jq -e --arg generation "$FEED_GENERATION" '.promoted == true and .generation == $generation' <<<"$PROMOTE_RESPONSE" >/dev/null
+          PROMOTED=1
+          DEADLINE=$(($(date +%s) + 270))
+          verify_route() {
+            local url="$1" expected_file="$2" body="$RUNNER_TEMP/route-body"
+            [ "$(date +%s)" -lt "$DEADLINE" ] || return 1
+            curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$RUNNER_TEMP/route-headers" "$url" -o "$body" || return 1
+            grep -Eiq '^content-type: application/json' "$RUNNER_TEMP/route-headers" || return 1
+            grep -Eiq '^cache-control: public, max-age=120, s-maxage=120, must-revalidate' "$RUNNER_TEMP/route-headers" || return 1
+            ! grep -Eiq 'immutable|no-store' "$RUNNER_TEMP/route-headers" || return 1
+            grep -Fqi "x-vortx-feed-generation: $FEED_GENERATION" "$RUNNER_TEMP/route-headers" || return 1
+            cmp -s "$expected_file" "$body"
+          }
+          for ROUTE_FILE in "https://vortx.tv/altstore.json|feed-artifact/source.json" "https://vortx.tv/vortx-altstore.json|feed-artifact/source.json" "https://vortx.tv/appcast.json|feed-artifact/appcast.json"; do
+            ROUTE="${ROUTE_FILE%%|*}"; EXPECTED_FILE="${ROUTE_FILE#*|}"; VERIFIED=0
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              if verify_route "$ROUTE" "$EXPECTED_FILE" && verify_route "$ROUTE?release-check=$FEED_GENERATION" "$EXPECTED_FILE"; then VERIFIED=1; break; fi
+              sleep 15
+            done
+            [ "$VERIFIED" = 1 ] || { echo "::error::public route did not converge to exact generation $FEED_GENERATION: $ROUTE"; exit 1; }
+          done
+          MAIN_PUBLIC="$RUNNER_TEMP/public-source.json"
+          MAIN_VERIFIED=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            if curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "https://raw.githubusercontent.com/$GH_REPO/main/altstore/source.json" -o "$MAIN_PUBLIC" && cmp -s feed-artifact/source.json "$MAIN_PUBLIC"; then
+              MAIN_VERIFIED=1
+              break
+            fi
+            sleep 15
+          done
+          [ "$MAIN_VERIFIED" = 1 ] || { echo "::error::raw main source did not converge to the exact staged bytes"; exit 1; }
+          # Final write: only now can the draft become externally installable.
+          # Retrying is bounded and every readback binds the same immutable ID,
+          # tag, and published timestamp before any public-asset proof starts.
+          PUBLISH_DEADLINE=$(($(date +%s) + 90))
+          PUBLISHED=0
+          while [ "$(date +%s)" -lt "$PUBLISH_DEADLINE" ]; do
+            gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
+            RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+              PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
+              PUBLISHED=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$PUBLISHED" = 1 ] || { echo "::error::release:published did not converge for immutable release $RELEASE_ID"; exit 1; }
+          # Post-publication checks are read-only. They use the API-bound
+          # release JSON plus the public CDN bytes and never mutate a feed.
+          for KEY_FILE in \
+            "ios:out/VortX-iOS-$TAG-ci.ipa" \
+            "tvos:out/VortX-tvOS-$TAG-ci.ipa" \
+            "tvosLite:out/VortX-tvOS-lite-$TAG-ci.ipa" \
+            "mac:out/VortX-macOS-$TAG-ci.dmg"; do
+            KEY="${KEY_FILE%%:*}"; FILE="${KEY_FILE#*:}"
+            URL="$(jq -er --arg key "$KEY" '.assets[$key].url' feed-artifact/manifest.json)"; SIZE="$(jq -er --arg key "$KEY" '.assets[$key].size' feed-artifact/manifest.json)"; SHA="$(jq -er --arg key "$KEY" '.assets[$key].sha256' feed-artifact/manifest.json)"
+            curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "$URL" -o "$RUNNER_TEMP/public-$KEY"
+            cmp -s "$FILE" "$RUNNER_TEMP/public-$KEY" || { echo "::error::public asset bytes differ for $KEY"; exit 1; }
+            [ "$(wc -c <"$RUNNER_TEMP/public-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::public asset size differs for $KEY"; exit 1; }
+            [ "$(shasum -a 256 "$RUNNER_TEMP/public-$KEY" | awk '{print $1}')" = "$SHA" ] || { echo "::error::public asset digest differs for $KEY"; exit 1; }
+          done
+          curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "https://github.com/$GH_REPO/releases/download/$TAG/SHA256SUMS-ci.txt" -o "$RUNNER_TEMP/public-checksums.txt"
+          cmp -s out/SHA256SUMS-ci.txt "$RUNNER_TEMP/public-checksums.txt" || { echo "::error::public checksum bytes differ from the trusted local checksum file"; exit 1; }
+          trap - EXIT
+          echo "promoted feed generation $FEED_GENERATION, verified public/raw bytes, then published release $RELEASE_ID and completed read-only postchecks"
+
+  # A published event is verification and recovery only. It is bound to the immutable release ID
+  # from the event payload and never attaches assets, mutates main, promotes a feed, or republishes.
+  verify-published:
+    if: github.event_name == 'release'
+    concurrency:
+      group: vortx-release-verify-${{ github.event.release.id }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 12
+    steps:
+      - name: Wait for the immutable published release to become readable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          # Same strict release-tag grammar the attach steps enforce: this value is spent in a
-          # download URL and gh calls, so it must never be anything but a real release tag.
-          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
-          if [ -z "${TAG:-}" ] || ! [[ "$TAG" =~ $TAG_RE ]]; then
-            echo "::error::release tag '$TAG' is not a strict release tag; refusing to update AltStore source"
-            exit 1
-          fi
-          cd srcrepo
-          # Build number: read it from the TAG's own project.yml (the exact commit that was built),
-          # NOT from main HEAD. If main's CURRENT_PROJECT_VERSION is bumped for the next beta during
-          # the approval wait (two betas briefly in flight), reading main would advertise a
-          # buildVersion that does not match the CFBundleVersion inside the linked IPA, and AltStore
-          # would re-offer the same update forever. The tag peels to the built commit (proven by the
-          # tag-commit binding step above), so its project.yml is the authoritative build number.
-          git fetch --no-tags origin "+refs/tags/$TAG:refs/tags/$TAG"
-          BUILD="$(git show "refs/tags/$TAG:app/project.yml" | grep -m1 -E 'CURRENT_PROJECT_VERSION:' | sed -E 's/.*"([0-9]+)".*/\1/')"
-          if ! [[ "$BUILD" =~ ^[0-9]+$ ]]; then
-            echo "::error::could not read a numeric CURRENT_PROJECT_VERSION from app/project.yml at tag $TAG"
-            exit 1
-          fi
-          # Sizes come from the assets just uploaded to THIS release (bytes), so the store entry
-          # matches exactly what a user downloads.
-          # Flags BEFORE the `--` terminator so gh parses --json/--jq as options; the tag stays the
-          # sole positional after `--` (gh release view accepts at most one positional, unlike the
-          # upload/delete-asset calls above whose args are all positional).
-          ASSETS_JSON="$(gh release view --json assets -- "$TAG")"
-          IOS_SIZE="$(jq -r --arg n "VortX-iOS-$TAG-ci.ipa" '.assets[] | select(.name==$n) | .size' <<<"$ASSETS_JSON")"
-          TVOS_SIZE="$(jq -r --arg n "VortX-tvOS-$TAG-ci.ipa" '.assets[] | select(.name==$n) | .size' <<<"$ASSETS_JSON")"
-          # `// ""` guards a JSON-null (untitled) release from arriving as the literal string "null".
-          NAME="$(gh release view --json name --jq '.name // ""' -- "$TAG")"
-          for pair in "iOS:$IOS_SIZE" "tvOS:$TVOS_SIZE"; do
-            v="${pair#*:}"
-            if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -le 0 ]; then
-              echo "::error::missing/invalid asset size for ${pair%%:*} (iOS=$IOS_SIZE tvOS=$TVOS_SIZE); did the upload attach both IPAs?"
-              exit 1
+          [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
+          READ_DEADLINE=$(($(date +%s) + 90))
+          READY=0
+          while [ "$(date +%s)" -lt "$READ_DEADLINE" ]; do
+            RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+              READY=1
+              break
             fi
+            sleep 5
           done
-          node scripts/update-altstore-source.mjs \
-            --file altstore/source.json \
-            --tag "$TAG" --build "$BUILD" --date "$(date -u +%F)" \
-            --name "$NAME" --note "${ALTSTORE_NOTE:-}" \
-            --ios-size "$IOS_SIZE" --tvos-size "$TVOS_SIZE"
-          if git diff --quiet -- altstore/source.json; then
-            echo "AltStore source already current for build $BUILD ($TAG); nothing to commit."
-            exit 0
-          fi
-          git config user.name "Mamaclapper"
-          git config user.email "50227842+mamaclapper@users.noreply.github.com"
-          git add altstore/source.json
-          git commit -m "chore(release): point AltStore source at ${NAME:-$TAG} (build $BUILD)"
-          # main may have advanced between checkout and now. Push; on a stale-ref rejection, rebase
-          # our single-file change onto the latest main and retry (bounded). The ruleset on main
-          # allows fast-forward pushes and forbids only force-push/deletion, so the rebase path stays
-          # a valid fast-forward.
-          pushed=0
-          for attempt in 1 2 3; do
-            if git push origin main; then pushed=1; break; fi
-            echo "push rejected (attempt $attempt); rebasing on latest main and retrying"
-            git pull --rebase origin main || git rebase --abort 2>/dev/null || true
-            sleep "$((attempt * 3))"
+          [ "$READY" = 1 ] || { echo "::error::release:published did not become readable for immutable release $RELEASE_ID"; exit 1; }
+      - name: Verify the immutable published release and public feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
+          RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
+          [[ "$EVENT_TAG" == *-* ]] || { echo "::error::published event tag is not a prerelease"; exit 1; }
+          jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .prerelease == true and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag/prerelease identity changed or release was recreated"; exit 1; }
+          REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$EVENT_TAG")"
+          TAG_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"; TAG_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"; HOPS=0
+          while [ "$TAG_TYPE" = tag ]; do HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || exit 1; TAG_OBJECT="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"; TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"; TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"; done
+          [ "$TAG_TYPE" = commit ] || { echo "::error::published tag does not resolve to a commit"; exit 1; }
+          curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$RUNNER_TEMP/appcast.headers" https://vortx.tv/appcast.json -o "$RUNNER_TEMP/appcast.json"
+          grep -Eiq '^content-type: application/json' "$RUNNER_TEMP/appcast.headers" || exit 1
+          grep -Eiq '^cache-control: public, max-age=120, s-maxage=120, must-revalidate' "$RUNNER_TEMP/appcast.headers" || exit 1
+          grep -Eiq '^x-vortx-feed-generation: .+' "$RUNNER_TEMP/appcast.headers" || exit 1
+          jq -e --arg tag "$EVENT_TAG" --arg commit "$TAG_SHA" '.schemaVersion == 2 and ._generatedFromTag == $tag and ._generatedFromCommit == $commit and .android == null and .ios.altstore == "https://vortx.tv/altstore.json" and .tvos.altstore == null and .mac.altstore == null and .ios.artifactType == "ipa" and .tvos.artifactType == "ipa" and .mac.artifactType == "dmg"' "$RUNNER_TEMP/appcast.json" >/dev/null
+          curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "https://vortx.tv/appcast.json?release-check=$RELEASE_ID" -o "$RUNNER_TEMP/appcast-query.json"
+          cmp -s "$RUNNER_TEMP/appcast.json" "$RUNNER_TEMP/appcast-query.json" || { echo "::error::appcast query returned different bytes"; exit 1; }
+          for KEY_URL in "ios:.ios" "tvos:.tvos" "mac:.mac"; do
+            KEY="${KEY_URL%%:*}"; SELECTOR="${KEY_URL#*:}"; URL="$(jq -er "$SELECTOR.ipa" "$RUNNER_TEMP/appcast.json")"; SIZE="$(jq -er "$SELECTOR.size" "$RUNNER_TEMP/appcast.json")"; SHA="$(jq -er "$SELECTOR.sha256" "$RUNNER_TEMP/appcast.json" | tr '[:upper:]' '[:lower:]')"
+            curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "$URL" -o "$RUNNER_TEMP/published-$KEY"
+            [ "$(wc -c <"$RUNNER_TEMP/published-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::published $KEY size differs from appcast"; exit 1; }
+            [ "$(shasum -a 256 "$RUNNER_TEMP/published-$KEY" | awk '{print $1}')" = "$SHA" ] || { echo "::error::published $KEY digest differs from appcast"; exit 1; }
           done
-          if [ "$pushed" != 1 ]; then
-            echo "::error::could not push the AltStore source update to main after 3 attempts (assets are attached; re-run the dispatch or update altstore/source.json by hand)"
-            exit 1
-          fi
+          curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$RUNNER_TEMP/source.headers" https://vortx.tv/altstore.json -o "$RUNNER_TEMP/source.json"
+          curl --fail-with-body --connect-timeout 5 --max-time 15 -sS https://vortx.tv/vortx-altstore.json -o "$RUNNER_TEMP/compat.json"
+          cmp -s "$RUNNER_TEMP/source.json" "$RUNNER_TEMP/compat.json" || { echo "::error::compatibility route differs from canonical route"; exit 1; }
+          curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "https://vortx.tv/altstore.json?release-check=$RELEASE_ID" -o "$RUNNER_TEMP/source-query.json"
+          cmp -s "$RUNNER_TEMP/source.json" "$RUNNER_TEMP/source-query.json" || { echo "::error::canonical query returned different bytes"; exit 1; }
+          jq -e --arg build "$(jq -er '.ios.build' "$RUNNER_TEMP/appcast.json")" --arg ios "$(jq -er '.ios.url' "$RUNNER_TEMP/appcast.json")" --arg tvos "$(jq -er '.tvos.url' "$RUNNER_TEMP/appcast.json")" --arg iosSha "$(jq -er '.ios.sha256' "$RUNNER_TEMP/appcast.json")" --arg tvosSha "$(jq -er '.tvos.sha256' "$RUNNER_TEMP/appcast.json")" '.apps | length == 2 and all(.versions[0].buildVersion | tostring == $build) and (map(select(.bundleIdentifier == "com.stremiox.app.native"))[0].versions[0].downloadURL == $ios) and (map(select(.bundleIdentifier == "com.stremiox.tv"))[0].versions[0].downloadURL == $tvos) and (map(select(.bundleIdentifier == "com.stremiox.app.native"))[0].versions[0].sha256 | ascii_downcase) == ($iosSha | ascii_downcase) and (map(select(.bundleIdentifier == "com.stremiox.tv"))[0].versions[0].sha256 | ascii_downcase) == ($tvosSha | ascii_downcase)' "$RUNNER_TEMP/source.json" >/dev/null
+          grep -Eiq '^content-type: application/json' "$RUNNER_TEMP/source.headers" || exit 1
+          grep -Eiq '^cache-control: public, max-age=120, s-maxage=120, must-revalidate' "$RUNNER_TEMP/source.headers" || exit 1
+          echo "published event $RELEASE_ID verified without performing release or feed writes"

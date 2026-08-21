@@ -1,0 +1,22 @@
+name = "vortx-appcast"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+routes = [
+  { pattern = "vortx.tv/altstore.json*", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/vortx-altstore.json*", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/appcast.json*", zone_name = "vortx.tv" },
+  { pattern = "vortx.tv/__release/receipt*", zone_name = "vortx.tv" },
+]
+
+[[kv_namespaces]]
+binding = "LEGACY_LASTGOOD"
+id = "7edd0bcba056430fb3e6fb7fc6656281"
+
+[[durable_objects.bindings]]
+name = "COORDINATOR"
+class_name = "FeedCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FeedCoordinator"]

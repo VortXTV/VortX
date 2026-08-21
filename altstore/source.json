@@ -24,6 +24,7 @@
           "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-iOS-v0.3.14-beta.18-ci.ipa",
           "size": 64243010,
+          "sha256": "3feab87f4d005f1726b7c0a0bc83225478907b59bbc2fe54a6fdbd0855618596",
           "minOSVersion": "16.0"
         },
         {
@@ -109,6 +110,7 @@
           "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-tvOS-v0.3.14-beta.18-ci.ipa",
           "size": 63680653,
+          "sha256": "ea22ad198314a0425ccb589caa3e797c3c8db91c697930cb24881e6f382eb76e",
           "minOSVersion": "18.0"
         },
         {
