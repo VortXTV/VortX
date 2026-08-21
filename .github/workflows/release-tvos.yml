@@ -44,6 +44,10 @@ on:
         required: false
         type: boolean
         default: false
+      release_id:
+        description: "Optional numeric draft-release ID. When set, CI resolves the draft by ID directly instead of by tag lookup (GITHUB_TOKEN tag lookup can miss drafts)."
+        required: false
+        default: ""
 
 # Workflow-wide default is READ-ONLY: the build job executes repo-controlled code (scripts/*,
 # app/scripts/*, the xcodegen'd build phases), so it must never hold write authority on the repo.
@@ -908,6 +912,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           ALTSTORE_NOTE: ${{ inputs.altstore_note }}
+          RELEASE_ID_INPUT: ${{ inputs.release_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
@@ -917,7 +922,11 @@ jobs:
           [[ "$TAG" =~ $TAG_RE ]] || { echo "::error::release tag $TAG is not strict"; exit 1; }
           BUILD="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
-          RELEASE_JSON="$(gh release view "$TAG" --repo "$GH_REPO" --json id,name,body,tagName,isDraft,isPrerelease --jq '{id: .id, name: .name, body: .body, tag_name: .tagName, draft: .isDraft, prerelease: .isPrerelease}')"
+          if [ -n "$RELEASE_ID_INPUT" ]; then
+            RELEASE_JSON="$(gh api "repos/$GH_REPO/releases/$RELEASE_ID_INPUT")"
+          else
+            RELEASE_JSON="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "first(.[] | select(.tag_name == \"$TAG\"))")"
+          fi
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
           [[ "$TAG" == *-* ]] || { echo "::error::this lane accepts prerelease tags only"; exit 1; }
           jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .prerelease == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing prerelease draft"; exit 1; }
@@ -985,6 +994,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.release_tag }}
+          RELEASE_ID_INPUT: ${{ inputs.release_id }}
         run: |
           set -euo pipefail
           TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
@@ -997,7 +1007,11 @@ jobs:
             '.tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
           BUILD="$(jq -er '.build' "$MANIFEST")"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::feed artifact build is not numeric"; exit 1; }
-          RELEASE_JSON="$(gh release view "$TAG" --repo "$GH_REPO" --json id,name,body,tagName,isDraft,isPrerelease --jq '{id: .id, name: .name, body: .body, tag_name: .tagName, draft: .isDraft, prerelease: .isPrerelease}')"
+          if [ -n "$RELEASE_ID_INPUT" ]; then
+            RELEASE_JSON="$(gh api "repos/$GH_REPO/releases/$RELEASE_ID_INPUT")"
+          else
+            RELEASE_JSON="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "first(.[] | select(.tag_name == \"$TAG\"))")"
+          fi
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
           jq -e --arg id "$RELEASE_ID" '(.releaseId | tostring) == $id' "$MANIFEST" >/dev/null || { echo "::error::draft release identity differs from the immutable feed artifact"; exit 1; }
           [ "$(jq -r '.draft' <<<"$RELEASE_JSON")" = true ] || { echo "::error::release $RELEASE_ID is not a draft; refusing asset writes"; exit 1; }
