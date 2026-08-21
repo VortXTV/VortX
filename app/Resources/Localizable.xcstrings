@@ -45471,6 +45471,16 @@
         }
       }
     },
+    "Featured Shows": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Séries à la une"
+          }
+        }
+      }
+    },
     "Finding best…  %@/%@": {
       "localizations": {
         "en": {
@@ -140221,6 +140231,26 @@
         }
       }
     },
+    "Trending Movies": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Films tendance"
+          }
+        }
+      }
+    },
+    "Trending Shows": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Séries tendance"
+          }
+        }
+      }
+    },
     "War": {
       "localizations": {
         "af": {
@@ -211261,6 +211291,26 @@
         }
       }
     },
+    "New Movies": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nouveaux films"
+          }
+        }
+      }
+    },
+    "New Shows": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nouvelles séries"
+          }
+        }
+      }
+    },
     "Nothing to Export": {
       "localizations": {
         "af": {
@@ -230457,6 +230507,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Phequlula ngesevisi"
+          }
+        }
+      }
+    },
+    "Popular Shows": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Séries populaires"
           }
         }
       }

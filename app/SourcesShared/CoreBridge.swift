@@ -3128,6 +3128,13 @@ final class CoreBridge: ObservableObject {
         // Capture the add-on's category name + content-type label and localize each against our own term
         // dictionary (Stremio does the same); unknown add-on names pass through unchanged.
         if lower.contains(t) || lower.contains(label.lowercased()) { return AddonTerms.localize(name) }
+        // Prefer a real whole-phrase translation ("Popular Shows" -> fr "Séries populaires") before
+        // falling back to word-wise concatenation. Concatenating the individually-localized words
+        // keeps English adjective/noun order ("Populaires émissions"), which is wrong in French and
+        // other adjective-after-noun languages; the phrase key preserves natural grammar, and the
+        // nil fallback keeps locales without a phrase byte-identical to the old output (#203).
+        let phrase = "\(name) \(label)"
+        if let whole = AddonTerms.localizeWhole(phrase) { return whole }
         return "\(AddonTerms.localize(name)) \(AddonTerms.localize(label))"
     }
 

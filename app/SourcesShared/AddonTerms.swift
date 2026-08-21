@@ -24,6 +24,21 @@ enum AddonTerms {
         return tokenized(key) ?? whole      // else try word-wise (compound names), else passthrough
     }
 
+    /// Returns a WHOLE-STRING translation only when the String Catalog actually has a real
+    /// translation for this exact key, and nil otherwise. Unlike `localize`, this does NOT
+    /// fall back to word-wise splicing, so a caller that needs phrase-order-correct output
+    /// (e.g. French "Séries populaires", not English-order "Populaires émissions") can try
+    /// the whole phrase first and only fall back to concatenation when no real phrase exists.
+    /// `NSLocalizedString` returns the key itself when the key is absent, so a value equal to
+    /// the normalized key means "not translated" and we return nil to signal the fallback.
+    static func localizeWhole(_ raw: String) -> String? {
+        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return nil }
+        let whole = NSLocalizedString(key, comment: "Add-on-provided category / genre / content-type name (whole phrase)")
+        if whole != key { return whole }   // a real whole-phrase translation exists
+        return nil                          // no whole phrase; caller decides the fallback
+    }
+
     /// Word-wise fallback for compound add-on names ("Popular Movies", "Top Series") whose whole string is
     /// not in the catalog but whose individual words are. Localizes each space-separated word and re-joins
     /// ONLY when every word resolved to a real translation; if any word is unknown it returns nil so the
