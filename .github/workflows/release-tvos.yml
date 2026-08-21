@@ -917,7 +917,7 @@ jobs:
           [[ "$TAG" =~ $TAG_RE ]] || { echo "::error::release tag $TAG is not strict"; exit 1; }
           BUILD="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
-          RELEASE_JSON="$(gh api --paginate -- "repos/$GH_REPO/releases" | jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("release identity is missing or duplicated") end')"
+          RELEASE_JSON="$(gh release view "$TAG" --repo "$GH_REPO" --json id,name,body,tagName,isDraft,isPrerelease --jq '{id: .id, name: .name, body: .body, tag_name: .tagName, draft: .isDraft, prerelease: .isPrerelease}')"
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
           [[ "$TAG" == *-* ]] || { echo "::error::this lane accepts prerelease tags only"; exit 1; }
           jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == true and .prerelease == true' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing prerelease draft"; exit 1; }
@@ -997,7 +997,7 @@ jobs:
             '.tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
           BUILD="$(jq -er '.build' "$MANIFEST")"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::feed artifact build is not numeric"; exit 1; }
-          RELEASE_JSON="$(gh api --paginate -- "repos/$GH_REPO/releases" | jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | if length == 1 then .[0] else error("release identity is missing or duplicated") end')"
+          RELEASE_JSON="$(gh release view "$TAG" --repo "$GH_REPO" --json id,name,body,tagName,isDraft,isPrerelease --jq '{id: .id, name: .name, body: .body, tag_name: .tagName, draft: .isDraft, prerelease: .isPrerelease}')"
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
           jq -e --arg id "$RELEASE_ID" '(.releaseId | tostring) == $id' "$MANIFEST" >/dev/null || { echo "::error::draft release identity differs from the immutable feed artifact"; exit 1; }
           [ "$(jq -r '.draft' <<<"$RELEASE_JSON")" = true ] || { echo "::error::release $RELEASE_ID is not a draft; refusing asset writes"; exit 1; }
