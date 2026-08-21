@@ -1119,7 +1119,16 @@ jobs:
               existing_state="$(jq -er --arg n "$name" '.assets[] | select(.name == $n) | .state' <<<"$RELEASE_JSON")"
               [ "$existing_state" = uploaded ] && [ "$existing_size" = "$expected_size" ] && [ "$existing_sha" = "$expected_sha" ] || { echo "::error::existing draft asset $name differs; refusing replacement"; exit 1; }
             else
-              gh api --method POST --header "Content-Type: application/octet-stream" --input "$file" -- "repos/$GH_REPO/releases/$RELEASE_ID/assets?name=$name" >/dev/null
+              # Upload via uploads.github.com directly. `gh api --method POST` on the assets
+              # endpoint regressed to posting at api.github.com (which 404s asset writes); the
+              # upload host is the only documented write endpoint for release assets.
+              curl -sS -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$file" \
+                -o /dev/null -w '%{http_code}' \
+                "https://uploads.github.com/repos/$GH_REPO/releases/$RELEASE_ID/assets?name=$name" \
+                | grep -qx '201' || { echo "::error::asset upload failed for $name"; exit 1; }
               RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
             fi
             jq -e --arg n "$name" --arg sha "$expected_sha" --argjson size "$expected_size" --argjson rid "$RELEASE_ID" \
