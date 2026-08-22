@@ -61,6 +61,48 @@ enum VortXRemuxProducerLeadPolicy {
     }
 }
 
+/// Couples the PLAYER's steady-state forward-buffer appetite to the PRODUCER's byte ceiling
+/// (Beta 25 diag 6, 2026-08-22).
+///
+/// The two sides were tuned independently and never checked against each other. After the first rendered
+/// frame, `VortXRemuxForwardBufferPolicy.steadyStateSeconds` told AVPlayer to hold THIRTY seconds of media,
+/// while `maximumAheadBytes` (352 MiB) lets the producer keep only what fits one retained window share. On
+/// the Beta 25 field stream (~86.4 Mb/s, see `highThroughputProducerCannotConsumeTheRetainedWindowBudget`)
+/// that ceiling is ~34 s of media: after AVPlayer filled its own 30 s target, ONE more published segment
+/// (~6-12 s of media at 4K bitrates) crossed the byte cap and parked production. The playlist then froze
+/// until the playhead consumed a full segment, AVPlayer tipped into
+/// `AVPlayerWaitingToMinimizeStallsReason` on any jitter, and the stall watchdog remounted the whole remux -
+/// sixteen-plus times in one episode (diag 6, ~323 s of visible buffering).
+///
+/// The fix keeps the spool reservation algebra untouched (`maximumAheadBytes` stays exactly one window
+/// share, protecting the rewind floor) and instead sizes the player's ask to what production may legally
+/// supply: target = affordable seconds - one conservative EXT-X-TARGETDURATION of fetch/granularity margin,
+/// floored so an extreme-bitrate stream still gets a viable target rather than zero.
+enum VortXRemuxForwardBufferCoupling {
+    /// Fetch-latency + segment-granularity headroom demanded between the player target and the byte ceiling.
+    /// One conservative EXT-X-TARGETDURATION (12 s here): a parked-gap of up to one target must never reach
+    /// the playhead while AVPlayer still holds its full target.
+    static let safetySeconds: TimeInterval = 12
+    /// Floor for extreme bitrates, where even the ceiling affords little more than the margin itself. Well
+    /// above the 4 s startup floor, so the coupled target never drops below proven-startable territory.
+    static let minimumSteadyStateSeconds: TimeInterval = 8
+
+    /// Pure decision. Unknown bitrate or a non-positive budget fails OPEN to `unconstrainedDuration`
+    /// (today's behaviour), because a missing measurement must never shrink the player's buffer blindly.
+    static func steadyStateDuration(aheadByteBudget: Int,
+                                    observedBitsPerSecond: Double?,
+                                    unconstrainedDuration: TimeInterval) -> TimeInterval {
+        guard let bps = observedBitsPerSecond, bps > 0, bps.isFinite, aheadByteBudget > 0 else {
+            return unconstrainedDuration
+        }
+        let affordableSeconds = Double(aheadByteBudget) * 8 / bps
+        guard affordableSeconds.isFinite, affordableSeconds > 0 else { return unconstrainedDuration }
+        let capped = affordableSeconds - safetySeconds
+        guard capped < unconstrainedDuration else { return unconstrainedDuration }
+        return max(minimumSteadyStateSeconds, capped)
+    }
+}
+
 /// A single serialized frontier for producer-boundary and consumer-clock receipts.  It deliberately keeps
 /// only the not-yet-consumed byte ledger instead of repeatedly copying the complete HLS window.  Receipt
 /// ordering is monotonic: an old boundary or an old playhead can never reverse a newer gate decision.

@@ -342,18 +342,41 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
         if isRemuxMounted {
-            let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
+            let baseSteadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
                 mount: forwardBufferMount,
                 hasProducedFirstFrame: true)
+            // Beta 25 diag 6 coupling: on a local remux, AVPlayer's steady-state ask must stay under what
+            // the producer's byte ceiling can actually supply at the OBSERVED source bitrate. On an
+            // ~86-98 Mb/s DV remux the uncoupled 30 s target exceeded the ceiling's affordable seconds, so
+            // the producer parked right at the player's edge and the stall watchdog remounted every few
+            // minutes. Unknown/unsampled bitrate fails OPEN to the base duration.
+            let steadyDuration: TimeInterval
+            if forwardBufferMount == .localRemux, let server = remuxHLSServer {
+                let observedBps = server.observedSourceBitsPerSecond()
+                steadyDuration = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+                    aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                    observedBitsPerSecond: observedBps,
+                    unconstrainedDuration: baseSteadyDuration)
+                if steadyDuration != baseSteadyDuration {
+                    DiagnosticsLog.log(
+                        "dv",
+                        "forward-buffer coupled to producer byte budget base=\(String(format: "%.1f", baseSteadyDuration))s coupled=\(String(format: "%.1f", steadyDuration))s bps=\(observedBps.map { Int($0.rounded()) }.map(String.init) ?? "unknown") budget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes)")
+                }
+            } else {
+                steadyDuration = baseSteadyDuration
+            }
             if item?.preferredForwardBufferDuration != steadyDuration {
                 item?.preferredForwardBufferDuration = steadyDuration
             }
         }
         if let server = remuxHLSServer {
+            // Report the EFFECTIVE duration: the diag-6 coupling may have lowered it under the 30 s cap.
+            let effectiveSeconds = Int((item?.preferredForwardBufferDuration
+                ?? VortXRemuxForwardBufferPolicy.steadyStateSeconds).rounded())
             DiagnosticsLog.log(
                 "dv",
                 "startup phase=first-video-frame elapsedMs=\(server.startupElapsedMilliseconds) "
-                    + "forwardBufferSeconds=\(Int(VortXRemuxForwardBufferPolicy.steadyStateSeconds))")
+                    + "forwardBufferSeconds=\(effectiveSeconds)")
         } else if remuxRemoteMount != nil {
             DiagnosticsLog.log(
                 "engine",
