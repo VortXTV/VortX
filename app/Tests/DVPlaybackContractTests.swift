@@ -799,19 +799,19 @@ check("target authority: exact twelve is valid while malformed or over-twelve co
               adjacentIntervalsSeconds: [12.000_001])) == nil)
 let targetSevenReadiness = VortXHLSStartupReadiness(
     frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
-// The startup floor is a flat one-decodable-segment / six-second budget, decoupled from the frozen target: the
+// The startup floor is a flat one-decodable-segment / twelve-second budget, decoupled from the frozen target: the
 // 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
 // start watchdog and inflated the live window into the then-smaller session spool ceiling - the build 189
 // field regression, twice over.
-check("startup readiness: one independently decodable segment and six seconds are one immutable contract",
+check("startup readiness: one independently decodable segment and twelve seconds are one immutable contract",
       targetSevenReadiness == .init(
           frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex),
           minimumSegmentCount: 1))
-check("startup readiness: the startup floor is 6000 rendered milliseconds regardless of target",
-      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 6_000
+check("startup readiness: the startup floor is 12000 rendered milliseconds regardless of target",
+      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 12_000
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
-              .minimumRenderedDurationMilliseconds == 6_000)
+              .minimumRenderedDurationMilliseconds == 12_000)
 // The forward buffer starts at AVPlayer's readiness window; the publication floor deliberately sits ABOVE it
 // (readiness + 50%) so a startup cohort is never declined for want of a few milliseconds of media.
 check("startup forward buffer: local remux starts at the readiness window the publication floor exceeds",

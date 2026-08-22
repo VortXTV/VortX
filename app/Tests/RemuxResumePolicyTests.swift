@@ -589,21 +589,21 @@ check("wired: the resumed playlist carries the frozen conservative target durati
       frozenTarget.seconds == 12
         && resumedPlaylist.contains("#EXT-X-TARGETDURATION:12"))
 let readiness = VortXHLSStartupReadiness(frozenTarget: frozenTarget)
-// The startup floor is the flat one-decodable-segment / six-second budget (the 6-segment / 3x-target floor held every
-// UHD master past the chrome's 10s start watchdog in the field - the build 189 regression; four seconds sat
-// exactly on AVPlayer's readiness window and cost a declined-readiness reload), and resume must not change it.
+// The startup floor is the flat one-decodable-segment / twelve-second budget (the 6-segment / 3x-target floor held every
+// UHD master past the chrome's 10s start watchdog in the field - the build 189 regression; the earlier four-second
+// floor sat exactly on AVPlayer's readiness window and cost a declined-readiness reload), and resume must not change it.
 check("wired: startup readiness admission is unchanged by resume",
       readiness?.minimumSegmentCount == 1
-        && readiness?.minimumRenderedDurationMilliseconds == 6_000)
+        && readiness?.minimumRenderedDurationMilliseconds == 12_000)
 if let readiness {
     let pinned = DVPlaybackPolicy.pinnedStartupSnapshot(
         window: resumedWindow, ended: false,
         minimumSegmentCount: readiness.minimumSegmentCount,
         minimumRenderedDurationMilliseconds: readiness.minimumRenderedDurationMilliseconds)
-    // The build-189 readiness floor is one decodable segment AND a six-second rendered budget; two 4 s
+    // The build-189 readiness floor is one decodable segment AND a twelve-second rendered budget; three 4 s
     // segments are the minimal cohort that satisfies both, exactly as for a fresh mount.
     check("wired: the resumed window pins the same startup cohort as a fresh mount",
-          pinned?.window.segments.map(\.id) == [0, 1] && pinned?.ended == false)
+          pinned?.window.segments.map(\.id) == [0, 1, 2] && pinned?.ended == false)
 } else {
     check("wired: startup readiness must construct for the frozen conservative target", false)
 }
