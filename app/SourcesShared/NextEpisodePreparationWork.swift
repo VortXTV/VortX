@@ -225,7 +225,13 @@ enum NextEpisodePreparationBudget {
     static let addonConcurrencyLimit = 5
     static let addonFetchBudget: TimeInterval = 14
     static let minimumResolutionBudget: TimeInterval = 20
-    static let addonRequestTimeout: TimeInterval = 2
+    /// Per-add-on fetch budget for a NON-wanted source during preload/fallback settle (A3). Raised to 6s
+    /// (was 2s) so a stream-type debrid add-on has time to answer before the settlement window closes: its
+    /// measured tail is 9-12s, so a 2s budget routinely gave up before the source ever arrived, which is the
+    /// "wanted X, got Y" drift. Still well under the whole-batch `addonFetchBudget` (14s) and the shared
+    /// settle cap (`SourceSettlementPolicy.maximumWait`, 20s), and the remembered manual source keeps the
+    /// longer `stickyAddonRequestTimeout` (13s) instead.
+    static let addonRequestTimeout: TimeInterval = 6
     static let stickyAddonRequestTimeout: TimeInterval = 13
     static let providerRotationStride = addonConcurrencyLimit * 4
 

@@ -48,8 +48,9 @@ struct NextEpisodePreloadPolicy: Equatable {
     static let addonFetchBudget = NextEpisodePreparationBudget.addonFetchBudget
     static let minimumResolutionBudget = NextEpisodePreparationBudget.minimumResolutionBudget
     /// General per-request cap for a preload add-on fetch. The remembered manual source overrides this with
-    /// `stickyAddonRequestTimeout`; every OTHER add-on keeps this short 2s cap so one slow provider cannot
-    /// stall the concurrent window.
+    /// `stickyAddonRequestTimeout`; every OTHER add-on keeps this 6s cap (A3, raised from 2s) so a stream-type
+    /// debrid add-on has time to answer, while one slow provider cannot stall the concurrent window (the
+    /// batch is still bounded by the 14s `addonFetchBudget`).
     static let addonRequestTimeout = NextEpisodePreparationBudget.addonRequestTimeout
     /// Per-request cap for the WANTED (series-sticky) add-on only. The aggregator the viewer picked by hand
     /// (aiostreams/debridio) answers in the measured 9-12 second window. Thirteen seconds covers that tail
