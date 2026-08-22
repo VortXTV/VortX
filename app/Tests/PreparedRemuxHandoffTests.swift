@@ -22,6 +22,8 @@ struct PreparedRemuxHandoffTests {
         staleCleanupRunsOnce()
         mismatchedSourceIsRejected()
         currentPlaybackSurvivesProducerHandoff()
+        sameOwnerStaysAdmissibleAcrossSurfaceChange()
+        changedOwnerAbandonsOnSurfaceChange()
         skipBeforeReadyFallsBackCold()
         coordinatorReleaseWaitsForRealProducerUnwind()
         liveCoordinatorSerializesProducerCallbacks()
@@ -172,6 +174,36 @@ struct PreparedRemuxHandoffTests {
         expect(currentListenerServing,
                "producer handoff does not retire the current listener or retained credits spool")
         currentListenerServing = false
+    }
+
+    private static func sameOwnerStaysAdmissibleAcrossSurfaceChange() {
+        // Beta 26 C1, F7: an AV-to-mpv demote changes the render surface, not the TARGET episode's owner. A
+        // prepared next-episode transport therefore stays admissible (.configure) so the prewarm survives the
+        // engine swap instead of being thrashed and refetched from scratch.
+        let preparedOwner = owner(9)
+        expect(
+            VortXPreparedRemuxCallerPolicy.admission(
+                actualOwner: preparedOwner,
+                expectedOwner: preparedOwner,
+                avPlayerActive: true,
+                mountIsOnDevice: true
+            ) == .configure,
+            "same-owner prepared transport stays admissible across an engine surface change (prewarm survives demote)"
+        )
+    }
+
+    private static func changedOwnerAbandonsOnSurfaceChange() {
+        // The guardrails stay: a genuinely different episode owner must abandon the prepared transport even if
+        // the engine surface happened to change at the same time.
+        expect(
+            VortXPreparedRemuxCallerPolicy.admission(
+                actualOwner: owner(9),
+                expectedOwner: owner(10),
+                avPlayerActive: true,
+                mountIsOnDevice: true
+            ) == .abandonAndColdLoad,
+            "owner mismatch abandons the prepared transport regardless of the engine surface"
+        )
     }
 
     private static func skipBeforeReadyFallsBackCold() {

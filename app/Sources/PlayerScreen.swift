@@ -3524,9 +3524,9 @@ struct PlayerScreen: View {
         // Engine of origin for the `avDemotedAt` grace (W2-A item 3a; tvOS twin in TVPlayerView). Captured
         // BEFORE stop() clears the engine's active token: this is the exact load the grace exists to swallow.
         demotedEngineLoadToken = retiringAVPlayer.activeLoadToken
-        // Invalidation makes a prepared next-episode transport logically dead, but its producer can be queued
-        // behind the current one. Cancel it before the current producer emits its terminal receipt.
-        invalidatePreparedEpisode(reason: "AV-to-mpv handoff")
+        // The next-episode prep is scoped to the TARGET episode's owner identity, not the engine surface
+        // (Beta 26 C1, F7). An AV-to-mpv demote is a same-stream DV fallback, so the prewarmed next episode
+        // must survive it; `PreparedEpisodeRetentionPolicy` still rejects a genuinely stale prep by episode id.
         let quiescence = retiringAVPlayer.stopForMPVFallback()
         clearCachedAudioOutputTruth()
         // An engine-owned target is a newer explicit seek and is authoritative in BOTH directions. In
