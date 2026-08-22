@@ -1690,7 +1690,15 @@ extension DebridCoordinator {
         // Bound concurrency to <= 4 (and >= 1) so a group never hammers the provider with more than a handful
         // of parallel resolves; the losers are cancelled the moment one wins.
         let cap = Swift.min(Swift.max(max, 1), 4)
-        let racing = Array(cached.prefix(cap))
+        // GLOBAL RANK-SORT BEFORE THE TOP-4 RACE SLICE (Beta 26 A1). The caller's flattened candidate order is
+        // best-first for the label, but the race slice must be the globally best-resolution confirmed-cached
+        // candidates so a lower-tier source never displaces a higher-tier confirmed-cached one. Swift's sort is
+        // stable, so equal-resolution rows keep the caller's group/order; the label-authoritative gate below still
+        // refuses any winner below a confirmed-cached label.
+        let raceRanked = cached.sorted {
+            StreamRanking.resolutionRank($0) > StreamRanking.resolutionRank($1)
+        }
+        let racing = Array(raceRanked.prefix(cap))
 
         // LABEL-AUTHORITATIVE GATE. The Watch-Now label is composed from `labeledBest`; the played source must
         // not be a LOWER resolution than that promise. We can only hold the promise when the labeled best is
@@ -1714,6 +1722,17 @@ extension DebridCoordinator {
         func acceptable(_ s: CoreStream) -> Bool {
             guard bestConfirmedCached, let br = bestRank else { return true }
             return StreamRanking.resolutionRank(s) >= br
+        }
+
+        // INSTANT-URL SHORT-CIRCUIT (Beta 26 A1). When the labeled best is already a resolvable direct/debrid
+        // link (url != nil) it needs no add-then-download, so racing a batch of raw torrents only adds latency
+        // before presenting exactly what the button promised. `acceptable` accepts a candidate at its own tier,
+        // so the label itself always qualifies; single-resolve it and return before the race starts.
+        if let best = labeledBest, best.url != nil, acceptable(best) {
+            guard let ref = await resolvedPlaybackRef(for: best, episode: episode,
+                                                      confirmedCachedHashes: cachedHashes,
+                                                      confirmedUsenetURLs: cachedUsenetURLs) else { return nil }
+            return (ref, best)
         }
 
         // A single confirmed-cached candidate is just the existing single resolve (no group overhead). Still
