@@ -165,6 +165,10 @@ struct TVPlayerView: View {
     var debridRef: DebridPlaybackRef? = nil    // native-debrid provenance of the launching link, for CW reresolve of an expired link
     var initialSourceStream: CoreStream? = nil // exact launch row, including a raw torrent's proven fileIdx
     var initialEnginePlayerVideoId: String? = nil   // confirmed exact series binding from the presenter
+    /// Account-confirmed debrid-cache snapshot captured at launch, so the cached-advance / binge / failover
+    /// re-rank (`rankedCandidates` / `best` / `bestCachedResolution`) sees the same cache awareness the source
+    /// list ranked with (Beta 26 A2). Default empty keeps every other construction site compiling unchanged.
+    var debridCachedHashes: Set<String> = []
     /// True when the LAUNCH source was an explicit user choice (a tapped source-list row / quality pick),
     /// false for an auto-pick (Watch Now / a Continue-Watching resume). An explicit pick is HONORED on a
     /// start-timeout: retry the SAME source in place with a longer first-buffer grace rather than silently
@@ -3711,7 +3715,7 @@ struct TVPlayerView: View {
         // option that exists (the "picked/expected 4K, silently got 480p" report). Prefer candidates within
         // one tier of the best cached resolution; fall back to the unfiltered ranking only when the cap
         // leaves nothing untried, so a title whose only remaining sources are low-res still plays.
-        let cachedRes = StreamRanking.bestCachedResolution(remaining)
+        let cachedRes = StreamRanking.bestCachedResolution(remaining, debridCachedHashes: debridCachedHashes)
         if cachedRes > 0 {
             let floorStep = StreamRanking.resolutionTierStep(cachedRes) - 1
             let capped = remaining.map { group in
@@ -3721,13 +3725,15 @@ struct TVPlayerView: View {
             }
             if let hit = StreamRanking.best(capped, continuity: curHint, binge: curBinge, pin: sourcePin,
                                             sticky: seriesSticky,
-                                            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }) {
+                                            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
+                                            debridCachedHashes: debridCachedHashes) {
                 return hit
             }
         }
         return StreamRanking.best(remaining, continuity: curHint, binge: curBinge, pin: sourcePin,
                                   sticky: seriesSticky,
-                                  providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) })
+                                  providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
+                                  debridCachedHashes: debridCachedHashes)
     }
 
     /// The playing source is dead (its retry, stall, or warm-up budget ran out): mark it
@@ -7246,7 +7252,8 @@ struct TVPlayerView: View {
                     let candidates = StreamRanking.rankedCandidates(
                         groups, continuity: curHint, binge: curBinge, pin: sourcePin,
                         sticky: seriesSticky, stickyAuthoritative: false,
-                        providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
+                        providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
+                        debridCachedHashes: debridCachedHashes
                     )
                     let hint = episodeHint(for: newMeta)
                     var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?
@@ -7602,6 +7609,7 @@ struct TVPlayerView: View {
                 bingeGroup: binge,
                 pin: pin,
                 sticky: sticky,
+                debridCachedHashes: debridCachedHashes,
                 attemptDeadline: attempt.deadline
             )
             guard !Task.isCancelled else { return }
@@ -7767,32 +7775,24 @@ struct TVPlayerView: View {
         bingeGroup: String?,
         pin: ResolvedPin?,
         sticky: (addon: String?, bingeGroup: String?)?,
+        debridCachedHashes: Set<String>,
         attemptDeadline: TimeInterval
     ) async -> PreloadResolution? {
         guard !Task.isCancelled else { return nil }
 
         let allStreams = groups.flatMap(\.streams)
-        // `sticky` is the source the viewer chose BY HAND for this show and `providerPenalty` demotes an add-on
-        // that just failed. Both are what stop the preload drifting to whichever provider answers fastest -
-        // the drift the "wanted binge=X got=Y" line has been reporting. Preload of the NEXT episode is an
-        // ADVANCE, so sticky is SOFT here exactly as in `play(episode:)`: it yields to a materially better
-        // tier/cache and otherwise holds among near-identical releases (diag-21). The two MUST match so the
-        // preload cannot warm a different source than the advance would then pick.
-        let candidates = StreamRanking.rankedCandidates(
-            groups,
-            continuity: continuityHint,
-            binge: bingeGroup,
-            pin: pin,
-            sticky: sticky, stickyAuthoritative: false,
-            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
-        )
+        // Snapshot the cache status BEFORE ranking (Beta 26 A2): the old code derived the hash set from the
+        // already-rank-sliced `candidates`, so ranking ran cache-blind and the preload could warm a different
+        // provider than the on-screen list would pick (diag-21 / "wanted binge=X got=Y"). Query the whole
+        // episode-scoped raw-torrent set here, then feed the confirmed-cached set into rankedCandidates so a
+        // cached source gets its +8000 and wins before the settle window closes.
         let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
             season: season,
             episode: episodeNumber
         ).map { DebridEpisode(season: $0.season, episode: $0.episode) }
-        let hashes = Set(candidates.compactMap { candidate -> String? in
-            guard candidate.isTorrent else { return nil }
-            return candidate.infoHash?.lowercased()
+        let hashes = Set(allStreams.compactMap { s -> String? in
+            guard s.isTorrent, s.url == nil else { return nil }
+            return s.infoHash?.lowercased()
         })
         guard !Task.isCancelled else { return nil }
         let cacheResults: DebridCacheCheckResult? = await Self.valueBeforePreloadDeadline(
@@ -7809,11 +7809,33 @@ struct TVPlayerView: View {
         }
         guard !Task.isCancelled else { return nil }
 
+        // Union the account-level snapshot the source list ranked with: it may know a hash this episode-scoped
+        // cacheCheck did not reach before the deadline, so the preload does not fall cache-blind when its own
+        // check came back empty (Beta 26 A2). The account set only ever contains confirmed-cached hashes, so
+        // the union is a strict superset of what the launch path already trusted.
+        let effectiveCachedHashes = cachedHashes.union(debridCachedHashes)
+
+        // `sticky` is the source the viewer chose BY HAND for this show and `providerPenalty` demotes an add-on
+        // that just failed. Both are what stop the preload drifting to whichever provider answers fastest -
+        // the drift the "wanted binge=X got=Y" line has been reporting. Preload of the NEXT episode is an
+        // ADVANCE, so sticky is SOFT here exactly as in `play(episode:)`: it yields to a materially better
+        // tier/cache and otherwise holds among near-identical releases (diag-21). The two MUST match so the
+        // preload cannot warm a different source than the advance would then pick.
+        let candidates = StreamRanking.rankedCandidates(
+            groups,
+            continuity: continuityHint,
+            binge: bingeGroup,
+            pin: pin,
+            sticky: sticky, stickyAuthoritative: false,
+            providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
+            debridCachedHashes: effectiveCachedHashes
+        )
+
         for candidate in candidates {
             guard !Task.isCancelled else { return nil }
             let ref: DebridPlaybackRef?
             let hash = candidate.infoHash?.lowercased()
-            let canResolveCached = episode != nil && hash.map(cachedHashes.contains) == true
+            let canResolveCached = episode != nil && hash.map(effectiveCachedHashes.contains) == true
             if candidate.url == nil, !canResolveCached {
                 ref = nil
             } else {
@@ -7823,7 +7845,7 @@ struct TVPlayerView: View {
                     await DebridCoordinator.shared.resolvedPlaybackRef(
                         for: candidate,
                         episode: episode,
-                        confirmedCachedHashes: cachedHashes
+                        confirmedCachedHashes: effectiveCachedHashes
                     )
                 } ?? nil
                 guard !Task.isCancelled else { return nil }

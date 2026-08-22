@@ -3586,7 +3586,8 @@ struct CoreStreamList: View {
                                                     debridRef: ref, sourceStream: resumeSource,
                                                     enginePlayerVideoId: engineVideoID,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
-                                                    startAtSeconds: admittedStart.seconds)
+                                                    startAtSeconds: admittedStart.seconds,
+                                                    debridCachedHashes: debridCache.cachedHashes)
                 return
             }
         }
@@ -3616,7 +3617,8 @@ struct CoreStreamList: View {
                                                 headers: win.stream.requestHeaders, debridRef: win.ref,
                                                 sourceStream: win.stream,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
-                                                startAtSeconds: admittedStart.seconds)
+                                                startAtSeconds: admittedStart.seconds,
+                                                debridCachedHashes: debridCache.cachedHashes)
             return
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
@@ -3678,7 +3680,8 @@ struct CoreStreamList: View {
                                                 sourceStream: stream,
                                                 enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
                                                 startFromZero: fromStart,
-                                                startAtSeconds: admittedStart.seconds)
+                                                startAtSeconds: admittedStart.seconds,
+                                                debridCachedHashes: debridCache.cachedHashes)
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3702,7 +3705,8 @@ struct CoreStreamList: View {
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
-                                            startAtSeconds: admittedStart.seconds)
+                                            startAtSeconds: admittedStart.seconds,
+                                            debridCachedHashes: debridCache.cachedHashes)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

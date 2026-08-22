@@ -40,6 +40,10 @@ struct PlaybackRequest: Identifiable {
     var debridRef: DebridPlaybackRef? = nil
     /// Exact source row that produced the URL, retained for raw-torrent selector provenance.
     var sourceStream: CoreStream? = nil
+    /// Account-confirmed debrid-cache snapshot captured at launch, so the player's cached-advance / binge /
+    /// failover re-rank (`rankedCandidates` / `best` / `bestCachedResolution`) sees the same cache awareness
+    /// the source list ranked with (Beta 26 A2). Default empty keeps every existing request site compiling.
+    var debridCachedHashes: Set<String> = []
     /// Exact series engine identity confirmed by the launch path. nil keeps engine writes closed.
     var enginePlayerVideoId: String? = nil
     /// yt-direct adaptive pair (trailers / pasted YouTube links): the separate AUDIO stream mpv mounts
@@ -151,6 +155,7 @@ struct RootView: View {
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              initialSourceStream: req.sourceStream,
                              initialEnginePlayerVideoId: req.enginePlayerVideoId,
+                             debridCachedHashes: req.debridCachedHashes,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
                              startFromZero: req.startFromZero, startAtSeconds: req.startAtSeconds,
                              onPlaybackIdentityCommitted: {
