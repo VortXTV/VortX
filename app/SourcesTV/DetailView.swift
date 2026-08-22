@@ -2691,16 +2691,20 @@ struct CoreStreamList: View {
                     // took ~26 s, and gating this button on `sourceList.isSettled` left the page's ONLY
                     // primary action a passive status view for that whole gap. The real button now appears
                     // as soon as a ranked candidate exists; while ranking continues, a compact secondary
-                    // indicator beside it shows the progress. The pressed candidate is frozen (playBest's
-                    // exact-source path), and the UNATTENDED auto-pick keeps its own isSettled deadline
-                    // below, so early manual play cannot race the complete-set guarantee.
+                    // indicator beside it shows the progress. The pressed candidate is frozen by
+                    // `playBest`'s generation guard, and the UNATTENDED auto-pick keeps its own isSettled
+                    // deadline below, so early manual play cannot race the complete-set guarantee.
                     HStack(spacing: Theme.Space.sm) {
                         Button { playBest(best, in: groups) } label: {
-                            // watchLabel derives from the EXACT stream this button plays, so it
-                            // can never promise a quality it doesn't deliver. A saved resume position
-                            // turns the lead-in into "Resume · 1:03" (playback already seeks there).
-                            let lead = resumeSeconds.flatMap(resumeTimecode).map { "\(String(localized: "Resume"))  ·  \($0)  ·  " } ?? String(localized: "Watch in ")
-                            Label { Text(verbatim: "\(lead)\(StreamRanking.watchLabel(best))") } icon: { Image(systemName: "play.fill") }
+                            // Branch-review finding 5: `playBest` keeps the parallel CACHED-source race
+                            // (it exists to avoid serial debrid timeouts), so the committed source can be
+                            // a cached winner rather than this displayed candidate. The button therefore
+                            // makes NO source promise - generic "Watch"/"Resume · 1:03" only; naming a
+                            // specific quality here would let the press deliver something else.
+                            let lead = resumeSeconds.flatMap(resumeTimecode).map { timecode in
+                                String(localized: "Resume") + "  ·  " + timecode
+                            } ?? String(localized: "Watch")
+                            Label { Text(verbatim: lead) } icon: { Image(systemName: "play.fill") }
                         }
                         .buttonStyle(PrimaryActionStyle())
                         .focused($watchFocused)   // FIX H: target of the page's default focus

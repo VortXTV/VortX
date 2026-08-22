@@ -84539,6 +84539,16 @@
         }
       }
     },
+    "Still ranking %lld/%lld": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Still ranking %lld/%lld"
+          }
+        }
+      }
+    },
     "Still finding more · %@/%@ add-ons": {
       "localizations": {
         "en": {
@@ -101827,6 +101837,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Fudumele"
+          }
+        }
+      }
+    },
+    "Watch": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Watch"
+          }
+        }
+      }
+    },
+    "Resume": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "new",
+            "value": "Resume"
           }
         }
       }
