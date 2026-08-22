@@ -101,6 +101,76 @@ enum VortXRemuxForwardBufferCoupling {
         guard capped < unconstrainedDuration else { return unconstrainedDuration }
         return max(minimumSteadyStateSeconds, capped)
     }
+
+    // MARK: Generation-owned retry (branch review finding 2)
+
+    /// The first rendered frame can beat the remux server's minimum sampling window (10 s of produced
+    /// media), and the HLS `signaling.bandwidth` may not be parsed yet either. A ONE-SHOT coupling at the
+    /// first-frame latch therefore missed permanently on fast starts and left the uncoupled 30 s ask in
+    /// place for the whole item. These constants bound the retry schedule that follows the latch instead.
+    static let maximumSampleAttempts = 5
+    static let sampleRetryIntervalSeconds: TimeInterval = 2
+
+    /// Coupling ownership for exactly one player-item generation. A replaced mount/item resets the attempt
+    /// budget and the estimate; stale callbacks from the old generation can never retune the new item.
+    /// `finished` latches the end of the schedule so steady-state ticks pay nothing.
+    struct AttemptState: Equatable {
+        let generation: UInt64
+        var attemptsUsed: Int
+        var bestBitsPerSecond: Double?
+        var finished: Bool = false
+
+        init(generation: UInt64 = 0, attemptsUsed: Int = 0, bestBitsPerSecond: Double? = nil) {
+            self.generation = generation
+            self.attemptsUsed = attemptsUsed
+            self.bestBitsPerSecond = bestBitsPerSecond
+        }
+    }
+
+    /// Monotonic estimate merge. An EARLY low sample must never pull the estimate down for a stream whose
+    /// later segments are materially larger (variable-bitrate sources), so the best-known value only ever
+    /// rises within one generation. The authoritative declared bandwidth participates on equal terms.
+    static func effectiveEstimate(observed: Double?, indicated: Double?, best: Double?) -> Double? {
+        [observed, indicated, best]
+            .compactMap { $0 }
+            .filter { $0.isFinite && $0 > 0 }
+            .max()
+    }
+
+    /// One step of the bounded retry. Returns the duration to apply NOW (nil = leave the item alone this
+    /// tick) and whether the schedule has finished for this generation. Fails OPEN: exhausting the attempts
+    /// without any usable estimate leaves today's base duration untouched.
+    static func nextCouplingAttempt(state: AttemptState,
+                                    currentGeneration: UInt64,
+                                    observedBitsPerSecond: Double?,
+                                    indicatedBitsPerSecond: Double?,
+                                    aheadByteBudget: Int,
+                                    baseDuration: TimeInterval)
+        -> (state: AttemptState, applyDuration: TimeInterval?, finished: Bool) {
+        var next = state.generation == currentGeneration
+            ? state
+            : AttemptState(generation: currentGeneration)
+        if next.finished { return (next, nil, true) }
+        let merged = effectiveEstimate(
+            observed: observedBitsPerSecond,
+            indicated: indicatedBitsPerSecond,
+            best: next.bestBitsPerSecond)
+        if let bps = merged {
+            next.bestBitsPerSecond = bps
+            next.finished = true
+            let duration = steadyStateDuration(
+                aheadByteBudget: aheadByteBudget,
+                observedBitsPerSecond: bps,
+                unconstrainedDuration: baseDuration)
+            return (next, duration, true)
+        }
+        if next.attemptsUsed + 1 >= maximumSampleAttempts {
+            next.finished = true
+            return (next, nil, true)
+        }
+        next.attemptsUsed += 1
+        return (next, nil, false)
+    }
 }
 
 /// A single serialized frontier for producer-boundary and consumer-clock receipts.  It deliberately keeps

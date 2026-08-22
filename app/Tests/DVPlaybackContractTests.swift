@@ -175,17 +175,13 @@ private struct StartupWiringRule {
             exactSection: """
             videoFrameEverProduced = true
             if isRemuxMounted {
-                let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
-                    mount: forwardBufferMount,
-                    hasProducedFirstFrame: true)
-                if item?.preferredForwardBufferDuration != steadyDuration {
-                    item?.preferredForwardBufferDuration = steadyDuration
-                }
+                applyForwardBufferCouplingIfDue()
             }
             """,
-            mutationTarget: "if item?.preferredForwardBufferDuration != steadyDuration {",
-            mutationReplacement:
-                "if false && item?.preferredForwardBufferDuration != steadyDuration {"),
+            mutationTarget: "applyForwardBufferCouplingIfDue()",
+            mutationReplacement: "_ = isRemuxMounted",
+            secondaryMutationTarget: "if isRemuxMounted {",
+            secondaryMutationReplacement: "if false && isRemuxMounted {"),
         StartupWiringRule(
             name: "HDR replacement forward-buffer restore", usesServer: false,
             start: "freshItem.preferredForwardBufferDuration =",
@@ -256,10 +252,10 @@ private struct StartupWiringRule {
             mutationReplacement: "mount: .direct"),
         StartupWiringRule(
             name: "cohort successor publication", usesServer: true,
-            start: "if !engineReady,\n           consumptionAnchored,",
+            start: "if !isEngineReady,\n           consumptionAnchored,",
             end: "let ids = selectedVideo.segments.map(\\.id)",
             exactSection: """
-            if !engineReady,
+            if !isEngineReady,
                consumptionAnchored,
                highestServedVideoSegmentID < 0,
                !ended,

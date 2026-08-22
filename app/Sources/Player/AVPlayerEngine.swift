@@ -337,37 +337,50 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
     }
 
+    /// Diag-6 coupling ownership state, keyed by `itemGeneration` (branch review finding 2). The first frame
+    /// can render before the server has its 10 s bitrate sample and before `signaling.bandwidth` is parsed,
+    /// so the coupling RETRIES on the periodic observer instead of latching once; a replaced item resets the
+    /// schedule because the stored generation no longer matches.
+    private var forwardBufferCouplingState = VortXRemuxForwardBufferCoupling.AttemptState()
+
+    /// Applies (or retries) the producer-budget coupling for the CURRENT local-remux item. Only meaningful
+    /// after the first frame: before it, the item must keep the proven-startable startup floor.
+    private func applyForwardBufferCouplingIfDue() {
+        guard videoFrameEverProduced,
+              isRemuxMounted,
+              forwardBufferMount == .localRemux,
+              let server = remuxHLSServer else { return }
+        let decision = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: forwardBufferCouplingState,
+            currentGeneration: itemGeneration,
+            observedBitsPerSecond: server.observedSourceBitsPerSecond(),
+            indicatedBitsPerSecond: (server.signaling?.bandwidth).map(Double.init),
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+            baseDuration: VortXRemuxForwardBufferPolicy.preferredDuration(
+                mount: .localRemux,
+                hasProducedFirstFrame: true))
+        forwardBufferCouplingState = decision.state
+        guard decision.finished else { return }
+        if let steadyDuration = decision.applyDuration {
+            if item?.preferredForwardBufferDuration != steadyDuration {
+                item?.preferredForwardBufferDuration = steadyDuration
+            }
+            DiagnosticsLog.log(
+                "dv",
+                "forward-buffer coupled to producer byte budget coupled=\(String(format: "%.1f", steadyDuration))s bps=\(decision.state.bestBitsPerSecond.map { Int($0.rounded()) }.map(String.init) ?? "unknown") budget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) generation=\(itemGeneration)")
+        } else {
+            DiagnosticsLog.log(
+                "dv",
+                "forward-buffer coupling gave up without an estimate after \(decision.state.attemptsUsed) attempts base=\(String(format: "%.1f", VortXRemuxForwardBufferPolicy.steadyStateSeconds))s generation=\(itemGeneration)")
+        }
+    }
+
     private func latchPlayableVideoFrame(atClock seconds: Double) -> Bool {
         if videoFrameEverProduced { return true }
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
         if isRemuxMounted {
-            let baseSteadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
-                mount: forwardBufferMount,
-                hasProducedFirstFrame: true)
-            // Beta 25 diag 6 coupling: on a local remux, AVPlayer's steady-state ask must stay under what
-            // the producer's byte ceiling can actually supply at the OBSERVED source bitrate. On an
-            // ~86-98 Mb/s DV remux the uncoupled 30 s target exceeded the ceiling's affordable seconds, so
-            // the producer parked right at the player's edge and the stall watchdog remounted every few
-            // minutes. Unknown/unsampled bitrate fails OPEN to the base duration.
-            let steadyDuration: TimeInterval
-            if forwardBufferMount == .localRemux, let server = remuxHLSServer {
-                let observedBps = server.observedSourceBitsPerSecond()
-                steadyDuration = VortXRemuxForwardBufferCoupling.steadyStateDuration(
-                    aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
-                    observedBitsPerSecond: observedBps,
-                    unconstrainedDuration: baseSteadyDuration)
-                if steadyDuration != baseSteadyDuration {
-                    DiagnosticsLog.log(
-                        "dv",
-                        "forward-buffer coupled to producer byte budget base=\(String(format: "%.1f", baseSteadyDuration))s coupled=\(String(format: "%.1f", steadyDuration))s bps=\(observedBps.map { Int($0.rounded()) }.map(String.init) ?? "unknown") budget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes)")
-                }
-            } else {
-                steadyDuration = baseSteadyDuration
-            }
-            if item?.preferredForwardBufferDuration != steadyDuration {
-                item?.preferredForwardBufferDuration = steadyDuration
-            }
+            applyForwardBufferCouplingIfDue()
         }
         if let server = remuxHLSServer {
             // Report the EFFECTIVE duration: the diag-6 coupling may have lowered it under the 30 s cap.
@@ -3047,6 +3060,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
                 let clock = ProcessInfo.processInfo.systemUptime
                 self.pinPreferredPeakBitRateAfterFirstFrame(item, atClock: time.seconds)
+                // Diag-6 coupling retry (branch review finding 2): the first frame can beat the server's
+                // bitrate sample, so keep the bounded retry schedule ticking here until it lands or gives
+                // up. The call is a no-op once finished, and the generation check inside discards stale
+                // schedules after a remount.
+                self.applyForwardBufferCouplingIfDue()
                 // AUDIO-OVER-BLACK probe (native DV lane only). Two boolean guards once latched/off-route,
                 // so the non-DV steady state pays nothing (see checkAudioOverBlackWatchdog).
                 self.checkAudioOverBlackWatchdog(clock: clock, position: time.seconds)

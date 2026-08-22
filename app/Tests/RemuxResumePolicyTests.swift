@@ -600,8 +600,10 @@ if let readiness {
         window: resumedWindow, ended: false,
         minimumSegmentCount: readiness.minimumSegmentCount,
         minimumRenderedDurationMilliseconds: readiness.minimumRenderedDurationMilliseconds)
+    // The build-189 readiness floor is one decodable segment AND a six-second rendered budget; two 4 s
+    // segments are the minimal cohort that satisfies both, exactly as for a fresh mount.
     check("wired: the resumed window pins the same startup cohort as a fresh mount",
-          pinned?.window.segments.map(\.id) == [0] && pinned?.ended == false)
+          pinned?.window.segments.map(\.id) == [0, 1] && pinned?.ended == false)
 } else {
     check("wired: startup readiness must construct for the frozen conservative target", false)
 }

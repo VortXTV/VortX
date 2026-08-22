@@ -276,56 +276,82 @@ enum VortXRemuxProducerLeadPolicyTests {
         }
     }
 
-    /// Deterministic replay of the diag-6 failure loop: the player holds exactly its target and consumes at
-    /// 1x while the producer publishes 6-second segments until the byte cap parks it. The starvation
-    /// precondition is SLACK: while parked, the gap between the produced lead and the player's held buffer.
-    /// With the OLD uncoupled 30 s target the deepest parked point leaves less than one segment of slack, so
-    /// a single parked cycle (resume needs a full segment consumed) reaches the player's edge. The coupled
-    /// target keeps more than a full segment of slack even at the deepest parked point.
+    /// State-machine replay of the diag-6 loop (branch review finding 3: the configured target must CHANGE
+    /// behaviour, not just a subtraction). Modelled per one-second tick:
+    ///   - Producer publishes one 6-second segment when the gate allows, else stays parked.
+    ///   - Gate park/resume goes through the REAL `shouldPauseProducer` decision (byte cap + lead).
+    ///   - AVPlayer initiates whole-segment fetches only while its held buffer is UNDER its configured
+    ///     target, but an in-flight segment carries it PAST the preference (documented AVPlayer behaviour:
+    ///     preferredForwardBufferDuration gates initiation, not completion); it can never hold more than
+    ///     the produced lead.
+    ///   - Playhead consumption drains both the retained lead and the held buffer at 1x.
+    /// A stall fires when a PARKED playlist lets the player converge onto the frozen live edge
+    /// (held >= produced lead): AVPlayer has requested everything published and any jitter reaches it.
+    /// With the uncoupled 30 s target the target-gated fetch plus one-segment overshoot lands the held
+    /// buffer exactly on the parked live edge (reproducing diag 6); with the coupled target the same
+    /// machine keeps a multi-second cushion.
     static func fieldLoopSimulationOldTargetStarvesNewTargetDoesNot() {
         let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
         let bytesPerSecond = fieldBitsPerSecond / 8
         let segmentSeconds = 6.0
         let segmentBytes = Int(bytesPerSecond * segmentSeconds)
 
-        func simulate(playerTargetSeconds: Double) -> Double {
-            var producedAheadBytes = 0
-            var producedAheadSeconds = 0.0   // un-consumed produced media == AVPlayer's held buffer here
+        func simulate(playerTargetSeconds: Double) -> Int {
+            var leadSeconds = 0.0        // retained, unconsumed produced media
+            var leadBytes = 0            // retained, unconsumed produced bytes
+            var unfetchedSegments = 0.0  // published but not yet pulled by AVPlayer
+            var heldSeconds = 0.0        // AVPlayer's forward buffer
             var paused = false
-            var minParkedSlack = Double.greatestFiniteMagnitude
+            var stalls = 0
+            var stalled = false
             // 90 simulated minutes at one-second ticks.
             for _ in 0..<5400 {
-                // Player consumes one second per tick out of its held buffer.
-                producedAheadBytes = max(0, producedAheadBytes - Int(bytesPerSecond))
-                producedAheadSeconds = max(0, producedAheadSeconds - 1)
-                // Producer publishes one segment when running.
+                // 1x consumption drains the playhead-facing edges.
+                leadSeconds = max(0, leadSeconds - 1)
+                leadBytes = max(0, leadBytes - Int(bytesPerSecond))
+                heldSeconds = max(0, heldSeconds - 1)
+                // Producer side.
                 if !paused {
-                    producedAheadBytes += segmentBytes
-                    producedAheadSeconds += segmentSeconds
+                    leadSeconds += segmentSeconds
+                    leadBytes += segmentBytes
+                    unfetchedSegments += 1
                 }
                 paused = VortXRemuxProducerLeadPolicy.shouldPauseProducer(
-                    leadSeconds: producedAheadSeconds,
-                    aheadBytes: producedAheadBytes,
+                    leadSeconds: leadSeconds,
+                    aheadBytes: leadBytes,
                     currentlyPaused: paused)
+                // Player side: initiation is gated on the configured target; completion may overshoot it
+                // by the in-flight segment, bounded by what the producer has actually published.
+                if heldSeconds < playerTargetSeconds, unfetchedSegments >= 1 {
+                    unfetchedSegments -= 1
+                    heldSeconds = min(leadSeconds, heldSeconds + segmentSeconds)
+                }
+                // Stall: parked playlist AND the player caught the frozen live edge.
                 if paused {
-                    minParkedSlack = min(minParkedSlack,
-                                         producedAheadSeconds - playerTargetSeconds)
+                    if heldSeconds >= leadSeconds - 0.001 {
+                        if !stalled { stalls += 1 }
+                        stalled = true
+                    } else {
+                        stalled = false
+                    }
+                } else {
+                    stalled = false
                 }
             }
-            return minParkedSlack
+            return stalls
         }
 
-        let oldSlack = simulate(playerTargetSeconds: 30)
-        check("OLD uncoupled 30 s target: deepest parked point leaves under one segment of slack (reproduces diag 6)",
-              oldSlack < segmentSeconds)
+        let oldStalls = simulate(playerTargetSeconds: 30)
+        check("OLD uncoupled 30 s target: the player converges onto the parked live edge (reproduces diag 6)",
+              oldStalls > 0)
 
         let newTarget = VortXRemuxForwardBufferCoupling.steadyStateDuration(
             aheadByteBudget: budget,
             observedBitsPerSecond: fieldBitsPerSecond,
             unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
-        let coupledSlack = simulate(playerTargetSeconds: newTarget)
-        check("COUPLED target: deepest parked point keeps at least one full segment of slack",
-              coupledSlack >= segmentSeconds)
+        let coupledStalls = simulate(playerTargetSeconds: newTarget)
+        check("COUPLED target: the player always keeps a cushion under the parked live edge",
+              coupledStalls == 0)
     }
 }
 
