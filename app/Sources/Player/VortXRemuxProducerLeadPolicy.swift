@@ -31,6 +31,16 @@ enum VortXRemuxProducerLeadPolicy {
     /// every publication cycle as ordinary segment-duration jitter crosses back and forth over a single value.
     static let resumeBelowSeconds: Double = 60
 
+    /// Fraction of the byte ceiling the producer must drain back to before a byte-cap park may lift. Mirrors
+    /// the time-leg hysteresis gap (`resumeBelowSeconds` vs `pauseAheadSeconds`) on the byte leg: without it, a
+    /// pause the byte cap forced with only a hair of margin insta-resumed one byte under the ceiling and
+    /// re-parked production on the next published segment (Beta 26 F3 aheadBytes sawtooth around
+    /// `retainedWindowMaximumBytes`).
+    static let byteResumeFraction: Double = 0.85
+
+    /// Absolute byte resume line: `maximumAheadBytes` scaled by `byteResumeFraction`.
+    static let byteResumeThreshold = Int(Double(maximumAheadBytes) * byteResumeFraction)
+
     /// Window publication policy is orthogonal to producer safety. In particular, the anchor-off rollback
     /// keeps a startup window pinned but must still apply the same local producer bound; only a hosted retaining
     /// mount and true EOF are exempt.
@@ -55,7 +65,12 @@ enum VortXRemuxProducerLeadPolicy {
         if currentlyPaused {
             // "resume below 60s" (report section 6): resume ONLY once strictly under the resume line, so a
             // lead sitting exactly on it stays paused rather than flapping.
-            return !(leadSeconds < resumeBelowSeconds && !overByteBudget)
+            // A byte-cap park additionally demands a real down-drain below `byteResumeThreshold`: an unknown
+            // byte count fails OPEN (nil resumes), but a measured count that is only a hair under the ceiling
+            // stays paused, otherwise one published segment right after resuming re-crossed the cap and
+            // re-parked production on the next segment (Beta 26 F3 sawtooth).
+            let underByteResume = aheadBytes.map { $0 < byteResumeThreshold } ?? true
+            return !(leadSeconds < resumeBelowSeconds && underByteResume)
         }
         return leadSeconds >= pauseAheadSeconds || overByteBudget
     }

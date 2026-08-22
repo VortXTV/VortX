@@ -44,6 +44,9 @@ enum VortXRemuxProducerLeadPolicyTests {
         resumesOnlyOnceBelowTheResumeThreshold()
         nonFiniteLeadFailsClosedToCurrentState()
         boundaryConstantsHaveARealHysteresisGap()
+        byteHysteresisHasARealGap()
+        byteCapParkResumeRequiresMaterialDrain()
+        byteCapParksRegardlessOfLeadWhenAtCeiling()
         gateStartsUnpausedAndTracksSetPaused()
         gateSetPausedIsIdempotent()
         gateCancelForcesUnpausedAndSticks()
@@ -110,6 +113,41 @@ enum VortXRemuxProducerLeadPolicyTests {
               VortXRemuxProducerLeadPolicy.pauseAheadSeconds == 90)
         check("resume threshold is exactly 60s per the recovery policy",
               VortXRemuxProducerLeadPolicy.resumeBelowSeconds == 60)
+    }
+
+    static func byteHysteresisHasARealGap() {
+        check("byte resume line is strictly below the ceiling (no every-segment oscillation on the byte leg)",
+              VortXRemuxProducerLeadPolicy.byteResumeThreshold < VortXRemuxProducerLeadPolicy.maximumAheadBytes)
+        check("byte resume fraction is a real drain, not a symbolic constant",
+              VortXRemuxProducerLeadPolicy.byteResumeFraction > 0
+                && VortXRemuxProducerLeadPolicy.byteResumeFraction < 1)
+    }
+
+    static func byteCapParkResumeRequiresMaterialDrain() {
+        let ceiling = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        let resumeLine = VortXRemuxProducerLeadPolicy.byteResumeThreshold
+        // Parked because the byte cap fired with only a hair of margin: even once the TIME leg is satisfied
+        // (lead well under 60s) the byte leg must actually have drained below the resume line. One byte under
+        // the ceiling is NOT enough; this is the F3 sawtooth if it were.
+        check("byte-cap park stays paused at ceiling-1 even when the time leg is satisfied",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: ceiling - 1, currentlyPaused: true))
+        check("byte-cap park stays paused at the resume line (resume is STRICTLY below)",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: resumeLine, currentlyPaused: true))
+        check("byte-cap park resumes once the byte leg has drained below the resume line",
+              !VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: resumeLine - 1, currentlyPaused: true))
+        check("byte-cap park resumes once the byte leg is fully drained",
+              !VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: 0, currentlyPaused: true))
+    }
+
+    static func byteCapParksRegardlessOfLeadWhenAtCeiling() {
+        check("at the ceiling, even a tiny lead force-parks (byte reservation is a hard floor)",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 10, aheadBytes: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                currentlyPaused: false))
     }
 
     static func gateStartsUnpausedAndTracksSetPaused() {
