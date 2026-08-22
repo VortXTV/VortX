@@ -19,6 +19,16 @@
       "versions": [
         {
           "version": "0.3.14",
+          "buildVersion": "227",
+          "date": "2026-08-22",
+          "localizedDescription": "# VortX 0.3.14 Beta 25 (build 227) Apple-only reliability release. It publishes the playback and Apple TV fixes prepared for Beta 19 (which was never made public) plus the source-picker, localization, and subtitle-hardening fixes. Android remains absent. ## What's new **Playback reliability (from the Beta 19 work).** Fixes the AVPlayer/libmpv/remux ownership races, the producer-lead stalls on Dolby Vision and high-bitrate 4K, the \"source failed\" fallback loops on TorBox/AIOStreams/AllDebrid, the repeating stall-and-jump pattern when Dolby Vision or MKV remux is on, and the duplicate subtitle flash. Apple TV, iPhone, iPad, and Mac. **Two-row Apple TV detail actions.** The detail page actions are now two semantic rows with single-line labels, a stable Library focus anchor, and predictable upward focus back to the title and menu bar, fixing the wrapped-button and focus-trap defects. Apple TV (full and Lite). **Audio-language filter in the source picker.** A new Audio control next to Quality filters and re-ranks the source list by audio language, session-scoped only, without changing your saved preference. Apple TV, iPhone, iPad, and Mac. **French catalog titles.** Home and Discover rows now translate catalog titles as whole phrases instead of word by word, so Popular Shows reads Séries populaires rather than Populaires émissions, and Featured Movies reads Films à la une. French. **External subtitles use the hardened transport on every player.** The built-in player's subtitle download now resolves the host once and connects only to the exact vetted address, with size limits and no redirects, matching the other player. Apple TV, iPhone, iPad, and Mac. **AltStore and SideStore updates propagate reliably.** Release promotion is transactional end to end, so build 227 should appear in the VortX source automatically. Apple TV, iPhone, iPad. ## Please test - Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play. - With Dolby Vision or MKV remux enabled, play for several minutes and confirm the repeating stall-and-jump pattern is gone. - On Apple TV, open a title and confirm the detail actions sit on two rows with single-line labels, and that Up returns you to the top and the menu bar. - Confirm external subtitles render once, without the repeated flash. - Pick an audio language in the source picker and confirm the list re-ranks. - On a French device, confirm catalog titles read naturally (Séries populaires, Films à la une). If anything still fails, share the Diagnostics log (Settings > Diagnostics). **Apple TV HD crash fix.** Fixes a crash a few seconds after playback started on some streams on Apple TV HD: the on-device trickplay frame capture could abort the process during Metal rendering on that device class. Capture is now skipped on those devices only; newer Apple TV models are unchanged. **Reinstalling a removed add-on works again.** Installing a previously removed add-on URL no longer fails with \"Install did not confirm\", and reconnecting a Stremio account now imports its add-ons again even if they were removed earlier in VortX. Removing an add-on still sticks against background sync.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.25/VortX-iOS-v0.3.14-beta.25-ci.ipa",
+          "size": 64369656,
+          "sha256": "725db244532ea464168113288576fb7b6bb8a6d907ab75fca2f4def0c6a3b624",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
           "buildVersion": "220",
           "date": "2026-08-20",
           "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
@@ -80,15 +90,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.10/VortX-iOS-v0.3.14-beta.10-ci.ipa",
           "size": 63344203,
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "200",
-          "date": "2026-07-27",
-          "localizedDescription": "0.3.14 Beta 9. Use a Mac as the engine, true Dolby Vision including Profile 7 enhancement layer, Dolby Atmos passthrough, Blu-ray subtitles, our own player engine, tvOS Now Playing, and working QR sign-in.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.9/VortX-iOS-v0.3.14-beta.9-ci.ipa",
-          "size": 62970820,
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -103,6 +104,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "227",
+          "date": "2026-08-22",
+          "localizedDescription": "# VortX 0.3.14 Beta 25 (build 227) Apple-only reliability release. It publishes the playback and Apple TV fixes prepared for Beta 19 (which was never made public) plus the source-picker, localization, and subtitle-hardening fixes. Android remains absent. ## What's new **Playback reliability (from the Beta 19 work).** Fixes the AVPlayer/libmpv/remux ownership races, the producer-lead stalls on Dolby Vision and high-bitrate 4K, the \"source failed\" fallback loops on TorBox/AIOStreams/AllDebrid, the repeating stall-and-jump pattern when Dolby Vision or MKV remux is on, and the duplicate subtitle flash. Apple TV, iPhone, iPad, and Mac. **Two-row Apple TV detail actions.** The detail page actions are now two semantic rows with single-line labels, a stable Library focus anchor, and predictable upward focus back to the title and menu bar, fixing the wrapped-button and focus-trap defects. Apple TV (full and Lite). **Audio-language filter in the source picker.** A new Audio control next to Quality filters and re-ranks the source list by audio language, session-scoped only, without changing your saved preference. Apple TV, iPhone, iPad, and Mac. **French catalog titles.** Home and Discover rows now translate catalog titles as whole phrases instead of word by word, so Popular Shows reads Séries populaires rather than Populaires émissions, and Featured Movies reads Films à la une. French. **External subtitles use the hardened transport on every player.** The built-in player's subtitle download now resolves the host once and connects only to the exact vetted address, with size limits and no redirects, matching the other player. Apple TV, iPhone, iPad, and Mac. **AltStore and SideStore updates propagate reliably.** Release promotion is transactional end to end, so build 227 should appear in the VortX source automatically. Apple TV, iPhone, iPad. ## Please test - Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play. - With Dolby Vision or MKV remux enabled, play for several minutes and confirm the repeating stall-and-jump pattern is gone. - On Apple TV, open a title and confirm the detail actions sit on two rows with single-line labels, and that Up returns you to the top and the menu bar. - Confirm external subtitles render once, without the repeated flash. - Pick an audio language in the source picker and confirm the list re-ranks. - On a French device, confirm catalog titles read naturally (Séries populaires, Films à la une). If anything still fails, share the Diagnostics log (Settings > Diagnostics). **Apple TV HD crash fix.** Fixes a crash a few seconds after playback started on some streams on Apple TV HD: the on-device trickplay frame capture could abort the process during Metal rendering on that device class. Capture is now skipped on those devices only; newer Apple TV models are unchanged. **Reinstalling a removed add-on works again.** Installing a previously removed add-on URL no longer fails with \"Install did not confirm\", and reconnecting a Stremio account now imports its add-ons again even if they were removed earlier in VortX. Removing an add-on still sticks against background sync.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.25/VortX-tvOS-v0.3.14-beta.25-ci.ipa",
+          "size": 63867930,
+          "sha256": "d72233a5b40604c912748f1f8ed387cda730b274fa555e9b059a9f488fca13aa",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "220",
@@ -165,15 +176,6 @@
           "localizedDescription": "0.3.14 Beta 10. Fresh episodes now start at 0:00 (fixes the few-seconds-in start), remux playback and seeking are hardened, and trusted media transport is enforced at the app layer. In-place update over Beta 9, nothing resets.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.10/VortX-tvOS-v0.3.14-beta.10-ci.ipa",
           "size": 62898234,
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "200",
-          "date": "2026-07-27",
-          "localizedDescription": "0.3.14 Beta 9. Use a Mac as the engine, true Dolby Vision including Profile 7 enhancement layer, Dolby Atmos passthrough, Blu-ray subtitles, our own player engine, tvOS Now Playing, and working QR sign-in.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.9/VortX-tvOS-v0.3.14-beta.9-ci.ipa",
-          "size": 62444033,
           "minOSVersion": "18.0"
         }
       ]
