@@ -325,6 +325,12 @@ struct PlayerScreen: View {
     @State private var scrubbing = false
     @State private var scrubTarget: Double = 0   // committed scrub position while dragging; avoids timePos fighting the thumb (#32)
     @State private var refreshTask: Task<Void, Never>?   // debounced panel/track refresh; cancellable so it can't outlive the player (#20)
+    /// Session audio-language filter, matching the tvOS/iOS source-picker chip (#204). On Mac the
+    /// pre-play source picker runs in the embedded Stremio web UI, so this lives in the native in-player
+    /// `.sources` panel instead. Non-nil is installed as `TrackPreferences.audioLanguagesOverride` (a
+    /// task-local) around the source ranking so releases carrying that audio float up; nil = profile pref.
+    /// Per-playback state, never persisted, exactly like the native pickers' per-detail session scope.
+    @State private var sessionAudioLanguages: [String]? = nil
     #if os(macOS)
     /// Display-sleep assertion held while the player is open (macOS parity with the iOS idle-timer
     /// disable): keeps the Mac from dimming / sleeping mid-movie. Ended on disappear.
@@ -7328,31 +7334,54 @@ struct PlayerScreen: View {
     /// Up to a capped number of loaded sources, grouped by add-on in their existing priority order, so
     /// switching is quick. The full (sometimes thousands-long) list stays on the detail page; capping
     /// keeps the panel light. Mirrors tvOS `sourceRows`.
+    /// Session audio-language filter rows for the `.sources` panel, matching the tvOS/iOS source-picker
+    /// chip (#204): an "Audio" header with "Auto" + the curated language list. Selecting a language sets
+    /// `sessionAudioLanguages`, which re-ranks the list below so releases carrying that audio float up.
+    private func audioLanguageFilterRows() -> [Row] {
+        var rs: [Row] = [Row(label: String(localized: "Audio"), isHeader: true)]
+        rs.append(Row(label: String(localized: "Auto"), selected: sessionAudioLanguages == nil) {
+            sessionAudioLanguages = nil
+        })
+        for lang in TrackPreferences.commonLanguages {
+            rs.append(Row(label: lang.label, selected: sessionAudioLanguages == [lang.id]) {
+                sessionAudioLanguages = [lang.id]
+            })
+        }
+        return rs
+    }
+
     private func sourceRows() -> [Row] {
         let perAddon = 5
         let maxInPlayerSources = 60
-        var rs: [Row] = []
-        var count = 0
         let groups = currentSourceGroups
         if groups.isEmpty { return [Row(label: "Loading sources…", isHeader: true)] }
-        for group in groups {
-            let best = group.streams.filter { playableURL(for: $0) != nil }
-                .map { (stream: $0, rank: StreamRanking.score($0)) }
-                .sorted { $0.rank > $1.rank }
-                .prefix(perAddon)
-                .map(\.stream)
-            guard !best.isEmpty, count < maxInPlayerSources else { continue }
-            rs.append(Row(label: group.addon, isHeader: true))
-            for stream in best {
-                guard count < maxInPlayerSources, let sURL = playableURL(for: stream) else { continue }
-                count += 1
-                let info = StreamRanking.sourceDetail(stream)
-                let name = String(sourceLabel(stream).prefix(40))
-                rs.append(Row(label: "\(info.tags)   \(name)", detail: info.size ?? "",
-                              selected: sURL == curURL) {
-                    switchStream(to: stream, url: sURL, userInitiated: true, explicitPick: true,
-                                 addon: group.addon)
-                })
+        var rs: [Row] = audioLanguageFilterRows()
+        var count = 0
+        // Install the session audio-language filter as a task-local for the ranking reads only: #204 does
+        // the same in SourceListModel's detached rank. `StreamRanking.score` -> `languageScore` reads
+        // `TrackPreferences.current.audioLanguages` live at score time (StreamRanking.swift:561), so this
+        // is what actually floats the chosen-audio release above a same-resolution foreign-audio one. Nil
+        // (Auto) installs nothing and falls back to the persisted profile preference, exactly as tvOS/iOS.
+        TrackPreferences.$audioLanguagesOverride.withValue(sessionAudioLanguages) {
+            for group in groups {
+                let best = group.streams.filter { playableURL(for: $0) != nil }
+                    .map { (stream: $0, rank: StreamRanking.score($0)) }
+                    .sorted { $0.rank > $1.rank }
+                    .prefix(perAddon)
+                    .map(\.stream)
+                guard !best.isEmpty, count < maxInPlayerSources else { continue }
+                rs.append(Row(label: group.addon, isHeader: true))
+                for stream in best {
+                    guard count < maxInPlayerSources, let sURL = playableURL(for: stream) else { continue }
+                    count += 1
+                    let info = StreamRanking.sourceDetail(stream)
+                    let name = String(sourceLabel(stream).prefix(40))
+                    rs.append(Row(label: "\(info.tags)   \(name)", detail: info.size ?? "",
+                                  selected: sURL == curURL) {
+                        switchStream(to: stream, url: sURL, userInitiated: true, explicitPick: true,
+                                     addon: group.addon)
+                    })
+                }
             }
         }
         return rs
