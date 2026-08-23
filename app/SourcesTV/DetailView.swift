@@ -2687,38 +2687,35 @@ struct CoreStreamList: View {
             TVDetailActionRow(accessibilityLabel: String(localized: "Playback and source actions"),
                               onMoveCommand: sourceMoveHandler(from: .primary, state: actionState)) {
                 if let best {
-                    // Beta 25 diag 6: playable candidates existed ~7 s after open, but full add-on settlement
-                    // took ~26 s, and gating this button on `sourceList.isSettled` left the page's ONLY
-                    // primary action a passive status view for that whole gap. The real button now appears
-                    // as soon as a ranked candidate exists; while ranking continues, a compact secondary
-                    // indicator beside it shows the progress. The pressed candidate is frozen by
-                    // `playBest`'s generation guard, and the UNATTENDED auto-pick keeps its own isSettled
-                    // deadline below, so early manual play cannot race the complete-set guarantee.
+                    // Restored 0.3.13 semantics (reverses the Beta 25 diag-6 experiment): the Watch button is
+                    // gated on full add-on settlement again, so the single primary action can no longer be
+                    // pressed against an incomplete rank. While ranking, the SAME button stays focused but
+                    // inert (not SwiftUI-.disabled, which is unfocusable on tvOS and would dump focus onto the
+                    // Quality chip), dimmed to translucent, with a spinner + "Finding best…" inside it. The
+                    // instant the add-ons settle (or the open gate fires), it springs alive in place and names
+                    // the committed quality via `watchLabel`, prefixed by the resume lead-in when one exists.
+                    // The pressed source is still frozen by `playBest`'s generation guard, and the UNATTENDED
+                    // auto-pick keeps its own isSettled deadline below.
                     HStack(spacing: Theme.Space.sm) {
-                        Button { playBest(best, in: groups) } label: {
-                            // Branch-review finding 5: `playBest` keeps the parallel CACHED-source race
-                            // (it exists to avoid serial debrid timeouts), so the committed source can be
-                            // a cached winner rather than this displayed candidate. The button therefore
-                            // makes NO source promise - generic "Watch"/"Resume · 1:03" only; naming a
-                            // specific quality here would let the press deliver something else.
-                            let lead = resumeSeconds.flatMap(resumeTimecode).map { timecode in
-                                String(localized: "Resume") + "  ·  " + timecode
-                            } ?? String(localized: "Watch")
-                            Label { Text(verbatim: lead) } icon: { Image(systemName: "play.fill") }
+                        Button { if watchReady { playBest(best, in: groups) } } label: {
+                            if watchReady {
+                                // watchLabel derives from the EXACT stream this button plays, so it can never
+                                // promise a quality it doesn't deliver. A saved resume position turns the
+                                // lead-in into "Resume · 1:03" (playback already seeks there).
+                                let lead = resumeSeconds.flatMap(resumeTimecode).map { timecode in
+                                    String(localized: "Resume") + "  ·  " + timecode + "  ·  "
+                                } ?? String(localized: "Watch in ")
+                                Label { Text(verbatim: lead + StreamRanking.watchLabel(best)) } icon: { Image(systemName: "play.fill") }
+                            } else {
+                                HStack(spacing: Theme.Space.sm) {
+                                    ProgressView().tint(Theme.Palette.onAccent)
+                                    Text(verbatim: String(localized: "Finding best…  \(addons.loaded)/\(addons.total)"))
+                                }
+                            }
                         }
                         .buttonStyle(PrimaryActionStyle())
+                        .opacity(watchReady ? 1 : 0.55)
                         .focused($watchFocused)   // FIX H: target of the page's default focus
-                        if !watchReady {
-                            HStack(spacing: Theme.Space.xs) {
-                                ProgressView()
-                                Text(verbatim: String(localized: "Still ranking \(addons.loaded)/\(addons.total)"))
-                            }
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .accessibilityElement(children: .combine)
-                            .accessibilityLabel(String(localized: "Still ranking sources"))
-                            .accessibilityHint(String(localized: "Watch plays the current best candidate now."))
-                        }
                     }
                 } else if loadingAddons {
                     // The primary action slot remains present while sources are loading, so the source row's

@@ -5645,9 +5645,9 @@ struct iOSSourceList: View {
                                 Text(progress.total > 0 ? "Finding best…  \(progress.loaded)/\(progress.total)" : "Finding best…")
                             }
                         } else {
-                            // Same contract as tvOS (branch-review finding 5): playBest races cached
-                            // candidates, so the committed source can differ from `best`. No source promise.
-                            Label("Watch", systemImage: "play.fill")
+                            // Restored 0.3.13 copy: the button names the quality of the source it plays, so
+                            // "Watch in 1080p · DV" is a truthful promise about what this press plays.
+                            Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
                         }
                     }
                     .buttonStyle(PrimaryActionStyle())
