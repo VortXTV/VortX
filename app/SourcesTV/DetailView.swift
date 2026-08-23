@@ -3584,10 +3584,10 @@ struct CoreStreamList: View {
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
                                                     debridRef: ref, sourceStream: resumeSource,
+                                                    debridCachedHashes: debridCache.cachedHashes,
                                                     enginePlayerVideoId: engineVideoID,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
-                                                    startAtSeconds: admittedStart.seconds,
-                                                    debridCachedHashes: debridCache.cachedHashes)
+                                                    startAtSeconds: admittedStart.seconds)
                 return
             }
         }
@@ -3616,9 +3616,9 @@ struct CoreStreamList: View {
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 headers: win.stream.requestHeaders, debridRef: win.ref,
                                                 sourceStream: win.stream,
+                                                debridCachedHashes: debridCache.cachedHashes,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
-                                                startAtSeconds: admittedStart.seconds,
-                                                debridCachedHashes: debridCache.cachedHashes)
+                                                startAtSeconds: admittedStart.seconds)
             return
         }
         // No parallel-cached winner: today's single-resolve path on the ranked best, unchanged. This is an
@@ -3678,10 +3678,10 @@ struct CoreStreamList: View {
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders, debridRef: ref,
                                                 sourceStream: stream,
-                                                enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
-                                                startFromZero: fromStart,
-                                                startAtSeconds: admittedStart.seconds,
-                                                debridCachedHashes: debridCache.cachedHashes)
+                                            debridCachedHashes: debridCache.cachedHashes,
+                                            enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
+                                            startFromZero: fromStart,
+                                            startAtSeconds: admittedStart.seconds)
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3702,11 +3702,11 @@ struct CoreStreamList: View {
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders, sourceStream: stream,
+                                            debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
-                                            startAtSeconds: admittedStart.seconds,
-                                            debridCachedHashes: debridCache.cachedHashes)
+                                            startAtSeconds: admittedStart.seconds)
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {
