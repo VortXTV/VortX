@@ -457,6 +457,8 @@ data class StreamSource(
     /// (EngineState.parseStream) and carried onto [Playable.headers] at resolve time so both player
     /// engines and the download worker send them. Mirrors Apple `CoreStream.requestHeaders`.
     val requestHeaders: Map<String, String> = emptyMap(),
+    /** External sidecar subtitle URLs returned by a source provider. */
+    val externalSubtitles: List<String> = emptyList(),
 ) {
     /// A USENET stream: no direct [url] yet, but an `.nzb` link to resolve through a usenet-capable
     /// debrid account. Like a raw torrent, it needs resolution before it is playable. Kept mutually

@@ -237,6 +237,7 @@ fun AddonsScreen(
                     }
                 }
             }
+            item { CommunityJsProviderCard() }
             if (installed.isNotEmpty()) {
                 item {
                     Row(modifier = Modifier.fillMaxWidth()) {

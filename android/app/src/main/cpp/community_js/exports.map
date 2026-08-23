@@ -1,0 +1,6 @@
+{
+  global:
+    Java_com_vortx_android_communityjs_CommunityJsNative_evaluate;
+  local:
+    *;
+};

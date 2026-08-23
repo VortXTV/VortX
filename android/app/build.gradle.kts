@@ -68,6 +68,7 @@ android {
         applicationId = "com.vortx.android"
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 187
         versionName = "0.3.14"
 
@@ -149,6 +150,7 @@ android {
 
     buildFeatures {
         compose = true
+        aidl = true
         // BuildConfig.DEBUG gates the design-system gallery screen (S02: ui/gallery/GalleryScreen.kt)
         // behind debug builds only, via a Settings row -- no separate launcher activity/manifest entry.
         buildConfig = true
@@ -319,6 +321,8 @@ dependencies {
     testImplementation(libs.junit)
     testImplementation(libs.json.jvm)
     testImplementation(libs.kotlinx.coroutines.test)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }
 
 // =====================================================================================================
@@ -439,6 +443,15 @@ android {
     }
     // ndkVersion pins the NDK the cargo-ndk linker uses. Keep in sync with the NDK CI installs.
     ndkVersion = "27.2.12479018"
+
+    // The bounded community-provider host is a separate C library. It deliberately does not share
+    // symbols or build output with the Rust engine JNI library above.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/community_js/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     // In the `full` flavor two native-lib sources coexist: the cargo-ndk Rust output
     // (libstremiox_core.so) and the libmpv AAR (libmpv.so + libplayer.so + libavcodec.so +

@@ -229,7 +229,7 @@ internal fun TvAddonConfigureDialog(addon: InstalledAddon, onDismiss: () -> Unit
 /// A focusable TV action button local to this file (the one in TvAddonsScreen.kt is private there).
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvAddonActionButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+internal fun TvAddonActionButton(label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,

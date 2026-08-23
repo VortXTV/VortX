@@ -137,6 +137,13 @@
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
 
+        <service
+            android:name=".communityjs.CommunityJsBrokerService"
+            android:exported="false"
+            android:isolatedProcess="true"
+            android:process=":communityjs"
+            android:directBootAware="false" />
+
         <!-- #132 auto-recovery: resume a download parked by a locked-write failure once the user unlocks.
              MANIFEST-registered, not runtime-registered, precisely because the app process is usually gone by
              then; a runtime receiver would miss the exact case it exists for. Not exported: both actions are

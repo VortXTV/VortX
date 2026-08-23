@@ -398,6 +398,9 @@ object RemoteConfigDefaults {
     const val FEATURE_LANGUAGE_INDEX_CONTRIBUTE = true // language-index contribute (wave-5)
     const val FEATURE_LOCALIZED_METADATA = true   // localized metadata (wave-5)
     const val FEATURE_SOURCE_INDEX = true         // Singularity community source-index hoard + serve (wave-5)
+    // Community JavaScript providers are an explicit opt-in on BOTH axes. A missing/failed remote
+    // configuration therefore keeps the untrusted-code host dark until the fleet deliberately enables it.
+    const val FEATURE_COMMUNITY_JS_PLUGINS = false
 
     // --- Trickplay capture params (Apple RemoteConfigDefaults.captureIntervalSecs / trickplay*). ---
     const val CAPTURE_INTERVAL_SECS = 10

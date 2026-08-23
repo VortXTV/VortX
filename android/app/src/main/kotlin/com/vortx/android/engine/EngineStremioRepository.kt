@@ -2077,6 +2077,7 @@ class EngineStremioRepository(
                 isDolbyVision = isDolbyVision,
                 isAtmos = isAtmos,
                 headers = source.requestHeaders,
+                externalSubtitles = source.externalSubtitles,
             )
         } else if (source.isTorrent) {
             // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent

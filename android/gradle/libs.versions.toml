@@ -114,6 +114,8 @@ playServicesCast = "21.5.0"
 # metadata, so it is compiler-safe like the cast framework above.
 mediarouter = "1.7.0"
 junit = "4.13.2"
+androidxTestRunner = "1.6.2"
+androidxTestExtJunit = "1.2.1"
 jsonJvm = "20240303"
 zxing = "3.5.4"
 
@@ -158,6 +160,8 @@ androidx-mediarouter = { group = "androidx.mediarouter", name = "mediarouter", v
 
 work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
+androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExtJunit" }
 json-jvm = { group = "org.json", name = "json", version.ref = "jsonJvm" }
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
 

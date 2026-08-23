@@ -1,8 +1,12 @@
 package com.vortx.android
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.Application
+import android.content.Context
+import android.os.Build
 import android.os.Bundle
+import android.os.Process
 import android.util.Log
 import coil3.ImageLoader
 import coil3.PlatformContext
@@ -99,6 +103,10 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// touches the network here. The settings screen calls the same idempotent init defensively.
     override fun onCreate() {
         super.onCreate()
+        // An isolated service still receives this Application callback. Its broker is deliberately supplied
+        // only bounded IPC input, so do not initialize any process-wide repositories, encrypted stores,
+        // filesystem caches, or network clients in that process.
+        if (isCommunityJsBrokerProcess()) return
         // Fail closed until the encrypted session store has produced a definitive account or sign-out.
         // This process-wide binding precedes every lazy repository, resolver, and settings consumer.
         DebridKeys.bindAccountOwnerSource { DebridAccountOwnerState.UnknownOrUnavailable }
@@ -142,6 +150,16 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // banner and the once-per-launch popup. Idempotent + off the critical path.
         runCatching { UpdateChecker.start(this) }
             .onFailure { Log.w(TAG, "Update check could not start this launch", it) }
+    }
+
+    private fun isCommunityJsBrokerProcess(): Boolean {
+        val name = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            Application.getProcessName()
+        } else {
+            val manager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            manager?.runningAppProcesses?.firstOrNull { it.pid == Process.myPid() }?.processName
+        }
+        return name == "$packageName:communityjs"
     }
 
     private fun startIPTVCleanupReplay() {
