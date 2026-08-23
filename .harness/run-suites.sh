@@ -43,6 +43,10 @@ run remux-first-packet-failure-policy \
   app/Sources/Player/RemuxFirstPacketFailurePolicy.swift \
   app/Tests/RemuxFirstPacketFailurePolicyTests.swift
 
+run read-liveness-policy \
+  app/Sources/Player/VortXRemuxReadLivenessPolicy.swift \
+  app/Tests/VortXRemuxReadLivenessPolicyTests.swift
+
 run producer-lead-policy \
   app/Sources/Player/VortXRemuxBuffer.swift \
   app/Sources/Player/VortXRemuxProducerLeadPolicy.swift \
