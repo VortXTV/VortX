@@ -87,6 +87,13 @@ enum SettingsBackup {
     static let deviceLocalKeyPrefixes: [String] = [
         "vortx.sync.",
         Keychain.invalidationKeyPrefix, // non-secret record of an unconfirmed Keychain mutation on this device
+        // Per-profile exact played-link memory (E3, Beta 26): a ~45KB dictionary rewritten on every
+        // play and engine/source switch, carried through every sync push for zero cross-device value.
+        // The stored URL is session provenance (often an already-expired signed debrid link), and
+        // Continue Watching itself syncs through the watch overlay, not this blob. A peer's blob landing
+        // here can only evict THIS device's own resume memory and bloat the payload, so it is per-device
+        // by prefix: the profile UUID in the key name is open-ended, exactly like the sync bookkeeping.
+        "stremiox.lastStream.",
     ]
 
     /// SECRETS, which must never leave this device in any form. Kept as its OWN list rather than folded into
