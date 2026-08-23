@@ -39,4 +39,28 @@ enum PlayerMidPlaybackStallPolicy {
         recoveries > 0
             && stableProgressTicks >= stableProgressTicksToResetRecoveryBudget
     }
+
+    /// Seek-nudge tier (Beta 26 workstream B2): before spending a reload, a stall whose demuxer still
+    /// holds a real cushion gets a tiny same-item seek to re-kick the decode pipeline.
+    static let nudgeMinimumStallSeconds: Double = 6
+    static let nudgeBufferedAheadThresholdSeconds: Double = 2
+    static let maxSeekNudgesPerStallEpisode = 2
+
+    static func shouldSeekNudge(
+        stallOpenSeconds: Double,
+        bufferedAheadSeconds: Double,
+        nudgesIssued: Int
+    ) -> Bool {
+        guard nudgesIssued < maxSeekNudgesPerStallEpisode else { return false }
+        return stallOpenSeconds >= nudgeMinimumStallSeconds
+            && bufferedAheadSeconds > nudgeBufferedAheadThresholdSeconds
+    }
+
+    /// Buffered-retirement gate (workstream B3): an engine retirement with at least this much media
+    /// still loaded prefers one same-engine reload at the playhead over an immediate demote/hop.
+    static let bufferedReloadThresholdSeconds: Double = 10
+
+    static func prefersBufferedReloadBeforeRetirement(bufferedAheadSeconds: Double) -> Bool {
+        bufferedAheadSeconds >= bufferedReloadThresholdSeconds
+    }
 }

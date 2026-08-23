@@ -724,6 +724,8 @@ struct TVPlayerView: View {
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
     @State private var stallStableProgressTicks = 0
+    @State private var stallNudgesIssued = 0          // B2 seek-nudge counter, per continuous stall episode
+    @State private var midPlayBufferedReloadUsed = false  // B3 one same-engine reload before any mid-play demote
     // Direct-resume launches (Continue Watching) start without an episode list;
     // it loads in the background so Next/auto-advance still work.
     @State private var loadedEpisodes: [CoreVideo] = []
@@ -2011,6 +2013,21 @@ struct TVPlayerView: View {
                     if hopToNextSource(reason: "remux terminal zero-packet source") { return }
                     if loadErrorMsg.isEmpty { loadErrorMsg = "This source did not produce playable media." }
                     presentTerminalLoadFailure()
+                    return
+                }
+                // Buffered-retirement gate (Beta 26 workstream B3): a mid-play item failure that still
+                // holds a real loaded cushion is frequently a transient mount fault rather than dead
+                // bytes, and the demote below reopens the SAME url through libmpv anyway. ONE
+                // same-engine reload at the playhead is strictly cheaper and keeps native DV alive when
+                // the retry succeeds. The one-shot flag resets only after a minute of stable progress,
+                // so a genuinely dead source cannot loop here.
+                let bufferedAheadAtFailure = max(0, bufferedTime - currentTime)
+                if !midPlayBufferedReloadUsed, firstFrameRenderedAt != nil,
+                   PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
+                       bufferedAheadSeconds: bufferedAheadAtFailure) {
+                    midPlayBufferedReloadUsed = true
+                    DiagnosticsLog.log("player", "mid-play AV failure with \(Int(bufferedAheadAtFailure))s buffered -> one same-engine reload before any demote")
+                    reloadAtPlayhead()
                     return
                 }
                 DiagnosticsLog.log("dv", "mid-play AVPlayer endFileError class=\(safeFailureClass(midPlayAVFailureMessage)) -> demote to libmpv in place")
@@ -4347,8 +4364,9 @@ struct TVPlayerView: View {
                     if stalledTicks >= PlayerMidPlaybackStallPolicy.recoveryTickThreshold(
                         buffering: buffering
                     ) {
+                        let ticksAtRecovery = stalledTicks
                         stalledTicks = 0
-                        recoverFromStall()
+                        recoverFromStall(stalledTicksAtRecovery: ticksAtRecovery)
                     }
                 } else {
                     stalledTicks = 0
@@ -4359,6 +4377,8 @@ struct TVPlayerView: View {
                     ) {
                         stallRecoveries = 0
                         stallStableProgressTicks = 0
+                        stallNudgesIssued = 0
+                        midPlayBufferedReloadUsed = false
                     }
                 }
                 lastObservedTime = currentTime
@@ -4545,7 +4565,7 @@ struct TVPlayerView: View {
         startLoadTimeout()
     }
 
-    private func recoverFromStall() {
+    private func recoverFromStall(stalledTicksAtRecovery: Int) {
         guard stallRecoveries < 3 else {
             // Repeated stalls on the same source: stop reloading and let the viewer
             // pick another source from the error overlay.
@@ -4557,10 +4577,34 @@ struct TVPlayerView: View {
             presentTerminalLoadFailure()
             return
         }
+        // Seek-nudge tier (Beta 26 workstream B2): a stall whose demuxer still holds a real cushion is
+        // usually a wedged decode pipeline rather than dead bytes. A tiny same-item seek re-kicks the
+        // engine without paying the reload cost (fresh spool, subtitle re-OCR, first-frame wait). Two
+        // nudges max per stall episode, never charged to the reload budget; beyond that the proven
+        // reload ladder takes over unchanged.
+        let bufferedAhead = max(0, bufferedTime - currentTime)
+        let stallOpenSeconds = Double(stalledTicksAtRecovery) * PlayerMidPlaybackStallPolicy.pollIntervalSeconds
+        if PlayerMidPlaybackStallPolicy.shouldSeekNudge(
+            stallOpenSeconds: stallOpenSeconds,
+            bufferedAheadSeconds: bufferedAhead,
+            nudgesIssued: stallNudgesIssued
+        ) {
+            stallNudgesIssued += 1
+            plog.info("mid-playback stall, seek-nudge \(stallNudgesIssued) at \(currentTime, privacy: .public)")
+            DiagnosticsLog.log("player", "stall seek-nudge \(stallNudgesIssued)/\(PlayerMidPlaybackStallPolicy.maxSeekNudgesPerStallEpisode) at \(Int(currentTime))s buffered=\(Int(bufferedAhead))s")
+            coordinator.player?.seek(to: currentTime + 0.25)
+            return
+        }
+        stallNudgesIssued = 0
         stallRecoveries += 1
-        stallStableProgressTicks = 0
         plog.info("mid-playback stall, reloading at \(currentTime, privacy: .public)")
         DiagnosticsLog.log("player", "mid-playback stall \(stallRecoveries), reloading at \(Int(currentTime))s")
+        reloadAtPlayhead()
+    }
+
+    /// The shared mid-play same-engine reload: replays the current mount at the live play head. Used by
+    /// the stall ladder and by the buffered-retirement gate ahead of an AVPlayer-to-libmpv demote (B3).
+    private func reloadAtPlayhead() {
         resumeSeconds = currentTime
         resumeIsMidPlayRecovery = true   // the live play head of the stalled mount, not a stored offset
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false
