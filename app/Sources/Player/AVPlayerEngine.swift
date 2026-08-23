@@ -313,6 +313,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// mounts the remux, and the retry gate refuses any remux-mounted failure (`!isRemuxMounted`), so a failed
     /// retry demotes normally.
     private var plainRemuxRetried = false
+    // B4b soft retry: one same-engine playlist reload for a mid-play CoreMedia resource-unavailable
+    // failure, before any libmpv demote. Reset per load alongside plainRemuxRetried.
+    private var coreMediaReloadRetried = false
     /// Forces the next loadFile onto the PLAIN remux lane (#147), bypassing the router's explicit-Matroska
     /// candidacy (the reactive retry has already proven raw AVPlayer cannot demux the bytes). Consumed (reset
     /// to false) inside loadFile; set only by the container-unsupported retry in handleStatus.
@@ -878,6 +881,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             remuxSeekRemountTarget = nil
         }
         incompatibleEntryHandled = false; plainRemuxRetried = false
+        coreMediaReloadRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
         audioOverBlackSince = 0; audioOverBlackFired = false
@@ -3382,6 +3386,28 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     failedURL, headers: lastLoadHeaders, live: lastLoadLive,
                     audioSidecar: nil, reusing: loadToken
                 )
+                return
+            }
+            // Soft retry (Beta 26 workstream B4b, diag F2/F4 family): a MID-PLAY resource-unavailable
+            // failure surfaced through CoreMedia (-1008 over CoreMediaErrorDomain) is usually the local
+            // playlist window briefly outliving its producer, not dead source bytes. The demote below
+            // reopens the SAME url through libmpv regardless, so ONE same-engine playlist reload carrying
+            // the playhead is strictly cheaper and keeps native DV alive when it succeeds. One-shot per
+            // load; a pre-start -1008 (no frame ever) still falls through to the demote ladder unchanged.
+            if videoFrameEverProduced,
+               ns?.code == NSURLErrorResourceUnavailable,
+               underlying.hasPrefix("CoreMediaErrorDomain"),
+               !coreMediaReloadRetried,
+               let failedURL = lastLoadURL {
+                coreMediaReloadRetried = true
+                let interruptedPosition = player.currentTime().seconds
+                DiagnosticsLog.log("avplayer", "mid-play resource-unavailable over CoreMedia -> ONE same-engine playlist reload at \(Int(interruptedPosition))s")
+                VXProbe.log("avplayer", "CoreMedia -1008 mid-play -> same-engine playlist reload")
+                loadFile(
+                    failedURL, headers: lastLoadHeaders, live: lastLoadLive,
+                    audioSidecar: nil, reusing: loadToken
+                )
+                if interruptedPosition.isFinite, interruptedPosition > 0 { seek(to: interruptedPosition) }
                 return
             }
             if recoverAudioReplacementIfNeeded(
