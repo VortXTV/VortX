@@ -101,6 +101,18 @@ export function cleanProse(value) {
     .trim();
 }
 
+// Like cleanProse, but preserves intentional newlines for multi-line fields
+// such as release notes. Horizontal whitespace still collapses; blank-line
+// runs normalize to a single blank line.
+export function cleanMultilineProse(value) {
+  return String(value || "")
+    .replace(/[\u2012\u2013\u2014\u2015\u2212]/g, "-")
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function releaseAssetURL(tag, slug) {
   requireTag(tag);
   if (!/^[A-Za-z]+$/.test(String(slug))) die(`invalid asset slug ${JSON.stringify(slug)}`);
@@ -195,7 +207,7 @@ export function buildAppcast({
   const releaseBuild = requirePositiveInteger("build", build);
   const releaseVersion = String(version || releaseTag.replace(/^v/, "").split("-", 1)[0]);
   const releaseName = cleanProse(name) || releaseTag;
-  const releaseNotes = cleanProse(notes) || `${releaseName}. One-tap update over any earlier build, nothing resets.`;
+  const releaseNotes = cleanMultilineProse(notes) || `${releaseName}. One-tap update over any earlier build, nothing resets.`;
   const entry = (platform, artifact, altstore, artifactType) => {
     if (!artifact || typeof artifact !== "object") die(`missing ${platform} artifact metadata`, "appcast-schema");
     const url = String(artifact.url || "");
@@ -281,7 +293,7 @@ export function buildReleaseFeedArtifact(options) {
   copyFileSync(String(options.sourceTemplate || ""), sourceFile);
   const date = String(options.date || new Date().toISOString().slice(0, 10));
   const name = cleanProse(options.name) || tag;
-  const note = cleanProse(options.note);
+  const note = cleanMultilineProse(options.note);
   const assets = {
     ios: { file: String(options.iosFile || ""), name: releaseAssetName(tag, "iOS") },
     tvos: { file: String(options.tvosFile || ""), name: releaseAssetName(tag, "tvOS") },
@@ -335,7 +347,7 @@ export function buildReleaseFeedArtifact(options) {
     build,
     version: tag.replace(/^v/, "").split("-", 1)[0],
     name,
-    notes: cleanProse(note) || `${name}. One-tap update over any earlier build, nothing resets.`,
+    notes: cleanMultilineProse(note) || `${name}. One-tap update over any earlier build, nothing resets.`,
     prerelease: tag.includes("-"),
     sourceCommit,
     releaseId: options.releaseId ? String(options.releaseId) : null,
@@ -461,7 +473,7 @@ export function updateSourceFile(options) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) die(`--date must be YYYY-MM-DD (got ${JSON.stringify(date)})`);
   const version = tag.replace(/^v/, "").split("-")[0];
   const name = cleanProse(options.name) || `${version} (${tag})`;
-  const note = cleanProse(options.note);
+  const note = cleanMultilineProse(options.note);
   const localizedDescription = note || `${name}. One-tap update over any earlier build, nothing resets.`;
   const iosSize = requirePositiveInteger("ios-size", options.iosSize);
   const tvosSize = requirePositiveInteger("tvos-size", options.tvosSize);
@@ -606,7 +618,7 @@ export async function verifyPublicRoutes(options) {
     build: requirePositiveInteger("build", options.build),
     version: String(options.version || String(options.tag).replace(/^v/, "").split("-")[0]),
     name: cleanProse(options.name) || String(options.tag),
-    notes: cleanProse(options.notes || options.note) || `${cleanProse(options.name) || String(options.tag)}. One-tap update over any earlier build, nothing resets.`,
+    notes: cleanMultilineProse(options.notes || options.note) || `${cleanProse(options.name) || String(options.tag)}. One-tap update over any earlier build, nothing resets.`,
     prerelease: options.prerelease === undefined ? String(options.tag).includes("-") : String(options.prerelease) === "true",
     iosSize: requirePositiveInteger("ios-size", options.iosSize),
     tvosSize: requirePositiveInteger("tvos-size", options.tvosSize),
