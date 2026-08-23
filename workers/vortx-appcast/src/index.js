@@ -400,7 +400,7 @@ async function handleReceipt(request, env) {
   return failure(400, "receipt-action", "unsupported receipt action");
 }
 
-async function handlePublic(pathname, env) {
+async function handlePublic(request, pathname, env) {
   const response = await coordinatorRequest(new Request("https://coordinator.internal/"), env, { action: "read-active" });
   if (!response.ok) return response;
   const { active } = await response.json();
@@ -409,15 +409,23 @@ async function handlePublic(pathname, env) {
   if (!selected || !selected.manifest?.generation) return failure(503, "feed-unavailable", "no verified feed generation is active");
   const body = pathname === "/appcast.json" ? selected.appcastText : selected.sourceText;
   const generation = selected.manifest.generation;
-  return new Response(body, {
-    status: 200,
-    headers: {
+  const headers = {
       "content-type": "application/json; charset=utf-8",
       "cache-control": `public, max-age=${MAX_PUBLIC_AGE}, s-maxage=${MAX_PUBLIC_AGE}, must-revalidate`,
       etag: `"${generation}"`,
       "x-vortx-feed-generation": generation,
       "x-vortx-feed-state": "active",
-    },
+    };
+  // Conditional GET: an unchanged generation answers 304 so source clients and
+  // health probes can refresh without re-downloading identical bytes.
+  const clientEtag = request.headers.get("if-none-match");
+  if (clientEtag && clientEtag.trim() === `"${generation}"`) return new Response(null, { status: 304, headers });
+  // HEAD serves the exact metadata of the GET (including content-length via
+  // the runtime) with an empty body.
+  if (request.method === "HEAD") return new Response(null, { status: 200, headers });
+  return new Response(body, {
+    status: 200,
+    headers,
   });
 }
 
@@ -426,8 +434,9 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname === "/__release/receipt") return await handleReceipt(request, env);
-      if (request.method !== "GET") return failure(405, "method", "feed routes accept GET only");
-      if (url.pathname === "/altstore.json" || url.pathname === "/vortx-altstore.json" || url.pathname === "/appcast.json") return await handlePublic(url.pathname, env);
+      const isFeedRoute = url.pathname === "/altstore.json" || url.pathname === "/vortx-altstore.json" || url.pathname === "/appcast.json";
+      if (isFeedRoute && (request.method === "GET" || request.method === "HEAD")) return await handlePublic(request, url.pathname, env);
+      if (isFeedRoute) return failure(405, "method", "feed routes accept GET and HEAD only");
       return failure(404, "route", "unknown feed route");
     } catch (error) {
       return failure(503, "feed-validation", error instanceof Error ? error.message : "feed validation failed");

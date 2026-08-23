@@ -153,6 +153,39 @@ test("staging, promotion, exact bytes, query invariance, and rollback are fail-c
   assert.equal(unavailable.status, 503);
 });
 
+test("feed routes answer HEAD with GET metadata and honor If-None-Match with 304", async () => {
+  const kv = new MemoryKV();
+  const env = environment(kv);
+  const receipt = makeReceipt();
+  const staged = await worker.fetch(signedRequest("/__release/receipt", receipt), env);
+  assert.equal(staged.status, 200, await staged.text());
+  const generation = receipt.manifest.generation;
+  const promoted = await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "head-promote", releaseId: "19", generation, expectedActiveGeneration: null }), env);
+  assert.equal(promoted.status, 200);
+
+  // HEAD returns the exact GET headers with an empty body.
+  const head = await worker.fetch(new Request("https://vortx.tv/appcast.json", { method: "HEAD" }), env);
+  assert.equal(head.status, 200);
+  assert.equal(await head.text(), "");
+  assert.equal(head.headers.get("etag"), `"${generation}"`);
+  assert.equal(head.headers.get("x-vortx-feed-generation"), generation);
+  assert.equal(head.headers.get("content-type"), "application/json; charset=utf-8");
+
+  // Conditional GET with the current ETag answers 304 Not Modified (no body).
+  const conditional = await worker.fetch(new Request("https://vortx.tv/appcast.json", { headers: { "if-none-match": `"${generation}"` } }), env);
+  assert.equal(conditional.status, 304);
+  assert.equal(await conditional.text(), "");
+
+  // A stale or mismatched ETag falls through to a full 200 response.
+  const stale = await worker.fetch(new Request("https://vortx.tv/appcast.json", { headers: { "if-none-match": '"stale-generation"' } }), env);
+  assert.equal(stale.status, 200);
+  assert.notEqual((await stale.text()).length, 0);
+
+  // Unsupported methods on feed routes still fail closed.
+  const deleted = await worker.fetch(new Request("https://vortx.tv/appcast.json", { method: "DELETE" }), env);
+  assert.equal(deleted.status, 405);
+});
+
 test("a replayed promote is idempotent while the exact target is active and 409 after rollback", async () => {
   const kv = new MemoryKV();
   const env = environment(kv);
