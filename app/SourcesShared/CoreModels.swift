@@ -1368,6 +1368,10 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// engine JSON WITHOUT the key decodes byte-identically; set only by `MediaServerSource`'s synthetic mapping.
     let vortxProvider: String?
 
+    /// Community JavaScript results must use the guarded routing contract before any direct URL reaches a
+    /// player, download, subtitle, or warm path. Other stream classes preserve their established routing.
+    var isCommunityJavaScriptProvider: Bool { vortxProvider?.hasPrefix("jsplugin:") == true }
+
     var id: String { (url ?? externalUrl ?? infoHash ?? nzbUrl ?? "?") + "#" + (name ?? "") + (description ?? "") }
     var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
 
@@ -1384,7 +1388,9 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// the movie (and a trailer must never be recorded as Continue Watching).
     var isYouTubeTrailer: Bool { url == nil && infoHash == nil && (ytId.map { !$0.isEmpty } ?? false) }
 
-    /// Direct/debrid URLs play as-is; torrents go through the embedded streaming server.
+    /// Direct/debrid URLs play as-is; community-provider direct URLs are converted to an opaque loopback
+    /// route before any Apple consumer can hand them to a player or URLSession; torrents go through the
+    /// embedded streaming server.
     ///
     /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
     /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the remote resolver's
@@ -1396,7 +1402,10 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// Episode-aware playable URL. Direct, usenet, and YouTube sources keep their existing behavior. Raw
     /// episode torrents require an explicit file selector so a season-pack hash can never default to file 0.
     func playableURL(isEpisode: Bool) -> URL? {
-        if let url, let parsed = URL(string: url) { return parsed }
+        if let url, let parsed = URL(string: url) {
+            guard isCommunityJavaScriptProvider else { return parsed }
+            return CommunityStreamGateway.shared.localURLIfReady(for: self, upstream: parsed)
+        }
         // USENET: playable when a usenet source can be resolved, i.e. the user has a TorBox key OR (on a
         // full target) their own usenet provider configured (`DebridPlaybackAvailability.canResolveUsenet`).
         // The play path (`DebridCoordinator.resolvedPlaybackRef`) turns the nzb into a playable URL BEFORE

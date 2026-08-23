@@ -219,6 +219,7 @@ targets:
         codeSign: true
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app
         MARKETING_VERSION: "0.3.14"
         CURRENT_PROJECT_VERSION: "227"
@@ -295,6 +296,14 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
+        optional: true
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -318,6 +327,7 @@ targets:
         embed: false
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.app.native
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         # VortxEngine module discovery. The vortx-ffi xcframework nests its header + module.modulemap
@@ -398,6 +408,14 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
+        optional: true
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -429,6 +447,7 @@ targets:
         basedOnDependencyAnalysis: false
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         MARKETING_VERSION: "0.3.14"
@@ -502,6 +521,14 @@ targets:
         optional: true
         type: folder
         buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
+        optional: true
+        type: folder
+        buildPhase: resources
       # The full release changelog, bundled so Settings > What's New renders the whole history from the
       # single source of truth (repo-root CHANGELOG.md); no copy, stays in sync.
       - path: ../CHANGELOG.md
@@ -536,6 +563,7 @@ targets:
         embed: true
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         # VortxEngine module discovery, same as VortXiOSNative: the xcframework nests its header +
@@ -652,6 +680,14 @@ targets:
       # via BundledLogo.image(named:) (SourcesShared/ProviderBrandLogo.swift). Folder reference so the PNGs
       # land under a `streaming-logos/` subdir, resolved at runtime from Bundle.main. No network, no letters.
       - path: Resources/streaming-logos
+        optional: true
+        type: folder
+        buildPhase: resources
+      # Community JS provider runtime resources: the two bundled single-file libraries the sandbox's require
+      # gate yields (real crypto-js 4.2.0 + cheerio 1.0.0-rc.3, self-contained UMD) and the host-API shim
+      # preamble, evaluated into a fresh JavaScriptCore context per provider call. Folder reference so they
+      # land under a `jsproviders/` subdir, resolved at runtime from Bundle.main (JSProviderRuntime.bootstrap).
+      - path: Resources/jsproviders
         optional: true
         type: folder
         buildPhase: resources

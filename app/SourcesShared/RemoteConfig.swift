@@ -203,6 +203,11 @@ enum RemoteConfigDefaults {
     static let featureRefindSources = true      // "Re-find sources" control master gate. Baked ON, so it is on
                                                 // by default; an explicit remote OFF hides the control on every
                                                 // detail screen and the terminal-failure overlay, NO app update.
+    static let featureCommunityJSPlugins = false // Community JS provider runtime (JSProviderSource) master gate.
+                                                // Baked OFF: the feature ships DARK, so an unreachable RemoteConfig
+                                                // (and every existing install) runs NO provider code. A device
+                                                // toggle must ALSO be on; an explicit remote ON is what lets the
+                                                // feature light up with no app update once it is ready.
 }
 
 // MARK: - Decodable schema (decode ALL; wire a subset). Every field Optional; unknown keys ignored.
@@ -231,6 +236,7 @@ struct RemoteConfigData: Decodable {
         let collectionsHub: Bool?
         let torBoxSearch: Bool?        // TorBoxSearchSource master gate (baked ON; remote OFF kills the dead path)
         let refindSources: Bool?       // "Re-find sources" control master gate (baked ON; backend kill switch)
+        let communityJSPlugins: Bool?  // JSProviderSource master gate (baked OFF; ships dark, remote ON enables)
         let skipVortxLayer: Bool?
         let aniSkip: Bool?
         let spoilerBlur: Bool?
@@ -1011,6 +1017,7 @@ actor RemoteConfig {
             put("collectionsHub", f.collectionsHub)
             put("torBoxSearch", f.torBoxSearch)
             put("refindSources", f.refindSources)
+            put("communityJSPlugins", f.communityJSPlugins)
             put("skipVortxLayer", f.skipVortxLayer)
             put("aniSkip", f.aniSkip)
             put("spoilerBlur", f.spoilerBlur)

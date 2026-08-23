@@ -101,6 +101,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         let torboxSettlementEpoch: Int
         let singularitySettlementEpoch: Int
         let mediaServerSettlementEpoch: Int
+        let jsProviderEpoch: Int
+        let jsProviderSettlementEpoch: Int
         let settlementDeadlineExpired: Bool
         let inputsHash: Int
     }
@@ -124,6 +126,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     private weak var singularity: SourceIndexServeSource?
     private weak var mediaServers: MediaServerSource?
     private weak var debridCache: DebridCacheAwareness?
+    /// Optional community JS provider source. Nil at every existing call site (the feature ships dark behind
+    /// its OFF-by-default gate), so its epochs fold in as 0 and its merge is a pure pass-through until a screen
+    /// opts in by passing one to `bind`.
+    private weak var jsProvider: JSProviderSource?
 
     private var context = Context()
     private var subscriptions: Set<AnyCancellable> = []
@@ -158,7 +164,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
     /// CoreBridge.objectWillChange, whose revision storm is exactly what this model exists to absorb).
     func bind(core: CoreBridge, torbox: TorBoxSearchSource,
               singularity: SourceIndexServeSource, mediaServers: MediaServerSource,
-              debridCache: DebridCacheAwareness) {
+              debridCache: DebridCacheAwareness,
+              jsProvider: JSProviderSource? = nil) {
         SourceIndexLifecycleScope.shared.register(self)
         guard subscriptions.isEmpty else {
             trigger.send()
@@ -169,8 +176,9 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
         self.singularity = singularity
         self.mediaServers = mediaServers
         self.debridCache = debridCache
+        self.jsProvider = jsProvider
 
-        let events: [AnyPublisher<Void, Never>] = [
+        var events: [AnyPublisher<Void, Never>] = [
             core.$streamsEpoch.map { _ in () }.eraseToAnyPublisher(),      // ready-stream set really changed
             core.$addons.map { _ in () }.eraseToAnyPublisher(),            // add-on installed/removed (tombstones)
             torbox.$streams.map { _ in () }.eraseToAnyPublisher(),         // TorBox search results replaced
@@ -182,6 +190,10 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             debridCache.$cachedHashes.map { _ in () }.eraseToAnyPublisher(), // cache awareness re-ranks
             trigger.eraseToAnyPublisher(),                                 // context change / manual nudge
         ]
+        if let jsProvider {
+            events.append(jsProvider.$groups.map { _ in () }.eraseToAnyPublisher())         // JS provider groups replaced
+            events.append(jsProvider.$settlementEpoch.map { _ in () }.eraseToAnyPublisher()) // including empty/error terminal
+        }
         Publishers.MergeMany(events)
             .throttle(for: .milliseconds(Self.coalesceMs), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] in self?.rebuild() }
@@ -324,6 +336,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                                   torboxSettlementEpoch: torbox.settlementEpoch,
                                   singularitySettlementEpoch: singularity.settlementEpoch,
                                   mediaServerSettlementEpoch: mediaServers.settlementEpoch,
+                                  jsProviderEpoch: jsProvider?.epoch ?? 0,
+                                  jsProviderSettlementEpoch: jsProvider?.settlementEpoch ?? 0,
                                   settlementDeadlineExpired: settlementDeadlineExpired,
                                   inputsHash: hasher.finalize())
         guard signature != publishedSignature, signature != pendingSignature else { return }
@@ -353,6 +367,12 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             page: mediaTarget
         )
         let mediaServerGroups = mediaAuthorization == nil ? [] : mediaServers.groups
+        // Community JS providers: same IMDb-target authorization as TorBox, published per-provider groups like
+        // the media-server lane. Nil source (feature dark / screen didn't opt in) => empty, pass-through merge.
+        let jsProviderAuthorization = jsProvider.flatMap {
+            SourceIndexIdentity.mergeAuthorization(published: $0.publishedTarget, page: target)
+        }
+        let jsProviderGroups = jsProviderAuthorization == nil ? [] : (jsProvider?.groups ?? [])
         let rawProgress = ctx.streamId.map { core.streamLoadProgress(forStreamId: $0) }
             ?? core.streamLoadProgress()
         let rawSettlement = core.streamContributorSettlement(metaId: ctx.metaId, streamId: ctx.streamId)
@@ -360,6 +380,7 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
             torbox.settlementState(for: target),
             singularity.settlementState(for: target),
             mediaServers.settlementState(for: mediaTarget),
+            jsProvider?.settlementState(for: target) ?? .inactive,
         ]
         let hasPendingContributor = ([rawSettlement] + auxiliarySettlement).contains(.pending)
         if SourceSettlementPolicy.shouldRearmDeadline(
@@ -399,18 +420,23 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                 assembled = assembled.filter { !tombstones.contains(AddonTombstones.normalize($0.id)) }
             }
             // Merge order preserved from the old per-body displayGroups: TorBox search first, then the
-            // Singularity pool, then the media-server direct-play groups, then the direct-links filter so a
-            // merged torrent obeys the same rule. Final rank order is decided by StreamRanking, not merge order.
-            assembled = MediaServerSource.merge(
-                authorizedBy: mediaAuthorization,
-                mediaServerGroups,
-                into: SourceIndexServeSource.merge(
-                    authorizedBy: singularityAuthorization,
-                    singularityStreams,
-                    into: TorBoxSearchSource.merge(
-                        authorizedBy: torboxAuthorization,
-                        torboxStreams,
-                        into: assembled
+            // Singularity pool, then the media-server direct-play groups, then the community JS provider groups,
+            // then the direct-links filter so a merged torrent obeys the same rule. Final rank order is decided
+            // by StreamRanking, not merge order.
+            assembled = JSProviderSource.merge(
+                authorizedBy: jsProviderAuthorization,
+                jsProviderGroups,
+                into: MediaServerSource.merge(
+                    authorizedBy: mediaAuthorization,
+                    mediaServerGroups,
+                    into: SourceIndexServeSource.merge(
+                        authorizedBy: singularityAuthorization,
+                        singularityStreams,
+                        into: TorBoxSearchSource.merge(
+                            authorizedBy: torboxAuthorization,
+                            torboxStreams,
+                            into: assembled
+                        )
                     )
                 )
             )
@@ -450,6 +476,8 @@ final class SourceListModel: ObservableObject, SourceIndexLifecycleParticipant {
                       torbox.settlementEpoch == signature.torboxSettlementEpoch,
                       singularity.settlementEpoch == signature.singularitySettlementEpoch,
                       mediaServers.settlementEpoch == signature.mediaServerSettlementEpoch,
+                      (self.jsProvider?.epoch ?? 0) == signature.jsProviderEpoch,
+                      (self.jsProvider?.settlementEpoch ?? 0) == signature.jsProviderSettlementEpoch,
                       self.settlementDeadlineExpired == signature.settlementDeadlineExpired else {
                     self.pendingSignature = nil
                     self.trigger.send()
