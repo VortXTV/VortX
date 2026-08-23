@@ -1,0 +1,55 @@
+name: diag-receipt
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  replay-stage-receipt:
+    runs-on: ubuntu-latest
+    environment: release-approval
+    steps:
+      - name: Reconstruct and replay the Beta 26.2 stage receipt with visible errors
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
+        run: |
+          set -euo pipefail
+          [ -n "${RELEASE_FEED_RECEIPT_SECRET:-}" ] || { echo "::error::secret missing"; exit 1; }
+          mkdir feed-artifact && cd feed-artifact
+          gh api repos/VortXTV/VortX/actions/artifacts/9499957283/zip > artifact.zip
+          unzip -o -q artifact.zip && rm artifact.zip
+          echo "== trusted-input verification =="
+          echo "source   actual=$(sha256sum source.json | awk '{print $1}')"
+          echo "appcast  actual=$(sha256sum appcast.json | awk '{print $1}')"
+          echo "checksum actual=$(sha256sum SHA256SUMS-ci.txt | awk '{print $1}')"
+          MANIFEST_SHA=$(jq -er '.feedSha256' manifest.json)
+          GEN=$(jq -er '.generation' manifest.json)
+          RELEASE_ID=$(jq -er '.releaseId' manifest.json)
+          echo "generation=$GEN releaseId=$RELEASE_ID manifestFeedSha=$MANIFEST_SHA"
+          # Current draft asset ids (must match the ones the failed job registered)
+          IOS_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-iOS-v0.3.14-beta.26.2-ci.ipa")|.id')
+          TVOS_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-tvOS-v0.3.14-beta.26.2-ci.ipa")|.id')
+          LITE_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-tvOS-lite-v0.3.14-beta.26.2-ci.ipa")|.id')
+          MAC_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-macOS-v0.3.14-beta.26.2-ci.dmg")|.id')
+          CHECKSUM_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="SHA256SUMS-ci.txt")|.id')
+          echo "assetIds ios=$IOS_ID tvos=$TVOS_ID lite=$LITE_ID mac=$MAC_ID checksum=$CHECKSUM_ID"
+          # Byte-exact reproduction of the workflow's receipt construction
+          jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" \
+            '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
+            manifest.json > receipt-manifest.json
+          jq -c --slurpfile manifest receipt-manifest.json --rawfile source source.json --rawfile appcast appcast.json --rawfile checksum SHA256SUMS-ci.txt \
+            '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > ../feed-receipt.json
+          cd ..
+          echo "receiptBytes=$(wc -c < feed-receipt.json | tr -d ' ') receiptSha256=$(sha256sum feed-receipt.json | awk '{print $1}')"
+          SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary < feed-receipt.json | od -An -tx1 | tr -d ' \n')"
+          CODE="$(curl -sS --connect-timeout 5 --max-time 30 -o body.json -w '%{http_code}' \
+            -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" \
+            --data-binary @feed-receipt.json https://vortx.tv/__release/receipt || true)"
+          echo "STAGE_HTTP_STATUS=$CODE"
+          echo "== sanitized response body =="
+          jq -c '{staged, error, message, generation, currentGeneration, expectedActiveGeneration, detail}' body.json 2>/dev/null || head -c 600 body.json
+          echo
