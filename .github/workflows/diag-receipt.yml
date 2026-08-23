@@ -38,11 +38,9 @@ jobs:
           CHECKSUM_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="SHA256SUMS-ci.txt")|.id')
           echo "assetIds ios=$IOS_ID tvos=$TVOS_ID lite=$LITE_ID mac=$MAC_ID checksum=$CHECKSUM_ID"
           # Byte-exact reproduction of the workflow's receipt construction
-          jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" \
-            '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
-            manifest.json > receipt-manifest.json
-          jq -c --slurpfile manifest receipt-manifest.json --rawfile source source.json --rawfile appcast appcast.json --rawfile checksum SHA256SUMS-ci.txt \
-            '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > ../feed-receipt.json
+          jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' manifest.json > receipt-manifest.json
+          echo "receiptManifestBytes=$(wc -c < receipt-manifest.json | tr -d ' ')"
+          jq -c --slurpfile manifest receipt-manifest.json --rawfile source source.json --rawfile appcast appcast.json --rawfile checksum SHA256SUMS-ci.txt '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > ../feed-receipt.json
           cd ..
           echo "receiptBytes=$(wc -c < feed-receipt.json | tr -d ' ') receiptSha256=$(sha256sum feed-receipt.json | awk '{print $1}')"
           SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary < feed-receipt.json | od -An -tx1 | tr -d ' \n')"
