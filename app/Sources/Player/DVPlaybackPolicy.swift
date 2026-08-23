@@ -1406,9 +1406,10 @@ struct VortXHLSFrozenTarget: Equatable, Sendable {
     let authority: Authority
 }
 
-/// Phase-aware AVPlayer buffering for remux mounts. Local production starts at the same four-second media floor
-/// as HLS publication. Remote production leaves the initial duration at zero so AVPlayer adapts to the network.
-/// Both restore the field-proven 30-second device cap after the first decoded picture.
+/// Phase-aware AVPlayer buffering for remux mounts. Local production starts at the HLS publication readiness
+/// window (`startupSeconds`, raised to eight seconds for high-bitrate DV readiness) so a startup cohort is never
+/// declined for want of media. Remote production leaves the initial duration at zero so AVPlayer adapts to the
+/// network. Both restore the field-proven 30-second device cap after the first decoded picture.
 enum VortXRemuxForwardBufferPolicy {
     enum Mount: Equatable, Sendable {
         case direct
@@ -1416,7 +1417,7 @@ enum VortXRemuxForwardBufferPolicy {
         case remoteRemux
     }
 
-    static let startupSeconds: TimeInterval = 4
+    static let startupSeconds: TimeInterval = 8
     static let steadyStateSeconds: TimeInterval = 30
 
     static func preferredDuration(
@@ -1464,21 +1465,22 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     let minimumSegmentCount: Int
     let minimumRenderedDurationMilliseconds: Int
 
-    /// Startup floor: ONE independently decodable segment and SIX seconds of rendered media. This is a flat
+    /// Startup floor: ONE independently decodable segment and TWELVE seconds of rendered media. This is a flat
     /// wall-clock budget, not a multiple of the frozen target. A short segment still requires enough following
     /// segments to reach the floor; a single complete segment that already covers it can be served immediately.
     ///
-    /// WHY SIX AND NOT FOUR (Beta 13 seek-latency diagnosis). At four seconds the floor sat EXACTLY on
-    /// AVPlayer's readiness requirement: the startup cohort advertised 4 x 1.002s = 4.01s of media against a
-    /// ~4.0s window (`VortXRemuxForwardBufferPolicy.startupSeconds`), i.e. ten milliseconds of margin.
-    /// CoreMedia declined readiness on that cohort, and the retry then had to wait a playlist reload interval
-    /// derived from our own conservative EXT-X-TARGETDURATION of 12 -- 6.2 seconds of a 12.9-second remount
-    /// spent re-asking a question that a fraction of a second more media would have answered first time.
-    /// Sizing the floor off the readiness window rather than a bare literal keeps the two from drifting apart
-    /// again: half a window of margin, capped at six seconds so this can never creep back toward the build 189
-    /// regression below. The cost is the extra ~2s of media produced before the master publishes (well under
-    /// a second on a debrid link, against the 6.2s it removes) and a correspondingly larger published window,
-    /// which the spool ceiling still bounds exactly as before.
+    /// WHY THE FLOOR MUST EXCEED THE WINDOW (Beta 13 seek-latency diagnosis, resized by Beta 26). In Beta 13 the
+    /// floor sat EXACTLY on AVPlayer's readiness window, so the startup cohort advertised ~4.01s of media against
+    /// a ~4.0s window, i.e. ten milliseconds of margin, and CoreMedia declined readiness; the retry then waited a
+    /// playlist reload interval derived from our own conservative EXT-X-TARGETDURATION of 12, spending 6.2 seconds
+    /// of a 12.9-second remount re-asking a question a fraction of a second more media would have answered first
+    /// time. Sizing the floor off the readiness window rather than a bare literal keeps the two from drifting
+    /// apart again: the floor is the window + 50% (`startupSeconds * 1.5`), capped at twelve seconds so it can
+    /// never creep back toward the build 189 regression below. Beta 26 raised the local-remux startup window from
+    /// four to eight seconds (`startupSeconds`) so a high-bitrate DV mount does not stall right after it starts;
+    /// following the same +50% rule raises this floor to twelve seconds, adding ~4s of media before the master
+    /// publishes (the "startup buffer 4s->8s" trade: a slightly later first frame in exchange for a robust
+    /// startup), a published window the spool ceiling still bounds exactly as before.
     ///
     /// The build 189 field regression: the floor was
     /// 6 segments AND 3x the conservative 12s target (36 SECONDS of media), so a UHD DV mount held its master
@@ -1490,8 +1492,8 @@ struct VortXHLSStartupReadiness: Equatable, Sendable {
     /// EXT-X-START:TIME-OFFSET=0,PRECISE=YES pins the start point, so the 3-target live-edge heuristic of
     /// RFC 8216 6.3.3 does not apply to this server's fixed-offset startup.
     static let startupFloorMilliseconds = min(
-        6_000,
-        Int(VortXRemuxForwardBufferPolicy.startupSeconds * 1_500))   // readiness window + 50%, capped at 6s
+        12_000,
+        Int(VortXRemuxForwardBufferPolicy.startupSeconds * 1_500))   // readiness window + 50%, capped at 12s
 
     /// Before AVPlayer has fetched any media, advertise a base cap of two segments. The actual cap below also
     /// carries one already-produced successor beyond the master-frozen cohort. That successor is bounded growth

@@ -25,6 +25,7 @@ run multi-audio-policy \
 run subtitle-rendition-policy \
   app/Sources/Player/VortXRemuxBuffer.swift \
   app/Sources/Player/SubtitleRenditionPolicy.swift \
+  app/Sources/Player/PGSOCRPolicy.swift \
   app/Tests/SubtitleRenditionPolicyTests.swift
 
 run dv-playback-contract \
@@ -43,6 +44,7 @@ run remux-first-packet-failure-policy \
   app/Tests/RemuxFirstPacketFailurePolicyTests.swift
 
 run producer-lead-policy \
+  app/Sources/Player/VortXRemuxBuffer.swift \
   app/Sources/Player/VortXRemuxProducerLeadPolicy.swift \
   app/Tests/VortXRemuxProducerLeadPolicyTests.swift
 

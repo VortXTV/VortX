@@ -313,6 +313,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// mounts the remux, and the retry gate refuses any remux-mounted failure (`!isRemuxMounted`), so a failed
     /// retry demotes normally.
     private var plainRemuxRetried = false
+    // B4b soft retry: one same-engine playlist reload for a mid-play CoreMedia resource-unavailable
+    // failure, before any libmpv demote. Reset per load alongside plainRemuxRetried.
+    private var coreMediaReloadRetried = false
     /// Forces the next loadFile onto the PLAIN remux lane (#147), bypassing the router's explicit-Matroska
     /// candidacy (the reactive retry has already proven raw AVPlayer cannot demux the bytes). Consumed (reset
     /// to false) inside loadFile; set only by the container-unsupported retry in handleStatus.
@@ -337,23 +340,59 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
     }
 
+    /// Diag-6 coupling ownership state, keyed by `itemGeneration` (branch review finding 2). The first frame
+    /// can render before the server has its 10 s bitrate sample and before `signaling.bandwidth` is parsed,
+    /// so the coupling RETRIES on the periodic observer instead of latching once; a replaced item resets the
+    /// schedule because the stored generation no longer matches.
+    private var forwardBufferCouplingState = VortXRemuxForwardBufferCoupling.AttemptState()
+
+    /// Applies (or retries) the producer-budget coupling for the CURRENT local-remux item. Only meaningful
+    /// after the first frame: before it, the item must keep the proven-startable startup floor.
+    private func applyForwardBufferCouplingIfDue() {
+        guard videoFrameEverProduced,
+              isRemuxMounted,
+              forwardBufferMount == .localRemux,
+              let server = remuxHLSServer else { return }
+        let decision = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: forwardBufferCouplingState,
+            currentGeneration: itemGeneration,
+            observedBitsPerSecond: server.observedSourceBitsPerSecond(),
+            indicatedBitsPerSecond: (server.signaling?.bandwidth).map(Double.init),
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+            baseDuration: VortXRemuxForwardBufferPolicy.preferredDuration(
+                mount: .localRemux,
+                hasProducedFirstFrame: true))
+        forwardBufferCouplingState = decision.state
+        guard decision.finished else { return }
+        if let steadyDuration = decision.applyDuration {
+            if item?.preferredForwardBufferDuration != steadyDuration {
+                item?.preferredForwardBufferDuration = steadyDuration
+            }
+            DiagnosticsLog.log(
+                "dv",
+                "forward-buffer coupled to producer byte budget coupled=\(String(format: "%.1f", steadyDuration))s bps=\(decision.state.bestBitsPerSecond.map { Int($0.rounded()) }.map(String.init) ?? "unknown") budget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) generation=\(itemGeneration)")
+        } else {
+            DiagnosticsLog.log(
+                "dv",
+                "forward-buffer coupling gave up without an estimate after \(decision.state.attemptsUsed) attempts base=\(String(format: "%.1f", VortXRemuxForwardBufferPolicy.steadyStateSeconds))s generation=\(itemGeneration)")
+        }
+    }
+
     private func latchPlayableVideoFrame(atClock seconds: Double) -> Bool {
         if videoFrameEverProduced { return true }
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
         if isRemuxMounted {
-            let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
-                mount: forwardBufferMount,
-                hasProducedFirstFrame: true)
-            if item?.preferredForwardBufferDuration != steadyDuration {
-                item?.preferredForwardBufferDuration = steadyDuration
-            }
+            applyForwardBufferCouplingIfDue()
         }
         if let server = remuxHLSServer {
+            // Report the EFFECTIVE duration: the diag-6 coupling may have lowered it under the 30 s cap.
+            let effectiveSeconds = Int((item?.preferredForwardBufferDuration
+                ?? VortXRemuxForwardBufferPolicy.steadyStateSeconds).rounded())
             DiagnosticsLog.log(
                 "dv",
                 "startup phase=first-video-frame elapsedMs=\(server.startupElapsedMilliseconds) "
-                    + "forwardBufferSeconds=\(Int(VortXRemuxForwardBufferPolicy.steadyStateSeconds))")
+                    + "forwardBufferSeconds=\(effectiveSeconds)")
         } else if remuxRemoteMount != nil {
             DiagnosticsLog.log(
                 "engine",
@@ -842,6 +881,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             remuxSeekRemountTarget = nil
         }
         incompatibleEntryHandled = false; plainRemuxRetried = false
+        coreMediaReloadRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
         audioOverBlackSince = 0; audioOverBlackFired = false
@@ -3024,6 +3064,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
                 let clock = ProcessInfo.processInfo.systemUptime
                 self.pinPreferredPeakBitRateAfterFirstFrame(item, atClock: time.seconds)
+                // Diag-6 coupling retry (branch review finding 2): the first frame can beat the server's
+                // bitrate sample, so keep the bounded retry schedule ticking here until it lands or gives
+                // up. The call is a no-op once finished, and the generation check inside discards stale
+                // schedules after a remount.
+                self.applyForwardBufferCouplingIfDue()
                 // AUDIO-OVER-BLACK probe (native DV lane only). Two boolean guards once latched/off-route,
                 // so the non-DV steady state pays nothing (see checkAudioOverBlackWatchdog).
                 self.checkAudioOverBlackWatchdog(clock: clock, position: time.seconds)
@@ -3341,6 +3386,28 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     failedURL, headers: lastLoadHeaders, live: lastLoadLive,
                     audioSidecar: nil, reusing: loadToken
                 )
+                return
+            }
+            // Soft retry (Beta 26 workstream B4b, diag F2/F4 family): a MID-PLAY resource-unavailable
+            // failure surfaced through CoreMedia (-1008 over CoreMediaErrorDomain) is usually the local
+            // playlist window briefly outliving its producer, not dead source bytes. The demote below
+            // reopens the SAME url through libmpv regardless, so ONE same-engine playlist reload carrying
+            // the playhead is strictly cheaper and keeps native DV alive when it succeeds. One-shot per
+            // load; a pre-start -1008 (no frame ever) still falls through to the demote ladder unchanged.
+            if videoFrameEverProduced,
+               ns?.code == NSURLErrorResourceUnavailable,
+               underlying.hasPrefix("CoreMediaErrorDomain"),
+               !coreMediaReloadRetried,
+               let failedURL = lastLoadURL {
+                coreMediaReloadRetried = true
+                let interruptedPosition = player.currentTime().seconds
+                DiagnosticsLog.log("avplayer", "mid-play resource-unavailable over CoreMedia -> ONE same-engine playlist reload at \(Int(interruptedPosition))s")
+                VXProbe.log("avplayer", "CoreMedia -1008 mid-play -> same-engine playlist reload")
+                loadFile(
+                    failedURL, headers: lastLoadHeaders, live: lastLoadLive,
+                    audioSidecar: nil, reusing: loadToken
+                )
+                if interruptedPosition.isFinite, interruptedPosition > 0 { seek(to: interruptedPosition) }
                 return
             }
             if recoverAudioReplacementIfNeeded(

@@ -31,6 +31,16 @@ enum VortXRemuxProducerLeadPolicy {
     /// every publication cycle as ordinary segment-duration jitter crosses back and forth over a single value.
     static let resumeBelowSeconds: Double = 60
 
+    /// Fraction of the byte ceiling the producer must drain back to before a byte-cap park may lift. Mirrors
+    /// the time-leg hysteresis gap (`resumeBelowSeconds` vs `pauseAheadSeconds`) on the byte leg: without it, a
+    /// pause the byte cap forced with only a hair of margin insta-resumed one byte under the ceiling and
+    /// re-parked production on the next published segment (Beta 26 F3 aheadBytes sawtooth around
+    /// `retainedWindowMaximumBytes`).
+    static let byteResumeFraction: Double = 0.85
+
+    /// Absolute byte resume line: `maximumAheadBytes` scaled by `byteResumeFraction`.
+    static let byteResumeThreshold = Int(Double(maximumAheadBytes) * byteResumeFraction)
+
     /// Window publication policy is orthogonal to producer safety. In particular, the anchor-off rollback
     /// keeps a startup window pinned but must still apply the same local producer bound; only a hosted retaining
     /// mount and true EOF are exempt.
@@ -55,9 +65,126 @@ enum VortXRemuxProducerLeadPolicy {
         if currentlyPaused {
             // "resume below 60s" (report section 6): resume ONLY once strictly under the resume line, so a
             // lead sitting exactly on it stays paused rather than flapping.
-            return !(leadSeconds < resumeBelowSeconds && !overByteBudget)
+            // A byte-cap park additionally demands a real down-drain below `byteResumeThreshold`: an unknown
+            // byte count fails OPEN (nil resumes), but a measured count that is only a hair under the ceiling
+            // stays paused, otherwise one published segment right after resuming re-crossed the cap and
+            // re-parked production on the next segment (Beta 26 F3 sawtooth).
+            let underByteResume = aheadBytes.map { $0 < byteResumeThreshold } ?? true
+            return !(leadSeconds < resumeBelowSeconds && underByteResume)
         }
         return leadSeconds >= pauseAheadSeconds || overByteBudget
+    }
+}
+
+/// Couples the PLAYER's steady-state forward-buffer appetite to the PRODUCER's byte ceiling
+/// (Beta 25 diag 6, 2026-08-22).
+///
+/// The two sides were tuned independently and never checked against each other. After the first rendered
+/// frame, `VortXRemuxForwardBufferPolicy.steadyStateSeconds` told AVPlayer to hold THIRTY seconds of media,
+/// while `maximumAheadBytes` (352 MiB) lets the producer keep only what fits one retained window share. On
+/// the Beta 25 field stream (~86.4 Mb/s, see `highThroughputProducerCannotConsumeTheRetainedWindowBudget`)
+/// that ceiling is ~34 s of media: after AVPlayer filled its own 30 s target, ONE more published segment
+/// (~6-12 s of media at 4K bitrates) crossed the byte cap and parked production. The playlist then froze
+/// until the playhead consumed a full segment, AVPlayer tipped into
+/// `AVPlayerWaitingToMinimizeStallsReason` on any jitter, and the stall watchdog remounted the whole remux -
+/// sixteen-plus times in one episode (diag 6, ~323 s of visible buffering).
+///
+/// The fix keeps the spool reservation algebra untouched (`maximumAheadBytes` stays exactly one window
+/// share, protecting the rewind floor) and instead sizes the player's ask to what production may legally
+/// supply: target = affordable seconds - one conservative EXT-X-TARGETDURATION of fetch/granularity margin,
+/// floored so an extreme-bitrate stream still gets a viable target rather than zero.
+enum VortXRemuxForwardBufferCoupling {
+    /// Fetch-latency + segment-granularity headroom demanded between the player target and the byte ceiling.
+    /// One conservative EXT-X-TARGETDURATION (12 s here): a parked-gap of up to one target must never reach
+    /// the playhead while AVPlayer still holds its full target.
+    static let safetySeconds: TimeInterval = 12
+    /// Floor for extreme bitrates, where even the ceiling affords little more than the margin itself. Well
+    /// above the 4 s startup floor, so the coupled target never drops below proven-startable territory.
+    static let minimumSteadyStateSeconds: TimeInterval = 8
+
+    /// Pure decision. Unknown bitrate or a non-positive budget fails OPEN to `unconstrainedDuration`
+    /// (today's behaviour), because a missing measurement must never shrink the player's buffer blindly.
+    static func steadyStateDuration(aheadByteBudget: Int,
+                                    observedBitsPerSecond: Double?,
+                                    unconstrainedDuration: TimeInterval) -> TimeInterval {
+        guard let bps = observedBitsPerSecond, bps > 0, bps.isFinite, aheadByteBudget > 0 else {
+            return unconstrainedDuration
+        }
+        let affordableSeconds = Double(aheadByteBudget) * 8 / bps
+        guard affordableSeconds.isFinite, affordableSeconds > 0 else { return unconstrainedDuration }
+        let capped = affordableSeconds - safetySeconds
+        guard capped < unconstrainedDuration else { return unconstrainedDuration }
+        return max(minimumSteadyStateSeconds, capped)
+    }
+
+    // MARK: Generation-owned retry (branch review finding 2)
+
+    /// The first rendered frame can beat the remux server's minimum sampling window (10 s of produced
+    /// media), and the HLS `signaling.bandwidth` may not be parsed yet either. A ONE-SHOT coupling at the
+    /// first-frame latch therefore missed permanently on fast starts and left the uncoupled 30 s ask in
+    /// place for the whole item. These constants bound the retry schedule that follows the latch instead.
+    static let maximumSampleAttempts = 5
+    static let sampleRetryIntervalSeconds: TimeInterval = 2
+
+    /// Coupling ownership for exactly one player-item generation. A replaced mount/item resets the attempt
+    /// budget and the estimate; stale callbacks from the old generation can never retune the new item.
+    /// `finished` latches the end of the schedule so steady-state ticks pay nothing.
+    struct AttemptState: Equatable {
+        let generation: UInt64
+        var attemptsUsed: Int
+        var bestBitsPerSecond: Double?
+        var finished: Bool = false
+
+        init(generation: UInt64 = 0, attemptsUsed: Int = 0, bestBitsPerSecond: Double? = nil) {
+            self.generation = generation
+            self.attemptsUsed = attemptsUsed
+            self.bestBitsPerSecond = bestBitsPerSecond
+        }
+    }
+
+    /// Monotonic estimate merge. An EARLY low sample must never pull the estimate down for a stream whose
+    /// later segments are materially larger (variable-bitrate sources), so the best-known value only ever
+    /// rises within one generation. The authoritative declared bandwidth participates on equal terms.
+    static func effectiveEstimate(observed: Double?, indicated: Double?, best: Double?) -> Double? {
+        [observed, indicated, best]
+            .compactMap { $0 }
+            .filter { $0.isFinite && $0 > 0 }
+            .max()
+    }
+
+    /// One step of the bounded retry. Returns the duration to apply NOW (nil = leave the item alone this
+    /// tick) and whether the schedule has finished for this generation. Fails OPEN: exhausting the attempts
+    /// without any usable estimate leaves today's base duration untouched.
+    static func nextCouplingAttempt(state: AttemptState,
+                                    currentGeneration: UInt64,
+                                    observedBitsPerSecond: Double?,
+                                    indicatedBitsPerSecond: Double?,
+                                    aheadByteBudget: Int,
+                                    baseDuration: TimeInterval)
+        -> (state: AttemptState, applyDuration: TimeInterval?, finished: Bool) {
+        var next = state.generation == currentGeneration
+            ? state
+            : AttemptState(generation: currentGeneration)
+        if next.finished { return (next, nil, true) }
+        let merged = effectiveEstimate(
+            observed: observedBitsPerSecond,
+            indicated: indicatedBitsPerSecond,
+            best: next.bestBitsPerSecond)
+        if let bps = merged {
+            next.bestBitsPerSecond = bps
+            next.finished = true
+            let duration = steadyStateDuration(
+                aheadByteBudget: aheadByteBudget,
+                observedBitsPerSecond: bps,
+                unconstrainedDuration: baseDuration)
+            return (next, duration, true)
+        }
+        if next.attemptsUsed + 1 >= maximumSampleAttempts {
+            next.finished = true
+            return (next, nil, true)
+        }
+        next.attemptsUsed += 1
+        return (next, nil, false)
     }
 }
 

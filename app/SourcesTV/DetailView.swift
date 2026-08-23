@@ -2660,9 +2660,10 @@ struct CoreStreamList: View {
         let addons = episodeStreamId.map { core.streamLoadProgress(forStreamId: $0) } ?? core.streamLoadProgress()
         let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
-        // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
-        // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
-        // button hostage: the timeout opens the gate anyway.
+        // Beta 25 diag 6: `watchReady` (full add-on settlement) no longer gates the Watch button itself -
+        // playable candidates existed ~7 s after open while settlement took ~26 s, stranding the page's
+        // only primary action behind a passive status view. It now gates only (a) the compact "Still
+        // ranking" indicator beside the early button and (b) the UNATTENDED auto-pick deadline below.
         let watchReady = sourceList.isSettled
         let actionState = TVDetailActionState(
             isLive: isLive,
@@ -2685,32 +2686,40 @@ struct CoreStreamList: View {
             // the source state changes from loading -> ready -> failed, so its focus target never disappears.
             TVDetailActionRow(accessibilityLabel: String(localized: "Playback and source actions"),
                               onMoveCommand: sourceMoveHandler(from: .primary, state: actionState)) {
-                if let best, watchReady {
-                    // Once the complete source set is settled this is the real primary action. While it
-                    // is settling, the branch below is a focusable status view rather than an announced
-                    // Button whose action would do nothing.
-                    Button { playBest(best, in: groups) } label: {
-                        // watchLabel derives from the EXACT stream this button plays, so it
-                        // can never promise a quality it doesn't deliver. A saved resume position
-                        // turns the lead-in into "Resume · 1:03" (playback already seeks there).
-                        let lead = resumeSeconds.flatMap(resumeTimecode).map { "\(String(localized: "Resume"))  ·  \($0)  ·  " } ?? String(localized: "Watch in ")
-                        Label { Text(verbatim: "\(lead)\(StreamRanking.watchLabel(best))") } icon: { Image(systemName: "play.fill") }
-                    }
-                    .buttonStyle(PrimaryActionStyle())
-                    .focused($watchFocused)   // FIX H: target of the page's default focus
-                } else if best != nil {
-                    // A best candidate exists, but the complete source set is still settling. Keep a
-                    // visible/focusable status target in the primary row without exposing an inert action.
+                if let best {
+                    // Beta 25 diag 6: playable candidates existed ~7 s after open, but full add-on settlement
+                    // took ~26 s, and gating this button on `sourceList.isSettled` left the page's ONLY
+                    // primary action a passive status view for that whole gap. The real button now appears
+                    // as soon as a ranked candidate exists; while ranking continues, a compact secondary
+                    // indicator beside it shows the progress. The pressed candidate is frozen by
+                    // `playBest`'s generation guard, and the UNATTENDED auto-pick keeps its own isSettled
+                    // deadline below, so early manual play cannot race the complete-set guarantee.
                     HStack(spacing: Theme.Space.sm) {
-                        ProgressView().tint(Theme.Palette.onAccent)
-                        Text(verbatim: String(localized: "Finding best…  \(addons.loaded)/\(addons.total)"))
+                        Button { playBest(best, in: groups) } label: {
+                            // Branch-review finding 5: `playBest` keeps the parallel CACHED-source race
+                            // (it exists to avoid serial debrid timeouts), so the committed source can be
+                            // a cached winner rather than this displayed candidate. The button therefore
+                            // makes NO source promise - generic "Watch"/"Resume · 1:03" only; naming a
+                            // specific quality here would let the press deliver something else.
+                            let lead = resumeSeconds.flatMap(resumeTimecode).map { timecode in
+                                String(localized: "Resume") + "  ·  " + timecode
+                            } ?? String(localized: "Watch")
+                            Label { Text(verbatim: lead) } icon: { Image(systemName: "play.fill") }
+                        }
+                        .buttonStyle(PrimaryActionStyle())
+                        .focused($watchFocused)   // FIX H: target of the page's default focus
+                        if !watchReady {
+                            HStack(spacing: Theme.Space.xs) {
+                                ProgressView()
+                                Text(verbatim: String(localized: "Still ranking \(addons.loaded)/\(addons.total)"))
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel(String(localized: "Still ranking sources"))
+                            .accessibilityHint(String(localized: "Watch plays the current best candidate now."))
+                        }
                     }
-                    .fixedSize(horizontal: true, vertical: false)
-                    .focusable()
-                    .focused($watchFocused)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityLabel(String(localized: "Finding best"))
-                    .accessibilityHint(String(localized: "Sources are still being ranked."))
                 } else if loadingAddons {
                     // The primary action slot remains present while sources are loading, so the source row's
                     // focus graph never points at a disappearing target. This is status, not a fake button.
@@ -3575,6 +3584,7 @@ struct CoreStreamList: View {
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
                                                     debridRef: ref, sourceStream: resumeSource,
+                                                    debridCachedHashes: debridCache.cachedHashes,
                                                     enginePlayerVideoId: engineVideoID,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
                                                     startAtSeconds: admittedStart.seconds)
@@ -3606,6 +3616,7 @@ struct CoreStreamList: View {
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 headers: win.stream.requestHeaders, debridRef: win.ref,
                                                 sourceStream: win.stream,
+                                                debridCachedHashes: debridCache.cachedHashes,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
                                                 startAtSeconds: admittedStart.seconds)
             return
@@ -3667,9 +3678,10 @@ struct CoreStreamList: View {
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders, debridRef: ref,
                                                 sourceStream: stream,
-                                                enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
-                                                startFromZero: fromStart,
-                                                startAtSeconds: admittedStart.seconds)
+                                            debridCachedHashes: debridCache.cachedHashes,
+                                            enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
+                                            startFromZero: fromStart,
+                                            startAtSeconds: admittedStart.seconds)
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3690,6 +3702,7 @@ struct CoreStreamList: View {
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders, sourceStream: stream,
+                                            debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,

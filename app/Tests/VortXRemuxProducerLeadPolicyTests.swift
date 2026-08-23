@@ -44,6 +44,9 @@ enum VortXRemuxProducerLeadPolicyTests {
         resumesOnlyOnceBelowTheResumeThreshold()
         nonFiniteLeadFailsClosedToCurrentState()
         boundaryConstantsHaveARealHysteresisGap()
+        byteHysteresisHasARealGap()
+        byteCapParkResumeRequiresMaterialDrain()
+        byteCapParksRegardlessOfLeadWhenAtCeiling()
         gateStartsUnpausedAndTracksSetPaused()
         gateSetPausedIsIdempotent()
         gateCancelForcesUnpausedAndSticks()
@@ -51,6 +54,12 @@ enum VortXRemuxProducerLeadPolicyTests {
         clocklessStartupStillHonoursByteReservation()
         monotonicLedgerRejectsStaleReceipts()
         anchorModeCannotBypassTheProducerGate()
+        couplesPlayerTargetUnderTheCeilingAtFieldBitrate()
+        leavesThirtySecondTargetWhenBudgetAffordsIt()
+        unknownBitrateKeepsCurrentBehaviour()
+        extremeBitrateRespectsTheViableFloor()
+        coupledTargetPlusMarginNeverReachesTheCeilingAcrossFieldBitrates()
+        fieldLoopSimulationOldTargetStarvesNewTargetDoesNot()
 
         print("===== FAILURES: \(failures) =====")
         exit(failures == 0 ? 0 : 1)
@@ -104,6 +113,41 @@ enum VortXRemuxProducerLeadPolicyTests {
               VortXRemuxProducerLeadPolicy.pauseAheadSeconds == 90)
         check("resume threshold is exactly 60s per the recovery policy",
               VortXRemuxProducerLeadPolicy.resumeBelowSeconds == 60)
+    }
+
+    static func byteHysteresisHasARealGap() {
+        check("byte resume line is strictly below the ceiling (no every-segment oscillation on the byte leg)",
+              VortXRemuxProducerLeadPolicy.byteResumeThreshold < VortXRemuxProducerLeadPolicy.maximumAheadBytes)
+        check("byte resume fraction is a real drain, not a symbolic constant",
+              VortXRemuxProducerLeadPolicy.byteResumeFraction > 0
+                && VortXRemuxProducerLeadPolicy.byteResumeFraction < 1)
+    }
+
+    static func byteCapParkResumeRequiresMaterialDrain() {
+        let ceiling = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        let resumeLine = VortXRemuxProducerLeadPolicy.byteResumeThreshold
+        // Parked because the byte cap fired with only a hair of margin: even once the TIME leg is satisfied
+        // (lead well under 60s) the byte leg must actually have drained below the resume line. One byte under
+        // the ceiling is NOT enough; this is the F3 sawtooth if it were.
+        check("byte-cap park stays paused at ceiling-1 even when the time leg is satisfied",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: ceiling - 1, currentlyPaused: true))
+        check("byte-cap park stays paused at the resume line (resume is STRICTLY below)",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: resumeLine, currentlyPaused: true))
+        check("byte-cap park resumes once the byte leg has drained below the resume line",
+              !VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: resumeLine - 1, currentlyPaused: true))
+        check("byte-cap park resumes once the byte leg is fully drained",
+              !VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 30, aheadBytes: 0, currentlyPaused: true))
+    }
+
+    static func byteCapParksRegardlessOfLeadWhenAtCeiling() {
+        check("at the ceiling, even a tiny lead force-parks (byte reservation is a hard floor)",
+              VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                leadSeconds: 10, aheadBytes: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                currentlyPaused: false))
     }
 
     static func gateStartsUnpausedAndTracksSetPaused() {
@@ -193,4 +237,164 @@ enum VortXRemuxProducerLeadPolicyTests {
         check("producer ledger never rolls its consumer frontier back", ledger.playbackSeconds == 8)
         check("producer ledger retains exactly the still-ahead byte reservation", ledger.outstandingBytes == 100)
     }
+
+    // MARK: - Player-target <-> producer-ceiling coupling (Beta 25 diag 6)
+
+    /// The declared field-stream bandwidth from the 86 Mb/s harness above.
+    private static let fieldBitsPerSecond = 86_444_640.0
+
+    static func couplesPlayerTargetUnderTheCeilingAtFieldBitrate() {
+        let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+            aheadByteBudget: budget,
+            observedBitsPerSecond: fieldBitsPerSecond,
+            unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+        let affordableSeconds = Double(budget) * 8 / fieldBitsPerSecond
+        check("field-bitrate target is capped below the unconstrained 30 s",
+              target < VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+        check("field-bitrate target leaves the full safety margin under the ceiling",
+              target + VortXRemuxForwardBufferCoupling.safetySeconds <= affordableSeconds)
+        check("field-bitrate target never falls under one full safety margin of media",
+              target >= VortXRemuxForwardBufferCoupling.minimumSteadyStateSeconds)
+    }
+
+    static func leavesThirtySecondTargetWhenBudgetAffordsIt() {
+        let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+            observedBitsPerSecond: 20_000_000,
+            unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+        check("20 Mb/s stream keeps the unconstrained 30 s target", target == 30)
+    }
+
+    static func unknownBitrateKeepsCurrentBehaviour() {
+        let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        for bps in [nil, 0.0 as Double?, .some(-1), .some(.nan), .some(.infinity)] {
+            let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+                aheadByteBudget: budget,
+                observedBitsPerSecond: bps,
+                unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+            check("unmeasurable bitrate fails open to 30 s", target == 30)
+        }
+        check("zero budget fails open too",
+              VortXRemuxForwardBufferCoupling.steadyStateDuration(
+                aheadByteBudget: 0,
+                observedBitsPerSecond: fieldBitsPerSecond,
+                unconstrainedDuration: 30) == 30)
+    }
+
+    static func extremeBitrateRespectsTheViableFloor() {
+        let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+            observedBitsPerSecond: 200_000_000,
+            unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+        check("200 Mb/s stream floors at the minimum viable target", target == 8)
+    }
+
+    static func coupledTargetPlusMarginNeverReachesTheCeilingAcrossFieldBitrates() {
+        // Across every bitrate where the margin itself still fits, target + safety must stay at or under
+        // what the producer ceiling affords. That invariant is exactly "AVPlayer's ask can no longer exceed
+        // production's legal supply".
+        for mbps in [50.0, 65.0, 86.44464, 98.0, 130.0] {
+            let bps = mbps * 1_000_000
+            let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+            let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+                aheadByteBudget: budget,
+                observedBitsPerSecond: bps,
+                unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+            let affordable = Double(budget) * 8 / bps
+            let floored = affordable - VortXRemuxForwardBufferCoupling.safetySeconds
+                < VortXRemuxForwardBufferCoupling.minimumSteadyStateSeconds
+            if !floored {
+                check("\(mbps) Mb/s: target + safety <= ceiling-affordable seconds",
+                      target + VortXRemuxForwardBufferCoupling.safetySeconds <= affordable + 0.000001)
+            } else {
+                check("\(mbps) Mb/s (floored): floor stays within affordable seconds",
+                      target <= affordable)
+            }
+        }
+    }
+
+    /// State-machine replay of the diag-6 loop (branch review finding 3: the configured target must CHANGE
+    /// behaviour, not just a subtraction). Modelled per one-second tick:
+    ///   - Producer publishes one 6-second segment when the gate allows, else stays parked.
+    ///   - Gate park/resume goes through the REAL `shouldPauseProducer` decision (byte cap + lead).
+    ///   - AVPlayer initiates whole-segment fetches only while its held buffer is UNDER its configured
+    ///     target, but an in-flight segment carries it PAST the preference (documented AVPlayer behaviour:
+    ///     preferredForwardBufferDuration gates initiation, not completion); it can never hold more than
+    ///     the produced lead.
+    ///   - Playhead consumption drains both the retained lead and the held buffer at 1x.
+    /// A stall fires when a PARKED playlist lets the player converge onto the frozen live edge
+    /// (held >= produced lead): AVPlayer has requested everything published and any jitter reaches it.
+    /// With the uncoupled 30 s target the target-gated fetch plus one-segment overshoot lands the held
+    /// buffer exactly on the parked live edge (reproducing diag 6); with the coupled target the same
+    /// machine keeps a multi-second cushion.
+    static func fieldLoopSimulationOldTargetStarvesNewTargetDoesNot() {
+        let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        let bytesPerSecond = fieldBitsPerSecond / 8
+        let segmentSeconds = 6.0
+        let segmentBytes = Int(bytesPerSecond * segmentSeconds)
+
+        func simulate(playerTargetSeconds: Double) -> Int {
+            var leadSeconds = 0.0        // retained, unconsumed produced media
+            var leadBytes = 0            // retained, unconsumed produced bytes
+            var unfetchedSegments = 0.0  // published but not yet pulled by AVPlayer
+            var heldSeconds = 0.0        // AVPlayer's forward buffer
+            var paused = false
+            var stalls = 0
+            var stalled = false
+            // 90 simulated minutes at one-second ticks.
+            for _ in 0..<5400 {
+                // 1x consumption drains the playhead-facing edges.
+                leadSeconds = max(0, leadSeconds - 1)
+                leadBytes = max(0, leadBytes - Int(bytesPerSecond))
+                heldSeconds = max(0, heldSeconds - 1)
+                // Producer side.
+                if !paused {
+                    leadSeconds += segmentSeconds
+                    leadBytes += segmentBytes
+                    unfetchedSegments += 1
+                }
+                paused = VortXRemuxProducerLeadPolicy.shouldPauseProducer(
+                    leadSeconds: leadSeconds,
+                    aheadBytes: leadBytes,
+                    currentlyPaused: paused)
+                // Player side: initiation is gated on the configured target; completion may overshoot it
+                // by the in-flight segment, bounded by what the producer has actually published.
+                if heldSeconds < playerTargetSeconds, unfetchedSegments >= 1 {
+                    unfetchedSegments -= 1
+                    heldSeconds = min(leadSeconds, heldSeconds + segmentSeconds)
+                }
+                // Stall: parked playlist AND the player caught the frozen live edge.
+                if paused {
+                    if heldSeconds >= leadSeconds - 0.001 {
+                        if !stalled { stalls += 1 }
+                        stalled = true
+                    } else {
+                        stalled = false
+                    }
+                } else {
+                    stalled = false
+                }
+            }
+            return stalls
+        }
+
+        let oldStalls = simulate(playerTargetSeconds: 30)
+        check("OLD uncoupled 30 s target: the player converges onto the parked live edge (reproduces diag 6)",
+              oldStalls > 0)
+
+        let newTarget = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+            aheadByteBudget: budget,
+            observedBitsPerSecond: fieldBitsPerSecond,
+            unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
+        let coupledStalls = simulate(playerTargetSeconds: newTarget)
+        check("COUPLED target: the player always keeps a cushion under the parked live edge",
+              coupledStalls == 0)
+    }
+}
+
+/// Harness-local stand-in for `VortXRemuxForwardBufferPolicy.steadyStateSeconds` so this file keeps compiling
+/// standalone (DVPlaybackPolicy.swift drags in UIKit/AVFoundation and cannot join the swiftc line).
+enum VortXRemuxForwardBufferCouplingStubs {
+    static let unconstrainedSteadyStateSeconds: TimeInterval = 30
 }

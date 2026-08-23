@@ -175,17 +175,13 @@ private struct StartupWiringRule {
             exactSection: """
             videoFrameEverProduced = true
             if isRemuxMounted {
-                let steadyDuration = VortXRemuxForwardBufferPolicy.preferredDuration(
-                    mount: forwardBufferMount,
-                    hasProducedFirstFrame: true)
-                if item?.preferredForwardBufferDuration != steadyDuration {
-                    item?.preferredForwardBufferDuration = steadyDuration
-                }
+                applyForwardBufferCouplingIfDue()
             }
             """,
-            mutationTarget: "if item?.preferredForwardBufferDuration != steadyDuration {",
-            mutationReplacement:
-                "if false && item?.preferredForwardBufferDuration != steadyDuration {"),
+            mutationTarget: "applyForwardBufferCouplingIfDue()",
+            mutationReplacement: "_ = isRemuxMounted",
+            secondaryMutationTarget: "if isRemuxMounted {",
+            secondaryMutationReplacement: "if false && isRemuxMounted {"),
         StartupWiringRule(
             name: "HDR replacement forward-buffer restore", usesServer: false,
             start: "freshItem.preferredForwardBufferDuration =",
@@ -256,10 +252,10 @@ private struct StartupWiringRule {
             mutationReplacement: "mount: .direct"),
         StartupWiringRule(
             name: "cohort successor publication", usesServer: true,
-            start: "if !engineReady,\n           consumptionAnchored,",
+            start: "if !isEngineReady,\n           consumptionAnchored,",
             end: "let ids = selectedVideo.segments.map(\\.id)",
             exactSection: """
-            if !engineReady,
+            if !isEngineReady,
                consumptionAnchored,
                highestServedVideoSegmentID < 0,
                !ended,
@@ -803,19 +799,19 @@ check("target authority: exact twelve is valid while malformed or over-twelve co
               adjacentIntervalsSeconds: [12.000_001])) == nil)
 let targetSevenReadiness = VortXHLSStartupReadiness(
     frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex))
-// The startup floor is a flat one-decodable-segment / six-second budget, decoupled from the frozen target: the
+// The startup floor is a flat one-decodable-segment / twelve-second budget, decoupled from the frozen target: the
 // 6-segment / 3x-target floor (36s at the conservative target) held every UHD master past the chrome's 10s
 // start watchdog and inflated the live window into the then-smaller session spool ceiling - the build 189
 // field regression, twice over.
-check("startup readiness: one independently decodable segment and six seconds are one immutable contract",
+check("startup readiness: one independently decodable segment and twelve seconds are one immutable contract",
       targetSevenReadiness == .init(
           frozenTarget: .init(seconds: 7, authority: .validatedCompleteIndex),
           minimumSegmentCount: 1))
-check("startup readiness: the startup floor is 6000 rendered milliseconds regardless of target",
-      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 6_000
+check("startup readiness: the startup floor is 12000 rendered milliseconds regardless of target",
+      targetSevenReadiness?.minimumRenderedDurationMilliseconds == 12_000
           && VortXHLSStartupReadiness(
               frozenTarget: VortXHLSTargetPolicy.conservativeTarget)?
-              .minimumRenderedDurationMilliseconds == 6_000)
+              .minimumRenderedDurationMilliseconds == 12_000)
 // The forward buffer starts at AVPlayer's readiness window; the publication floor deliberately sits ABOVE it
 // (readiness + 50%) so a startup cohort is never declined for want of a few milliseconds of media.
 check("startup forward buffer: local remux starts at the readiness window the publication floor exceeds",
@@ -860,11 +856,11 @@ check("startup forward buffer: memory pressure lowers oversized and system-selec
       VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
           currentDuration: 30,
           mount: .localRemux,
-          hasProducedFirstFrame: false) == 4
+          hasProducedFirstFrame: false) == 8
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 0,
               mount: .localRemux,
-              hasProducedFirstFrame: false) == 4
+              hasProducedFirstFrame: false) == 8
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 0,
               mount: .direct,
@@ -872,7 +868,7 @@ check("startup forward buffer: memory pressure lowers oversized and system-selec
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 0,
               mount: .remoteRemux,
-              hasProducedFirstFrame: false) == 4
+              hasProducedFirstFrame: false) == 8
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 2,
               mount: .remoteRemux,
@@ -880,7 +876,7 @@ check("startup forward buffer: memory pressure lowers oversized and system-selec
           && VortXRemuxForwardBufferPolicy.memoryWarningReplacementDuration(
               currentDuration: 30,
               mount: .remoteRemux,
-              hasProducedFirstFrame: false) == 4)
+              hasProducedFirstFrame: false) == 8)
 checkStartupProductionWiring()
 check("startup readiness: an unconsumed playlist exposes at most two startup segments",
       targetSevenReadiness?.maximumUnconsumedSegmentCount == 2
@@ -1170,20 +1166,49 @@ let fieldStartupFirstFourCohort = DVPlaybackPolicy.pinnedStartupCohort(
 check("startup readiness: the first four field segments total 5880ms and do not form a non-ended cohort",
       DVPlaybackPolicy.renderedDurationMilliseconds(of: fieldStartupFirstFour) == 5_880
           && fieldStartupFirstFourCohort == nil)
-let fieldStartupCohort = DVPlaybackPolicy.pinnedStartupCohort(
+// Beta 26 raised the publication floor to twelve seconds, so neither the five-segment (7130ms) nor
+// the full six-segment (8380ms) real field trace satisfies readiness on its own any more: short
+// cohorts must stay unfrozen until the floor is met rather than freezing early against the old
+// six-second budget.
+let fieldStartupFiveCohort = DVPlaybackPolicy.pinnedStartupCohort(
+    windows: [fieldStartupFirstFive],
+    ended: false,
+    minimumSegmentCount: targetSevenReadiness?.minimumSegmentCount ?? 0,
+    minimumRenderedDurationMilliseconds:
+        targetSevenReadiness?.minimumRenderedDurationMilliseconds ?? 0)
+let fieldStartupFullWindowCohort = DVPlaybackPolicy.pinnedStartupCohort(
     windows: [fieldStartupWindow],
     ended: false,
     minimumSegmentCount: targetSevenReadiness?.minimumSegmentCount ?? 0,
     minimumRenderedDurationMilliseconds:
         targetSevenReadiness?.minimumRenderedDurationMilliseconds ?? 0)
-check("startup readiness: the first five field segments total 7130ms and freeze the shortest five-segment cohort",
+check("startup readiness: the first five field segments total 7130ms and do not meet the twelve-second floor",
       DVPlaybackPolicy.renderedDurationMilliseconds(of: fieldStartupFirstFive) == 7_130
-          && fieldStartupCohort?.window.segments.map(\.id) == [0, 1, 2, 3, 4])
-check("startup readiness: the first field-shaped body includes segment five as growth evidence",
+          && fieldStartupFiveCohort == nil)
+check("startup readiness: the full six-segment field trace totals 8380ms and still forms no cohort",
+      DVPlaybackPolicy.renderedDurationMilliseconds(of: fieldStartupWindow) == 8_380
+          && fieldStartupFullWindowCohort == nil)
+let floorFieldCohortWindow = VortXHLSWindow(segments: (0..<6).map {
+    VortXHLSSegment(
+        id: $0,
+        byteOffset: $0 * 100,
+        byteLength: 100,
+        start: Double($0) * 4,
+        duration: 4)
+})
+let floorFieldCohort = DVPlaybackPolicy.pinnedStartupCohort(
+    windows: [floorFieldCohortWindow],
+    ended: false,
+    minimumSegmentCount: targetSevenReadiness?.minimumSegmentCount ?? 0,
+    minimumRenderedDurationMilliseconds:
+        targetSevenReadiness?.minimumRenderedDurationMilliseconds ?? 0)
+check("startup readiness: a three-segment cohort reaches the twelve-second floor and freezes",
+      floorFieldCohort?.window.segments.map(\.id) == [0, 1, 2])
+check("startup readiness: the frozen cohort carries one produced successor as growth evidence",
       targetSevenReadiness?.unconsumedStartupWindow(
-          fieldStartupWindow,
-          startupCohortCount: fieldStartupCohort?.window.segments.count ?? 0
-      ).segments.map(\.id) == [0, 1, 2, 3, 4, 5])
+          floorFieldCohortWindow,
+          startupCohortCount: floorFieldCohort?.window.segments.count ?? 0
+      ).segments.map(\.id) == [0, 1, 2, 3])
 check("startup readiness: a successor that is not produced yet is never invented",
       targetSevenReadiness?.unconsumedStartupWindow(
           fieldStartupFirstFive,

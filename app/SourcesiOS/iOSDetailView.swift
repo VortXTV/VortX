@@ -5645,7 +5645,9 @@ struct iOSSourceList: View {
                                 Text(progress.total > 0 ? "Finding best…  \(progress.loaded)/\(progress.total)" : "Finding best…")
                             }
                         } else {
-                            Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
+                            // Same contract as tvOS (branch-review finding 5): playBest races cached
+                            // candidates, so the committed source can differ from `best`. No source promise.
+                            Label("Watch", systemImage: "play.fill")
                         }
                     }
                     .buttonStyle(PrimaryActionStyle())

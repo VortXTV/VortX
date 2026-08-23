@@ -109,6 +109,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private let producerLeadLock = NSLock()
     private var producerLeadLedger = VortXRemuxProducerLeadLedger()
     private var lastProducerLeadPaused: Bool?
+    /// Cumulative produced-segment byte and media totals, sampled from the same producer-boundary receipts the
+    /// lead ledger consumes. Their ratio is the OBSERVED muxed-output bitrate that
+    /// `VortXRemuxForwardBufferCoupling` uses to keep AVPlayer's steady-state forward-buffer ask under the
+    /// producer's byte ceiling (Beta 25 diag 6). Video-segment bytes only: a separate audio rendition's bytes
+    /// are not counted while its aligned durations are, so the estimate understates true total bitrate by the
+    /// small audio share; the coupling's 12 s safety margin absorbs that by a wide margin.
+    private var couplingProducedBytes = 0
+    private var couplingProducedMediaSeconds: Double = 0
     /// Session-captured window-advancement policy (see `consumptionAnchorEnabled`).
     private let consumptionAnchored = VortXRemuxHLSServer.consumptionAnchorEnabled
     private var advertisedSubtitles: [SubtitleRenditionPolicy.Rendition] = []
@@ -615,6 +623,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Monotonic mount-to-now duration used for ready and first-frame timing receipts.
     var startupElapsedMilliseconds: Int { stream.startupElapsedMilliseconds }
 
+    /// Observed muxed-output bits per second over every produced segment so far, or nil before enough media
+    /// exists for a stable estimate. Feeds `VortXRemuxForwardBufferCoupling` at the engine's first-frame
+    /// latch: the coupled player target must be derived from what production ACTUALLY costs per second, not
+    /// from an assumed bitrate. nil also on retaining sessions, where the lead gate never parks and the
+    /// unconstrained steady-state target stays correct.
+    func observedSourceBitsPerSecond(minimumMediaSeconds: Double = 10) -> Double? {
+        producerLeadLock.lock(); defer { producerLeadLock.unlock() }
+        guard couplingProducedMediaSeconds >= minimumMediaSeconds,
+              couplingProducedBytes > 0 else { return nil }
+        return Double(couplingProducedBytes) * 8 / couplingProducedMediaSeconds
+    }
+
     /// The furthest SOURCE second a closed segment has been published for.
     ///
     /// On-device this is inferable from AVPlayer's own seekable ranges, so nothing reads it. A remote client
@@ -744,10 +764,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
         producerLeadLock.lock()
         if let producedReceipt {
+            let safeBytes = max(0, producedReceipt.byteLength)
             producerLeadLedger.recordProduced(.init(
                 id: producedReceipt.id,
                 end: producedReceipt.end,
-                byteLength: max(0, producedReceipt.byteLength)))
+                byteLength: safeBytes))
+            if producedReceipt.duration.isFinite, producedReceipt.duration > 0 {
+                couplingProducedMediaSeconds += producedReceipt.duration
+                couplingProducedBytes += safeBytes
+            }
         }
         if let playbackReceipt { producerLeadLedger.recordPlayback(playbackReceipt) }
         let producedEnd = producerLeadLedger.producedEnd
@@ -771,7 +796,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             engineReadyLock.lock(); let ready = engineReady; engineReadyLock.unlock()
             DiagnosticsLog.log(
                 "hls",
-                "producer lead gate=\(shouldPause ? "park" : "run") engineReady=\(ready) anchored=\(consumptionAnchored) retainsFullTimeline=\(retainsFullTimeline) edge=\(String(format: "%.3f", producedEnd)) playhead=\(playhead.isFinite ? String(format: "%.3f", playhead) : "unknown") lead=\((producedEnd - playhead).isFinite ? String(format: "%.3f", producedEnd - playhead) : "unknown") aheadBytes=\(aheadBytes) byteBudget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) segments=\(segmentCount)"
+                "producer lead gate=\(shouldPause ? "park" : "run") engineReady=\(ready) anchored=\(consumptionAnchored) retainsFullTimeline=\(retainsFullTimeline) edge=\(String(format: "%.3f", producedEnd)) playhead=\(playhead.isFinite ? String(format: "%.3f", playhead) : "unknown") lead=\((producedEnd - playhead).isFinite ? String(format: "%.3f", producedEnd - playhead) : "unknown") aheadBytes=\(aheadBytes) byteBudget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) segments=\(segmentCount) bps=\(observedSourceBitsPerSecond().map { Int($0.rounded()) }.map(String.init) ?? "unknown")"
             )
         }
     }
