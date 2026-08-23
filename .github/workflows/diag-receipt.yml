@@ -12,19 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     environment: release-approval
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Stage, promote, prove, and publish Beta 26.2 build 228
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
-          EXPECTED_ACTIVE: v0.3.14-beta.25:227:0bab693cbeb31cc909aae4a162f54bd7a2093c29ff2a980b0b8880bfda9b65e5
+          EXPECTED_ACTIVE: v0.3.14-beta.26.2:228:4cf6c804f828126b2fdfe5ff5767382d5ca10414db48f0814aa54b8e1e5e9ce4
         run: |
           set -euo pipefail
           [ -n "${RELEASE_FEED_RECEIPT_SECRET:-}" ] || { echo "::error::secret missing"; exit 1; }
-          mkdir feed-artifact && cd feed-artifact
-          gh api repos/VortXTV/VortX/actions/artifacts/9499957283/zip > artifact.zip
-          unzip -o -q artifact.zip && rm artifact.zip
-          GEN=$(jq -er '.generation' manifest.json)
-          RELEASE_ID=$(jq -er '.releaseId' manifest.json)
+          GEN=$(jq -er '.generation' regen-feed/manifest.json)
+          RELEASE_ID=$(jq -er '.releaseId' regen-feed/manifest.json)
           echo "generation=$GEN releaseId=$RELEASE_ID"
           IOS_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-iOS-v0.3.14-beta.26.2-ci.ipa")|.id')
           TVOS_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-tvOS-v0.3.14-beta.26.2-ci.ipa")|.id')
@@ -32,10 +30,9 @@ jobs:
           MAC_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="VortX-macOS-v0.3.14-beta.26.2-ci.dmg")|.id')
           CHECKSUM_ID=$(gh api repos/VortXTV/VortX/releases/375254899 --jq '.assets[]|select(.name=="SHA256SUMS-ci.txt")|.id')
           echo "assetIds ios=$IOS_ID tvos=$TVOS_ID lite=$LITE_ID mac=$MAC_ID checksum=$CHECKSUM_ID"
-          jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' manifest.json > receipt-manifest.json
+          jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' regen-feed/manifest.json > receipt-manifest.json
           # -n is REQUIRED: without a main input jq reads stdin and runs the filter zero times
-          jq -cn --slurpfile manifest receipt-manifest.json --rawfile source source.json --rawfile appcast appcast.json --rawfile checksum SHA256SUMS-ci.txt '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > ../feed-receipt.json
-          cd ..
+          jq -cn --slurpfile manifest receipt-manifest.json --rawfile source regen-feed/source.json --rawfile appcast regen-feed/appcast.json --rawfile checksum regen-feed/SHA256SUMS-ci.txt '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > ../feed-receipt.json
           BYTES=$(wc -c < feed-receipt.json | tr -d ' ')
           echo "receiptBytes=$BYTES"
           [ "$BYTES" -gt 10000 ] || { echo "::error::receipt construction produced empty output"; exit 1; }
@@ -74,7 +71,7 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch main "https://x-access-token:${GH_TOKEN}@github.com/VortXTV/VortX.git" repo
           cd repo
-          cp "$GITHUB_WORKSPACE/feed-artifact/source.json" altstore/source.json
+          cp "$GITHUB_WORKSPACE/regen-feed/source.json" altstore/source.json
           if git diff --quiet altstore/source.json; then echo "altstore/source.json already current"; exit 0; fi
           git config user.name "mamaclapper"
           git config user.email "50227842+mamaclapper@users.noreply.github.com"

@@ -1,0 +1,4 @@
+b95241571d57d4c502125cb3402d207765716dfb9cc20d0b9b3c2c897a030d6c  out/VortX-tvOS-ci.ipa
+b57e07a6ba6497b4e841baf370caacbcd8bdf2f875bdfc7ef2b0facf336619d5  out/VortX-tvOS-lite-ci.ipa
+ba7959ebcfe3e31b9cf3b3f60b70b1cb351ebbd585b9ea7efb74aebb5b2d8da8  out/VortX-iOS-ci.ipa
+86576295ddf2edfc321fae641fe966e189410304574ce65c3b8d607e176c8298  out/VortX-macOS-ci.dmg

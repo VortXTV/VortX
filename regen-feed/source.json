@@ -1,0 +1,187 @@
+{
+  "name": "VortX",
+  "identifier": "tv.vortx.altstore",
+  "subtitle": "Native streaming app for Apple, on stremio-core + libmpv.",
+  "iconURL": "https://raw.githubusercontent.com/VortXTV/VortX/main/docs/logo.png",
+  "website": "https://vortx.tv",
+  "tintColor": "C8A24B",
+  "apps": [
+    {
+      "name": "VortX",
+      "bundleIdentifier": "com.stremiox.app.native",
+      "developerName": "Mamaclapper",
+      "subtitle": "Stream movies and shows on iPhone and iPad.",
+      "localizedDescription": "VortX is a native, open-source streaming app for Apple devices, built on the official stremio-core engine and the libmpv player. Multi-profile, HDR and Dolby Vision, skip intro and outro, stream ranking, in-app add-ons and debrid keys, and more. Sideload-friendly: this source delivers one-tap updates so you never re-download an IPA by hand.",
+      "iconURL": "https://raw.githubusercontent.com/VortXTV/VortX/main/docs/logo.png",
+      "tintColor": "C8A24B",
+      "category": "entertainment",
+      "screenshotURLs": [],
+      "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "228",
+          "date": "2026-08-23",
+          "localizedDescription": "# VortX 0.3.14 Beta 26 (build 228)\n\nApple-first reliability release. The headline is the end of the repeating mid-playback stutter Apple TV owners were hitting under memory pressure. It also completes the zero-stall playback lane (the Beta 25 remux work, finished and merged), tightens debrid cached-source ranking and sync, gives the release feed proper HTTP caching, and lands the Android usenet + community-JavaScript-provider stacks in source. Android remains absent from this Apple sideload release.\n\n## What's new\n\n**The memory-pressure stutter is fixed.** On the Apple TV 4K, the device parks its available headroom at roughly 400-420 MiB - inside the band the app treats as \"pressured but recoverable\" - and tvOS posts an advisory memory warning every minute or two. The destructive cache-shed (drop buffers plus re-anchor seek) was fire-and-forget, so each warning ran it again: a burst of dropped frames and a visible stutter on a metronome, all episode long. That shed is now edge-triggered: it fires once when the app first enters the advisory band, then holds until headroom genuinely recovers above the restore bar (or you change title). Genuine low headroom never waits - the flush that keeps the app alive against memory pressure is untouched - and the ample-headroom regime behaves exactly as before. Apple TV, iPhone, iPad, and Mac.\n\n**Playback reliability (the Beta 25 remux work, now complete).** The zero-stall lane lands: the AVPlayer steady-state buffer is coupled to the remux producer's byte budget; the producer-lead park gate gets byte-level hysteresis; local-remux startup buffer rises to 8 s with a 12 s readiness floor; a seek-nudge tier and buffered-retirement gate run before any engine demote; a single same-engine playlist reload answers an otherwise-fatal mid-play CoreMedia -1008; and a proactive read-liveness soft-interrupt drives the remux input so playback does not drain into a stall. Apple TV, iPhone, iPad, and Mac.\n\n**Keep the prepared next episode across an engine demote.** Switching from AVPlayer to the mpv fallback used to drop the prepared next-episode source; it is now carried across, so auto-advance does not re-search cold. Apple TV, iPhone, iPad, and Mac.\n\n**Debrid cached sources rank and resolve faster.** A cached-source race is rank-sorted with an instant-URL short circuit, and the debrid-cache snapshot is threaded into the player's cached re-rank, so the right cached source surfaces first. Non-wanted add-on request budget is raised to avoid a false stall. Apple TV, iPhone, iPad, and Mac.\n\n**Last-stream memory is device-local on sync.** A watched position held in memory no longer bleeds across profile or device because it no longer rides into the account sync, so one device's in-progress title cannot overwrite another's. Apple TV, iPhone, iPad, and Mac.\n\n**TorBox circuits stop hammering a read-only cooldown.** A TorBox source that hits its quota now enters a cooldown fast-path and logs one suppression line per episode instead of re-asking on a loop. Apple TV, iPhone, iPad, and Mac.\n\n**Feed and update behavior.** Update eligibility is build-number-only (strict ordering, no legacy prerelease override); the release feed answers HEAD and honors If-None-Match with 304; and a prior-exit termination receipt is captured with MetricKit so a feed worker or app that died is recorded. All devices.\n\n**Android (in this build's source, not the Apple release).** Community JavaScript providers run again through a new QuickJS runtime and provider stack, and a usenet provider stack is wired into the debrid coordinator. These are the Android line; the Apple sideload release does not include them.\n\n## Please test\n\n- On the Apple TV, start a title and let it play for ten minutes or more, especially a 4K Dolby Vision or high-bitrate stream; confirm the repeated every-few-seconds stutter is gone.\n- Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play.\n- With Dolby Vision or MKV remux enabled, play for several minutes and confirm no repeating stall-and-jump.\n- Auto-advance between episodes and confirm the next episode starts without a cold search.\n- On a second profile or device, confirm a watched position is not written across.\n\nIf anything still fails, share the Diagnostics log (Settings > Diagnostics).\n\n## Install\n\n**Mac (.dmg, easiest, never expires).** Download `VortX-macOS-v0.3.14-beta.26-ci.dmg`, drag VortX into Applications, then clear Apple's one-time quarantine: open it once, click Done, then **System Settings > Privacy & Security > Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/VortX.app`). Full guide: **[Install on Mac](https://github.com/VortXTV/VortX/wiki/Install-on-Mac)**.\n\n**iPhone, iPad, Apple TV (sideload the IPA).** The IPAs are unsigned, because VortX is open-source and distributed outside the App Store with no Apple Developer ID yet, so you re-sign them yourself with Sideloadly, AltStore / SideStore, or Signulous. No jailbreak. For one-tap updates, add the VortX source to AltStore / SideStore or your sideloading service so new builds appear automatically: **`https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json`**. Full guide: **[Installing on iPhone, iPad, and Apple TV](https://github.com/VortXTV/VortX/wiki/Installing)**.\n\nEach Apple asset lists a SHA-256 checksum (`SHA256SUMS-ci.txt`) so you can confirm your download matches what the public [GitHub Actions workflow](https://github.com/VortXTV/VortX/tree/main/.github/workflows) built from this code.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.26.2/VortX-iOS-v0.3.14-beta.26.2-ci.ipa",
+          "size": 64615116,
+          "sha256": "ba7959ebcfe3e31b9cf3b3f60b70b1cb351ebbd585b9ea7efb74aebb5b2d8da8",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "227",
+          "date": "2026-08-22",
+          "localizedDescription": "# VortX 0.3.14 Beta 25 (build 227) Apple-only reliability release. It publishes the playback and Apple TV fixes prepared for Beta 19 (which was never made public) plus the source-picker, localization, and subtitle-hardening fixes. Android remains absent. ## What's new **Playback reliability (from the Beta 19 work).** Fixes the AVPlayer/libmpv/remux ownership races, the producer-lead stalls on Dolby Vision and high-bitrate 4K, the \"source failed\" fallback loops on TorBox/AIOStreams/AllDebrid, the repeating stall-and-jump pattern when Dolby Vision or MKV remux is on, and the duplicate subtitle flash. Apple TV, iPhone, iPad, and Mac. **Two-row Apple TV detail actions.** The detail page actions are now two semantic rows with single-line labels, a stable Library focus anchor, and predictable upward focus back to the title and menu bar, fixing the wrapped-button and focus-trap defects. Apple TV (full and Lite). **Audio-language filter in the source picker.** A new Audio control next to Quality filters and re-ranks the source list by audio language, session-scoped only, without changing your saved preference. Apple TV, iPhone, iPad, and Mac. **French catalog titles.** Home and Discover rows now translate catalog titles as whole phrases instead of word by word, so Popular Shows reads Séries populaires rather than Populaires émissions, and Featured Movies reads Films à la une. French. **External subtitles use the hardened transport on every player.** The built-in player's subtitle download now resolves the host once and connects only to the exact vetted address, with size limits and no redirects, matching the other player. Apple TV, iPhone, iPad, and Mac. **AltStore and SideStore updates propagate reliably.** Release promotion is transactional end to end, so build 227 should appear in the VortX source automatically. Apple TV, iPhone, iPad. ## Please test - Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play. - With Dolby Vision or MKV remux enabled, play for several minutes and confirm the repeating stall-and-jump pattern is gone. - On Apple TV, open a title and confirm the detail actions sit on two rows with single-line labels, and that Up returns you to the top and the menu bar. - Confirm external subtitles render once, without the repeated flash. - Pick an audio language in the source picker and confirm the list re-ranks. - On a French device, confirm catalog titles read naturally (Séries populaires, Films à la une). If anything still fails, share the Diagnostics log (Settings > Diagnostics). **Apple TV HD crash fix.** Fixes a crash a few seconds after playback started on some streams on Apple TV HD: the on-device trickplay frame capture could abort the process during Metal rendering on that device class. Capture is now skipped on those devices only; newer Apple TV models are unchanged. **Reinstalling a removed add-on works again.** Installing a previously removed add-on URL no longer fails with \"Install did not confirm\", and reconnecting a Stremio account now imports its add-ons again even if they were removed earlier in VortX. Removing an add-on still sticks against background sync.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.25/VortX-iOS-v0.3.14-beta.25-ci.ipa",
+          "size": 64369656,
+          "sha256": "725db244532ea464168113288576fb7b6bb8a6d907ab75fca2f4def0c6a3b624",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "220",
+          "date": "2026-08-20",
+          "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-iOS-v0.3.14-beta.18-ci.ipa",
+          "size": 64243010,
+          "sha256": "3feab87f4d005f1726b7c0a0bc83225478907b59bbc2fe54a6fdbd0855618596",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "219",
+          "date": "2026-08-20",
+          "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-iOS-v0.3.14-beta.17-ci.ipa",
+          "size": 64227247,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "218",
+          "date": "2026-08-19",
+          "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-iOS-v0.3.14-beta.16-ci.ipa",
+          "size": 64182016,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "217",
+          "date": "2026-08-16",
+          "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. Streams that spun forever now recover on their own, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. Trakt sign-in works again, no app update needed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-iOS-v0.3.14-beta.15-ci.ipa",
+          "size": 64172346,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "216",
+          "date": "2026-08-11",
+          "localizedDescription": "0.3.14 Beta 14. The big one since Beta 12. The playback-stability campaign that fixes the Beta 12 constant-buffering regression plus a long list of stalls, freezes, and crashes traced on real Apple devices, a full account and credential security pass, audio and Continue Watching fixes, and deeper diagnostics. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.14/VortX-iOS-v0.3.14-beta.14-ci.ipa",
+          "size": 64137204,
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "207",
+          "date": "2026-08-01",
+          "localizedDescription": "0.3.14 Beta 12. Two hotfixes over Beta 10. The app opens again: a keychain locking deadlock that froze the splash screen on signed-in installs (worst on Apple TV) is fixed. External debrid playback works again: a TLS enforcement shipped with no certificate trust store, which blocked every Real-Debrid and TorBox source while local torrents played, is removed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.12/VortX-iOS-v0.3.14-beta.12-ci.ipa",
+          "size": 63340937,
+          "minOSVersion": "16.0"
+        }
+      ]
+    },
+    {
+      "name": "VortX (Apple TV)",
+      "bundleIdentifier": "com.stremiox.tv",
+      "developerName": "Mamaclapper",
+      "subtitle": "Stream movies and shows on Apple TV.",
+      "localizedDescription": "VortX for Apple TV: a native, open-source streaming app on the official stremio-core engine and the libmpv player, with an in-process streaming server for torrents. HDR and Dolby Vision, Dolby Atmos passthrough, stream ranking, in-app add-ons and debrid keys, Top Shelf, and more. This source delivers one-tap updates so you never sideload an IPA by hand.",
+      "iconURL": "https://raw.githubusercontent.com/VortXTV/VortX/main/docs/logo.png",
+      "tintColor": "C8A24B",
+      "category": "entertainment",
+      "screenshotURLs": [],
+      "versions": [
+        {
+          "version": "0.3.14",
+          "buildVersion": "228",
+          "date": "2026-08-23",
+          "localizedDescription": "# VortX 0.3.14 Beta 26 (build 228)\n\nApple-first reliability release. The headline is the end of the repeating mid-playback stutter Apple TV owners were hitting under memory pressure. It also completes the zero-stall playback lane (the Beta 25 remux work, finished and merged), tightens debrid cached-source ranking and sync, gives the release feed proper HTTP caching, and lands the Android usenet + community-JavaScript-provider stacks in source. Android remains absent from this Apple sideload release.\n\n## What's new\n\n**The memory-pressure stutter is fixed.** On the Apple TV 4K, the device parks its available headroom at roughly 400-420 MiB - inside the band the app treats as \"pressured but recoverable\" - and tvOS posts an advisory memory warning every minute or two. The destructive cache-shed (drop buffers plus re-anchor seek) was fire-and-forget, so each warning ran it again: a burst of dropped frames and a visible stutter on a metronome, all episode long. That shed is now edge-triggered: it fires once when the app first enters the advisory band, then holds until headroom genuinely recovers above the restore bar (or you change title). Genuine low headroom never waits - the flush that keeps the app alive against memory pressure is untouched - and the ample-headroom regime behaves exactly as before. Apple TV, iPhone, iPad, and Mac.\n\n**Playback reliability (the Beta 25 remux work, now complete).** The zero-stall lane lands: the AVPlayer steady-state buffer is coupled to the remux producer's byte budget; the producer-lead park gate gets byte-level hysteresis; local-remux startup buffer rises to 8 s with a 12 s readiness floor; a seek-nudge tier and buffered-retirement gate run before any engine demote; a single same-engine playlist reload answers an otherwise-fatal mid-play CoreMedia -1008; and a proactive read-liveness soft-interrupt drives the remux input so playback does not drain into a stall. Apple TV, iPhone, iPad, and Mac.\n\n**Keep the prepared next episode across an engine demote.** Switching from AVPlayer to the mpv fallback used to drop the prepared next-episode source; it is now carried across, so auto-advance does not re-search cold. Apple TV, iPhone, iPad, and Mac.\n\n**Debrid cached sources rank and resolve faster.** A cached-source race is rank-sorted with an instant-URL short circuit, and the debrid-cache snapshot is threaded into the player's cached re-rank, so the right cached source surfaces first. Non-wanted add-on request budget is raised to avoid a false stall. Apple TV, iPhone, iPad, and Mac.\n\n**Last-stream memory is device-local on sync.** A watched position held in memory no longer bleeds across profile or device because it no longer rides into the account sync, so one device's in-progress title cannot overwrite another's. Apple TV, iPhone, iPad, and Mac.\n\n**TorBox circuits stop hammering a read-only cooldown.** A TorBox source that hits its quota now enters a cooldown fast-path and logs one suppression line per episode instead of re-asking on a loop. Apple TV, iPhone, iPad, and Mac.\n\n**Feed and update behavior.** Update eligibility is build-number-only (strict ordering, no legacy prerelease override); the release feed answers HEAD and honors If-None-Match with 304; and a prior-exit termination receipt is captured with MetricKit so a feed worker or app that died is recorded. All devices.\n\n**Android (in this build's source, not the Apple release).** Community JavaScript providers run again through a new QuickJS runtime and provider stack, and a usenet provider stack is wired into the debrid coordinator. These are the Android line; the Apple sideload release does not include them.\n\n## Please test\n\n- On the Apple TV, start a title and let it play for ten minutes or more, especially a 4K Dolby Vision or high-bitrate stream; confirm the repeated every-few-seconds stutter is gone.\n- Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play.\n- With Dolby Vision or MKV remux enabled, play for several minutes and confirm no repeating stall-and-jump.\n- Auto-advance between episodes and confirm the next episode starts without a cold search.\n- On a second profile or device, confirm a watched position is not written across.\n\nIf anything still fails, share the Diagnostics log (Settings > Diagnostics).\n\n## Install\n\n**Mac (.dmg, easiest, never expires).** Download `VortX-macOS-v0.3.14-beta.26-ci.dmg`, drag VortX into Applications, then clear Apple's one-time quarantine: open it once, click Done, then **System Settings > Privacy & Security > Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/VortX.app`). Full guide: **[Install on Mac](https://github.com/VortXTV/VortX/wiki/Install-on-Mac)**.\n\n**iPhone, iPad, Apple TV (sideload the IPA).** The IPAs are unsigned, because VortX is open-source and distributed outside the App Store with no Apple Developer ID yet, so you re-sign them yourself with Sideloadly, AltStore / SideStore, or Signulous. No jailbreak. For one-tap updates, add the VortX source to AltStore / SideStore or your sideloading service so new builds appear automatically: **`https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json`**. Full guide: **[Installing on iPhone, iPad, and Apple TV](https://github.com/VortXTV/VortX/wiki/Installing)**.\n\nEach Apple asset lists a SHA-256 checksum (`SHA256SUMS-ci.txt`) so you can confirm your download matches what the public [GitHub Actions workflow](https://github.com/VortXTV/VortX/tree/main/.github/workflows) built from this code.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.26.2/VortX-tvOS-v0.3.14-beta.26.2-ci.ipa",
+          "size": 64117046,
+          "sha256": "b95241571d57d4c502125cb3402d207765716dfb9cc20d0b9b3c2c897a030d6c",
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "227",
+          "date": "2026-08-22",
+          "localizedDescription": "# VortX 0.3.14 Beta 25 (build 227) Apple-only reliability release. It publishes the playback and Apple TV fixes prepared for Beta 19 (which was never made public) plus the source-picker, localization, and subtitle-hardening fixes. Android remains absent. ## What's new **Playback reliability (from the Beta 19 work).** Fixes the AVPlayer/libmpv/remux ownership races, the producer-lead stalls on Dolby Vision and high-bitrate 4K, the \"source failed\" fallback loops on TorBox/AIOStreams/AllDebrid, the repeating stall-and-jump pattern when Dolby Vision or MKV remux is on, and the duplicate subtitle flash. Apple TV, iPhone, iPad, and Mac. **Two-row Apple TV detail actions.** The detail page actions are now two semantic rows with single-line labels, a stable Library focus anchor, and predictable upward focus back to the title and menu bar, fixing the wrapped-button and focus-trap defects. Apple TV (full and Lite). **Audio-language filter in the source picker.** A new Audio control next to Quality filters and re-ranks the source list by audio language, session-scoped only, without changing your saved preference. Apple TV, iPhone, iPad, and Mac. **French catalog titles.** Home and Discover rows now translate catalog titles as whole phrases instead of word by word, so Popular Shows reads Séries populaires rather than Populaires émissions, and Featured Movies reads Films à la une. French. **External subtitles use the hardened transport on every player.** The built-in player's subtitle download now resolves the host once and connects only to the exact vetted address, with size limits and no redirects, matching the other player. Apple TV, iPhone, iPad, and Mac. **AltStore and SideStore updates propagate reliably.** Release promotion is transactional end to end, so build 227 should appear in the VortX source automatically. Apple TV, iPhone, iPad. ## Please test - Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play. - With Dolby Vision or MKV remux enabled, play for several minutes and confirm the repeating stall-and-jump pattern is gone. - On Apple TV, open a title and confirm the detail actions sit on two rows with single-line labels, and that Up returns you to the top and the menu bar. - Confirm external subtitles render once, without the repeated flash. - Pick an audio language in the source picker and confirm the list re-ranks. - On a French device, confirm catalog titles read naturally (Séries populaires, Films à la une). If anything still fails, share the Diagnostics log (Settings > Diagnostics). **Apple TV HD crash fix.** Fixes a crash a few seconds after playback started on some streams on Apple TV HD: the on-device trickplay frame capture could abort the process during Metal rendering on that device class. Capture is now skipped on those devices only; newer Apple TV models are unchanged. **Reinstalling a removed add-on works again.** Installing a previously removed add-on URL no longer fails with \"Install did not confirm\", and reconnecting a Stremio account now imports its add-ons again even if they were removed earlier in VortX. Removing an add-on still sticks against background sync.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.25/VortX-tvOS-v0.3.14-beta.25-ci.ipa",
+          "size": 63867930,
+          "sha256": "d72233a5b40604c912748f1f8ed387cda730b274fa555e9b059a9f488fca13aa",
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "220",
+          "date": "2026-08-20",
+          "localizedDescription": "Re-find sources when a title's links go stale, plus a 4K HDR seek-stutter fix.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-tvOS-v0.3.14-beta.18-ci.ipa",
+          "size": 63680653,
+          "sha256": "ea22ad198314a0425ccb589caa3e797c3c8db91c697930cb24881e6f382eb76e",
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "219",
+          "date": "2026-08-20",
+          "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-tvOS-v0.3.14-beta.17-ci.ipa",
+          "size": 63660824,
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "218",
+          "date": "2026-08-19",
+          "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-tvOS-v0.3.14-beta.16-ci.ipa",
+          "size": 63617303,
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "217",
+          "date": "2026-08-16",
+          "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. On Apple TV a stream that froze mid-play now recovers on its own instead of spinning forever, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-tvOS-v0.3.14-beta.15-ci.ipa",
+          "size": 63601691,
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "216",
+          "date": "2026-08-11",
+          "localizedDescription": "0.3.14 Beta 14. The big one since Beta 12. The playback-stability campaign that fixes the Beta 12 constant-buffering regression on Apple TV plus a long list of stalls, freezes, and crashes traced on real Apple TVs, a full account and credential security pass, audio and Continue Watching fixes, and deeper diagnostics. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.14/VortX-tvOS-v0.3.14-beta.14-ci.ipa",
+          "size": 63561827,
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "207",
+          "date": "2026-08-01",
+          "localizedDescription": "0.3.14 Beta 12. Two hotfixes over Beta 10. The app opens again: a keychain locking deadlock that froze the splash screen on signed-in installs (worst on Apple TV) is fixed. External debrid playback works again: a TLS enforcement shipped with no certificate trust store, which blocked every Real-Debrid and TorBox source while local torrents played, is removed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.12/VortX-tvOS-v0.3.14-beta.12-ci.ipa",
+          "size": 62894628,
+          "minOSVersion": "18.0"
+        }
+      ]
+    }
+  ],
+  "news": []
+}

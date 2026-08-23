@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 2,
+  "tag": "v0.3.14-beta.26.2",
+  "build": 228,
+  "version": "0.3.14",
+  "name": "VortX 0.3.14 Beta 26",
+  "notes": "# VortX 0.3.14 Beta 26 (build 228)\n\nApple-first reliability release. The headline is the end of the repeating mid-playback stutter Apple TV owners were hitting under memory pressure. It also completes the zero-stall playback lane (the Beta 25 remux work, finished and merged), tightens debrid cached-source ranking and sync, gives the release feed proper HTTP caching, and lands the Android usenet + community-JavaScript-provider stacks in source. Android remains absent from this Apple sideload release.\n\n## What's new\n\n**The memory-pressure stutter is fixed.** On the Apple TV 4K, the device parks its available headroom at roughly 400-420 MiB - inside the band the app treats as \"pressured but recoverable\" - and tvOS posts an advisory memory warning every minute or two. The destructive cache-shed (drop buffers plus re-anchor seek) was fire-and-forget, so each warning ran it again: a burst of dropped frames and a visible stutter on a metronome, all episode long. That shed is now edge-triggered: it fires once when the app first enters the advisory band, then holds until headroom genuinely recovers above the restore bar (or you change title). Genuine low headroom never waits - the flush that keeps the app alive against memory pressure is untouched - and the ample-headroom regime behaves exactly as before. Apple TV, iPhone, iPad, and Mac.\n\n**Playback reliability (the Beta 25 remux work, now complete).** The zero-stall lane lands: the AVPlayer steady-state buffer is coupled to the remux producer's byte budget; the producer-lead park gate gets byte-level hysteresis; local-remux startup buffer rises to 8 s with a 12 s readiness floor; a seek-nudge tier and buffered-retirement gate run before any engine demote; a single same-engine playlist reload answers an otherwise-fatal mid-play CoreMedia -1008; and a proactive read-liveness soft-interrupt drives the remux input so playback does not drain into a stall. Apple TV, iPhone, iPad, and Mac.\n\n**Keep the prepared next episode across an engine demote.** Switching from AVPlayer to the mpv fallback used to drop the prepared next-episode source; it is now carried across, so auto-advance does not re-search cold. Apple TV, iPhone, iPad, and Mac.\n\n**Debrid cached sources rank and resolve faster.** A cached-source race is rank-sorted with an instant-URL short circuit, and the debrid-cache snapshot is threaded into the player's cached re-rank, so the right cached source surfaces first. Non-wanted add-on request budget is raised to avoid a false stall. Apple TV, iPhone, iPad, and Mac.\n\n**Last-stream memory is device-local on sync.** A watched position held in memory no longer bleeds across profile or device because it no longer rides into the account sync, so one device's in-progress title cannot overwrite another's. Apple TV, iPhone, iPad, and Mac.\n\n**TorBox circuits stop hammering a read-only cooldown.** A TorBox source that hits its quota now enters a cooldown fast-path and logs one suppression line per episode instead of re-asking on a loop. Apple TV, iPhone, iPad, and Mac.\n\n**Feed and update behavior.** Update eligibility is build-number-only (strict ordering, no legacy prerelease override); the release feed answers HEAD and honors If-None-Match with 304; and a prior-exit termination receipt is captured with MetricKit so a feed worker or app that died is recorded. All devices.\n\n**Android (in this build's source, not the Apple release).** Community JavaScript providers run again through a new QuickJS runtime and provider stack, and a usenet provider stack is wired into the debrid coordinator. These are the Android line; the Apple sideload release does not include them.\n\n## Please test\n\n- On the Apple TV, start a title and let it play for ten minutes or more, especially a 4K Dolby Vision or high-bitrate stream; confirm the repeated every-few-seconds stutter is gone.\n- Play sources from TorBox, AIOStreams, or AllDebrid that failed before and confirm they play.\n- With Dolby Vision or MKV remux enabled, play for several minutes and confirm no repeating stall-and-jump.\n- Auto-advance between episodes and confirm the next episode starts without a cold search.\n- On a second profile or device, confirm a watched position is not written across.\n\nIf anything still fails, share the Diagnostics log (Settings > Diagnostics).\n\n## Install\n\n**Mac (.dmg, easiest, never expires).** Download `VortX-macOS-v0.3.14-beta.26-ci.dmg`, drag VortX into Applications, then clear Apple's one-time quarantine: open it once, click Done, then **System Settings > Privacy & Security > Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/VortX.app`). Full guide: **[Install on Mac](https://github.com/VortXTV/VortX/wiki/Install-on-Mac)**.\n\n**iPhone, iPad, Apple TV (sideload the IPA).** The IPAs are unsigned, because VortX is open-source and distributed outside the App Store with no Apple Developer ID yet, so you re-sign them yourself with Sideloadly, AltStore / SideStore, or Signulous. No jailbreak. For one-tap updates, add the VortX source to AltStore / SideStore or your sideloading service so new builds appear automatically: **`https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json`**. Full guide: **[Installing on iPhone, iPad, and Apple TV](https://github.com/VortXTV/VortX/wiki/Installing)**.\n\nEach Apple asset lists a SHA-256 checksum (`SHA256SUMS-ci.txt`) so you can confirm your download matches what the public [GitHub Actions workflow](https://github.com/VortXTV/VortX/tree/main/.github/workflows) built from this code.",
+  "prerelease": true,
+  "sourceCommit": "1a05f6c884a303ad022bd4b6c716a63fcdd7cf7b",
+  "releaseId": "375254899",
+  "generation": "v0.3.14-beta.26.2:228:4b5adc7d66b9fa26dd75e4e1b0e43d1ad4e856060c74b6cad4186d712be61626",
+  "feedSha256": "4b5adc7d66b9fa26dd75e4e1b0e43d1ad4e856060c74b6cad4186d712be61626",
+  "sourceSha256": "789465a12b1c67c1d4752f5521187bd9dab45768d0b32615d03bf6a6b95a511f",
+  "appcastSha256": "19ba5cbfc84b3e9062fbb01db32fc14654350347a91e51ea0dc53b949013a43e",
+  "checksumSha256": "d13f027d1787517dbbf3288d55e7c5daa82a2a9694151dfcc67df322a10665b1",
+  "assets": {
+    "ios": {
+      "name": "VortX-iOS-v0.3.14-beta.26.2-ci.ipa",
+      "checksumName": "VortX-iOS-ci.ipa",
+      "url": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.26.2/VortX-iOS-v0.3.14-beta.26.2-ci.ipa",
+      "size": 64615116,
+      "sha256": "ba7959ebcfe3e31b9cf3b3f60b70b1cb351ebbd585b9ea7efb74aebb5b2d8da8",
+      "state": "trusted-local",
+      "assetId": null
+    },
+    "tvos": {
+      "name": "VortX-tvOS-v0.3.14-beta.26.2-ci.ipa",
+      "checksumName": "VortX-tvOS-ci.ipa",
+      "url": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.26.2/VortX-tvOS-v0.3.14-beta.26.2-ci.ipa",
+      "size": 64117046,
+      "sha256": "b95241571d57d4c502125cb3402d207765716dfb9cc20d0b9b3c2c897a030d6c",
+      "state": "trusted-local",
+      "assetId": null
+    },
+    "tvosLite": {
+      "name": "VortX-tvOS-lite-v0.3.14-beta.26.2-ci.ipa",
+      "checksumName": "VortX-tvOS-lite-ci.ipa",
+      "url": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.26.2/VortX-tvOS-lite-v0.3.14-beta.26.2-ci.ipa",
+      "size": 37423847,
+      "sha256": "b57e07a6ba6497b4e841baf370caacbcd8bdf2f875bdfc7ef2b0facf336619d5",
+      "state": "trusted-local",
+      "assetId": null
+    },
+    "mac": {
+      "name": "VortX-macOS-v0.3.14-beta.26.2-ci.dmg",
+      "checksumName": "VortX-macOS-ci.dmg",
+      "url": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.26.2/VortX-macOS-v0.3.14-beta.26.2-ci.dmg",
+      "size": 85729246,
+      "sha256": "86576295ddf2edfc321fae641fe966e189410304574ce65c3b8d607e176c8298",
+      "state": "trusted-local",
+      "assetId": null
+    }
+  },
+  "android": null
+}
