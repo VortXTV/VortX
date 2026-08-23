@@ -138,6 +138,13 @@ enum VortXCrashReporter {
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         return caches.appendingPathComponent("vortx-lastcrash.txt")
     }
+
+    /// True while a captured-but-unfolded crash marker is on disk. TerminationReceipt.classify
+    /// reads this BEFORE install() folds (and deletes) the marker, so a real crash is attributed
+    /// to `.crash` rather than guessed as a foreground kill from phase heuristics.
+    static var pendingCrashMarkerExists: Bool {
+        FileManager.default.fileExists(atPath: markerURL.path)
+    }
 }
 
 // MARK: - Process-wide state (allocated once in install(); the handler only READS these)

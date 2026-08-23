@@ -47,6 +47,10 @@ run read-liveness-policy \
   app/Sources/Player/VortXRemuxReadLivenessPolicy.swift \
   app/Tests/VortXRemuxReadLivenessPolicyTests.swift
 
+run termination-receipt-policy \
+  app/SourcesShared/TerminationReceiptPolicy.swift \
+  app/Tests/TerminationReceiptPolicyTests.swift
+
 run producer-lead-policy \
   app/Sources/Player/VortXRemuxBuffer.swift \
   app/Sources/Player/VortXRemuxProducerLeadPolicy.swift \

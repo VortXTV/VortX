@@ -58,6 +58,8 @@ struct VortXiOSApp: App {
         // The owner cannot easily pull .ips reports off a sideloaded device, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
         VortXCrashReporter.install()
+        // Prior-launch termination evidence (jetsam vs watchdog vs clean exit). See TerminationReceipt.
+        TerminationReceipt.install()
         // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
         VXProbeHeartbeat.start()
@@ -105,6 +107,14 @@ struct VortXiOSApp: App {
         WindowGroup {
             iOSRootView()
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
+                    // Termination evidence: keep the receipt's last-known phase current so the next
+                    // launch can distinguish a backgrounded jetsam kill from a foreground kill.
+                    switch phase {
+                    case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
+                    case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
+                    case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
+                    @unknown default: break
+                    }
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
                         // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero

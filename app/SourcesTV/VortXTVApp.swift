@@ -51,6 +51,9 @@ struct VortXTVApp: App {
         // A sideloaded Apple TV cannot hand its .ips reports to the owner, so the app writes its own: a
         // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
         VortXCrashReporter.install()
+        // Prior-launch termination evidence: folds how the PREVIOUS run ended into the probe log,
+        // then keeps this session's receipt fresh (phase + 60 s heartbeat + memory warnings).
+        TerminationReceipt.install()
         // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise. tvOS was the ONE
         // target that never armed it (iOS/macOS both did), so a tvOS probe log had no per-second record of
@@ -136,6 +139,14 @@ struct VortXTVApp: App {
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
+                // Termination evidence: keep the receipt's last-known phase current so the next
+                // launch can distinguish a backgrounded jetsam kill from a foreground kill.
+                switch phase {
+                case .active: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseActive)
+                case .inactive: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseInactive)
+                case .background: TerminationReceipt.note(phase: TerminationReceiptPolicy.phaseBackground)
+                @unknown default: break
+                }
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
                     // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero call
