@@ -4,6 +4,29 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 26 (build 228)
+
+### Apple: the memory-pressure stutter fix and the completed zero-stall lane
+
+**The memory-pressure stutter is fixed.** On Apple TV the device often parks its available memory headroom at roughly 400-420 MiB, inside the band the app treats as "pressured but recoverable," and tvOS posts an advisory memory warning every minute or two. The destructive cache-shed (drop buffers plus re-anchor seek) was fire-and-forget, so each warning ran it again, producing a stutter on a metronome all episode long. That shed is now edge-triggered: it fires once when the app first enters the advisory band, then holds until headroom genuinely recovers above the restore bar (or you change title). Genuine low headroom never waits, and the ample-headroom regime behaves exactly as before. Apple TV, iPhone, iPad, and Mac.
+
+**The zero-stall playback lane is complete.** The Beta 25 remux work ships: the AVPlayer steady-state buffer is coupled to the remux producer's byte budget; the producer-lead park gate gets byte-level hysteresis; local-remux startup buffer rises to 8 s with a 12 s readiness floor; a seek-nudge tier and buffered-retirement gate run before any engine demote; a single same-engine playlist reload answers an otherwise-fatal mid-play CoreMedia -1008; and a proactive read-liveness soft-interrupt drives the remux input. Apple TV, iPhone, iPad, and Mac.
+
+**Keep the prepared next episode across an engine demote.** Switching from AVPlayer to the mpv fallback no longer drops the prepared next-episode source, so auto-advance does not re-search cold. Apple TV, iPhone, iPad, and Mac.
+
+**Debrid cached sources rank and resolve faster.** A cached-source race is rank-sorted with an instant-URL short circuit and the debrid-cache snapshot is threaded into the player's cached re-rank; non-wanted add-on request budget is raised to avoid a false stall. Apple TV, iPhone, iPad, and Mac.
+
+**Last-stream memory is device-local on sync.** A watched position held in memory no longer climbs into the account sync, so one device's in-progress title cannot overwrite another's. Apple TV, iPhone, iPad, and Mac.
+
+**TorBox circuits stop hammering a read-only cooldown.** A TorBox source that hits its quota enters a cooldown fast-path and logs one suppression line per episode. Apple TV, iPhone, iPad, and Mac.
+
+**Feed and update behavior.** Update eligibility is build-number-only (strict ordering, no legacy prerelease override); the release feed answers HEAD and honors If-None-Match with 304; and a prior-exit termination receipt is captured with MetricKit. All devices.
+
+### Under the hood
+
+- Community JavaScript providers run again through a new QuickJS runtime and provider stack, and a usenet provider stack is wired into the debrid coordinator (Android line, not in the Apple sideload build).
+
+
 ## 0.3.14 (unreleased)
 
 ### Apple: source picker, localization, and subtitle hardening
