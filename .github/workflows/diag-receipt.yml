@@ -32,7 +32,7 @@ jobs:
           echo "assetIds ios=$IOS_ID tvos=$TVOS_ID lite=$LITE_ID mac=$MAC_ID checksum=$CHECKSUM_ID"
           jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' regen-feed/manifest.json > receipt-manifest.json
           # -n is REQUIRED: without a main input jq reads stdin and runs the filter zero times
-          jq -cn --slurpfile manifest receipt-manifest.json --rawfile source regen-feed/source.json --rawfile appcast regen-feed/appcast.json --rawfile checksum regen-feed/SHA256SUMS-ci.txt '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > ../feed-receipt.json
+          jq -cn --slurpfile manifest receipt-manifest.json --rawfile source regen-feed/source.json --rawfile appcast regen-feed/appcast.json --rawfile checksum regen-feed/SHA256SUMS-ci.txt '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > feed-receipt.json
           BYTES=$(wc -c < feed-receipt.json | tr -d ' ')
           echo "receiptBytes=$BYTES"
           [ "$BYTES" -gt 10000 ] || { echo "::error::receipt construction produced empty output"; exit 1; }
