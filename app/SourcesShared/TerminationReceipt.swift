@@ -92,7 +92,7 @@ enum TerminationReceipt {
             save(receipt)
         }
         #endif
-        #if canImport(MetricKit)
+        #if canImport(MetricKit) && !os(tvOS)
         if #available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *) {
             MetricSubscriber.shared.registerOnce()
         }
@@ -113,7 +113,9 @@ enum TerminationReceipt {
         return Int64(info.phys_footprint / (1024 * 1024))
     }
 
-    #if canImport(MetricKit)
+    // tvOS exclusion: the tvOS 26.5 SDK marks the subscriber protocol and the diagnostic payload types
+    // unavailable, so this class cannot compile there even though the module still imports.
+    #if canImport(MetricKit) && !os(tvOS)
     @available(iOS 14.0, tvOS 14.0, macCatalyst 14.0, *)
     private final class MetricSubscriber: NSObject, MXMetricManagerSubscriber {
         static let shared = MetricSubscriber()

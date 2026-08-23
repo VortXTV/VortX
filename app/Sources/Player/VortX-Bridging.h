@@ -1,5 +1,10 @@
 #import <AVFoundation/AVFoundation.h>
 
+// Community JS provider runtime: exposes the QuickJS C bridge to Swift
+// (JSProviderRuntime.swift calls VortXQuickJSRun / VortXQuickJSFree). Quoted path is relative to this
+// header's directory and resolves on every target that compiles the QuickJS C sources.
+#include "../../SourcesShared/JSProviders/QuickJS/VortXQuickJSBridge.h"
+
 // macOS 26 (Tahoe) SwiftUI toolbar-crash guard. Swallows the NSException thrown by
 // NSToolbar's private -_insertNewItemWithItemIdentifier:... under SwiftUI's
 // ToolbarBridge on a hidden, unused window toolbar, which AppKit otherwise turns

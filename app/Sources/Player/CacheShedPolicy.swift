@@ -296,6 +296,36 @@ enum VortXCacheShedPolicy {
         return cacheFillBytes <= reducedCapBytes
     }
 
+    /// Beta 26 stutter fix: the EDGE-TRIGGERED wrapper around `shouldDeferFlushOnWarning` for the advisory band.
+    ///
+    /// The level-triggered gate above was correct for occasional warnings, but field logs from beta 25/26 show a
+    /// different regime on the Apple TV 4K: headroom PARKS at roughly 400-420 MiB - permanently inside the
+    /// [pressure, restore) band - and tvOS keeps posting advisory warnings every minute or two. Each one re-ran
+    /// the destructive drop-buffers + exact-re-anchor-seek flush (~15 s of main-thread IPC and a documented
+    /// frame-drop burst), so the viewer saw a visible stutter on a metronome. Flushing repeatedly at a stable
+    /// in-band headroom frees nothing durable (the cache refills to the same held cap), so every repetition is
+    /// pure cost with no jetsam benefit.
+    ///
+    /// This gate makes the IN-BAND flush fire ONCE per headroom episode: the controller passes
+    /// `hasFlushedSinceHeadroomRecovered`, latched true after an in-band flush and cleared only when headroom
+    /// actually recovers to the restore bar (or the item changes). Below the pressure bar nothing changes -
+    /// genuine low headroom always flushes immediately, jetsam relief intact. At or above the restore bar the
+    /// strict level-triggered gate alone decides, exactly as shipped.
+    static func shouldDeferInBandFlush(
+        availableBytes: UInt64,
+        pressureThresholdBytes: UInt64,
+        restoreThresholdBytes: UInt64,
+        policyDefer: Bool,
+        hasFlushedSinceHeadroomRecovered: Bool
+    ) -> Bool {
+        // Genuine low headroom: the drastic flush is the last defence before jetsam and must never wait.
+        guard availableBytes >= pressureThresholdBytes else { return false }
+        // Provably ample headroom: the existing strict gate owns the decision, unchanged.
+        if availableBytes >= restoreThresholdBytes { return policyDefer }
+        // Advisory band: one flush per episode, then hold until headroom genuinely recovers.
+        return policyDefer || hasFlushedSinceHeadroomRecovered
+    }
+
     /// Parse the two cap spellings the controller actually applies to mpv: plain byte counts
     /// ("268435456", the Streaming-cache branch) and MiB-suffixed ("256MiB", the static tiers).
     /// nil for anything else, so a surprise never silently becomes a 0-byte cache.

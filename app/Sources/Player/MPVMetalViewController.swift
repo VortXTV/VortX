@@ -1585,6 +1585,8 @@ final class MPVMetalViewController: PlatformViewController {
             pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
             pausedCacheClamped = false
             memoryCacheClamped = false
+            // A new file starts with a fresh headroom episode: an in-band advisory flush may fire once again.
+            hasFlushedInBandSinceHeadroomRecovered = false
             #if os(tvOS)
             proactiveMemoryCacheClamped = false
             proactiveRecoveredSampleCount = 0
@@ -1982,6 +1984,10 @@ final class MPVMetalViewController: PlatformViewController {
     /// zero-initialized as "never fired": `ProcessInfo.processInfo.systemUptime` starts at boot, so 0 is
     /// already in the past on first call and the very first warning is always acted on immediately.
     private var memoryWarningCooldownUntil: TimeInterval = 0
+    /// Beta 26 stutter fix: latched after ONE destructive flush at an advisory-band headroom ([pressure,
+    /// restore)), cleared only when headroom recovers to the restore bar or a new file loads. Below the pressure
+    /// bar this never gates anything - jetsam relief stays unconditional.
+    private var hasFlushedInBandSinceHeadroomRecovered = false
     /// Report item 8: "coalesce OS memory warnings, but do not let each callback initiate additional
     /// main-thread work" - the diagnosed log shows six `didReceiveMemoryWarningNotification`s land in one
     /// window. `shedForMemoryPressure()` is not free (an `os_proc_available_memory()` syscall, and when it
@@ -2027,19 +2033,38 @@ final class MPVMetalViewController: PlatformViewController {
             stepBytes: step)
         let capLowered = newCapBytes < currentCapBytes
 
-        // The flush gate is unchanged (diag-23 FIX-C): drop-buffers + an exact re-anchor seek frees resident
-        // bytes NOW but causes a visible frame-drop burst, so defer it when headroom is provably ample AND the
-        // live cache already fits the reduced cap (the drop would free nothing the cap does not already bound).
-        // A failed fill read passes Int.max, which overflows any reduced cap, so an unreadable fill keeps the
-        // drop; when headroom is genuinely low this returns false and the drastic flush fires, jetsam intact.
+        // The flush gate: drop-buffers + an exact re-anchor seek frees resident bytes NOW but causes a visible
+        // frame-drop burst, so defer it when headroom is provably ample AND the live cache already fits the
+        // reduced cap (the drop would free nothing the cap does not already bound). A failed fill read passes
+        // Int.max, which overflows any reduced cap, so an unreadable fill keeps the drop; when headroom is
+        // genuinely low the drastic flush fires, jetsam intact.
+        //
+        // Beta 26 stutter fix: field logs show headroom PARKED at ~400-420 MiB on the 3 GB box - permanently in
+        // the [pressure, restore) band - with advisory warnings arriving every minute or two. The level-triggered
+        // gate above flushed on EVERY one (~15 s of disruption each), producing a metronome-steady mid-play
+        // stutter while freeing nothing durable (the cache just refills to the same held cap). The in-band flush
+        // is now edge-triggered: once per headroom episode, re-armed only when headroom actually recovers to the
+        // restore bar. Below the pressure bar the flush still fires unconditionally.
         let cacheFillBytes = diagnosticInt("demuxer-cache-state/fw-bytes") ?? Int.max
-        let deferFlush = VortXCacheShedPolicy.shouldDeferFlushOnWarning(
+        let pressureBar = TVOSProactiveMemoryPressurePolicy.pressureThresholdBytes(physicalMemoryBytes: physicalBytes)
+        let restoreBar = TVOSProactiveMemoryPressurePolicy.restoreThresholdBytes(physicalMemoryBytes: physicalBytes)
+        if availableBytes >= restoreBar {
+            // Headroom recovered: a future in-band warning earns its own single flush again.
+            hasFlushedInBandSinceHeadroomRecovered = false
+        }
+        let policyDefer = VortXCacheShedPolicy.shouldDeferFlushOnWarning(
             availableBytes: availableBytes,
             physicalBytes: physicalBytes,
             currentCapBytes: currentCapBytes,
             cacheFillBytes: cacheFillBytes,
             floorBytes: floor,
             stepBytes: step)
+        let deferFlush = VortXCacheShedPolicy.shouldDeferInBandFlush(
+            availableBytes: availableBytes,
+            pressureThresholdBytes: pressureBar,
+            restoreThresholdBytes: restoreBar,
+            policyDefer: policyDefer,
+            hasFlushedSinceHeadroomRecovered: hasFlushedInBandSinceHeadroomRecovered)
 
         if capLowered {
             // Genuine low headroom: apply the non-increasing step-down and remember this file was shed. A
@@ -2058,6 +2083,11 @@ final class MPVMetalViewController: PlatformViewController {
             // flush so an advisory warning with ample headroom never quietly costs the viewer their rewind
             // window or a frame-drop burst.
             setString("demuxer-max-back-bytes", "8MiB")
+            if availableBytes < restoreBar {
+                // Advisory-band flush: latch it so the next advisory warning at the same parked headroom
+                // defers instead of stuttering playback again for no durable gain.
+                hasFlushedInBandSinceHeadroomRecovered = true
+            }
             flushDisposition = flushDemuxerCachePreservingPosition(reason: .memoryWarning)   // NOT bare drop-buffers: that moves the play head (see above)
         } else {
             flushDisposition = .skipped

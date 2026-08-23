@@ -530,6 +530,50 @@ if let policySource = try? String(contentsOf: policyURL, encoding: .utf8) {
             && !policySource.contains("mutating func markSeek(id:"))
 }
 
+// MARK: - Beta 26 stutter fix: the in-band flush is edge-triggered (one per headroom episode)
+
+// The 3 GB Apple TV 4K field regime: pressure = 384 MiB, restore = 768 MiB, and os_proc_available_memory
+// PARKED at ~410 MiB with advisory warnings every minute or two. Each warning used to re-run the destructive
+// drop-buffers + re-anchor seek (~15 s of disruption) - the metronome-steady mid-play stutter. The gate must
+// fire once per episode, hold while headroom stays parked in-band, never gate below the pressure bar, and
+// leave the ample-headroom regime exactly as shipped.
+let bandPressure = UInt64(384 * mib)
+let bandRestore = UInt64(768 * mib)
+
+check("(g) first in-band warning still flushes (latch unset)",
+      !P.shouldDeferInBandFlush(
+        availableBytes: UInt64(410 * mib), pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: false,
+        hasFlushedSinceHeadroomRecovered: false))
+check("(g) second in-band warning at the same parked headroom defers",
+      P.shouldDeferInBandFlush(
+        availableBytes: UInt64(410 * mib), pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: false,
+        hasFlushedSinceHeadroomRecovered: true))
+check("(g) below the pressure bar the latch NEVER defers (jetsam relief unconditional)",
+      !P.shouldDeferInBandFlush(
+        availableBytes: UInt64(300 * mib), pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: false,
+        hasFlushedSinceHeadroomRecovered: true)
+      && !P.shouldDeferInBandFlush(
+        availableBytes: 0, pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: true,
+        hasFlushedSinceHeadroomRecovered: true))
+check("(g) at or above the restore bar the strict level-triggered gate alone decides (unchanged)",
+      P.shouldDeferInBandFlush(
+        availableBytes: bandRestore, pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: true,
+        hasFlushedSinceHeadroomRecovered: false)
+      && !P.shouldDeferInBandFlush(
+        availableBytes: bandRestore + UInt64(mib), pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: false,
+        hasFlushedSinceHeadroomRecovered: true))
+check("(g) a level-triggered defer inside the band still holds even before any latch",
+      P.shouldDeferInBandFlush(
+        availableBytes: UInt64(420 * mib), pressureThresholdBytes: bandPressure,
+        restoreThresholdBytes: bandRestore, policyDefer: true,
+        hasFlushedSinceHeadroomRecovered: false))
+
 // MARK: - Result
 
 print("")
