@@ -300,6 +300,11 @@ final class TorBoxSearchSource: ObservableObject {
     /// The fetch key currently in flight, so the paired `.onChange` + `.onAppear` for the same title issue
     /// exactly one network round trip instead of two.
     private var inFlightKey: String?
+    /// Until when repeated refresh ticks are suppressed from logging the open-circuit skip (F13). The
+    /// breaker already refuses each attempt; without this, one detail visit while a cooldown runs logs
+    /// the same "circuit open" line once per tick (26 in diag 6). One line per episode, with the
+    /// seconds remaining, then silence until the cooldown lapses.
+    private var circuitLogSuppressedUntil: Date?
     /// Session cache of completed results, keyed by "imdb|season|episode". A hit re-publishes with no network,
     /// so browsing back and forth never re-hits the TorBox scraper. Re-hitting on every open is exactly what
     /// exhausts the account's small daily search allowance and trips its ~24h `cooldown_until`.
@@ -414,6 +419,26 @@ final class TorBoxSearchSource: ObservableObject {
         VXProbe.log("torbox-search", "refresh id=\(VXProbeRedaction.identityToken(target.titleID)) \(scope) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
             guard let self else { return }
+            // F13: consult the cooldown READ-ONLY first. Repeated refresh ticks during an open circuit
+            // would each run shouldAttempt (harmless) but each log a "circuit open" line; one line per
+            // episode with the seconds remaining is the honest summary. This path never consumes the
+            // half-open probe: once the cooldown lapses, the ordinary shouldAttempt flow below grants it.
+            if let remaining = await ProviderCircuitBreaker.shared.cooldownRemaining(
+                provider: Self.breakerProvider, sourceID: fetchKey
+            ) {
+                guard SourceContributorCompletionOwnership.accepts(
+                    completedKey: fetchKey, shownKey: self.shownKey, inFlightKey: self.inFlightKey,
+                    canceled: Task.isCancelled
+                ) else { return }
+                self.inFlightKey = nil
+                self.task = nil
+                if self.circuitLogSuppressedUntil == nil || Date() >= self.circuitLogSuppressedUntil! {
+                    VXProbe.log("torbox-search", "circuit open for id=\(VXProbeRedaction.identityToken(target.titleID)), skipping fetch for \(Int(remaining))s")
+                    self.circuitLogSuppressedUntil = Date().addingTimeInterval(max(1, remaining - 1))
+                }
+                self.publishSettlement(contentID: fetchKey, terminal: true)
+                return
+            }
             // Ask the SHARED breaker, not instance state: an open circuit here means some earlier caller
             // (possibly a now-dead view) already saw TorBox back off for this exact content id, and that
             // memory must survive this view's own lifetime. `shouldAttempt` also grants at most one

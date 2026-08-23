@@ -131,6 +131,19 @@ actor ProviderCircuitBreaker {
         }
     }
 
+    /// Read-only availability snapshot for callers that only want to know whether an attempt is worth
+    /// SCHEDULING: unlike `shouldAttempt` this mutates nothing, so a poller can consult it every tick
+    /// without consuming the half-open probe or churning state. Returns the whole seconds left in an
+    /// open cooldown, or nil when the circuit is not open.
+    func cooldownRemaining(provider: String, sourceID: String) -> TimeInterval? {
+        let entry = entries[Key(provider: provider, sourceID: sourceID)] ?? Entry()
+        if case let .open(until, _) = entry.state {
+            let remaining = until.timeIntervalSince(now())
+            return remaining > 0 ? remaining : nil
+        }
+        return nil
+    }
+
     /// Report a completed, successful attempt: fully resets the circuit to `.closed` with a zeroed streak,
     /// whether it was closed, half-open (the probe passed), or, defensively, still open.
     func recordSuccess(provider: String, sourceID: String) {
