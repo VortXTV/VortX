@@ -704,6 +704,7 @@ targets:
       - sdk: AVKit.framework
     settings:
       base:
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.tv.lite
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VORTX_NO_EMBEDDED_SERVER"
