@@ -1586,7 +1586,9 @@ final class MPVMetalViewController: PlatformViewController {
             pausedCacheClamped = false
             memoryCacheClamped = false
             // A new file starts with a fresh headroom episode: an in-band advisory flush may fire once again.
+            #if canImport(UIKit)
             hasFlushedInBandSinceHeadroomRecovered = false
+            #endif
             #if os(tvOS)
             proactiveMemoryCacheClamped = false
             proactiveRecoveredSampleCount = 0
