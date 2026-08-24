@@ -6193,7 +6193,7 @@ struct TVPlayerView: View {
         let marker = sub.url.absoluteString
         let downloadID = subtitlePoolRequests.beginDownload()
         subtitleLoadingURL = marker
-        if showOptions, panelKind == .subtitles { panelRows = optionRows }
+        if showOptions, panelShowsSubtitleList { panelRows = optionRows }
         Task { @MainActor in
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
             let signedIn = VortXSyncManager.shared.isSignedIn
