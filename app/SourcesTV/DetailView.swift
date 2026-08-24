@@ -2875,12 +2875,27 @@ struct CoreStreamList: View {
                 }
                 if showAllSources {
                     VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        if groups.count > 1 { filterBar(groups, total: streamCount) }
+                        if groups.count > 1 {
+                            // The filter bar is the column's top boundary: Up from any filter chip returns to
+                            // the nearest semantic action row. (#206)
+                            filterBar(groups, total: streamCount)
+                                .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower, state: actionState)))
+                        }
                         // LazyVStack so only on-screen rows are built; the window caps how many rows exist at all,
                         // keeping the focus tree small. Rows carry a stable content id (SourceRow), so the ~4/sec
                         // republish no longer reshuffles the focus handle mid-scroll.
                         LazyVStack(spacing: Theme.Space.sm) {
-                            ForEach(shownRows) { row in streamRow(row.addon, row.stream) }
+                            ForEach(Array(shownRows.enumerated()), id: \.element.id) { index, row in
+                                let rowView = streamRow(row.addon, row.stream)
+                                if index == 0, groups.count <= 1 {
+                                    // No filter bar: the FIRST row is the column's top boundary, so Up from it
+                                    // alone returns to the action row. Up from any deeper row stays native and
+                                    // moves one row up in the list (#206).
+                                    rowView.modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower, state: actionState)))
+                                } else {
+                                    rowView
+                                }
+                            }
                             if hasMore {
                                 Button { sourceRenderLimit += Self.sourceWindowStep } label: {
                                     Label("Show more · \(visibleCount - shownRows.count) more", systemImage: "chevron.down")
@@ -2889,10 +2904,11 @@ struct CoreStreamList: View {
                             }
                         }
                     }
-                    // The source column is its own focus section, and its one Up owner returns to the nearest
-                    // semantic action row. There is no page-level duplicate handler to swallow top -> shell.
+                    // The source column is its own focus section; only its top boundary (the filter bar, or the
+                    // first row when there is no filter bar) owns the Up return to the nearest semantic action
+                    // row. Up inside the list stays native so it moves one row up (#206). There is no page-level
+                    // duplicate handler to swallow top -> shell.
                     .focusSection()
-                    .modifier(DetailMoveCommandHandler(action: sourceMoveHandler(from: .lower, state: actionState)))
                 }
             } else {
                 // Error/no-source status is a lower region. Its single handler covers Re-find as well as the
