@@ -927,10 +927,27 @@ enum SubtitleRenditionPolicy {
             let endMilliseconds = Int((max(0, end) * 1_000).rounded())
             guard endMilliseconds > startMilliseconds else { continue }
             lines.append("")
+            // A STABLE cue identifier, derived from the cue's absolute identity (start, end, text) so every
+            // segment's copy of a straddling cue carries the SAME id. Apple's HLS authoring guidance uses the
+            // id for exactly this: AVFoundation recognises the copies as one cue across segment boundaries
+            // and renders it once, instead of stacking the outgoing segment's instance on top of the incoming
+            // one for the overlap (the Dolby Vision "subtitle shows 3-4 copies for a second" flicker).
+            lines.append(Self.cueIdentifier(startSeconds: cue.start, endSeconds: cue.end, text: cue.text))
             lines.append("\(timestamp(start)) --> \(timestamp(end))")
             lines.append(cue.text)
         }
         lines.append("")
         return lines.joined(separator: "\n")
+    }
+
+    /// FNV-1a over the cue's absolute identity: the same cue served from any segment gets the same id, and
+    /// distinct cues cannot collide in practice. The id carries no user text; it only needs uniqueness.
+    static func cueIdentifier(startSeconds: Double, endSeconds: Double, text: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in "\(startSeconds)|\(endSeconds)|\(text)".utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x0000_0100_0000_01b3
+        }
+        return "cue-" + String(hash, radix: 16)
     }
 }

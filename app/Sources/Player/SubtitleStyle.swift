@@ -136,10 +136,20 @@ enum SubtitleStyle {
     /// mpv option/property name → value pairs realizing the current style. Applied both at player
     /// setup (as options, before init) and live (as properties). Every option that differs between
     /// font styles appears in both branches, so a live switch fully overwrites the previous one.
+    ///
+    /// Size is carried by `sub-scale`, NOT by varying `sub-font-size`: mpv ignores `sub-font-size` for
+    /// BITMAP subtitle tracks (embedded PGS), so the old mapping made every size change a silent no-op
+    /// on built-in subs. `sub-scale` multiplies the whole rendered subtitle (text and bitmap alike), so
+    /// `sub-font-size` stays at the fixed 55px base and the named preset + fine multiplier fold into
+    /// `sub-scale`; for text subs the effective size (base × scale) is byte-for-byte the same value the
+    /// old mapping produced, so nothing about text rendering changes.
     static var mpvOptions: [(String, String)] {
+        let basePreset = (sizes.first { $0.id == current(Key.size, defaultSize) } ?? sizes[1]).fontSize
+        let scale = (Double(basePreset) / 55.0) * sizeScale
         var opts: [(String, String)] = [
             ("sub-font", mpvFontName),
-            ("sub-font-size", String(fontSize)),
+            ("sub-font-size", "55"),
+            ("sub-scale", String(format: "%.3f", scale)),
             ("sub-color", colorHex),
             ("sub-border-color", "#000000"),
         ]

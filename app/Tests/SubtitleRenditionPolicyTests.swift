@@ -62,8 +62,10 @@ func parseVTT(_ document: String) -> (header: String, cues: [(time: String, body
     for block in blocks.dropFirst() {
         let lines = block.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
             .filter { !$0.isEmpty }
-        guard let first = lines.first, first.contains("-->") else { continue }
-        cues.append((first, lines.dropFirst().joined(separator: "\n")))
+        // A cue may carry a stable identifier line before its timing line (cue-…); find the timing line
+        // wherever it sits and treat everything after it as the body.
+        guard let timeIndex = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
+        cues.append((lines[timeIndex], lines[(timeIndex + 1)...].joined(separator: "\n")))
     }
     return (blocks.first ?? "", cues)
 }

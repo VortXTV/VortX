@@ -4010,29 +4010,40 @@ struct TVPlayerView: View {
         appliedVolume = true
         coordinator.player?.setVolume(playerVolume)
     }
-    // In-player style tweaks also stick to the active profile (Settings does the same).
+    // In-player style tweaks also stick to the active profile (Settings does the same). The profile
+    // capture is DEBOUNCED: pressing Bigger five times fast must not encode + persist the whole roster
+    // five times on the main thread (the subtitle-settings lag), only once, 0.7s after the last press.
+    @State private var stylePrefsSaveTask: Task<Void, Never>?
+    private func schedulePlaybackPrefsSave() {
+        stylePrefsSaveTask?.cancel()
+        stylePrefsSaveTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            ProfileStore.shared.capturePlayback()
+        }
+    }
     private func setSubtitleFont(_ id: String) {
-        subFont = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+        subFont = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
     }
     private func setSubtitleSize(_ id: String) {
-        subSize = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+        subSize = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
     }
     private func adjustSubScale(_ direction: Int) {
         let next = subSizeScale + Double(direction) * SubtitleStyle.sizeScaleStep
         let clamped = min(max(next, SubtitleStyle.sizeScaleRange.lowerBound), SubtitleStyle.sizeScaleRange.upperBound)
         subSizeScale = (clamped * 100).rounded() / 100
         coordinator.player?.applySubtitleStyle()
-        ProfileStore.shared.capturePlayback()
+        schedulePlaybackPrefsSave()
         if showOptions { panelRows = optionRows }   // refresh the % readout in place
     }
     private func setSubtitleColor(_ id: String) {
-        subColor = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+        subColor = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
     }
     private func setSubtitleBrightness(_ id: String) {
-        subBrightness = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+        subBrightness = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
     }
     private func setSubtitleBackground(_ id: String) {
-        subBackground = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
+        subBackground = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
     }
 
     /// True while a subtitle panel is open (the language menu or one language's sub list), so async
