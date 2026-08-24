@@ -3414,7 +3414,7 @@ struct PlayerScreen: View {
             try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
             guard !Task.isCancelled,
                   coordinator.player?.activeLoadToken == armedToken,
-                  abs(currentTime - target) > 5 else { return }
+                  target - currentTime > 5 else { return }
             DiagnosticsLog.log(
                 "playback",
                 String(format: "deferred resume seek did not land in %ds (real pos %.1f): abandoning the offset and playing from the current position",

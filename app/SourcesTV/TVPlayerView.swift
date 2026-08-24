@@ -5366,7 +5366,7 @@ struct TVPlayerView: View {
             try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
             guard !Task.isCancelled,
                   coordinator.player?.activeLoadToken == armedToken,
-                  abs(lastRawTimePos - target) > inFlightSeekSnapRadius else { return }
+                  target - lastRawTimePos > inFlightSeekSnapRadius else { return }
             DiagnosticsLog.log(
                 "playback",
                 String(format: "deferred resume seek did not land in %ds (real pos %.1f): abandoning the offset and playing from the current position",
