@@ -2795,7 +2795,7 @@ struct TVPlayerView: View {
                 language: { $0.lang })
             if !languageAddon.isEmpty {
                 rows.append(OptionRow(label: String(localized: "From add-ons"), isHeader: true))
-                for sub in languageAddon.prefix(30) {
+                for sub in languageAddon.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url
                     rows.append(OptionRow(label: sub.addonName,
                                           detail: loading ? String(localized: "Loading…") : String(localized: "Add-on")) {
@@ -2837,7 +2837,7 @@ struct TVPlayerView: View {
                 language: { $0.lang })
             if !languagePooled.isEmpty {
                 rows.append(OptionRow(label: String(localized: "Community"), isHeader: true))
-                for sub in languagePooled.prefix(30) {
+                for sub in languagePooled.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
                     rows.append(OptionRow(label: pooledLabel(sub),
                                           detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {

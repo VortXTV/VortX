@@ -7035,7 +7035,7 @@ struct PlayerScreen: View {
                 language: { $0.lang })
             if !languageAddon.isEmpty {
                 rs.append(Row(label: String(localized: "From add-ons"), isHeader: true))
-                for sub in languageAddon.prefix(30) {
+                for sub in languageAddon.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url
                     rs.append(Row(label: sub.addonName, detail: loading ? String(localized: "Loading…") : String(localized: "Add-on")) {
                         // Non-blocking: the download + sub-add happen off the main thread with a timeout, so a
@@ -7077,7 +7077,7 @@ struct PlayerScreen: View {
                 language: { $0.lang })
             if !languagePooled.isEmpty {
                 rs.append(Row(label: String(localized: "Community"), isHeader: true))
-                for sub in languagePooled.prefix(30) {
+                for sub in languagePooled.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
                     rs.append(Row(label: pooledLabel(sub), detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {
                         userPickedSubtitle = true
