@@ -423,6 +423,12 @@ struct PlayerScreen: View {
     // Only set when hasStartedPlaying is false (a warm mid-play nudge seeks immediately). Cleared at every fresh
     // mount / teardown so it can never leak onto the wrong mount. iOS port of TVPlayerView.pendingLibmpvResumeSeek.
     @State private var pendingLibmpvResumeSeek: Double?
+    /// Safety net for the deferred resume seek issued at first frame. A slow / non-Range source can leave mpv
+    /// parked at the pre-seek position indefinitely; the plain stall ladder then reloads at the real (low)
+    /// playhead and silently drops the viewer's resume point. This abandons the offset instead and resumes
+    /// playback from wherever the source actually is, with the persistence floor keeping the stored position.
+    @State private var postFrameResumeSeekWatchdog: Task<Void, Never>?
+    private let postFrameResumeSeekWatchdogSeconds: Double = 12
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var preparingEpisodeID: String?
     @State private var preparedEpisode: PlayerEpisodeStream?
@@ -1200,12 +1206,14 @@ struct PlayerScreen: View {
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
+        postFrameResumeSeekWatchdog?.cancel()
             refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel(); idleWatchTask?.cancel()
             cancelTerminalFinalityRefresh()
             #if os(iOS) || os(macOS)
             engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
             #endif
             pendingLibmpvResumeSeek = nil   // teardown: drop any deferred resume seek so it cannot fire on a later mount
+            postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Never
             // touches the player teardown below.
@@ -1687,7 +1695,14 @@ struct PlayerScreen: View {
                     // AVPlayer never stashes one (its resume is a pre-mount remux origin), so this is a no-op there.
                     if let t = pendingLibmpvResumeSeek {
                         pendingLibmpvResumeSeek = nil
+                        // Arm the persistence fence synchronously with the seek (mirrors nudgeResume): a low
+                        // tick or exit callback before the seek lands must not regress the stored resume.
+                        if let floor = DeferredResumeFloorPolicy.armedFloor(targetSeconds: t) {
+                            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
+                            lastReported = max(lastReported, suppressedResumeFloor ?? floor)
+                        }
                         coordinator.player?.seek(to: t)
+                        armPostFrameResumeSeekWatchdog(target: t)
                     }
                     midPlayFailureResume = nil   // a mount that is playing owns its own position again
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually
@@ -3386,6 +3401,30 @@ struct PlayerScreen: View {
         }
     }
 
+    /// Safety net for the DEFERRED resume seek issued at first frame (the warm-pipeline scrub). On a slow or
+    /// non-Range source that absolute seek can leave mpv parked at the pre-seek position indefinitely; the
+    /// plain stall ladder then reloads at the real (low) playhead and silently drops the viewer's resume
+    /// point. If the seek has not landed within 12s, abandon the offset instead: a relative +0.1s nudge (the
+    /// proven wedge release) resumes playback from wherever the source actually is, and the floor armed at
+    /// issuance keeps the stored Continue Watching position from regressing.
+    private func armPostFrameResumeSeekWatchdog(target: Double) {
+        postFrameResumeSeekWatchdog?.cancel()
+        let armedToken = coordinator.player?.activeLoadToken
+        postFrameResumeSeekWatchdog = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
+            guard !Task.isCancelled,
+                  coordinator.player?.activeLoadToken == armedToken,
+                  abs(currentTime - target) > 5 else { return }
+            DiagnosticsLog.log(
+                "playback",
+                String(format: "deferred resume seek did not land in %ds (real pos %.1f): abandoning the offset and playing from the current position",
+                       Int(postFrameResumeSeekWatchdogSeconds), currentTime)
+            )
+            pendingLibmpvResumeSeek = nil
+            coordinator.player?.seek(by: 0.1)
+        }
+    }
+
     /// Watch for a hard stall after playback has started. Both a silent frozen surface and visible buffering
     /// need a bounded recovery owner. Buffering gets a longer allowance so an ordinary short network pause is
     /// not mistaken for a wedged player. Disabled for live, whose reconnect path owns recovery separately.
@@ -3462,6 +3501,7 @@ struct PlayerScreen: View {
         // elapsedSinceFirstFrame (the playback-diagnostics receipt) keeps measuring from the ORIGINAL,
         // now-stale first frame across the reload instead of the fresh one this recovery is about to render.
         firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil   // fresh mount: no deferred resume seek from the outgoing mount
+        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(
             curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume
@@ -3576,6 +3616,7 @@ struct PlayerScreen: View {
             appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
             buffering = true; loadFailed = false; loadErrorMsg = ""
             firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil
+            postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
             subtitleLoadingURL = nil
             srcProbeLoadStart = Date()
             bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
@@ -3695,6 +3736,7 @@ struct PlayerScreen: View {
         // Mirrors demoteAVPlayerToMPV: the outgoing engine's first frame belongs to a mount this session is
         // leaving, so elapsedSinceFirstFrame must not keep measuring from it once the new engine mounts.
         firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil   // fresh mount: no deferred resume seek from the outgoing mount
+        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         srcProbeLoadStart = Date()
         startLoadTimeout()
         if toAVPlayer { startAVStartWatchdog() }   // arm the AV no-frame demote on the new mount
@@ -4107,6 +4149,7 @@ struct PlayerScreen: View {
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false
         userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
         pendingSubtitleReapply = nil; suppressedResumeFloor = nil; pendingLibmpvResumeSeek = nil
+        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         midPlayFailureResume = nil   // consumed by this switch's resumeOverride; it must not leak to the next load
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
@@ -7546,6 +7589,7 @@ struct PlayerScreen: View {
         cancelAssetSanityObservationDeadline()
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel(); idleWatchTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
+        postFrameResumeSeekWatchdog?.cancel()
         #if os(iOS) || os(macOS)
         avStartWatchdog?.cancel()
         avToMPVHandoffTask?.cancel()

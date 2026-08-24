@@ -792,6 +792,16 @@ struct TVPlayerView: View {
     @State private var inFlightSeekIssuedAt = 0.0
     private let inFlightSeekSettleWindow = 10.0   // seconds before stale-looking ticks are trusted again
     private let inFlightSeekSnapRadius = 5.0      // a tick this close to the target means the seek landed
+    /// The engine's REAL time-pos from the latest raw tick, recorded BEFORE the in-flight seek guard drops
+    /// stale ticks. The post-first-frame resume watchdog uses it to tell a landed seek from a wedged one
+    /// (the UI-side currentTime stays optimistically pinned to the seek target while the guard is active).
+    @State private var lastRawTimePos: Double = -1
+    /// Safety net for the deferred resume seek issued at first frame (see armPostFrameResumeSeekWatchdog).
+    /// A slow / non-Range source can leave mpv parked at the pre-seek position indefinitely, and the plain
+    /// stall ladder answers that with a same-source reload at the SAME offset, wedging again and re-arming
+    /// the DV->HDR10 display switch every cycle (the Harry Potter stall loop).
+    @State private var postFrameResumeSeekWatchdog: Task<Void, Never>?
+    private let postFrameResumeSeekWatchdogSeconds: Double = 12
     /// Wall-clock when settled playback first ticked inside the last-10% "watched" zone, nil while
     /// outside it (or while scrubbing). The watched marker requires a few seconds of dwell here, so a
     /// scrub commit that merely LANDS past 90% can no longer mark the episode watched on its first tick.
@@ -1050,7 +1060,7 @@ struct TVPlayerView: View {
             invalidateNextEpisodePreparation(reason: "player view disappeared")
             invalidateLocalTrickplayCapture()
             cancelAssetSanityObservationDeadline()
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); libmpvResumeWatchdog?.cancel(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); libmpvResumeWatchdog?.cancel(); postFrameResumeSeekWatchdog?.cancel(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
             cancelTerminalFinalityRefresh()
             invalidateEpisodeResolution()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
@@ -1653,6 +1663,7 @@ struct TVPlayerView: View {
                     if let t = pendingLibmpvResumeSeek {
                         pendingLibmpvResumeSeek = nil
                         coordinator.player?.seek(to: t)
+                        armPostFrameResumeSeekWatchdog(target: t)
                     }
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually rendered,
                     // so publish the advance NOW, before anything below (the LastStreamStore record, the
@@ -1722,7 +1733,9 @@ struct TVPlayerView: View {
                 }
                 // Seek-in-flight guard (see the state declaration): drop stale pre-seek ticks so they
                 // cannot clobber the freshly committed position; everything downstream of a tick
-                // (progress saves, watched-at-90%, skip spans) waits with it.
+                // (progress saves, watched-at-90%, skip spans) waits with it. The RAW position is recorded
+                // first so the post-first-frame resume watchdog can still see the real playhead.
+                lastRawTimePos = d
                 if let target = inFlightSeekTarget {
                     if abs(d - target) <= inFlightSeekSnapRadius
                         || Date().timeIntervalSinceReferenceDate - inFlightSeekIssuedAt > inFlightSeekSettleWindow {
@@ -4897,6 +4910,7 @@ struct TVPlayerView: View {
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         loadTimeout?.cancel(); loadTimeout = nil
         libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil   // fresh mount incoming: retire any deferred-resume safety net
+        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         let engineRequestedResume =
             retiringAVPlayer.pendingRequestedSourcePositionSeconds
         // Real DV-profile evidence from the outgoing AVPlayer's own remux parse (#148), captured for the
@@ -5088,6 +5102,7 @@ struct TVPlayerView: View {
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil   // fresh mount incoming: retire any deferred-resume safety net
+        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         // Carry the HIGHER of the live position and any suppressed resume floor. A DV-remux session that
         // started at 0 (its resume seek was dropped, forward-only) holds the REAL resume point ONLY in
         // suppressedResumeFloor, so carrying currentTime alone would regress the account resume to ~0 when the
@@ -5333,6 +5348,36 @@ struct TVPlayerView: View {
             showEngineNote("That resume point is unavailable for this source. Playing from the earliest available position.")
             DiagnosticsLog.log("playback", "resume watchdog: no first frame in \(Int(libmpvResumeWatchdogSeconds))s, falling back to start")
             retryLoad()
+        }
+    }
+
+    /// Safety net for the DEFERRED resume seek issued at first frame (the warm-pipeline scrub). On a slow or
+    /// non-Range source that absolute seek can leave mpv parked at the pre-seek position indefinitely (the
+    /// playhead frozen at ~1s with paused-for-cache false, and the UI's currentTime optimistically pinned to
+    /// the target by the in-flight guard). The plain stall ladder answers that with a same-source reload AT THE
+    /// SAME OFFSET, which wedges again and re-arms the DV->HDR10 display switch every cycle (the observed
+    /// Harry Potter stall loop). If the seek has not landed within 12s, abandon the offset instead: a relative
+    /// +0.1s nudge (the same proven wedge release as the cold-start nudge) resumes playback from wherever the
+    /// source actually is, with a progress floor so the stored Continue Watching point is never regressed.
+    private func armPostFrameResumeSeekWatchdog(target: Double) {
+        postFrameResumeSeekWatchdog?.cancel()
+        let armedToken = coordinator.player?.activeLoadToken
+        postFrameResumeSeekWatchdog = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
+            guard !Task.isCancelled,
+                  coordinator.player?.activeLoadToken == armedToken,
+                  abs(lastRawTimePos - target) > inFlightSeekSnapRadius else { return }
+            DiagnosticsLog.log(
+                "playback",
+                String(format: "deferred resume seek did not land in %ds (real pos %.1f): abandoning the offset and playing from the current position",
+                       Int(postFrameResumeSeekWatchdogSeconds), lastRawTimePos)
+            )
+            inFlightSeekTarget = nil
+            pendingLibmpvResumeSeek = nil
+            let floor = min(max(0, target), max(0, duration - 5))
+            suppressedResumeFloor = floor
+            lastSaved = floor
+            coordinator.player?.seek(by: 0.1)
         }
     }
 
