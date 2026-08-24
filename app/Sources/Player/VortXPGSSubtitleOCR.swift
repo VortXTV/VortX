@@ -27,7 +27,12 @@ enum PGSOCRPrepareOutcome {
 /// handling, cancellation, and teardown never wait for Vision.
 final class VortXPGSSubtitleOCR {
 
-    static let maximumStreams = 4
+    /// How many PGS streams one session may decode + OCR at once. Previously 4, which disabled every other
+    /// built-in PGS track with the "OCR track limit" reason on subtitle-heavy remuxes (the "99% of built-in
+    /// subs don't work in AVPlayer" report). The cap exists only to bound the serial Vision worker's
+    /// throughput; raising it alongside the `.fast` recognition level keeps the same bounded queue while
+    /// letting the worker serve far more tracks. Memory stays bounded by PGSOCRPolicy regardless of this value.
+    static let maximumStreams = 8
     static let minimumRectEdge = 8
 
     private let epoch: UInt64
@@ -297,7 +302,10 @@ final class VortXPGSSubtitleOCR {
             if context.shouldStop { return .failed }
             guard let image = image(from: bitmap) else { continue }
             let request = VNRecognizeTextRequest()
-            request.recognitionLevel = .accurate
+            // .fast, not .accurate: subtitle bitmaps are clean, high-contrast text, and .fast recognises it
+            // ~3-5x quicker on Apple TV, which is what lets one serial worker serve maximumStreams tracks at
+            // once without dropping cues. A rare misread of a stylized glyph is far cheaper than a missing line.
+            request.recognitionLevel = .fast
             request.usesLanguageCorrection = true
             request.minimumTextHeight = 0.15
             let cancellationBox = RequestCancellationBox(request)

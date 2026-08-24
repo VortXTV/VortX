@@ -384,7 +384,10 @@ final class SubtitleCueRenderer {
 /// unlike libmpv which is handed a local file path). A `file://` URL (used by the community-pool path, which
 /// already downloaded to disk) is read straight off disk with no network.
 enum SubtitleFileFetcher {
-    private static let maximumBytes = 2 * 1024 * 1024
+    /// Raised from 2 MiB: long films ship SDH-heavy SRT / styled ASS well past 2 MiB, and the old cap made
+    /// those subtitle downloads fail exactly on big files. Still bounded so a hostile add-on cannot make the
+    /// player parse unbounded input.
+    private static let maximumBytes = 8 * 1024 * 1024
     private static let maximumHeaderBytes = 32 * 1024
 
     /// Fetch the subtitle bytes for `url`, calling `done` on a background thread with the data (or nil on

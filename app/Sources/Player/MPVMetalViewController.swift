@@ -3131,11 +3131,12 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     /// Per-pick network timeout and retry count for subtitle downloads. Hardcoded constants for now (a later
-    /// pass may move these to RemoteConfig); 12s is snappy without giving up on a slow-but-alive provider, and
-    /// ONE retry rescues a transient timeout / flaky first connection.
-    private static let subtitleDownloadTimeout: TimeInterval = 12
+    /// pass may move these to RemoteConfig). 20s rides out a slow provider that shares bandwidth with a big
+    /// remux spool (the "subtitle fails to load on big files" report); ONE retry rescues a transient timeout
+    /// or flaky first connection.
+    private static let subtitleDownloadTimeout: TimeInterval = 20
     private static let subtitleDownloadRetries = 1
-    private static let maximumExternalSubtitleBytes = 2 * 1024 * 1024
+    private static let maximumExternalSubtitleBytes = 8 * 1024 * 1024
     private let externalSubtitleRequestLock = NSLock()
     private var externalSubtitleRequestGeneration: UInt64 = 0
 

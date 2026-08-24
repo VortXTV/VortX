@@ -26,8 +26,10 @@ enum SubtitlePoolClient {
     // 49 separators, the outer object, and the largest offset object totals 21,420 bytes. Keep the fixed
     // 64 KiB ceiling well above that mechanically derived maximum and independent of RemoteConfig.
     static let indexResponseMaxBytes = 64 * 1024
-    // Mirrors the Worker's fixed MAX_TEXT_BYTES. This is intentionally not remotely raisable.
-    static let subtitleBodyMaxBytes = 1024 * 1024
+    // The Worker's own MAX_TEXT_BYTES still caps pooled bodies at 1 MiB today, so this client-side budget is
+    // deliberately roomier (8 MiB): it must never be the reason a download the worker is willing to serve
+    // fails, and it future-proofs the client against a worker-side raise without another client release.
+    static let subtitleBodyMaxBytes = 8 * 1024 * 1024
 
     struct TransportResponse: Sendable {
         let data: Data

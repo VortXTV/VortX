@@ -146,7 +146,7 @@ enum RemoteConfigDefaults {
     static let refreshIntervalHours = 6
 
     // Community-subtitle system tunables (clamped in validate). Baked == the client-side shipping defaults.
-    static let subtitleDownloadTimeoutMs = 12000   // per-sub download budget
+    static let subtitleDownloadTimeoutMs = 20000  // per-sub download budget (was 12s: big-remux bandwidth contention starved subtitle downloads)
     static let subtitleUploadMaxBytes = 1_048_576  // 1 MiB text cap (mirrors the worker's cap)
     static let subtitleOffsetBucketMs = 250        // offset quantization (worker also buckets to 250 ms)
     static let langIndexMinSeen = 1                // min pool `seenCount` before an availability read is trusted
