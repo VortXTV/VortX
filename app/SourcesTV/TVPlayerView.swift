@@ -299,6 +299,9 @@ struct TVPlayerView: View {
     @State private var subFingerprintKey = ""
     @State private var showOptions = false             // options panel (audio / subtitles / aspect / episodes)
     @State private var panelKind: PanelKind = .audio   // which list the options panel shows
+    /// The language drilled into from the subtitle list (its canonical key), so the `.subtitleLanguage`
+    /// panel lists every sub in that language across embedded + add-on + community sources.
+    @State private var subtitleLanguageCode: String? = nil
     @State private var subDelay: Double = 0            // manual subtitle sync, seconds
     @State private var audioDelay: Double = 0          // manual audio sync, seconds
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
@@ -765,7 +768,7 @@ struct TVPlayerView: View {
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, engine, sleep, skipEditor }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, subtitleLanguage, aspect, playback, episodes, chapters, sources, quality, playerSettings, engine, sleep, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -2162,6 +2165,7 @@ struct TVPlayerView: View {
                 switch panelKind {                       // Back from a settings sub-panel returns to its list
                 case .audioSettings:    openPanel(.audio)
                 case .subtitleSettings: openPanel(.subtitles)
+                case .subtitleLanguage: openPanel(.subtitles)
                 case .engine:           openPanel(.playerSettings)
                 case .sleep:            openPanel(.playerSettings)
                 default:                closePanel()
@@ -2707,7 +2711,12 @@ struct TVPlayerView: View {
             if audioDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustAudioDelay(-audioDelay) }) }
             return rows
         case .subtitles:
-            var rows = [OptionRow(
+            // Settings FIRST (the user's primary in-session action), then Off, then one row per language.
+            // Each language row drills into `.subtitleLanguage`, which lists every sub in that language
+            // across embedded + add-on + community sources, so a title with dozens of subs no longer
+            // forces one endless flat scroll.
+            var rows = [OptionRow(label: String(localized: "Subtitle Settings"), detail: "›") { openPanel(.subtitleSettings) }]
+            rows.append(OptionRow(
                 label: String(localized: "Off"),
                 isSelected: subtitleTracks.allSatisfy { !$0.selected || !$0.isSelectable }
             ) {
@@ -2715,26 +2724,68 @@ struct TVPlayerView: View {
                 optimisticSelect(type: "sub", id: -1)
                 coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
                 VXProbe.event("subs", "subs selected off")
-            }]
-            rows += groupedTrackRows(subtitleTracks) { id in
-                userPickedSubtitle = true
-                optimisticSelect(type: "sub", id: id)
-                coordinator.player?.setSubtitleTrack(id); refreshTracksSoon()
-                let lang = subtitleTracks.first { $0.id == id }.map { langName($0.lang) } ?? "\(id)"
-                VXProbe.event("subs", "subs selected \(lang)")
-            }
+            })
             // External subtitles from the installed subtitle add-ons. Work on BOTH engines now: libmpv sub-adds
             // the downloaded file (it joins the embedded list above); AVPlayer parses it and renders the cues
             // over the video itself. When the opt-in "only preferred languages" toggle is on, non-preferred
             // languages are hidden (unknown-language subs always kept so the list never empties).
-            let available = TrackSelector.keepingPreferredSubtitleLanguages(
+            let availableAddon = TrackSelector.keepingPreferredSubtitleLanguages(
                 addonSubs.filter { !addedSubURLs.contains($0.url) }, language: { $0.lang })
-            if !available.isEmpty {
+            // Community-pooled subtitles (P2): other users' extracted subs for this title. Same opt-in
+            // preferred-language filter as the add-on rows above.
+            let availablePooled = TrackSelector.keepingPreferredSubtitleLanguages(
+                pooledSubs.filter { !addedPooledIDs.contains($0.id) }, language: { $0.lang })
+            // Union of every language offered by ANY source, each with its total count.
+            var languageCounts: [String: Int] = [:]
+            for t in subtitleTracks { languageCounts[subtitleLanguageKey(t.lang), default: 0] += 1 }
+            for s in availableAddon { languageCounts[subtitleLanguageKey(s.lang), default: 0] += 1 }
+            for s in availablePooled { languageCounts[subtitleLanguageKey(s.lang), default: 0] += 1 }
+            for code in languageCounts.keys.sorted(by: { langName($0) < langName($1) }) {
+                let count = languageCounts[code] ?? 0
+                let hasSelection = subtitleTracks.contains {
+                    $0.isSelectable && $0.selected && subtitleLanguageKey($0.lang) == code
+                }
+                rows.append(OptionRow(label: langName(code), detail: "\(count) ›", isSelected: hasSelection) {
+                    subtitleLanguageCode = code
+                    openPanel(.subtitleLanguage)
+                })
+            }
+            if languageCounts.isEmpty {
+                rows.append(OptionRow(label: String(localized: "No subtitles available"), isHeader: true))
+            }
+            return rows
+        case .subtitleLanguage:
+            guard let code = subtitleLanguageCode else { return [] }
+            var rows: [OptionRow] = []
+            // Embedded tracks in this language first (a sub-added external file also lands here on libmpv).
+            let embedded = subtitleTracks.filter { subtitleLanguageKey($0.lang) == code }
+            if !embedded.isEmpty {
+                rows.append(OptionRow(label: String(localized: "Embedded"), isHeader: true))
+                for (i, t) in embedded.enumerated() {
+                    rows.append(OptionRow(
+                        label: t.title.isEmpty ? "Track \(i + 1)" : t.title,
+                        detail: t.unavailableReason ?? "",
+                        isSelected: t.isSelectable && t.selected,
+                        isEnabled: t.isSelectable
+                    ) {
+                        guard t.isSelectable else { return }
+                        userPickedSubtitle = true
+                        optimisticSelect(type: "sub", id: t.id)
+                        coordinator.player?.setSubtitleTrack(t.id); refreshTracksSoon()
+                        let lang = langName(t.lang)
+                        VXProbe.event("subs", "subs selected \(lang)")
+                    })
+                }
+            }
+            let languageAddon = TrackSelector.keepingPreferredSubtitleLanguages(
+                addonSubs.filter { !addedSubURLs.contains($0.url) && subtitleLanguageKey($0.lang) == code },
+                language: { $0.lang })
+            if !languageAddon.isEmpty {
                 rows.append(OptionRow(label: String(localized: "From add-ons"), isHeader: true))
-                for sub in available.prefix(30) {
+                for sub in languageAddon.prefix(30) {
                     let loading = subtitleLoadingURL == sub.url
-                    rows.append(OptionRow(label: langName(sub.lang),
-                                          detail: loading ? String(localized: "Loading…") : sub.addonName) {
+                    rows.append(OptionRow(label: sub.addonName,
+                                          detail: loading ? String(localized: "Loading…") : String(localized: "Add-on")) {
                         // Non-blocking: download + sub-add happen off the main thread with a timeout, so a
                         // slow / hanging subtitle endpoint can't freeze the player. The row shows Loading…
                         // until the track arrives (then it moves into the embedded list above).
@@ -2768,15 +2819,12 @@ struct TVPlayerView: View {
                     })
                 }
             }
-            // Community-pooled subtitles (P2): other users' extracted subs for this title, in the SAME list.
-            // No add-on wording - labeled by language with a subtle "Community" provenance. Work on BOTH engines
-            // now (AVPlayer renders the downloaded file over the video, same as the add-on rows above). Same
-            // opt-in preferred-language filter as the add-on rows above.
-            let pooled = TrackSelector.keepingPreferredSubtitleLanguages(
-                pooledSubs.filter { !addedPooledIDs.contains($0.id) }, language: { $0.lang })
-            if !pooled.isEmpty {
+            let languagePooled = TrackSelector.keepingPreferredSubtitleLanguages(
+                pooledSubs.filter { !addedPooledIDs.contains($0.id) && subtitleLanguageKey($0.lang) == code },
+                language: { $0.lang })
+            if !languagePooled.isEmpty {
                 rows.append(OptionRow(label: String(localized: "Community"), isHeader: true))
-                for sub in pooled.prefix(30) {
+                for sub in languagePooled.prefix(30) {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
                     rows.append(OptionRow(label: pooledLabel(sub),
                                           detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {
@@ -2785,7 +2833,6 @@ struct TVPlayerView: View {
                     })
                 }
             }
-            rows.append(OptionRow(label: String(localized: "Subtitle Settings"), detail: "›") { openPanel(.subtitleSettings) })
             return rows
         case .subtitleSettings:
             let now = String(format: "%+.1fs", subDelay)
@@ -2922,6 +2969,19 @@ struct TVPlayerView: View {
         // Delegate to the shared helper so tvOS shows FULL names (English/French/Italian) and handles
         // 3-letter ISO 639-2 codes (eng/fre/ita) and region-tagged codes (pt-BR) gracefully, matching iOS/Mac.
         fullLanguageName(code)
+    }
+
+    /// Canonical key for the per-language subtitle groups: lowercase, with 3-letter ISO 639-2 codes folded
+    /// to their 2-letter base (eng -> en) so embedded, add-on and community subs share one language row.
+    /// Empty / und / unknown all fold to "und" (one "Unknown" bucket), mirroring `groupedTrackRows`.
+    private func subtitleLanguageKey(_ code: String) -> String {
+        let trimmed = code.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !trimmed.isEmpty, trimmed != "und", trimmed != "unknown" else { return "und" }
+        if Locale.current.localizedString(forLanguageCode: trimmed) != nil { return trimmed }
+        if let base = Locale(identifier: trimmed).language.languageCode?.identifier, base != trimmed {
+            return base
+        }
+        return trimmed
     }
 
     // MARK: - Skip-segment editor panel (tvOS)
@@ -3975,12 +4035,18 @@ struct TVPlayerView: View {
         subBackground = id; coordinator.player?.applySubtitleStyle(); ProfileStore.shared.capturePlayback()
     }
 
+    /// True while a subtitle panel is open (the language menu or one language's sub list), so async
+    /// subtitle arrivals (add-on fetch, pooled downloads) refresh the open panel instead of only the
+    /// flat list that used to be the single subtitles surface.
+    private var panelShowsSubtitleList: Bool { panelKind == .subtitles || panelKind == .subtitleLanguage }
+
     private var panelTitle: String {
         switch panelKind {
         case .audio:            return "Audio"
         case .audioSettings:    return "Audio Settings"
         case .subtitles:        return "Subtitles"
         case .subtitleSettings: return "Subtitle Settings"
+        case .subtitleLanguage: return langName(subtitleLanguageCode ?? "und")
         case .aspect:           return "Aspect Ratio"
         case .playback:         return "Playback"
         case .episodes:         return "Episodes"
@@ -5863,7 +5929,7 @@ struct TVPlayerView: View {
             let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: effectiveVideoId)
             guard addonSubsKey == key else { return }   // episode changed / re-keyed mid-fetch
             addonSubs = subs
-            if showOptions, panelKind == .subtitles { panelRows = optionRows }
+            if showOptions, panelShowsSubtitleList { panelRows = optionRows }
             // The add-on list can land AFTER autoSelectTracks already ran (and left subs off because the
             // container had no chain match): re-evaluate the add-on fallback now that candidates exist.
             autoSelectAddonSubtitleIfNeeded()
@@ -6114,7 +6180,7 @@ struct TVPlayerView: View {
                 applyCurrentSubtitleDelayIfReady(force: false)
                 VXProbe.log("subs", "subs sync \(seconds)s (community seed)")
             }
-            if showOptions, panelKind == .subtitles { panelRows = optionRows }
+            if showOptions, panelShowsSubtitleList { panelRows = optionRows }
         }
     }
 
@@ -6140,14 +6206,14 @@ struct TVPlayerView: View {
             guard mayPublishDownload else {
                 if subtitlePoolRequests.finishDownload(downloadID) {
                     subtitleLoadingURL = nil
-                    if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                    if showOptions, panelShowsSubtitleList { panelRows = optionRows }
                 }
                 return
             }
             guard let localURL = downloaded else {
                 if subtitlePoolRequests.finishDownload(downloadID) {
                     subtitleLoadingURL = nil
-                    if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                    if showOptions, panelShowsSubtitleList { panelRows = optionRows }
                 }
                 return
             }
@@ -6159,7 +6225,7 @@ struct TVPlayerView: View {
             guard let player = coordinator.player else {
                 if subtitlePoolRequests.finishExternal(externalID) {
                     subtitleLoadingURL = nil
-                    if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                    if showOptions, panelShowsSubtitleList { panelRows = optionRows }
                 }
                 return
             }
@@ -6176,7 +6242,7 @@ struct TVPlayerView: View {
                 guard mayPublishExternal, loadStillCurrent else {
                     if subtitlePoolRequests.finishExternal(externalID) {
                         subtitleLoadingURL = nil
-                        if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                        if showOptions, panelShowsSubtitleList { panelRows = optionRows }
                     }
                     return
                 }
@@ -6187,7 +6253,7 @@ struct TVPlayerView: View {
                 if ok, player === coordinator.player {
                     applyCurrentSubtitleDelayIfReady(force: false)
                 }
-                if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                if showOptions, panelShowsSubtitleList { panelRows = optionRows }
                 VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community ok=\(ok))")
             }
         }
