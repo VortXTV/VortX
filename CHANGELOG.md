@@ -4,6 +4,27 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 27 (build 229)
+
+### Apple: subtitles rebuilt, the source-list focus fix, and resume-seek recovery
+
+**Subtitles are organized by language.** The subtitles panel now opens with Subtitle Settings, then Off, then one row per language. Each language row lists every subtitle in that language across the file's embedded tracks, your add-ons, and the community pool, so titles with dozens of subs no longer force one long scroll and no longer cut the list off. Apple TV, iPhone, iPad, and Mac.
+
+**Subtitle reliability and limits fixed.** Size presets now actually scale built-in bitmap (PGS) subtitles, not just text, so changing size stops doing nothing on embedded subs. Built-in subs work far more often on the Dolby Vision player: the OCR track cap doubled and switched to fast recognition, so subtitle-heavy remuxes stop disabling most of their tracks with the OCR limit message. Add-on and community subtitle downloads allow files up to 8 MiB (long films) and wait up to 20 seconds, so big-file subtitle loads stop failing. Subtitle settings respond faster: repeated size presses no longer re-save the whole profile on every tap. Apple TV, iPhone, iPad, and Mac.
+
+**No more duplicate subtitle flash on the Dolby Vision player.** Subtitle cues now carry a stable identity, so AVFoundation recognizes the same cue across HLS segment boundaries and renders it once instead of stacking 3-4 copies for a second. Apple TV, iPhone, iPad, and Mac.
+
+**Resume no longer loops.** When a resume point cannot be reached on a slow source, the player abandons the offset after 12 seconds and continues playback from the earliest available position instead of reloading the same source at the same offset over and over (the stall loop that also flipped the display between DV and HDR each time). The saved Continue Watching position is never regressed. Apple TV, iPhone, iPad, and Mac.
+
+**All sources list moves one row at a time.** Pressing Up in the expanded source list on Apple TV now moves one row up instead of jumping all the way to the top action row. Apple TV.
+
+**In-player parity fixes.** The tvOS player gains the in-player audio-language source filter and the Output mode picker, and the aspect-ratio choice now persists across loads, matching iPhone, iPad, and Mac. The iPhone, iPad, and Mac player gains the in-player subtitle Font row. Apple TV, iPhone, iPad, and Mac.
+
+### Under the hood
+
+- The Apple app audit wave closed nine half-wired findings: stale media-server docs, a silent community-subtitle failure on tvOS, a defensive-guard drift, a dead SDR-tonemap setting, and cross-platform subtitle panel drift.
+
+
 ## 0.3.14 Beta 26 (build 228)
 
 ### Apple: the memory-pressure stutter fix and the completed zero-stall lane
