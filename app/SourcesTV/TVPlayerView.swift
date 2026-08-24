@@ -302,6 +302,9 @@ struct TVPlayerView: View {
     /// The language drilled into from the subtitle list (its canonical key), so the `.subtitleLanguage`
     /// panel lists every sub in that language across embedded + add-on + community sources.
     @State private var subtitleLanguageCode: String? = nil
+    /// Session audio-language filter for the IN-PLAYER source panel (iOS parity, #204); nil = Auto, which
+    /// falls back to the persisted profile preference.
+    @State private var sessionAudioLanguages: [String]? = nil
     @State private var subDelay: Double = 0            // manual subtitle sync, seconds
     @State private var audioDelay: Double = 0          // manual audio sync, seconds
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
@@ -367,6 +370,8 @@ struct TVPlayerView: View {
     /// completion recorded before the reload is never re-sent as a duplicate history record.
     @State private var playbackSessionID = UUID().uuidString
     @State private var appliedVolume = false   // D5: the persisted default-volume apply runs once per load (re-armed on source switch/reload)
+    @State private var appliedSize = false     // the persisted aspect-ratio pick applies once per load, mirroring iOS PlayerScreen
+    @AppStorage("stremiox.videoSize") private var videoSize = "original"   // same key iOS uses; re-applied on every load
     // #76: AVPlayer could not open this stream (item status .failed); fell back to libmpv for it in place.
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
@@ -1859,6 +1864,12 @@ struct TVPlayerView: View {
         case MPVProperty.duration:
             if let d = data as? Double {
                 duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles()
+                // Re-apply the persisted aspect-ratio pick on every (re)load, the same iOS does (aspect
+                // parity: a tvOS pick previously reset to Fit on the next source or episode).
+                if !appliedSize, d > 0 {
+                    appliedSize = true
+                    coordinator.player?.setVideoSize(videoSize)
+                }
                 // The real duration sharpens the community trickplay key and subtitle release fingerprint,
                 // but only after the exact load has passed asset sanity. A rejected short preview can share the
                 // episode's local cache key, so publishing its duration here would poison the replacement load.
@@ -2722,6 +2733,15 @@ struct TVPlayerView: View {
                         OptionRow(label: String(localized: "Earlier  −0.1s"), detail: now) { adjustAudioDelay(-0.1) },
                         OptionRow(label: String(localized: "Later  +0.1s"), detail: now) { adjustAudioDelay(0.1) }]
             if audioDelay != 0 { rows.append(OptionRow(label: String(localized: "Reset")) { adjustAudioDelay(-audioDelay) }) }
+            // Output mode, mirrored from Settings so it is reachable mid-playback (iOS parity: the iOS
+            // player ships the same section). Applies live; mpv re-opens the audio output on the change.
+            let mode = AudioOutputMode.current
+            rows.append(OptionRow(label: String(localized: "Output"), isHeader: true))
+            for m in AudioOutputMode.allCases {
+                rows.append(OptionRow(label: m.label, isSelected: m == mode) {
+                    coordinator.player?.setAudioOutputMode(m)
+                })
+            }
             return rows
         case .subtitles:
             // Settings FIRST (the user's primary in-session action), then Off, then one row per language.
@@ -2875,11 +2895,13 @@ struct TVPlayerView: View {
             for b in SubtitleStyle.backgrounds { rows.append(OptionRow(label: Self.l10n(b.label), isSelected: subBackground == b.id) { setSubtitleBackground(b.id) }) }
             return rows
         case .aspect:
-            let mode = coordinator.player?.videoSizeMode ?? "original"
+            // Live mode wins while mounted (the engine's state is authoritative); the persisted pick is the
+            // fallback for the brief mount gap and the value the next load re-applies (iOS parity).
+            let mode = coordinator.player?.videoSizeMode ?? videoSize
             return [
-                OptionRow(label: "Fit  ·  default", isSelected: mode == "original") { coordinator.player?.setVideoSize("original") },
-                OptionRow(label: "Fill  ·  crop to screen", isSelected: mode == "fill" || mode == "zoom") { coordinator.player?.setVideoSize("fill") },
-                OptionRow(label: "Stretch  ·  fill, distort", isSelected: mode == "stretch") { coordinator.player?.setVideoSize("stretch") },
+                OptionRow(label: "Fit  ·  default", isSelected: mode == "original") { videoSize = "original"; coordinator.player?.setVideoSize("original") },
+                OptionRow(label: "Fill  ·  crop to screen", isSelected: mode == "fill" || mode == "zoom") { videoSize = "fill"; coordinator.player?.setVideoSize("fill") },
+                OptionRow(label: "Stretch  ·  fill, distort", isSelected: mode == "stretch") { videoSize = "stretch"; coordinator.player?.setVideoSize("stretch") },
             ]
         case .playback:
             var rows: [OptionRow] = [OptionRow(label: "Speed", isHeader: true)]
@@ -2944,7 +2966,7 @@ struct TVPlayerView: View {
         let groups = Dictionary(grouping: tracks) { $0.lang.isEmpty ? "und" : $0.lang.lowercased() }
         var rows: [OptionRow] = []
         for code in groups.keys.sorted(by: { langName($0) < langName($1) }) {
-            let ts = groups[code]!
+            guard let ts = groups[code] else { continue }   // defensive; key comes from groups.keys so always present (mirrors iOS)
             if ts.count == 1 {
                 let t = ts[0]
                 let detail = [
@@ -3227,38 +3249,60 @@ struct TVPlayerView: View {
         // hundreds of results can no longer flood the panel and bury the rest.
         let perAddon = 5
         let maxInPlayerSources = 60
-        var rows: [OptionRow] = []
         var count = 0
         let groups = currentSourceGroups
         if groups.isEmpty {
             return [OptionRow(label: "Loading sources…", isHeader: true)]
         }
-        for group in groups {
-            // T22: at the source cap, BREAK (stop scanning further groups) instead of continuing, so we do not
-            // pointlessly re-score every remaining group's streams. The empty-group case below still continues.
-            guard count < maxInPlayerSources else { break }
-            // Score each stream ONCE; the old sort recomputed the (string-heavy)
-            // score inside the comparator, which is what melted the main thread
-            // on thousand-source titles.
-            let best = group.streams.filter { playableURL(for: $0) != nil }
-                .map { (stream: $0, rank: StreamRanking.score($0)) }
-                .sorted { $0.rank > $1.rank }
-                .prefix(perAddon)
-                .map(\.stream)
-            guard !best.isEmpty else { continue }
-            rows.append(OptionRow(label: group.addon, isHeader: true))
-            for stream in best {
+        var rows: [OptionRow] = audioLanguageFilterRows()
+        // Install the session audio-language filter as a task-local for the ranking reads only (iOS parity,
+        // #204): `StreamRanking.score` -> `languageScore` reads `TrackPreferences.current.audioLanguages` live
+        // at score time, so this floats the chosen-audio release above a same-resolution foreign-audio one.
+        // Nil (Auto) installs nothing and falls back to the persisted profile preference.
+        TrackPreferences.$audioLanguagesOverride.withValue(sessionAudioLanguages) {
+            for group in groups {
+                // T22: at the source cap, BREAK (stop scanning further groups) instead of continuing, so we do not
+                // pointlessly re-score every remaining group's streams. The empty-group case below still continues.
                 guard count < maxInPlayerSources else { break }
-                count += 1
-                let info = StreamRanking.sourceDetail(stream)
-                let name = String(sourceLabel(stream).prefix(40))
-                rows.append(OptionRow(label: "\(info.tags)   \(name)", detail: info.size ?? "",
-                                      isSelected: playableURL(for: stream) == curURL) {
-                    resolveAndSwitchStream(to: stream, addon: group.addon)
-                })
+                // Score each stream ONCE; the old sort recomputed the (string-heavy)
+                // score inside the comparator, which is what melted the main thread
+                // on thousand-source titles.
+                let best = group.streams.filter { playableURL(for: $0) != nil }
+                    .map { (stream: $0, rank: StreamRanking.score($0)) }
+                    .sorted { $0.rank > $1.rank }
+                    .prefix(perAddon)
+                    .map(\.stream)
+                guard !best.isEmpty else { continue }
+                rows.append(OptionRow(label: group.addon, isHeader: true))
+                for stream in best {
+                    guard count < maxInPlayerSources else { break }
+                    count += 1
+                    let info = StreamRanking.sourceDetail(stream)
+                    let name = String(sourceLabel(stream).prefix(40))
+                    rows.append(OptionRow(label: "\(info.tags)   \(name)", detail: info.size ?? "",
+                                          isSelected: playableURL(for: stream) == curURL) {
+                        resolveAndSwitchStream(to: stream, addon: group.addon)
+                    })
+                }
             }
         }
         return rows
+    }
+
+    /// The in-player source panel's session audio-language filter (iOS parity, #204): an "Audio" header with
+    /// "Auto" + the curated language list. Selecting a language sets `sessionAudioLanguages`, which re-ranks
+    /// the rows built above so releases carrying that audio float up.
+    private func audioLanguageFilterRows() -> [OptionRow] {
+        var rs: [OptionRow] = [OptionRow(label: String(localized: "Audio"), isHeader: true)]
+        rs.append(OptionRow(label: String(localized: "Auto"), isSelected: sessionAudioLanguages == nil) {
+            sessionAudioLanguages = nil
+        })
+        for lang in TrackPreferences.commonLanguages {
+            rs.append(OptionRow(label: lang.label, isSelected: sessionAudioLanguages == [lang.id]) {
+                sessionAudioLanguages = [lang.id]
+            })
+        }
+        return rs
     }
 
     /// The gear panel: player-wide settings that aren't tied to one media kind. Handoff to an
@@ -3637,7 +3681,7 @@ struct TVPlayerView: View {
         bufferedTime = 0
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false
         autoAddonSubTried = false; userPickedSubtitle = false
-        addonSubsResolveTried = false; appliedVolume = false; loadErrorMsg = ""
+        addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""
         pendingSubtitleReapply = nil; suppressedResumeFloor = nil
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
         watchedZoneSince = nil
@@ -4961,7 +5005,7 @@ struct TVPlayerView: View {
         // Continue-Watching launch's STORED offset as a live play head on a pre-start demote, and maybeResume
         // would then bypass its near-end guard and auto-resume a fresh play straight into the credits.
         let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
-        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedSize = false; appliedResume = false; loadErrorMsg = ""
         // The outgoing AVPlayer mount already had a first frame (or never got one); either way this fresh
         // mpv mount earns its own. Without clearing it, elapsedSinceFirstFrame keeps measuring from the
         // OUTGOING engine's stale timestamp instead of the incoming mpv leg's. Mirrors iOS PlayerScreen.
@@ -5126,7 +5170,7 @@ struct TVPlayerView: View {
         manualEngineAVPlayer = toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
         engineSwitchedAt = Date()           // grace window swallows a stale event from the outgoing engine
-        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedSize = false; appliedResume = false
         appliedAutoTracks = false; loadErrorMsg = ""
         // Mirrors demoteAVPlayerToMPV: the outgoing engine's first frame belongs to a mount this session is
         // leaving, so elapsedSinceFirstFrame must not keep measuring from it once the new engine mounts.
@@ -5727,7 +5771,7 @@ struct TVPlayerView: View {
         resumeSourceReresolved = true
         coordinator.player?.invalidateLoadToken()
         // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
-        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; pendingLibmpvResumeSeek = nil
+        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedSize = false; appliedResume = false; pendingLibmpvResumeSeek = nil
         loadErrorMsg = ""; autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         withAnimation { reconnecting = true }
         let resume: Double? = resumeSeconds
@@ -5912,7 +5956,7 @@ struct TVPlayerView: View {
         avToMPVHandoffBlocked = false
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
-        buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; loadErrorMsg = ""; pendingLibmpvResumeSeek = nil
+        buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""; pendingLibmpvResumeSeek = nil
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
@@ -6049,7 +6093,7 @@ struct TVPlayerView: View {
         if let sub = pooledPick {
             autoAddonSubTried = true
             VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community auto)")
-            selectPooledSubtitle(sub)   // shared path: moat-gated download -> addExternalSubtitle -> addedPooledIDs
+            selectPooledSubtitle(sub, auto: true)   // shared path: moat-gated download -> addExternalSubtitle -> addedPooledIDs
             return
         }
         // No chain match. Latch only once BOTH async lists have arrived (each completion re-calls this), so a
@@ -6242,7 +6286,7 @@ struct TVPlayerView: View {
 
     /// P2: load a pooled subtitle into the player, reusing the exact external-subtitle path (download to a
     /// local file, then mpv `sub-add`). Shows the shared Loading… row state. Fail-soft.
-    private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+    private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
         guard subtitleLoadingURL == nil, communityContentKey == sub.contentKey,
               MoatConsent.contributeAndConsume,
               VortXSyncManager.shared.isSignedIn else { return }
@@ -6271,6 +6315,8 @@ struct TVPlayerView: View {
                     subtitleLoadingURL = nil
                     if showOptions, panelShowsSubtitleList { panelRows = optionRows }
                 }
+                // Honest failure on a manual pick; the automatic tier-2 pick stays silent (mirrors iOS).
+                if !auto { showEngineNote(String(localized: "Subtitle failed to load")) }
                 return
             }
             guard let externalID = subtitlePoolRequests.beginExternal(after: downloadID) else { return }
@@ -6306,6 +6352,7 @@ struct TVPlayerView: View {
                 subtitleLoadingURL = nil
                 // Same still-live-engine gate as the add-on rows: never record an add the live engine never saw.
                 if ok, player === coordinator.player { addedPooledIDs.insert(sub.id) }
+                else if !ok, !auto { showEngineNote(String(localized: "Subtitle failed to load")) }
                 if ok, player === coordinator.player {
                     applyCurrentSubtitleDelayIfReady(force: false)
                 }
@@ -7139,7 +7186,7 @@ struct TVPlayerView: View {
         // A DIFFERENT episode resumes from ITS stored offset, so the near-end guard applies again.
         resumeIsMidPlayRecovery = false
         appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false
-        addonSubsResolveTried = false; appliedVolume = false
+        addonSubsResolveTried = false; appliedVolume = false; appliedSize = false
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
         watchedZoneSince = nil
         suppressedResumeFloor = nil

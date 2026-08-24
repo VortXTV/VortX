@@ -7117,6 +7117,8 @@ struct PlayerScreen: View {
             } else {
                 rs.append(Row(label: "Sync unavailable · external subtitles only", isHeader: true))
             }
+            rs.append(Row(label: String(localized: "Font"), isHeader: true))
+            for f in SubtitleStyle.fonts { rs.append(Row(label: Self.l10n(f.label), selected: subFont == f.id) { setSubtitleFont(f.id) }) }
             rs.append(Row(label: String(localized: "Size"), isHeader: true))
             for s in SubtitleStyle.sizes { rs.append(Row(label: Self.l10n(s.label), selected: subSize == s.id) { setSubtitleSize(s.id) }) }
             let scalePct = "\(Int((subSizeScale * 100).rounded()))%"
@@ -7532,6 +7534,9 @@ struct PlayerScreen: View {
             guard !Task.isCancelled else { return }
             ProfileStore.shared.capturePlayback()
         }
+    }
+    private func setSubtitleFont(_ id: String) {
+        subFont = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
     }
     private func setSubtitleSize(_ id: String) {
         subSize = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()

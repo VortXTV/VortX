@@ -3,33 +3,29 @@ import Foundation
 /// Native in-client MEDIA-SERVER resolution: turn an IMDb id (or title+year) into a DIRECT, streamable
 /// HTTPS URL from a personal media server the user runs (Jellyfin / Emby / Plex), so a title the user
 /// already owns plays straight from their own box with no add-on. The credentials (server URL + API key +
-/// user id) are INJECTED here; there is no Keychain/Settings surface yet. This mirrors `DebridResolver`
-/// exactly: a `MediaServerProviding` protocol + per-service ACTOR conformers + a `@MainActor`
-/// `MediaServerCoordinator`, built the same way so it slots into the play path later without reshaping.
+/// user id) are INJECTED here; the Settings surface is `MediaServersSettingsView` (the same Keychain-backed
+/// shape as `DebridKeys`/`DebridKeysView`). This mirrors `DebridResolver` exactly: a `MediaServerProviding`
+/// protocol + per-service ACTOR conformers + a `@MainActor` `MediaServerCoordinator`.
 ///
-/// UNWIRED GROUNDWORK. This file is the resolver ENGINE only: it takes an IMDb id / title and returns a
-/// matched item with a playable URL. NOTHING calls it yet, exactly like `DebridResolver` was built and
-/// left inert before the source-list/play-path wiring. Two deferred, owner-steered pieces are out of scope
-/// here on purpose:
-///   1. The play/`streamGroups()` integration. `streamGroups()` is SYNCHRONOUS and has 14+ callers;
-///      surfacing async media-server hits in the unified stream list means making that path async across
-///      all of them, a one-way-door refactor that must be owner-approved, not slipped in under this groundwork.
-///   2. A Settings + Keychain credential surface (mirroring `DebridKeys`/`DebridKeysView`). Until that
-///      lands, configs are passed in by the caller; `MediaServerCoordinator.reload(configs:)` is the seam.
+/// WIRED AND LIVE. `MediaServerSource` (the source-list contributor) calls
+/// `MediaServerCoordinator.shared.find(...)`, and that contributor is mounted by the iOS/tvOS detail pages,
+/// the tvOS player, and `SourceListModel`, so media-server hits flow into the unified ranked source list like
+/// any add-on. `MediaServerCoordinator.reload(configs:)` is the credential seam the Settings surface feeds.
 ///
-/// API focus: JELLYFIN is implemented now. Emby shares almost the same REST surface (parameterize the host
-/// header / auth scheme) and Plex differs (plex.tv token auth + a different item/stream API); both are left
-/// as `// TODO` stubs in the `kind` switch, not implemented.
+/// API focus: JELLYFIN and PLEX are implemented (`JellyfinProvider` / `PlexProvider`). Emby shares almost the
+/// same REST surface as Jellyfin (parameterize the host header / auth scheme) and is served through the
+/// Jellyfin provider's compatible REST calls.
 
 // MARK: - Value types
 
-/// Which media-server product a config points at. Only `.jellyfin` is implemented in this groundwork.
+/// Which media-server product a config points at. Jellyfin and Plex are implemented; Emby rides the
+/// Jellyfin-compatible REST surface.
 enum MediaServerKind: String, Sendable, CaseIterable {
     case jellyfin, emby, plex
 }
 
-/// The injectable credentials for one media server. No Keychain/Settings wiring: the caller supplies these
-/// (the future Settings surface will build `[MediaServerConfig]` from stored credentials, like `DebridKeys`).
+/// The injectable credentials for one media server, supplied by `MediaServersSettingsView` (the
+/// Keychain-backed Settings surface, like `DebridKeys`).
 /// `baseURL` is the server root the user pastes, e.g. `https://jelly.example.com` or `http://192.168.1.10:8096`.
 struct MediaServerConfig: Sendable, Equatable {
     let kind: MediaServerKind
@@ -385,8 +381,8 @@ actor JellyfinProvider: MediaServerProviding {
 
 /// Builds providers from the user's media-server configs and drives the find-by-imdb/title query. Mirrors
 /// `DebridCoordinator`: configs in, providers built per `MediaServerKind`, queried CONCURRENTLY (providers are
-/// actors, so the captures are Sendable). With no configs it returns `[]`. This is the seam the future play
-/// layer will call to surface "play from my server" sources; NOTHING calls it yet.
+/// actors, so the captures are Sendable). With no configs it returns `[]`. Called live by `MediaServerSource`
+/// (the source-list contributor) on every title and source refresh.
 @MainActor
 final class MediaServerCoordinator {
     static let shared = MediaServerCoordinator()

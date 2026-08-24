@@ -18,7 +18,6 @@ struct SettingsView: View {
     /// Settings search query. Empty shows the full settings tree; a non-empty query filters the sections
     /// below to those whose title or any of their row keywords contain it (case-insensitive substring).
     @State private var settingsQuery = ""
-    @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     // Match Frame Rate: HDRDisplayMode owns both the key and the display-mode behavior it drives, so the key
     // string lives there rather than being duplicated as a literal across the Settings screens.

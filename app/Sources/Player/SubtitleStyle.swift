@@ -1,7 +1,8 @@
 import Foundation
 
 /// User-tunable subtitle appearance, persisted in UserDefaults and applied to libmpv. Shared by the
-/// iOS and tvOS players; configured from the tvOS Settings screen (iOS uses the defaults).
+/// iOS and tvOS players; configured from BOTH Settings screens (iOS Settings exposes the full style
+/// section too: font, size, scale, colour, background, brightness) and from the in-player panels.
 ///
 /// mpv colour note: colours are `#AARRGGBB` (alpha first). Opaque text/border colours use the plain
 /// 6-digit `#RRGGBB` form to avoid alpha-order ambiguity; the subtitle background and shadow use the
