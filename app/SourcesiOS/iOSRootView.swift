@@ -89,20 +89,6 @@ struct iOSRootView: View {
     @State private var tab: Tab = .home
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
-    #if os(macOS)
-    /// macOS keyboard browse: the focused bottom tab-strip item (its own focus space, traversed with
-    /// Left/Right and Tab; Enter switches to it). nil = no tab in the strip is focused. Keyed by raw value.
-    @FocusState private var tabFocus: MacBrowseFocus?
-    /// The persistent top-bar search field's text (macOS only; submits into the search flow).
-    @State private var macQuery = ""
-    /// Focus for the top-bar search field so ⌘F (menu "Go ▸ Search") lands the cursor in it.
-    @FocusState private var macSearchFocused: Bool
-    /// Measured height of the floated top chrome (search strip + nav pill). The content ZStack reserves
-    /// exactly this via a top `.safeAreaInset` so Forms / Lists start below the chrome while a full-bleed
-    /// hero passes under it. Seeded with a close estimate so the first frame is right before measurement
-    /// lands; `MacTopChromeHeightKey` republishes the real value.
-    @State private var macTopChromeHeight: CGFloat = 64
-    #endif
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
     /// when a still-newer build ships.
@@ -321,7 +307,14 @@ struct iOSRootView: View {
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
         } detail: {
-            selectedScreen
+            ZStack {
+                Theme.Palette.canvas.ignoresSafeArea()
+                selectedScreen
+                    .frame(maxWidth: 1_100, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.horizontal, 24)
+            }
+            .navigationTitle("VortX")
         }
         .navigationSplitViewStyle(.balanced)
         #else
@@ -356,9 +349,19 @@ struct iOSRootView: View {
 
     #if os(macOS)
     private func sidebarItem(_ item: Tab) -> some View {
-        Label(item.title, systemImage: tab == item ? item.icon : item.inactiveIcon)
+        Label(item.title, systemImage: sidebarIcon(for: item))
             .tag(item)
             .accessibilityLabel(item.title)
+    }
+
+    private func sidebarIcon(for item: Tab) -> String {
+        switch item {
+        case .home: return "house"
+        case .discover: return "square.grid.2x2"
+        case .search: return "magnifyingglass"
+        case .library: return "books.vertical"
+        default: return item.inactiveIcon
+        }
     }
     #endif
 
@@ -370,67 +373,6 @@ struct iOSRootView: View {
     }
 
     #if os(macOS)
-    /// The persistent macOS top strip: an always-visible search field, right-aligned. Pure in-content
-    /// SwiftUI, NEVER `.toolbar`/`.searchable`/`navigationTitle`, which bridge into the shared window
-    /// NSToolbar and crash (`_insertNewItemWithItemIdentifier`, the Beta 7 class). The leading inset
-    /// clears the floating traffic lights over the hidden titlebar's full-size content. The brand
-    /// wordmark used to anchor this strip's leading edge; it now lives on `macNavPill` (MAC NAV MOVE,
-    /// glass-Browse), so this strip is search-only to avoid a duplicate mark.
-    private var macTopBar: some View {
-        HStack(spacing: Theme.Space.md) {
-            Spacer(minLength: Theme.Space.md)
-            HStack(spacing: Theme.Space.sm) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                TextField(text: $macQuery) {
-                    Text("Search movies or series").foregroundStyle(Theme.Palette.textTertiary)
-                }
-                .textFieldStyle(.plain)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .focused($macSearchFocused)
-                .onSubmit { submitMacSearch() }
-                if !macQuery.isEmpty {
-                    Button {
-                        macQuery = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.Palette.textTertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Clear search")
-                }
-            }
-            .padding(.horizontal, Theme.Space.sm)
-            .padding(.vertical, 4)
-            .frame(maxWidth: 300)
-            // Glass search field (redesign Phase A): the warm liquid-glass material replaces the flat
-            // surface1 capsule so the top-bar search affordance matches the Mac home mockup. The field's
-            // text, focus, submit, and clear-button behavior are unchanged; appearance only.
-            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
-        }
-        // 84pt leading clears the traffic lights (~70pt of buttons + breathing room) restored by
-        // MacWindowChrome over the hidden titlebar.
-        .padding(.leading, 84)
-        .padding(.trailing, Theme.Space.md)
-        // Compact strip height so the search field reads light at the very top-right. The nav pill now
-        // OVERLAPS this strip in the SAME top band (see `macTopNavOverlay`'s top-aligned ZStack), so this
-        // height only positions the search field near the very top; it no longer stacks a second line below.
-        .frame(height: 32)
-        .frame(maxWidth: .infinity)
-        .background {
-            // The strip now FLOATS over the hero art (not an opaque canvas band that pushed the hero down),
-            // so it is transparent except for a soft top-edge scrim that keeps the traffic lights + search
-            // field legible over bright artwork; the hero's own top gradient does most of the darkening.
-            // Over a scroll screen (Settings, Add-ons) the reserved inset shows canvas behind, so the scrim
-            // is invisible there. Bleeds under the hidden-titlebar region so the scrim covers the whole strip.
-            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.55), .clear],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
-        }
-    }
-
     /// Where a search request lands (#117 rule: never route to a hidden tab, fall back to Home).
     /// Resolve the natural destination FIRST (merged mode folds Search into Discover, so merge on
     /// means Discover, else Search), then apply the hidden state: if the user hid THAT tab in
@@ -442,90 +384,7 @@ struct iOSRootView: View {
         let dest: Tab = mergeDiscoverSearch ? .discover : .search
         return hiddenTabs.contains(dest) ? .home : dest
     }
-
-    /// Submit the top-bar query into the engine search flow: hand it to `MacSearchBridge` (consumed by
-    /// the Search tab, or Discover in merged mode, possibly mounting for the first time) and switch there.
-    private func submitMacSearch() {
-        let q = macQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return }
-        // Never route to a hidden tab; fall back to Home (#117). Only queue the pending query when a
-        // search surface will actually consume it, so a submit with the destination hidden cannot
-        // leave a stale query that fires on a much later visit.
-        let dest = searchDestination
-        if dest != .home { MacSearchBridge.shared.pending = q }
-        tab = dest
-    }
-
-    /// MAC NAV MOVE (CEO greenlit): the macOS navigation shell, restructured from the old bottom bar
-    /// into a top-center floating glass pill (the Mac mockup): the VortX mark, then the SAME tab items
-    /// as the bar (`tabButton`, `visibleTabs`), so tab identity / selection / scroll-to-top / the
-    /// macOS keyboard focus-ring wiring carry over UNCHANGED; only the pill's position and the
-    /// wordmark move. Structural on macOS ONLY (see the `#if os(macOS)` gate around this whole
-    /// extension and around its call site in `body`); iOS/iPadOS keep `customTabBar` at the bottom.
-    private var macNavPill: some View {
-        HStack(spacing: Theme.Space.md) {
-            VortXWordmark(fontSize: 18)
-            Divider().frame(height: 20)
-            HStack(spacing: Theme.Space.xs) {
-                ForEach(visibleTabs, id: \.rawValue) { item in
-                    // `tabButton` internally requests `.frame(maxWidth: .infinity)` (right, for the
-                    // bottom bar's seven-equal-columns layout on iOS). `.fixedSize()` collapses that
-                    // back to the item's intrinsic width here, so the PILL stays compact and centered
-                    // instead of stretching to the full window width; `tabButton` itself, and its iOS
-                    // callers, are unchanged. A small per-item horizontal pad + the row spacing above
-                    // give the compact Mac pill breathing room between tabs.
-                    tabButton(item).fixedSize().padding(.horizontal, Theme.Space.xs)
-                }
-            }
-            // Same keyboard-browse focus section as the old bottom bar: arrows/Tab walk the pill,
-            // Enter switches tabs.
-            .focusSection()
-        }
-        .padding(.horizontal, Theme.Space.md)
-        .padding(.vertical, Theme.Space.xs)
-        .vortxGlass(in: Capsule())
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Tabs")
-    }
     #endif
-
-    /// The floated macOS top chrome: the search strip (`macTopBar`) and the top-center nav pill
-    /// (`macNavPill`) OVERLAID top-aligned in ONE band (a ZStack, not stacked lines), so the centered pill
-    /// rises to sit nearly level with the search bar on the right rather than a full line beneath it (CEO
-    /// ask: search + nav read as almost the same horizontal line, the whole cluster hugging the very top).
-    /// Pill centered, search right, so on a normal-width window they do not collide. Floats OVER the content
-    /// so the Home / Library / Discover hero art bleeds to the window top behind it (no opaque canvas band).
-    /// `EmptyView` everywhere else. A
-    /// `@ViewBuilder` var (not an inline `#if` inside a modifier chain) so `body` can unconditionally
-    /// `.overlay` it without SwiftUI's ViewBuilder choking on an `#if`/`#else` split mid-chain. Its
-    /// measured height is published via `MacTopChromeHeightKey` so `body` can reserve exactly this band
-    /// (a top `.safeAreaInset`) for the scroll screens that must start below the chrome.
-    @ViewBuilder private var macTopNavOverlay: some View {
-        #if os(macOS)
-        ZStack(alignment: .top) {
-            macTopBar
-            macNavPill
-        }
-        .background {
-            GeometryReader { g in
-                Color.clear.preference(key: MacTopChromeHeightKey.self, value: g.size.height)
-            }
-        }
-        #else
-        EmptyView()
-        #endif
-    }
-
-    /// The iOS/iPadOS bottom tab bar row; a no-op on macOS, which drives navigation from
-    /// `macTopNavOverlay` instead (MAC NAV MOVE). Kept as its own `@ViewBuilder` var for the same
-    /// #if-inside-a-view-builder reason as `macTopNavOverlay`.
-    @ViewBuilder private var bottomTabBarRow: some View {
-        #if os(macOS)
-        EmptyView()
-        #else
-        customTabBar
-        #endif
-    }
 
     /// Brand-styled bottom bar: seven equal items, each a small SF Symbol over a caption label. The
     /// selected item is tinted with the app accent; the rest read as tertiary text. A hairline +
@@ -557,11 +416,6 @@ struct iOSRootView: View {
                 tabButton(item)
             }
         }
-        #if os(macOS)
-        // Group the tab items so native directional focus walks Left/Right across the strip; Tab / Full
-        // Keyboard Access reaches it via the standard key-view loop. Enter on a focused tab switches to it.
-        .focusSection()
-        #endif
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tabs")
         // Floating glass pill (redesign Phase A): the tab items ride VortX's warm liquid-glass material,
@@ -729,30 +583,9 @@ struct iOSRootView: View {
         .accessibilityHint("Switches to \(item.title) tab")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
 
-        #if os(macOS)
-        // macOS keyboard browse: each tab item is focusable so arrows/Tab walk the strip and the focus
-        // ring shows where you are; Enter fires the Button (switches tab). Additive + gated, so iOS is
-        // unchanged. The ring uses the control radius (the pill is capsule-ish at this small size).
         return base
-            .focusable()
-            .focused($tabFocus, equals: .tab(item.rawValue))
-            .macFocusRing(tabFocus == .tab(item.rawValue), cornerRadius: Theme.Radius.control)
-        #else
-        return base
-        #endif
     }
 }
-
-#if os(macOS)
-/// Publishes the measured height of the floated macOS top chrome (search strip + nav pill) up to
-/// `iOSRootView.body`, which reserves exactly this band via a top `.safeAreaInset` so Forms / Lists start
-/// below the chrome while a full-bleed hero passes under it. `max` reduce so the largest reported band wins
-/// (there is a single source, so this is just a safe default).
-private struct MacTopChromeHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 64
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-#endif
 
 private extension View {
     /// macOS: reclaim the top container safe area (the window titlebar / traffic-light band) so a
