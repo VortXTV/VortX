@@ -409,10 +409,16 @@ private struct MacWindowChrome: NSViewRepresentable {
             }
         }
 
-        /// Temporary field diagnostic for the owner's "no traffic lights" report: dumps the true AppKit
-        /// state of the three standard buttons + their titlebar chain to the unified log.
+        #if DEBUG
+        private static var didProbe = false
+        #endif
+
+        /// Debug-only field diagnostic for the owner's "no traffic lights" report. At most one hierarchy
+        /// snapshot is emitted per process so repeated SwiftUI representable updates stay cheap.
         private static func probe(_ window: NSWindow?) {
-            guard let window else { return }
+            #if DEBUG
+            guard !didProbe, let window else { return }
+            didProbe = true
             var lines = ["styleMask=\(window.styleMask.rawValue) titleVis=\(window.titleVisibility.rawValue) transparent=\(window.titlebarAppearsTransparent)"]
             for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
                 guard let b = window.standardWindowButton(kind) else {
@@ -428,6 +434,7 @@ private struct MacWindowChrome: NSViewRepresentable {
                 lines.append(chain)
             }
             NSLog("[macchrome] %@", lines.joined(separator: "\n"))
+            #endif
         }
 
         private static func apply(to window: NSWindow?) {

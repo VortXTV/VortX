@@ -1269,20 +1269,11 @@ struct iOSDetailView: View {
                 .frame(width: geo.size.width, alignment: .leading)
             }
         }
-        // Near-full-bleed cinematic backdrop behind the ENTIRE detail page (owner ask). The pinned banner only
-        // paints the top portion of the window (heroBandHeight reserves an inner-scroll region so the Watch /
-        // Quality actions stay visible), which left the scroll region beneath it on flat black canvas: the
-        // "dead black below" report. Painting the SAME art + multi-stop gradient scrim at the full window
-        // height BEHIND the page makes the lower region read as continuous cinematic art with the copy still
-        // legible, without growing the banner (which would push Watch below the fold). `.background` does not
-        // affect the VStack's own layout; the opaque banner still owns the crisp focal art up top. macOS-only.
+        // Keep atmosphere behind the full detail page without decoding the hero art a second time or applying
+        // a full-window Gaussian blur. The static material and already-computed dominant tint preserve the
+        // cinematic color wash while bounding compositing cost as the inner scroll view moves. macOS-only.
         .background(alignment: .top) {
-            // Use the blurred-FILL wash, NOT a second crisp `backdrop`: painting `backdrop` again at full
-            // height re-ran the banner's `.fit` fallback for a series (portrait poster), so the crisp banner
-            // poster and this crisp background poster rendered as TWO offset centered images (the "two images"
-            // report). `backdropWash` always fills + blurs + dims, so a movie reads as one continuous image
-            // and a series reads as a crisp poster over soft blurred art (one image), never two.
-            backdropWash(height: geo.size.height)
+            macDetailBackdrop
                 .ignoresSafeArea()
         }
     }
@@ -1533,36 +1524,14 @@ struct iOSDetailView: View {
     }
 
     #if os(macOS)
-    /// The full-window BACKGROUND wash behind the pinned macOS detail page (the pinned banner only paints the
-    /// top band, so the scroll region beneath needs continuous atmosphere). Unlike the crisp `backdrop` banner,
-    /// this ALWAYS uses `.fill` (never the series `.fit` fallback) plus a blur and a dim, so it reads as soft
-    /// atmosphere rather than a SECOND crisp poster: a movie's crisp fill banner sits over a matching (softly
-    /// blurred) fill wash (continuous, no seam), and a series' `.fit` poster banner sits over a soft blurred
-    /// fill of the same art (poster-on-blur) instead of two competing centered posters. Decoupled from the
-    /// banner's `.fit` switch at `backdrop(height:)` on purpose.
-    private func backdropWash(height: CGFloat) -> some View {
-        let bg = meta?.background ?? meta?.poster
-            ?? seedBackdrop
-            ?? FeaturedHeroItem.metahubBackground(forId: id)
-        return AsyncImage(url: URL(string: bg ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)   // ALWAYS fill, never .fit
-            default: Theme.Palette.canvas
-            }
-        }
-        .frame(height: height)
-        .frame(maxWidth: .infinity, alignment: .top)
-        .clipped()
-        .blur(radius: 40)
-        // Dim + fade to canvas so the copy scrolling below the banner stays legible over the soft art.
-        .overlay(Theme.Palette.canvas.opacity(0.5))
-        .overlay(
-            LinearGradient(stops: [
-                .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.6),
-                .init(color: Theme.Palette.canvas, location: 1.0),
-            ], startPoint: .top, endPoint: .bottom)
-        )
+    /// A static, bounded-cost continuation of the hero palette behind the pinned macOS detail page. The hero
+    /// remains the only full artwork decode; this surface reuses its asynchronously computed dominant tint.
+    private var macDetailBackdrop: some View {
+        LinearGradient(stops: [
+            .init(color: dominantTint ?? Theme.Palette.surface1, location: 0.0),
+            .init(color: Theme.Palette.canvas.opacity(0.92), location: 0.55),
+            .init(color: Theme.Palette.canvas, location: 1.0),
+        ], startPoint: .top, endPoint: .bottom)
         .accessibilityHidden(true)
     }
     #endif

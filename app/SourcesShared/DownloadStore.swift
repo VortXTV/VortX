@@ -17,6 +17,10 @@ final class DownloadStore: ObservableObject {
     @Published private(set) var records: [DownloadRecord] = []
 
     private let fileManager = FileManager.default
+    /// Bare progress callbacks are coalesced across every active download. Publishing one array snapshot at
+    /// most twice per second prevents unrelated rows from re-rendering for each delegate callback.
+    private var pendingProgressRecords: [UUID: DownloadRecord] = [:]
+    private var progressPublishTask: Task<Void, Never>?
 
     init() {
         ensureDirectory()
@@ -132,6 +136,7 @@ final class DownloadStore: ObservableObject {
     }
 
     func upsert(_ record: DownloadRecord) {
+        pendingProgressRecords.removeValue(forKey: record.id)
         if let idx = records.firstIndex(where: { $0.id == record.id }) {
             records[idx] = record
         } else {
@@ -142,21 +147,48 @@ final class DownloadStore: ObservableObject {
 
     /// Mutate a record in place (progress / state transitions) and persist. No-op if the id is gone
     /// (e.g. the user deleted the row while a late delegate callback arrived).
-    /// `persistIndex: false` is for high-frequency PROGRESS ticks (#24): they only need the published
-    /// records for the UI, and re-encoding + atomically rewriting the JSON index on every tick was a
-    /// main-thread disk write several times per second. State transitions keep the default and persist.
+    /// `persistIndex: false` is for high-frequency PROGRESS ticks (#24): they are coalesced across all active
+    /// downloads and published as one array snapshot at most every 0.5s. State transitions remain immediate.
     func update(id: UUID, persistIndex: Bool = true, _ mutate: (inout DownloadRecord) -> Void) {
         guard let idx = records.firstIndex(where: { $0.id == id }) else { return }
-        var copy = records[idx]
+        if !persistIndex {
+            var copy = pendingProgressRecords[id] ?? records[idx]
+            mutate(&copy)
+            pendingProgressRecords[id] = copy
+            scheduleProgressPublish()
+            return
+        }
+        var copy = pendingProgressRecords.removeValue(forKey: id) ?? records[idx]
         mutate(&copy)
         records[idx] = copy
-        if persistIndex { persist() }
+        persist()
+    }
+
+    private func scheduleProgressPublish() {
+        guard progressPublishTask == nil else { return }
+        progressPublishTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(500)) }
+            catch { return }
+            self?.publishPendingProgress()
+        }
+    }
+
+    private func publishPendingProgress() {
+        defer { progressPublishTask = nil }
+        guard !pendingProgressRecords.isEmpty else { return }
+        var next = records
+        for (id, pending) in pendingProgressRecords {
+            if let idx = next.firstIndex(where: { $0.id == id }) { next[idx] = pending }
+        }
+        pendingProgressRecords.removeAll(keepingCapacity: true)
+        records = next
     }
 
     /// Remove a record AND its on-disk file. The caller (DownloadManager) is responsible for cancelling
     /// any live URLSession task first.
     func remove(id: UUID) {
         guard let idx = records.firstIndex(where: { $0.id == id }) else { return }
+        pendingProgressRecords.removeValue(forKey: id)
         let record = records[idx]
         try? fileManager.removeItem(at: fileURL(for: record))
         records.remove(at: idx)

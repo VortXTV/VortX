@@ -102,7 +102,7 @@ struct iOSCollectionsHub: View {
             // localize it here so the section header follows the app language.
             Text(LocalizedStringKey(title)).sectionTitleStyle().padding(.horizontal, Theme.Space.md)
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(alignment: .top, spacing: Theme.Space.sm) { tiles() }
+                LazyHStack(alignment: .top, spacing: Theme.Space.sm) { tiles() }
                     .padding(.horizontal, Theme.Space.md)
             }
         }

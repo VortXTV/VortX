@@ -45,6 +45,77 @@ struct PlayerEpisodeStream {
     var preparedRemux: VortXPreparedRemuxAttachment? = nil
 }
 
+/// High-frequency playback position lives outside PlayerScreen's observed state. Only the small clock
+/// leaves below subscribe to these ticks, so engine time updates do not invalidate the full player hierarchy.
+private final class TimePosClock: ObservableObject {
+    @Published var position: Double = 0
+}
+
+private struct PlayerTimeLabel: View {
+    @ObservedObject var clock: TimePosClock
+    var opacity: Double = 1
+    var showWhenPositive = false
+
+    var body: some View {
+        Text(formattedTime(clock.position))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.white.opacity(opacity))
+            .opacity(!showWhenPositive || clock.position > 0 ? 1 : 0)
+    }
+
+    private func formattedTime(_ time: Double) -> String {
+        guard time.isFinite, time >= 0 else { return "0:00" }
+        let total = Int(time), hours = total / 3600, minutes = (total % 3600) / 60, seconds = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, seconds)
+            : String(format: "%d:%02d", minutes, seconds)
+    }
+}
+
+private struct PlayerClockSlider: View {
+    @ObservedObject var clock: TimePosClock
+    @Binding var scrubbing: Bool
+    @Binding var scrubTarget: Double
+    let duration: Double
+    let onScrubChanged: (Double) -> Void
+    let onEditingChanged: (Bool) -> Void
+
+    var body: some View {
+        Slider(
+            value: Binding(
+                get: { scrubbing ? scrubTarget : clock.position },
+                set: { scrubTarget = $0; onScrubChanged($0) }
+            ),
+            in: 0...max(duration, 1),
+            onEditingChanged: onEditingChanged
+        )
+    }
+}
+
+private struct PlayerBufferedBand: View {
+    @ObservedObject var clock: TimePosClock
+    let duration: Double
+    let bufferedTime: Double
+    let trackWidth: CGFloat
+    let sliderInset: CGFloat
+    let height: CGFloat
+
+    var body: some View {
+        if duration > 0 {
+            let head = min(1, max(0, clock.position / duration))
+            let ahead = min(1, max(0, bufferedTime / duration))
+            if ahead > head {
+                let sx = sliderInset + CGFloat(head) * trackWidth
+                let width = CGFloat(ahead - head) * trackWidth
+                Capsule().fill(.white.opacity(0.42))
+                    .frame(width: max(1, width), height: 3)
+                    .position(x: sx + max(1, width) / 2, y: height / 2)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+}
+
 struct PlayerScreen: View {
     #if os(iOS) || os(macOS)
     private struct DirectAVNoFrameRecovery: Equatable {
@@ -301,7 +372,12 @@ struct PlayerScreen: View {
     @State private var autoAddedThisPlayback = false    // D8/D9: the ~60s auto-add + watch-ping fires once per playback
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true   // "Auto-add watched to Library" (default ON)
     @State private var buffering = true
-    @State private var currentTime = 0.0
+    /// Stored as a reference in State without observing it here. TimePosClock's leaf views own the observation.
+    @State private var timePosClock = TimePosClock()
+    private var currentTime: Double {
+        get { timePosClock.position }
+        nonmutating set { timePosClock.position = newValue }
+    }
     @State private var duration = 0.0
     @State private var bufferedTime = 0.0   // buffered-ahead edge (seconds) for the YouTube-style grey scrubber band
     @State private var lastReported = -1.0     // last whole-second progress pushed to stremio-core
@@ -5571,7 +5647,7 @@ struct PlayerScreen: View {
                 liveIndicator
             } else {
                 HStack(spacing: 12) {
-                    Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    PlayerTimeLabel(clock: timePosClock)
                     // Slider is wrapped in a GeometryReader so the trickplay bubble can be positioned
                     // relative to the knob and macOS hover can compute the preview time from cursor x.
                     GeometryReader { geo in
@@ -5580,22 +5656,27 @@ struct PlayerScreen: View {
                         let trackWidth = max(1, geo.size.width - sliderInset * 2)
                         // While dragging the thumb follows scrubTarget so an incoming timePos tick
                         // can't yank it back to the pre-seek position (#32). On release we commit.
-                        Slider(value: Binding(get: { scrubbing ? scrubTarget : currentTime },
-                                              set: { scrubTarget = $0; scrubThumbnails.show(time: $0) }),
-                               in: 0...max(duration, 1)) { editing in
-                            scrubbing = editing
-                            if editing {
-                                scrubTarget = currentTime; hideTask?.cancel()
-                                hoverPreviewTime = nil; hoverPreviewRatio = nil
-                            } else {
-                                let target = scrubTarget
-                                currentTime = target
-                                issueSeek(to: target, reason: "scrub")
-                                reportSeek(target)
-                                scrubThumbnails.clear()
-                                scheduleHide()
+                        PlayerClockSlider(
+                            clock: timePosClock,
+                            scrubbing: $scrubbing,
+                            scrubTarget: $scrubTarget,
+                            duration: duration,
+                            onScrubChanged: { scrubThumbnails.show(time: $0) },
+                            onEditingChanged: { editing in
+                                scrubbing = editing
+                                if editing {
+                                    scrubTarget = currentTime; hideTask?.cancel()
+                                    hoverPreviewTime = nil; hoverPreviewRatio = nil
+                                } else {
+                                    let target = scrubTarget
+                                    currentTime = target
+                                    issueSeek(to: target, reason: "scrub")
+                                    reportSeek(target)
+                                    scrubThumbnails.clear()
+                                    scheduleHide()
+                                }
                             }
-                        }
+                        )
                         .tint(Theme.Palette.accent)
                         #if os(macOS)
                         .onContinuousHover { phase in
@@ -5617,17 +5698,15 @@ struct PlayerScreen: View {
                         // loaded edge, over the Slider's own track but under the thumb/ticks. Never intercepts
                         // the drag. Fail-soft: no buffered info (or behind the playhead) → nothing draws.
                         .overlay {
-                            if duration > 0, !scrubbing {
-                                let head = min(1, max(0, currentTime / duration))
-                                let ahead = min(1, max(0, bufferedTime / duration))
-                                if ahead > head {
-                                    let sx = sliderInset + CGFloat(head) * trackWidth
-                                    let w  = CGFloat(ahead - head) * trackWidth
-                                    Capsule().fill(.white.opacity(0.42))
-                                        .frame(width: max(1, w), height: 3)
-                                        .position(x: sx + max(1, w) / 2, y: geo.size.height / 2)
-                                        .allowsHitTesting(false)   // decorative; never intercept the Slider drag
-                                }
+                            if !scrubbing {
+                                PlayerBufferedBand(
+                                    clock: timePosClock,
+                                    duration: duration,
+                                    bufferedTime: bufferedTime,
+                                    trackWidth: trackWidth,
+                                    sliderInset: sliderInset,
+                                    height: geo.size.height
+                                )
                             }
                         }
                         // Chapter boundary ticks along the track (purely decorative, never intercept the
@@ -6115,9 +6194,7 @@ struct PlayerScreen: View {
             // Liquid Glass on OS 26. Background only; the red dot stays a plain fill and playback state is unchanged.
             .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
             Spacer()
-            if currentTime > 0 {
-                Text(timeString(currentTime)).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.85))
-            }
+            PlayerTimeLabel(clock: timePosClock, opacity: 0.85, showWhenPositive: true)
         }
     }
 

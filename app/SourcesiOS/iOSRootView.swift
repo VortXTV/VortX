@@ -87,10 +87,6 @@ struct iOSRootView: View {
     }
 
     @State private var tab: Tab = .home
-    /// First-visit lazy mount (#24): a tab's screen is built only once it has been SELECTED at least
-    /// once, then stays mounted (opacity-switched) so its state survives switches exactly as before.
-    /// Launch no longer pays for ~6 unvisited screens' engine subscriptions, heroes, and image loads.
-    @State private var visitedTabs: Set<Int> = [Tab.home.rawValue]
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -151,12 +147,6 @@ struct iOSRootView: View {
         TabBarPrefs.migrateLegacyLiveKey()
     }
 
-    /// Whether a tab's screen should be mounted: only after its first selection (#24). The active tab
-    /// is always mounted (covers the initial Home and any programmatic switch before onChange lands).
-    private func isMounted(_ item: Tab) -> Bool {
-        tab == item || visitedTabs.contains(item.rawValue)
-    }
-
     /// The launch "Who's watching?" picker is owed when the roster has more than one profile and none has
     /// been chosen this launch (ProfileStore.needsPicker), with no fullscreen player up. The tvOS gate is
     /// `splashDone && needsPicker && presenter.request == nil`; iOSRootView has no splash of its own (the
@@ -182,28 +172,27 @@ struct iOSRootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Selected screen fills the whole window. Screens mount LAZILY on first visit (#24) and then
-            // stay in this ZStack so each screen's own state (scroll position, search query, engine
-            // subscriptions) survives a tab switch instead of being torn down and rebuilt. On macOS the
-            // search strip + nav pill now FLOAT over this region (`macTopNavOverlay`) instead of an opaque
-            // in-flow strip, so the Home / Library / Discover hero art bleeds to the window top behind the
-            // chrome (no black canvas band); scroll screens reserve the chrome band below via the inset.
+            // Selected screen fills the whole window. Only the selected screen is mounted, so hidden tabs
+            // cannot observe broad CoreBridge publications or keep heroes, catalogs, and image work alive.
+            // Per-tab model singletons and persisted preferences survive switches; view-local navigation and
+            // scroll state are rebuilt when returning to a tab.
             ZStack {
-                // `isActive` gates each browse screen's `.principal` wordmark: on macOS a principal
-                // toolbar item is hoisted into the shared window titlebar, and every mounted
-                // NavigationStack would otherwise stamp its own, tiling "StremioX" once per screen.
-                // Only the visible tab contributes its wordmark (#46 regression).
-                iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
-                // Hidden tabs UNMOUNT, mirroring Live's long-standing gate (#117): a tab hidden in
-                // Settings > Tab bar stops its background work (hero rotation, catalog refresh)
-                // instead of idling at opacity 0. Safe because no route can land on a hidden tab
-                // (the per-toggle healers + the macOS searchDestination rule fall back to Home).
-                if !hideDiscoverTab, isMounted(.discover) { iOSDiscoverView(isActive: tab == .discover).opacity(tab == .discover ? 1 : 0) }
-                if !hideLiveTab, isMounted(.live) { iOSLiveView().opacity(tab == .live ? 1 : 0) }
-                if !hideLibraryTab, isMounted(.library) { iOSLibraryView(isActive: tab == .library).opacity(tab == .library ? 1 : 0) }
-                if !mergeDiscoverSearch, !hideSearchTab, isMounted(.search) { iOSSearchView(isActive: tab == .search).opacity(tab == .search ? 1 : 0) }
-                if isMounted(.addons) { AddonsView().opacity(tab == .addons ? 1 : 0) }
-                if isMounted(.settings) { iOSSettingsView().opacity(tab == .settings ? 1 : 0) }
+                switch tab {
+                case .home:
+                    iOSHomeView(isActive: true)
+                case .discover:
+                    if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
+                case .live:
+                    if !hideLiveTab { iOSLiveView() }
+                case .library:
+                    if !hideLibraryTab { iOSLibraryView(isActive: true) }
+                case .search:
+                    if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
+                case .addons:
+                    AddonsView()
+                case .settings:
+                    iOSSettingsView()
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             #if os(macOS)
@@ -230,7 +219,6 @@ struct iOSRootView: View {
             bottomTabBarRow
         }
         .onChange(of: tab) { newTab in
-            visitedTabs.insert(newTab.rawValue)   // lazy mount: remember every visit (#24)
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
             VXProbe.event("nav", "tab \(newTab.probeName)")
@@ -4139,14 +4127,16 @@ private struct PosterRail: View {
         #if os(macOS)
         if let macFocus {
             let target = MacBrowseFocus.card(rail: title, item: item.id)
+            // Compare the shared focus once while constructing the cell, then give this poster a plain value.
+            // The ring and scroll observer no longer subscribe every realized poster to the shared binding.
+            let isFocused = macFocus.wrappedValue == target
             base
                 .focusable()
                 .focused(macFocus, equals: target)
-                .macFocusRing(macFocus.wrappedValue == target)
-                // Keep the keyboard-focused card on screen as focus walks the row (the same scrollTo the
-                // hover arrows use). Driven off focus change so it tracks both arrow moves and Tab landings.
-                .onChange(of: macFocus.wrappedValue) { newValue in
-                    if newValue == target { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(item.id, anchor: .center) } }
+                .macFocusRing(isFocused)
+                // Only the old and new focused cells receive a changed Bool as focus walks the row.
+                .onChange(of: isFocused) { focused in
+                    if focused { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(item.id, anchor: .center) } }
                 }
         } else {
             base

@@ -225,6 +225,10 @@ final class ProfileStore: ObservableObject {
 
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
+    /// Progress ticks update memory immediately but coalesce the full watch-cache serialization. Continuous
+    /// playback writes at most once per minute; a separate trailing task flushes once playback ticks stop.
+    private var watchCacheSaveTask: Task<Void, Never>?
+    private var watchCacheStopSaveTask: Task<Void, Never>?
 
     /// Durable delete tombstones (profile id strings). Persisted in UserDefaults, emitted into
     /// doc.vortx.deletedProfiles by VortXSyncManager, and subtracted from every roster union so a
@@ -311,6 +315,8 @@ final class ProfileStore: ObservableObject {
         // roster already matches, and it safely does nothing when there is no active profile
         // (remove()'s select-after-removal: the removed profile is already gone from the roster).
         capturePlayback()
+        // Persist delayed progress against the outgoing profile before replacing the active watch dictionary.
+        flushScheduledWatchCacheSave()
         let beforeAccount = active.map(keychainAccount(for:))
         activeID = profile.id
         pickedThisLaunch = true
@@ -1323,7 +1329,7 @@ final class ProfileStore: ObservableObject {
         entry.name = meta.name
         entry.poster = meta.poster ?? entry.poster
         watch[meta.libraryId] = entry
-        saveWatchCache()
+        scheduleWatchCacheSave()
         schedulePushWatch()
     }
 
@@ -1427,6 +1433,35 @@ final class ProfileStore: ObservableObject {
         }
     }
 
+    private func scheduleWatchCacheSave() {
+        if watchCacheSaveTask == nil {
+            watchCacheSaveTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .seconds(60)) }
+                catch { return }
+                guard let self else { return }
+                self.watchCacheSaveTask = nil
+                self.saveWatchCache()
+            }
+        }
+        // A separate trailing save captures the final position after progress ticks stop. Its delay exceeds
+        // the normal playback tick interval, so continuous playback still serializes no more than once/minute.
+        watchCacheStopSaveTask?.cancel()
+        watchCacheStopSaveTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(45)) }
+            catch { return }
+            self?.flushScheduledWatchCacheSave()
+        }
+    }
+
+    private func flushScheduledWatchCacheSave() {
+        guard watchCacheSaveTask != nil || watchCacheStopSaveTask != nil else { return }
+        watchCacheSaveTask?.cancel()
+        watchCacheSaveTask = nil
+        watchCacheStopSaveTask?.cancel()
+        watchCacheStopSaveTask = nil
+        saveWatchCache()
+    }
+
     private func schedulePushWatch() {
         pushWatchTask?.cancel()
         // DEBOUNCED (3s): progress writes fire on every ~20s tick AND on every pause / seek / menu / close,
@@ -1461,6 +1496,10 @@ final class ProfileStore: ObservableObject {
     }
 
     private func saveWatchCache() {
+        watchCacheSaveTask?.cancel()
+        watchCacheSaveTask = nil
+        watchCacheStopSaveTask?.cancel()
+        watchCacheStopSaveTask = nil
         guard let profile = active else { return }
         if let data = try? JSONEncoder().encode(watch) {
             UserDefaults.standard.set(data, forKey: Self.watchCacheKey(profile.id))
