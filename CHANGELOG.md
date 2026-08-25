@@ -4,6 +4,17 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 29 (build 231)
+
+### Add-ons that stopped working are back
+
+**Comet and StreamFusion (and any add-on on plain http) work again.** A security hardening introduced after build 215 accidentally required every add-on manifest to be HTTPS-only, which locked out community add-ons whose manifests live on plain http addresses or redirect through one, while well-hosted add-ons kept working. Manifests over public http addresses are accepted again. Every private-address protection still applies to both schemes: loopback, LAN, and other private addresses stay refused on the entry URL and on every redirect hop, redirects are still re-validated hop by hop, and the manifest size cap remains.
+
+### The app now tells you when an update is out
+
+**Update notices on Apple TV, iPhone, iPad, and Mac.** Sideloaded installs had no way to learn a new build existed unless you happened to check. The app now compares versions numerically (so 0.3.10 never sorts below 0.3.9), reads only published releases, checks at most once a day automatically (plus the manual Check for Updates menu action on Mac), and shows a dismissible notice when a newer build is available. Failing network probes stay silent.
+
+
 ## 0.3.14 Beta 28 (build 230)
 
 ### Apple: the Mac app, rebuilt for the desktop
