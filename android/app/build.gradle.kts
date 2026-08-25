@@ -1,3 +1,5 @@
+import java.nio.file.Files
+import java.util.Base64
 import java.util.Properties
 
 plugins {
@@ -27,35 +29,32 @@ val externalSyncProps = Properties().apply {
 fun externalSyncSecret(name: String): String =
     (externalSyncProps.getProperty(name) ?: System.getenv(name) ?: "").trim()
 
-// Release signing (W0-2). The upload keystore and its passwords NEVER live in this repo (the tree is
-// public). They resolve, in order, from a GITIGNORED keystore.properties on a dev box, then from an
-// environment variable of the same name in CI -- mirroring the externalSyncSecret() model above. The
-// four inputs are:
-//   VORTX_KEYSTORE_FILE     -- path to the keystore (.jks/.keystore); relative paths resolve against
-//                              the android/ project root, absolute paths (what CI passes) are used as-is.
-//   VORTX_KEYSTORE_PASSWORD -- store password.
-//   VORTX_KEY_ALIAS         -- key alias inside the keystore.
-//   VORTX_KEY_PASSWORD      -- key password (falls back to the store password when a single password
-//                              was used at generation time, the keytool default).
-// When any input is missing the release build stays UNSIGNED so a fresh/public clone and the existing
-// debug CI still build unchanged (fail-soft, exactly like the dormant-by-default externalSync* keys).
-// The real keystore is generated + backed up out of git; see android/RELEASE-SIGNING.md.
-val keystoreProps = Properties().apply {
-    val f = rootProject.file("keystore.properties")
-    if (f.exists()) f.inputStream().use { load(it) }
-}
+// Release signing credentials stay outside the public repository. VORTX_KEYSTORE_PATH may be an
+// existing local path or the base64 keystore value used by CI. Base64 input is decoded into an OS
+// temporary file and removed when the Gradle process exits.
 fun signingSecret(name: String): String? =
-    (keystoreProps.getProperty(name) ?: System.getenv(name))?.trim()?.takeIf { it.isNotEmpty() }
+    System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
 
-val releaseStoreFile: File? = signingSecret("VORTX_KEYSTORE_FILE")?.let { rootProject.file(it) }
-val releaseStorePassword: String? = signingSecret("VORTX_KEYSTORE_PASSWORD")
-val releaseKeyAlias: String? = signingSecret("VORTX_KEY_ALIAS")
-val releaseKeyPassword: String? = signingSecret("VORTX_KEY_PASSWORD") ?: releaseStorePassword
-val releaseSigningReady: Boolean =
-    releaseStoreFile?.isFile == true &&
-        !releaseStorePassword.isNullOrEmpty() &&
-        !releaseKeyAlias.isNullOrEmpty() &&
-        !releaseKeyPassword.isNullOrEmpty()
+val releaseKeystoreValue = signingSecret("VORTX_KEYSTORE_PATH")
+val releaseStorePassword = signingSecret("VORTX_KEYSTORE_PASSWORD")
+val releaseKeyAlias = signingSecret("VORTX_KEY_ALIAS")
+val releaseKeyPassword = signingSecret("VORTX_KEY_PASSWORD")
+val releaseSigningReady =
+    listOf(releaseKeystoreValue, releaseStorePassword, releaseKeyAlias, releaseKeyPassword).all { it != null }
+val releaseStoreFile: File? = if (releaseSigningReady) {
+    val directFile = rootProject.file(releaseKeystoreValue!!)
+    if (directFile.isFile) {
+        directFile
+    } else {
+        Files.createTempFile("vortx-release-", ".jks").toFile().apply {
+            writeBytes(Base64.getMimeDecoder().decode(releaseKeystoreValue))
+            deleteOnExit()
+            require(length() > 0L) { "VORTX_KEYSTORE_PATH decoded to an empty keystore" }
+        }
+    }
+} else {
+    null
+}
 
 android {
     namespace = "com.vortx.android"
@@ -69,7 +68,7 @@ android {
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 187
+        versionCode = 188
         versionName = "0.3.14"
 
         // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /
@@ -91,19 +90,13 @@ android {
         }
     }
 
-    // Release signing config (W0-2). Registered ONLY when all four inputs resolved above (releaseSigningReady);
-    // otherwise no "release" config exists and the release build stays unsigned (fail-soft). One identity for
-    // every release build gives a reproducible signing cert across consecutive builds.
     signingConfigs {
-        if (releaseSigningReady) {
-            create("release") {
+        create("release") {
+            if (releaseSigningReady) {
                 storeFile = releaseStoreFile
                 storePassword = releaseStorePassword
                 keyAlias = releaseKeyAlias
                 keyPassword = releaseKeyPassword
-                // Sign with both the APK Signature Scheme v2 (whole-file, Android 7+) and the legacy v1
-                // JAR scheme so any tooling that still checks v1 verifies too. minSdk 26 is well above
-                // v2's floor, but keeping v1 on costs nothing and avoids a verifier edge case.
                 enableV1Signing = true
                 enableV2Signing = true
             }
@@ -112,11 +105,13 @@ android {
 
     buildTypes {
         release {
+            // Both fullRelease and playRelease use the same release identity. When credentials are absent,
+            // use debug signing so local release builds and pre-provisioning CI tests remain buildable.
+            signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
+            // The native engine JNI has no proven release keep rules in this repository. Keep beta builds
+            // unminified and unshrunk to prioritize playback stability over download size.
             isMinifyEnabled = false
-            // Null-safe: findByName returns null when the keystore was not provisioned, which leaves the
-            // release variant unsigned instead of failing the build. Debug is untouched (it keeps AGP's
-            // auto-generated debug keystore).
-            signingConfig = signingConfigs.findByName("release")
+            isShrinkResources = false
         }
     }
 

@@ -1,0 +1,237 @@
+name: Release Android
+
+# OWNER SETUP BEFORE THE FIRST REAL RUN:
+# Add VORTX_KEYSTORE_PATH, VORTX_KEYSTORE_PASSWORD, VORTX_KEY_ALIAS, and
+# VORTX_KEY_PASSWORD as secrets on the engine-ci environment. VORTX_KEYSTORE_PATH must contain the
+# base64 of the upload keystore. Until then this lane deliberately produces debug-signed release
+# artifacts with a -debug-signed suffix so the complete release path can be tested safely.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing tag for the draft release, for example v0.3.14-beta.28-android
+        required: true
+        type: string
+      publish_release:
+        description: Publish the draft after uploading Android artifacts
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release-android:
+    # Environment gate for this token-bearing job (trust boundary): engine-ci must restrict deployment
+    # to reviewed release refs before ENGINE_REPO_TOKEN and signing secrets become available.
+    environment: engine-ci
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Private engine fetch is kept in lockstep with android.yml. Both checkouts are required because
+      # every release variant packages libstremiox_core.so and libvortx_ffi.so.
+      - name: Preflight the engine token (fail closed)
+        env:
+          ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_REPO_TOKEN:-}" ]; then
+            echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
+            exit 1
+          fi
+
+      - name: Fetch stremiox-core (private, pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: VortXTV/stremiox-core
+          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: core
+          persist-credentials: false
+
+      - name: Fetch vortx-core (private monorepo, pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: VortXTV/vortx-core
+          ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
+          token: ${{ secrets.ENGINE_REPO_TOKEN }}
+          path: _vortx_core_src
+          persist-credentials: false
+
+      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        run: |
+          set -euo pipefail
+          rm -rf vortx-core
+          mv _vortx_core_src/vortx-core vortx-core
+          rm -rf _vortx_core_src
+          test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
+          test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
+          test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@df6b8f5 (promoted from monorepo subdir)"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      # The committed wrapper remains the Gradle version authority. This action supplies caching only.
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
+        run: |
+          yes | sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly + Android targets
+        uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
+        with:
+          toolchain: nightly-2026-07-19
+          targets: aarch64-linux-android,x86_64-linux-android
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ github.ref_name }}
+          workspaces: |
+            core -> target
+            vortx-core -> target-andx
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version "=3.5.4" --locked
+
+      # Secret presence is intentionally a soft gate. A missing or incomplete set is annotated, then
+      # Gradle falls back to debug signing so this workflow remains testable before owner provisioning.
+      - name: Preflight release signing (fail soft)
+        id: signing
+        env:
+          VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
+          VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
+          VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
+          VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${VORTX_KEYSTORE_PATH:-}" ] && [ -n "${VORTX_KEYSTORE_PASSWORD:-}" ] && [ -n "${VORTX_KEY_ALIAS:-}" ] && [ -n "${VORTX_KEY_PASSWORD:-}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "release signing secrets are complete"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "suffix=-debug-signed" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Android release uses debug signing::Add all four VORTX_KEYSTORE_* secrets to the engine-ci environment before shipping. Artifacts from this run will be labeled -debug-signed."
+          fi
+
+      - name: Build release APKs and Play bundle
+        working-directory: android
+        env:
+          TRAKT_CLIENT_ID: ${{ secrets.TRAKT_CLIENT_ID }}
+          TRAKT_CLIENT_SECRET: ${{ secrets.TRAKT_CLIENT_SECRET }}
+          SIMKL_CLIENT_ID: ${{ secrets.SIMKL_CLIENT_ID }}
+          SIMKL_CLIENT_SECRET: ${{ secrets.SIMKL_CLIENT_SECRET }}
+          STREMIOX_CORE_DIR: ${{ github.workspace }}/core
+          VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
+          VORTX_REQUIRE_ENGINE: "1"
+          VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
+          VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
+          VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
+          VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
+
+      - name: Verify each APK embeds libstremiox_core.so for both ABIs
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
+          if [ ${#apks[@]} -ne 2 ]; then
+            echo "::error::expected exactly two release APKs, found ${#apks[@]}"
+            exit 1
+          fi
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          for apk in "${apks[@]}"; do
+            for abi in arm64-v8a x86_64; do
+              entry="lib/$abi/libstremiox_core.so"
+              out="$workdir/$(basename "$apk").$abi.libstremiox_core.so"
+              unzip -p "$apk" "$entry" > "$out" 2>/dev/null || { echo "::error::$entry missing from $apk"; exit 1; }
+              test -s "$out" || { echo "::error::$entry is empty in $apk"; exit 1; }
+              magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+              test "$magic" = "7f454c46" || { echo "::error::$entry is not ELF in $apk"; exit 1; }
+              echo "ok: $apk contains non-empty ELF $entry"
+            done
+          done
+
+      - name: Verify both APKs are signed
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          signers=("$ANDROID_HOME"/build-tools/*/apksigner)
+          test ${#signers[@]} -gt 0 || { echo "::error::apksigner was not installed"; exit 1; }
+          APKSIGNER="$(printf '%s\n' "${signers[@]}" | sort -V | tail -n1)"
+          for apk in android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk; do
+            output="$("$APKSIGNER" verify --verbose "$apk")"
+            grep -Eq 'Verified using v2 scheme \(APK Signature Scheme v2\): true' <<<"$output" || { echo "::error::$apk is not v2 signed"; exit 1; }
+            echo "ok: $apk is signed"
+          done
+
+      - name: Verify Play APK remains GPL-native-library free
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for apk in android/app/build/outputs/apk/play/release/*.apk; do
+            listing="$(unzip -l "$apk")"
+            if grep -Eq 'lib(mpv|player|avcodec|avformat|avutil)\.so' <<<"$listing"; then
+              echo "::error::GPL native library found in play release APK: $apk"
+              exit 1
+            fi
+          done
+
+      - name: Stage clearly named release assets
+        id: assets
+        env:
+          SIGNING_SUFFIX: ${{ steps.signing.outputs.suffix }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          version="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' android/app/build.gradle.kts | head -n1)"
+          test -n "$version" || { echo "::error::could not read Android versionName"; exit 1; }
+          full=(android/app/build/outputs/apk/full/release/*.apk)
+          play=(android/app/build/outputs/apk/play/release/*.apk)
+          bundle=(android/app/build/outputs/bundle/playRelease/*.aab)
+          test ${#full[@]} -eq 1 && test ${#play[@]} -eq 1 && test ${#bundle[@]} -eq 1 || { echo "::error::expected one full APK, one play APK, and one play AAB"; exit 1; }
+          mkdir -p dist
+          cp "${full[0]}" "dist/VortX-${version}-phone${SIGNING_SUFFIX}.apk"
+          cp "${play[0]}" "dist/VortX-${version}-tv${SIGNING_SUFFIX}.apk"
+          cp "${bundle[0]}" "dist/VortX-${version}-play${SIGNING_SUFFIX}.aab"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create or append to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if release_json="$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null)"; then
+            is_draft="$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["isDraft"]).lower())' <<<"$release_json")"
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::release $RELEASE_TAG already exists and is not a draft"
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes "Android phone and Android TV beta artifacts."
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+
+      - name: Publish the draft release
+        if: inputs.publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
