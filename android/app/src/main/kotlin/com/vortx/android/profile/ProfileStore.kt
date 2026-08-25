@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.TrackPreferences
+import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceType
@@ -392,11 +393,11 @@ class ProfileStore private constructor(context: Context) {
     private fun currentPlaybackPrefs(base: PlaybackPrefs?): PlaybackPrefs {
         val lang = TrackPreferences.deviceLanguages.firstOrNull() ?: "en"
         return PlaybackPrefs(
-            audioLang = prefs.getString(TrackPreferences.KEY_AUDIO, null)
+            audioLang = prefs.getString(TrackPreferencesStore.KEY_AUDIO, null)
                 ?.split(",")?.firstOrNull { it.isNotBlank() } ?: base?.audioLang ?: lang,
-            subtitleLang = prefs.getString(TrackPreferences.KEY_SUBTITLE, null)
+            subtitleLang = prefs.getString(TrackPreferencesStore.KEY_SUBTITLE, null)
                 ?.split(",")?.firstOrNull { it.isNotBlank() } ?: base?.subtitleLang ?: lang,
-            forcedPolicy = prefs.getString(TrackPreferences.KEY_FORCED, null) ?: base?.forcedPolicy ?: "forced",
+            forcedPolicy = prefs.getString(TrackPreferencesStore.KEY_FORCED, null) ?: base?.forcedPolicy ?: "forced",
             // Subtitle style: read live (same Apple keys Android's SubtitleStyle reader consumes).
             subFont = prefs.getString(SubtitleStyle.KEY_FONT, null) ?: base?.subFont ?: DEFAULT_SUB_FONT,
             subSize = prefs.getString(SubtitleStyle.KEY_SIZE, null) ?: base?.subSize ?: DEFAULT_SUB_SIZE,
@@ -483,9 +484,9 @@ class ProfileStore private constructor(context: Context) {
         // the incoming profile never inherits the outgoing one's languages; on a sync fold a null leaves
         // the live keys untouched.
         val deviceLang = TrackPreferences.deviceLanguages.firstOrNull() ?: "en"
-        applyString(e, TrackPreferences.KEY_AUDIO, p?.audioLang, deviceLang, resetUnset)
-        applyString(e, TrackPreferences.KEY_SUBTITLE, p?.subtitleLang, deviceLang, resetUnset)
-        applyString(e, TrackPreferences.KEY_FORCED, p?.forcedPolicy, "forced", resetUnset)
+        applyString(e, TrackPreferencesStore.KEY_AUDIO, p?.audioLang, deviceLang, resetUnset)
+        applyString(e, TrackPreferencesStore.KEY_SUBTITLE, p?.subtitleLang, deviceLang, resetUnset)
+        applyString(e, TrackPreferencesStore.KEY_FORCED, p?.forcedPolicy, "forced", resetUnset)
         // ---- Subtitle style (audit 09 A-20): the SAME Apple keys + vocabulary Android's SubtitleStyle
         // reader consumes, so a synced Apple profile applies verbatim. sizeScale stores as a Float because
         // that is exactly what SubtitleStyle.current reads (clamped there too); subBrightness carries

@@ -685,6 +685,104 @@ class VortXSyncManager(context: Context) {
      */
     private val settingsPrefs: SharedPreferences =
         appContext.getSharedPreferences(SETTINGS_PREFS_FILE, Context.MODE_PRIVATE)
+
+    // ---- LOCAL-WINS settings bookkeeping (audit 09 S-04, the Android port of Apple SettingsDirtyKeys) ----
+
+    /**
+     * Durable per-account dirty map for the settings sync: syncable `vortx_settings` keys the user changed on
+     * THIS device that have NOT been confirmed onto the account yet, as `key -> dirtyAt` epoch stamps. The
+     * PULL path skips these keys (a just-made local edit survives until its own push lands, across relaunch),
+     * and a CONFIRMED push clears exactly the stamps it carried up. Keyed PER ACCOUNT so switching accounts
+     * never carries another account's dirty set. Stored as a JSON object string in its own tiny prefs file.
+     */
+    private val dirtyPrefs: SharedPreferences =
+        appContext.getSharedPreferences("vortx_sync_dirty", Context.MODE_PRIVATE)
+
+    /** Strong ref: Android holds preference listeners WEAKLY, so an inline lambda would be collected. */
+    private val settingsChangeListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> noteLocalSettingsChange() }
+
+    /**
+     * The differ shadow: the last-seen snapshot of the syncable settings domain. A local write diffs against
+     * this; remote/housekeeping writes RE-BASELINE it instead of marking, so they never become a future
+     * user edit's phantom diff (Apple `refreshSettingsShadow`).
+     */
+    @Volatile private var settingsShadow: Map<String, Any> = emptyMap()
+
+    private fun currentSyncableDomain(): Map<String, Any> =
+        SettingsBackup.plistSettingsFrom(settingsPrefs.all)
+
+    private val dirtyAccountId: String? get() = session?.account?.id
+
+    private fun dirtySettingsStorageKey(forAccount: String?): String =
+        "vortx.sync.dirtySettings." + (forAccount ?: "")
+
+    private fun readDirtySettings(): MutableMap<String, Double> {
+        val raw = dirtyPrefs.getString(dirtySettingsStorageKey(forAccount = dirtyAccountId), null)
+            ?: return mutableMapOf()
+        return runCatching {
+            val obj = JSONObject(raw)
+            val map = linkedMapOf<String, Double>()
+            for (key in obj.keys()) map[key] = obj.getDouble(key)
+            map
+        }.getOrDefault(mutableMapOf())
+    }
+
+    private fun writeDirtySettings(map: Map<String, Double>) {
+        val accountId = dirtyAccountId ?: return
+        if (map.isEmpty()) {
+            dirtyPrefs.edit().remove(dirtySettingsStorageKey(forAccount = accountId)).apply()
+        } else {
+            dirtyPrefs.edit().putString(dirtySettingsStorageKey(forAccount = accountId), JSONObject(map).toString()).apply()
+        }
+    }
+
+    /** Re-baseline the differ shadow to the live domain (after a remote apply / suppressed window). */
+    private fun refreshSettingsShadow() { settingsShadow = currentSyncableDomain() }
+
+    /**
+     * A preferences write landed. Under [applyingRemote] it is a remote/housekeeping write: re-baseline only.
+     * Otherwise diff the live domain against the shadow, mark any changed SYNCABLE key dirty (per account,
+     * durable), and re-baseline. No-op marking while signed out (nothing to protect).
+     */
+    private fun noteLocalSettingsChange() {
+        val current = currentSyncableDomain()
+        val signedIn = isSignedIn
+        val changed = if (!applyingRemote && signedIn) {
+            SettingsDirtyKeys.changedSyncableKeys(settingsShadow, current) { SettingsBackup.isSyncable(it) }
+        } else {
+            emptySet()
+        }
+        settingsShadow = current
+        if (changed.isEmpty()) return
+        val dirty = readDirtySettings()
+        SettingsDirtyKeys.mark(changed, at = System.currentTimeMillis() / 1000.0, into = dirty)
+        writeDirtySettings(dirty)
+    }
+
+    /**
+     * Clear the keys a CONFIRMED push carried up, guarded by the stamp [snapshot] taken when that push began,
+     * so a key re-edited mid-push stays protected (`SettingsDirtyKeys.clearPushed`). Runs under the remote-
+     * apply suppression because it is a durable-sync write that must not arm a self-echo push.
+     */
+    private fun clearPushedDirtySettings(snapshot: Map<String, Double>) {
+        if (snapshot.isEmpty()) return
+        applyingRemote = true
+        try {
+            val dirty = readDirtySettings()
+            SettingsDirtyKeys.clearPushed(snapshot, from = dirty)
+            writeDirtySettings(dirty)
+        } finally {
+            applyingRemote = false
+        }
+        refreshSettingsShadow()
+    }
+
+    init {
+        settingsShadow = currentSyncableDomain()
+        settingsPrefs.registerOnSharedPreferenceChangeListener(settingsChangeListener)
+    }
+
     private val debridKeys = DebridKeys(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
@@ -1421,9 +1519,16 @@ class VortXSyncManager(context: Context) {
 
     private suspend fun syncUp(lease: SyncSessionLease): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
+        // Stamp snapshot taken when the push BEGINS, before the blob is built: a key re-edited while this
+        // push is in flight gets a newer stamp and stays dirty (its newer value was not necessarily carried).
+        val pushedStamps = readDirtySettings()
         val initial = mergeLocalIntoDoc(lease) ?: return false    // failed pull: never overwrite the account doc
         if (!isSyncLeaseCurrent(lease)) return false
-        return pushDerivedDoc(lease, initial) { mergeLocalIntoDoc(lease) }
+        val synced = pushDerivedDoc(lease, initial) { mergeLocalIntoDoc(lease) }
+        // Only a CONFIRMED push clears its stamps; a failed/lost push leaves every key dirty so the next
+        // pull cannot clobber the un-pushed local edits.
+        if (synced && isSyncLeaseCurrent(lease)) clearPushedDirtySettings(pushedStamps)
+        return synced && isSyncLeaseCurrent(lease)
     }
 
     /**
@@ -1498,8 +1603,14 @@ class VortXSyncManager(context: Context) {
     private fun applyDeviceSettings(blob: Any?): Boolean {
         val settings = SettingsBackup.settingsFromBlob(blob) ?: return false
         if (settings.isEmpty()) return false
+        // LOCAL-WINS: a key the user changed on THIS device whose push has not confirmed yet keeps its local
+        // value; the account's older copy must not clobber it across a relaunch (the "toggle would not stay"
+        // bug). The mark clears only when this device's own confirmed push carries the value up.
+        val dirty = readDirtySettings().keys
         val editor = settingsPrefs.edit()
+        var applied = 0
         for ((key, value) in settings) {
+            if (key in dirty) continue
             when (value) {
                 is SettingsBackup.BackupValue.Bool -> editor.putBoolean(key, value.value)
                 is SettingsBackup.BackupValue.IntValue -> editor.putInt(key, value.value)
@@ -1508,8 +1619,13 @@ class VortXSyncManager(context: Context) {
                 is SettingsBackup.BackupValue.Str -> editor.putString(key, value.value)
                 is SettingsBackup.BackupValue.StrSet -> editor.putStringSet(key, value.value)
             }
+            applied++
         }
+        if (applied == 0) return false
         editor.apply()
+        // The just-applied remote values become the differ baseline, so they are never mistaken for a
+        // future LOCAL edit (Apple re-baselines its shadow before clearing the applyingRemote flag).
+        refreshSettingsShadow()
         return true
     }
 
@@ -1629,6 +1745,10 @@ class VortXSyncManager(context: Context) {
         if (applyDebridKeys(doc.optJSONObject("apiKeys"))) restored = true
         // Stamp the applied version so the version-wins guard holds across relaunches (per account).
         if (!advanceVersion(lease, version)) return false
+        // STARTUP HEAL: a settings key that is STILL dirty after this pull (a previous session's edit whose
+        // debounced push never landed) needs its own push so the account converges on the local value.
+        // Debounced and self-gated; the push reads LOCAL values (local wins) and clears the stamps it carries.
+        if (readDirtySettings().isNotEmpty()) requestSyncSoon()
         return restored
     }
 
