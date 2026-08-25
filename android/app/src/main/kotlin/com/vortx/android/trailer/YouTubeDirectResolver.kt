@@ -52,6 +52,9 @@ object YouTubeDirectResolver {
         val height: Int,
         val isMuxed: Boolean,
         val userAgent: String,
+        // WHY audit 04.2: retain the trailer's complete dub inventory so detail can offer every OTHER dub.
+        val selectedAudioLanguage: String?,
+        val availableAudioLanguages: List<String>,
     )
 
     /// Resolve [videoId] by walking the client ladder, returning on the first client that yields a usable
@@ -361,18 +364,30 @@ object YouTubeDirectResolver {
 
         if (!preferAdaptiveForLanguage) {
             pickMuxed(muxedFormats)?.let { muxed ->
-                return Resolved(muxed.first, null, muxed.second, isMuxed = true, userAgent = userAgent)
+                return Resolved(
+                    muxed.first, null, muxed.second, isMuxed = true, userAgent = userAgent,
+                    selectedAudioLanguage = audioChoice?.language,
+                    availableAudioLanguages = audioLangs,
+                )
             }
         }
 
         val videoLeg = pickAdaptiveVideo(adaptive, maxHeight)
         if (videoLeg != null && audioChoice != null) {
-            return Resolved(videoLeg.first, audioChoice.url, videoLeg.second, isMuxed = false, userAgent = userAgent)
+            return Resolved(
+                videoLeg.first, audioChoice.url, videoLeg.second, isMuxed = false, userAgent = userAgent,
+                selectedAudioLanguage = audioChoice.language,
+                availableAudioLanguages = audioLangs,
+            )
         }
 
         // Fallback: a muxed default we skipped above for a language override that then had no adaptive leg.
         pickMuxed(muxedFormats)?.let { muxed ->
-            return Resolved(muxed.first, null, muxed.second, isMuxed = true, userAgent = userAgent)
+            return Resolved(
+                muxed.first, null, muxed.second, isMuxed = true, userAgent = userAgent,
+                selectedAudioLanguage = audioChoice?.language,
+                availableAudioLanguages = audioLangs,
+            )
         }
         return null
     }
@@ -433,7 +448,7 @@ object YouTubeDirectResolver {
     }
 
     /// The chosen adaptive AUDIO leg + what it is (for the muxed-override decision).
-    private data class AudioChoice(val url: String, val matchedPreferred: Boolean)
+    private data class AudioChoice(val url: String, val matchedPreferred: Boolean, val language: String?)
 
     /// Pick the audio/mp4 leg honoring [preferredLanguages] (priority order), then YouTube's default/original
     /// track, then highest bitrate overall (the single-audio path). A clean URL breaks ties over a throttled
@@ -456,13 +471,19 @@ object YouTubeDirectResolver {
             if (code.isEmpty()) continue
             val want = code.lowercase()
             val matches = candidates.filter { audioLanguageCode(it.format) == want }
-            best(matches)?.let { return AudioChoice(it.url, matchedPreferred = true) }
+            best(matches)?.let {
+                return AudioChoice(it.url, matchedPreferred = true, language = audioLanguageCode(it.format))
+            }
         }
         // 2. YouTube's default/original track.
         val defaults = candidates.filter { it.format.optJSONObject("audioTrack")?.optBoolean("audioIsDefault") == true }
-        best(defaults)?.let { return AudioChoice(it.url, matchedPreferred = false) }
+        best(defaults)?.let {
+            return AudioChoice(it.url, matchedPreferred = false, language = audioLanguageCode(it.format))
+        }
         // 3. Highest bitrate overall (single-audio video, or multi-audio with no default flag).
-        return best(candidates)?.let { AudioChoice(it.url, matchedPreferred = false) }
+        return best(candidates)?.let {
+            AudioChoice(it.url, matchedPreferred = false, language = audioLanguageCode(it.format))
+        }
     }
 
     private data class AudioCandidate(val format: JSONObject, val url: String)

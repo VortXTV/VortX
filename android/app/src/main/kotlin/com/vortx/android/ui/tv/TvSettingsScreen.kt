@@ -100,6 +100,7 @@ import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlaybackBehaviorSettings
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
+import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.tv.TopShelfSettings
@@ -670,6 +671,24 @@ fun TvSettingsScreen(
                             },
                         )
                     }
+                }
+            }
+
+            if (show("loudness", "normalization", "audio", "sound")) item {
+                TvSettingsSection("Loudness normalization") {
+                    var loudnessOn by remember {
+                        mutableStateOf(LoudnessNormalizationSetting.isEnabled(appContext))
+                    }
+                    TvToggleRow(
+                        label = "Normalize loudness",
+                        detail = "Evens out volume: quiet dialogue lifted, loud peaks contained " +
+                            "(late-night viewing). Built-in libmpv player only.",
+                        checked = loudnessOn,
+                        onToggle = {
+                            loudnessOn = !loudnessOn
+                            LoudnessNormalizationSetting.setEnabled(appContext, loudnessOn)
+                        },
+                    )
                 }
             }
 

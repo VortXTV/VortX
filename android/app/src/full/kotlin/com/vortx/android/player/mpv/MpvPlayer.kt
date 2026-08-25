@@ -13,6 +13,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
+import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.PlayerChapter
 import com.vortx.android.player.PlayerEngine
@@ -221,6 +222,10 @@ class MpvPlayer private constructor(
         for ((name, value) in SubtitleStyle.current(appContext).mpvOptions()) {
             mpv.setOptionString(name, value)
         }
+        // WHY audit 13: arm the persisted late-night dynamic normalizer before mpv initializes.
+        for ((name, value) in LoudnessNormalizationSetting.mpvOptions(appContext)) {
+            mpv.setOptionString(name, value)
+        }
         // Route-aware: the live output route decides the channel layout / bitstream so a multichannel
         // (5.1/Atmos) stream is never forced onto a stereo-only sink as silence (the Apple silence guard).
         for ((name, value) in AudioOutputMode.current(appContext).mpvOptions(appContext)) {
@@ -282,6 +287,11 @@ class MpvPlayer private constructor(
         // into a later source that omitted them. Apply the reset first, then this file's values, all as runtime
         // properties because mpv is already initialized.
         for ((name, value) in streamHttpPropertyWrites(playable)) {
+            mpv.setPropertyString(name, value)
+        }
+        // The player instance survives `loadfile replace`; pick up a Settings change for the next title and
+        // clear the old filter when the toggle moved OFF.
+        for ((name, value) in LoudnessNormalizationSetting.mpvOptions(appContext)) {
             mpv.setPropertyString(name, value)
         }
 
@@ -558,6 +568,11 @@ class MpvPlayer private constructor(
     /// options pre-init; this overwrites them for a live Settings change. Mirrors Apple `applySubtitleStyle`.
     override fun applySubtitleStyle() {
         for ((name, value) in SubtitleStyle.current(appContext).mpvOptions()) {
+            mpv.setPropertyString(name, value)
+        }
+        // WHY audit 13: this existing live style refresh is the settings-to-mpv property bridge. Re-read the
+        // persisted toggle here so enabling or disabling late-night normalization does not require a restart.
+        for ((name, value) in LoudnessNormalizationSetting.mpvOptions(appContext)) {
             mpv.setPropertyString(name, value)
         }
     }

@@ -48,6 +48,7 @@ import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.model.VideoUpscaling
+import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.DiskCacheSetting
@@ -180,6 +181,23 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         },
                     )
                 }
+            }
+
+            SettingsSection(
+                title = "Loudness normalization",
+                footer = "Evens out volume so quiet dialogue is lifted and loud peaks are contained " +
+                    "(late-night viewing). Applies to the built-in libmpv player.",
+            ) {
+                var loudnessOn by remember { mutableStateOf(LoudnessNormalizationSetting.isEnabled(appContext)) }
+                ToggleRow(
+                    label = "Normalize loudness",
+                    detail = null,
+                    checked = loudnessOn,
+                    onCheckedChange = {
+                        loudnessOn = it
+                        LoudnessNormalizationSetting.setEnabled(appContext, it)
+                    },
+                )
             }
 
             SettingsSection(

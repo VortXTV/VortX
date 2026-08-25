@@ -26,8 +26,38 @@ import kotlinx.coroutines.withTimeoutOrNull
 /// at all (nothing to play).
 object TrailerCoordinator {
 
+    data class AudioLanguages(val selected: String?, val available: List<String>)
+
+    private val forcedLanguageLock = Any()
+    private val forcedLanguages = HashMap<String, String>()
+
+    /** Queue a one-play language override so Detail can keep using DetailViewModel.playTrailer unchanged. */
+    fun forceNextAudioLanguage(youTubeId: String, language: String) {
+        val id = youTubeId.trim()
+        val code = language.trim().lowercase()
+        if (id.isEmpty() || code.isEmpty()) return
+        synchronized(forcedLanguageLock) { forcedLanguages[id] = code }
+    }
+
+    private fun consumeForcedAudioLanguage(youTubeId: String): String? =
+        synchronized(forcedLanguageLock) { forcedLanguages.remove(youTubeId) }
+
     /// Bound the entire client resolve (config scrape + the 4-client ladder). On timeout, fall to the worker.
     private const val RESOLVE_BUDGET_MS = 8_000L
+
+    /// WHY audit 04.2: enumerate the current trailer's adaptive dubs through the same bounded resolver used
+    /// for playback. A cached resolve makes the later chip tap immediate; worker-only trailers expose no list.
+    suspend fun audioLanguages(context: Context, youTubeId: String): AudioLanguages? {
+        if (!TrailerFlags.clientResolverEnabled(context)) return null
+        val id = youTubeId.trim()
+        if (id.isEmpty()) return null
+        val preferred = TrackPreferencesStore(context.applicationContext).trailerAudioLanguages
+        val resolved = withTimeoutOrNull(RESOLVE_BUDGET_MS) {
+            YouTubeDirectResolver.resolve(id, preferred)
+        } ?: return null
+        return AudioLanguages(resolved.selectedAudioLanguage, resolved.availableAudioLanguages)
+            .takeIf { it.available.size > 1 }
+    }
 
     /// Build the [Playable] for [youTubeId]. [title] labels the player; [imdbId]/[year]/[mediaType] feed the
     /// worker fallback's `/clip` matching (mirrors [TrailerRequest]). Returns null only for a blank id.
@@ -38,10 +68,18 @@ object TrailerCoordinator {
         imdbId: String? = null,
         year: String? = null,
         mediaType: String = "movie",
+        forcedAudioLanguage: String? = null,
     ): Playable? {
         val id = youTubeId.trim()
         if (id.isEmpty()) return null
-        val prefLangs = TrackPreferencesStore(context.applicationContext).trailerAudioLanguages
+        val storedLanguages = TrackPreferencesStore(context.applicationContext).trailerAudioLanguages
+        val requestedLanguage = forcedAudioLanguage?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            ?: consumeForcedAudioLanguage(id)
+        // WHY audit 04.2: a tapped dub wins this resolve only; it never mutates the viewer's stored order.
+        val prefLangs = buildList {
+            requestedLanguage?.let(::add)
+            addAll(storedLanguages.filterNot { it.equals(requestedLanguage, ignoreCase = true) })
+        }
 
         if (TrailerFlags.clientResolverEnabled(context)) {
             val resolved = withTimeoutOrNull(RESOLVE_BUDGET_MS) {

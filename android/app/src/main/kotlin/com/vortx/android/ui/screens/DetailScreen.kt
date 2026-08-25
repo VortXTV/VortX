@@ -91,6 +91,7 @@ import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceSettingsRevision
+import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.DefaultEpisodeThumb
@@ -115,6 +116,7 @@ import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 internal data class ResolvedDetailPlayback(
     val playable: Playable,
@@ -248,6 +250,23 @@ fun DetailScreen(
     var castMembers by remember { mutableStateOf<List<CastMember>>(emptyList()) }
     var fallbackOverview by remember { mutableStateOf<String?>(null) }
     val loadedMeta = metaState as? UiState.Success
+    val trailerYouTubeId = loadedMeta?.data?.trailerYouTubeId
+    var trailerLanguageChips by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
+    LaunchedEffect(trailerYouTubeId) {
+        trailerLanguageChips = emptyList()
+        val id = trailerYouTubeId ?: return@LaunchedEffect
+        val inventory = TrailerCoordinator.audioLanguages(context, id) ?: return@LaunchedEffect
+        // WHY audit 04.2: mirror Apple's "Also available in" localized chip labels, but make the OTHER
+        // trailer dubs actionable. The selected dub is represented by the normal Trailer affordance.
+        trailerLanguageChips = inventory.available
+            .filterNot { it == inventory.selected }
+            .map { code ->
+                val label = Locale.forLanguageTag(code).getDisplayLanguage(Locale.getDefault())
+                    .ifBlank { code.uppercase(Locale.ROOT) }
+                    .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                code to label
+            }
+    }
     val castImdbId = loadedMeta?.data?.id
     val castType = loadedMeta?.data?.type
     val hasDescription = !loadedMeta?.data?.description.isNullOrBlank()
@@ -404,6 +423,12 @@ fun DetailScreen(
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
                         onTrailer = { viewModel.playTrailer() },
+                        trailerLanguageChips = trailerLanguageChips,
+                        onTrailerLanguage = { language ->
+                            // Queue the override, then use the exact same ViewModel entry point as Trailer.
+                            TrailerCoordinator.forceNextAudioLanguage(m.data.trailerYouTubeId.orEmpty(), language)
+                            viewModel.playTrailer()
+                        },
                     )
                 }
                 // DET-8: the one-line rationale for the auto-picked source (#16), shown once under the hero
@@ -925,6 +950,8 @@ private fun ActionsCluster(
     onToggleWatched: () -> Unit,
     hasTrailer: Boolean,
     onTrailer: () -> Unit,
+    trailerLanguageChips: List<Pair<String, String>>,
+    onTrailerLanguage: (String) -> Unit,
 ) {
     val watchLabel = when {
         resolving -> "Starting…"
@@ -1012,6 +1039,24 @@ private fun ActionsCluster(
                         selected = isWatched,
                         leadingIcon = VortXIcons.checkmarkCircle,
                         onClick = onToggleWatched,
+                    )
+                }
+            }
+        }
+        if (trailerLanguageChips.isNotEmpty()) {
+            // WHY audit 04.2: unlike Apple's display-only availability pills, these trailer dub chips replay
+            // the same YouTube id immediately with the tapped language forced through TrailerCoordinator.
+            Text(
+                text = "Also available in",
+                style = VortXTheme.type.eyebrow.copy(color = VortXTheme.colors.textTertiary),
+            )
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+                items(trailerLanguageChips, key = { it.first }) { (code, label) ->
+                    Chip(
+                        label = label,
+                        selected = false,
+                        enabled = !resolving,
+                        onClick = { onTrailerLanguage(code) },
                     )
                 }
             }

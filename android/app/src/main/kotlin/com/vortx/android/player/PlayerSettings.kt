@@ -361,6 +361,30 @@ enum class AudioOutputMode(val storageValue: String, val label: String, val deta
 }
 
 // ---------------------------------------------------------------------------------------------------
+// LoudnessNormalizationSetting - audit 13 late-night dynamic range control
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * Optional late-night loudness normalization for libmpv. The dynamic normalizer lifts quiet dialogue while
+ * containing loud peaks. It is OFF by default, persisted beside the other player settings, and emits the same
+ * `af` pair for pre-init options and live property application.
+ */
+object LoudnessNormalizationSetting {
+    const val KEY = "stremiox.loudnessNormalization"
+    private const val FILTER = "lavfi=[dynaudnorm=f=250:g=15:p=0.9:m=10]"
+
+    fun isEnabled(context: Context): Boolean = prefs(context).getBoolean(KEY, false)
+
+    fun setEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY, enabled).apply()
+    }
+
+    /** WHY audit 13: an empty `af` value actively removes a previously live-applied normalizer. */
+    fun mpvOptions(context: Context): List<Pair<String, String>> =
+        listOf("af" to if (isEnabled(context)) FILTER else "")
+}
+
+// ---------------------------------------------------------------------------------------------------
 // DiskCacheSetting - Apple app/Sources/Player/DiskCacheSetting.swift
 // ---------------------------------------------------------------------------------------------------
 
