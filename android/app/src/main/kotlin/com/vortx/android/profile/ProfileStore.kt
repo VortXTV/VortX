@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.TrackPreferences
+import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sources.SourceType
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -382,32 +383,29 @@ class ProfileStore private constructor(context: Context) {
     // ---- Per-profile playback preferences ----
 
     /**
-     * The live flat-key filter values as a [PlaybackPrefs] snapshot. Filter fields are read LIVE from the
-     * flat `SourcePreferences` keys (so a capture folds a Settings edit); track/subtitle fields are carried
-     * from [base] (or device defaults) so a capture never wipes values a synced Apple roster set but that
-     * Android does not yet apply. Mirrors the intent of Apple `currentPlaybackPrefs`.
-     *
-     * SCOPE NOTE: this wave manages ONLY the source-filter flat keys (unambiguous 1:1 mapping to
-     * `SourcePreferencesStore`). Track-language + subtitle-style + theme application are deferred to when
-     * their Android readers/vocab mapping land; the roster still CARRIES those fields so they round-trip
-     * for cross-device sync.
+     * The live flat-key filter values as a [PlaybackPrefs] snapshot. Filter, track-language and
+     * subtitle-style fields are all read LIVE from the flat keys (so a capture folds a Settings edit);
+     * a missing key falls back to [base] (or the device default) so a capture never wipes a value a
+     * synced roster set. Mirrors the intent of Apple `currentPlaybackPrefs`, which reads every field
+     * live off `UserDefaults`.
      */
     private fun currentPlaybackPrefs(base: PlaybackPrefs?): PlaybackPrefs {
         val lang = TrackPreferences.deviceLanguages.firstOrNull() ?: "en"
         return PlaybackPrefs(
-            audioLang = base?.audioLang ?: lang,
-            subtitleLang = base?.subtitleLang ?: lang,
-            forcedPolicy = base?.forcedPolicy ?: "forced",
-            // Subtitle style: carry a synced value, else seed Apple's documented SubtitleStyle.default*
-            // (modern / m / white / outline), NOT "": an empty string synced to Apple blanks its styling.
-            subFont = base?.subFont ?: DEFAULT_SUB_FONT,
-            subSize = base?.subSize ?: DEFAULT_SUB_SIZE,
-            subColor = base?.subColor ?: DEFAULT_SUB_COLOR,
-            subBackground = base?.subBackground ?: DEFAULT_SUB_BACKGROUND,
-            subSizeScale = base?.subSizeScale,
-            // Android does not apply the Apple brightness vocabulary yet, but it must carry the value
-            // losslessly so a profile round-trip cannot erase an Apple-side preference.
-            subBrightness = base?.subBrightness,
+            audioLang = prefs.getString(TrackPreferences.KEY_AUDIO, null)
+                ?.split(",")?.firstOrNull { it.isNotBlank() } ?: base?.audioLang ?: lang,
+            subtitleLang = prefs.getString(TrackPreferences.KEY_SUBTITLE, null)
+                ?.split(",")?.firstOrNull { it.isNotBlank() } ?: base?.subtitleLang ?: lang,
+            forcedPolicy = prefs.getString(TrackPreferences.KEY_FORCED, null) ?: base?.forcedPolicy ?: "forced",
+            // Subtitle style: read live (same Apple keys Android's SubtitleStyle reader consumes).
+            subFont = prefs.getString(SubtitleStyle.KEY_FONT, null) ?: base?.subFont ?: DEFAULT_SUB_FONT,
+            subSize = prefs.getString(SubtitleStyle.KEY_SIZE, null) ?: base?.subSize ?: DEFAULT_SUB_SIZE,
+            subColor = prefs.getString(SubtitleStyle.KEY_COLOR, null) ?: base?.subColor ?: DEFAULT_SUB_COLOR,
+            subBackground = prefs.getString(SubtitleStyle.KEY_BACKGROUND, null) ?: base?.subBackground ?: DEFAULT_SUB_BACKGROUND,
+            subSizeScale = if (prefs.contains(SubtitleStyle.KEY_SIZE_SCALE))
+                prefs.getFloat(SubtitleStyle.KEY_SIZE_SCALE, 1f).toDouble() else base?.subSizeScale,
+            // Carried losslessly so a profile round-trip cannot erase an Apple-side preference.
+            subBrightness = prefs.getString(SubtitleStyle.KEY_BRIGHTNESS, null) ?: base?.subBrightness,
             // The FULL resolved order (never null), like Apple's SourcePreferences.typeOrder. A null here
             // would diff against the default order applyPlayback writes, spuriously re-pushing the roster.
             sourceTypeOrder = readFullOrder(),
@@ -478,6 +476,26 @@ class ProfileStore private constructor(context: Context) {
         applyString(e, SourcePreferencesStore.PREFER_KEY, p?.preferKeywords, "", resetUnset)
         applyString(e, SourcePreferencesStore.AVOID_BEHAVIOR_KEY, p?.avoidBehavior, "hide", resetUnset)
         applyBool(e, SourcePreferencesStore.AUTO_PICK_BEST_KEY, p?.autoPickBest, false, resetUnset)
+        // ---- Track languages + forced policy (audit 09 A-19): the flat keys the player's track
+        // auto-selection reads. Apple's roster stores ONE code per field; Android's flat keys store
+        // comma-joined lists, so a profile code writes as a one-element list. Same reset contract as the
+        // filters above: on a real SWITCH an unset field falls back to the documented device default so
+        // the incoming profile never inherits the outgoing one's languages; on a sync fold a null leaves
+        // the live keys untouched.
+        val deviceLang = TrackPreferences.deviceLanguages.firstOrNull() ?: "en"
+        applyString(e, TrackPreferences.KEY_AUDIO, p?.audioLang, deviceLang, resetUnset)
+        applyString(e, TrackPreferences.KEY_SUBTITLE, p?.subtitleLang, deviceLang, resetUnset)
+        applyString(e, TrackPreferences.KEY_FORCED, p?.forcedPolicy, "forced", resetUnset)
+        // ---- Subtitle style (audit 09 A-20): the SAME Apple keys + vocabulary Android's SubtitleStyle
+        // reader consumes, so a synced Apple profile applies verbatim. sizeScale stores as a Float because
+        // that is exactly what SubtitleStyle.current reads (clamped there too); subBrightness carries
+        // through (the read side dims colorHex with it).
+        applyString(e, SubtitleStyle.KEY_FONT, p?.subFont, DEFAULT_SUB_FONT, resetUnset)
+        applyString(e, SubtitleStyle.KEY_SIZE, p?.subSize, DEFAULT_SUB_SIZE, resetUnset)
+        applyString(e, SubtitleStyle.KEY_COLOR, p?.subColor, DEFAULT_SUB_COLOR, resetUnset)
+        applyString(e, SubtitleStyle.KEY_BRIGHTNESS, p?.subBrightness, "100", resetUnset)
+        applyString(e, SubtitleStyle.KEY_BACKGROUND, p?.subBackground, DEFAULT_SUB_BACKGROUND, resetUnset)
+        applyFloat(e, SubtitleStyle.KEY_SIZE_SCALE, p?.subSizeScale, 1.0, resetUnset)
         e.apply()
         // Every apply changes stream FILTERING / RANKING order, so drop the memoized scores and rebuild the
         // per-profile Home board. Mirrors the tail of Apple `applyPlayback`. This makes a per-profile
