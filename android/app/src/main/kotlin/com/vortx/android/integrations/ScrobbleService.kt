@@ -10,6 +10,7 @@ import com.vortx.android.model.MediaType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -48,8 +49,8 @@ object ScrobbleService {
 
     // Granular per-provider sync toggles (SET-4), on Apple's EXACT keys and defaults
     // (ExternalScrobbleProvider.swift:100-143, ExternalSyncToggle.isOn). Persisted here so the choices ride
-    // the same cross-device carriage the Apple apps use. Each leg is inert until its sync path exists on
-    // Android; only the scrobble leg above runs today (see the doc on the render site in IntegrationsScreen).
+    // the same cross-device carriage the Apple apps use. Trakt history, ratings, and check-in are implemented
+    // below; the remaining toggles stay inert until their Android sync paths exist.
     const val KEY_TRAKT_IMPORT_WATCHED = "vortx.trakt.importWatched"   // default OFF
     const val KEY_TRAKT_RATINGS = "vortx.trakt.ratings"               // default ON
     const val KEY_TRAKT_WATCHLIST = "vortx.trakt.watchlist"          // default ON
@@ -65,6 +66,7 @@ object ScrobbleService {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile private var togglePrefs: SharedPreferences? = null
+    @Volatile private var traktSessionWatcherStarted = false
 
     /// Idempotent init: wire the toggle prefs and both auth token stores. Safe to call from every entry
     /// point (the player scrobble hook, the Integrations screen).
@@ -79,6 +81,43 @@ object ScrobbleService {
         }
         TraktAuth.init(app)
         SIMKLAuth.init(app)
+        TraktRatingsSync.init(app)
+        startTraktSessionWatcher()
+    }
+
+    private fun startTraktSessionWatcher() {
+        if (traktSessionWatcherStarted) return
+        synchronized(this) {
+            if (traktSessionWatcherStarted) return
+            traktSessionWatcherStarted = true
+            scope.launch {
+                TraktAuth.sessionBoundary.collect {
+                    if (TraktAuth.isSignedIn) refreshTraktAccountData()
+                }
+            }
+        }
+    }
+
+    /**
+     * Sign-in and manual-refresh hook. WHY audit row 11 and provider-rating read-back: pull both account
+     * datasets off playback's path. The lead should also call this from the Integrations refresh action.
+     */
+    fun refreshTraktAccountData() {
+        if (!TraktAuth.isSignedIn) return
+        scope.launch {
+            runCatching { TraktHistoryImport.run() }
+                .onFailure { Log.d(TAG, "trakt history import skipped: ${it.message}") }
+            runCatching { TraktRatingsSync.sync() }
+                .onFailure { Log.d(TAG, "trakt ratings sync skipped: ${it.message}") }
+        }
+    }
+
+    /** Future local user-rating mutation hook. Android currently has no writable user-rating store/UI. */
+    fun traktRatingChanged(ref: MediaRef, rating: Int, ratedAt: String) {
+        scope.launch {
+            runCatching { TraktRatingsSync.ratingChanged(TraktRatingsSync.Rating(ref, rating, ratedAt)) }
+                .onFailure { Log.d(TAG, "trakt rating push skipped: ${it.message}") }
+        }
     }
 
     // MARK: - Toggles
@@ -110,8 +149,16 @@ object ScrobbleService {
 
     // MARK: - Live transitions (fire-and-forget)
 
-    /// Playback started or resumed at [progress] (0..100). Trakt only.
-    fun start(ref: MediaRef, progress: Double) = fanScrobble(ref, "start", progress)
+    /// Playback started or resumed at [progress] (0..100). Trakt scrobble plus optional check-in.
+    fun start(ref: MediaRef, progress: Double) {
+        fanScrobble(ref, "start", progress)
+        if (!ref.hasUsableId) return
+        TraktCheckIn.prepareStart(ref)
+        scope.launch {
+            runCatching { TraktCheckIn.started(ref) }
+                .onFailure { Log.d(TAG, "trakt checkin skipped: ${it.message}") }
+        }
+    }
 
     /// Playback paused at [progress]. Trakt only.
     fun pause(ref: MediaRef, progress: Double) = fanScrobble(ref, "pause", progress)
@@ -122,6 +169,11 @@ object ScrobbleService {
         if (!ref.hasUsableId) return
         fanScrobble(ref, "stop", progress)
         if (progress >= WATCHED_THRESHOLD) recordSimklWatched(ref)
+        TraktCheckIn.prepareStop(ref)
+        scope.launch {
+            runCatching { TraktCheckIn.stopped(ref) }
+                .onFailure { Log.d(TAG, "trakt checkin/delete skipped: ${it.message}") }
+        }
     }
 
     private fun fanScrobble(ref: MediaRef, action: String, progress: Double) {

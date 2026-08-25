@@ -77,8 +77,17 @@ data class SubtitleStyle(
      * `mpvOptions`, minus `sub-font` (see the class doc for why Android omits the face name).
      */
     fun mpvOptions(): List<Pair<String, String>> {
+        // Size is carried by `sub-scale`, NOT by varying `sub-font-size`: mpv ignores `sub-font-size`
+        // for BITMAP subtitle tracks (embedded PGS), so the old mapping made every size change a silent
+        // no-op on built-in subs. `sub-scale` multiplies the whole rendered subtitle (text and bitmap
+        // alike), so `sub-font-size` stays at the fixed 55px base and the named preset + fine multiplier
+        // fold into `sub-scale`; for text subs the effective size (base x scale) is byte-for-byte the
+        // same value the old mapping produced, so nothing about text rendering changes. Mirrors Apple
+        // SubtitleStyle.mpvOptions.
+        val scale = (baseFontSize(sizeId) / 55.0) * sizeScale
         val opts = mutableListOf(
-            "sub-font-size" to fontSize.toString(),
+            "sub-font-size" to "55",
+            "sub-scale" to "%.3f".format(scale),
             "sub-color" to colorHex,
             "sub-border-color" to "#000000",
         )

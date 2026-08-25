@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Display
 import android.view.WindowManager
@@ -92,6 +93,18 @@ class AfrController(private val activity: Activity) {
      * window to a matching display mode. Idempotent per instance; call [stop] to revert. Safe to call with
      * an engine that never reports a rate (it just polls out and does nothing).
      */
+    // SETTLE GATE (audit 05.6): a display-mode switch is not instant. The panel takes up to a couple of
+    // seconds to relock at the new rate, and during that transition the compositor delivers no new frames
+    // and the clock can appear frozen. Anything sampling playback health in that window (the stall/start
+    // watchdog, trickplay capture) would misread hardware transition as a dead source or bank an
+    // unrendered frame. Apple gets this for free: AVDisplayManager coordinates the switch with playback.
+    // Android has no such coordination, so the controller publishes a short settling window instead.
+    @Volatile
+    private var settlingUntilElapsedMs = 0L
+
+    /** True from a mode switch until [SETTLE_WINDOW_MS] elapses; see the settle-gate note above. */
+    fun isSettling(): Boolean = SystemClock.elapsedRealtime() < settlingUntilElapsedMs
+
     fun start(engine: PlayerEngine) {
         if (stopped) return
         pollAttempts = 0
@@ -125,6 +138,7 @@ class AfrController(private val activity: Activity) {
         }
         setPreferredModeId(target.modeId)
         applied = true
+        settlingUntilElapsedMs = SystemClock.elapsedRealtime() + SETTLE_WINDOW_MS
         Log.i(
             TAG,
             "AFR: switched to mode ${target.modeId} " +
@@ -160,6 +174,9 @@ class AfrController(private val activity: Activity) {
 
         /** Poll cadence + ceiling while waiting for the demuxer to report the container rate (~5s total). */
         private const val POLL_INTERVAL_MS = 250L
+
+        /** Generous panel-relock budget; expiring early only re-opens verdicts, it never fakes progress. */
+        private const val SETTLE_WINDOW_MS = 2_500L
         private const val MAX_POLL_ATTEMPTS = 20
 
         /** How close a mode's refresh rate must be to an integer multiple of the content rate to count. */

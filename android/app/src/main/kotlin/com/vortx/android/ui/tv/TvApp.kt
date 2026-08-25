@@ -190,7 +190,10 @@ fun TvApp(
                     }
                     is Playback.Failed -> {
                         playerVm.clearPlayback()
-                        if (!playerVm.retryNextSource(retryResumePositionMs)) retryingSource = false
+                        // SAME-SOURCE TIER FIRST (audit 05.1), then the hop ladder (see VortXApp note).
+                        val healed = playerVm.retrySameSource(retryResumePositionMs) ||
+                            playerVm.retryNextSource(retryResumePositionMs)
+                        if (!healed) retryingSource = false
                     }
                     else -> Unit
                 }
@@ -227,7 +230,8 @@ fun TvApp(
                 onSourceFailed = if (playerVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
                     { positionMs ->
                         retryResumePositionMs = positionMs
-                        retryingSource = playerVm.retryNextSource(positionMs)
+                        // SAME-SOURCE TIER FIRST (audit 05.1), then the hop ladder (see VortXApp note).
+                        retryingSource = playerVm.retrySameSource(positionMs) || playerVm.retryNextSource(positionMs)
                     }
                 } else {
                     null

@@ -609,6 +609,7 @@ class DetailViewModel(
         pendingAdvanceHint = null
         warmNextSourceByEpisode = null
         failedHandlesByTarget.clear()
+        sameSourceReresolved = false
         _streams.value = UiState.Loading
         _playback.value = Playback.Idle
         _meta.value = UiState.Loading
@@ -981,6 +982,9 @@ class DetailViewModel(
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val stickyWrite = if (manualPick && type == MediaType.SERIES) sourceSticky.capture(id) else null
+        if (lastPlayedSource != null && handleOf(lastPlayedSource!!) != handleOf(source)) {
+            sameSourceReresolved = false   // a different mount gets its own one re-resolve
+        }
         lastPlayedSource = source
         _playback.value = Playback.Resolving
         val resumeMs = startPositionOverrideMs?.coerceAtLeast(0L) ?: resumeOffsetMs()
@@ -1640,6 +1644,13 @@ class DetailViewModel(
     /// same identity [StreamRanking]'s de-dup and the resolve paths key on.
     private val failedHandlesByTarget = HashMap<String, MutableSet<String>>()
 
+    // SAME-SOURCE RE-RESOLVE TIER (audit 05.1, Apple `retryResumeSameSource`): a stall/error is often the
+    // LINK (an expired debrid token, a dead embedded port), not the source itself, and hopping straight to
+    // another source costs the viewer quality and continuity. Re-mounting the SAME source once at the play
+    // head heals those without leaving it; if the fresh mount wedges again, the hop ladder takes over.
+    // One attempt per playback: the flag keeps a genuinely bad file from reloading forever.
+    private var sameSourceReresolved = false
+
     /// Record the just-failed play (the last source this ViewModel resolved) against the current play
     /// target and start the next-ranked source, WITHOUT bouncing the viewer out of the player: the
     /// resolve posts through [playback] exactly like a manual play and the shell swaps the player's
@@ -1647,6 +1658,22 @@ class DetailViewModel(
     /// sources failed) or no untried candidate exists, in which case the caller must surface MANUAL
     /// selection. (The hive-mind failure-report hook (#80) would attach here: target id + failed
     /// handle + attempt count are all in scope. Not built in this change.)
+    /**
+     * ONE re-mount of the CURRENT source at [resumePositionMs] (audit 05.1), mirroring Apple's
+     * `retryResumeSameSource`: heals link-shaped failures (expired debrid token, moved embedded port)
+     * without burning hop budget or downgrading quality. Deliberately does NOT touch
+     * [failedHandlesByTarget] or ProviderHealth -- this tier does not claim the source failed -- and
+     * returns false once spent so the caller falls through to [retryNextSource] immediately.
+     */
+    fun retrySameSource(resumePositionMs: Long? = null): Boolean {
+        val source = lastPlayedSource ?: return false
+        if (sameSourceReresolved) return false
+        if (_playback.value is Playback.Resolving) return false
+        sameSourceReresolved = true
+        playAutomatically(source, resumePositionMs)
+        return true
+    }
+
     fun retryNextSource(resumePositionMs: Long? = null): Boolean {
         val targetId = _selectedEpisodeId.value ?: id
         val failed = failedHandlesByTarget.getOrPut(targetId) { mutableSetOf() }

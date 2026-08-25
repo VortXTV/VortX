@@ -623,7 +623,10 @@ fun VortXApp(
                     onSourceFailed = if (advanceVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
                         { positionMs ->
                             retryResumePositionMs = positionMs
-                            if (advanceVm.retryNextSource(positionMs)) retryingSource = true else manualSourcePick = true
+                            // SAME-SOURCE TIER FIRST (audit 05.1): a fresh mount of the same source heals
+                            // link-shaped failures without a quality/continuity downgrade; hop only after.
+                            val healed = advanceVm.retrySameSource(positionMs) || advanceVm.retryNextSource(positionMs)
+                            if (healed) retryingSource = true else manualSourcePick = true
                         }
                     } else {
                         null
@@ -1090,6 +1093,10 @@ fun VortXApp(
                     }
                 }
             },
+            // OFFLINE SURFACE (audit 12 cross-cut): the phone shell had no offline chip; the TV shell did
+            // (TvConnectivity). The pill floats just above the bottom bar whenever the default network
+            // loses its VALIDATED capability, debounced so transient drops do not flash it.
+            snackbarHost = { OfflineChip(Modifier.padding(VortXTheme.spacing.md)) },
         ) { padding ->
             val content = Modifier.padding(padding)
             // SD-8: Search and Discover unlock on EITHER a Stremio or a VortX sign-in, mirroring Apple's

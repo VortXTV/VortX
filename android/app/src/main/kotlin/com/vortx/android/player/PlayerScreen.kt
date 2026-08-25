@@ -68,6 +68,7 @@ import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.player.audio.AudioRouteMonitor
 import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
@@ -436,6 +437,23 @@ fun PlayerScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // REAPPLY THE AUDIO POLICY WHEN THE ROUTE CHANGES MID-PLAY (audit 08.1). The policy ran at init and
+    // explicit picks only, so plugging in or dropping BT/WiFi/headphones kept the stale output mode until
+    // the next manual action. The monitor coalesces device add/remove + BECOMING_NOISY bursts into one
+    // callback; we re-run the same engine seam the picker uses, which re-reads the current route.
+    DisposableEffect(lifecycleOwner, engine) {
+        val routeMonitor = AudioRouteMonitor(context) {
+            if (engine.audioOutputModeAvailable) {
+                engine.setAudioOutputMode(audioOutputMode)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(routeMonitor)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(routeMonitor)
+            routeMonitor.stop()
+        }
+    }
+
     // AUTO-ROTATE TO LANDSCAPE (Apple `stremiox.autoLandscapeInPlayer`, default on). On a phone, opening a
     // non-trailer stream turns the device to landscape to match the video (following the sensor between the
     // two landscape orientations), and restores the previous orientation on exit. A no-op on TV, which is
@@ -460,6 +478,9 @@ fun PlayerScreen(
     // and is a fail-soft no-op on a panel that exposes no matching mode (phones), so this single hook is
     // safe on every device. Keyed on the engine so a source/engine switch re-matches for the new stream.
     // Mirrors the Apple TV HDRDisplayMode Match-Frame-Rate path; same preference key across all apps.
+    // Held outside the effect so the watchdog / trickplay samplers below can read the settle window;
+    // same atomic-holder pattern as engineHolder (no recomposition on AFR state).
+    val afrHolder = remember { AtomicReference<AfrController?>(null) }
     DisposableEffect(engine, hostActivity) {
         val activity = hostActivity
         val controller = if (activity != null && MatchFrameRateSetting.isEnabled(context)) {
@@ -467,7 +488,8 @@ fun PlayerScreen(
         } else {
             null
         }
-        onDispose { controller?.stop() }
+        afrHolder.set(controller)
+        onDispose { controller?.stop(); afrHolder.set(null) }
     }
 
     val playerState by engine.state.collectAsStateWithLifecycle()
@@ -665,6 +687,12 @@ fun PlayerScreen(
             val s = latestState
             val now = SystemClock.elapsedRealtime()
             if (s.hasError || s.hasEnded || s.isPaused) {
+                lastProgressAt = now
+                continue
+            }
+            // AFR SETTLE GATE (audit 05.6): during a display-mode relock no new frames arrive; that is
+            // hardware transition, not a dead source. Hold the clock open instead of tripping the bound.
+            if (afrHolder.get()?.isSettling() == true) {
                 lastProgressAt = now
                 continue
             }
@@ -975,7 +1003,10 @@ fun PlayerScreen(
             val s = latestState
             // The runtimeMismatch gate keeps a condemned file's frames out of the shared pool (the
             // configure above already refused to key the session on a junk duration).
-            if (s.isPaused || s.isBuffering || s.durationMs <= 0L || runtimeMismatch) continue
+            // The settle check keeps an unrendered mid-switch frame out of the shared timeline.
+            if (s.isPaused || s.isBuffering || s.durationMs <= 0L || runtimeMismatch ||
+                afrHolder.get()?.isSettling() == true
+            ) continue
             val jpeg = engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH) ?: continue
             // Read the source height HERE, while the engine is demonstrably alive and rendering, and bank
             // it with the frame. Doing it at teardown instead would mean a JNI property read against an

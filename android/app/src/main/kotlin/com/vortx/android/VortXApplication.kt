@@ -35,6 +35,7 @@ import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.config.RemoteConfig
 import com.vortx.android.debrid.DebridAccountOwnerState
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.diagnostics.CrashReporter
 import com.vortx.android.engine.EngineStremioRepository
 import com.vortx.android.iptv.IPTVCleanupCoordinator
 import com.vortx.android.iptv.IPTVPlaylists
@@ -103,6 +104,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// touches the network here. The settings screen calls the same idempotent init defensively.
     override fun onCreate() {
         super.onCreate()
+        CrashReporter.install(this) // Audit 12.5: capture before any process initialization can fail.
         // An isolated service still receives this Application callback. Its broker is deliberately supplied
         // only bounded IPC input, so do not initialize any process-wide repositories, encrypted stores,
         // filesystem caches, or network clients in that process.
