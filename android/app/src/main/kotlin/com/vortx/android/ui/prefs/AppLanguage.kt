@@ -11,11 +11,8 @@ import android.os.LocaleList
  * system) so the choice rides the same cross-device settings blob as the Apple apps.
  *
  * APPLY PATH: on Android 13+ (API 33) the framework `LocaleManager.setApplicationLocales` applies + persists
- * the per-app locale system-side, so a pick takes effect on the next resumed Activity and survives restart
- * with no relaunch dance. Below 33 the framework has no per-app locale API and this project does not depend
- * on androidx.appcompat (whose `AppCompatDelegate.setApplicationLocales` backports it), so the override is
- * STORED for cross-device sync but not applied to the running process. Fail-soft: nothing here can crash or
- * blank a screen, and an unsupported OS simply keeps the system language while the choice still syncs.
+ * the per-app locale system-side. On API 26-32 [com.vortx.android.MainActivity.attachBaseContext] wraps the
+ * Activity context with the persisted locale before creation. Invalid overrides fail soft to the system locale.
  *
  * The curated [supported] list is byte-for-byte the Apple `AppLanguage.supported` roster (autonyms, in the
  * catalog's order) so both platforms offer the SAME options; SET-8's trailer-language picker reuses it too.
@@ -61,13 +58,12 @@ object AppLanguage {
     fun current(context: Context): String? =
         prefs(context).getString(OVERRIDE_KEY, null)?.takeIf { it.isNotEmpty() }
 
-    /** True on the OS versions where a pick is applied to the running app (not merely stored for sync). */
-    val canApply: Boolean get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+    /** True because every supported OS applies a pick, either through the framework or Activity context. */
+    val canApply: Boolean = true
 
     /**
      * Pin a language (null / "" = follow the system). Persists the override on Apple's key, then applies it
-     * via the framework per-app locale on API 33+. Fail-soft on every OS: the write always succeeds so the
-     * choice syncs, and the apply is a best-effort no-op where the framework has no per-app locale API.
+     * via the framework per-app locale on API 33+. API 26-32 reads the persisted value on Activity creation.
      */
     fun set(context: Context, code: String?) {
         val normalized = code?.takeIf { it.isNotEmpty() }.orEmpty()

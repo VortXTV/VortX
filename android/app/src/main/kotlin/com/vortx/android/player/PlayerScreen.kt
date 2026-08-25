@@ -1,9 +1,11 @@
 package com.vortx.android.player
 
 import android.app.Activity
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -435,6 +437,31 @@ fun PlayerScreen(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // WHY audit 05.4: player-scoped runtime pressure must reach the live engine, not only the next load.
+    // UI_HIDDEN alone is not pressure; RUNNING_LOW/CRITICAL and background pressure levels shed once.
+    DisposableEffect(context, engine) {
+        val appContext = context.applicationContext
+        val callbacks = object : ComponentCallbacks2 {
+            override fun onTrimMemory(level: Int) {
+                if (
+                    level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+                    level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                    level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+                ) {
+                    engine.onTrimMemory(level)
+                }
+            }
+
+            override fun onLowMemory() {
+                engine.onTrimMemory(ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL)
+            }
+
+            override fun onConfigurationChanged(newConfig: Configuration) = Unit
+        }
+        appContext.registerComponentCallbacks(callbacks)
+        onDispose { appContext.unregisterComponentCallbacks(callbacks) }
     }
 
     // REAPPLY THE AUDIO POLICY WHEN THE ROUTE CHANGES MID-PLAY (audit 08.1). The policy ran at init and

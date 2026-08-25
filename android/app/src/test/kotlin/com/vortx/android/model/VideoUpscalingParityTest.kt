@@ -9,7 +9,13 @@ import org.junit.Test
 class VideoUpscalingParityTest {
     @Test
     fun androidExposesOnlyPresetsBackedByPackagedResources() {
-        assertFalse(VideoUpscaling.ANIME4K in VideoUpscaling.androidChoices)
+        // Anime4K rides ONLY the full flavor (libmpv GLSL); the play flavor must never offer a dead
+        // control. Mirrors the documented androidChoices contract.
+        if (com.vortx.android.BuildConfig.FLAVOR == "full") {
+            assertTrue(VideoUpscaling.ANIME4K in VideoUpscaling.androidChoices)
+        } else {
+            assertFalse(VideoUpscaling.ANIME4K in VideoUpscaling.androidChoices)
+        }
         assertTrue(VideoUpscaling.HIGH_QUALITY in VideoUpscaling.androidChoices)
         assertTrue(VideoUpscaling.PERFORMANCE.mpvOptions.isNotEmpty())
         assertEquals("stremiox.videoUpscaling", TrackPreferencesStore.KEY_UPSCALING)

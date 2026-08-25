@@ -20,13 +20,13 @@ class TvAddonsContractTest {
     @Test
     fun `TV route passes one shared AddonsViewModel into the add-ons surface`() {
         val shell = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvShell.kt")
-        val settings = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvSettingsScreen.kt")
         val addons = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvAddonsScreen.kt")
 
-        assertTrue(shell.contains("TvSettingsScreen(repo = repo)"))
-        assertTrue(settings.contains("if (route == TvSettingsRoute.ADDONS)"))
-        assertTrue(settings.contains("viewModel<AddonsViewModel>"))
-        assertTrue(settings.contains("TvAddonsScreen(") && settings.contains("viewModel = addonsVm"))
+        // The add-ons surface moved from the settings screen to the TV shell; the CONTRACT is unchanged:
+        // ONE shared AddonsViewModel instance handed to the screen, health collected live off it.
+        assertTrue(shell.contains("TvSettingsScreen(repo = repo"))
+        assertTrue(shell.contains("val addonsVm: AddonsViewModel = viewModel("))
+        assertTrue(shell.contains("TvAddonsScreen(") && shell.contains("viewModel = addonsVm"))
         assertTrue(addons.contains("val health by viewModel.health.collectAsStateWithLifecycle()"))
         assertFalse(addons.contains("AddonHealthStore()"))
     }

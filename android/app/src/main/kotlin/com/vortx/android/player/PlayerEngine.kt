@@ -182,6 +182,10 @@ interface PlayerEngine {
     /// resumes. [release] tears the engine down; the instance is unusable afterward.
     fun onEnterBackground()
     fun onEnterForeground()
+
+    /** Runtime memory-pressure seam. Engines without a live cache keep the fail-soft no-op. */
+    fun onTrimMemory(level: Int) {}
+
     fun release()
 
     /// The engine's video surface, hosted by the caller's `AndroidView`. Implementations own surface

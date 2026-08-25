@@ -3,6 +3,7 @@ package com.vortx.android.player.mpv
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.runtime.Composable
@@ -20,10 +21,17 @@ import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
 import com.vortx.android.player.tuning.AdaptiveTuning
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import java.io.ByteArrayOutputStream
@@ -93,6 +101,16 @@ class MpvPlayer private constructor(
     @Volatile
     private var pendingResumeSeekMs: Long = 0L
 
+    private val runtimePolicyScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var pausedClampJob: Job? = null
+    private var memoryRecoveryJob: Job? = null
+    private var normalReadAheadBytes: Long? = null
+    private var activeReadAheadBytes: Long? = null
+    private var pausedCacheClamped = false
+    private var memoryShedConsumed = false
+    private var memoryShedActive = false
+    private var memoryShedPositionMs = 0L
+
     private val observer = object : MPVLib.EventObserver {
         override fun eventProperty(name: String) {
             // Format-less "changed" signal. track-list has no scalar value, so re-read it here.
@@ -130,7 +148,10 @@ class MpvPlayer private constructor(
 
         override fun eventProperty(name: String, value: Boolean) {
             when (name) {
-                PROP_PAUSE -> _state.value = _state.value.copy(isPaused = value)
+                PROP_PAUSE -> {
+                    _state.value = _state.value.copy(isPaused = value)
+                    pausedStateChanged(value)
+                }
                 PROP_PAUSED_FOR_CACHE -> {
                     // Before the first frame, [load] holds isBuffering=true as the "connecting" state, and
                     // mpv's initial observer sync delivers paused-for-cache=false for the still-idle core.
@@ -269,14 +290,15 @@ class MpvPlayer private constructor(
         // The capable remote debrid/CDN path is the ONE that takes the adaptive buffer.
         val remoteAdaptive = !diskCache && !localStream
         val readAhead = when {
-            diskCache -> DiskCacheSetting.resolvedMaxBytes(appContext, reduced).toString()
-            localStream -> READ_AHEAD_LOCAL
+            diskCache -> DiskCacheSetting.resolvedMaxBytes(appContext, reduced)
+            localStream -> READ_AHEAD_LOCAL_BYTES
             // Remote debrid/CDN on a capable device: size the forward read-ahead to the device RAM tier
             // scaled by the buffer-intent + measured-link plan, clamped by free disk and floored at the
             // conservative flat cap. Behind the buffer-tuning flag; OFF keeps the flat cap.
-            else -> AdaptiveTuning.mpvRemoteReadAheadBytes(appContext).toString()
+            else -> AdaptiveTuning.mpvRemoteReadAheadBytes(appContext)
         }
-        mpv.setPropertyString(OPT_DEMUXER_MAX_BYTES, readAhead)
+        resetRuntimeCachePolicy(readAhead)
+        applyReadAheadCap(readAhead)
 
         // On the capable remote path, also match the forward read-ahead SECONDS and cache window to the
         // adaptive plan (the mpv half of feeding the plan into demuxer-readahead-secs / cache-secs). The
@@ -336,6 +358,58 @@ class MpvPlayer private constructor(
         val durationMs = _state.value.durationMs
         if (durationMs > 0L && target >= durationMs - RESUME_TAIL_GUARD_MS) return
         mpv.command(arrayOf("seek", (target / 1000.0).toString(), "absolute"))
+    }
+
+    /** WHY audit 05.3: mpv keeps filling its forward cache while paused. Mirror Apple's delayed 48 MiB
+     * clamp, but use the requested 10s Android grace, then restore this file's current tuned budget. */
+    @Synchronized
+    private fun pausedStateChanged(paused: Boolean) {
+        pausedClampJob?.cancel()
+        pausedClampJob = null
+        if (paused) {
+            val active = activeReadAheadBytes ?: return
+            if (pausedCacheClamped || active <= PAUSED_CACHE_CLAMP_BYTES) return
+            pausedClampJob = runtimePolicyScope.launch {
+                delay(PAUSED_CACHE_CLAMP_GRACE_MS)
+                applyPausedCacheClamp()
+            }
+        } else if (pausedCacheClamped) {
+            pausedCacheClamped = false
+            activeReadAheadBytes?.let(::applyReadAheadCap)
+            Log.i(TAG, "paused cache clamp released")
+        }
+    }
+
+    @Synchronized
+    private fun applyPausedCacheClamp() {
+        if (!_state.value.isPaused || pausedCacheClamped) return
+        val active = activeReadAheadBytes ?: return
+        if (active <= PAUSED_CACHE_CLAMP_BYTES) return
+        pausedCacheClamped = true
+        applyReadAheadCap(PAUSED_CACHE_CLAMP_BYTES)
+        Log.i(TAG, "paused cache clamped to 48MiB after 10s")
+    }
+
+    @Synchronized
+    private fun resetRuntimeCachePolicy(normalBytes: Long) {
+        pausedClampJob?.cancel()
+        memoryRecoveryJob?.cancel()
+        pausedClampJob = null
+        memoryRecoveryJob = null
+        normalReadAheadBytes = normalBytes
+        activeReadAheadBytes = normalBytes
+        pausedCacheClamped = false
+        memoryShedConsumed = false
+        memoryShedActive = false
+        memoryShedPositionMs = 0L
+    }
+
+    private fun applyReadAheadCap(bytes: Long) {
+        val value = bytes.toString()
+        // The second property is present on newer mpv cache backends. Older builds may reject it, so each
+        // write is independent and fail-soft while demuxer-max-bytes remains the authoritative cap.
+        runCatching { mpv.setPropertyString(OPT_DEMUXER_MAX_BYTES, value) }
+        runCatching { mpv.setPropertyString(OPT_DEMUXER_MAX_BYTES_CACHE, value) }
     }
 
     override fun play() { mpv.setPropertyString(PROP_PAUSE, "no") }
@@ -470,6 +544,51 @@ class MpvPlayer private constructor(
         return com.vortx.android.player.VideoFrameProfile(fps, w, h)
     }
 
+    /** WHY audit 05.4: per-load sizing alone cannot react to Android runtime pressure. Shed exactly one
+     * DeviceMemoryTier rung per file, then restore once after sustained healthy playback. */
+    @Synchronized
+    override fun onTrimMemory(level: Int) {
+        if (memoryShedConsumed) return
+        val normal = normalReadAheadBytes ?: return
+        val target = AdaptiveTuning.oneStepDownReadAheadBytes(appContext, normal)
+        if (target >= normal) return
+
+        memoryShedConsumed = true
+        memoryShedActive = true
+        memoryShedPositionMs = _state.value.positionMs
+        activeReadAheadBytes = target
+        if (!pausedCacheClamped) applyReadAheadCap(target)
+        Log.i(TAG, "memory pressure level=$level shed read-ahead to ${target / BYTES_PER_MIB}MiB")
+        memoryRecoveryJob = runtimePolicyScope.launch { awaitHealthyPlaybackAndRecover() }
+    }
+
+    private suspend fun awaitHealthyPlaybackAndRecover() {
+        var healthyMs = 0L
+        var progressed = false
+        while (runtimePolicyScope.isActive) {
+            delay(MEMORY_RECOVERY_SAMPLE_MS)
+            val state = _state.value
+            if (state.positionMs > memoryShedPositionMs) progressed = true
+            val healthy = progressed && !state.isPaused && !state.isBuffering &&
+                !state.hasError && !state.hasEnded
+            healthyMs = if (healthy) healthyMs + MEMORY_RECOVERY_SAMPLE_MS else 0L
+            if (healthyMs >= MEMORY_RECOVERY_HEALTHY_MS) {
+                restoreMemoryShedOnce()
+                return
+            }
+        }
+    }
+
+    @Synchronized
+    private fun restoreMemoryShedOnce() {
+        if (!memoryShedActive) return
+        val normal = normalReadAheadBytes ?: return
+        memoryShedActive = false
+        activeReadAheadBytes = normal
+        if (!pausedCacheClamped) applyReadAheadCap(normal)
+        Log.i(TAG, "memory pressure recovery restored read-ahead to ${normal / BYTES_PER_MIB}MiB")
+    }
+
     override fun onEnterBackground() {
         // Drop video decode off-screen either way (matches Apple enterBackground: `vid=no`), which saves
         // power while backgrounded. Pause the audio too ONLY when "keep playing in the background" is off;
@@ -570,6 +689,7 @@ class MpvPlayer private constructor(
     }
 
     override fun release() {
+        runtimePolicyScope.cancel()
         mpv.removeObserver(observer)
         mpv.detachSurface()
         mpv.destroy()
@@ -669,6 +789,13 @@ class MpvPlayer private constructor(
     }
 
     companion object {
+        private const val TAG = "VortxMpvPlayer"
+        private const val BYTES_PER_MIB = 1024L * 1024
+        private const val PAUSED_CACHE_CLAMP_BYTES = 48L * BYTES_PER_MIB
+        private const val PAUSED_CACHE_CLAMP_GRACE_MS = 10_000L
+        private const val MEMORY_RECOVERY_HEALTHY_MS = 30_000L
+        private const val MEMORY_RECOVERY_SAMPLE_MS = 1_000L
+
         // Observed property names (Apple MPVMetalViewController parity).
         private const val PROP_TIME_POS = "time-pos"
         private const val PROP_DURATION = "duration"
@@ -698,6 +825,7 @@ class MpvPlayer private constructor(
         private const val PROP_SCREENSHOT_JPEG_QUALITY = "screenshot-jpeg-quality"
         private const val OPT_HTTP_HEADER_FIELDS = "http-header-fields"
         private const val OPT_DEMUXER_MAX_BYTES = "demuxer-max-bytes"
+        private const val OPT_DEMUXER_MAX_BYTES_CACHE = "demuxer-max-bytes-cache"
         // Per-file adaptive read-ahead SECONDS + cache window on the capable remote path (the base values
         // are pre-init options in [MpvConfig]; these override them from the adaptive plan).
         private const val OPT_DEMUXER_READAHEAD_SECS = "demuxer-readahead-secs"
@@ -722,7 +850,7 @@ class MpvPlayer private constructor(
         // own cache, so mpv's read-ahead is kept tight). The REMOTE path is now sized per load by the
         // adaptive tuner (device RAM tier + buffer intent + measured link), see
         // [com.vortx.android.player.tuning.AdaptiveTuning.mpvRemoteReadAheadBytes].
-        private const val READ_AHEAD_LOCAL = "96MiB"
+        private const val READ_AHEAD_LOCAL_BYTES = 96L * BYTES_PER_MIB
 
         /// Runtime HTTP-property writes for one file, in application order. The first two writes always clear
         /// the previous file's identity; later writes apply only this file's headers / trailer-bound UA.

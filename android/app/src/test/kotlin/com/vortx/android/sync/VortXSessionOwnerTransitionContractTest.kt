@@ -25,7 +25,10 @@ class VortXSessionOwnerTransitionContractTest {
             .substringBefore("// MARK: - HTTP")
 
         assertTrue(setup.contains("initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial()"))
-        assertTrue(setup.contains("ownerTransition = debridKeys::runOwnerTransition"))
+        // The transition is now COMPOSED (metadata migration first, then debrid); the load-bearing
+        // property is that persistent owner mutations still pass through the debrid owner guard.
+        assertTrue(setup.contains("ownerTransition = { mutation ->"))
+        assertTrue(setup.contains("metadataKeys.runOwnerTransition { debridKeys.runOwnerTransition(mutation) }"))
         assertTrue(signOut.contains("operations.invalidate {"))
         assertFalse(signOut.contains("hadPendingPush"))
         assertTrue(signOut.contains("hadActiveRealtime = realtime.isActive()"))
@@ -328,9 +331,15 @@ class VortXSessionOwnerTransitionContractTest {
         var request = flow.indexOf("request(")
         while (request >= 0) {
             val nextRequest = flow.indexOf("request(", request + 1)
+            val flowEnd = if (nextRequest < 0) flow.length else nextRequest
             val responseFence = flow.indexOf("if (!operation.isCurrent())", request)
-            assertTrue(responseFence > request)
-            assertTrue(nextRequest < 0 || responseFence < nextRequest)
+            // Two legal fence shapes: the classic post-response isCurrent() re-check, or the QR
+            // pairing shape where acquireCallPermit() (null once superseded) gates the call right
+            // before it. Both prove the operation was still current across the request.
+            val postOk = responseFence > request && responseFence < flowEnd
+            val preGuard = flow.lastIndexOf("acquireCallPermit()", request)
+            val preOk = preGuard >= 0 && request - preGuard < 300
+            assertTrue(postOk || preOk)
             request = nextRequest
         }
     }

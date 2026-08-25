@@ -39,6 +39,9 @@ object AdaptiveTuning {
     /** mpv remote read-ahead floor: never below the merged conservative flat cap (128 MiB). */
     private const val MPV_REMOTE_FLOOR_BYTES = 128L * 1024 * 1024
 
+    /** Apple-compatible absolute floor used only by the runtime shed ratio and paused clamp. */
+    private const val MPV_RUNTIME_SHED_FLOOR_BYTES = 48L * 1024 * 1024
+
     /** A cached link measurement is stale after this long; a stream on a stale host re-probes. */
     private const val PROBE_STALE_MS = 10L * 60 * 1000
 
@@ -73,6 +76,28 @@ object AdaptiveTuning {
             ?.let { (it * DiskCacheSetting.FREE_DISK_FRACTION).toLong() }
         val clamped = if (freeClamp != null) minOf(ramScaled, freeClamp) else ramScaled
         return maxOf(clamped, MPV_REMOTE_FLOOR_BYTES)
+    }
+
+    /**
+     * One DeviceMemoryTier rung below this device's normal read-ahead. WHY audit 05.4: Android previously
+     * sized only at load time, so a runtime trim signal had no bounded shed target. The ratio preserves the
+     * per-load intent/link/disk clamp while stepping down on the existing RAM-tier ladder.
+     */
+    fun oneStepDownReadAheadBytes(context: Context, normalBytes: Long): Long {
+        val currentTierMb = DeviceMemoryTier.safeBufferMb(context)
+        val lowerTierMb = when (currentTierMb) {
+            200 -> 150
+            250 -> 200
+            500 -> 250
+            1000 -> 500
+            1600 -> 1000
+            2000 -> 1600
+            else -> currentTierMb
+        }
+        if (lowerTierMb >= currentTierMb) return normalBytes
+        return (normalBytes * lowerTierMb / currentTierMb)
+            .coerceAtLeast(MPV_RUNTIME_SHED_FLOOR_BYTES)
+            .coerceAtMost(normalBytes)
     }
 
     /**

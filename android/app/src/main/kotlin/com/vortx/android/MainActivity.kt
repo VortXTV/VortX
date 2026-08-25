@@ -3,8 +3,11 @@ package com.vortx.android
 import android.animation.Animator
 import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
+import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
+import android.os.Build
 import android.os.Bundle
 import android.view.animation.AnticipateInterpolator
 import androidx.activity.ComponentActivity
@@ -19,7 +22,9 @@ import com.vortx.android.deeplink.DeepLinkDeliveryState
 import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.player.PlayerPipBridge
 import com.vortx.android.ui.VortXApp
+import com.vortx.android.ui.prefs.AppLanguage
 import com.vortx.android.ui.theme.isAnimatorScaleZero
+import java.util.Locale
 import java.util.UUID
 
 /// Android + Android TV entry point. The five-tab Compose shell in [VortXApp] matches the iOS and
@@ -29,6 +34,22 @@ import java.util.UUID
 /// once per process, not per Activity instance) -- see that class's doc comment for why that matters
 /// (engine double-init / event-listener orphaning safety across Activity recreation).
 class MainActivity : ComponentActivity() {
+    override fun attachBaseContext(base: Context) {
+        val wrapped = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) base else {
+            // WHY audit row 09: API 26-32 stored the override but did not apply it before Activity creation.
+            val locale = AppLanguage.current(base)
+                ?.takeIf { tag -> AppLanguage.supported.any { (supported, _) -> supported == tag } }
+                ?.let(Locale::forLanguageTag)
+            if (locale == null) base else base.createConfigurationContext(
+                Configuration(base.resources.configuration).apply {
+                    setLocale(locale)
+                    setLayoutDirection(locale)
+                },
+            )
+        }
+        super.attachBaseContext(wrapped)
+    }
+
     private var deepLinkEvent by mutableStateOf<VortXDeepLinkEvent?>(null)
     private var deepLinkSequence = 0L
     private var deepLinkDelivery = DeepLinkDeliveryState()

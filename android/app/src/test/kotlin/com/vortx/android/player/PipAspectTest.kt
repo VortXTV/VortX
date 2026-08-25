@@ -24,8 +24,10 @@ class PipAspectTest {
 
     @Test
     fun `tall video clamps to the tallest legal ratio`() {
-        // 9:16 vertical is under the 0.42 floor.
-        assertEquals(42 to 100, pipAspect(1080, 1920))
+        // Only a ratio UNDER the 0.42 floor clamps; 9:16 portrait is 0.5625, inside the legal band,
+        // and must pass through untouched (the old expectation misread the math).
+        assertEquals(1080 to 1920, pipAspect(1080, 1920))
+        assertEquals(42 to 100, pipAspect(1000, 3000))
     }
 
     @Test

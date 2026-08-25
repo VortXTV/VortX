@@ -6,6 +6,7 @@ import android.util.Log
 import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.metadata.MetadataProviderKeys
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
@@ -784,6 +785,7 @@ class VortXSyncManager(context: Context) {
     }
 
     private val debridKeys = DebridKeys(appContext)
+    private val metadataKeys = MetadataProviderKeys(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
     private val sessionState = DurableSessionState(
@@ -791,7 +793,9 @@ class VortXSyncManager(context: Context) {
         initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial(),
         persist = store::persist,
         clear = store::clear,
-        ownerTransition = debridKeys::runOwnerTransition,
+        ownerTransition = { mutation ->
+            metadataKeys.runOwnerTransition { debridKeys.runOwnerTransition(mutation) }
+        },
     )
     private val operations = SessionOperationCoordinator()
 
@@ -1588,6 +1592,7 @@ class VortXSyncManager(context: Context) {
                 // gap 2: mirror this device's connected-service (debrid) keys on doc.apiKeys, read-merge +
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
+                mergeMetadataKeysIntoDoc(doc)
             }
         }
         return doc.takeIf { published && isSyncLeaseCurrent(lease) }
@@ -1646,6 +1651,21 @@ class VortXSyncManager(context: Context) {
     }
 
     /**
+     * WHY K-05: metadata credentials use their own `apiKeys.metadata` namespace. Read-merging both levels
+     * preserves fields written by peers that do not understand this leg, while omission never deletes a key.
+     */
+    private fun mergeMetadataKeysIntoDoc(doc: JSONObject) {
+        val apiKeys = doc.optJSONObject("apiKeys")?.let { JSONObject(it.toString()) } ?: JSONObject()
+        val metadata = apiKeys.optJSONObject("metadata")?.let { JSONObject(it.toString()) } ?: JSONObject()
+        for (slot in MetadataProviderKeys.Slot.entries) {
+            val value = metadataKeys.value(slot)
+            if (value.isNotEmpty()) metadata.put(slot.syncKey, value)
+        }
+        if (metadata.length() > 0) apiKeys.put("metadata", metadata)
+        if (apiKeys.length() > 0) doc.put("apiKeys", apiKeys)
+    }
+
+    /**
      * Apply connected-service (debrid) keys from an incoming `doc.apiKeys` (gap 2). Sets ONLY the slots the blob
      * carries and NEVER clears a locally-configured key the blob omits (mirrors Apple's never-delete-on-absence
      * apiKeys guard). Owner-scoped via [DebridKeys]' account binding; a failed durable write is skipped
@@ -1657,6 +1677,17 @@ class VortXSyncManager(context: Context) {
         for (service in DebridService.entries) {
             val value = apiKeys.optString(service.id, "")
             if (value.isNotEmpty() && debridKeys.setKey(service, value)) applied = true
+        }
+        return applied
+    }
+
+    /** WHY K-05: apply only present, non-empty metadata slots, preserving every omitted local credential. */
+    private fun applyMetadataKeys(apiKeys: JSONObject?): Boolean {
+        val metadata = apiKeys?.optJSONObject("metadata") ?: return false
+        var applied = false
+        for (slot in MetadataProviderKeys.Slot.entries) {
+            val value = metadata.optString(slot.syncKey, "")
+            if (value.isNotEmpty() && metadataKeys.set(slot, value)) applied = true
         }
         return applied
     }
@@ -1742,7 +1773,9 @@ class VortXSyncManager(context: Context) {
         // gap 2: adopt connected-service (debrid) keys set on another device. Applied off the Main thread
         // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
         // applyingRemote window). Owner-scoped by DebridKeys' account binding; never clears a key the blob omits.
-        if (applyDebridKeys(doc.optJSONObject("apiKeys"))) restored = true
+        val apiKeys = doc.optJSONObject("apiKeys")
+        if (applyDebridKeys(apiKeys)) restored = true
+        if (applyMetadataKeys(apiKeys)) restored = true
         // Stamp the applied version so the version-wins guard holds across relaunches (per account).
         if (!advanceVersion(lease, version)) return false
         // STARTUP HEAL: a settings key that is STILL dirty after this pull (a previous session's edit whose
