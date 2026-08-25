@@ -54,6 +54,10 @@ object VortXSyncDoc {
         val overlays: Map<String, Map<String, WatchEntry>>,
         /** Cross-device profile delete tombstones. */
         val deletedProfiles: List<String>,
+        /** Back-compatible effective owner-library removal set. */
+        val deletedLibrary: List<String>,
+        /** LWW owner-library stamps, keyed by normalized id then removedAt/addedAt. */
+        val deletedLibraryTs: Map<String, Map<String, Double>>,
         /** The remote device's active profile (advisory; selection stays per-device). */
         val activeProfile: String?,
     )
@@ -62,7 +66,7 @@ object VortXSyncDoc {
 
     fun parse(doc: JSONObject): Parsed {
         val vortx = doc.optJSONObject("vortx")
-            ?: return Parsed(null, null, false, emptyMap(), emptyList(), null)
+            ?: return Parsed(null, null, false, emptyMap(), emptyList(), emptyList(), emptyMap(), null)
 
         // Roster: prefer the FULL lossless carrier (Android-authored); else reconstruct from the dashboard
         // summary (Apple / web-authored) so a cross-surface doc still yields a usable roster.
@@ -100,8 +104,33 @@ object VortXSyncDoc {
         }
 
         val deleted = vortx.optJSONArray("deletedProfiles")?.toStringList() ?: emptyList()
+        val deletedLibrary = vortx.optJSONArray("deletedLibrary")?.toStringList() ?: emptyList()
+        val deletedLibraryTs = parseLibraryTimestamps(vortx.optJSONObject("deletedLibraryTs"))
         val active = vortx.optStringOrNull("activeProfile")
-        return Parsed(roster, modified, fullRoster != null, overlays, deleted, active)
+        return Parsed(
+            roster,
+            modified,
+            fullRoster != null,
+            overlays,
+            deleted,
+            deletedLibrary,
+            deletedLibraryTs,
+            active,
+        )
+    }
+
+    private fun parseLibraryTimestamps(raw: JSONObject?): Map<String, Map<String, Double>> {
+        raw ?: return emptyMap()
+        return buildMap {
+            for (id in raw.keys()) {
+                val source = raw.optJSONObject(id) ?: continue
+                val entry = buildMap {
+                    finiteClock(source.opt("removedAt"))?.let { put("removedAt", it) }
+                    finiteClock(source.opt("addedAt"))?.let { put("addedAt", it) }
+                }
+                if (entry.isNotEmpty()) put(id, entry)
+            }
+        }
     }
 
     private fun finiteClock(value: Any?): Double? =

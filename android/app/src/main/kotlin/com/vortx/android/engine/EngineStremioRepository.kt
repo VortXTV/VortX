@@ -41,6 +41,7 @@ import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sync.AccountLibrarySync
+import com.vortx.android.sync.LibraryTombstones
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -1627,6 +1628,7 @@ class EngineStremioRepository(
                             poster = item.poster,
                         ),
                     )
+                    LibraryTombstones(appContext).forget(item.id)
                     // Mirror the ACCOUNT-library add out to the connected Trakt/SIMKL watchlists. This
                     // Engine branch is the account path (an overlay profile takes HistoryRoute.Overlay and
                     // never reaches here), so the mirror is main-profile-only by construction. Fire-and-forget.
@@ -1644,6 +1646,7 @@ class EngineStremioRepository(
                 }
                 HistoryRoute.Engine -> {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                    LibraryTombstones(appContext).tombstone(id)
                     // Bare-id remove: the type is unknown here, so the Trakt remove targets both arrays
                     // (see TitleRef). SIMKL has no watchlist-remove, so it is a no-op there.
                     AccountLibrarySync.onLibraryRemoved(appContext, id, type = null)
@@ -1667,6 +1670,7 @@ class EngineStremioRepository(
                     // fail closed when the current native snapshot contains the same id under another type.
                     if (validateContinueWatchingRemovalTarget(strictContinueWatchingItemsLocked(), target)) {
                         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(target.id))
+                        LibraryTombstones(appContext).tombstone(target.id)
                     }
                 }
             }
@@ -2455,6 +2459,7 @@ class EngineStremioRepository(
                         StremioCoreNative.dispatch(
                             EngineActions.addToLibrary(id, type.id, name, poster),
                         )
+                        LibraryTombstones(appContext).forget(id)
                         // Mirror the account-library add to Trakt/SIMKL watchlists (account path only).
                         AccountLibrarySync.onLibraryAdded(appContext, type, id)
                     }
@@ -2472,6 +2477,7 @@ class EngineStremioRepository(
                 }
                 HistoryRoute.Engine -> {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                    LibraryTombstones(appContext).tombstone(id)
                     // Mirror the account-library remove to the Trakt watchlist (typed; SIMKL has no remove).
                     AccountLibrarySync.onLibraryRemoved(appContext, id, type)
                 }

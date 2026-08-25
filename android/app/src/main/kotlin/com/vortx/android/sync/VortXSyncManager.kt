@@ -23,6 +23,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -786,6 +787,7 @@ class VortXSyncManager(context: Context) {
 
     private val debridKeys = DebridKeys(appContext)
     private val metadataKeys = MetadataProviderKeys(appContext)
+    private val libraryTombstones = LibraryTombstones(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
     private val sessionState = DurableSessionState(
@@ -1535,6 +1537,32 @@ class VortXSyncManager(context: Context) {
         return synced && isSyncLeaseCurrent(lease)
     }
 
+    private fun applyLibraryTombstonesToVortx(vortx: JSONObject): JSONObject {
+        val removed = libraryTombstones.all()
+        val source = vortx.optJSONArray("library")
+        if (source != null) {
+            val filtered = JSONArray()
+            for (index in 0 until source.length()) {
+                val item = source.optJSONObject(index) ?: continue
+                val id = LibraryTombstones.normalize(item.optString("id", ""))
+                if (id !in removed) filtered.put(item)
+            }
+            if (filtered.length() > 0) vortx.put("library", filtered) else vortx.remove("library")
+        }
+        if (removed.isNotEmpty()) {
+            vortx.put("deletedLibrary", JSONArray(removed.sorted()))
+        } else {
+            vortx.remove("deletedLibrary")
+        }
+        val stamps = libraryTombstones.timestampsForSync()
+        if (stamps.isNotEmpty()) {
+            vortx.put("deletedLibraryTs", JSONObject(stamps))
+        } else {
+            vortx.remove("deletedLibraryTs")
+        }
+        return vortx
+    }
+
     /**
      * Build the doc to push by MERGING this device's state onto a freshly pulled base. Returns null on a
      * FAILED pull (network / undecryptable): a failed pull must NEVER overwrite the account's doc, or it
@@ -1572,6 +1600,10 @@ class VortXSyncManager(context: Context) {
                     // is a monotone, idempotent union that also prunes the live roster, so it needs no version
                     // gate; buildVortx then emits the folded set (and read-merges the pulled one again).
                     if (parsed.deletedProfiles.isNotEmpty()) store.mergeDeletedTombstones(parsed.deletedProfiles)
+                    if (parsed.deletedLibrary.isNotEmpty() || parsed.deletedLibraryTs.isNotEmpty()) {
+                        libraryTombstones.merge(parsed.deletedLibrary, parsed.deletedLibraryTs)
+                        refreshSettingsShadow()
+                    }
                     resolvedRoster.roster?.let {
                         if (it.isNotEmpty()) store.mergeInRoster(it, resolvedRoster.modifiedSeconds)
                     }
@@ -1588,7 +1620,8 @@ class VortXSyncManager(context: Context) {
                     // never-delete: only keys this device holds are set; a key it lacks keeps the account's value.
                     deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
                 )?.let { doc.put("settings", it) }
-                doc.put("vortx", VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx")))
+                val vortx = VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx"))
+                doc.put("vortx", applyLibraryTombstonesToVortx(vortx))
                 // gap 2: mirror this device's connected-service (debrid) keys on doc.apiKeys, read-merge +
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
@@ -1721,16 +1754,39 @@ class VortXSyncManager(context: Context) {
             is SyncDocPull.Doc -> { doc = pull.doc; version = pull.version }
             else -> return false                                 // .empty / .failed: never wipe local
         }
-        // VERSION-WINS: apply only a STRICTLY-NEWER remote; a stale or equal pull is a no-op.
-        if (!force && version <= lastSyncedVersion(lease)) return false
         val parsed = VortXSyncDoc.parse(doc)
+        var libraryTombstonesChanged = false
+        val foldedLibrary = withContext(Dispatchers.Main) {
+            publishIfSyncLeaseCurrent(lease) {
+                applyingRemote = true
+                try {
+                    if (parsed.deletedLibrary.isNotEmpty() || parsed.deletedLibraryTs.isNotEmpty()) {
+                        libraryTombstonesChanged = libraryTombstones.merge(
+                            parsed.deletedLibrary,
+                            parsed.deletedLibraryTs,
+                        )
+                        refreshSettingsShadow()
+                        if (libraryTombstonesChanged) {
+                            doc.optJSONObject("vortx")?.let(::applyLibraryTombstonesToVortx)
+                        }
+                    }
+                } finally {
+                    applyingRemote = false
+                }
+            }
+        }
+        if (!foldedLibrary || !isSyncLeaseCurrent(lease)) return false
+        if (libraryTombstonesChanged) requestSyncSoon()
+        // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Library tombstone
+        // stamps are monotone MAX folds and therefore apply from every successfully decrypted doc.
+        if (!force && version <= lastSyncedVersion(lease)) return libraryTombstonesChanged
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
             pulledBlob = doc.opt("settings"),
             fallbackRoster = parsed.roster,
             fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
             fallbackIsLossless = parsed.rosterIsLossless,
         )
-        var restored = false
+        var restored = libraryTombstonesChanged
         val published = withContext(Dispatchers.Main) {
             val store = resolveStore() ?: return@withContext false
             publishIfSyncLeaseCurrent(lease) {
