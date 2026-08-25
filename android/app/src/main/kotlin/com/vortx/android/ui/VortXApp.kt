@@ -35,6 +35,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -57,6 +58,7 @@ import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.deeplink.VortXDeepLink
 import com.vortx.android.deeplink.VortXDeepLinkEvent
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
@@ -235,7 +237,9 @@ fun VortXApp(
             accentId = accentId,
             oled = oled,
         ) {
-            var tab by remember { mutableStateOf(Tab.HOME) }
+            // WHY audit R02: save enum identity, not ordinal, so shell selection survives process death safely.
+            var savedTabName by rememberSaveable { mutableStateOf(Tab.HOME.name) }
+            val tab = Tab.entries.firstOrNull { it.name == savedTabName } ?: Tab.HOME
             // SD-2: the combined Discover+Search surface folds Search into Discover, so the standalone
             // Search tab is dropped from the bar while the pref is on (Apple `visibleTabs`).
             val homeDiscoverPrefs = remember(appContext) { HomeDiscoverPreferences(appContext) }
@@ -244,10 +248,25 @@ fun VortXApp(
                 hiddenTabs.isVisible(it.slot) && !(mergeDiscoverSearch && it == Tab.SEARCH)
             }
             LaunchedEffect(tab, hiddenTabs) {
-                if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) tab = Tab.HOME
+                if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) savedTabName = Tab.HOME.name
             }
-        var detail by remember { mutableStateOf<MetaItem?>(null) }
+        // WHY audit R02: save only the stable route strings, then rehydrate through the deep-link target hook.
+        var savedDetailId by rememberSaveable { mutableStateOf<String?>(null) }
+        var savedDetailType by rememberSaveable { mutableStateOf<String?>(null) }
+        val detail = remember(savedDetailId, savedDetailType) {
+            val restoredType = MediaType.entries.firstOrNull { it.id == savedDetailType }
+            if (restoredType != null && !savedDetailId.isNullOrEmpty()) {
+                VortXDeepLink(restoredType, savedDetailId!!).toMetaItem()
+            } else {
+                null
+            }
+        }
+        val openDetail: (MetaItem?) -> Unit = { item ->
+            savedDetailId = item?.id
+            savedDetailType = item?.type?.id
+        }
         var detailGeneration by remember { mutableStateOf(0L) }
+        var pendingDirectResumeId by remember { mutableStateOf<String?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
         // "Still watching?" binge streak: consecutive auto-advanced episodes with no manual play between
         // them, so the player can raise the prompt at the binge boundary (Apple `consecutiveAutoAdvances`).
@@ -314,7 +333,7 @@ fun VortXApp(
         }
         LaunchedEffect(mergeDiscoverSearch, tab) {
             if (mergeDiscoverSearch && tab == Tab.SEARCH) {
-                tab = if (hiddenTabs.isVisible(TabSlot.DISCOVER)) Tab.DISCOVER else Tab.HOME
+                savedTabName = if (hiddenTabs.isVisible(TabSlot.DISCOVER)) Tab.DISCOVER.name else Tab.HOME.name
             }
         }
         // SD-6: per-tab re-tap tokens. The shell bumps one when the ALREADY-active tab is re-tapped, and the
@@ -355,11 +374,11 @@ fun VortXApp(
             showTabBar = false
             showPlayLink = false
             detailGeneration += 1
-            detail = target.toMetaItem()
+            openDetail(target.toMetaItem())
         }
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
-            detail = it
+            openDetail(it)
         }
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
@@ -517,6 +536,9 @@ fun VortXApp(
                 } else {
                     null
                 }
+            DisposableEffect(historyIdentity, advanceVm) {
+                onDispose { advanceVm?.recordLastStreamProgress(lastProgress[0], force = true) }
+            }
             // Keep the in-player Sources/Quality sheets live as late add-ons settle. The options themselves
             // come from the ViewModel's unified, filtered, ranked assembly, never from an ad-hoc UI sort.
             val playerSourceState = if (advanceVm != null) {
@@ -637,6 +659,7 @@ fun VortXApp(
                         // A trailer reports no progress and never auto-adds to the library (it is not the feature).
                         if (playable.isTrailer) return@PlayerScreen
                         playbackSessions.report(playbackSession, pos, dur)
+                        advanceVm?.recordLastStreamProgress(pos)
                         // ~60s in -> the viewer is really watching this: auto-add it to the Library (D8), once
                         // per playback. This is the Android seam for Apple's block at PlayerScreen.swift:972-978
                         // and TVPlayerView.swift:810-816, which hangs the same call off the same progress tick:
@@ -1025,14 +1048,19 @@ fun VortXApp(
                         appContext = appContext,
                     ),
                 )
+                LaunchedEffect(detailVm, pendingDirectResumeId) {
+                    if (pendingDirectResumeId == current.id && detailVm.playLastStream()) {
+                        pendingDirectResumeId = null
+                    }
+                }
                 // System Back closes the detail overlay back to the browse shell. Composed BEFORE
                 // DetailScreen so the screen's own nested overlay handlers (person page / nested title,
                 // DetailScreen.kt) register later and therefore take precedence while they are open.
-                BackHandler { detail = null }
+                BackHandler { openDetail(null) }
                 DetailScreen(
                     viewModel = detailVm,
                     title = current.name,
-                    onBack = { detail = null },
+                    onBack = { openDetail(null) },
                     // DetailScreen supplies the successfully loaded MetaDetail, not the provisional
                     // deep-link MetaItem. This keeps auto-add title/poster truth tied to engine metadata.
                     onPlay = { playable, loadedMeta ->
@@ -1077,14 +1105,14 @@ fun VortXApp(
                             // (back to root) and scrolls that screen to the top (Apple's active-tab re-tap).
                             onClick = {
                                 if (t == tab) {
-                                    detail = null
+                                    openDetail(null)
                                     when (t) {
                                         Tab.SEARCH -> searchReselect++
                                         Tab.DISCOVER -> discoverReselect++
                                         else -> Unit
                                     }
                                 } else {
-                                    tab = t
+                                    savedTabName = t.name
                                 }
                             },
                             icon = { Icon(t.icon, contentDescription = t.label) },
@@ -1104,7 +1132,16 @@ fun VortXApp(
             val accountSignedIn = authState is AuthState.SignedIn ||
                 vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn
             when (tab) {
-                Tab.HOME -> HomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, content)
+                Tab.HOME -> HomeScreen(
+                    viewModel = viewModel<HomeViewModel>(factory = factory),
+                    onItem = onItem,
+                    modifier = content,
+                    onDirectResume = { item ->
+                        pendingDirectResumeId = item.id
+                        detailGeneration += 1
+                        openDetail(item)
+                    },
+                )
                 Tab.DISCOVER -> if (mergeDiscoverSearch) {
                     // SD-2: the combined surface hosts both the Discover browse and the folded-in Search.
                     MergedDiscoverSearchScreen(

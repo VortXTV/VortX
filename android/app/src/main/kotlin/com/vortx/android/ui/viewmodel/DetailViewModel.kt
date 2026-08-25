@@ -36,6 +36,7 @@ import com.vortx.android.player.PlayerSourceSwitchCommitGate
 import com.vortx.android.player.PlayerSourceSwitchResolution
 import com.vortx.android.singularity.SourceIndexServeSource
 import com.vortx.android.trailer.TrailerCoordinator
+import com.vortx.android.profile.LastStreamStore
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.ResolvedPin
 import com.vortx.android.sources.CanonicalContentIdentity
@@ -243,6 +244,7 @@ class DetailViewModel(
 ) : ViewModel() {
 
     private val app = appContext.applicationContext
+    private val lastStreamStore = LastStreamStore(app)
 
     /// The route identity the screen opened, exposed so a view-local enrichment (More Like This) can key
     /// off the ROUTE id and populate before the engine meta resolves (Apple's `loadSimilarFallback`).
@@ -419,6 +421,23 @@ class DetailViewModel(
             repo.ctxUpdates().collect {
                 if (_meta.value !is UiState.Success) return@collect
                 repo.peekMeta(type, metaId)?.let { fresh -> _meta.value = UiState.Success(fresh) }
+            }
+        }
+        viewModelScope.launch {
+            // WHY audit R01: persist every successfully resolved source before the player can outlive this process.
+            playback.collect { state ->
+                val playable = (state as? Playback.Ready)?.playable?.takeUnless { it.isTrailer } ?: return@collect
+                val source = lastPlayedSource
+                val targetId = _selectedEpisodeId.value ?: id
+                val stored = resumeRef?.takeIf { it.targetId == targetId && it.source.id == source?.id }
+                lastStreamStore.saveReady(
+                    mediaId = id,
+                    mediaType = type,
+                    playable = playable,
+                    source = source,
+                    ref = stored?.ref,
+                    linkSavedAtMs = stored?.savedAtMs,
+                )
             }
         }
         // Start the assembly pipeline and bridge its ranked output to [_streams]. The bridge is gated by
@@ -1312,7 +1331,9 @@ class DetailViewModel(
     /// point WITHOUT clearing it (the library `timeOffset` is left untouched, so the primary Resume
     /// still seeks there next time). It only forces the player's start position to zero across all
     /// three legs below by not reading [resumeOffsetMs]; nothing engine/account state is written.
-    fun playBest(fromStart: Boolean = false) {
+    fun playBest(fromStart: Boolean = false) = playBest(fromStart, startPositionOverrideMs = null)
+
+    private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?) {
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
@@ -1320,7 +1341,7 @@ class DetailViewModel(
         val best = bestSource() ?: return
         lastPlayedSource = best
         _playback.value = Playback.Resolving
-        val resumeMs = if (fromStart) 0L else resumeOffsetMs()
+        val resumeMs = if (fromStart) 0L else startPositionOverrideMs?.coerceAtLeast(0L) ?: resumeOffsetMs()
         val ref = currentMediaRef()
         val targetId = _selectedEpisodeId.value ?: id
         val episode = currentModelEpisode()
@@ -1530,6 +1551,44 @@ class DetailViewModel(
     /// [resumeOffsetMs] would seek forward, so the "Play from start" secondary action is offered for a
     /// resumed title and hidden for a fresh one. Read-only; mirrors Apple's `movieResumeSeconds != nil`.
     fun resumeAvailable(): Boolean = resumeOffsetMs() > 0L
+
+    /** WHY audit R01: Home's first CW hero restores the persisted exact source through CWResume. */
+    fun playLastStream(): Boolean {
+        val saved = lastStreamStore.load()?.takeIf { it.mediaId == id && it.mediaType == type } ?: return false
+        viewModelScope.launch {
+            val streamState = streams.first { it !is UiState.Loading }
+            if (streamState !is UiState.Success) return@launch
+            val owner = debridKeys.ownerToken()
+            val service = saved.debridService
+            if (owner != null && service != null) {
+                val ref = DebridCoordinator.DebridPlaybackRef(
+                    url = saved.url,
+                    service = service,
+                    owner = owner,
+                    infoHash = saved.infoHash.orEmpty(),
+                    torrentId = saved.torrentId,
+                    fileId = saved.fileId,
+                    fileIdx = saved.fileIdx,
+                    episode = currentModelEpisode()?.debridEpisodeForResolve(),
+                )
+                resumeRef = NativeDebridResumeRef(
+                    targetId = _selectedEpisodeId.value ?: id,
+                    ref = ref,
+                    source = saved.source,
+                    url = saved.url,
+                    savedAtMs = saved.linkSavedAtMs ?: saved.timestampMs,
+                )
+                playBest(fromStart = false, startPositionOverrideMs = saved.positionMs)
+            } else {
+                play(saved.source, manualPick = false, startPositionOverrideMs = saved.positionMs)
+            }
+        }
+        return true
+    }
+
+    fun recordLastStreamProgress(positionMs: Long, force: Boolean = false) {
+        lastStreamStore.saveProgress(id, positionMs, force)
+    }
 
     fun clearPlayback() {
         _playback.value = Playback.Idle

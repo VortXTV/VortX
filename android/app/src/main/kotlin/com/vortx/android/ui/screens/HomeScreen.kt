@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -25,12 +26,14 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
+import com.vortx.android.profile.LastStreamStore
 import com.vortx.android.home.CollectionsHubSnapshot
 import com.vortx.android.home.TOP_PICKS_CATALOG_ID
 import com.vortx.android.home.SIMKL_WATCHLIST_CATALOG_ID
@@ -57,12 +60,19 @@ import com.vortx.android.ui.viewmodel.HomeViewModel
 /// the same composition the iOS and Apple TV apps lead with (DESIGN-SYSTEM.md §4 "Home"). Driven by
 /// [HomeViewModel] so loading and error are first-class states, not an empty screen.
 @Composable
-fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+fun HomeScreen(
+    viewModel: HomeViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    onDirectResume: (MetaItem) -> Unit = onItem,
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val collections by viewModel.collections.collectAsStateWithLifecycle()
     val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
     val hubOrder by viewModel.collectionsHubOrder.collectAsStateWithLifecycle()
     val hubHidden by viewModel.collectionsHubHidden.collectAsStateWithLifecycle()
+    val appContext = LocalContext.current.applicationContext
+    val lastStreamStore = remember(appContext) { LastStreamStore(appContext) }
 
     if (collectionBrowse.target != null) {
         CollectionsBrowseScreen(
@@ -90,7 +100,17 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
                     modifier,
                 )
             } else {
-                HomeContent(s.data, collections, hubOrder, hubHidden, onItem, viewModel, modifier)
+                HomeContent(
+                    s.data,
+                    collections,
+                    hubOrder,
+                    hubHidden,
+                    onItem,
+                    onDirectResume,
+                    lastStreamStore,
+                    viewModel,
+                    modifier,
+                )
             }
     }
 }
@@ -102,12 +122,20 @@ private fun HomeContent(
     hubOrder: List<HomeRail>,
     hubHidden: Boolean,
     onItem: (MetaItem) -> Unit,
+    onDirectResume: (MetaItem) -> Unit,
+    lastStreamStore: LastStreamStore,
     viewModel: HomeViewModel,
     modifier: Modifier,
 ) {
     val visibleCatalogs = remember(catalogs) { normalizeHomeCatalogs(catalogs) }
     // The hub is not a catalog, so the hero (first item of the first REAL rail) is unaffected by it.
-    val hero = visibleCatalogs.firstOrNull()?.items?.firstOrNull()
+    val heroCatalog = visibleCatalogs.firstOrNull()
+    val hero = heroCatalog?.items?.firstOrNull()
+    val savedStream = hero?.let { lastStreamStore.load() }
+    // WHY audit R01: direct resume belongs only to the first Continue Watching hero, never ordinary cards.
+    val heroCanDirectResume = heroCatalog?.id == "continue" && hero != null && savedStream?.let {
+        it.mediaId == hero.id && it.mediaType == hero.type && it.positionMs > 0L
+    } == true
     val hubShown = collections.isVisible && !hubHidden
     val rows = remember(visibleCatalogs, hubShown, hubOrder) {
         homeRowsWithHub(visibleCatalogs, if (hubShown) collectionsHubSlot(visibleCatalogs, hubOrder) else null)
@@ -126,7 +154,7 @@ private fun HomeContent(
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
     ) {
         if (hero != null) {
-            item { HeroHeader(hero, onItem) }
+            item { HeroHeader(hero, onItem, onDirectResume.takeIf { heroCanDirectResume }) }
         }
         itemsIndexed(rows, key = { _, row -> homeRowKey(row) }) { _, row ->
             when (row) {
@@ -179,7 +207,11 @@ private fun LoadingColumn(modifier: Modifier) {
 /// bottom scrim that fades to canvas, with the bottom-left content block (eyebrow kicker + serif hero
 /// title + meta line). Tapping it opens the title. The S10 rotation/leading-fade work is still to come.
 @Composable
-private fun HeroHeader(item: MetaItem, onItem: (MetaItem) -> Unit) {
+private fun HeroHeader(
+    item: MetaItem,
+    onItem: (MetaItem) -> Unit,
+    onDirectResume: ((MetaItem) -> Unit)?,
+) {
     val colors = VortXTheme.colors
     // The featured title's real artwork, drawn from the SAME catalog data the rails use: prefer the
     // wide featured backdrop ([MetaItem.background], what browse pages lead with and what the engine's
@@ -245,6 +277,14 @@ private fun HeroHeader(item: MetaItem, onItem: (MetaItem) -> Unit) {
                     style = VortXTheme.type.label.copy(color = colors.textSecondary),
                     modifier = Modifier.padding(top = 4.dp),
                 )
+            }
+            onDirectResume?.let { resume ->
+                Button(
+                    onClick = { resume(item) },
+                    modifier = Modifier.padding(top = VortXTheme.spacing.sm),
+                ) {
+                    Text("Resume")
+                }
             }
         }
     }
