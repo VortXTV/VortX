@@ -37,7 +37,12 @@ import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URI
+import java.net.URL
+import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /// The libmpv [PlayerEngine] (PRIMARY player, `full` flavor only). Owns one [MPVLib] for its lifetime,
 /// renders into an Android [SurfaceView] (the Android analogue of Apple's Metal `wid` layer), applies
@@ -102,6 +107,7 @@ class MpvPlayer private constructor(
     private var pendingResumeSeekMs: Long = 0L
 
     private val runtimePolicyScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val subtitleLoadGeneration = AtomicLong()
     private var pausedClampJob: Job? = null
     private var memoryRecoveryJob: Job? = null
     private var normalReadAheadBytes: Long? = null
@@ -261,6 +267,7 @@ class MpvPlayer private constructor(
     }
 
     override fun load(playable: Playable) {
+        val loadGeneration = subtitleLoadGeneration.incrementAndGet()
         // Fresh terminal flags for the new file, and isBuffering=true as the CONNECTING state: from
         // loadfile until the first frame (PLAYBACK_RESTART) or a failed open (END_FILE error branch),
         // the chrome shows its spinner instead of a silent black frame. mpv only starts reporting
@@ -329,9 +336,10 @@ class MpvPlayer private constructor(
             mpv.command(arrayOf("audio-add", audio))
         }
 
-        // Mount external sidecar subtitles after load (sub-add takes effect on the loaded file).
+        // WHY audit 07.5: never hand an untrusted remote subtitle URL to mpv. Download under the same
+        // 8 MiB / 20s bounds as Apple, then mount only the local cache file. Failure never affects playback.
         for (sub in playable.externalSubtitles) {
-            mpv.command(arrayOf("sub-add", sub))
+            mountExternalSubtitle(sub, loadGeneration)
         }
 
         // Resume position: DEFER the seek to the first rendered frame rather than issuing it here. A
@@ -447,7 +455,79 @@ class MpvPlayer private constructor(
         mpv.setPropertyString(PROP_SID, id?.toString() ?: "no")
     }
 
-    override fun addExternalSubtitle(url: String) { mpv.command(arrayOf("sub-add", url)) }
+    override fun addExternalSubtitle(url: String) {
+        mountExternalSubtitle(url, subtitleLoadGeneration.get())
+    }
+
+    private fun mountExternalSubtitle(source: String, generation: Long) {
+        runtimePolicyScope.launch(Dispatchers.IO) {
+            val local = boundedSubtitleFile(source)
+            if (local == null) {
+                Log.w(TAG, "external subtitle skipped: bounded fetch failed")
+                return@launch
+            }
+            if (subtitleLoadGeneration.get() != generation) return@launch
+            mpv.command(arrayOf("sub-add", local.absolutePath))
+        }
+    }
+
+    private fun boundedSubtitleFile(source: String): File? {
+        val uri = runCatching { URI(source) }.getOrNull()
+        if (uri?.scheme == null || uri.scheme.equals("file", ignoreCase = true)) {
+            val file = if (uri?.scheme == null) File(source) else runCatching { File(uri) }.getOrNull()
+            return file?.takeIf { it.isFile && it.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES }
+        }
+        if (!uri.scheme.equals("https", ignoreCase = true) || uri.host.isNullOrBlank()) return null
+
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(source.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+        val extension = uri.path?.substringAfterLast('.', "")
+            ?.lowercase()?.takeIf { it in SUBTITLE_EXTENSIONS } ?: "srt"
+        val target = File(appContext.cacheDir, "vortx-extsub-$digest.$extension")
+        if (target.isFile && target.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES) return target
+
+        var connection: HttpURLConnection? = null
+        return try {
+            connection = (URL(source).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
+                readTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
+                instanceFollowRedirects = false
+                useCaches = false
+            }
+            if (connection.responseCode !in 200..299 ||
+                connection.contentLengthLong > MAX_EXTERNAL_SUBTITLE_BYTES
+            ) return null
+            val tmp = File.createTempFile("vortx-extsub-", ".$extension", appContext.cacheDir)
+            val complete = connection.inputStream.use { input ->
+                tmp.outputStream().use outputUse@{ output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var total = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        if (total > MAX_EXTERNAL_SUBTITLE_BYTES) return@outputUse false
+                        output.write(buffer, 0, read)
+                    }
+                    total > 0
+                }
+            }
+            if (!complete) {
+                tmp.delete()
+                null
+            } else if (tmp.renameTo(target)) {
+                target
+            } else {
+                tmp
+            }
+        } catch (_: Throwable) {
+            null
+        } finally {
+            connection?.disconnect()
+        }
+    }
 
     override fun setSubtitleDelay(seconds: Double) { mpv.setPropertyString(PROP_SUB_DELAY, seconds.toString()) }
 
@@ -808,6 +888,9 @@ class MpvPlayer private constructor(
         private const val PAUSED_CACHE_CLAMP_GRACE_MS = 10_000L
         private const val MEMORY_RECOVERY_HEALTHY_MS = 30_000L
         private const val MEMORY_RECOVERY_SAMPLE_MS = 1_000L
+        private const val MAX_EXTERNAL_SUBTITLE_BYTES = 8L * BYTES_PER_MIB
+        private const val EXTERNAL_SUBTITLE_TIMEOUT_MS = 20_000
+        private val SUBTITLE_EXTENSIONS = setOf("srt", "vtt", "ass", "ssa", "sub", "smi")
 
         // Observed property names (Apple MPVMetalViewController parity).
         private const val PROP_TIME_POS = "time-pos"

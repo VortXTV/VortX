@@ -107,8 +107,23 @@ object SubtitleAddonService {
                     connection.readTimeout = FETCH_TIMEOUT_MS
                     connection.instanceFollowRedirects = true
                     if (connection.responseCode !in 200..299) return@runCatching emptyList()
-                    val body = connection.inputStream.bufferedReader().use { it.readText() }
-                    parseSubtitles(body, source.name)
+                    // WHY audit 07.5: add-on listings are tiny. Refuse a hostile/broken response above 1 MiB
+                    // instead of letting readText allocate without bound; the per-add-on failure stays soft.
+                    if (connection.contentLengthLong > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
+                    val bytes = connection.inputStream.use { input ->
+                        val out = java.io.ByteArrayOutputStream()
+                        val buffer = ByteArray(16 * 1024)
+                        var total = 0
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            total += read
+                            if (total > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
+                            out.write(buffer, 0, read)
+                        }
+                        out.toByteArray()
+                    }
+                    parseSubtitles(bytes.toString(Charsets.UTF_8), source.name)
                 } finally {
                     connection.disconnect()
                 }
@@ -138,4 +153,5 @@ object SubtitleAddonService {
 
     /// Per-source fetch timeout, matching Apple's `req.timeoutInterval = 15`.
     private const val FETCH_TIMEOUT_MS = 15_000
+    private const val LISTING_RESPONSE_MAX_BYTES = 1024 * 1024
 }

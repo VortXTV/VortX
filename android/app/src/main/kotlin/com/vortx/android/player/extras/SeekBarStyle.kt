@@ -3,6 +3,11 @@ package com.vortx.android.player.extras
 import android.content.Context
 import androidx.compose.animation.core.withInfiniteAnimationFrameMillis
 import androidx.compose.foundation.Canvas
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.runtime.Composable
@@ -168,7 +173,20 @@ fun StyledScrubber(
             }
     }
 
-    Canvas(modifier = modifier.then(gesture)) {
+    // AUDIT 12 a11y: this is a bare canvas to TalkBack otherwise - no name, no position, no way to
+    // know where playback stands. Expose it as a progress node announcing "X of Y".
+    val announcedCurrent = (progress * durationSeconds).toLong()
+    val announcedTotal = durationSeconds.toLong()
+    Canvas(
+        modifier = modifier
+            .then(gesture)
+            .semantics {
+                contentDescription = "Playback position"
+                stateDescription =
+                    "${formatA11yClock(announcedCurrent)} of ${formatA11yClock(announcedTotal)}"
+                progressBarRangeInfo = ProgressBarRangeInfo(progress, 0f..1f)
+            }
+    ) {
         drawSeekBar(style, timeSeconds, progress, accent, trackColor)
         drawBufferedBand(progress, buffered, trackColor)
         drawSkipBands(durationSeconds, skipBands)
@@ -506,4 +524,14 @@ private fun DrawScope.spectrum(t: Double, p: Float, accent: Color, track: Color)
             CornerRadius(tw / 2f),
         )
     }
+}
+
+
+/// "H:MM:SS" / "M:SS" clock for the scrubber's TalkBack announcement (audit 12 a11y).
+private fun formatA11yClock(totalSeconds: Long): String {
+    val s = totalSeconds.coerceAtLeast(0L)
+    val h = s / 3600
+    val m = (s % 3600) / 60
+    val sec = s % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
 }

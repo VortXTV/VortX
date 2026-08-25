@@ -3,6 +3,7 @@ package com.vortx.android.player.subtitles
 import android.content.Context
 import com.vortx.android.config.RemoteConfig
 import com.vortx.android.config.RemoteConfigDefaults
+import com.vortx.android.model.MediaRef
 import com.vortx.android.net.VortXEdgeAuth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -81,6 +82,29 @@ object SubtitlePoolClient {
 
     /** The result of a pool read: the offered subtitles and the community-learned sync offset (ms), if any. */
     data class PooledResult(val subs: List<PooledSubtitle>, val offsetMs: Int?)
+
+    /**
+     * Sheet-ready pool lookup for the current playback identity. IMDb remains authoritative; title/year are
+     * only fallback release hints, while [filename] and duration sharpen rip fingerprint matching.
+     */
+    suspend fun fetchForPlayback(
+        ref: MediaRef?,
+        title: String?,
+        year: Int?,
+        filename: String?,
+        durationSecs: Double?,
+        isSignedIn: Boolean,
+    ): PooledResult {
+        val contentKey = SubtitleReleaseFingerprint.contentKey(ref?.imdb, ref?.season, ref?.episode)
+            ?: return PooledResult(emptyList(), null)
+        val releaseHint = filename?.takeIf { it.isNotBlank() }
+            ?: listOfNotNull(title?.takeIf { it.isNotBlank() }, year?.toString()).joinToString(" ")
+        val fingerprint = SubtitleReleaseFingerprint.releaseFingerprint(
+            durationSecs = durationSecs,
+            releaseName = releaseHint.takeIf { it.isNotBlank() },
+        )
+        return fetchPooled(contentKey, fingerprint = fingerprint, isSignedIn = isSignedIn)
+    }
 
     // MARK: - Read: GET /subs
 
