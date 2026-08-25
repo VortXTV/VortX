@@ -121,7 +121,7 @@ struct RootView: View {
             // and the profile picker animating in shows the app's own background, never
             // a flash of the main profile's Home underneath.
             Theme.Palette.canvas.ignoresSafeArea()
-            RootTabView()
+            RootTabView(launchReady: splashDone && shellVisible)
                 .opacity(shellVisible ? 1 : 0)
                 .disabled(!shellVisible)
                 // A `vortx://open` link (today: a Top Shelf tap) opens the title's detail page.
@@ -237,6 +237,8 @@ struct RootView: View {
 /// player no longer depends on the shell being a custom bar, it locks focus on its own catcher while up,
 /// so the native tab bar can't steal the remote.
 struct RootTabView: View {
+    let launchReady: Bool
+
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
@@ -270,7 +272,8 @@ struct RootTabView: View {
 
     /// Seed the per-tab Live key from the legacy toggle before the first @AppStorage read, so a user
     /// who had hidden Live keeps it hidden across the #117 generalization.
-    init() {
+    init(launchReady: Bool) {
+        self.launchReady = launchReady
         TabBarPrefs.migrateLegacyLiveKey()
     }
 
@@ -411,14 +414,18 @@ struct RootTabView: View {
             // card. Stand it down once at shell appear so every field on tvOS shows the VortX surface
             // authored behind it instead of an opaque near-white slab. See VortXGlass.applyTextFieldAppearance.
             VortXGlass.applyTextFieldAppearance()
-            updates.startMonitoring()   // launch check + hourly re-check while open
+            updates.startMonitoring()   // cached result immediately, network at most once per day
+            presentUpdateIfReady()
             let name = Self.tabName(selection)
             VXProbeState.shared.setRoute(name)
             VXProbe.event("nav", "tab \(name)")
         }
+        .onChange(of: launchReady) { _, _ in presentUpdateIfReady() }
+        .onChange(of: updates.available?.key) { _, _ in presentUpdateIfReady() }
         // Reset the tab being LEFT to its root, so returning to it lands on the root page.
         .onChange(of: selection) { old, new in
             if old >= 0, old < resetTokens.count { resetTokens[old] += 1 }
+            presentUpdateIfReady()
             let name = Self.tabName(new)
             VXProbeState.shared.setRoute(name)
             VXProbe.event("nav", "tab \(name)")
@@ -509,6 +516,12 @@ struct RootTabView: View {
         await MoveSeeding.armLaunchNag {
             if presenter.request == nil { showSeedingNag = true }
         }
+    }
+
+    /// Present only after the real Home shell is visible, never behind the splash, picker, or player.
+    private func presentUpdateIfReady() {
+        guard launchReady, selection == 0 else { return }
+        updates.presentAvailableIfNeeded()
     }
 
     private func applyTabBarAccent() {

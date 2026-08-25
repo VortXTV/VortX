@@ -105,7 +105,7 @@ struct VortXiOSApp: App {
 
     var body: some Scene {
         WindowGroup {
-            iOSRootView()
+            iOSRootView(launchReady: splashDone)
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     // Termination evidence: keep the receipt's last-known phase current so the next
                     // launch can distinguish a backgrounded jetsam kill from a foreground kill.

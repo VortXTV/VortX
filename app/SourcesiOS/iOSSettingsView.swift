@@ -392,7 +392,7 @@ struct iOSSettingsView: View {
                     try? await Task.sleep(for: .seconds(online ? 12 : 3))
                 }
             }
-            .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
+            .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
             .onAppear { SettingsChangeLog.prime() }   // I-settings: baseline the [settings] change log for this visit
             // I-settings: ONE centralized hook records every preference write on the [settings] channel (see
             // SettingsChangeLog), covering all the @AppStorage controls without a scattered .onChange per control.

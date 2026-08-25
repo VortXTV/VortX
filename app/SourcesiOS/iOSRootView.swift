@@ -11,6 +11,8 @@ import AppKit
 /// stay visible at once (matching the tvOS pill bar). Surfaces are filled in one at a time during the
 /// 0.3.0 rebase; Home is the first real one (poster rails from CoreBridge).
 struct iOSRootView: View {
+    let launchReady: Bool
+
     /// The seven destinations, in display order: Home · Discover · Live · Library · Search · Add-ons
     /// · Settings (Live sits after Discover; Add-ons beside Settings, mirroring tvOS).
     private enum Tab: Int, CaseIterable {
@@ -132,7 +134,8 @@ struct iOSRootView: View {
 
     /// Seed the per-tab Live key from the legacy stremiox.hideLiveTab toggle before the first
     /// @AppStorage read, so a user who had hidden Live keeps it hidden across the #117 generalization.
-    init() {
+    init(launchReady: Bool) {
+        self.launchReady = launchReady
         TabBarPrefs.migrateLegacyLiveKey()
     }
 
@@ -149,6 +152,17 @@ struct iOSRootView: View {
     /// owner's rails from showing around it too. Mirrors tvOS RootView.shellVisible.
     private var shellVisible: Bool { !pickerOwed }
 
+    /// iPhone and iPad wait for the visible Home shell. Mac has no tab-specific requirement and presents as
+    /// soon as its launch splash and profile picker are out of the way.
+    private func presentUpdateIfReady(force: Bool = false) {
+        #if os(macOS)
+        guard launchReady, shellVisible, !playbackGate.playerActive else { return }
+        #else
+        guard launchReady, shellVisible, !playbackGate.playerActive, tab == .home else { return }
+        #endif
+        updates.presentAvailableIfNeeded(force: force)
+    }
+
     /// Presentation binding for the launch picker: shown while it is owed; dismissing it by any means marks
     /// the launch as picked (pickedThisLaunch), so it never re-appears until Settings' Switch Profile asks.
     /// Mirrors tvOS RootView.pickerPresented.
@@ -162,6 +176,7 @@ struct iOSRootView: View {
     var body: some View {
         platformShell
         .onChange(of: tab) { newTab in
+            presentUpdateIfReady()
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
             VXProbe.event("nav", "tab \(newTab.probeName)")
@@ -220,6 +235,13 @@ struct iOSRootView: View {
         .sheet(item: $updates.prompt) { release in
             UpdatePromptView(release: release) { updates.dismissPrompt() }
         }
+        .onChange(of: launchReady) { _ in presentUpdateIfReady() }
+        .onChange(of: shellVisible) { _ in presentUpdateIfReady() }
+        .onChange(of: playbackGate.playerActive) { active in
+            if !active { presentUpdateIfReady() }
+        }
+        .onChange(of: updates.available?.key) { _ in presentUpdateIfReady() }
+        .onChange(of: updates.forcePresentationNonce) { _ in presentUpdateIfReady(force: true) }
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
         // device still owes its first VortX-account sync. armLaunchNag waits out the splashless iOS launch
         // + the profile picker, so the sheet never fights a modal; always dismissible, never blocks use.
@@ -250,7 +272,8 @@ struct iOSRootView: View {
             if merged, tab == .search { tab = hideDiscoverTab ? .home : .discover }
         }
         .onAppear {
-            updates.startMonitoring()   // launch check + hourly re-check while open
+            updates.startMonitoring()   // cached result immediately, network at most once per day
+            presentUpdateIfReady()
         }
         #if os(macOS)
         // macOS menu-bar commands (the "Go" menu + ⌘-shortcuts) post here, since they live at the

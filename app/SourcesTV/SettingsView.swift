@@ -1487,7 +1487,7 @@ struct SettingsView: View {
             }
             .buttonStyle(ChipButtonStyle(selected: false))
         }
-        .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
+        .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
     }
 
     private var appVersion: String {

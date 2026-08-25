@@ -1,32 +1,27 @@
 import Foundation
 
-/// Checks vortx.tv/appcast.json for a newer BUILD of this platform and remembers it so the UI can offer
-/// an update. Sideloaded apps have no store update channel, so this is how users learn a new IPA exists.
+/// Checks GitHub's published releases for a newer build of this platform and remembers it so the UI can
+/// offer an update. Sideloaded apps have no store update channel, so this is how users learn a new IPA or
+/// DMG exists.
 ///
-/// Compares by BUILD (CFBundleVersion), NOT marketing version: the betas share the marketing version
-/// ("0.3.8") and differ only by build (115 -> 116), and they ship as GitHub PRERELEASES. The old check
-/// (/releases/latest + semver on the marketing version) could therefore NEVER see a beta -> beta update:
-/// /latest excludes prereleases, and "0.3.8" is not newer than "0.3.8". A manifest we host carries the
-/// build number, so the comparison is reliable. See [[vortx-inapp-update-design]].
+/// Marketing versions are compared as numeric components and builds as integers. This avoids lexical traps
+/// such as 0.3.10 sorting before 0.3.9, while the build comparison distinguishes betas that share a marketing
+/// version. Drafts are excluded. Published prereleases remain eligible because VortX betas are public releases.
 @MainActor
 final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
 
-    struct Release: Equatable, Identifiable {
-        let version: String      // marketing, e.g. "0.3.8"
-        let build: Int           // CFBundleVersion, e.g. 116 (the real beta discriminator)
-        let name: String         // release title, e.g. "Beta 4"
-        let notes: String        // what's new (shown in the update sheet)
-        let ipa: String?         // direct signed-IPA URL (a GitHub release asset)
-        let altstore: String?    // AltStore/SideStore source URL for one-tap / auto update
+    struct Release: Codable, Equatable, Identifiable {
+        let version: String
+        let build: Int
+        let name: String
+        let notes: String
+        let ipa: String?
+        let altstore: String?
 
-        /// A stable key that distinguishes betas (which share `version`); used for the dismiss memory
-        /// and as the `Identifiable` id so a `.sheet(item:)` re-presents when a still-newer build ships.
         var key: String { "\(version).\(build)" }
         var id: String { key }
-        /// Where "Get the update" should send the user: the AltStore source (add once -> auto-updates) if
-        /// present, else the direct IPA, else the releases page. iOS cannot self-install a sideloaded app,
-        /// so this hands off to the install channel rather than pretending to overwrite in place.
+
         var installURL: URL? {
             if let a = altstore, let u = URL(string: a) { return u }
             if let i = ipa, let u = URL(string: i) { return u }
@@ -34,66 +29,53 @@ final class UpdateChecker: ObservableObject {
         }
     }
 
-    /// A build newer than the running one, or nil (also nil before/without a check, or when up to date).
-    /// This is the PASSIVE signal: the tvOS Settings row and the iOS top banner read it.
+    /// A published release newer than the running app, or nil when the app is current.
     @Published private(set) var available: Release?
 
-    /// The ACTIVE signal: when non-nil, every platform's root presents a modal update popup bound to it via
-    /// `.sheet(item:)`. Set by `check()` for a newer build that has not yet been prompted THIS launch (see
-    /// `promptedKeys`), so the popup appears automatically once per launch and again when the hourly re-check
-    /// finds a still-newer build. Cleared by `dismissPrompt()`.
+    /// The active signal consumed by the shared tvOS, iOS, and macOS update sheet.
     @Published var prompt: Release?
 
-    /// Builds already surfaced as a popup during THIS launch. In-memory (never persisted) on purpose: it
-    /// suppresses a second popup for the same build within one session, but resets on relaunch so the user is
-    /// reminded once every launch until they actually update. (The iOS banner's dismissal, by contrast, IS
-    /// persisted, so dismissing the popup quiets the banner for that build but not the next-launch popup.)
-    private var promptedKeys: Set<String> = []
+    /// Bumped after a manual check finds an update. Roots observe it and honor their launch/player gates before
+    /// forcing the sheet to reappear, rather than letting the network layer present behind another surface.
+    @Published private(set) var forcePresentationNonce = 0
 
-    /// Hourly re-check while the app stays open, so a user who leaves the app running still learns about a
-    /// release without relaunching. Started by `startMonitoring()`.
-    private var hourlyTimer: Timer?
-    private static let hourlyInterval: TimeInterval = 3600
+    /// Builds already surfaced during this process. The set resets on relaunch, so a cached update can produce
+    /// the requested one launch alert without another network request inside the daily gate.
+    private var promptedKeys: Set<String> = []
+    private var isChecking = false
+    private var manualCheckPending = false
+    private var restoredCache = false
 
     private static let lastCheckedKey = "stremiox.update.lastChecked"
-    private static let dismissedKey = "stremiox.update.dismissedVersion"   // shared with the iOS banner
-    private static let manifestURL = "https://vortx.tv/appcast.json"
+    private static let dismissedKey = "stremiox.update.dismissedVersion"
+    private static let cachedReleaseKey = "stremiox.update.cachedRelease"
+    private static let releasesURL = "https://api.github.com/repos/VortXTV/VortX/releases?per_page=100"
+    private static let automaticInterval: TimeInterval = 24 * 3600
 
-    /// The running build, overridable for testing the Settings row + banner (-stremiox-fake-build 1).
     private var currentBuild: Int {
         let args = ProcessInfo.processInfo.arguments
-        if let i = args.firstIndex(of: "-stremiox-fake-build"), i + 1 < args.count, let b = Int(args[i + 1]) { return b }
+        if let i = args.firstIndex(of: "-stremiox-fake-build"), i + 1 < args.count,
+           let build = Int(args[i + 1]) {
+            return build
+        }
         return Int(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "0") ?? 0
     }
 
-    /// Which manifest entry this build reads.
-    private var platformKey: String {
-        #if os(tvOS)
-        return "tvos"
-        #elseif os(macOS)
-        return "mac"
-        #else
-        return "ios"
-        #endif
-    }
-
-    /// Call once from each platform's root view on appear. Fires an immediate (un-gated) check so the popup
-    /// can appear once per launch when an update exists, then schedules an hourly re-check for as long as the
-    /// app stays open. Idempotent: a second call won't stack a second timer.
-    func startMonitoring() {
-        check()   // un-gated: the once-per-launch popup must not be silenced by a recent check timestamp
-        guard hourlyTimer == nil else { return }   // idempotent: the singleton keeps one timer for the app's life
-        hourlyTimer = Timer.scheduledTimer(withTimeInterval: Self.hourlyInterval, repeats: true) { _ in
-            // Capture `self` only inside the @MainActor Task so the weak load happens on the actor, not on the
-            // timer's run-loop thread (sound under Swift 6 strict concurrency). The fetch is gated only by the
-            // build comparison, so an hourly check is cheap.
-            Task { @MainActor [weak self] in self?.check() }
+    private var currentVersion: String {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-stremiox-fake-version"), i + 1 < args.count {
+            return args[i + 1]
         }
+        return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     }
 
-    /// The user dismissed the popup ("Later" or after tapping "Get the update"). Clear it. The build's key is
-    /// already in `promptedKeys`, so it won't re-pop this launch. Also persist the dismissal under the key the
-    /// iOS banner reads, so dismissing the popup doesn't leave the passive banner nagging for the same build.
+    /// Called by each platform shell. Restores the last successful result immediately, then starts a network
+    /// request only when the persisted daily gate is stale. The request runs asynchronously and never blocks UI.
+    func startMonitoring() {
+        restoreCachedReleaseIfNeeded()
+        checkIfStale()
+    }
+
     func dismissPrompt() {
         if let key = prompt?.key {
             UserDefaults.standard.set(key, forKey: Self.dismissedKey)
@@ -101,74 +83,194 @@ final class UpdateChecker: ObservableObject {
         prompt = nil
     }
 
-    /// Re-check when the last check is older than maxAge (6h default). tvOS apps rarely relaunch (they
-    /// suspend for days), so a once-per-launch check meant a user could sit a release behind forever;
-    /// this is also called on every return to the foreground. Settings passes a short maxAge (a Settings
-    /// visit usually MEANS "any updates?"). The fake-build test hook bypasses the gate.
-    func checkIfStale(maxAge: TimeInterval = 6 * 3600) {
-        let testing = ProcessInfo.processInfo.arguments.contains("-stremiox-fake-build")
+    /// Passing zero is the explicit manual path and always requests a fresh fetch. Every nonzero call is an
+    /// automatic request and uses the fixed one-day gate, even when an older caller supplies a shorter age.
+    /// Automatic attempts are timestamped before the request so failures remain silent without causing a retry
+    /// loop on foreground or shell appearance.
+    func checkIfStale(maxAge: TimeInterval = 24 * 3600) {
+        restoreCachedReleaseIfNeeded()
+        if maxAge <= 0 {
+            if isChecking {
+                manualCheckPending = true
+            } else {
+                check(forcePrompt: true)
+            }
+            return
+        }
+
+        let now = Date().timeIntervalSince1970
         let last = UserDefaults.standard.double(forKey: Self.lastCheckedKey)
-        guard testing || Date().timeIntervalSince1970 - last >= maxAge else { return }
-        check()
+        guard now - last >= Self.automaticInterval, !isChecking else { return }
+        UserDefaults.standard.set(now, forKey: Self.lastCheckedKey)
+        check(forcePrompt: false)
     }
 
-    @MainActor private func check() {
+    private func check(forcePrompt: Bool) {
+        isChecking = true
         Task { [weak self] in
             guard let self else { return }
-            guard let url = URL(string: Self.manifestURL),
-                  let (data, response) = try? await URLSession.shared.data(from: url),
+            defer { self.finishCheck() }
+            guard let url = URL(string: Self.releasesURL) else { return }
+            var request = URLRequest(url: url)
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            request.setValue("VortX-UpdateChecker", forHTTPHeaderField: "User-Agent")
+            request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
                   (response as? HTTPURLResponse)?.statusCode == 200,
-                  let manifest = try? JSONDecoder().decode(Manifest.self, from: data) else {
+                  let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
                 return
             }
-            // Only a successful fetch counts, so a network blip doesn't silence notices for 6h.
-            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastCheckedKey)
-            guard let e = manifest.entry(for: self.platformKey), e.build > self.currentBuild else {
-                self.available = nil; self.prompt = nil; return
+
+            guard let latest = releases
+                .filter({ !$0.draft && $0.publishedAt != nil })
+                .compactMap({ self.release(from: $0) })
+                .max(by: { self.compare($0, $1) == .orderedAscending }) else {
+                self.available = nil
+                self.prompt = nil
+                UserDefaults.standard.removeObject(forKey: Self.cachedReleaseKey)
+                return
             }
-            // Eligibility is BUILD-NUMBER-ONLY (binding policy 2026-08-22): if the remotely advertised
-            // valid build is strictly greater than the installed build, notify. The former `prerelease`
-            // veto here was a confirmed regression (commit a33fcb9c9): Beta 18/220 correctly found build
-            // 227 on this manifest and then silenced itself because the entry carried prerelease=true,
-            // even after Beta 25 became the GitHub Latest. Betas ship as GitHub prereleases permanently,
-            // so that flag can never gate a build-number-newer notice again.
-            let release = Release(version: e.version ?? "", build: e.build, name: e.name ?? (e.version ?? "Update"),
-                                  notes: e.notes ?? "", ipa: e.ipa, altstore: e.altstore)
-            self.available = release
-            // Raise the popup once per launch per build: the launch check shows it, and the hourly re-check
-            // shows it again only when a genuinely newer build appears (a new key).
-            if !self.promptedKeys.contains(release.key) {
-                self.promptedKeys.insert(release.key)
-                self.prompt = release
+
+            if let encoded = try? JSONEncoder().encode(latest) {
+                UserDefaults.standard.set(encoded, forKey: Self.cachedReleaseKey)
             }
+
+            guard self.isNewer(latest) else {
+                self.available = nil
+                self.prompt = nil
+                return
+            }
+            self.available = latest
+            if forcePrompt { self.forcePresentationNonce &+= 1 }
         }
     }
 
-    private struct Entry: Decodable {
-        let version: String?
-        let build: Int
-        let name: String?
-        let notes: String?
-        let ipa: String?
-        let altstore: String?
-        // NOTE: the manifest's legacy `prerelease` flag is deliberately NOT decoded. It must never gate
-        // update eligibility (see the comment in `check()`); unknown keys are ignored by this decoder.
+    private func finishCheck() {
+        isChecking = false
+        guard manualCheckPending else { return }
+        manualCheckPending = false
+        check(forcePrompt: true)
     }
 
-    /// Typed wrapper over the manifest. Decoding into named optional fields (instead of `[String: Entry]`)
-    /// makes the parse tolerant of non-entry top-level keys: the live manifest carries a `_comment` string,
-    /// and a dictionary decode is all-or-nothing, so that one string used to fail the WHOLE decode and
-    /// silence updates on every platform. Unknown keys (`_comment`, future additions) are now ignored.
-    private struct Manifest: Decodable {
-        let ios: Entry?
-        let tvos: Entry?
-        let mac: Entry?
-        func entry(for key: String) -> Entry? {
-            switch key {
-            case "tvos": return tvos
-            case "mac":  return mac
-            default:     return ios
-            }
+    private func restoreCachedReleaseIfNeeded() {
+        guard !restoredCache else { return }
+        restoredCache = true
+        guard let data = UserDefaults.standard.data(forKey: Self.cachedReleaseKey),
+              let release = try? JSONDecoder().decode(Release.self, from: data),
+              isNewer(release) else {
+            UserDefaults.standard.removeObject(forKey: Self.cachedReleaseKey)
+            return
+        }
+        available = release
+    }
+
+    /// Platform shells call this only after their launch surface is visible. Keeping presentation separate from
+    /// discovery prevents a fast response from putting the sheet behind a splash, profile picker, or player.
+    func presentAvailableIfNeeded(force: Bool = false) {
+        guard let release = available else { return }
+        guard force || !promptedKeys.contains(release.key) else { return }
+        promptedKeys.insert(release.key)
+        prompt = release
+    }
+
+    private func release(from github: GitHubRelease) -> Release? {
+        guard let version = marketingVersion(in: github.tagName),
+              let build = buildNumber(in: [github.name, github.body].compactMap { $0 }.joined(separator: "\n")),
+              build > 0,
+              let asset = github.assets.first(where: platformAsset) else {
+            return nil
+        }
+        return Release(version: version, build: build,
+                       name: github.name ?? github.tagName,
+                       notes: github.body ?? "",
+                       ipa: asset.browserDownloadURL,
+                       altstore: nil)
+    }
+
+    private func platformAsset(_ asset: GitHubAsset) -> Bool {
+        let name = asset.name.lowercased()
+        #if os(tvOS)
+        return name.contains("tvos") && !name.contains("lite") && name.hasSuffix(".ipa")
+        #elseif os(macOS)
+        return name.contains("macos") && (name.hasSuffix(".dmg") || name.hasSuffix(".pkg"))
+        #else
+        return name.contains("ios") && name.hasSuffix(".ipa")
+        #endif
+    }
+
+    private func isNewer(_ release: Release) -> Bool {
+        let remote = numericVersion(release.version)
+        let installed = numericVersion(currentVersion)
+        guard !remote.isEmpty, !installed.isEmpty else { return false }
+        let versionOrder = compareComponents(remote, installed)
+        return versionOrder == .orderedDescending ||
+            (versionOrder == .orderedSame && release.build > currentBuild)
+    }
+
+    private func compare(_ lhs: Release, _ rhs: Release) -> ComparisonResult {
+        let versionOrder = compareComponents(numericVersion(lhs.version), numericVersion(rhs.version))
+        guard versionOrder == .orderedSame else { return versionOrder }
+        if lhs.build == rhs.build { return .orderedSame }
+        return lhs.build < rhs.build ? .orderedAscending : .orderedDescending
+    }
+
+    private func marketingVersion(in text: String) -> String? {
+        firstMatch(in: text, pattern: #"(?i)(?:^|[^0-9])(\d+(?:\.\d+)+)"#)
+    }
+
+    private func buildNumber(in text: String) -> Int? {
+        guard let value = firstMatch(in: text, pattern: #"(?i)\bbuild\s*[:#-]?\s*(\d+)\b"#) else { return nil }
+        return Int(value)
+    }
+
+    private func firstMatch(in text: String, pattern: String) -> String? {
+        guard let expression = try? NSRegularExpression(pattern: pattern),
+              let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              match.numberOfRanges > 1,
+              let range = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[range])
+    }
+
+    private func numericVersion(_ version: String) -> [Int] {
+        let numeric = marketingVersion(in: version) ?? version
+        return numeric.split(separator: ".").compactMap { Int($0) }
+    }
+
+    private func compareComponents(_ lhs: [Int], _ rhs: [Int]) -> ComparisonResult {
+        let count = max(lhs.count, rhs.count)
+        for index in 0..<count {
+            let left = index < lhs.count ? lhs[index] : 0
+            let right = index < rhs.count ? rhs[index] : 0
+            if left != right { return left < right ? .orderedAscending : .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    private struct GitHubRelease: Decodable {
+        let tagName: String
+        let name: String?
+        let body: String?
+        let draft: Bool
+        let prerelease: Bool
+        let publishedAt: String?
+        let assets: [GitHubAsset]
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case name, body, draft, prerelease, assets
+            case publishedAt = "published_at"
+        }
+    }
+
+    private struct GitHubAsset: Decodable {
+        let name: String
+        let browserDownloadURL: String
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadURL = "browser_download_url"
         }
     }
 }
