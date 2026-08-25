@@ -36,7 +36,7 @@ enum AddonURLGuard {
         var message: String {
             switch self {
             case .invalidScheme:
-                return "Enter a valid add-on URL (https://…/manifest.json)."
+                return "Enter a valid add-on URL (http:// or https://…/manifest.json)."
             case .privateAddress:
                 return "This add-on URL points to a private address and can't be installed."
             case .unresolvable:
@@ -86,14 +86,18 @@ enum AddonURLGuard {
             : host
         if let literal = IPAddress(parsing: bareHost) {
             if literal.isBlocked { return .privateAddress }
-            guard scheme == "https",
+            // WHY (viewer regression after b215): Comet/StreamFusion manifests commonly live on plain
+            // http:// or redirect through it; the HTTPS-only rule from 0d6f360e locked them out while
+            // well-hosted addons kept working. Public hosts may use http again - every private-address
+            // check below still applies to BOTH schemes, so the SSRF posture is unchanged.
+            guard scheme == "http" || scheme == "https",
                   Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
                 return .invalidScheme
             }
             return nil
         }
 
-        guard scheme == "https",
+        guard scheme == "http" || scheme == "https",
               Data(url.absoluteString.utf8).count <= AddonPairingProtocol.maxManifestURLBytes else {
             return .invalidScheme
         }
