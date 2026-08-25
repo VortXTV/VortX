@@ -132,6 +132,9 @@ struct iOSRootView: View {
     /// Search tab is dropped from the bar and Discover hosts an inline search field; OFF keeps them separate.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
     @Environment(\.openURL) private var openURL
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
     /// The profile roster + launch-picker gate, shared with every surface. When the roster has more than
     /// one profile and none has been chosen this launch, the "Who's watching?" picker is owed at cold
     /// start (and re-presented from Settings' Switch Profile), exactly as tvOS RootView drives it.
@@ -171,53 +174,7 @@ struct iOSRootView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Selected screen fills the whole window. Only the selected screen is mounted, so hidden tabs
-            // cannot observe broad CoreBridge publications or keep heroes, catalogs, and image work alive.
-            // Per-tab model singletons and persisted preferences survive switches; view-local navigation and
-            // scroll state are rebuilt when returning to a tab.
-            ZStack {
-                switch tab {
-                case .home:
-                    iOSHomeView(isActive: true)
-                case .discover:
-                    if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
-                case .live:
-                    if !hideLiveTab { iOSLiveView() }
-                case .library:
-                    if !hideLibraryTab { iOSLibraryView(isActive: true) }
-                case .search:
-                    if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
-                case .addons:
-                    AddonsView()
-                case .settings:
-                    iOSSettingsView()
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            #if os(macOS)
-            // Reserve the floated top-chrome band (search strip + nav pill, measured via
-            // `MacTopChromeHeightKey`) so Forms / Lists (Settings, Add-ons, Library, Discover) start BELOW
-            // the chrome instead of under it (the pill-covered-Settings report). Applied BEFORE the overlay
-            // so the chrome still draws over the reserved strip. A full-bleed hero calls
-            // `.ignoresSafeArea(.container, .top)` (FeaturedHeroView) so it passes UNDER this strip to the
-            // window top; only respecting-safe-area scroll screens actually inset.
-            .safeAreaInset(edge: .top, spacing: 0) { Color.clear.frame(height: macTopChromeHeight) }
-            #endif
-            // MAC NAV MOVE (CEO greenlit, glass-Browse): macOS drives navigation + search from the floated
-            // top chrome (`macTopNavOverlay`: the search strip with the top-center nav pill beneath it)
-            // instead of the bottom bar. iOS/iPadOS keep the unchanged bottom tab bar (`bottomTabBarRow`,
-            // a no-op on macOS). Both helpers gate on the same `#if os(macOS)` idiom, kept inside
-            // @ViewBuilder vars so the conditional never splits a chained-modifier expression (which
-            // SwiftUI's ViewBuilder cannot parse across an `#if`/`#else`).
-            .overlay(alignment: .top) { macTopNavOverlay }
-            #if os(macOS)
-            // Feed the measured chrome height back into the reserve above (drift-proof vs a magic number).
-            .onPreferenceChange(MacTopChromeHeightKey.self) { macTopChromeHeight = $0 }
-            #endif
-
-            bottomTabBarRow
-        }
+        platformShell
         .onChange(of: tab) { newTab in
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
@@ -318,8 +275,11 @@ struct iOSRootView: View {
             // the #117 rule: never route to a hidden tab, fall back to Home. `searchDestination`
             // resolves the merge fold (Discover when merged, else Search) BEFORE the hidden check,
             // so a hidden destination can never resurface with no tab selected in the bar.
+            if dest == .settings {
+                openSettings()
+                return
+            }
             if dest == .search {
-                macSearchFocused = true
                 tab = searchDestination
                 return
             }
@@ -341,6 +301,66 @@ struct iOSRootView: View {
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
         .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
     }
+
+    @ViewBuilder private var platformShell: some View {
+        #if os(macOS)
+        NavigationSplitView {
+            List(selection: $tab) {
+                Section("Browse") {
+                    sidebarItem(.home)
+                    sidebarItem(.discover)
+                    sidebarItem(.search)
+                    sidebarItem(.library)
+                }
+
+                Section {
+                    SettingsLink {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
+        } detail: {
+            selectedScreen
+        }
+        .navigationSplitViewStyle(.balanced)
+        #else
+        VStack(spacing: 0) {
+            ZStack {
+                selectedScreen
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            customTabBar
+        }
+        #endif
+    }
+
+    @ViewBuilder private var selectedScreen: some View {
+        switch tab {
+        case .home:
+            iOSHomeView(isActive: true)
+        case .discover:
+            if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
+        case .live:
+            if !hideLiveTab { iOSLiveView() }
+        case .library:
+            if !hideLibraryTab { iOSLibraryView(isActive: true) }
+        case .search:
+            if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
+        case .addons:
+            AddonsView()
+        case .settings:
+            iOSSettingsView()
+        }
+    }
+
+    #if os(macOS)
+    private func sidebarItem(_ item: Tab) -> some View {
+        Label(item.title, systemImage: tab == item ? item.icon : item.inactiveIcon)
+            .tag(item)
+            .accessibilityLabel(item.title)
+    }
+    #endif
 
     /// Phase-0 seeding nag arm (com.vortx move): a named method (not an inline closure) so the shell
     /// body's already-tight type-check budget pays nothing for it. MoveSeeding gates once-per-launch,
