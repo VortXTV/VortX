@@ -110,6 +110,8 @@ class MpvPlayer private constructor(
     private var memoryShedConsumed = false
     private var memoryShedActive = false
     private var memoryShedPositionMs = 0L
+    @Volatile private var userPausedIntent = false
+    private var preservePauseOnForeground = false
 
     private val observer = object : MPVLib.EventObserver {
         override fun eventProperty(name: String) {
@@ -264,6 +266,8 @@ class MpvPlayer private constructor(
         // the chrome shows its spinner instead of a silent black frame. mpv only starts reporting
         // `paused-for-cache` once the demuxer is up, so without this the open window had no signal.
         playbackStarted = false
+        userPausedIntent = false
+        preservePauseOnForeground = false
         _state.value = _state.value.copy(hasEnded = false, hasError = false, isBuffering = true)
 
         // Every file starts from the known network-identity baseline. This player instance is reused across
@@ -417,6 +421,12 @@ class MpvPlayer private constructor(
     override fun togglePause() {
         val paused = mpv.getPropertyString(PROP_PAUSE) == "yes"
         mpv.setPropertyString(PROP_PAUSE, if (paused) "no" else "yes")
+    }
+
+    /** WHY audit 05.5: only chrome transport intent survives an app background pause. System and route
+     * pauses remain transient so foregrounding can resume them. Called reflectively by the shared screen. */
+    fun setUserPausedIntent(paused: Boolean) {
+        userPausedIntent = paused
     }
 
     override fun seekTo(positionMs: Long) {
@@ -591,15 +601,18 @@ class MpvPlayer private constructor(
 
     override fun onEnterBackground() {
         // Drop video decode off-screen either way (matches Apple enterBackground: `vid=no`), which saves
-        // power while backgrounded. Pause the audio too ONLY when "keep playing in the background" is off;
-        // when on (Apple's default) the audio keeps going. onEnterForeground restores video + play.
-        if (!com.vortx.android.player.extras.KeepPlayingBackgroundSetting.isEnabled(appContext)) pause()
+        // power while backgrounded. Pause the audio too ONLY when "keep playing in the background" is off.
+        val pauseInBackground = !com.vortx.android.player.extras.KeepPlayingBackgroundSetting.isEnabled(appContext)
+        // WHY audit 05.5: preserve only a deliberate chrome pause. System and route-loss pauses still resume.
+        preservePauseOnForeground = pauseInBackground && _state.value.isPaused && userPausedIntent
+        if (pauseInBackground) pause()
         mpv.setPropertyString(PROP_VID, "no")
     }
 
     override fun onEnterForeground() {
         mpv.setPropertyString(PROP_VID, "auto")
-        play()
+        if (!preservePauseOnForeground) play()
+        preservePauseOnForeground = false
     }
 
     /// Grab the current frame as JPEG, downscaled to at most [maxWidth] wide. The libmpv half of the

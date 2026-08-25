@@ -1230,16 +1230,19 @@ fun PlayerScreen(
                 when (event.key) {
                     Key.MediaPlayPause -> {
                         showControls()
+                        markMpvUserPausedIntent(engine, !latestState.isPaused)
                         engine.togglePause()
                         return@onKeyEvent true
                     }
                     Key.MediaPlay -> {
                         showControls()
+                        markMpvUserPausedIntent(engine, false)
                         engine.play()
                         return@onKeyEvent true
                     }
                     Key.MediaPause -> {
                         showControls()
+                        markMpvUserPausedIntent(engine, true)
                         engine.pause()
                         return@onKeyEvent true
                     }
@@ -1463,7 +1466,11 @@ fun PlayerScreen(
             // the auto-hide timer through this seam; the discrete actions below re-arm via [showControls].
             onInteraction = { showControls() },
             onBack = currentOnBack,
-            onTogglePause = { showControls(); engine.togglePause() },
+            onTogglePause = {
+                showControls()
+                markMpvUserPausedIntent(engine, !latestState.isPaused)
+                engine.togglePause()
+            },
             onSeek = { showControls(); engine.seekTo(it) },
             onSeekBy = { showControls(); engine.seekBy(it) },
             onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
@@ -1784,6 +1791,9 @@ private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
         segments.filter { positionSec >= it.start && positionSec < it.end }.minByOrNull { it.start }
     } ?: return
     if (active.start == dismissedStart) return
+    // WHY audit 06.5: derive from the pill's existing whole-second tick so phone and TV count down cheaply.
+    val remainingSeconds = kotlin.math.ceil(active.end - positionSec).toInt().coerceAtLeast(1)
+    val displayLabel = "${active.label} - ${remainingSeconds}s"
 
     Row(
         modifier = modifier
@@ -1797,16 +1807,26 @@ private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
     ) {
         Icon(
             imageVector = Icons.Filled.SkipNext,
-            contentDescription = active.label,
+            contentDescription = displayLabel,
             tint = Color.White,
             modifier = Modifier.size(18.dp),
         )
         Text(
-            text = active.label,
+            text = displayLabel,
             color = Color.White,
             fontWeight = FontWeight.SemiBold,
             fontSize = 14.sp,
         )
+    }
+}
+
+/// WHY audit 05.5: pass deliberate transport intent to full-only mpv without coupling the shared source set.
+private fun markMpvUserPausedIntent(engine: PlayerEngine, paused: Boolean) {
+    runCatching {
+        engine.javaClass.methods.firstOrNull {
+            it.name == "setUserPausedIntent" && it.parameterCount == 1 &&
+                it.parameterTypes[0] == Boolean::class.javaPrimitiveType
+        }?.invoke(engine, paused)
     }
 }
 

@@ -327,6 +327,24 @@ fun PlayerChrome(
         TrackSelector.select(state.audioTracks, state.subtitleTracks, next, trackStore.matchAudioSub)
             .audioId?.let { onSelectAudio(it) }
     }
+    fun selectManualAudioTrack(track: PlayerTrack) {
+        // WHY audit 08.2: a manual per-title pick promotes its clean language globally, matching Apple.
+        val raw = track.lang?.trim()?.lowercase().orEmpty()
+        val base = raw.substringBefore('-')
+        val code = if (base.matches(Regex("[a-z]{2,3}")) && base !in setOf("und", "unknown", "zxx", "mul")) {
+            TrackSelector.canonical(raw).takeIf { it.length == 2 && it.all(Char::isLetter) }
+        } else {
+            null
+        }
+        if (code != null) {
+            val next = trackPrefs.copy(
+                audioLanguages = LanguagePriority.normalized(listOf(code) + trackPrefs.audioLanguages),
+            )
+            trackPrefs = next
+            trackStore.save(next)
+        }
+        onSelectAudio(track.id)
+    }
     fun applySubtitlePreferences(next: TrackPreferences) {
         trackPrefs = next
         trackStore.save(next)
@@ -572,7 +590,7 @@ fun PlayerChrome(
                                 label = trackLabel(track.title, track.lang),
                                 selected = track.selected,
                                 isChoice = true,
-                                onPick = { onSelectAudio(track.id) },
+                                onPick = { selectManualAudioTrack(track) },
                             ),
                         )
                     }
