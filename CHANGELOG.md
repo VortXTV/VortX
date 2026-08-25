@@ -4,6 +4,31 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 28 (build 230)
+
+### Apple: the Mac app, rebuilt for the desktop
+
+**The Mac app finally looks and feels like a Mac app.** The floating phone tab bar is gone: navigation now lives in a proper macOS sidebar (Home, Discover, Search, Library) with the same screens you know in the content pane. Settings moved into a real Mac Settings window with General, Playback, Subtitles, and Sources categories, reachable from the sidebar or the app menu, and every tab has a Command-key shortcut (Cmd 1 through 5). The window opens at a sensible size and resizes like any other Mac window. All of this is gated to macOS; iPhone, iPad, and Apple TV are unchanged.
+
+**The Mac app got dramatically faster.** The player no longer rebuilds the whole screen several times a second while you watch; only the clock and scrubber tick. Tabs you are not looking at stop running entirely instead of hiding behind an invisible layer. Poster rails load lazily as you scroll, the detail page decodes its artwork once instead of twice with a full-window blur on top, download progress redraws twice a second instead of dozens of times, and the watch-history cache saves on a cadence instead of rewriting itself constantly during playback.
+
+### Android: at full parity with Apple
+
+**Everything Apple does, Android now does too.** This release completes the Android catch-up program across playback, sync, library, subtitles, and settings:
+
+- Playback keeps your intent: a manual pause survives backgrounding when background play is off, your manual audio-track pick becomes your preferred language, skip buttons count down ("Skip Intro - 87s"), and late-night loudness normalization evens out volume (off by default, in Playback settings).
+- Deleting a title from Your Library on one device now stays deleted everywhere, with the same removal-sync the Apple apps use.
+- Your tab and the title you had open survive the app being killed; Continue Watching's first card offers one-tap direct resume that re-resolves fresh links at your saved position.
+- Subtitles from add-ons and the community pool are downloaded with sane size and time limits so big-file subs stop failing, community releases appear automatically when a title has few or no embedded tracks, and listings from broken add-ons fail soft.
+- Trailers show "Also available in" chips for other languages and tap to play that dub immediately, matching iOS.
+- The Library gains Unwatched / In Progress / Watched / Short smart filters that combine freely, TalkBack users get a fully described scrubber and transport controls, and app language selection works below Android 13.
+
+### Under the hood
+
+- Metadata API keys (TMDB, MDBList, fanart) sync per-account with owner-scoped encrypted storage, migration tombstones, and merge semantics that preserve fields set by other devices.
+- mpv's forward cache clamps to 48 MiB while paused and sheds one memory tier under system pressure, recovering once playback is healthy again.
+
+
 ## 0.3.14 Beta 27 (build 229)
 
 ### Apple: subtitles rebuilt, the source-list focus fix, and resume-seek recovery
