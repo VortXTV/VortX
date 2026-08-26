@@ -5,6 +5,7 @@ import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.View
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -88,10 +89,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     private val listener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
-            publish(
+            _state.value = _state.value.withPlaybackStatus(
                 buffering = playbackState == Player.STATE_BUFFERING,
                 ended = playbackState == Player.STATE_ENDED,
             )
+            publish()
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) = publish()
@@ -101,7 +103,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // Surface an unrecoverable decode/network error so the chrome can fall back to the ranked source
         // list instead of leaving a dead black frame (error-to-sources fallback).
         override fun onPlayerError(error: PlaybackException) {
-            _state.value = _state.value.copy(hasError = true)
+            _state.value = _state.value.withPlaybackError()
         }
 
         // In-stream ID3 chapter frames (`CHAP`), accumulated so [chapters] can offer a chapter picker on
@@ -207,6 +209,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
     override fun load(playable: Playable) {
+        _state.value = freshPlayerStateForLoad()
         lastPlayable = playable
         // A fresh stream starts with no chapters; the ID3 frames for the new file repopulate the store.
         chapterStore.clear()
@@ -215,8 +218,23 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // host in the background for the NEXT play. Fail-soft and gated inside noteStream.
         AdaptiveTuning.noteStream(appContext, playable.url, playable.headers)
 
+        // External sidecars need a concrete Media3 MIME. Admit recognized path extensions and explicit
+        // format metadata carried by extensionless URLs. Opaque extensionless URLs are rejected with a
+        // reason instead of guessed as a parser type or synchronously fetched on the playback thread.
+        val subtitleConfigs = playable.externalSubtitles.mapNotNull { subUrl ->
+            val decision = externalSubtitleMimeDecision(subUrl)
+            val mime = decision.mimeType ?: run {
+                Log.w(TAG, "Skipping external subtitle: ${decision.rejectionReason}")
+                return@mapNotNull null
+            }
+            MediaItem.SubtitleConfiguration.Builder(Uri.parse(subUrl))
+                .setMimeType(mime)
+                .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
+                .build()
+        }
+
         // yt-direct ADAPTIVE trailer: the InnerTube answer is a video-only leg + a separate audio-only leg
-        // (not a single .mpd). Merge them with a [MergingMediaSource] of two [ProgressiveMediaSource]s over a
+        // (not a single .mpd). Merge a subtitle-aware video source with a progressive audio source over a
         // [DefaultHttpDataSource] whose UA is the MINTING client's UA -- the UA/URL lockstep googlevideo
         // requires (a 403 otherwise). Both legs are already the loopback range-proxy's 127.0.0.1 URLs (the
         // proxy is what defeats googlevideo's Range-403 for ExoPlayer's DefaultHttpDataSource, exactly as for
@@ -227,13 +245,18 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                 playable.userAgent?.takeIf { it.isNotEmpty() }?.let { setUserAgent(it) }
                 setAllowCrossProtocolRedirects(true)
             }
-            val videoSource = ProgressiveMediaSource.Factory(trailerHttp)
-                .createMediaSource(MediaItem.fromUri(playable.url))
+            val videoItem = MediaItem.Builder()
+                .setUri(playable.url)
+                .setSubtitleConfigurations(subtitleConfigs)
+                .build()
+            val videoSource = DefaultMediaSourceFactory(appContext)
+                .setDataSourceFactory(trailerHttp)
+                .createMediaSource(videoItem)
             val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
                 .createMediaSource(MediaItem.fromUri(playable.audioUrl))
             player.setMediaSource(MergingMediaSource(videoSource, audioSource))
             player.playWhenReady = true
-            if (playable.startPositionMs > 0L) player.seekTo(playable.startPositionMs)
+            admittedResumePosition(playable.startPositionMs)?.let(player::seekTo)
             player.prepare()
             return
         }
@@ -255,18 +278,6 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             DefaultMediaSourceFactory(appContext)
         }
 
-        // External sidecar subtitles as side-loaded text tracks on the MediaItem. ExoPlayer needs a
-        // concrete, parseable subtitle MIME (unlike mpv, which sniffs the file), so infer it from the
-        // URL extension and SKIP a sidecar whose type we can't identify rather than attach an
-        // unparseable TEXT_UNKNOWN track. The mpv engine is the primary external-subs path; this is the
-        // fallback engine.
-        val subtitleConfigs = playable.externalSubtitles.mapNotNull { subUrl ->
-            val mime = subtitleMimeFromUrl(subUrl) ?: return@mapNotNull null
-            MediaItem.SubtitleConfiguration.Builder(Uri.parse(subUrl))
-                .setMimeType(mime)
-                .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                .build()
-        }
         val item = MediaItem.Builder()
             .setUri(playable.url)
             .setSubtitleConfigurations(subtitleConfigs)
@@ -277,11 +288,9 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // sidecar SubtitleConfigurations on the MediaItem (it merges them as side-loaded text tracks).
         player.setMediaSource(mediaSourceFactory.createMediaSource(item))
         player.playWhenReady = true
-        // RESUME ADMISSION (Apple PlayerScreen.swift:1812): honour a resume only past a >5s floor. The
-        // last-10s tail guard is enforced by the primary libmpv lane (which knows the duration by the first
-        // frame); ExoPlayer seeks into a not-yet-known duration here and clamps a past-end seek itself, so
-        // the floor is the meaningful gate on this lane.
-        if (playable.startPositionMs > RESUME_FLOOR_MS) player.seekTo(playable.startPositionMs)
+        // Both Exo load routes use the same resume-admission policy. A tail guard cannot run here because
+        // Media3 does not know the duration until after prepare; it clamps a past-end seek once known.
+        admittedResumePosition(playable.startPositionMs)?.let(player::seekTo)
         player.prepare()
     }
 
@@ -332,8 +341,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     // The hosted PlayerView, kept so [applySubtitleStyle] can restyle its SubtitleView after creation.
     private var playerView: PlayerView? = null
 
-    // Volume level saved across a mute so unmute restores it (ExoPlayer has one volume, no separate mute).
-    private var preMuteVolume: Float = 1f
+    // ExoPlayer has one volume and no separate mute, so keep the transition state explicitly.
+    private var muteState = ExoMuteState()
 
     override fun addExternalSubtitle(url: String) {
         val base = lastPlayable ?: return
@@ -364,16 +373,15 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     override fun chapters(): List<PlayerChapter> = chapterStore.sortedBy { it.startMs }
 
     override fun setVolume(volume0to100: Double) {
-        player.volume = (volume0to100 / 100.0).toFloat().coerceIn(0f, 1f)
+        val transition = muteState.withRequestedVolume((volume0to100 / 100.0).toFloat())
+        muteState = transition.state
+        player.volume = transition.outputVolume
     }
 
     override fun setMuted(muted: Boolean) {
-        if (muted) {
-            preMuteVolume = player.volume
-            player.volume = 0f
-        } else {
-            player.volume = preMuteVolume
-        }
+        val transition = muteState.transitionTo(muted, player.volume)
+        muteState = transition.state
+        player.volume = transition.outputVolume
     }
 
     // Apply the persisted subtitle appearance to the hosted SubtitleView. `setApplyEmbeddedStyles(false)`
@@ -456,18 +464,6 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     /// something to smuggle in behind this seam.
     override suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = null
 
-    /// Map a sidecar subtitle URL to a Media3-parseable MIME by extension, or null when unknown (skip it).
-    private fun subtitleMimeFromUrl(url: String): String? {
-        val lower = url.substringBefore('?').lowercase()
-        return when {
-            lower.endsWith(".srt") -> MimeTypes.APPLICATION_SUBRIP
-            lower.endsWith(".vtt") -> MimeTypes.TEXT_VTT
-            lower.endsWith(".ssa") || lower.endsWith(".ass") -> MimeTypes.TEXT_SSA
-            lower.endsWith(".ttml") || lower.endsWith(".dfxp") || lower.endsWith(".xml") -> MimeTypes.APPLICATION_TTML
-            else -> null
-        }
-    }
-
     override fun onEnterBackground() {
         // Keep audio going when "keep playing in the background" is on (Apple's default); the detached
         // surface stops video output on its own, so nothing extra is needed for that. Off = pause as before.
@@ -527,15 +523,127 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     }
 
     private companion object {
+        const val TAG = "ExoPlayerEngine"
         const val POSITION_POLL_MS = 1_000L
         const val MIN_SPEED = 0.25f
         const val MAX_SPEED = 4.0f
-        /// Resume floor (Apple `resumeSeconds > 5`): a resume under 5s starts the title over instead.
-        const val RESUME_FLOOR_MS = 5_000L
         // The bandwidth-meter seed now comes from AdaptiveTuning.initialBitrateEstimate (measured link when
         // known, else its own 50 Mbps default), so the constant that used to live here moved there.
     }
 }
+
+/** Apply a Media3 playback status while preserving the terminal-state exclusivity contract. */
+internal fun PlayerState.withPlaybackStatus(buffering: Boolean, ended: Boolean): PlayerState = copy(
+    isBuffering = buffering && !ended,
+    hasEnded = ended,
+    hasError = if (ended) false else hasError,
+)
+
+/** Apply an unrecoverable Media3 failure. A failed item is neither buffering nor successfully ended. */
+internal fun PlayerState.withPlaybackError(): PlayerState = copy(
+    isBuffering = false,
+    hasEnded = false,
+    hasError = true,
+)
+
+internal data class ExoMuteState(
+    val muted: Boolean = false,
+    val restoreVolume: Float = 1f,
+)
+
+internal data class ExoMuteTransition(
+    val state: ExoMuteState,
+    val outputVolume: Float,
+)
+
+/** Idempotent mute transition. Repeating the current request cannot overwrite the restore volume. */
+internal fun ExoMuteState.transitionTo(requestedMuted: Boolean, currentVolume: Float): ExoMuteTransition {
+    if (requestedMuted == muted) {
+        return ExoMuteTransition(this, if (muted) 0f else currentVolume.coerceIn(0f, 1f))
+    }
+    return if (requestedMuted) {
+        val saved = currentVolume.coerceIn(0f, 1f)
+        ExoMuteTransition(ExoMuteState(muted = true, restoreVolume = saved), outputVolume = 0f)
+    } else {
+        ExoMuteTransition(ExoMuteState(muted = false, restoreVolume = restoreVolume), restoreVolume)
+    }
+}
+
+/** Change the desired level without accidentally unmuting the player. */
+internal fun ExoMuteState.withRequestedVolume(requestedVolume: Float): ExoMuteTransition {
+    val volume = requestedVolume.coerceIn(0f, 1f)
+    return if (muted) {
+        ExoMuteTransition(copy(restoreVolume = volume), outputVolume = 0f)
+    } else {
+        ExoMuteTransition(this, outputVolume = volume)
+    }
+}
+
+/** Resume admission shared by every Exo media-source route. */
+internal fun admittedResumePosition(startPositionMs: Long): Long? =
+    startPositionMs.takeIf { it > EXO_RESUME_FLOOR_MS }
+
+internal data class ExternalSubtitleMimeDecision(
+    val mimeType: String? = null,
+    val rejectionReason: String? = null,
+)
+
+/**
+ * Resolve a subtitle MIME without network I/O. Path extensions work with signed URLs; extensionless URLs
+ * must carry explicit `format`, `mime`, `type`, `filename`, `file`, or `name` metadata. Truly opaque URLs
+ * are rejected rather than guessed, because feeding the wrong parser is not safe detection.
+ */
+internal fun externalSubtitleMimeDecision(url: String): ExternalSubtitleMimeDecision {
+    val dataMime = if (url.startsWith("data:", ignoreCase = true)) {
+        url.substringAfter("data:").substringBefore(';').substringBefore(',')
+    } else {
+        null
+    }
+    mimeFromSubtitleDeclaration(dataMime)?.let { return ExternalSubtitleMimeDecision(mimeType = it) }
+
+    val path = decodeUrlComponent(url.substringBefore('#').substringBefore('?'))
+    mimeFromSubtitleDeclaration(path)?.let { return ExternalSubtitleMimeDecision(mimeType = it) }
+
+    val declaredKeys = setOf("format", "mime", "type", "filename", "file", "name", "response-content-disposition")
+    val query = url.substringAfter('?', missingDelimiterValue = "").substringBefore('#')
+    query.split('&').forEach { field ->
+        val key = decodeUrlComponent(field.substringBefore('=')).lowercase()
+        if (key !in declaredKeys) return@forEach
+        val value = decodeUrlComponent(field.substringAfter('=', missingDelimiterValue = ""))
+        mimeFromSubtitleDeclaration(value)?.let { return ExternalSubtitleMimeDecision(mimeType = it) }
+    }
+
+    return ExternalSubtitleMimeDecision(
+        rejectionReason = "no supported subtitle format was declared",
+    )
+}
+
+private fun decodeUrlComponent(value: String): String =
+    runCatching { java.net.URLDecoder.decode(value, Charsets.UTF_8.name()) }.getOrDefault(value)
+
+private fun mimeFromSubtitleDeclaration(value: String?): String? {
+    val declaration = value?.trim()?.lowercase().orEmpty()
+    if (declaration.isEmpty()) return null
+    return when {
+        declaration in setOf("srt", "subrip", MimeTypes.APPLICATION_SUBRIP) -> MimeTypes.APPLICATION_SUBRIP
+        declaration in setOf("vtt", "webvtt", MimeTypes.TEXT_VTT) -> MimeTypes.TEXT_VTT
+        declaration in setOf("ssa", "ass", MimeTypes.TEXT_SSA) -> MimeTypes.TEXT_SSA
+        declaration in setOf("ttml", "dfxp", MimeTypes.APPLICATION_TTML) -> MimeTypes.APPLICATION_TTML
+        SUBTITLE_EXTENSION_REGEX.containsMatchIn(declaration) -> when (
+            SUBTITLE_EXTENSION_REGEX.find(declaration)?.groupValues?.get(1)
+        ) {
+            "srt" -> MimeTypes.APPLICATION_SUBRIP
+            "vtt" -> MimeTypes.TEXT_VTT
+            "ssa", "ass" -> MimeTypes.TEXT_SSA
+            "ttml", "dfxp" -> MimeTypes.APPLICATION_TTML
+            else -> null
+        }
+        else -> null
+    }
+}
+
+private const val EXO_RESUME_FLOOR_MS = 5_000L
+private val SUBTITLE_EXTENSION_REGEX = Regex("\\.(srt|vtt|ssa|ass|ttml|dfxp)(?:$|[\\s;\\\"'])")
 
 /// Tint the Media3 controller's scrubber to the ember accent, if the built-in controller is present.
 /// Harmless when `useController = false` (the view is absent), so callers can always apply it.

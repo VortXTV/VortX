@@ -251,6 +251,9 @@ data class PlayerState(
     val subtitleTracks: List<PlayerTrack> = emptyList(),
 )
 
+/** Fresh per-item state. No terminal, timing, buffering, or track data may leak across [PlayerEngine.load]. */
+internal fun freshPlayerStateForLoad(): PlayerState = PlayerState(isBuffering = true)
+
 /// Builds the libmpv [PlayerEngine], or returns null when mpv is unavailable. This is the FLAVOR SEAM,
 /// declared PER FLAVOR (never in `src/main`) so exactly one definition is on the classpath per variant
 /// and the two never collide:
