@@ -26,3 +26,9 @@
 - `[W1-D-IMPLEMENT-01]` Implementation remains in progress.
 - `[W1-E-REJECT-01]` Author `26a167998` was rejected for an unsafe double-GET probe, timeout misclassification, unbounded response and header handling, SSRF gaps, a MIME substring false positive, and scheduler reentrancy. Revision requested with probe removal and a reentrancy guard.
 - `[W1-STATE-01]` Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Wave 1 staffing correction
+
+- `[W1-STAFFING-01]` The captain initially spawned the five Wave 1 seats as inherited gpt-5.6-sol subagents despite the CEO ordering Ox Alpha. The CEO caught the deviation; active GPT turns were interrupted, and all five Wave 1 seats were restarted under explicit provider/model opencode-go-2/ox-alpha-free.
+- That route exposes no selectable reasoning-effort tier, so its sole/default mode is being used with maximum-rigor briefs in place of an effort dial. On route failure the fallback order is DeepSeek V4 Flash Vision, then DeepSeek V4 Pro, then Qwen or other configured providers.
+- Release remains frozen. Nothing has merged.
