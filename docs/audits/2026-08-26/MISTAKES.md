@@ -91,3 +91,19 @@ Guardrails:
 Guardrail:
 
 1. When an earlier unmerged commit in a lane contains rejected behavior and a later commit removes it, integrate a squashed version of the final safe tree (one clean commit) rather than cherry-picking the commit chain, so the rejected intermediate commit never appears on main. Verify the final-branch diff hashes match the main-squash diff before retiring the worktree.
+
+## Native payload model proof is not a runtime seam (W1-B)
+
+`[MIS-W1-B-MODEL-01]` The initial W1-B heuristic was accepted as the terminal-reason change based on model-level reasoning about a native payload, but that did not prove the runtime seam: at runtime the native payload was unreachable and an eof-reached generation race existed. The blocking DeepSeek review required a source-built seam, and only the final `:mpv-seam` exposing the real `mpv_event_end_file` reason/error satisfied the gate.
+
+Guardrail:
+
+1. Model-level reasoning about a native payload is not proof of the runtime seam. Require a source-built, runnable seam and load-bearing evidence (JNI descriptor/export, DT_NEEDED, dex/APK contents, four-ABI rebuild) that the actual runtime path is exercised before treating a native payload as satisfying the gate.
+
+## Inaccurate tag citation requires primary-source verification (W1-B)
+
+`[MIS-W1-B-TAG-01]` The upstream `v1.0.0` tag was cited against an inaccurate commit target. The t18 provenance/NDK follow-up `9d8b3d67d` corrected the tag target to `fcf6745`, produced a complete delta inventory, and pinned NDK `27.2.12479018`.
+
+Guardrail:
+
+1. A tag/version/SHA citation must be verified against the primary source (the tag's actual commit and its ancestry), never assumed from the version string. Record the corrected target and a complete delta inventory before treating upstream provenance or license claims as confirmed.

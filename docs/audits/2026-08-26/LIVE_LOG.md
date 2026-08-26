@@ -73,3 +73,19 @@
 - Main was pushed through `c62b38de1`. The generated mac app was unregistered from LaunchServices and all lane build outputs were cleaned. The clean lane worktree was retired after the final-branch and main-squash diff hashes matched.
 - `[W1-E-OPEN-01]` APP-DL-05 remains explicitly open: extensionless HLS requires upstream metadata; the 64-byte post-download sniff has a documented limitation (an extensionless URL with no filename hint classifies as `.byte`); no speculative probe and no double GET were introduced.
 - Release remains frozen. Only the reviewed, gate-passing Wave 1 code lanes have merged.
+
+## 2026-08-26 - W1-B approved and integrated
+
+- `[W1-B-APPROVE-01]` The initial W1-B heuristic commit was blocked by the DeepSeek review (t2), because the native payload was unreachable at runtime and an eof-reached generation race existed. The final Ox Alpha seat (t14) `:mpv-seam` at author HEAD `bf109f5cf` was source-built, removed the heuristic, and exposed the real `mpv_event_end_file` reason/error.
+- The independent Ox Alpha seat (t17) APPROVED with upstream/source/header/license provenance, a clean four-ABI native rebuild, and JNI descriptor/export/DT_NEEDED/dex/APK proof.
+- `[W1-B-PROVENANCE-01]` The t18 provenance/NDK follow-up commit `9d8b3d67d` corrected the `v1.0.0` tag target to `fcf6745`, produced a complete delta inventory, and pinned NDK `27.2.12479018`.
+- The t19 review APPROVED.
+- The captain integrated only the final safe tree as a squashed main commit `049fe3a12` (`feat(android): carry native mpv terminal reasons`), avoiding the rejected intermediate commit. The integrated clean native rebuild, focused tests, Full+Play release compile, and Full+Play debug assembly all passed (163 tasks / 12m34s).
+- The Full APK carries the seam in arm64-v8a and x86_64 with no libplayer; the Play flavor has no seam and no libmpv.
+- Main was pushed (through `049fe3a12`). Outputs were cleaned and the clean lane worktree was retired after diff-hash equality was confirmed.
+- `[W1-B-OPEN-01]` Open follow-ups recorded:
+  1. Gradle warns `mpvLinkAar` is resolved at configuration time.
+  2. `hasLoadedSource` is read assuming there are no concurrent loads.
+  3. Inherited upstream JNI null/exception/global-ref nits.
+  4. The debug APK lacked the Rust engine libraries because `cargo`/`coreDir` were unavailable, so the physical/device/release artifact gate must be rebuilt with Rust and cargo-ndk and the native engine libs verified.
+- Release remains frozen.
