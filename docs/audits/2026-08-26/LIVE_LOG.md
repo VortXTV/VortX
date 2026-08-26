@@ -63,3 +63,13 @@
 - Captain-run gates all pass: the system Bash full signing suite ran 10 consecutive passes; the missing-secret release Gradle invocation fails closed; the secretless debug config passes; the pinned signer SHA-256 fingerprint `90DD...E0006A` matches the recovered production certificate; and the clean lane worktree was retired after the branch series and the main series diff hashes matched.
 - `[W1-A-HOSTILE-TAG-01]` Recorded as a later release-orchestration hardening item, not a Wave 1 defect: `gh` hostile-tag option parsing at the release gate. Backlog placeholder; no lane action required now.
 - Release remains frozen. Only the reviewed, gate-passing Wave 1 code lanes have merged.
+
+## 2026-08-26 - W1-E approved and integrated
+
+- `[W1-E-APPROVE-01]` The Ox Alpha author HEAD for W1-E is `bbdf7c3d4` (parent `26a167998`, `fix(apple): drop extensionless download probes, guard drain reentry`). The independent Ox Alpha apple-download-reviewer seat APPROVED the revised Apple download scheduler (t10).
+- The captain integrated the final safe tree as a single squashed main commit `43ac0bc60` (`fix(apple): serialize download scheduler starts`), so the earlier unmerged intermediate probe commit (`26a167998`, the rejected `W1-E-REJECT-01` author) never appears on main.
+- Contract gates all pass: scheduler, cross-platform, HLS, failure-classifier, and parse contracts.
+- Builds pass on tvOS VortXTV, iOS VortXiOSNative, and macOS VortXMac arm64.
+- Main was pushed through `c62b38de1`. The generated mac app was unregistered from LaunchServices and all lane build outputs were cleaned. The clean lane worktree was retired after the final-branch and main-squash diff hashes matched.
+- `[W1-E-OPEN-01]` APP-DL-05 remains explicitly open: extensionless HLS requires upstream metadata; the 64-byte post-download sniff has a documented limitation (an extensionless URL with no filename hint classifies as `.byte`); no speculative probe and no double GET were introduced.
+- Release remains frozen. Only the reviewed, gate-passing Wave 1 code lanes have merged.

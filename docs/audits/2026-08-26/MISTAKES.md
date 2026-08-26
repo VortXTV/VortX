@@ -83,3 +83,11 @@ Guardrails:
 
 1. Local signing verification must record the interpreter it ran under and execute the suite with the stable system Bash (`/bin/bash`); never rely on a PATH-resolved `env bash`.
 2. A tool crash is never a security pass. Only a clean run under a known, recorded interpreter that produces the expected output counts; a crash that fails closed must not be allowed to turn expected-message assertions into flaky noise.
+
+## Unmerged rejected commit before the safe tree (W1-E)
+
+`[MIS-W1-E-SQUASH-01]` The W1-E lane carried an intermediate author commit `26a167998` that contained the rejected double-GET probe behavior, followed by the final safe commit `bbdf7c3d4` that removed the probe. The captain integrated only the final safe tree as a single squashed main commit `43ac0bc60`, so the rejected intermediate commit never reaches main.
+
+Guardrail:
+
+1. When an earlier unmerged commit in a lane contains rejected behavior and a later commit removes it, integrate a squashed version of the final safe tree (one clean commit) rather than cherry-picking the commit chain, so the rejected intermediate commit never appears on main. Verify the final-branch diff hashes match the main-squash diff before retiring the worktree.
