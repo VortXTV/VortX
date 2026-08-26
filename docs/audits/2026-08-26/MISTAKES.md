@@ -130,3 +130,13 @@ Guardrails:
 
 1. After any skill catalog refresh, reload the department-operating-model skill before standing up a team, dispatching seats, or writing programme docs; never assume standing orders survived a catalog change unverified.
 2. Resuming the programme means resuming exactly from the recorded exit state: confirm the exit commit is pushed (here `611dedaa3`), cut every lane worktree at that exact baseline, and keep every standing hold such as the release freeze in force until the owner lifts it explicitly.
+
+## Idle Wave 2 release seat with no verdict
+
+`[MIS-W2-RELEASE-SEAT-01]` The initial Wave 2 release-engineer seat claimed t1 but stayed idle through repeated wakes and never produced work or a verdict on the release orchestration lane. The captain removed the seat atomically, revoked and requeued the t1 attempt, and the replacement Ox Alpha seat release-engineer-2 resumed the lane as attempt 2. This is a route/seat execution failure only: no code changed and no conclusion about the REL-02/REL-03 scope was drawn from the dead seat.
+
+Guardrails:
+
+1. A claimed task with no produced work after repeated wakes is treated exactly like a failed seat: no partial credit, no code accepted, and the parked attempt must be revoked and requeued instead of left blocking the lane.
+2. Replace the seat atomically (remove member, revoke attempt, requeue) and have the replacement claim a fresh numbered attempt so any late output from the removed seat can never overwrite the new run.
+3. An idle-seat failure is evidence about the seat, never about the lane's findings or code; restart the lane at the same exact baseline with its scope unchanged.

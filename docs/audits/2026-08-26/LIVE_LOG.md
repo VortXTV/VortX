@@ -117,3 +117,10 @@
 - `[W2-CROSSREVIEW-01]` Cross-review ring assigned, each seat reviewing the opposite lane and never its own: backup-engineer reviews the release lane and release-engineer reviews the backup lane; edge-auth-engineer reviews the updater lane and updater-engineer reviews the edge-auth lane.
 - `[W2-OPMODEL-01]` The department-operating-model skill was reloaded after a skill catalog refresh so the wave runs under the current operating model.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Wave 2 release lane seat failure and replacement
+
+- `[W2-SEAT-FAIL-01]` The initial Wave 2 release-engineer seat claimed t1 (Harden release orchestration) but remained idle after the claim and repeated wakes, producing no work and no verdict. No code changed and no result was counted from that seat.
+- `[W2-SEAT-SWAP-01]` The captain removed the idle seat atomically, revoked and requeued the t1 attempt, and the replacement Ox Alpha seat release-engineer-2 (same opencode-go-2/ox-alpha-free route) claimed t1 as attempt 2.
+- This is classified as a route/seat execution failure only: nothing about the REL-02/REL-03 findings or any code is implicated, and the release lane restarts clean at exact baseline `611dedaa3`.
+- Release remains frozen. Nothing has merged.
