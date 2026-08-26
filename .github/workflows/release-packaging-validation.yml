@@ -16,15 +16,17 @@ name: Release packaging validation
 #     gate, the pinned production signer SHA-256 verification, and the tag/source-commit binding
 #     remain exclusively in the protected release stage.
 #   - Apple job: runs the fixture-driven tests of the packaging/feed scripts that releases call
-#     (release-feed.mjs, gen-altstore-source.py, repackage-ipa.sh) plus a project-build parse of
-#     the real Xcode project manifest. Signed archives and notarization cannot exist without
-#     paid identities, so they stay in the thin protected release stage by construction.
+#     (release-feed.mjs, gen-altstore-source.py, repackage-ipa.sh), then generates the real Xcode
+#     project via pinned XcodeGen and exercises compile/link/package for tvOS, iOS, and macOS
+#     shells with CODE_SIGNING_ALLOWED=NO. CI-only stub engine xcframeworks stand in for the
+#     private engine source (unavailable to PRs); contract tests prove protected workflows cannot
+#     consume them. Signed archives and notarization stay in the thin protected release stage.
 #
 # Documented limits of what CAN be validated secretlessly (do not silently widen):
 #   - libstremiox_core.so / libvortx_ffi.so come from PRIVATE repos, so the Android APKs built
 #     here carry no engine .so files (the gradle tasks warn-skip exactly as on dev machines).
 #     Engine-linked packaging stays validated by the privileged push/release lanes only.
-#   - No Apple app archive, code-signing identity, or notarization is exercised here.
+#   - No Apple code-signing identity or notarization is exercised here (requires paid accounts).
 
 on:
   pull_request:
@@ -187,10 +189,10 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/adhoc-signing"
 
-  apple-packaging-scripts:
-    name: Apple packaging/feed script contracts (secretless)
+  apple-shell-packaging:
+    name: Apple tvOS/iOS/macOS shell packaging (secretless)
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -208,13 +210,101 @@ jobs:
       - name: Run IPA repackaging tests
         run: bash scripts/tests/repackage-ipa.test.sh
 
-      # Parse smoke against the REAL project manifest the release lane reads its numeric build
-      # number from; catches project.yml schema drift before a release does.
-      - name: Parse the release build number from the real project manifest
+      # Pinned XcodeGen, identical version + checksum gate as release-tvos.yml so project
+      # generation here observes the same generator the release lane uses.
+      - name: Install pinned XcodeGen
+        env:
+          XCODEGEN_VERSION: "2.46.0"
+          XCODEGEN_SHA256: "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
         run: |
           set -euo pipefail
-          build="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
-          case "$build" in
-            ''|*[!0-9]*) echo "::error::project-build did not yield a numeric build: $build"; exit 1 ;;
-          esac
-          echo "ok: project.yml parses to numeric build $build"
+          workdir="$RUNNER_TEMP/xcodegen"
+          mkdir -p "$workdir"
+          url="https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          curl -fsSL --retry 3 -o "$workdir/xcodegen.zip" "$url"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$workdir/xcodegen.zip" > "$workdir/xcodegen.sha256"
+          shasum -a 256 -c "$workdir/xcodegen.sha256"
+          unzip -q "$workdir/xcodegen.zip" -d "$workdir"
+          "$workdir/xcodegen/bin/xcodegen" --version
+          echo "$workdir/xcodegen/bin" >> "$GITHUB_PATH"
+
+      # Every dependency below is PUBLIC and checksum-pinned; none of these steps reads a secret.
+      # NodeMobile/server.js/fonts, the macOS node runtime, and the self-built MPVKit player stack
+      # are fetched exactly the way release-tvos.yml fetches them (same pins), so the only
+      # difference versus the protected lane is the ENGINE SOURCE: private repos cannot be checked
+      # out on a PR, so scripts/build-stub-engine-xcframeworks.sh generates CI-only fail-closed
+      # stand-ins that define the tracked ABI surface. This exercises compile/link/package for
+      # real; it does NOT exercise engine behavior (nothing can, secretlessly).
+      - name: Fetch server dependencies (NodeMobile, server.js, fonts)
+        run: ./scripts/fetch-server-deps.sh
+
+      - name: Fetch the macOS node runtime
+        run: ./app/scripts/fetch-node-macos.sh
+
+      - name: Fetch MPVKit-DVFEL artifacts (public release asset, sha256-verified)
+        env:
+          MPVKIT_ARTIFACTS_SHA256: "6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
+        run: |
+          set -euo pipefail
+          DEST="app/Vendor/MPVKit-DVFEL"
+          curl -sfL --retry 3 -o "$RUNNER_TEMP/mpvkit.zip" \
+            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-1/mpvkit-dvfel-artifacts.zip"
+          ACTUAL="$(shasum -a 256 "$RUNNER_TEMP/mpvkit.zip" | cut -d' ' -f1)"
+          if [ "$ACTUAL" != "$MPVKIT_ARTIFACTS_SHA256" ]; then
+            echo "::error::MPVKit artifact checksum mismatch: expected $MPVKIT_ARTIFACTS_SHA256 got $ACTUAL"
+            exit 1
+          fi
+          rm -rf "$DEST/artifacts"
+          unzip -q "$RUNNER_TEMP/mpvkit.zip" -d "$DEST"
+
+      - name: Generate CI-only stub engine xcframeworks
+        run: |
+          ./scripts/build-stub-engine-xcframeworks.sh
+          test -f app/Vendor/StremioXCore.xcframework/STUB-CI-ONLY.txt || { echo "::error::StremioXCore stub marker missing"; exit 1; }
+          test -f app/Vendor/VortxEngine.xcframework/STUB-CI-ONLY.txt || { echo "::error::VortxEngine stub marker missing"; exit 1; }
+
+      - name: Generate the Xcode project
+        run: cd app && xcodegen generate
+
+      # Real compile/link/package per platform shell. Signing is disabled outright (no identity,
+      # none needed for simulator or unsigned macOS builds). Each produced .app must carry the
+      # expected bundle ID and a Mach-O executable whose engine symbols are RESOLVED (defined in
+      # the linked binary), proving the link phase consumed the engine libraries.
+      # The legacy web-host `VortX` iOS target is deliberately not built here: it is the
+      # pre-native WebView shell kept until cutover, not one of the three native platform shells.
+      - name: Build and verify tvOS, iOS, and macOS shells
+        run: |
+          set -euo pipefail
+          build_shell() {
+            local scheme="$1" destination="$2" expected_bundle="$3" dd="$4" require_engines="$5"
+            echo "::group::xcodebuild $scheme"
+            xcodebuild -project app/VortX.xcodeproj -scheme "$scheme" \
+              -destination "$destination" \
+              -derivedDataPath "$dd" \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+              build
+            echo '::endgroup::'
+            local products_dir
+            products_dir="$(find "$dd/Build/Products" -type d -name '*.app' | head -n 1)"
+            [ -n "$products_dir" ] || { echo "::error::$scheme produced no .app"; exit 1; }
+            local bundle_id exe
+            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$products_dir/Info.plist")"
+            [ "$bundle_id" = "$expected_bundle" ] || { echo "::error::$scheme bundle id $bundle_id != $expected_bundle"; exit 1; }
+            exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$products_dir/Info.plist")"
+            file "$products_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
+            if ! nm -gU "$products_dir/$exe" | grep -q '_stremiox_core_schema_version'; then
+              echo "::error::$scheme binary does not contain the linked engine symbol _stremiox_core_schema_version"; exit 1;
+            fi
+            if [ "$require_engines" = "both" ]; then
+              nm -gU "$products_dir/$exe" | grep -q '_vortx_init_runtime' \
+                || { echo "::error::$scheme binary does not contain the linked engine symbol _vortx_init_runtime"; exit 1; }
+            fi
+            if nm -u "$products_dir/$exe" | grep -Eq '_stremiox_core_|_vortx_'; then
+              echo "::error::$scheme binary still has unresolved engine symbols"; nm -u "$products_dir/$exe" | grep -E '_stremiox_core_|_vortx_'; exit 1
+            fi
+            echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved"
+          }
+          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" core-only
+          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both
+          build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    both
+          build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    core-only

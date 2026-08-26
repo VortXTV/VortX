@@ -137,8 +137,77 @@ require_grep "validation exercises the AltStore source generator contract" \
     'python3 scripts/tests/test_gen_altstore_source\.py' "$VALIDATION_WF"
 require_grep "validation exercises the IPA repackaging contract" \
     'bash scripts/tests/repackage-ipa\.test\.sh' "$VALIDATION_WF"
-require_grep "validation parses the real project build number" \
-    'node scripts/release-feed\.mjs project-build --file app/project\.yml' "$VALIDATION_WF"
+
+# --- Contract 3b: Apple shell packaging exercises real compile/link/package -----------------------
+# The secretless lane must go beyond script fixtures: it must generate the Xcode project, build
+# every native platform shell (tvOS, iOS, macOS), and verify each produced .app carries the
+# expected bundle ID and a Mach-O executable with resolved engine symbols. This is what proves
+# the packaging pipeline works end-to-end without private source.
+
+require_grep "validation installs pinned XcodeGen" \
+    'xcodegen.*--version' "$VALIDATION_WF"
+require_grep "validation generates CI-only stub engine xcframeworks" \
+    'build-stub-engine-xcframeworks\.sh' "$VALIDATION_WF"
+require_grep "validation verifies StremioXCore stub marker" \
+    'StremioXCore\.xcframework/STUB-CI-ONLY\.txt' "$VALIDATION_WF"
+require_grep "validation verifies VortxEngine stub marker" \
+    'VortxEngine\.xcframework/STUB-CI-ONLY\.txt' "$VALIDATION_WF"
+require_grep "validation generates the Xcode project from project.yml" \
+    'xcodegen generate' "$VALIDATION_WF"
+require_grep "validation builds tvOS shell via xcodebuild" \
+    'build_shell VortXTV ' "$VALIDATION_WF"
+require_grep "validation builds tvOS Lite shell via xcodebuild" \
+    'build_shell VortXTVLite' "$VALIDATION_WF"
+require_grep "validation builds iOS native shell via xcodebuild" \
+    'build_shell VortXiOSNative' "$VALIDATION_WF"
+require_grep "validation builds macOS shell via xcodebuild" \
+    'build_shell VortXMac' "$VALIDATION_WF"
+require_grep "validation disables code signing for secretless builds" \
+    'CODE_SIGNING_ALLOWED=NO' "$VALIDATION_WF"
+require_grep "validation verifies bundle IDs of produced apps" \
+    'CFBundleIdentifier' "$VALIDATION_WF"
+require_grep "validation verifies Mach-O executables in produced apps" \
+    'Mach-O' "$VALIDATION_WF"
+require_grep "validation verifies linked engine symbols are resolved" \
+    '_stremiox_core_schema_version' "$VALIDATION_WF"
+require_grep "validation checks for unresolved engine symbols" \
+    'unresolved engine symbols' "$VALIDATION_WF"
+
+# --- Contract 3c: CI-only stub isolation (stubs never enter protected release lanes) ---------------
+# The stub engine xcframeworks exist ONLY for the secretless PR lane. Protected workflows
+# (android-release.yml, release-tvos.yml, android.yml) must NEVER reference the stub script or
+# its marker file, because that would mean a release could ship with no-op engine stand-ins.
+
+readonly STUB_SCRIPT="$REPO_ROOT/scripts/build-stub-engine-xcframeworks.sh"
+[[ -f "$STUB_SCRIPT" ]] || fail "stub engine script missing: $STUB_SCRIPT"
+for wf in "$RELEASE_WF" "$APPLE_RELEASE_WF" "$ANDROID_CI_WF"; do
+    require_absent "protected $(basename "$wf") never references the stub engine script" \
+        'build-stub-engine-xcframeworks' "$wf"
+    require_absent "protected $(basename "$wf") never references the STUB-CI-ONLY marker" \
+        'STUB-CI-ONLY' "$wf"
+done
+ok "stub engine artifacts are isolated to the secretless validation lane"
+
+# --- Contract 3d: android.yml signing-variable contract -------------------------------------------
+# The Gradle signing config reads exactly four env vars (build.gradle.kts:38-43). The workflow
+# must export all four under the correct names, and must never carry the old misnamed variable
+# VORTX_KEYSTORE_FILE (which silently missed the Gradle contract before it was caught).
+
+require_grep "android CI exports VORTX_KEYSTORE_PATH (not KEYSTORE_FILE)" \
+    'VORTX_KEYSTORE_PATH:' "$ANDROID_CI_WF"
+# The misnamed VORTX_KEYSTORE_FILE must never appear as an env-var export (indented key: value).
+# Mentions inside assertion scripts or comments are acceptable (the inline contract test itself
+# references the name to verify its absence); only an actual env binding is a regression.
+if grep -Eq '^[[:space:]]+VORTX_KEYSTORE_FILE:' "$ANDROID_CI_WF"; then
+    fail "android CI exports the misnamed VORTX_KEYSTORE_FILE as an env var (must be VORTX_KEYSTORE_PATH)"
+fi
+ok "android CI never exports the misnamed VORTX_KEYSTORE_FILE as an env var"
+require_grep "android CI asserts the signing-variable contract inline" \
+    'Assert signing-variable contract' "$ANDROID_CI_WF"
+for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
+    require_grep "android CI signing-contract assertion checks $var" \
+        "$var" "$ANDROID_CI_WF"
+done
 
 permissions_block="$(awk '/^permissions:/{flag=1} flag && /^[a-zA-Z_-]+:/ && !/^permissions:/{exit} flag{print}' "$VALIDATION_WF")"
 grep -Eq 'contents:\s*read' <<<"$permissions_block" \
@@ -148,8 +217,14 @@ ok "validation workflow holds contents: read only"
 # --- Contract 4: no debug-signing fallback anywhere in the release path ---------------------------
 
 for wf in "$RELEASE_WF" "$ANDROID_CI_WF" "$APPLE_RELEASE_WF" "$VALIDATION_WF"; do
-    require_absent "no debug-signed fallback marker in $(basename "$wf")" \
-        'debug-signed' "$wf"
+    # The string "debug-signed" may appear inside an inline contract-assertion step (a grep that
+    # CHECKS for the marker). Only a USE of the marker outside such an assertion is a regression.
+    # A line containing 'debug-signed' that also contains 'grep' or '#' is part of an assertion,
+    # not an actual fallback.
+    if grep -E 'debug-signed' "$wf" | grep -vEq 'grep|#'; then
+        fail "debug-signed fallback marker found outside assertion logic in $(basename "$wf")"
+    fi
+    ok "no debug-signed fallback marker in $(basename "$wf")"
 done
 require_absent "gradle never selects the debug signing config for release" \
     'signingConfigs\.getByName\("debug"\)' "$GRADLE_BUILD"

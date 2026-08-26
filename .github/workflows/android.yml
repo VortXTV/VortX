@@ -450,11 +450,47 @@ jobs:
           STREMIOX_CORE_DIR: ${{ github.workspace }}/core
           VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
           VORTX_REQUIRE_ENGINE: "1"
-          VORTX_KEYSTORE_FILE: ${{ runner.temp }}/signing/upload.jks
+          VORTX_KEYSTORE_PATH: ${{ runner.temp }}/signing/upload.jks
           VORTX_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           VORTX_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           VORTX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew assembleFullRelease bundleFullRelease --no-daemon --stacktrace
+
+      # Signing-contract assertion (fail-closed): prove the EXACT four env-var names the Gradle
+      # signing-config reads (build.gradle.kts:38-43) are present in this workflow's release build
+      # step, and that no debug-signing fallback exists anywhere in this file. A rename or removal
+      # of any one variable kills the release build silently (Gradle sees null, skips signing);
+      # this gate makes that regression loud. The assertion runs unconditionally (not gated on
+      # steps.signing.outputs.ready) because the CONTRACT must hold even when secrets are absent.
+      - name: Assert signing-variable contract (exact four names, no debug fallback)
+        run: |
+          set -euo pipefail
+          wf=".github/workflows/android.yml"
+          gradle="android/app/build.gradle.kts"
+          fail=0
+          # 1. Gradle declares exactly these four variable names (the canonical source of truth).
+          for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
+            grep -qF "\"$var\"" "$gradle" \
+              || { echo "::error::Gradle signing contract missing $var in $gradle"; fail=1; }
+          done
+          # 2. This workflow exports all four under the release-build step.
+          for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
+            grep -qE "^[[:space:]]+${var}:" "$wf" \
+              || { echo "::error::$wf does not export $var for the release build"; fail=1; }
+          done
+          # 3. No stale VORTX_KEYSTORE_FILE (the old misnamed variable that silently missed the
+          #    Gradle contract). Any occurrence means a future edit reintroduced the bug.
+          if grep -qF 'VORTX_KEYSTORE_FILE' "$wf"; then
+            echo "::error::$wf still references VORTX_KEYSTORE_FILE (must be VORTX_KEYSTORE_PATH)"
+            fail=1
+          fi
+          # 4. No debug-signing fallback anywhere in this file.
+          if grep -Eq 'signingConfigs\.getByName\("debug"\)|debug-signed|isDebuggable.*true' "$wf"; then
+            echo "::error::$wf contains a debug-signing fallback"
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "ok: signing-variable contract holds (4 vars match Gradle, no KEYSTORE_FILE, no debug fallback)"
 
       # Remove the decoded keystore as soon as the build is done, whatever the outcome.
       - name: Shred decoded keystore
