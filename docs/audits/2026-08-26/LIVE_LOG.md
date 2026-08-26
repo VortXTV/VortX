@@ -173,4 +173,10 @@
 - `[W2-SCHEDULER-ORDER-01]` The scheduler claimed t9 before t18 during the recovery sequence. The captain parked t9 with assignee=captain until t18 reaches a terminal state, preventing scheduler reversal of the dependency order.
 - `[W2-MEMBER-CAP-01]` The manager attempted five add_member calls at team cap 8; all were rejected atomically with no state change. Only the completed appcast author seat was rotated out to free a slot for the Qwen 3.7 Max replacement.
 - `[W2-SEC05-BASELINES-01]` SEC-05 server worktrees are registered at exact baselines: oauth d093e72ea, abuse 9fa5e5978 default work/ins-26, sources e12072c45, addon-pair 5139fbb07, watch c2828eb17. No edits and no deploy on any of these trees.
+- `[W2-SEC05-BASELINES-CORR-01]` Captain's first SEC-05 baseline validation incorrectly expanded trusted short commit IDs into guessed full SHA values, causing exit 1 before any successful row. The corrected validation compares each worktree HEAD directly to its exact remote ref and clean branch registration state; all five passed with full hashes:
+  - oauth `d093e72ea956eb565db51a2f66b3c76dcecca27d` = origin/main
+  - abuse `9fa5e59786773cf4b65ccca0650da53d75029c32` = origin/work/ins-26
+  - sources `e12072c458f74181a4b5d547516b5f2f2e18a786` = origin/main
+  - addon-pair `5139fbb0758a2cb83d4ec1ef1c8bb996a474cc48` = origin/main
+  - watch `c2828eb1752ce0950f4031fdc6ded34af7ff0a04` = origin/main
 - Release remains frozen. Nothing has merged.

@@ -2,6 +2,16 @@
 
 ## Release failure loop
 
+### SEC-05 baseline validation correction
+- Captain's first SEC-05 baseline validation incorrectly expanded trusted short commit IDs into guessed full SHA values, causing exit 1 before any successful row. The corrected validation compares each worktree HEAD directly to its exact remote ref and clean branch registration state; all five passed with full hashes:
+  - oauth `d093e72ea956eb565db51a2f66b3c76dcecca27d` = origin/main
+  - abuse `9fa5e59786773cf4b65ccca0650da53d75029c32` = origin/work/ins-26
+  - sources `e12072c458f74181a4b5d547516b5f2f2e18a786` = origin/main
+  - addon-pair `5139fbb0758a2cb83d4ec1ef1c8bb996a474cc48` = origin/main
+  - watch `c2828eb1752ce0950f4031fdc6ded34af7ff0a04` = origin/main
+- Guardrail: never invent full hashes from prefixes; resolve and compare authoritative refs.
+- CEO routing preference: use Cerebras strongest available model first until credits exhaust; SEC-05 author seat moved to `cerebras/gpt-oss-120b` high without interrupting active writers.
+
 What happened:
 
 - Repeated a deterministic Apple attach failure instead of recovering the documented response body and fixing the workflow.
