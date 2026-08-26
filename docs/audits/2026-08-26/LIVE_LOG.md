@@ -124,3 +124,9 @@
 - `[W2-SEAT-SWAP-01]` The captain removed the idle seat atomically, revoked and requeued the t1 attempt, and the replacement Ox Alpha seat release-engineer-2 (same opencode-go-2/ox-alpha-free route) claimed t1 as attempt 2.
 - This is classified as a route/seat execution failure only: nothing about the REL-02/REL-03 findings or any code is implicated, and the release lane restarts clean at exact baseline `611dedaa3`.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Correction: release lane seat removal was a manager misdiagnosis
+
+- `[W2-SEAT-CORRECTION-01]` The `[W2-SEAT-FAIL-01]` classification is corrected: team status showed four other members working while the fifth seat sat idle, so the likely cause of the initial seat's idleness was the live concurrency cap, not an Ox Alpha seat or route failure. The captain removed a healthy queued seat without proving any route failure.
+- The mistake is logged on the manager side as `[MIS-W2-SEAT-MISDIAG-01]`. No code or result was lost: the removed seat had produced nothing, and t1 remains with release-engineer-2 at attempt 2.
+- Release remains frozen. Nothing has merged.

@@ -140,3 +140,12 @@ Guardrails:
 1. A claimed task with no produced work after repeated wakes is treated exactly like a failed seat: no partial credit, no code accepted, and the parked attempt must be revoked and requeued instead of left blocking the lane.
 2. Replace the seat atomically (remove member, revoke attempt, requeue) and have the replacement claim a fresh numbered attempt so any late output from the removed seat can never overwrite the new run.
 3. An idle-seat failure is evidence about the seat, never about the lane's findings or code; restart the lane at the same exact baseline with its scope unchanged.
+
+## Manager misdiagnosis: healthy queued seat removed as failed
+
+`[MIS-W2-SEAT-MISDIAG-01]` The captain misdiagnosed the initial Wave 2 release-engineer as a stuck seat. Team status showed four members actively working and the replacement seat idle, which points to live concurrency-cap saturation, not an Ox Alpha route failure: an idle member may simply be queued for an execution slot. The seat was removed and t1 requeued to release-engineer-2 without proving any route failure. No code or result was lost, and t1 remains at attempt 2. This supersedes the seat-failure classification recorded against `[W2-SEAT-FAIL-01]` for the same event.
+
+Guardrails:
+
+1. Inspect active-slot saturation before revoking or removing an idle claimed member: when every execution slot is busy, idleness is expected queueing, not a dead seat.
+2. Seat removal requires positive evidence of route failure such as error receipts or hard failures on wake, never idleness alone; if a healthy seat is removed anyway, the swap must stay atomic and lossless, and the wrong diagnosis must be corrected candidly on the manager side.
