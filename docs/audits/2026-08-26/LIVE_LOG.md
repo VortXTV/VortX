@@ -44,4 +44,5 @@
 - `[W1-C-ROUTE-FAIL-01]` The Ox Alpha seat exo-reviewer also failed before producing any verdict on the ExoPlayer state-machine review (t3). No code changed and no result was counted from that seat.
 - The captain atomically reassigned t3 to opencode-go-2/deepseek-v4-flash-vision-exp per the CEO fallback order as attempt 2.
 - `[W1-C-OOM-01]` The captain-run focused Exo policy tests returned BUILD SUCCESSFUL. A separate compile invocation then failed after 1h25m with a Kotlin compiler out-of-memory error in the unrelated LocalizedMetadataStore.request path. This is classified as an environment-capacity failure pending a controlled higher-memory rerun, not a code verdict.
+- `[W1-C-OOM-RCPT-01]` Verification receipt: the captain Exo focused test task passed BUILD SUCCESSFUL; the subsequent standalone compile failed after 1h25m with the exact Kotlin compiler error `Not enough memory to run compilation` in the unrelated LocalizedMetadataStore.request path. Environment-capacity failure pending a controlled higher-memory rerun, not a code verdict.
 - Release remains frozen. Nothing has merged.
