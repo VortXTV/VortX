@@ -696,6 +696,220 @@ export function assertAppcast(manifest, expected) {
   return true;
 }
 
+// =================================================================================================
+// Release feed artifact validation (t22: split Android, client caps, tag/versionName coherence)
+// =================================================================================================
+
+// Client-compatible field caps. These bounds protect every downstream consumer (updater, appcast
+// reader, AltStore source generator) from oversized payloads that would blow parsing budgets or
+// UI layouts. They are generous enough for any real release but tight enough to catch accidents.
+export const FEED_CAPS = Object.freeze({
+  manifestBytes: 512 * 1024,     // 512 KiB total manifest
+  artifactBytes: 1 * 1024 * 1024 * 1024, // 1 GiB per artifact
+  versionLength: 64,             // version string max chars
+  nameLength: 200,               // release name max chars
+  notesLength: 20_000,           // release notes max chars
+});
+
+const VALID_ANDROID_FLAVORS = Object.freeze(["full", "play"]);
+const VALID_ANDROID_ARTIFACT_TYPES = Object.freeze(["apk", "aab"]);
+const ANDROID_APPLICATION_ID = "com.vortx.android";
+
+function assertStringField(obj, field, label, maxLength) {
+  const value = obj[field];
+  if (typeof value !== "string" || value.length === 0) {
+    die(`${label} must be a non-empty string (field: ${field})`, "feed-schema");
+  }
+  if (maxLength && value.length > maxLength) {
+    die(`${label}.${field} exceeds ${maxLength} characters (got ${value.length})`, "feed-caps");
+  }
+  return value;
+}
+
+function assertHTTPSURL(value, label) {
+  if (typeof value !== "string" || !value.startsWith("https://")) {
+    die(`${label} must be an HTTPS URL (got ${JSON.stringify(value)})`, "feed-schema");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    die(`${label} is not a valid URL`, "feed-schema");
+  }
+  if (parsed.protocol !== "https:") {
+    die(`${label} must use HTTPS`, "feed-schema");
+  }
+  return value;
+}
+
+function assertLowerHex64(value, label) {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    die(`${label} must be a lower-case 64-character hex SHA-256 digest (got ${JSON.stringify(value)})`, "feed-schema");
+  }
+  return value;
+}
+
+function assertPositiveInt(value, label, max) {
+  if (!Number.isInteger(value) || value <= 0) {
+    die(`${label} must be a positive integer (got ${JSON.stringify(value)})`, "feed-schema");
+  }
+  if (max && value > max) {
+    die(`${label} exceeds maximum ${max} (got ${value})`, "feed-caps");
+  }
+  return value;
+}
+
+function validateAndroidFlavorEntry(flavor, entry, tagVersion, build, prerelease) {
+  const label = `android.${flavor}`;
+  if (!entry || typeof entry !== "object") {
+    die(`${label} must be an object`, "feed-schema");
+  }
+  // Required metadata fields
+  assertStringField(entry, "applicationId", label, null);
+  if (entry.applicationId !== ANDROID_APPLICATION_ID) {
+    die(`${label}.applicationId must be ${ANDROID_APPLICATION_ID} (got ${JSON.stringify(entry.applicationId)})`, "feed-schema");
+  }
+  assertStringField(entry, "engine", label, null);
+  if (flavor === "full" && entry.engine !== "mpv") {
+    die(`${label}.engine must be "mpv" for the full flavor (got ${JSON.stringify(entry.engine)})`, "feed-schema");
+  }
+  if (flavor === "play" && entry.engine !== "media3") {
+    die(`${label}.engine must be "media3" for the play flavor (got ${JSON.stringify(entry.engine)})`, "feed-schema");
+  }
+  // Artifact type
+  if (!VALID_ANDROID_ARTIFACT_TYPES.includes(entry.artifactType)) {
+    die(`${label}.artifactType must be one of ${VALID_ANDROID_ARTIFACT_TYPES.join(", ")} (got ${JSON.stringify(entry.artifactType)})`, "feed-schema");
+  }
+  // Version coherence
+  assertStringField(entry, "version", label, FEED_CAPS.versionLength);
+  if (entry.version !== tagVersion) {
+    die(`${label}.version must equal the tag version ${tagVersion} (got ${JSON.stringify(entry.version)})`, "feed-coherence");
+  }
+  // Build number
+  if (!Number.isInteger(entry.build) || entry.build !== build) {
+    die(`${label}.build must equal the release build ${build} (got ${JSON.stringify(entry.build)})`, "feed-coherence");
+  }
+  // Signing
+  if (entry.signed !== true) {
+    die(`${label}.signed must be true`, "feed-schema");
+  }
+  // URL
+  assertHTTPSURL(entry.url, `${label}.url`);
+  // Size
+  assertPositiveInt(entry.size, `${label}.size`, FEED_CAPS.artifactBytes);
+  // SHA-256 (must be lower-case 64-hex)
+  assertLowerHex64(entry.sha256, `${label}.sha256`);
+  // Signer (compact, non-empty)
+  assertStringField(entry, "signer", label, null);
+  if (entry.signer.length > 256) {
+    die(`${label}.signer is too long (${entry.signer.length} chars); expected a compact fingerprint`, "feed-caps");
+  }
+  // Prerelease coherence
+  if (Boolean(entry.prerelease) !== Boolean(prerelease)) {
+    die(`${label}.prerelease must match the release prerelease flag`, "feed-coherence");
+  }
+  return true;
+}
+
+/**
+ * Validate a release feed artifact (manifest.json) against the full schema contract.
+ *
+ * Enforces:
+ *   - schemaVersion exactly 2
+ *   - Split android.full and android.play independently validated
+ *   - Android-only releases accepted (no ios/tvos/mac required when android present alone)
+ *   - Client-compatible caps on all string/size fields
+ *   - Exact APK metadata: applicationId, engine, artifactType, lower-case 64-hex SHA-256,
+ *     compact pinned signer, HTTPS artifact URL
+ *   - Tag version equals Android versionName and coherent build/version fields
+ *   - Flat root.android metadata rejected (must be split into full/play)
+ *
+ * @param {object|string} artifact - The manifest object or its JSON text
+ * @param {object} [options] - Optional overrides
+ * @param {string} [options.tagVersion] - Expected tag-derived version (e.g. "0.3.14")
+ * @returns {{valid: boolean, androidFlavors: string[], hasApple: boolean}}
+ */
+export function validateReleaseFeedArtifact(artifact, options = {}) {
+  let manifest;
+  if (typeof artifact === "string") {
+    // Check manifest size cap on raw text
+    if (Buffer.byteLength(artifact, "utf8") > FEED_CAPS.manifestBytes) {
+      die(`manifest exceeds ${FEED_CAPS.manifestBytes} bytes (${Buffer.byteLength(artifact, "utf8")} bytes)`, "feed-caps");
+    }
+    try {
+      manifest = JSON.parse(artifact);
+    } catch (error) {
+      die(`manifest is not valid JSON: ${error.message}`, "feed-schema");
+    }
+  } else {
+    manifest = artifact;
+  }
+  if (!manifest || typeof manifest !== "object") {
+    die("manifest must be a JSON object", "feed-schema");
+  }
+  // schemaVersion must be exactly 2
+  if (manifest.schemaVersion !== FEED_ARTIFACT_SCHEMA) {
+    die(`schemaVersion must be exactly ${FEED_ARTIFACT_SCHEMA} (got ${JSON.stringify(manifest.schemaVersion)})`, "feed-schema");
+  }
+  // Top-level identity fields with caps
+  const tag = assertStringField(manifest, "tag", "manifest", null);
+  if (!RELEASE_TAG_RE.test(tag)) {
+    die(`manifest.tag must be a valid release tag (got ${JSON.stringify(tag)})`, "feed-schema");
+  }
+  const build = assertPositiveInt(manifest.build, "manifest.build", null);
+  const version = assertStringField(manifest, "version", "manifest", FEED_CAPS.versionLength);
+  const tagVersion = options.tagVersion || tag.replace(/^v/, "").split("-", 1)[0];
+  if (version !== tagVersion) {
+    die(`manifest.version must equal the tag-derived version ${tagVersion} (got ${JSON.stringify(version)})`, "feed-coherence");
+  }
+  assertStringField(manifest, "name", "manifest", FEED_CAPS.nameLength);
+  if (manifest.notes !== undefined && manifest.notes !== null) {
+    assertStringField(manifest, "notes", "manifest", FEED_CAPS.notesLength);
+  }
+  // Source commit
+  if (manifest.sourceCommit !== undefined && manifest.sourceCommit !== null) {
+    if (typeof manifest.sourceCommit !== "string" || !/^[0-9a-f]{40}$/i.test(manifest.sourceCommit)) {
+      die("manifest.sourceCommit must be a 40-character commit SHA", "feed-schema");
+    }
+  }
+  // Detect Apple platforms
+  const hasIos = manifest.ios !== undefined && manifest.ios !== null;
+  const hasTvos = manifest.tvos !== undefined && manifest.tvos !== null;
+  const hasMac = manifest.mac !== undefined && manifest.mac !== null;
+  const hasApple = hasIos || hasTvos || hasMac;
+  // Android validation
+  const android = manifest.android;
+  if (android === null || android === undefined) {
+    // No Android entry at all: acceptable (Apple-only release)
+    return { valid: true, androidFlavors: [], hasApple };
+  }
+  // Reject flat root.android (must be split into full/play sub-objects)
+  if (typeof android !== "object" || Array.isArray(android)) {
+    die("manifest.android must be an object with split flavor entries (full/play), not a flat value", "feed-schema");
+  }
+  // If android has top-level signing fields (flat format), reject
+  if ("signed" in android || "url" in android || "sha256" in android || "apk" in android) {
+    die("manifest.android must use split flavor entries (android.full, android.play); flat root.android metadata is rejected", "feed-schema");
+  }
+  const foundFlavors = [];
+  for (const flavor of VALID_ANDROID_FLAVORS) {
+    if (android[flavor] !== undefined && android[flavor] !== null) {
+      validateAndroidFlavorEntry(flavor, android[flavor], tagVersion, build, manifest.prerelease);
+      foundFlavors.push(flavor);
+    }
+  }
+  if (foundFlavors.length === 0) {
+    die("manifest.android must contain at least one flavor entry (full or play)", "feed-schema");
+  }
+  // Reject unknown flavors
+  for (const key of Object.keys(android)) {
+    if (!VALID_ANDROID_FLAVORS.includes(key)) {
+      die(`manifest.android contains unknown flavor "${key}"; only ${VALID_ANDROID_FLAVORS.join(", ")} are permitted`, "feed-schema");
+    }
+  }
+  return { valid: true, androidFlavors: foundFlavors, hasApple };
+}
+
 export function main(argv = process.argv.slice(2)) {
   const [command, ...rest] = argv;
   const args = parseArgs(rest);
@@ -825,7 +1039,14 @@ export function main(argv = process.argv.slice(2)) {
     console.log(`release-feed: built ${result.manifest.generation}`);
     return;
   }
-  die(`unknown command ${JSON.stringify(command)}; expected project-build, update-altstore, verify-source, check-monotonic, verify-asset, verify-public, build-artifact, or rollback`);
+  if (command === "validate-android-feed") {
+    if (!args.file) die("validate-android-feed requires --file");
+    const raw = readText(args.file);
+    const result = validateReleaseFeedArtifact(raw, { tagVersion: args["tag-version"] });
+    console.log(`release-feed: validated ${args.file} (flavors: ${result.androidFlavors.join(", ") || "none"}, apple: ${result.hasApple})`);
+    return;
+  }
+  die(`unknown command ${JSON.stringify(command)}; expected project-build, update-altstore, verify-source, check-monotonic, verify-asset, verify-public, build-artifact, validate-android-feed, or rollback`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

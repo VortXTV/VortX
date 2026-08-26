@@ -241,6 +241,72 @@ upload_line="$(awk '/gh release upload/{ print NR; exit }' "$RELEASE_WF")"
     || fail "signer verification is not before release upload"
 ok "preflight precedes build and pinned signer verification precedes upload"
 
+# --- Contract 5: release feed artifact validation (t22) ------------------------------------------
+# The release-feed.mjs must export validateReleaseFeedArtifact with split Android validation,
+# client-compatible caps, tag/versionName coherence, and flat-root rejection.
+
+readonly FEED_SCRIPT="$REPO_ROOT/scripts/release-feed.mjs"
+readonly FEED_TEST="$REPO_ROOT/scripts/tests/release-feed.test.mjs"
+[[ -f "$FEED_SCRIPT" ]] || fail "release-feed.mjs missing: $FEED_SCRIPT"
+[[ -f "$FEED_TEST" ]] || fail "release-feed test missing: $FEED_TEST"
+
+require_grep "release-feed exports validateReleaseFeedArtifact" \
+    'export function validateReleaseFeedArtifact' "$FEED_SCRIPT"
+require_grep "release-feed exports FEED_CAPS" \
+    'export const FEED_CAPS' "$FEED_SCRIPT"
+require_grep "release-feed enforces schemaVersion exactly 2" \
+    'schemaVersion must be exactly|schemaVersion.*FEED_ARTIFACT_SCHEMA' "$FEED_SCRIPT"
+require_grep "release-feed validates split android.full" \
+    'android\.full|validateAndroidFlavorEntry.*full|VALID_ANDROID_FLAVORS' "$FEED_SCRIPT"
+require_grep "release-feed validates split android.play" \
+    'android\.play|validateAndroidFlavorEntry.*play' "$FEED_SCRIPT"
+require_grep "release-feed rejects flat root.android metadata" \
+    'flat root\.android|split flavor entries' "$FEED_SCRIPT"
+require_grep "release-feed enforces manifest size cap (512 KiB)" \
+    'manifestBytes.*512|512.*1024' "$FEED_SCRIPT"
+require_grep "release-feed enforces artifact size cap (1 GiB)" \
+    'artifactBytes.*1024.*1024.*1024|1.*GiB' "$FEED_SCRIPT"
+require_grep "release-feed enforces version length cap (64)" \
+    'versionLength.*64' "$FEED_SCRIPT"
+require_grep "release-feed enforces name length cap (200)" \
+    'nameLength.*200' "$FEED_SCRIPT"
+require_grep "release-feed enforces notes length cap (20000)" \
+    'notesLength.*20.000|notesLength.*20000' "$FEED_SCRIPT"
+require_grep "release-feed requires lower-case 64-hex SHA-256" \
+    'lower-case 64-character hex|\[0-9a-f\]\{64\}' "$FEED_SCRIPT"
+require_grep "release-feed requires HTTPS artifact URL" \
+    'HTTPS URL|https://' "$FEED_SCRIPT"
+require_grep "release-feed requires compact pinned signer" \
+    'signer.*compact|signer is too long' "$FEED_SCRIPT"
+require_grep "release-feed asserts tag version equals Android versionName" \
+    'tag version|tag-derived version|tagVersion' "$FEED_SCRIPT"
+require_grep "release-feed requires exact applicationId" \
+    'applicationId.*com\.vortx\.android|ANDROID_APPLICATION_ID' "$FEED_SCRIPT"
+require_grep "release-feed requires engine field per flavor" \
+    'engine.*mpv|engine.*media3' "$FEED_SCRIPT"
+require_grep "release-feed requires artifactType field" \
+    'artifactType.*apk|VALID_ANDROID_ARTIFACT_TYPES' "$FEED_SCRIPT"
+require_grep "release-feed exposes validate-android-feed CLI command" \
+    'validate-android-feed' "$FEED_SCRIPT"
+
+# Test coverage for the new validation function
+require_grep "test covers positive full+play Android fixture" \
+    'full+play Android|full.*VALID_ANDROID_FULL.*play.*VALID_ANDROID_PLAY' "$FEED_TEST"
+require_grep "test covers Apple+Android combined fixture" \
+    'Apple.*Android|hasApple.*true' "$FEED_TEST"
+require_grep "test covers Android-only fixture" \
+    'Android-only|hasApple.*false' "$FEED_TEST"
+require_grep "test covers flat root.android rejection" \
+    'flat root\.android|split flavor entries' "$FEED_TEST"
+require_grep "test covers schemaVersion rejection" \
+    'wrong schemaVersion|schemaVersion must be exactly 2' "$FEED_TEST"
+require_grep "test covers client cap enforcement" \
+    'exceeding.*cap|exceeds.*characters|exceeds maximum' "$FEED_TEST"
+require_grep "test covers lower-case SHA-256 enforcement" \
+    'upper-case SHA-256|lower-case 64-character' "$FEED_TEST"
+require_grep "test covers tag/versionName coherence" \
+    'version mismatch with tag|tag version' "$FEED_TEST"
+
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then

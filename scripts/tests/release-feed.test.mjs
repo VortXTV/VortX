@@ -12,10 +12,12 @@ import {
   assertSource,
   buildReleaseFeedArtifact,
   fetchJSON,
+  FEED_CAPS,
   main,
   projectBuildFromYmlText,
   releaseAssetURL,
   sha256File,
+  validateReleaseFeedArtifact,
   verifyPublicRoutes,
 } from "../release-feed.mjs";
 
@@ -302,4 +304,329 @@ test("content-addressed artifact records exact local bytes and keeps Android nul
   assert.equal(appcast.ios.altstore, "https://vortx.tv/altstore.json");
   assert.equal(appcast.tvos.altstore, null);
   assert.equal(appcast.mac.artifactType, "dmg");
+});
+
+// =================================================================================================
+// t22: Release feed artifact validation (split Android, client caps, tag/versionName coherence)
+// =================================================================================================
+
+const VALID_ANDROID_FULL = Object.freeze({
+  applicationId: "com.vortx.android",
+  engine: "mpv",
+  artifactType: "apk",
+  version: VERSION,
+  build: BUILD,
+  signed: true,
+  url: `https://github.com/VortXTV/VortX/releases/download/${TAG}/VortX-${VERSION}-full-mpv-universal.apk`,
+  size: 85_000_000,
+  sha256: "a".repeat(64),
+  signer: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89",
+  prerelease: true,
+});
+
+const VALID_ANDROID_PLAY = Object.freeze({
+  applicationId: "com.vortx.android",
+  engine: "media3",
+  artifactType: "apk",
+  version: VERSION,
+  build: BUILD,
+  signed: true,
+  url: `https://github.com/VortXTV/VortX/releases/download/${TAG}/VortX-${VERSION}-play-media3-universal.apk`,
+  size: 72_000_000,
+  sha256: "b".repeat(64),
+  signer: "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89",
+  prerelease: true,
+});
+
+function validManifest({ android = null, hasApple = true } = {}) {
+  const m = {
+    schemaVersion: 2,
+    tag: TAG,
+    build: BUILD,
+    version: VERSION,
+    name: "Beta 19",
+    notes: "Beta release notes.",
+    prerelease: true,
+    sourceCommit: "a".repeat(40),
+  };
+  if (hasApple) {
+    m.ios = { tag: TAG, version: VERSION, build: BUILD, url: IOS_URL, size: 101, sha256: IOS_SHA };
+    m.tvos = { tag: TAG, version: VERSION, build: BUILD, url: TVOS_URL, size: 202, sha256: TVOS_SHA };
+    m.mac = { tag: TAG, version: VERSION, build: BUILD, url: MAC_URL, size: 303, sha256: MAC_SHA };
+  }
+  m.android = android;
+  return m;
+}
+
+// --- Positive fixtures ---------------------------------------------------------------------------
+
+test("validateReleaseFeedArtifact accepts Apple-only release (android null)", () => {
+  const result = validateReleaseFeedArtifact(validManifest({ android: null }));
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.androidFlavors, []);
+  assert.equal(result.hasApple, true);
+});
+
+test("validateReleaseFeedArtifact accepts full+play Android with Apple", () => {
+  const result = validateReleaseFeedArtifact(validManifest({
+    android: { full: VALID_ANDROID_FULL, play: VALID_ANDROID_PLAY },
+  }));
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.androidFlavors.sort(), ["full", "play"]);
+  assert.equal(result.hasApple, true);
+});
+
+test("validateReleaseFeedArtifact accepts Android-only release (no Apple platforms)", () => {
+  const result = validateReleaseFeedArtifact(validManifest({
+    android: { full: VALID_ANDROID_FULL, play: VALID_ANDROID_PLAY },
+    hasApple: false,
+  }));
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.androidFlavors.sort(), ["full", "play"]);
+  assert.equal(result.hasApple, false);
+});
+
+test("validateReleaseFeedArtifact accepts single-flavor Android (full only)", () => {
+  const result = validateReleaseFeedArtifact(validManifest({
+    android: { full: VALID_ANDROID_FULL },
+    hasApple: false,
+  }));
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.androidFlavors, ["full"]);
+});
+
+test("validateReleaseFeedArtifact accepts single-flavor Android (play only)", () => {
+  const result = validateReleaseFeedArtifact(validManifest({
+    android: { play: VALID_ANDROID_PLAY },
+    hasApple: false,
+  }));
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.androidFlavors, ["play"]);
+});
+
+test("validateReleaseFeedArtifact accepts AAB artifact type", () => {
+  const playAab = { ...VALID_ANDROID_PLAY, artifactType: "aab", url: VALID_ANDROID_PLAY.url.replace(".apk", ".aab") };
+  const result = validateReleaseFeedArtifact(validManifest({
+    android: { full: VALID_ANDROID_FULL, play: playAab },
+  }));
+  assert.equal(result.valid, true);
+});
+
+test("validateReleaseFeedArtifact accepts JSON string input with size check", () => {
+  const json = JSON.stringify(validManifest({ android: { full: VALID_ANDROID_FULL } }));
+  const result = validateReleaseFeedArtifact(json);
+  assert.equal(result.valid, true);
+});
+
+// --- Negative fixtures: schema violations --------------------------------------------------------
+
+test("rejects wrong schemaVersion", () => {
+  const m = validManifest();
+  m.schemaVersion = 1;
+  assert.throws(() => validateReleaseFeedArtifact(m), /schemaVersion must be exactly 2/);
+});
+
+test("rejects missing schemaVersion", () => {
+  const m = validManifest();
+  delete m.schemaVersion;
+  assert.throws(() => validateReleaseFeedArtifact(m), /schemaVersion/);
+});
+
+test("rejects invalid tag format", () => {
+  const m = validManifest();
+  m.tag = "not-a-tag";
+  assert.throws(() => validateReleaseFeedArtifact(m), /valid release tag/);
+});
+
+test("rejects non-positive build", () => {
+  const m = validManifest();
+  m.build = 0;
+  assert.throws(() => validateReleaseFeedArtifact(m), /positive integer/);
+});
+
+test("rejects version mismatch with tag", () => {
+  const m = validManifest();
+  m.version = "9.9.9";
+  assert.throws(() => validateReleaseFeedArtifact(m), /tag-derived version/);
+});
+
+// --- Negative fixtures: flat root.android rejection ----------------------------------------------
+
+test("rejects flat root.android with signing fields", () => {
+  const m = validManifest();
+  m.android = { signed: true, url: "https://example.com/a.apk", sha256: "a".repeat(64), size: 100 };
+  assert.throws(() => validateReleaseFeedArtifact(m), /split flavor entries.*flat root\.android/);
+});
+
+test("rejects root.android as array", () => {
+  const m = validManifest();
+  m.android = [VALID_ANDROID_FULL];
+  assert.throws(() => validateReleaseFeedArtifact(m), /must be an object/);
+});
+
+test("rejects empty android object (no flavors)", () => {
+  const m = validManifest();
+  m.android = {};
+  assert.throws(() => validateReleaseFeedArtifact(m), /at least one flavor/);
+});
+
+test("rejects unknown android flavor", () => {
+  const m = validManifest();
+  m.android = { full: VALID_ANDROID_FULL, beta: VALID_ANDROID_PLAY };
+  assert.throws(() => validateReleaseFeedArtifact(m), /unknown flavor "beta"/);
+});
+
+// --- Negative fixtures: per-field Android validation ---------------------------------------------
+
+test("rejects wrong applicationId", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, applicationId: "com.evil.app" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /applicationId must be com\.vortx\.android/);
+});
+
+test("rejects wrong engine for full flavor", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, engine: "media3" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /engine must be "mpv" for the full flavor/);
+});
+
+test("rejects wrong engine for play flavor", () => {
+  const m = validManifest({ android: { play: { ...VALID_ANDROID_PLAY, engine: "mpv" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /engine must be "media3" for the play flavor/);
+});
+
+test("rejects invalid artifactType", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, artifactType: "exe" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /artifactType must be one of/);
+});
+
+test("rejects non-HTTPS URL", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, url: "http://evil.com/a.apk" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /HTTPS/);
+});
+
+test("rejects upper-case SHA-256", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, sha256: "A".repeat(64) } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /lower-case 64-character hex/);
+});
+
+test("rejects short SHA-256", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, sha256: "abc123" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /lower-case 64-character hex/);
+});
+
+test("rejects unsigned entry", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, signed: false } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /signed must be true/);
+});
+
+test("rejects zero-size artifact", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, size: 0 } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /positive integer/);
+});
+
+test("rejects negative size", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, size: -1 } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /positive integer/);
+});
+
+test("rejects Android version mismatch with tag", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, version: "9.9.9" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /version must equal the tag version/);
+});
+
+test("rejects Android build mismatch", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, build: 999 } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /build must equal the release build/);
+});
+
+test("rejects prerelease mismatch", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, prerelease: false } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /prerelease must match/);
+});
+
+test("rejects empty signer", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, signer: "" } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /non-empty string/);
+});
+
+// --- Client-compatible caps ----------------------------------------------------------------------
+
+test("rejects manifest exceeding 512 KiB cap", () => {
+  const hugeNotes = "x".repeat(FEED_CAPS.notesLength + 1);
+  const m = validManifest();
+  m.notes = hugeNotes;
+  // The JSON serialization will exceed 512 KiB
+  const json = JSON.stringify(m);
+  assert.ok(Buffer.byteLength(json, "utf8") > FEED_CAPS.manifestBytes || hugeNotes.length > FEED_CAPS.notesLength);
+  assert.throws(() => validateReleaseFeedArtifact(m), /exceeds.*characters|exceeds.*bytes/);
+});
+
+test("rejects version string exceeding 64 chars", () => {
+  const m = validManifest();
+  m.version = "0." + "1".repeat(63);
+  assert.throws(() => validateReleaseFeedArtifact(m), /exceeds 64 characters/);
+});
+
+test("rejects name exceeding 200 chars", () => {
+  const m = validManifest();
+  m.name = "R".repeat(201);
+  assert.throws(() => validateReleaseFeedArtifact(m), /exceeds 200 characters/);
+});
+
+test("rejects notes exceeding 20,000 chars", () => {
+  const m = validManifest();
+  m.notes = "N".repeat(20_001);
+  assert.throws(() => validateReleaseFeedArtifact(m), /exceeds 20000 characters/);
+});
+
+test("rejects artifact size exceeding 1 GiB cap", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, size: FEED_CAPS.artifactBytes + 1 } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /exceeds maximum/);
+});
+
+test("rejects oversized signer (>256 chars)", () => {
+  const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, signer: "X".repeat(257) } } });
+  assert.throws(() => validateReleaseFeedArtifact(m), /signer is too long/);
+});
+
+// --- Edge cases ----------------------------------------------------------------------------------
+
+test("accepts manifest without notes field", () => {
+  const m = validManifest();
+  delete m.notes;
+  const result = validateReleaseFeedArtifact(m);
+  assert.equal(result.valid, true);
+});
+
+test("accepts manifest with null notes", () => {
+  const m = validManifest();
+  m.notes = null;
+  const result = validateReleaseFeedArtifact(m);
+  assert.equal(result.valid, true);
+});
+
+test("rejects invalid JSON string input", () => {
+  assert.throws(() => validateReleaseFeedArtifact("{invalid json"), /not valid JSON/);
+});
+
+test("rejects non-object manifest", () => {
+  assert.throws(() => validateReleaseFeedArtifact("42"), /must be a JSON object/);
+});
+
+test("rejects manifest without tag", () => {
+  const m = validManifest();
+  delete m.tag;
+  assert.throws(() => validateReleaseFeedArtifact(m), /non-empty string.*tag/);
+});
+
+test("rejects invalid sourceCommit format", () => {
+  const m = validManifest();
+  m.sourceCommit = "not-a-sha";
+  assert.throws(() => validateReleaseFeedArtifact(m), /40-character commit SHA/);
+});
+
+test("accepts manifest without sourceCommit", () => {
+  const m = validManifest();
+  delete m.sourceCommit;
+  const result = validateReleaseFeedArtifact(m);
+  assert.equal(result.valid, true);
 });
