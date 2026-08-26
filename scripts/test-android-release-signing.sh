@@ -48,6 +48,10 @@ if [[ "${MOCK_JARSIGNER_PARTIAL:-0}" == "1" ]]; then
     printf 'jar verified, with signer errors.\n'
     printf 'Error: This jar contains unsigned entries which have not been integrity-checked.\n'
     exit 16
+elif [[ "${MOCK_JARSIGNER_CHAIN_ERROR:-0}" == "1" ]]; then
+    printf 'jar verified, with signer errors.\n'
+    printf 'Error: This jar contains entries whose certificate chain is invalid.\n'
+    exit 4
 elif [[ "${MOCK_JARSIGNER_UNSIGNED:-0}" == "1" ]]; then
     printf 'jar is unsigned.\n'
 else
@@ -118,6 +122,11 @@ partial_output="$(expect_failure "partially unsigned AAB" env "${common_env[@]}"
     MOCK_JARSIGNER_PARTIAL=1 "$VERIFY_SCRIPT" verify "$workdir/release.aab")"
 grep -Fq 'contains unsigned entries' <<<"$partial_output" || fail "partially unsigned bundle error was not explicit"
 printf 'ok: partially unsigned AAB is rejected\n'
+
+strict_output="$(expect_failure "nonzero strict jarsigner status" env "${common_env[@]}" \
+    MOCK_JARSIGNER_CHAIN_ERROR=1 "$VERIFY_SCRIPT" verify "$workdir/release.aab")"
+grep -Fq 'strict verification failed' <<<"$strict_output" || fail "nonzero strict status was not rejected"
+printf 'ok: every nonzero strict jarsigner status is rejected\n'
 
 debug_output="$(expect_failure "Android Debug APK signer" env "${common_env[@]}" \
     MOCK_SUBJECT='CN=Android Debug,O=Android,C=US' MOCK_FINGERPRINT="$EXPECTED_COMPACT" \

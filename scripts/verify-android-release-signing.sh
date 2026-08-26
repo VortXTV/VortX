@@ -129,18 +129,34 @@ verify_bundle() {
 
     [[ -f "$bundle" ]] || { error "Android App Bundle does not exist: $bundle"; return 1; }
     verification_status=0
-    verification_output="$(LC_ALL=C "$jarsigner" -verify -strict -verbose -certs "$bundle" 2>&1)" || verification_status=$?
+    verification_output="$(
+        set -euo pipefail
+        trust_dir="$(mktemp -d)"
+        trap 'rm -rf "$trust_dir"' EXIT
+        trust_store="$trust_dir/signer-trust.p12"
+        signer_certificate="$trust_dir/signer.pem"
+        trust_password="vortx-public-cert-verification"
+        LC_ALL=C "$keytool" -printcert -rfc -jarfile "$bundle" > "$signer_certificate"
+        LC_ALL=C "$keytool" -importcert -noprompt \
+            -alias vortx-release-signer \
+            -file "$signer_certificate" \
+            -keystore "$trust_store" \
+            -storetype PKCS12 \
+            -storepass "$trust_password" >/dev/null 2>&1
+        LC_ALL=C "$jarsigner" -verify -strict -verbose -certs \
+            -keystore "$trust_store" \
+            -storepass "$trust_password" \
+            "$bundle" 2>&1
+    )" || verification_status=$?
     if grep -Eiq 'unsigned entr(y|ies)|\? = unsigned entry|^[[:space:]]*\?' <<<"$verification_output"; then
         error "$bundle contains unsigned entries that were not integrity-checked"
         return 1
     fi
-    # Android signing certificates are self-signed. jarsigner strict returns 4 for that untrusted
-    # certificate chain even when every entry is signed, so only status 0 or chain-only status 4 is safe.
-    if [[ "$verification_status" != "0" && "$verification_status" != "4" ]]; then
+    if [[ "$verification_status" != "0" ]]; then
         error "jarsigner strict verification failed for $bundle with status $verification_status"
         return 1
     fi
-    grep -Eq '^jar verified(\.|, with signer errors\.)$' <<<"$verification_output" || {
+    grep -Eq '^jar verified\.$' <<<"$verification_output" || {
         error "$bundle does not contain a verified JAR signature"
         return 1
     }
