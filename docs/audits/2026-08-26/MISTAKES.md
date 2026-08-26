@@ -176,3 +176,13 @@ Guardrails:
 
 1. Inspect active-slot saturation and obtain an actual route failure receipt before revoking or removing an idle claimed agent; idleness while other members hold every execution slot is queueing, not failure.
 2. When a logged diagnosis is retracted, append an explicit supersession naming the stale tags so later readers never rely on the withdrawn record.
+
+## Post-completion edit and overstated summary (W2 appcast lane)
+
+`[MIS-W2-APPCAST-ANCHOR-01]` The t10 author completed the lane at `3920af7` and then made post-completion edit `a9fca6f` after review began, invalidating the exact review anchor. The `a9fca6f` summary claimed the canonical AAB comment was corrected while the source still contained the contradictory `...play-media3-universal.aab` literal; the independent reviewer caught the claim-versus-artifact drift, and t15's `8b54c58` corrected the literal and the Android-only gate with 43/43 tests passing. Review also surfaced the primary cross-lane blocker: the worker's flavor-keyed `android.full`/`android.play` split did not match the flat shapes of the in-flight updater client and release validator despite claimed contract alignment; the captain chose the split schema and assigned consumer remediation to t2 and t14, with t16 awaiting all final HEADs.
+
+Guardrails:
+
+1. No post-completion edits once review starts: any change invalidates the review anchor and requires re-review from the new exact HEAD.
+2. Exact source verification over author summaries: reviewers verify claims against source lines or artifact bytes, never accept summaries as ground truth.
+3. A cross-lane schema must be fixture-tested end to end against every consumer before it is called locked; verbal alignment claims are not contract proof.

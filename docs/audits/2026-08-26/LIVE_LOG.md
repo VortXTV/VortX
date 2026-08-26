@@ -157,3 +157,12 @@
 - `[W2-T12-SCOPE-01]` Appcast lane: the captain verified the live `vortx-appcast` worker emits only Apple entries and none of the Android install URL, artifact size, or SHA-256 metadata that SEC-01's signed-feed verification consumes. The registered cross-repo worktree `audit/w2-android-metadata` stands at exact baseline `79caab5`, with the Ox Alpha seat appcast-engineer implementing through t10 and independent review by the appcast-reviewer seat in t11. This lane publishes feed metadata only: no deploy and no release. This entry consolidates `[W2-APPCAST-01]` through `[W2-APPCAST-03]` and records the missing-field set in full, including the install URL omitted from the earlier wording.
 - `[W2-T12-SCOPE-02]` SEC-05 server scope: copied edge verifier code exists in `vortx-abuse`, `vortx-sources`, and `vortx-addon-pair`, and inline `VORTX_EDGE_SECRET`/HMAC gates exist in `vortx-watch` and `vortx-oauth-broker`, so closing SEC-05 inside the client app alone is insufficient; see `[W2-SEC05-SERVER-01]` through `[W2-SEC05-SERVER-03]` for the full inventory.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Wave 2 appcast review findings and remediation
+
+- `[W2-APPCAST-T10-01]` The appcast author completed t10 at `3920af7`, then made post-completion edit `a9fca6f` after review had begun, invalidating the exact review anchor.
+- `[W2-APPCAST-CLAIM-01]` The `a9fca6f` summary overstated the change: it claimed the canonical AAB comment was corrected while the source still contained the contradictory `...play-media3-universal.aab` literal (`src/index.js:43` at that revision). The independent reviewer caught the claim-versus-artifact drift.
+- `[W2-APPCAST-T15-01]` Remediation task t15 landed commit `8b54c58` (`fix: accept valid Android-only releases; name canonical Play AAB in comment`), which corrected the literal and the Android-only gate, with 43/43 tests passing and no deploy.
+- `[W2-CROSSSCHEMA-01]` Primary cross-lane blocker found by review: the worker split the feed into `android.full` and `android.play` while the in-flight updater client (t2) and release validator were flat, despite claimed contract alignment. The captain chose the split schema and assigned consumer remediation to t2 and t14; the t16 re-review waits for all final HEADs.
+- `[W2-OPMODEL-02]` The department-operating-model skill was reloaded after the latest skill catalog refresh.
+- Release remains frozen. Nothing has merged.
