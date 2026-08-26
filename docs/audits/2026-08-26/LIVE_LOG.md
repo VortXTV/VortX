@@ -38,3 +38,10 @@
 - `[W1-B-ROUTE-FAIL-01]` The Ox Alpha seat mpv-reviewer failed before producing any verdict on the mpv terminal-state review (t2). No code changed and no result was counted from that seat.
 - The captain atomically reassigned t2 to opencode-go-2/deepseek-v4-flash-vision-exp, the first entry in the CEO fallback order, as attempt 2.
 - All other Ox Alpha lanes remain active. Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Exo lane route failure and compile OOM
+
+- `[W1-C-ROUTE-FAIL-01]` The Ox Alpha seat exo-reviewer also failed before producing any verdict on the ExoPlayer state-machine review (t3). No code changed and no result was counted from that seat.
+- The captain atomically reassigned t3 to opencode-go-2/deepseek-v4-flash-vision-exp per the CEO fallback order as attempt 2.
+- `[W1-C-OOM-01]` The captain-run focused Exo policy tests returned BUILD SUCCESSFUL. A separate compile invocation then failed after 1h25m with a Kotlin compiler out-of-memory error in the unrelated LocalizedMetadataStore.request path. This is classified as an environment-capacity failure pending a controlled higher-memory rerun, not a code verdict.
+- Release remains frozen. Nothing has merged.
