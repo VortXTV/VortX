@@ -1,0 +1,220 @@
+name: Release packaging validation
+
+# REL-03 secretless pull-request validation lane. The privileged release workflows
+# (.github/workflows/android-release.yml, release-tvos.yml) hold signing secrets and the private
+# engine token, so by design they never run on pull requests; before this file existed the first
+# complete exercise of packaging-specific scripts could happen only after merge or during a real
+# release. This lane closes that gap WITHOUT weakening the W1-A signing posture:
+#
+#   - It references NO secrets of any kind (`secrets.` context is banned here; the contract test
+#     scripts/test-release-orchestration-contracts.sh enforces that), fetches NO private repos,
+#     and holds only `contents: read`.
+#   - Android job: exercises the EXACT release packaging tasks from android-release.yml
+#     (assembleFullRelease assemblePlayRelease bundlePlayRelease) against an EPHEMERAL ad-hoc
+#     keystore generated on the runner at run time. Nothing is published from this lane, so the
+#     throwaway identity proves packaging mechanics only; the production four-secret fail-closed
+#     gate, the pinned production signer SHA-256 verification, and the tag/source-commit binding
+#     remain exclusively in the protected release stage.
+#   - Apple job: runs the fixture-driven tests of the packaging/feed scripts that releases call
+#     (release-feed.mjs, gen-altstore-source.py, repackage-ipa.sh) plus a project-build parse of
+#     the real Xcode project manifest. Signed archives and notarization cannot exist without
+#     paid identities, so they stay in the thin protected release stage by construction.
+#
+# Documented limits of what CAN be validated secretlessly (do not silently widen):
+#   - libstremiox_core.so / libvortx_ffi.so come from PRIVATE repos, so the Android APKs built
+#     here carry no engine .so files (the gradle tasks warn-skip exactly as on dev machines).
+#     Engine-linked packaging stays validated by the privileged push/release lanes only.
+#   - No Apple app archive, code-signing identity, or notarization is exercised here.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-packaging-validation-${{ github.workflow_ref }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-release-packaging:
+    name: Ad-hoc Android Full+Play release packaging (secretless)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Toolchain parity with the privileged lanes: same pinned setup-android/setup-gradle/NDK as
+      # android.yml + android-release.yml, so packaging behavior observed here transfers.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
+        run: |
+          yes | sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      # Ephemeral ad-hoc release identity: generated on THIS runner for THIS run only, never
+      # committed, never used to publish, shredded below even on failure. A distinct CN (not
+      # "Android Debug") keeps the no-debug-fallback invariant testable: the verifier below
+      # asserts the exact ad-hoc subject AND rejects any Android Debug certificate.
+      - name: Generate ephemeral ad-hoc release keystore
+        env:
+          ADHOC_STORE_PASS: vortx-adhoc-ci-store
+          ADHOC_KEY_PASS: vortx-adhoc-ci-key
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/adhoc-signing"
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
+            -storetype PKCS12 \
+            -alias adhoc-release \
+            -keyalg RSA -keysize 4096 -validity 1 \
+            -storepass "$ADHOC_STORE_PASS" -keypass "$ADHOC_KEY_PASS" \
+            -dname "CN=VortX CI Ad-hoc Release, O=VortXTV, C=US"
+
+      # Same task set as the privileged release build (android-release.yml), same fail-closed
+      # signing-config path in app/build.gradle.kts (the four VORTX_* inputs are all provided,
+      # pointing at the ephemeral keystore). Engines are intentionally NOT fetched and
+      # VORTX_REQUIRE_ENGINE is NOT set, so both cargo-ndk tasks take the documented dev-machine
+      # warn-and-skip path; every other packaging phase (Kotlin/Compose release compilation,
+      # manifest merge, resources, libmpv native merge, DEX, AGP signing, AAB) is exercised.
+      - name: Build Full+Play release packages with the ephemeral identity
+        working-directory: android
+        env:
+          VORTX_KEYSTORE_PATH: ${{ runner.temp }}/adhoc-signing/adhoc-release.jks
+          VORTX_KEYSTORE_PASSWORD: vortx-adhoc-ci-store
+          VORTX_KEY_ALIAS: adhoc-release
+          VORTX_KEY_PASSWORD: vortx-adhoc-ci-key
+        run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
+
+      - name: Require the exact release package set (two universal APKs, one AAB)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
+          bundles=(android/app/build/outputs/bundle/playRelease/*.aab)
+          if [ ${#apks[@]} -ne 2 ] || [ ${#bundles[@]} -ne 1 ]; then
+            echo "::error::expected exactly two flavor release APKs and one play AAB, found ${#apks[@]} APKs and ${#bundles[@]} AABs"
+            exit 1
+          fi
+          echo "ok: full + play release APKs and playRelease AAB produced"
+
+      # Self-consistency proof of the ad-hoc signature chain, mirroring the strictness of
+      # scripts/verify-android-release-signing.sh (v2 scheme required, single signer, explicit
+      # Android Debug rejection) while comparing against the EPHEMERAL certificate instead of the
+      # production pin. The production pin itself is untouched and lives only in the verify
+      # script used by the release workflow.
+      - name: Verify ad-hoc signatures fail-closed (v2 scheme, pinned-to-run cert, no debug signer)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n1)"
+          [ -x "$apksigner" ] || { echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
+          expected_dn="CN=VortX CI Ad-hoc Release, O=VortXTV, C=US"
+          expected_fp="$("$JAVA_HOME/bin/keytool" -list -v \
+            -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
+            -storetype PKCS12 -storepass vortx-adhoc-ci-store -alias adhoc-release \
+            | sed -n 's/^SHA256:[[:space:]]*//p' | head -n1 | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+          [ -n "$expected_fp" ] || { echo "::error::could not derive the ad-hoc certificate fingerprint from the ephemeral keystore"; exit 1; }
+          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
+          for apk in "${apks[@]}"; do
+            out="$("$apksigner" verify --verbose --print-certs "$apk")"
+            grep -Fq 'Verified using v2 scheme (APK Signature Scheme v2): true' <<<"$out" \
+              || { echo "::error::$apk is not verified with APK Signature Scheme v2"; exit 1; }
+            if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$out"; then
+              echo "::error::$apk is signed by an Android Debug certificate"; exit 1
+            fi
+            count="$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' <<<"$out" | wc -l | tr -d '[:space:]')"
+            [ "$count" = "1" ] || { echo "::error::$apk must report exactly one signer digest, found $count"; exit 1; }
+            fp="$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' <<<"$out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+            [ "$fp" = "$expected_fp" ] || { echo "::error::$apk signer does not match the ephemeral ad-hoc certificate"; exit 1; }
+            dn="$(sed -n 's/^Signer #[0-9][0-9]* certificate DN: //p' <<<"$out")"
+            [ "$dn" = "$expected_dn" ] || { echo "::error::$apk signer DN is not the ad-hoc release identity: $dn"; exit 1; }
+            echo "ok: $apk carries a valid v2 ad-hoc signature bound to the run-local certificate"
+          done
+          bundle="$(ls android/app/build/outputs/bundle/playRelease/*.aab)"
+          jarsigner_out="$("$JAVA_HOME/bin/jarsigner" -verify -strict -verbose "$bundle" 2>&1)" \
+            || { echo "::error::jarsigner strict verification failed for $bundle"; printf '%s\n' "$jarsigner_out"; exit 1; }
+          grep -Eq '^jar verified.$' <<<"$jarsigner_out" \
+            || { echo "::error::$bundle does not contain a verified JAR signature"; exit 1; }
+          bundle_out="$("$JAVA_HOME/bin/keytool" -printcert -jarfile "$bundle")"
+          if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$bundle_out"; then
+            echo "::error::$bundle is signed by an Android Debug certificate"; exit 1
+          fi
+          bundle_count="$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$bundle_out" | wc -l | tr -d '[:space:]')"
+          [ "$bundle_count" = "1" ] || { echo "::error::$bundle must report exactly one signer fingerprint, found $bundle_count"; exit 1; }
+          bundle_fp="$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$bundle_out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+          [ "$bundle_fp" = "$expected_fp" ] || { echo "::error::$bundle signer does not match the ephemeral ad-hoc certificate"; exit 1; }
+          echo "ok: $bundle passes strict JAR verification bound to the run-local certificate"
+
+      # Licensing boundary holds regardless of engines: the play flavor must never contain the
+      # GPL mpv/ffmpeg set, and the full flavor must merge the mavenCentral libmpv natives for
+      # BOTH ABIs (real native-input packaging proof available without the private engines).
+      - name: Enforce the GPL boundary and prove native-lib merge packaging
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          gpl_pattern='lib(mpv|player|avcodec|avformat|avutil)\.so'
+          for apk in android/app/build/outputs/apk/play/release/*.apk; do
+            listing="$(unzip -l "$apk")"
+            if grep -Eq "$gpl_pattern" <<<"$listing"; then
+              echo "::error::GPL native library found in play release APK: $apk"
+              exit 1
+            fi
+          done
+          echo "ok: play flavor is clean of GPL native libraries"
+          full_apk="$(ls android/app/build/outputs/apk/full/release/*.apk)"
+          for abi in arm64-v8a x86_64; do
+            unzip -p "$full_apk" "lib/$abi/libmpv.so" > /dev/null 2>&1 \
+              || { echo "::error::lib/$abi/libmpv.so missing from $full_apk"; exit 1; }
+            echo "ok: $full_apk packages merged native library for $abi"
+          done
+
+      - name: Shred ephemeral ad-hoc keystore
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/adhoc-signing"
+
+  apple-packaging-scripts:
+    name: Apple packaging/feed script contracts (secretless)
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fixture-driven tests of the exact scripts the privileged release lane invokes
+      # (release-tvos.yml calls release-feed.mjs build-artifact/project-build,
+      # gen-altstore-source.py via the AltStore source step, repackage-ipa.sh for IPA packing).
+      - name: Run release-feed contract tests
+        run: node scripts/tests/release-feed.test.mjs
+
+      - name: Run AltStore source generator tests
+        run: python3 scripts/tests/test_gen_altstore_source.py
+
+      - name: Run IPA repackaging tests
+        run: bash scripts/tests/repackage-ipa.test.sh
+
+      # Parse smoke against the REAL project manifest the release lane reads its numeric build
+      # number from; catches project.yml schema drift before a release does.
+      - name: Parse the release build number from the real project manifest
+        run: |
+          set -euo pipefail
+          build="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
+          case "$build" in
+            ''|*[!0-9]*) echo "::error::project-build did not yield a numeric build: $build"; exit 1 ;;
+          esac
+          echo "ok: project.yml parses to numeric build $build"

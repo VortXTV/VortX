@@ -196,6 +196,15 @@ jobs:
             fi
           done
 
+      # REL-02: stage names carry the REAL dimensions of each artifact, never a device split.
+      # The product flavor is the engine/distribution boundary only:
+      #   full-mpv     = sideloaded build carrying the GPLv3 libmpv native engine
+      #   play-media3  = Google Play-bound build carrying only the Media3/ExoPlayer engine
+      # BOTH variants contain the phone AND the Android TV activities (one APK per flavor runs
+      # on both device classes; the flavor never selects a UI), and both are universal APKs:
+      # one binary per flavor packages every shipped ABI (arm64-v8a + x86_64). The canonical
+      # dimension table, old-to-new name mapping, and consumer guidance live in
+      # docs/RELEASE-ARTIFACTS.md.
       - name: Stage verified release assets and provenance
         id: assets
         env:
@@ -211,13 +220,13 @@ jobs:
           test ${#full[@]} -eq 1 && test ${#play[@]} -eq 1 && test ${#bundle[@]} -eq 1 || { echo "::error::expected one full APK, one play APK, and one play AAB"; exit 1; }
           rm -rf dist
           mkdir -p dist
-          cp "${full[0]}" "dist/VortX-${version}-phone.apk"
-          cp "${play[0]}" "dist/VortX-${version}-tv.apk"
-          cp "${bundle[0]}" "dist/VortX-${version}-play.aab"
+          cp "${full[0]}" "dist/VortX-${version}-full-mpv-universal.apk"
+          cp "${play[0]}" "dist/VortX-${version}-play-media3-universal.apk"
+          cp "${bundle[0]}" "dist/VortX-${version}-play-media3.aab"
           scripts/verify-android-release-signing.sh verify \
-            "dist/VortX-${version}-phone.apk" \
-            "dist/VortX-${version}-tv.apk" \
-            "dist/VortX-${version}-play.aab" | tee dist/SIGNING_PROVENANCE.txt
+            "dist/VortX-${version}-full-mpv-universal.apk" \
+            "dist/VortX-${version}-play-media3-universal.apk" \
+            "dist/VortX-${version}-play-media3.aab" | tee dist/SIGNING_PROVENANCE.txt
           {
             echo "release tag: $RELEASE_TAG"
             echo "release tag commit: $RELEASE_TAG_COMMIT"
@@ -226,9 +235,9 @@ jobs:
             echo "workflow run attempt: $GITHUB_RUN_ATTEMPT"
           } >> dist/SIGNING_PROVENANCE.txt
           sha256sum \
-            "dist/VortX-${version}-phone.apk" \
-            "dist/VortX-${version}-tv.apk" \
-            "dist/VortX-${version}-play.aab" > dist/SHA256SUMS
+            "dist/VortX-${version}-full-mpv-universal.apk" \
+            "dist/VortX-${version}-play-media3-universal.apk" \
+            "dist/VortX-${version}-play-media3.aab" > dist/SHA256SUMS
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create or append to the draft release
@@ -244,7 +253,7 @@ jobs:
               exit 1
             fi
           else
-            gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes "Android phone and Android TV beta artifacts."
+            gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes "Android beta artifacts are named by engine and distribution, never by device: full-mpv-universal.apk is the sideloaded GPL mpv-engine build, play-media3-universal.apk and play-media3.aab are the Google Play Media3 builds. Every variant contains both the phone and the Android TV user interface. See docs/RELEASE-ARTIFACTS.md."
           fi
           gh release upload "$RELEASE_TAG" \
             dist/*.apk \

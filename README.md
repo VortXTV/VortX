@@ -181,7 +181,7 @@ Everything the apps do today (Apple TV shown; iPhone, iPad, and Mac are at parit
 
 ## Installing
 
-The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the `VortX-tvOS-x.y.z.ipa` build with torrents, and the smaller **Lite** build `VortX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), the **macOS app** as a `.dmg`, and the **Android APK** `VortX-Android-vx.y.z.apk` (one build for phone and Android TV). None of this requires a jailbreak.
+The builds are attached to the [latest release](../../releases/latest): the **iOS IPA** (covers both iPhone and iPad), two **Apple TV IPAs** (the `VortX-tvOS-x.y.z.ipa` build with torrents, and the smaller **Lite** build `VortX-tvOS-lite-x.y.z.ipa` for debrid and direct links only, see "Two builds" above), the **macOS app** as a `.dmg`, and the **Android APKs**, named by engine and distribution rather than by device (see [docs/RELEASE-ARTIFACTS.md](docs/RELEASE-ARTIFACTS.md)): `VortX-x.y.z-full-mpv-universal.apk` is the sideloaded mpv-engine build, and every Android build covers phone and Android TV in one package. None of this requires a jailbreak.
 
 **Is it safe, and why the extra setup?** VortX is open-source and handed out here on GitHub, not through the App Store, and it is not yet signed with an Apple Developer identity (that needs a paid Apple Developer account, which is on the roadmap). Because Apple does not recognize the signature, iPhone, iPad, and Apple TV need the app re-signed with an Apple ID before they will run it, and macOS shows a "could not verify it is free of malware" warning the first time you open it. That warning means "Apple does not know who signed this," not that anything is wrong: every line of code is in this repository, the binaries are built by the public GitHub Actions workflow in [.github/workflows](.github/workflows) so you can read exactly what goes into them, and you can build them yourself (see "Building it yourself" below). Once there is a Developer ID, the Mac app gets notarized, the warning disappears, and the apps may move to TestFlight or the App Store.
 
@@ -239,9 +239,9 @@ Torrents work on the Mac too (it bundles the streaming server). If you only use 
 
 ### Android (the .apk): sideload and open
 
-The Android app is a single APK that runs on both phone and Android TV. It is a beta, debug-signed for testing, so there is no Play Store listing yet. On Android TV or Fire TV, the quick way is the **Downloader** app: enter **`dl.vortx.tv`** and it always fetches the newest APK.
+The Android app ships as a single APK per flavor that runs on both phone and Android TV. It is a beta, signed with the project's production release key by the fail-closed release workflow, so there is no Play Store listing yet. On Android TV or Fire TV, the quick way is the **Downloader** app: enter **`dl.vortx.tv`** and it always fetches the newest APK.
 
-1. From the [latest release](../../releases/latest), download `VortX-Android-vx.y.z.apk`.
+1. From the [latest release](../../releases/latest), download `VortX-x.y.z-full-mpv-universal.apk` (the sideloaded mpv-engine build; artifact names are explained in [docs/RELEASE-ARTIFACTS.md](docs/RELEASE-ARTIFACTS.md)).
 2. Open it from your browser or a file manager, and allow installs from that app when Android prompts (unknown-source installs stay blocked until you allow that one app).
 3. Open VortX and sign in with your VortX account.
 
