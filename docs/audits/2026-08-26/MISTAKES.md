@@ -152,7 +152,7 @@ Guardrails:
 
 ## Single-platform feed output hides client trust gaps
 
-`[MIS-W2-APPCAST-GAP-01]` Scoping SEC-01 production completeness revealed that the live vortx-appcast worker emits only Apple platform artifacts and carries no Android size or SHA-256 metadata. Had scope not been widened to the cross-repo appcast lane (t10 authoring plus independent t11 review), the Android updater's signed-feed verification requirement would have silently lacked its production feeder while the client-side fix looked complete.
+`[MIS-W2-APPCAST-GAP-01]` Scoping SEC-01 production completeness revealed that the live vortx-appcast worker emits only Apple platform artifacts and carries no Android size or SHA-256 metadata. Had scope not been widened to the cross-repo appcast lane (t10 authoring plus independent t11 review), the Android updater's signed-feed verification requirement would have silently lacked its production feeder while the client-side fix looked complete. Addendum: the missing Android field set includes the install URL itself, not only size and digest; feed completeness means every consumed field (URL, size, digest) present for every platform the feed serves.
 
 Guardrails:
 

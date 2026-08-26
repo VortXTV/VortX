@@ -151,3 +151,9 @@
 - `[W2-SEAT-CORRECTION-03]` The captain erred by removing a healthy queued seat without a route failure receipt and by sending contradictory queued notes during the episode. No code or result was lost, and t1 remains with release-engineer-2 at attempt 2.
 - `[W2-SEAT-CORRECTION-04]` Scope completeness note for the same task description: the appcast expansion (`[W2-APPCAST-01]` through `[W2-APPCAST-03]`, commit `59bcdb599`) and the SEC-05 multi-repo server inventory (`[W2-SEC05-SERVER-01]` through `[W2-SEC05-SERVER-03]`, commit `06c0e5a37`) are already recorded and stand unchanged.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Wave 2 scope record for t12
+
+- `[W2-T12-SCOPE-01]` Appcast lane: the captain verified the live `vortx-appcast` worker emits only Apple entries and none of the Android install URL, artifact size, or SHA-256 metadata that SEC-01's signed-feed verification consumes. The registered cross-repo worktree `audit/w2-android-metadata` stands at exact baseline `79caab5`, with the Ox Alpha seat appcast-engineer implementing through t10 and independent review by the appcast-reviewer seat in t11. This lane publishes feed metadata only: no deploy and no release. This entry consolidates `[W2-APPCAST-01]` through `[W2-APPCAST-03]` and records the missing-field set in full, including the install URL omitted from the earlier wording.
+- `[W2-T12-SCOPE-02]` SEC-05 server scope: copied edge verifier code exists in `vortx-abuse`, `vortx-sources`, and `vortx-addon-pair`, and inline `VORTX_EDGE_SECRET`/HMAC gates exist in `vortx-watch` and `vortx-oauth-broker`, so closing SEC-05 inside the client app alone is insufficient; see `[W2-SEC05-SERVER-01]` through `[W2-SEC05-SERVER-03]` for the full inventory.
+- Release remains frozen. Nothing has merged.
