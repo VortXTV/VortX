@@ -179,4 +179,5 @@
   - sources `e12072c458f74181a4b5d547516b5f2f2e18a786` = origin/main
   - addon-pair `5139fbb0758a2cb83d4ec1ef1c8bb996a474cc48` = origin/main
   - watch `c2828eb1752ce0950f4031fdc6ded34af7ff0a04` = origin/main
+- [W2-BACKUP-SYMLINK-01] Backup worktree at cdec98ad6 stalled with 10 tracked MPVKit‑DVFEL deletions and untracked app/Resources/fonts due to absolute symlinks into canonical checkout. Captain repaired vendor with git restore --worktree, confirming real directory with 10 tracked files and clean status, then removed the fonts symlink after verifying zero tracked entries; backup worktree now only has intended README.md dirty.
 - Release remains frozen. Nothing has merged.

@@ -199,6 +199,14 @@ Guardrails:
 
 ## Wave 2 route recovery guardrails
 
+## Backup symlink and secretary verification mistakes
+
+### Backup worktree symlink issue
+- Backup worktree at `cdec98ad6` stalled with 10 tracked `MPVKit‑DVFEL` deletions and an untracked `app/Resources/fonts` symlink due to absolute symlinks into the canonical checkout. The captain repaired the vendor directory with `git restore --worktree`, confirming it became a real directory with the 10 tracked files and clean status, then removed the fonts symlink after verifying zero tracked entries. The backup worktree now only has the intended `README.md` dirty.
+
+### Secretary verification mistake
+- Secretary `t32` first claimed complete while the docs remained dirty and the HEAD unchanged. Captain verification rejected the claim, requested an actual commit, then verified the clean exact commit `4de13202278b77f469fb8155487c91c14392aa4d` and pushed `main`. Guardrail: secretary completion requires exact HEAD and clean status, not merely written content.
+
 `[MIS-W2-ROUTE-RECOVERY-01]` After goal continuation, original Ox Alpha members sat idle with dirty preserved worktrees on t3, t14, and t18. Repeated wakes and same-owner retries produced no turns. Fresh Ox replacements emitted explicit failed-before-finish receipts. The fallback ladder ran DeepSeek V4 Flash Vision max (failed all three), DeepSeek V4 Pro max (failed all three), then Qwen 3.7 Max (succeeded, continuing preserved work as attempt 10). No dirty code was lost and no stale output was accepted. Separately, the scheduler claimed t9 before t18; the captain parked t9 with assignee=captain until t18 reaches terminal state. The manager attempted five add_member calls at team cap 8; all were rejected atomically with no state change, and only the completed appcast author seat was rotated to free a slot.
 
 Guardrails:
