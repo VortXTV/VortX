@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Paths the updater's FileProvider may share (SEC-01/SEC-07). Narrowest possible surface: ONLY the
+     private cache/update/ directory UpdateChecker stages verified update APKs into. Nothing else in the
+     app is shareable through this provider, and the provider itself is not exported, so a content URI from
+     here can only ever name a fully verified staged update. -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path
+        name="update"
+        path="update/" />
+</paths>

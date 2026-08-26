@@ -21,7 +21,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -33,21 +32,26 @@ import com.vortx.android.ui.theme.VortXTheme
 /**
  * The passive "update available" banner, shared by the phone Settings screen and the TV About section. Reads
  * [UpdateChecker.available] and renders nothing when up to date (or when the user dismissed this build), so a
- * caller places it unconditionally. Tapping it opens the install channel (the APK / AltStore source / the
- * releases page). Android is sideloaded, so this is a HAND-OFF to install, never an in-place overwrite.
+ * caller places it unconditionally.
+ *
+ * Tapping it starts the SECURE pipeline ([UpdateChecker.prepareInstall]): the APK is downloaded into the
+ * app-private cache and verified (size, SHA-256, package identity, pinned signer) BEFORE any installer is
+ * involved. The banner never opens a URL itself; the hand-off happens through [UpdatePromptDialog] once the
+ * artifact is [UpdateChecker.InstallPhase.Ready].
  */
 @Composable
 fun UpdateAvailableBanner(modifier: Modifier = Modifier) {
     val release by UpdateChecker.available.collectAsStateWithLifecycle()
+    val phase by UpdateChecker.installPhase.collectAsStateWithLifecycle()
     val current = release ?: return
     val colors = VortXTheme.colors
-    val uriHandler = LocalUriHandler.current
+    val context = LocalContext.current.applicationContext
     Row(
         modifier = modifier
             .fillMaxWidth()
             .clip(VortXShapes.card)
             .background(colors.accentSoft)
-            .clickable { uriHandler.openUri(current.installUrl) }
+            .clickable { UpdateChecker.prepareInstall(context) }
             .padding(horizontal = VortXTheme.spacing.md, vertical = VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         verticalAlignment = Alignment.CenterVertically,
@@ -64,8 +68,15 @@ fun UpdateAvailableBanner(modifier: Modifier = Modifier) {
             )
         }
         Text(
-            "Get",
-            style = VortXTheme.type.label.copy(color = colors.accent, fontWeight = FontWeight.SemiBold),
+            when {
+                phase is UpdateChecker.InstallPhase.Downloading -> "${phasePercent(phase)}%"
+                phase is UpdateChecker.InstallPhase.Ready -> "Install"
+                else -> "Get"
+            },
+            style = VortXTheme.type.label.copy(
+                color = colors.accent,
+                fontWeight = FontWeight.SemiBold,
+            ),
         )
     }
 }
@@ -77,22 +88,27 @@ fun UpdateAvailableBanner(modifier: Modifier = Modifier) {
  */
 @Composable
 fun UpdatePromptHost() {
-    val appContext = LocalContext.current.applicationContext
     val prompt by UpdateChecker.prompt.collectAsStateWithLifecycle()
     prompt?.let { release ->
-        UpdatePromptDialog(release = release, onDismiss = { UpdateChecker.dismissPrompt(appContext) })
+        UpdatePromptDialog(release = release)
     }
 }
 
 /**
- * The modal "an update is available" popup. "Get the update" opens the install channel then dismisses;
- * "Later" dismisses for this build this launch. The Android analogue of `UpdatePromptView.swift`.
+ * The modal "an update is available" popup, shared verbatim by the phone shell and the TV shell.
+ *
+ * Button semantics (SEC-07):
+ *  - the PRIMARY button starts the secure download/verify pipeline and flips to "Install now" only once the
+ *    artifact is fully verified; it hands off to the system installer via FileProvider, never to a browser;
+ *  - "Later" dismisses for THIS PROCESS ONLY (the reminder returns next launch);
+ *  - "Skip this version" durably suppresses exactly this build until a newer one ships.
  */
 @Composable
-fun UpdatePromptDialog(release: UpdateChecker.Release, onDismiss: () -> Unit) {
+fun UpdatePromptDialog(release: UpdateChecker.Release) {
     val colors = VortXTheme.colors
-    val uriHandler = LocalUriHandler.current
-    Dialog(onDismissRequest = onDismiss) {
+    val context = LocalContext.current.applicationContext
+    val phase by UpdateChecker.installPhase.collectAsStateWithLifecycle()
+    Dialog(onDismissRequest = { UpdateChecker.later() }) {
         Column(
             modifier = Modifier
                 .clip(VortXShapes.card)
@@ -128,21 +144,47 @@ fun UpdatePromptDialog(release: UpdateChecker.Release, onDismiss: () -> Unit) {
                     Text(release.notes, style = VortXTheme.type.body.copy(color = colors.textSecondary))
                 }
             }
+            when (val state = phase) {
+                is UpdateChecker.InstallPhase.Failed -> Text(
+                    state.reason,
+                    style = VortXTheme.type.label.copy(color = colors.textSecondary),
+                )
+                is UpdateChecker.InstallPhase.Downloading -> Text(
+                    "Downloading update… ${statePercent(state)}%",
+                    style = VortXTheme.type.label.copy(color = colors.textSecondary),
+                )
+                else -> Unit
+            }
+            val ready = phase is UpdateChecker.InstallPhase.Ready
             Button(
                 onClick = {
-                    uriHandler.openUri(release.installUrl)
-                    onDismiss()
+                    when {
+                        ready -> UpdateChecker.launchInstall(context)
+                        phase !is UpdateChecker.InstallPhase.Downloading -> UpdateChecker.prepareInstall(context)
+                        else -> Unit // a download is already in flight; wait for its terminal phase
+                    }
                 },
                 modifier = Modifier.fillMaxWidth(),
+                enabled = phase !is UpdateChecker.InstallPhase.Downloading || ready,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = colors.accent,
                     contentColor = colors.onAccent,
                 ),
             ) {
-                Text("Get the update", style = VortXTheme.type.cardTitle)
+                Text(
+                    when {
+                        ready -> "Install now"
+                        phase is UpdateChecker.InstallPhase.Downloading -> "Downloading…"
+                        else -> "Get the update"
+                    },
+                    style = VortXTheme.type.cardTitle,
+                )
             }
-            TextButton(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+            TextButton(onClick = { UpdateChecker.later() }, modifier = Modifier.fillMaxWidth()) {
                 Text("Later", style = VortXTheme.type.label.copy(color = colors.textPrimary))
+            }
+            TextButton(onClick = { UpdateChecker.skipVersion(context) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Skip this version", style = VortXTheme.type.label.copy(color = colors.textSecondary))
             }
         }
     }
@@ -153,3 +195,14 @@ private fun versionLine(release: UpdateChecker.Release): String {
     val build = "build ${release.build}"
     return if (version.isBlank()) build else "$version ($build)"
 }
+
+/** Percent for the banner label; clamped defensively so a zero/odd total can never divide by zero. */
+private fun phasePercent(phase: UpdateChecker.InstallPhase): Int = when (phase) {
+    is UpdateChecker.InstallPhase.Downloading ->
+        if (phase.total > 0) ((phase.received * 100) / phase.total).toInt().coerceIn(0, 100) else 0
+    is UpdateChecker.InstallPhase.Ready -> 100
+    else -> 0
+}
+
+private fun statePercent(state: UpdateChecker.InstallPhase.Downloading): Int =
+    if (state.total > 0) ((state.received * 100) / state.total).toInt().coerceIn(0, 100) else 0

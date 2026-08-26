@@ -137,6 +137,21 @@
             android:foregroundServiceType="dataSync"
             tools:node="merge" />
 
+        <!-- Updater install hand-off (SEC-01/SEC-07). The ONLY route a downloaded update APK takes out of
+             the app: UpdateChecker stages the verified artifact in the PRIVATE cache dir and hands a
+             content:// URI (never a file path, never a remote URL) to the system installer via
+             ACTION_VIEW + FLAG_GRANT_READ_URI_PERMISSION. Not exported; access is granted per-Intent and
+             read-only, and only for files under cache/update/ that passed size+digest+signer verification. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths" />
+        </provider>
+
         <service
             android:name=".communityjs.CommunityJsBrokerService"
             android:exported="false"
