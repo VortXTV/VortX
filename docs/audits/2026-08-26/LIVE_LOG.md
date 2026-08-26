@@ -32,3 +32,9 @@
 - `[W1-STAFFING-01]` The captain initially spawned the five Wave 1 seats as inherited gpt-5.6-sol subagents despite the CEO ordering Ox Alpha. The CEO caught the deviation; active GPT turns were interrupted, and all five Wave 1 seats were restarted under explicit provider/model opencode-go-2/ox-alpha-free.
 - That route exposes no selectable reasoning-effort tier, so its sole/default mode is being used with maximum-rigor briefs in place of an effort dial. On route failure the fallback order is DeepSeek V4 Flash Vision, then DeepSeek V4 Pro, then Qwen or other configured providers.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Ox Alpha route failure on the Wave 1 mpv lane
+
+- `[W1-B-ROUTE-FAIL-01]` The Ox Alpha seat mpv-reviewer failed before producing any verdict on the mpv terminal-state review (t2). No code changed and no result was counted from that seat.
+- The captain atomically reassigned t2 to opencode-go-2/deepseek-v4-flash-vision-exp, the first entry in the CEO fallback order, as attempt 2.
+- All other Ox Alpha lanes remain active. Release remains frozen. Nothing has merged.
