@@ -89,3 +89,17 @@
   3. Inherited upstream JNI null/exception/global-ref nits.
   4. The debug APK lacked the Rust engine libraries because `cargo`/`coreDir` were unavailable, so the physical/device/release artifact gate must be rebuilt with Rust and cargo-ndk and the native engine libs verified.
 - Release remains frozen.
+
+## 2026-08-26 - W1-D approved and integrated
+
+- `[W1-D-APPROVE-01]` The W1-D author sequence is `04f2d364c` (immutable `PlaybackContext`), `00b6a9435` (history owner seam, exactly the five granted production files plus three relevant tests), and `ef89ff974` (owner-token binding), followed by the formatting commit `9c523a9d6`.
+- The captain caught that the new `PlaybackContext.owner` field was carried but not consumed, before it reached stale review, and revoked t15.
+- `t16` bound an exact five-field `ContinueWatchingOwner` beside the context through an `expectedOwner` fail-closed mutation fence.
+- `t15` APPROVED the full lane at `ef89ff974`, and `t22` extended approval to `9c523a9d6`.
+- The captain integrated only the final safe tree as a squashed main commit `80ceaeff0` (`fix(android): bind offline playback identity end to end`). The full FullDebug suite plus the credentialed Full and Play release compiles passed (83 tasks / 5m07s), main was pushed, outputs were cleaned, and the clean lane worktree was retired after diff-hash equality.
+- `[W1-D-PREDEFECT-01]` The pre-existing Play UNIT-TEST source-set defect (shared `MpvPlayerHttpPropertiesTest` references full-only `MpvConfig`/`MpvPlayer`) is now tied to the W1-B/CI-test wave; it is the same defect recorded as `[W1-C-PREDEFECT-01]` and is not a W1-D regression.
+- Release remains frozen.
+
+## 2026-08-26 - Wave 1 exit
+
+- `[W1-EXIT-01]` Wave 1 is complete: every lane W1-A through W1-E was independently reviewed, integrated, pushed, and green. No public artifact was produced. Release remains frozen, and Wave 2 may begin.

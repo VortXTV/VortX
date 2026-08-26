@@ -107,3 +107,17 @@ Guardrail:
 Guardrail:
 
 1. A tag/version/SHA citation must be verified against the primary source (the tag's actual commit and its ancestry), never assumed from the version string. Record the corrected target and a complete delta inventory before treating upstream provenance or license claims as confirmed.
+
+## Offline playback identity owner binding (W1-D)
+
+`[MIS-W1-D-OWNER-01]` The initial W1-D author commit introduced an immutable `PlaybackContext.owner`, but the captain caught that the field was carried without being consumed or enforced at the authority seam. Had the stale review not been revoked, the unused field would have shipped. t16 then bound an exact five-field `ContinueWatchingOwner` beside the context through an `expectedOwner` fail-closed mutation fence, and the full lane was approved.
+
+`[MIS-W1-D-TOKEN-01]` Async owner binding, done correctly, requires the full principal/revision token captured at launch so a later mutation can fail closed against `expectedOwner`; a partial or ad-hoc token cannot prove the world did not move on between capture and use.
+
+`[MIS-W1-D-REVIEW-01]` A review of an outdated author HEAD is stale the moment the final HEAD changes. When the lane advances, the prior approval must be revoked atomically so it cannot be mistaken for an approval of the updated lane.
+
+Guardrails:
+
+1. Immutable identity fields must be consumed and enforced at the authority seam, not merely carried. Unused or un-enforced identity is dead weight and must be caught before it reaches review.
+2. Async owner binding requires the full principal/revision token captured at launch, so the mutation can fail closed on `expectedOwner` when the world has moved on.
+3. Revoke stale reviews atomically whenever the final HEAD changes, so a previous approval is never read as approving the updated lane.
