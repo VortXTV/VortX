@@ -5,6 +5,93 @@ import Combine
 import UIKit
 #endif
 
+enum DownloadStartDisposition: Equatable {
+    case started
+    case rejected
+    case deferred
+}
+
+struct DownloadSchedulerCoordinator {
+    enum Transport: Equatable {
+        case byte
+        case hls
+
+        var weight: Int { 1 }
+    }
+
+    private(set) var pendingReconciliationCallbacks = 0
+    private(set) var drainInProgress = false
+    private(set) var drainRequested = false
+
+    var admissionAllowed: Bool { pendingReconciliationCallbacks == 0 && !drainInProgress }
+
+    mutating func beginDrain() -> Bool {
+        guard admissionAllowed else {
+            drainRequested = true
+            return false
+        }
+        drainInProgress = true
+        drainRequested = false
+        return true
+    }
+
+    /// Releases the active drain and reports whether one coalesced pass should run after release.
+    mutating func finishDrain() -> Bool {
+        guard drainInProgress else { return false }
+        drainInProgress = false
+        return drainRequested && pendingReconciliationCallbacks == 0
+    }
+
+    mutating func beginReconciliation(callbackCount: Int) {
+        guard callbackCount > 0 else { return }
+        pendingReconciliationCallbacks += callbackCount
+    }
+
+    /// Returns true only when this callback drains the final outstanding reconciliation claim.
+    mutating func completeReconciliationCallback() -> Bool {
+        guard pendingReconciliationCallbacks > 0 else { return false }
+        pendingReconciliationCallbacks -= 1
+        return pendingReconciliationCallbacks == 0
+    }
+
+    @discardableResult
+    static func drain<Item>(
+        limit: Int,
+        activeWeight: inout Int,
+        queued: [Item],
+        transport: (Item) -> Transport,
+        start: (Item) -> DownloadStartDisposition
+    ) -> [DownloadStartDisposition] {
+        var dispositions: [DownloadStartDisposition] = []
+        for item in queued {
+            let weight = transport(item).weight
+            guard activeWeight + weight <= limit else { continue }
+            let disposition = start(item)
+            dispositions.append(disposition)
+            if disposition == .started { activeWeight += weight }
+        }
+        return dispositions
+    }
+
+    static func postMutationValue<Value>(_ fallback: Value, current: () -> Value?) -> Value {
+        current() ?? fallback
+    }
+}
+
+enum DownloadSourceClassification: Equatable {
+    case byte
+    case hls
+}
+
+enum DownloadSourceClassifier {
+    static func classify(url: URL, hintedFilename: String?) -> DownloadSourceClassification {
+        if url.pathExtension.lowercased() == "m3u8" { return .hls }
+        if let hintedFilename,
+           URL(fileURLWithPath: hintedFilename).pathExtension.lowercased() == "m3u8" { return .hls }
+        return .byte
+    }
+}
+
 /// The file-writing core for offline downloads. ONE download = GET an http(s) URL to a local file. There
 /// are TWO transport MODES, picked by `stream.isTorrent`, sharing this one core:
 ///
@@ -80,6 +167,10 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Resume data captured on pause / recoverable failure, so resume() can continue instead of restart.
     private var resumeData: [UUID: Data] = [:]
 
+    /// Admission remains closed while any selected background-session reconciliation callback is outstanding.
+    /// The pure coordinator combines overlapping reconnect calls into one counter and opens only at zero.
+    private var schedulerCoordinator = DownloadSchedulerCoordinator()
+
     /// Per-record count of UNLOCKED, non-ENOSPC NSURLErrorCannotCreateFile (-3000) save failures. Drives the
     /// BOUNDED unlocked-retry policy (`DownloadFailureClassifier`): a transient staging failure self-heals and
     /// parks, but a genuinely terminal -3000 hard-fails once the count passes `maxUnlockedSaveFailures` instead
@@ -108,6 +199,8 @@ final class DownloadManager: NSObject, ObservableObject {
     /// destination must be resolvable WITHOUT hopping to the main actor. The box is its own thread-safe
     /// (`NSLock`-guarded) `Sendable` type, so it's safe to read from either thread.
     nonisolated let destinations = DownloadDestinationMap()
+
+    private static let hlsProgressScaleValue: Int64 = 10_000
 
     #if os(iOS)
     /// HLS callback state lives outside the main actor because AVFoundation delivers finish callbacks on its
@@ -205,7 +298,7 @@ final class DownloadManager: NSObject, ObservableObject {
     private var recordForAssetTask: [Int: UUID] = [:]
     /// Fixed denominator for HLS progress (AVFoundation reports loaded/expected TIME, not bytes): the record's
     /// `bytesDone`/`bytesTotal` are set to `fraction * this` so the existing progress bar works unchanged.
-    private static let hlsProgressScale: Int64 = 10_000
+    private static let hlsProgressScale = hlsProgressScaleValue
     #endif
 
     // MARK: Public API
@@ -217,64 +310,35 @@ final class DownloadManager: NSObject, ObservableObject {
     func download(stream: CoreStream, meta: PlaybackMeta, resolvedURL: URL,
                   sourceName: String?, qualityText: String?) -> DownloadRecord {
         if let existing = store.records.first(where: { $0.videoId == meta.videoId && $0.state != .failed }) {
-            // A paused download is resumable: tapping Download again on a paused title should resume it, not
-            // return the paused record unchanged (which read as a silent no-op).
             if existing.state == .paused { resume(id: existing.id) }
-            return existing
+            return DownloadSchedulerCoordinator.postMutationValue(existing) { self.store.record(id: existing.id) }
         }
 
-        // Honor the concurrency cap: only start now if a slot is free; otherwise create the record
-        // `.queued` and let it start when a running download finishes / fails / is cancelled / paused.
         let id = UUID()
-        let ext = fileExtension(for: resolvedURL)
-        // HLS sources (adaptive .m3u8) cannot be saved by a single-file download task - it fetches only the
-        // playlist, not the media segments. On iOS we download them PROPERLY with AVAssetDownloadTask into a
-        // system-managed .movpkg (played back through AVPlayer); on tvOS and native macOS AVAssetDownloadURLSession
-        // is unavailable, so we fail honestly there (a .movpkg is device-local and never reaches those anyway).
-        // (Embed pages that don't end in .m3u8 are caught post-download by the content sniff in
-        // didFinishDownloadingTo.) Reported by a community user with the ok.ru add-on. Torrents are exempt (they
-        // go through the loopback server, not a media URL).
-        if !stream.isTorrent, Self.isHLSPlaylistURL(resolvedURL) {
-            #if os(iOS)
-            return startHLSDownload(id: id, ext: ext, meta: meta, stream: stream, resolvedURL: resolvedURL,
-                                    sourceName: sourceName, qualityText: qualityText)
-            #else
-            let failedRecord = DownloadRecord(
-                id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
-                name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
-                sourceName: sourceName, qualityText: qualityText, isTorrent: false,
-                headers: stream.requestHeaders, remoteURL: resolvedURL.absoluteString,
-                localFilename: "\(id.uuidString).\(ext)", state: .failed)
-            store.upsert(failedRecord)
-            store.update(id: id) { $0.errorText = String(localized: "This source streams in segments (HLS), which can't be saved for offline on this device yet. Download it on iPhone or iPad.") }
-            return failedRecord
-            #endif
+        let initialClassification: DownloadSourceClassification = stream.isTorrent
+            ? .byte
+            : DownloadSourceClassifier.classify(
+                url: resolvedURL,
+                hintedFilename: stream.behaviorHints?.filename)
+        let localFilename: String
+        switch initialClassification {
+        case .byte: localFilename = "\(id.uuidString).\(fileExtension(for: resolvedURL))"
+        case .hls: localFilename = "\(id.uuidString).movpkg"
         }
-
-        // Honor the concurrency cap: start now only if a slot is free, else create the record `.queued` and
-        // let it start when a running download finishes / fails / is cancelled / paused (start-next-on-finish).
-        let canStartNow = activeCount < maxConcurrentDownloads
         let record = DownloadRecord(
             id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
             name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
             sourceName: sourceName, qualityText: qualityText, isTorrent: stream.isTorrent,
             headers: stream.requestHeaders, remoteURL: resolvedURL.absoluteString,
-            localFilename: "\(id.uuidString).\(ext)", state: canStartNow ? .downloading : .queued)
+            localFilename: localFilename, state: .queued)
         store.upsert(record)
+        appendToQueueOrder(record.id)
 
-        // Defensive: iOS does NOT auto-create Application Support, so make sure the Downloads dir exists
-        // before the background session or the completion move ever needs it. Rules out a missing container
-        // as the "cannot create file (-3000)" cause. Route through ensureDownloadsDirectoryExists() (not a bare
-        // createDirectory) so the CompleteUntilFirstUserAuthentication protection class is applied here too, or
-        // a locked-device completion still trips -3000; the completion move also ensures it, this is belt+braces.
+        // Defensive: iOS does not auto-create Application Support. Create the destination before any
+        // background daemon stages bytes, while leaving index durability behavior unchanged for Wave 3.
         try? DownloadStore.ensureDownloadsDirectoryExists()
-
-        if canStartNow {
-            startTask(for: record, url: resolvedURL)
-        } else {
-            appendToQueueOrder(record.id)   // record it in the reorderable drain order (queue manager)
-        }
-        return record
+        fillAvailableSlots()
+        return DownloadSchedulerCoordinator.postMutationValue(record) { self.store.record(id: record.id) }
     }
 
     func pause(id: UUID) {
@@ -285,6 +349,7 @@ final class DownloadManager: NSObject, ObservableObject {
         if let assetTask = assetTaskForRecord[id] {
             assetTask.suspend()
             store.update(id: id) { $0.state = .paused; $0.taskIdentifier = nil }
+            fillAvailableSlots()
             return
         }
         #endif
@@ -292,6 +357,7 @@ final class DownloadManager: NSObject, ObservableObject {
         guard let task = taskForRecord[id] else {
             if store.record(id: id)?.state == .queued {
                 store.update(id: id) { $0.state = .paused; $0.taskIdentifier = nil }
+                fillAvailableSlots()
             }
             return
         }
@@ -306,60 +372,25 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     func resume(id: UUID) {
-        guard let record = store.record(id: id) else { return }
-        #if os(iOS)
-        // HLS downloads bypass the byte-download concurrency cap (a separate session). Resume a suspended live
-        // task, else re-create the asset task (AVFoundation auto-resumes the partial download, incl. post-relaunch).
-        if isHLSRecord(record) {
-            store.update(id: id) { $0.state = .downloading; $0.errorText = nil }
-            if let assetTask = assetTaskForRecord[id] { assetTask.resume() } else { beginHLSAssetTask(for: record) }
-            return
-        }
-        #endif
-        // Respect the concurrency cap on resume too: if every slot is busy, re-queue instead of
-        // starting now, so resuming several paused items can't blow past the cap. It starts when a
-        // slot frees (start-next-on-finish), exactly like a freshly-queued download.
-        guard activeCount < maxConcurrentDownloads else {
-            store.update(id: id) { $0.state = .queued }
-            appendToQueueOrder(id)   // rejoins the drain order at the tail (queue manager)
-            return
-        }
-        store.update(id: id) { $0.state = .downloading }
-        // Background-session resume data must be resumed on the SAME session kind it was produced on.
-        let session = record.isTorrent ? foregroundSession : backgroundSession
-        let task: URLSessionDownloadTask
-        if let data = resumeData[id] {
-            task = session.downloadTask(withResumeData: data)
-            resumeData[id] = nil
-        } else if let url = URL(string: record.remoteURL) {
-            task = makeTask(on: session, url: url, headers: record.headers)
-        } else {
-            store.update(id: id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
-            return
-        }
-        bind(task: task, to: id, on: session)
-        // Persist the destination filename ON the task: a background URLSession serializes `taskDescription`,
-        // so it survives the app-suspend/relaunch that wipes the in-memory `destinations` + `recordForTask`
-        // maps. The relaunched delegate reads it back to recover where to move the finished temp file (the
-        // "cannot create file" root cause: the in-memory map was empty in the relaunched process).
-        task.taskDescription = record.localFilename
-        destinations.set(store.fileURL(for: record), for: Self.taskKey(session, task.taskIdentifier))
-        beginForegroundAssertionIfNeeded(for: record)
-        task.resume()
+        guard store.record(id: id) != nil else { return }
+        store.update(id: id) { $0.state = .queued; $0.errorText = nil; $0.taskIdentifier = nil }
+        appendToQueueOrder(id)
+        fillAvailableSlots()
     }
 
     /// Cancel and remove the download entirely (task + record + on-disk file).
     func cancel(id: UUID) {
         taskForRecord[id]?.cancel()
-        clearTask(id: id)
-        resumeData[id] = nil
-        unlockedSaveFailures[id] = nil
-        awaitingUnlockRetry.remove(id)
         #if os(iOS)
         cancelAssetTask(id: id)
         #endif
+        clearTask(id: id, drainQueue: false)
+        resumeData[id] = nil
+        unlockedSaveFailures[id] = nil
+        awaitingUnlockRetry.remove(id)
         store.remove(id: id)
         pruneQueueOrder()
+        fillAvailableSlots()
     }
 
     // MARK: Queue manager (concurrency cap + reorder)
@@ -376,7 +407,7 @@ final class DownloadManager: NSObject, ObservableObject {
         guard clamped != maxConcurrentDownloads else { return }
         maxConcurrentDownloads = clamped
         UserDefaults.standard.set(clamped, forKey: Self.maxConcurrentDefaultsKey)
-        fillAvailableSlots()   // no-op when the cap dropped (activeCount already >= cap)
+        fillAvailableSlots()   // no-op when the cap dropped and activeWeight already meets it
     }
 
     /// `.queued` records in the exact order they will start: explicit `queueOrder` first, then `addedAt`
@@ -420,6 +451,12 @@ final class DownloadManager: NSObject, ObservableObject {
         UserDefaults.standard.set(queueOrder.map(\.uuidString), forKey: Self.queueOrderDefaultsKey)
     }
 
+    private func prependToQueueOrder(_ id: UUID) {
+        queueOrder.removeAll { $0 == id }
+        queueOrder.insert(id, at: 0)
+        UserDefaults.standard.set(queueOrder.map(\.uuidString), forKey: Self.queueOrderDefaultsKey)
+    }
+
     /// Drop ids whose record is gone (cancelled / auto-deleted). State flips (queued <-> downloading <->
     /// paused) are left in place so a paused item keeps its position when it re-queues. Persists only on a
     /// real change, so an ordinary terminal transition with a clean order pays nothing.
@@ -430,20 +467,22 @@ final class DownloadManager: NSObject, ObservableObject {
         UserDefaults.standard.set(filtered.map(\.uuidString), forKey: Self.queueOrderDefaultsKey)
     }
 
-    /// Pull queued downloads into EVERY free slot. `startNextQueued` starts one and re-arms itself from
-    /// `clearTask` on the next finish, but a cap raise opens several slots at once, so loop until the cap
-    /// is met or the queue is empty. Guarded against a no-progress spin: if a pass neither starts a task
-    /// nor shrinks the queue (e.g. every remaining record has a broken URL and was failed), stop.
+    /// The sole media-task starter. One ordered pass starts every item admitted by the aggregate weighted cap.
+    /// Rejected and deferred records do not stop later queued work from using an available slot.
     private func fillAvailableSlots() {
-        func queuedCount() -> Int { store.records.filter { $0.state == .queued }.count }
-        while activeCount < maxConcurrentDownloads {
-            let beforeActive = activeCount
-            let beforeQueued = queuedCount()
-            startNextQueued()
-            // No forward progress (no task started AND the queue did not shrink) means the remainder is
-            // unstartable this pass; stop rather than spin.
-            if activeCount == beforeActive, queuedCount() == beforeQueued { break }
+        guard schedulerCoordinator.beginDrain() else { return }
+        defer {
+            if schedulerCoordinator.finishDrain() {
+                fillAvailableSlots()
+            }
         }
+        var projectedWeight = activeWeight
+        DownloadSchedulerCoordinator.drain(
+            limit: maxConcurrentDownloads,
+            activeWeight: &projectedWeight,
+            queued: orderedQueuedRecords(),
+            transport: { self.transport(for: $0) },
+            start: { self.startQueued($0) })
     }
 
     // MARK: Task lifecycle
@@ -472,16 +511,23 @@ final class DownloadManager: NSObject, ObservableObject {
         return free < remaining + 200 * 1024 * 1024
     }
 
-    private func startTask(for record: DownloadRecord, url: URL) {
+    private func startTask(for record: DownloadRecord, url: URL) -> DownloadStartDisposition {
         if storageShortfall(for: record) {
             store.update(id: record.id) {
                 $0.state = .failed
                 $0.errorText = "Not enough storage to save this download. Free up space and try again."
             }
-            return
+            return .rejected
         }
         let session = record.isTorrent ? foregroundSession : backgroundSession
-        let task = makeTask(on: session, url: url, headers: record.headers)
+        let task: URLSessionDownloadTask
+        if let data = resumeData[record.id] {
+            task = session.downloadTask(withResumeData: data)
+            resumeData[record.id] = nil
+        } else {
+            task = makeTask(on: session, url: url, headers: record.headers)
+        }
+        store.update(id: record.id) { $0.state = .downloading; $0.errorText = nil }
         bind(task: task, to: record.id, on: session)
         // Persist the destination filename on the task (survives relaunch via the background session). See
         // the matching note in resume(): this is how the off-main delegate recovers the destination after a
@@ -501,42 +547,34 @@ final class DownloadManager: NSObject, ObservableObject {
         // log users actually attach, which is why #132 could not be diagnosed from two rounds of reports.
         logDownload("START id=\(record.id.uuidString) host=\(url.host ?? "?") torrent=\(record.isTorrent) session=\(record.isTorrent ? "fg" : "bg")")
         task.resume()
+        return .started
     }
 
     #if os(iOS)
     // MARK: HLS offline (AVAssetDownloadTask -> .movpkg)
 
-    /// Start an offline HLS download (iOS only). AVFoundation writes a system-managed `.movpkg` (we never move
-    /// it); on completion we persist its home-relative path in `hlsRelativePath`, which routes offline playback
-    /// through AVPlayer. HLS downloads bypass the byte-download concurrency queue (a separate mechanism).
-    private func startHLSDownload(id: UUID, ext: String, meta: PlaybackMeta, stream: CoreStream, resolvedURL: URL,
-                                  sourceName: String?, qualityText: String?) -> DownloadRecord {
-        let record = DownloadRecord(
-            id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
-            name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
-            sourceName: sourceName, qualityText: qualityText, isTorrent: false,
-            headers: stream.requestHeaders, remoteURL: resolvedURL.absoluteString,
-            localFilename: "\(id.uuidString).\(ext)",
-            bytesTotal: Self.hlsProgressScale, bytesDone: 0, state: .downloading)
-        store.upsert(record)
-        beginHLSAssetTask(for: record)
-        return record
-    }
-
-    /// Create (or re-create, for resume) the AVAssetDownloadTask for an HLS record. AVFoundation resumes a
-    /// partially-downloaded asset automatically when a new task is made for the same asset, so this also serves
-    /// as the resume path after a relaunch wiped the in-memory task.
-    private func beginHLSAssetTask(for record: DownloadRecord) {
+    /// Create or resume the HLS task after the shared scheduler admits its aggregate weight.
+    private func beginHLSAssetTask(for record: DownloadRecord) -> DownloadStartDisposition {
+        if let task = assetTaskForRecord[record.id] {
+            store.update(id: record.id) { $0.state = .downloading; $0.errorText = nil }
+            task.resume()
+            return .started
+        }
         guard let url = URL(string: record.remoteURL) else {
             store.update(id: record.id) { $0.state = .failed; $0.errorText = String(localized: "Invalid source URL") }
-            return
+            return .rejected
         }
         let options: [String: Any]? = (record.headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": record.headers!]
         let asset = AVURLAsset(url: url, options: options)
         guard let task = hlsAssetSession.makeAssetDownloadTask(asset: asset, assetTitle: record.displayTitle,
                                                                assetArtworkData: nil, options: nil) else {
             store.update(id: record.id) { $0.state = .failed; $0.errorText = String(localized: "This HLS source can't be downloaded (it may be protected or unavailable).") }
-            return
+            return .rejected
+        }
+        store.update(id: record.id) {
+            $0.state = .downloading
+            $0.errorText = nil
+            $0.bytesTotal = Self.hlsProgressScale
         }
         task.taskDescription = record.id.uuidString
         assetTaskForRecord[record.id] = task
@@ -545,6 +583,7 @@ final class DownloadManager: NSObject, ObservableObject {
         // uuid in taskDescription still serves as the fallback match). Cosmetic field.
         store.update(id: record.id) { $0.taskIdentifier = task.taskIdentifier }
         task.resume()
+        return .started
     }
 
     /// Record id for an asset task, recovering across a relaunch (in-memory map empty) via the uuid stored in
@@ -598,9 +637,10 @@ final class DownloadManager: NSObject, ObservableObject {
         return false
     }
 
-    /// True when a record's source is an HLS `.m3u8` (so pause/resume/cancel route to the asset session).
     private func isHLSRecord(_ record: DownloadRecord) -> Bool {
-        record.remoteURL.range(of: ".m3u8", options: .caseInsensitive) != nil
+        if record.localFilename.hasSuffix(".movpkg") { return true }
+        guard let url = URL(string: record.remoteURL) else { return false }
+        return DownloadSourceClassifier.classify(url: url, hintedFilename: nil) == .hls
     }
     #endif
 
@@ -621,52 +661,61 @@ final class DownloadManager: NSObject, ObservableObject {
         store.update(id: id) { $0.taskIdentifier = task.taskIdentifier }
     }
 
-    private func clearTask(id: UUID) {
+    private func clearTask(id: UUID, drainQueue: Bool = true) {
         if let task = taskForRecord[id] {
             let tid = task.taskIdentifier
-            // The task lives in exactly ONE of the two byte sessions; clear both possible keys (only one exists).
             for s in [foregroundSession, backgroundSession] {
                 recordForTask[Self.taskKey(s, tid)] = nil
                 destinations.remove(Self.taskKey(s, tid))
             }
         }
         taskForRecord[id] = nil
-        lastProgressPush[id] = nil   // do not leak the throttle entry across a terminal transition
-        // NOTE: unlockedSaveFailures is intentionally NOT cleared here. It must survive the self-heal
-        // restart / park cycle so the bounded -3000 retry cap accrues instead of resetting every attempt
-        // (the reset was the defect that made the unlocked-persistent -3000 loop re-download forever). It is
-        // cleared only on success (didFinishDownloadingTo), cancel, or the hard-fail branch.
-        // The record no longer has a live task; drop the persisted identifier so a later relaunch never
-        // tries to reconnect a task that is gone. No-op if the record was already removed (cancel).
+        lastProgressPush[id] = nil
         if store.record(id: id) != nil { store.update(id: id) { $0.taskIdentifier = nil } }
         endForegroundAssertionIfIdle()
-        // Keep the reorderable drain order free of ids whose record is gone, then pull the next queued
-        // download into the slot that just freed (finish / fail / pause / cancel).
         pruneQueueOrder()
-        startNextQueued()
+        if drainQueue { fillAvailableSlots() }
     }
 
     // MARK: Concurrency queue
 
-    /// Live download tasks in flight. A `.queued` / `.paused` record has no task, so this is exactly the
-    /// count of running downloads, which is what the cap gates on.
-    private var activeCount: Int { taskForRecord.count }
-
-    /// Start the next `.queued` download if a slot is free. Picks the head of the reorderable drain order
-    /// (`orderedQueuedRecords`, which falls back to earliest-added), so the queue drains in the order the
-    /// user set in the queue manager, or request order when untouched. Fail-soft: a queued record whose
-    /// source URL no longer parses is marked `.failed` and skipped, so one bad URL can't wedge the queue.
-    private func startNextQueued() {
-        guard activeCount < maxConcurrentDownloads else { return }
-        guard let next = orderedQueuedRecords().first else { return }
-        guard let url = URL(string: next.remoteURL) else {
-            store.update(id: next.id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
-            // Skipping a broken record freed nothing, but another queued record may now be startable.
-            startNextQueued()
-            return
+    private var activeWeight: Int {
+        var weight = taskForRecord.count
+        #if os(iOS)
+        weight += assetTaskForRecord.keys.reduce(into: 0) { total, id in
+            if store.record(id: id)?.state == .downloading { total += DownloadSchedulerCoordinator.Transport.hls.weight }
         }
-        store.update(id: next.id) { $0.state = .downloading }
-        startTask(for: next, url: url)
+        #endif
+        return weight
+    }
+
+    private func transport(for record: DownloadRecord) -> DownloadSchedulerCoordinator.Transport {
+        #if os(iOS)
+        if isHLSRecord(record) { return .hls }
+        #else
+        if record.localFilename.hasSuffix(".movpkg") { return .hls }
+        #endif
+        return .byte
+    }
+
+    private func startQueued(_ record: DownloadRecord) -> DownloadStartDisposition {
+        guard record.state == .queued else { return .deferred }
+        guard let url = URL(string: record.remoteURL) else {
+            store.update(id: record.id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
+            return .rejected
+        }
+        if transport(for: record) == .hls {
+            #if os(iOS)
+            return beginHLSAssetTask(for: record)
+            #else
+            store.update(id: record.id) {
+                $0.state = .failed
+                $0.errorText = String(localized: "This source streams in segments (HLS), which can't be saved for offline on this device yet. Download it on iPhone or iPad.")
+            }
+            return .rejected
+            #endif
+        }
+        return startTask(for: record, url: url)
     }
 
     private func recordID(for task: URLSessionTask, on session: URLSession) -> UUID? { recordForTask[Self.taskKey(session, task.taskIdentifier)] }
@@ -742,9 +791,11 @@ final class DownloadManager: NSObject, ObservableObject {
             hlsIdentifier: hlsIdentifier,
             hasInFlightRecords: hasInFlight)
         guard !sessions.isEmpty else {
+            fillAvailableSlots()
             Self.finishBackgroundEventWork(barrier)
             return
         }
+        schedulerCoordinator.beginReconciliation(callbackCount: sessions.count)
         for session in sessions { reconnect(session: session, barrier: barrier) }
     }
 
@@ -758,10 +809,9 @@ final class DownloadManager: NSObject, ObservableObject {
             let byteSession = backgroundSession
             byteSession.getAllTasks { tasks in
                 let downloadTasks = tasks.compactMap { $0 as? URLSessionDownloadTask }
-                Task { @MainActor [weak self] in
-                    defer { Self.finishBackgroundEventWork(barrier) }
-                    guard let self else { return }
-                    self.reconcileByteTasks(downloadTasks)
+                Task { @MainActor [self] in
+                    defer { finishReconciliationCallback(barrier: barrier) }
+                    reconcileByteTasks(downloadTasks)
                 }
             }
         case .hlsAsset:
@@ -770,15 +820,21 @@ final class DownloadManager: NSObject, ObservableObject {
             let assetSession = hlsAssetSession
             assetSession.getAllTasks { tasks in
                 let assetTasks = tasks.compactMap { $0 as? AVAssetDownloadTask }
-                Task { @MainActor [weak self] in
-                    defer { Self.finishBackgroundEventWork(barrier) }
-                    guard let self else { return }
-                    self.reconcileAssetTasks(assetTasks)
+                Task { @MainActor [self] in
+                    defer { finishReconciliationCallback(barrier: barrier) }
+                    reconcileAssetTasks(assetTasks)
                 }
             }
             #else
-            Self.finishBackgroundEventWork(barrier)
+            finishReconciliationCallback(barrier: barrier)
             #endif
+        }
+    }
+
+    private func finishReconciliationCallback(barrier: HLSBackgroundEventBarrier?) {
+        Self.finishBackgroundEventWork(barrier)
+        if schedulerCoordinator.completeReconciliationCallback() {
+            fillAvailableSlots()
         }
     }
 
@@ -998,14 +1054,6 @@ final class DownloadManager: NSObject, ObservableObject {
         }
     }
 
-    /// True when a resolved playback URL is an adaptive HLS playlist (.m3u8): a single-file download task
-    /// only fetches the tiny playlist, not the media segments. Cheap string check, no network. `nonisolated`
-    /// (pure) so the off-main download delegate can call it too.
-    nonisolated private static func isHLSPlaylistURL(_ url: URL) -> Bool {
-        if url.pathExtension.lowercased() == "m3u8" { return true }
-        return url.absoluteString.lowercased().contains(".m3u8")
-    }
-
     /// Sniff a finished download's first bytes: an HLS playlist (#EXTM3U) or an HTML embed page (from an
     /// add-on that hands back a web page rather than a media file, e.g. ok.ru) is NOT a real media download.
     /// Real media starts with binary magic (mp4 ftyp box, mkv EBML, MPEG-TS 0x47), which never decodes to
@@ -1220,7 +1268,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
             // The tally is deliberately NOT reset by clearTask, so the cap accrues across restart/park cycles.
             if ns.code == NSURLErrorCannotCreateFile,
                let record = self.store.record(id: id), !record.isTorrent,
-               let url = URL(string: record.remoteURL) {
+               URL(string: record.remoteURL) != nil {
                 let unlocked = self.isProtectedDataAvailable
                 let outOfSpace = DownloadFailureClassifier.isOutOfSpace(error)
                 if unlocked && !outOfSpace { self.unlockedSaveFailures[id, default: 0] += 1 }
@@ -1240,11 +1288,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
                     self.logDownload("-3000 parked for unlock/foreground retry id=\(id.uuidString) unlocked=\(unlocked) attempts=\(attempts) detail=\(Self.downloadFailureDetail(error))")
                     return
                 case .selfHealRestart:
-                    self.resumeData[id] = nil   // drop stale resume data: restart from scratch for a fresh stage
-                    self.clearTask(id: id)
-                    self.logDownload("-3000 self-heal restart id=\(id.uuidString) attempts=\(attempts) detail=\(Self.downloadFailureDetail(error))")
-                    self.store.update(id: id) { $0.state = .downloading; $0.errorText = nil }
-                    self.startTask(for: record, url: url)
+                    self.resumeData[id] = nil
+                    self.clearTask(id: id, drainQueue: false)
+                    self.logDownload("-3000 self-heal requeued id=\(id.uuidString) attempts=\(attempts) detail=\(Self.downloadFailureDetail(error))")
+                    self.store.update(id: id) { $0.state = .queued; $0.errorText = nil }
+                    self.prependToQueueOrder(id)
+                    self.fillAvailableSlots()
                     return
                 case .hardFail:
                     // Out of space, or the unlocked-retry cap is exhausted: stop retrying and surface the real
@@ -1289,6 +1338,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap { UUID(uuidString: $0) }
                 self.recordForAssetTask[taskId] = nil
                 if let id { self.assetTaskForRecord[id] = nil; self.lastProgressPush[id] = nil }
+                self.fillAvailableSlots()
             }
             return
         }
@@ -1336,6 +1386,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
             self.recordForAssetTask[taskId] = nil
             self.assetTaskForRecord[id] = nil
             self.lastProgressPush[id] = nil
+            self.fillAvailableSlots()
         }
     }
     #endif
