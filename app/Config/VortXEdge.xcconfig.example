@@ -1,7 +1,11 @@
 // VortXEdge.xcconfig.example  --  COMMITTED TEMPLATE (no real secret here).
 //
 // Copy this to `VortXEdge.xcconfig` (same directory) and fill in the real value to enable
-// client-side request signing against the hardened VortX edge workers:
+// client-side request signing for our edge workers. WHAT PROVISIONING BUYS (SEC-05, be honest):
+// attribution + abuse friction ONLY (per-key telemetry, rate limits, revocation). Any secret shipped
+// in a client is recoverable by extraction, so this layer is NOT an authorization boundary and grants
+// no privilege; privileged endpoints ride server-issued short-lived tokens (the MOAT seam), never
+// this value:
 //
 //     cp app/Config/VortXEdge.xcconfig.example app/Config/VortXEdge.xcconfig
 //
@@ -15,9 +19,9 @@
 // at runtime SourcesShared/VortXEdgeAuth.swift de-masks it back to the hex secret and signs requests to OUR
 // gated edge hosts (skip / trickplay / ratings / poster / erdb / trailer .vortx.tv) with X-VX-Ts + X-VX-Sig.
 //
-// DO NOT paste the raw 64-char hex key here. The de-mask path (VortXEdgeAuth.swift:72-82) XORs whatever it
-// finds against the mask, so a raw-hex value de-masks to non-hex bytes, fails the 64-hex validity check, and
-// SILENTLY collapses the secret to empty: no build error, no runtime warning, signing just turns into a
+// DO NOT paste the raw 64-char hex key here. The de-mask path (VortXEdgeAuth.deMaskedSecret) XORs whatever
+// it finds against the mask, so a raw-hex value de-masks to non-hex bytes, fails the 64-hex validity check,
+// and SILENTLY collapses the secret to empty: no build error, no runtime warning, signing just turns into a
 // no-op, and the day enforce is flipped on every such build is locked out with no visible cause. Always run
 // the value through maskedValue(for:) first.
 //

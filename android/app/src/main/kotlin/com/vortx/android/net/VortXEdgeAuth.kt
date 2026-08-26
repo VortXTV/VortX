@@ -8,16 +8,36 @@ import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * Client-side request signing for the hardened VortX edge workers. Kotlin port of the Apple
- * `app/SourcesShared/VortXEdgeAuth.swift`, matched BYTE-FOR-BYTE so an Android-signed request verifies
- * against the SAME Cloudflare Workers (skip / trickplay / ratings / poster / erdb / trailer / catalogs /
- * config / subtitles / add-pair) as an Apple- or web-signed one.
+ * Client-side request signing for the VortX edge workers (SEC-05 remediation: OPTIONAL ABUSE-FRICTION
+ * TELEMETRY, NEVER AUTHORIZATION). Kotlin port of the Apple `app/SourcesShared/VortXEdgeAuth.swift`,
+ * matched BYTE-FOR-BYTE so an Android-signed request verifies against the SAME Cloudflare Workers (skip /
+ * trickplay / ratings / poster / erdb / trailer / catalogs / config / subtitles / add-pair) as an Apple-
+ * or web-signed one.
  *
- * VortX's first-party edge services are fronted by workers that verify an HMAC signature so a request can
- * be attributed to a real VortX build rather than a scraper leeching the keyless endpoints. [sign] is the
- * one place that stamps a request; every HTTP call site that targets one of OUR gated hosts runs the
- * outgoing request through it right before it is sent. [signedUrl] is the header-less variant for image
- * GETs (Coil / `<img>`), which cannot attach `X-VX-*` headers.
+ * HONEST CLASSIFICATION: every secret shipped inside a client is recoverable by anyone who extracts the
+ * app binary, so this shared HMAC layer is NOT an authentication or authorization boundary and nothing may
+ * rely on it as one. Possession confers NO privilege and NO identity. All it buys is:
+ *  - ATTRIBUTION: first-party workers can tell signed traffic apart from other traffic well enough to count
+ *    and log it per key id, and
+ *  - ABUSE FRICTION: the operators can rate-limit, flag datacenter-origin traffic, and revoke a leaked or
+ *    abusive key id. Unsigned traffic stays valid in observe mode; enforce mode denies it.
+ *
+ * WHERE PRIVILEGED AUTHORIZATION ACTUALLY LIVES (do not move it onto this layer):
+ *  - Account-scoped entitlement uses SHORT-LIVED SERVER-ISSUED credentials: the ~24h MOAT token the
+ *    api.vortx.tv account worker mints at login (`/v1/moat/token`, authenticated with the account session
+ *    bearer) and the moat data workers verify offline via their shared `moat_auth.ts`. Clients mint/cache/
+ *    stamp it in [com.vortx.android.moat.MoatToken]. Nothing in THIS object derives, stores, or stands in
+ *    for such a token, and any FUTURE privileged endpoint must ride the same server-issued seam (an issuer
+ *    + verifier pair like moat_auth), never this shared secret.
+ *  - The Apple side additionally signs oauth.vortx.tv broker calls with this shared secret because the
+ *    DEPLOYED broker fail-closes on it; that remains quota-protection friction with no security value
+ *    against a determined extractor (blocked scope: fixing it requires re-architecting the deployed broker
+ *    service in its own repo). Android has no such call site today, so [GATED_HOSTS] deliberately omits
+ *    oauth.vortx.tv.
+ *
+ * [sign] is the one place that stamps a request; every HTTP call site that targets one of OUR gated hosts
+ * runs the outgoing request through it right before it is sent. [signedUrl] is the header-less variant for
+ * image GETs (Coil / `<img>`), which cannot attach `X-VX-*` headers.
  *
  * THREAT MODEL (be honest, same as Apple): a secret embedded in a CLIENT is never truly non-extractable.
  * This is DETERRENCE + REVOCATION, not a wall:
@@ -25,8 +45,9 @@ import javax.crypto.spec.SecretKeySpec
  *      injects only a MASKED (XOR + base64) blob (read below from `BuildConfig.VORTX_EDGE_SECRET`, the
  *      Android build-config channel that parallels the Apple Info.plist key), and the mask is assembled at
  *      runtime from two scattered byte fragments, so a casual `strings`/`unzip` of the APK yields nothing
- *      usable. Pulling the real key requires actually reverse-engineering the de-mask path. The plaintext
- *      key is NEVER a literal in this source, exactly as on Apple.
+ *      usable. Pulling the real key requires actually reverse-engineering the de-mask path. This raises RE
+ *      COST ONLY; it does not make the secret secret. The plaintext key is NEVER a literal in this source,
+ *      exactly as on Apple.
  *   2. KEY VERSIONING + ROTATION: every request carries a key id ([KEY_ID], `X-VX-Kid`). The workers hold
  *      a MAP of id -> secret and can REVOKE an id and roll to a new id WITHOUT breaking already-installed
  *      builds still signing with a still-valid id.
@@ -47,7 +68,7 @@ import javax.crypto.spec.SecretKeySpec
  * 64-hex secret, then ship it via `buildConfigField("String", "VORTX_EDGE_SECRET", "\"<masked>\"")` paired
  * with a matching [KEY_ID] and the id -> secret entry on the workers, BEFORE the build ships. The mask
  * fragments below are the SAME bytes as Apple, so a masked blob provisioned on either platform de-masks
- * identically.
+ * identically. Provisioning enables friction + attribution ONLY; it grants the build no authorization.
  */
 object VortXEdgeAuth {
     private const val TS_HEADER = "X-VX-Ts"
@@ -112,7 +133,22 @@ object VortXEdgeAuth {
      * base64( XOR(secretUTF8, mask-repeated) ). Absent/empty/malformed => "" (no-op signing, observe-safe),
      * matching the Apple `secret`. Read once (lazy), never crashes. Never stored as plaintext in source.
      */
-    private val secret: String by lazy { resolveSecret() }
+    private val secret: String by lazy { deMaskedSecret(readMaskedSecret()) }
+
+    /**
+     * Pure core of the provisioning pipeline (visible for tests): de-mask a build-injected blob into the
+     * real 64-hex secret STRING, or "" for anything absent/malformed/non-64-hex (treated as unprovisioned
+     * rather than signed with garbage). No I/O, no state, never throws. Mirrors the Apple
+     * `VortXEdgeAuth.deMaskedSecret(fromMasked:)`.
+     */
+    internal fun deMaskedSecret(masked: String?): String {
+        val trimmed = masked?.trim()?.takeIf { it.isNotEmpty() } ?: return ""
+        val blob = runCatching { Base64.getDecoder().decode(trimmed) }.getOrNull()
+        if (blob == null || blob.isEmpty() || MASK.isEmpty()) return ""
+        val out = ByteArray(blob.size) { i -> (blob[i].toInt() xor MASK[i % MASK.size].toInt()).toByte() }
+        val s = out.toString(Charsets.UTF_8)
+        return if (s.length == 64 && s.all { it.isHexDigitChar() }) s else ""
+    }
 
     /** Cache guard for [signedUrl] (`signedUrl` may be called from many image-load threads). */
     private val cacheLock = Any()
@@ -287,21 +323,6 @@ object VortXEdgeAuth {
         val sb = StringBuilder(digest.size * 2)
         for (b in digest) sb.append("%02x".format(b.toInt() and 0xFF))
         return sb.toString()
-    }
-
-    /**
-     * De-mask the build-injected masked blob into the real 64-hex secret. Mirrors the Apple `secret`
-     * computed property: read the masked value, base64-decode it, XOR by the repeated [MASK], and require a
-     * 64-char hex result; anything else (absent field, bad base64, placeholder config) => "" (no-op,
-     * observe-safe). Never throws.
-     */
-    private fun resolveSecret(): String {
-        val masked = readMaskedSecret()?.trim()?.takeIf { it.isNotEmpty() } ?: return ""
-        val blob = runCatching { Base64.getDecoder().decode(masked) }.getOrNull()
-        if (blob == null || blob.isEmpty() || MASK.isEmpty()) return ""
-        val out = ByteArray(blob.size) { i -> (blob[i].toInt() xor MASK[i % MASK.size].toInt()).toByte() }
-        val s = out.toString(Charsets.UTF_8)
-        return if (s.length == 64 && s.all { it.isHexDigitChar() }) s else ""
     }
 
     /**

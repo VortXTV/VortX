@@ -1,21 +1,45 @@
 import Foundation
 import CryptoKit
 
-/// Client-side request signing for the hardened VortX edge workers.
+/// Client-side request signing for the VortX edge workers (SEC-05 remediation: OPTIONAL ABUSE-FRICTION
+/// TELEMETRY, NEVER AUTHORIZATION).
 ///
-/// VortX's first-party edge services (skip / trickplay / ratings / poster / erdb / trailer / catalogs /
-/// config / subtitles / add-pair) are fronted by Cloudflare Workers that verify an HMAC signature so a
-/// request can be attributed to a real VortX build rather than a scraper leeching the keyless endpoints.
-/// `sign(_:)` is the one place that stamps a request; every URLSession call site that targets one of OUR
-/// gated hosts runs the outgoing `URLRequest` through it right before it is sent.
+/// HONEST CLASSIFICATION: every secret shipped inside a client is recoverable by anyone who extracts the
+/// app binary, so this shared HMAC layer is NOT an authentication or authorization boundary and nothing
+/// may rely on it as one. Possession confers NO privilege and NO identity. All it buys is:
+///   - ATTRIBUTION: first-party workers can tell signed traffic apart from other traffic well enough to
+///     count and log it per key id, and
+///   - ABUSE FRICTION: the operators can rate-limit, flag datacenter-origin traffic, and revoke a leaked
+///     or abusive key id. Unsigned traffic stays valid in observe mode; enforce mode denies it. That is
+///     friction against lazy scraping, not a wall against a determined extractor.
+///
+/// WHERE PRIVILEGED AUTHORIZATION ACTUALLY LIVES (do not move it onto this layer):
+///   - Account-scoped entitlement uses SHORT-LIVED SERVER-ISSUED credentials: the ~24h MOAT token the
+///     api.vortx.tv account worker mints at login (`/v1/moat/token`, authenticated with the account
+///     session bearer) and the moat data workers verify offline via their shared `moat_auth.ts`. Clients
+///     mint/cache/stamp it in MoatToken (this directory + the Kotlin port). Nothing in THIS file derives,
+///     stores, or stands in for such a token, and any FUTURE privileged endpoint must ride the same
+///     server-issued seam (an issuer + verifier pair like moat_auth), never this shared secret.
+///   - PROVEN BOUNDARY / BLOCKED SCOPE: oauth.vortx.tv currently gates its four Trakt broker routes on
+///     the SAME shared HMAC (VORTX-OAUTH-V2, fail closed), so broker access today rests on a recoverable
+///     client secret. Fixing that means re-architecting the DEPLOYED broker service (pre-login
+///     short-lived token issuance), which lives in its own repo and deployment and cannot be done from
+///     this client repository. Until then `signOAuthV2` below is exactly what the deployed wire contract
+///     demands: quota-protection friction for VortX's Trakt app credentials, with zero security value
+///     against anyone willing to extract the secret.
+///
+/// WIRE PURPOSE (mechanics unchanged): `sign(_:)` is the one place that stamps a request; every URLSession
+/// call site that targets one of OUR gated hosts runs the outgoing `URLRequest` through it right before it
+/// is sent, so the workers can attribute the call and apply per-key friction/telemetry.
 ///
 /// THREAT MODEL (be honest): a secret embedded in a CLIENT is never truly non-extractable, and a sideloaded
 /// app cannot use App Attest / DeviceCheck (no valid app identity). So this is DETERRENCE + REVOCATION, not
 /// a wall:
 ///   1. OBFUSCATION: the secret is NEVER stored or shipped as a contiguous plaintext string. Info.plist
 ///      carries only a MASKED (XOR + base64) blob, and the mask is assembled at runtime from scattered
-///      byte fragments, so `strings`/`plutil`/a casual unzip of the .ipa yields nothing usable. Pulling the
-///      real key requires actually reverse-engineering the de-mask path.
+///      byte fragments, so `strings`/`plutil`/a casual unzip of the .ipa yields nothing usable. Pulling
+///      the real key requires actually reverse-engineering the de-mask path. This raises RE COST ONLY;
+///      it does not make the secret secret.
 ///   2. KEY VERSIONING + ROTATION: every request carries a key id (`X-VX-Kid`). The workers hold a MAP of
 ///      id -> secret and can REVOKE an id (kill any leaked/extracted key, and anyone who scraped it) and
 ///      roll to a new id, WITHOUT breaking already-sideloaded builds still signing with a still-valid id.
@@ -23,7 +47,8 @@ import CryptoKit
 ///   3. OBSERVE -> ENFORCE stays: with an empty/absent secret this is a safe no-op the workers allow, so
 ///      the web client + older builds keep working until every shipping client signs and we flip enforce.
 /// The long-term move (compiled-Rust vortx-core holding the key) raises the RE cost further; see the Brain
-/// note vortx-core-native-features-and-moat. This is the strongest we can do in a sideloaded Swift client now.
+/// note vortx-core-native-features-and-moat. It would still be a recoverable client secret: friction, not
+/// authority.
 ///
 /// THE SIGNING CONTRACT (must match the workers byte-for-byte):
 ///   - Header `X-VX-Ts`:  current unix time in SECONDS, integer string.
@@ -97,10 +122,17 @@ enum VortXEdgeAuth {
     /// base64( XOR(secretUTF8, mask-repeated) ). Absent/empty/malformed => "" (no-op signing, observe-safe).
     /// Never stored as plaintext anywhere in the shipped bundle. Read once, cached; never crashes.
     private static let secret: String = {
-        guard let masked = (Bundle.main.object(forInfoDictionaryKey: "VortXEdgeSecret") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !masked.isEmpty,
-            let blob = Data(base64Encoded: masked), !blob.isEmpty, !mask.isEmpty
-        else { return "" }
+        let masked = (Bundle.main.object(forInfoDictionaryKey: "VortXEdgeSecret") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return deMaskedSecret(fromMasked: masked)
+    }()
+
+    /// Pure core of the provisioning pipeline (visible for tests): de-mask a build-injected blob into the
+    /// real 64-hex secret STRING, or "" for anything absent/malformed/non-64-hex (treated as unprovisioned
+    /// rather than signed with garbage). No I/O, no state, never throws.
+    static func deMaskedSecret(fromMasked masked: String?) -> String {
+        guard let masked, !masked.isEmpty,
+              let blob = Data(base64Encoded: masked), !blob.isEmpty, !mask.isEmpty else { return "" }
         var out = [UInt8](); out.reserveCapacity(blob.count)
         for (i, b) in blob.enumerated() { out.append(b ^ mask[i % mask.count]) }
         // The de-masked value must be a 64-char hex string; anything else means a bad/placeholder config,
@@ -108,7 +140,7 @@ enum VortXEdgeAuth {
         guard let s = String(bytes: out, encoding: .utf8),
               s.count == 64, s.allSatisfy({ $0.isHexDigit }) else { return "" }
         return s
-    }()
+    }
 
     /// Sign `request` IFF its URL host is one of our gated services. No-op otherwise. Never throws/crashes.
     /// With an empty secret it stamps an (empty-key) signature so the wire shape is identical in observe and
@@ -148,6 +180,11 @@ enum VortXEdgeAuth {
     /// Sign an OAuth broker request with the body-bound v2 contract. The caller must pass the exact bytes it
     /// assigns to `URLRequest.httpBody`; the worker hashes those same bytes before it parses them. Returning
     /// false is a fail-closed result for a missing or malformed edge secret, not an unsigned request.
+    ///
+    /// HONEST SCOPE (SEC-05): this signature is quota-protection friction required by the DEPLOYED broker
+    /// (oauth.vortx.tv rejects unsigned calls), not proof of identity or privilege: the key is recoverable,
+    /// so any extractor can sign too. The broker's real fix is server-side (pre-login short-lived token
+    /// issuance); see the blocked-scope note in the header doc.
     @discardableResult
     static func signOAuthV2(_ request: inout URLRequest, body: Data) -> Bool {
         guard let url = request.url,
@@ -176,7 +213,9 @@ enum VortXEdgeAuth {
         return true
     }
 
-    /// True only when the broker signer has a valid masked production key.
+    /// True only when the broker signer has a masked production key. This reports signing CAPABILITY for
+    /// the deployed fail-closed broker contract; it is not, and must never be read as, a privilege or
+    /// entitlement flag (the key it checks is recoverable from any shipped build).
     static var canSignOAuthV2: Bool { !secret.isEmpty }
 
     /// Return a QUERY-signed copy of `url` for header-less asset loads: `AsyncImage(url:)` and other `<img>`/

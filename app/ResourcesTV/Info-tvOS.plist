@@ -2,11 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Build-time edge-signing secret for the hardened VortX edge workers. Xcode substitutes
-	     $(VORTX_EDGE_SECRET) from the build setting (gitignored Config/VortXEdge.xcconfig, empty
-	     default), so the real 64-char hex value is NEVER in the tracked tree. VortXEdgeAuth.swift
-	     reads this at runtime via Bundle.main.object(forInfoDictionaryKey:). Empty = signing no-op
-	     (workers run in OBSERVE mode). The repo is public; do not hardcode a value here. -->
+	<!-- Build-time edge-signing blob for OPTIONAL abuse-friction/attribution telemetry on our edge
+	     workers (SEC-05: a shipped secret is recoverable, so it is NOT an authorization boundary and
+	     grants no privilege; privileged endpoints use server-issued short-lived tokens instead).
+	     Xcode substitutes $(VORTX_EDGE_SECRET) from the build setting (gitignored
+	     Config/VortXEdge.xcconfig, empty default), so the real 64-char hex value is NEVER in the tracked
+	     tree. VortXEdgeAuth.swift reads this at runtime via Bundle.main.object(forInfoDictionaryKey:).
+	     Empty = signing no-op (workers run in OBSERVE mode). The repo is public; do not hardcode. -->
 	<key>VortXEdgeSecret</key>
 	<string>$(VORTX_EDGE_SECRET)</string>
 	<!-- External sync provider credentials (Trakt Lane C, SIMKL Lane D). Xcode substitutes each
