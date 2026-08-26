@@ -149,3 +149,12 @@ Guardrails:
 
 1. Inspect active-slot saturation before revoking or removing an idle claimed member: when every execution slot is busy, idleness is expected queueing, not a dead seat.
 2. Seat removal requires positive evidence of route failure such as error receipts or hard failures on wake, never idleness alone; if a healthy seat is removed anyway, the swap must stay atomic and lossless, and the wrong diagnosis must be corrected candidly on the manager side.
+
+## Single-platform feed output hides client trust gaps
+
+`[MIS-W2-APPCAST-GAP-01]` Scoping SEC-01 production completeness revealed that the live vortx-appcast worker emits only Apple platform artifacts and carries no Android size or SHA-256 metadata. Had scope not been widened to the cross-repo appcast lane (t10 authoring plus independent t11 review), the Android updater's signed-feed verification requirement would have silently lacked its production feeder while the client-side fix looked complete.
+
+Guardrails:
+
+1. Production completeness of a client trust control must be checked against every platform-specific feeder it depends on; enumerate the emitters such as feed generators, workflows, and workers, not just the client code.
+2. Verify live emitted output such as the actual feed artifacts rather than inferring capability from source alone before calling a finding closed in production.

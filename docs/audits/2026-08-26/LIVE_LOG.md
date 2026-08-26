@@ -130,3 +130,10 @@
 - `[W2-SEAT-CORRECTION-01]` The `[W2-SEAT-FAIL-01]` classification is corrected: team status showed four other members working while the fifth seat sat idle, so the likely cause of the initial seat's idleness was the live concurrency cap, not an Ox Alpha seat or route failure. The captain removed a healthy queued seat without proving any route failure.
 - The mistake is logged on the manager side as `[MIS-W2-SEAT-MISDIAG-01]`. No code or result was lost: the removed seat had produced nothing, and t1 remains with release-engineer-2 at attempt 2.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Wave 2 scope expansion: Android appcast metadata
+
+- `[W2-APPCAST-01]` While scoping SEC-01 production completeness, the captain verified the live vortx-appcast worker (`a45c52a`, the update-manifest Worker emitting `appcast.json` and `vortx-altstore.json` from GitHub Releases) emits only Apple platform artifacts and no Android size or SHA-256 metadata. SEC-01 requires the signed feed to carry artifact size and SHA-256 for the updater to verify before installation, so without this work the SEC-01 fix would be incomplete in production.
+- `[W2-APPCAST-02]` Wave 2 scope was therefore expanded across repositories: a registered isolated worktree `audit/w2-android-metadata` was cut in the canonical `vortx-appcast` repository at exact baseline `79caab5`, owned by the Ox Alpha seat appcast-engineer running t10 (Publish Android appcast metadata), with independent review by the dedicated Ox Alpha seat appcast-reviewer in t11.
+- `[W2-APPCAST-03]` Boundaries: this lane publishes feed metadata only. There is no deploy and no release, and the VortX release freeze is unchanged.
+- Release remains frozen. Nothing has merged.
