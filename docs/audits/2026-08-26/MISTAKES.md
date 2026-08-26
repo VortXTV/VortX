@@ -186,3 +186,15 @@ Guardrails:
 1. No post-completion edits once review starts: any change invalidates the review anchor and requires re-review from the new exact HEAD.
 2. Exact source verification over author summaries: reviewers verify claims against source lines or artifact bytes, never accept summaries as ground truth.
 3. A cross-lane schema must be fixture-tested end to end against every consumer before it is called locked; verbal alignment claims are not contract proof.
+
+## Wave 2 route recovery guardrails
+
+`[MIS-W2-ROUTE-RECOVERY-01]` After goal continuation, original Ox Alpha members sat idle with dirty preserved worktrees on t3, t14, and t18. Repeated wakes and same-owner retries produced no turns. Fresh Ox replacements emitted explicit failed-before-finish receipts. The fallback ladder ran DeepSeek V4 Flash Vision max (failed all three), DeepSeek V4 Pro max (failed all three), then Qwen 3.7 Max (succeeded, continuing preserved work as attempt 10). No dirty code was lost and no stale output was accepted. Separately, the scheduler claimed t9 before t18; the captain parked t9 with assignee=captain until t18 reaches terminal state. The manager attempted five add_member calls at team cap 8; all were rejected atomically with no state change, and only the completed appcast author seat was rotated to free a slot.
+
+Guardrails:
+
+1. Preserve dirty worktrees across every route fallback step; never discard uncommitted lane work when rotating providers or seats.
+2. Require an explicit route failure receipt (failed-before-finish, error output, or hard failure on wake) before changing provider or replacing a seat; idleness alone is not failure evidence.
+3. Confirm current member count against the team cap before issuing batch add_member calls; rotate out only completed seats to free slots rather than removing active or queued members.
+4. Park review dependencies (assignee=captain) before retrying an author task when the scheduler has reversed dependency order, so the scheduler cannot re-claim the dependent task ahead of its prerequisite.
+5. Record exact baselines for every SEC-05 server worktree at registration time (oauth d093e72ea, abuse 9fa5e5978 default work/ins-26, sources e12072c45, addon-pair 5139fbb07, watch c2828eb17); no edits and no deploy until the client lane and release secret injection are reviewed together.

@@ -166,3 +166,11 @@
 - `[W2-CROSSSCHEMA-01]` Primary cross-lane blocker found by review: the worker split the feed into `android.full` and `android.play` while the in-flight updater client (t2) and release validator were flat, despite claimed contract alignment. The captain chose the split schema and assigned consumer remediation to t2 and t14; the t16 re-review waits for all final HEADs.
 - `[W2-OPMODEL-02]` The department-operating-model skill was reloaded after the latest skill catalog refresh.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Wave 2 route recovery and scheduler ordering
+
+- `[W2-ROUTE-RECOVERY-01]` After goal continuation, the original Ox Alpha members were idle/idle with dirty preserved worktrees on t3, t14, and t18. Repeated wakes and same-owner retries produced no turns. Fresh Ox replacements then emitted explicit failed-before-finish receipts. The fallback ladder followed: DeepSeek V4 Flash Vision max failed on all three tasks, DeepSeek V4 Pro max failed on all three tasks, and Qwen 3.7 Max successfully joined and is actively continuing preserved work as t3/t14/t18 attempt 10. No dirty code was lost and no stale output was accepted.
+- `[W2-SCHEDULER-ORDER-01]` The scheduler claimed t9 before t18 during the recovery sequence. The captain parked t9 with assignee=captain until t18 reaches a terminal state, preventing scheduler reversal of the dependency order.
+- `[W2-MEMBER-CAP-01]` The manager attempted five add_member calls at team cap 8; all were rejected atomically with no state change. Only the completed appcast author seat was rotated out to free a slot for the Qwen 3.7 Max replacement.
+- `[W2-SEC05-BASELINES-01]` SEC-05 server worktrees are registered at exact baselines: oauth d093e72ea, abuse 9fa5e5978 default work/ins-26, sources e12072c45, addon-pair 5139fbb07, watch c2828eb17. No edits and no deploy on any of these trees.
+- Release remains frozen. Nothing has merged.
