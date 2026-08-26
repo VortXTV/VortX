@@ -1,0 +1,39 @@
+Area,Capability,Apple,Android,Assessment,Apple evidence,Android evidence,Action
+Identity & sync,VortX account and encrypted cross-device sync,Implemented; v2 write migration still disabled,"Implemented, including realtime manager",Near parity,VortXSyncManager.swift,sync/VortXSyncManager.kt,Finish Apple v2 ratchet migration
+Identity & sync,Stremio account sign-in/import,Implemented,Implemented,Parity,CoreBridge/Auth surfaces,EngineStremioRepository/auth UI,
+Identity & sync,"Profiles, PIN and Kids restrictions",Implemented,Implemented on phone and TV,Parity,Profiles.swift and profile UI,profile/* and Who's Watching screens,
+Identity & sync,Per-profile own Stremio account binding,Implemented account-switch outcomes,Partial; selection carries current session and ignores switch outcome,Android behind,Profiles.swift/account scope,WhosWatchingScreen.kt; TvWhosWatchingScreen.kt,P1
+Identity & sync,Settings backup/restore,Fuller export/import with secret filtering,Partial roster-oriented implementation,Android behind,SettingsBackup.swift,backup/SettingsBackup.kt,P1
+Add-ons,Install/remove/update/disable/reorder and store/pairing,Implemented,Implemented,Broad parity,CoreBridge/add-on views,CatalogRepository and add-on UI,
+Browsing,"Home, Discover, Search, Library and Live",Implemented across Apple shells,Implemented on phone and TV,Parity,SourcesTV/SourcesiOS/SourcesShared,ui/screens and ui/tv,
+Browsing,Merge Discover and Search,Implemented,Implemented,Parity; Android comment is stale,Apple browse models,VortXApp.kt,
+Browsing,Home/Discover customization controls,Implemented,Several visible toggles lack consumers,Android behind,Apple settings + consumers,HomeDiscoverPreferences.kt,P1
+Browsing,"Detail financials, spoiler-safe/blur and poster-label controls",Implemented,Settings exposed; consumers incomplete,Android behind,Apple detail/settings,HomeDiscoverPreferences.kt,P1
+Metadata,Trailers,Metadata-derived request path implemented,Partial; factory/model fields not ported,Android behind,Trailer resolver/models,model/TrailerRequest.kt,P1
+Metadata,More Like This,TMDB plus add-on/catalog merge,TMDB leg only,Android behind,Apple similar/recommendation code,catalog/SimilarClient.kt,P2
+Metadata,Ratings and person/title metadata,Implemented,Implemented,Broad parity,Ratings/person clients,ratings/catalog UI,
+External services,Trakt and SIMKL,Implemented,Implemented,Broad parity,TraktService.swift and SIMKL code,trakt/* and simkl/*,
+External services,"Plex, Jellyfin and Emby",Implemented,Implemented,Broad parity,media-server clients,mediaserver/*,
+Live TV,"IPTV playlists, guides and playback",Implemented,Implemented,Broad parity,IPTV shared/Apple UI,iptv/*,
+Sources,"Debrid, direct HTTP, torrent/streaming server and Usenet/TorBox paths",Implemented,Implemented,Broad parity; route differences remain,DebridResolver/TorBox/stream server,"debrid/*, torbox/*, engine/*",
+Sources,Community Source Index / Singularity,Implemented/feature-gated,Compiled but hard-disabled,Android behind,SourceIndexClient.swift,singularity/SourceIndexClient.kt,P2 or remove
+Playback,libmpv engine,Implemented with native END_FILE reason handling,Implemented in full flavor; END_FILE reason lost,Android correctness gap,MPVMetalViewController.swift,mpv/MPVLib.kt; MpvPlayer.kt,P0
+Playback,Platform player route,AVPlayer full-chrome route,Media3/ExoPlayer fallback route,Near parity,AVPlayerEngine.swift,ExoPlayerEngine.kt,Capability differences must be explicit
+Playback,Dolby Vision/HDR handling,Strong AVPlayer native-DV/remux path plus mpv,Media3/mpv device-dependent routes,Partial/device-dependent,PlayerEngineRouter/AVPlayerEngine,player router/config,Maintain device matrix
+Playback,Audio/subtitle track selection and external subtitles,Implemented,Implemented; Exo extensionless URL gap,Near parity,AVPlayerEngine/MPV player,ExoPlayerEngine/MpvPlayer,P1 bug
+Playback,"Subtitle delay, audio delay and output policy",Full on mpv; AVPlayer has route-specific no-ops,Full on mpv; Exo has more no-ops,Route-specific parity,PlayerEngine capability code,PlayerEngine/ExoPlayerEngine,Expose capability model
+Playback,Chapters,AVPlayer metadata and mpv support,mpv support; Exo chiefly ID3,Android fallback behind,AVPlayerEngine,ExoPlayerEngine/MpvPlayer,
+Playback,Frame capture and community trickplay,Implemented on AVPlayer and mpv routes,"Primarily mpv; direct-surface capture unverified, Exo limited",Android behind,AVPlayerEngine/MPV controller,MpvPlayer/ExoPlayerEngine,P1/P2
+Playback,Picture in Picture,Implemented,Implemented,Parity,AVPlayerEngine PiP,PlayerPip.kt,
+Playback,AirPlay / Google Cast,AirPlay/system route,Google Cast manager,Platform-equivalent,AVPlayer route,cast/CastManager.kt,
+Playback,Skip intro/credits/community skip and autoplay flow,Implemented,Implemented,Broad parity,Skip/community/player code,skip/* and PlayerScreen,
+Playback,Offline playback progress identity,PlaybackMeta preserves title identity,Known gap: local Playable can use stale session identity,Android materially behind,DownloadManager + player context,DownloadsScreen/TvDownloadsScreen,P0
+Downloads,Direct/debrid file downloads,Implemented,Implemented,Parity with durability issues,DownloadManager.swift,downloads/*,Fix stores on both
+Downloads,Offline HLS,iPhone/iPad only; unavailable tvOS/macOS,Not implemented,Android behind; Apple platform-limited,AVAssetDownloadTask path,DownloadManager.kt,P1
+Downloads,Season/batch download,Implemented on iOS,Not implemented,Android behind,iOSBatchDownloadCoordinator.swift,No equivalent,P1/P2
+Downloads,Auto-delete watched downloads,Implemented and profile-aware,Preference only; behavior not wired,Android behind,DownloadManager.swift,DownloadManager.kt,P1
+Downloads,"Queue, reorder and concurrency control",Implemented but has preflight/retry invariant bugs; HLS bypasses cap,Implemented through WorkManager/store,Near parity with Apple correctness gaps,DownloadManager.swift,downloads/*,P0/P1
+TV integration,Home-screen Continue Watching,Top Shelf,Android TV Watch Next/Play Next,Platform-equivalent,TopShelf snapshot code,tv/WatchNextPublisher.kt,
+Notifications,New episode alerts,Implemented,Implemented with WorkManager,Parity,NewEpisodeNotifications Apple path,notifications/NewEpisodeNotifications.kt,
+Navigation,Deep links into title/playback,Implemented,Implemented,Broad parity,Apple URL/deep-link handlers,deeplink/* and WatchNext intents,
+Updater,In-app update discovery/install,Implemented through Apple distribution paths,"Implemented, but URL/digest trust needs hardening",Functionally present; Android risk,Apple update code/workflow,update/UpdateChecker.kt,P1 security
