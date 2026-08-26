@@ -144,3 +144,10 @@
 - `[W2-SEC05-SERVER-02]` `vortx-abuse` forcibly treats the shipped client HMAC as authorization for public mutation routes, and the OAuth broker uses it as well. SEC-05 therefore cannot be closed by removing client masking and documentation alone: the client lane (t4), release secret injection, and every privilege-bearing server gate must be reviewed together, with HMAC retained only as optional abuse friction and VortX account short-lived server tokens used wherever actual privilege is enforced.
 - `[W2-SEC05-SERVER-03]` The generic `api.vortx.tv` issuer source is not present in the canonical repository inventory, so no issuer changes are assumed or fabricated in this programme.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - Correction: Wave 2 seat-failure record retracted
+
+- `[W2-SEAT-CORRECTION-02]` `[W2-SEAT-FAIL-01]` must not be relied on. After the removal, the replacement release-engineer-2 also remained idle while updater-engineer, backup-engineer, edge-auth-engineer, and secretary occupied all four live execution slots. Identical fifth-seat idleness under a saturated slot pool proves live concurrency saturation was the likely cause of the original idleness; idle claimed status alone was never failure evidence.
+- `[W2-SEAT-CORRECTION-03]` The captain erred by removing a healthy queued seat without a route failure receipt and by sending contradictory queued notes during the episode. No code or result was lost, and t1 remains with release-engineer-2 at attempt 2.
+- `[W2-SEAT-CORRECTION-04]` Scope completeness note for the same task description: the appcast expansion (`[W2-APPCAST-01]` through `[W2-APPCAST-03]`, commit `59bcdb599`) and the SEC-05 multi-repo server inventory (`[W2-SEC05-SERVER-01]` through `[W2-SEC05-SERVER-03]`, commit `06c0e5a37`) are already recorded and stand unchanged.
+- Release remains frozen. Nothing has merged.

@@ -167,3 +167,12 @@ Guardrails:
 
 1. Never close a security finding with an app-only change when a server-side verifier of the same secret exists elsewhere; enumerate all verifier copies and all privilege-bearing gates before declaring a trust boundary removed.
 2. Where real privilege is enforced, replace shipped-secret trust with VortX account short-lived server-issued tokens and keep HMAC only as optional abuse friction; do not fabricate changes for components whose source is absent from the canonical inventory, such as the generic `api.vortx.tv` issuer.
+
+## Retraction of the Wave 2 seat-failure classification
+
+`[MIS-W2-SEAT-RETRACT-01]` `[MIS-W2-RELEASE-SEAT-01]` must not be relied on: it recorded the stale stuck-seat diagnosis in commit `a1cabed3b`. The replacement seat then showed identical idleness while updater, backup, edge-auth, and secretary seats held all four live slots, proving concurrency saturation, not route failure, was the likely cause; idle claimed status alone was not failure evidence. The captain erred by removing a healthy queued seat and by issuing contradictory queued notes. No code or result was lost, and t1 remains at attempt 2.
+
+Guardrails:
+
+1. Inspect active-slot saturation and obtain an actual route failure receipt before revoking or removing an idle claimed agent; idleness while other members hold every execution slot is queueing, not failure.
+2. When a logged diagnosis is retracted, append an explicit supersession naming the stale tags so later readers never rely on the withdrawn record.
