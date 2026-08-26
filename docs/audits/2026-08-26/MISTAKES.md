@@ -74,3 +74,12 @@ Guardrails:
 Guardrails:
 
 1. Retiring a lane whose patch landed through cherry-pick requires patch-id or equivalent hash verification of author HEAD against the integration commit; ancestor checks alone fail by design.
+
+## Local signing verification interpreter flake
+
+`[MIS-W1-A-BASH-01]` The local W1-A signing suite flaked under concurrency. Root cause: both new signing scripts are shebanged `#!/usr/bin/env bash`, so `/usr/bin/env bash` resolved to Homebrew Bash 5.3, and under concurrency the temporary fixtures intermittently exited 139 (a SIGSEGV-style core). The signing verifier failed closed on those crashes, but the expected-message assertions still flaked because the fixture did not emit the expected output. Running the suite under the controlled system `/bin/bash` removed the instability, after which the captain-run gates passed.
+
+Guardrails:
+
+1. Local signing verification must record the interpreter it ran under and execute the suite with the stable system Bash (`/bin/bash`); never rely on a PATH-resolved `env bash`.
+2. A tool crash is never a security pass. Only a clean run under a known, recorded interpreter that produces the expected output counts; a crash that fails closed must not be allowed to turn expected-message assertions into flaky noise.

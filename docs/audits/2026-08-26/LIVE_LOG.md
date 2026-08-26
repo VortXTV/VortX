@@ -55,3 +55,11 @@
 - `[W1-C-PREDEFECT-01]` A pre-existing Play UNIT-TEST source-set defect surfaced: shared MpvPlayerHttpPropertiesTest references full-only MpvConfig/MpvPlayer. It is byte-identical to parent, so it is not a W1-C regression; it is scheduled for the CI/test wave.
 - `[W1-C-RETIRE-01]` The initial retirement ancestor check failed because a cherry-pick creates a new commit; identical patch hashes then proved equivalence and retirement proceeded.
 - Release remains frozen.
+
+## 2026-08-26 - W1-A approved and integrated
+
+- `[W1-A-APPROVE-01]` The Ox Alpha signing-reviewer seat independently APPROVED W1-A at author HEAD `31a08bb4` (lineage `acd7480a5` -> `97bab3925` -> `9cc87db43` -> `31a08bb4`, all authored as Mamaclapper; the diff is confined to REL-01 release-signing ownership: `.github/workflows/android-release.yml`, `android/app/build.gradle.kts`, and the two new signing scripts `scripts/test-android-release-signing.sh` and `scripts/verify-android-release-signing.sh`).
+- The captain integrated the equivalent patch as a three-commit series onto main: `bbe1fbba4` (Harden Android release signing), `f1bc51243` (Reject partially unsigned Android bundles), and `5233a55d4` (Require strict AAB verification success), then pushed main.
+- Captain-run gates all pass: the system Bash full signing suite ran 10 consecutive passes; the missing-secret release Gradle invocation fails closed; the secretless debug config passes; the pinned signer SHA-256 fingerprint `90DD...E0006A` matches the recovered production certificate; and the clean lane worktree was retired after the branch series and the main series diff hashes matched.
+- `[W1-A-HOSTILE-TAG-01]` Recorded as a later release-orchestration hardening item, not a Wave 1 defect: `gh` hostile-tag option parsing at the release gate. Backlog placeholder; no lane action required now.
+- Release remains frozen. Only the reviewed, gate-passing Wave 1 code lanes have merged.
