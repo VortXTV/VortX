@@ -166,10 +166,34 @@ internal object UpdatePolicy {
         val key: String get() = "$version.$build"
     }
 
+    /** Distribution flavors that may appear as keys of a split android container (AGP flavor names). */
+    val ANDROID_FLAVOR_KEYS: Set<String> = setOf("full", "play")
+
+    /** Required engine per flavor; any other value is a hostile or mislabeled entry. */
+    private val FLAVOR_ENGINE: Map<String, String> = mapOf("full" to "mpv", "play" to "media3")
+
+    /** The only schemaVersion this client understands; anything else is refused outright. */
+    private const val REQUIRED_SCHEMA_VERSION = 2
+
     /**
-     * Evaluate a fetched appcast against the running build. This is the ONLY path from feed bytes to an
-     * update offer; it deliberately re-checks fields the release worker also validates server-side, because
-     * the client trusts neither the transport nor the edge cache.
+     * Evaluate a fetched appcast against the running build and flavor. This is the ONLY path from feed
+     * bytes to an update offer; it deliberately re-checks fields the release worker also validates
+     * server-side, because the client trusts neither the transport nor the edge cache.
+     *
+     * SchemaVersion 2 split container ONLY:
+     *  - The root must carry `"schemaVersion": 2`; any other value (or absence) is Malformed.
+     *  - `android` must be an object whose children are keyed by flavor (`full`, `play`). Each child is
+     *    an independent entry. ONLY the sub-entry keyed by [currentFlavor] is read; siblings are never
+     *    parsed, so a malformed sibling cannot block this device. A missing/null/non-object entry for
+     *    this flavor is None (nothing published for us), not Malformed.
+     *  - Flat legacy shapes (the android object IS the entry) are REJECTED: the approved worker emits
+     *    split containers only, and accepting a flat shape would bypass flavor/engine enforcement.
+     *
+     * Flavor and engine enforcement:
+     *  - [currentFlavor] must be exactly "full" or "play"; any other value is rejected before parsing.
+     *  - The selected child's `flavor` field, when present, must equal [currentFlavor].
+     *  - The selected child's `engine` field must equal "mpv" for full or "media3" for play; absent,
+     *    mismatched, or mistyped engine is Malformed.
      *
      * Strictness notes:
      *  - `build` must be a JSON integer (org.json would otherwise coerce "189"), strictly above the running one.
@@ -177,16 +201,77 @@ internal object UpdatePolicy {
      *  - `prerelease` true keeps the entry silent (stable-build semantics), a mistyped prerelease is Malformed.
      *  - `apk` and `url`, when both present, must agree; at least one must be present.
      *  - `signer` must normalize to [PINNED_SIGNER_SHA256]; anything else is refused before download.
+     *  - optional `applicationId`, when present, must equal [expectedApplicationId].
      */
-    fun evaluateFeed(manifestText: String, currentBuild: Int): UpdateDecision {
+    fun evaluateFeed(
+        manifestText: String,
+        currentBuild: Int,
+        currentFlavor: String,
+        expectedApplicationId: String,
+    ): UpdateDecision {
+        if (currentFlavor !in ANDROID_FLAVOR_KEYS) {
+            return UpdateDecision.Malformed("unsupported flavor \"$currentFlavor\"")
+        }
         if (manifestText.toByteArray(Charsets.UTF_8).size > MAX_MANIFEST_BYTES) {
             return UpdateDecision.Malformed("manifest exceeds ${MAX_MANIFEST_BYTES} byte cap")
         }
         val root = runCatching { JSONObject(manifestText) }.getOrNull()
             ?: return UpdateDecision.Malformed("manifest is not valid JSON")
-        val entryRaw = root.opt("android") ?: return UpdateDecision.None
-        if (entryRaw === JSONObject.NULL) return UpdateDecision.None
-        val entry = entryRaw as? JSONObject ?: return UpdateDecision.Malformed("android entry is not an object")
+
+        // Schema gate: only version 2 split containers are accepted.
+        val schemaRaw = root.opt("schemaVersion")
+        if (schemaRaw !is Int || schemaRaw != REQUIRED_SCHEMA_VERSION) {
+            return UpdateDecision.Malformed(
+                "schemaVersion must be $REQUIRED_SCHEMA_VERSION, got ${schemaRaw ?: "null"}",
+            )
+        }
+
+        val androidValue = root.opt("android") ?: return UpdateDecision.None
+        if (androidValue === JSONObject.NULL) return UpdateDecision.None
+        val androidObject = androidValue as? JSONObject
+            ?: return UpdateDecision.Malformed("android entry is not an object")
+
+        // Split container only: a flat legacy entry (one that carries its own "build") is rejected.
+        // The approved worker always emits split containers; accepting flat would bypass flavor/engine gates.
+        if (androidObject.has("build")) {
+            return UpdateDecision.Malformed("flat legacy android entry is not supported; expected split container")
+        }
+
+        // Select exact flavor child; never fall across to sibling.
+        val child = androidObject.opt(currentFlavor) ?: return UpdateDecision.None
+        if (child === JSONObject.NULL) return UpdateDecision.None
+        val entry = child as? JSONObject
+            ?: return UpdateDecision.Malformed("android.$currentFlavor is not an object")
+
+        // Flavor field must match selection when present.
+        val declaredFlavor = optionalString(entry, "flavor")
+        if (declaredFlavor == null) {
+            return UpdateDecision.Malformed("android.$currentFlavor missing required flavor field")
+        }
+        if (declaredFlavor != currentFlavor) {
+            return UpdateDecision.Malformed(
+                "android.$currentFlavor declares mismatched flavor \"$declaredFlavor\"",
+            )
+        }
+
+        // Engine field is mandatory and must match the flavor's required engine.
+        val declaredEngine = optionalString(entry, "engine")
+        val requiredEngine = FLAVOR_ENGINE.getValue(currentFlavor)
+        if (declaredEngine == null) {
+            return UpdateDecision.Malformed("android.$currentFlavor is missing required engine field")
+        }
+        if (declaredEngine != requiredEngine) {
+            return UpdateDecision.Malformed(
+                "android.$currentFlavor engine \"$declaredEngine\" does not match required \"$requiredEngine\"",
+            )
+        }
+
+        val declaredApplicationId = optionalString(entry, "applicationId")
+        if (declaredApplicationId != null && declaredApplicationId != expectedApplicationId) {
+            return UpdateDecision.Malformed(
+                "feed applicationId $declaredApplicationId does not match this app",
+            )
+        }
 
         when (val prerelease = entry.opt("prerelease") ?: JSONObject.NULL) {
             JSONObject.NULL -> Unit // absent reads as stable; the publisher always sends the field today

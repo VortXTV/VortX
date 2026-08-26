@@ -268,7 +268,12 @@ object UpdateChecker {
             // Only a successful fetch stamps the clock, so a network blip does not silence notices.
             prefs(context).edit().putLong(LAST_CHECKED_KEY, System.currentTimeMillis()).apply()
 
-            when (val decision = UpdatePolicy.evaluateFeed(manifestText, BuildConfig.VERSION_CODE)) {
+            when (val decision = UpdatePolicy.evaluateFeed(
+                manifestText = manifestText,
+                currentBuild = BuildConfig.VERSION_CODE,
+                currentFlavor = BuildConfig.FLAVOR,
+                expectedApplicationId = BuildConfig.APPLICATION_ID,
+            )) {
                 is UpdatePolicy.UpdateDecision.None -> clearSignals()
                 is UpdatePolicy.UpdateDecision.Malformed -> {
                     // Fail closed: log the refusal, offer nothing, never fall back to any other URL.
