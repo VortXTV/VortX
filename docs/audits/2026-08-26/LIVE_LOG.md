@@ -17,3 +17,12 @@
   - W1-D offline playback identity: `audit/w1-offline-identity` (`555c828f`)
   - W1-E Apple download scheduler: `audit/w1-apple-downloads` (`65afc024`)
 - Release remains frozen. Each lane requires independent review and captain-run verification before integration.
+
+## 2026-08-26 - Wave 1 milestones
+
+- `[W1-A-REJECT-01]` Initial `97bab392` was rejected because non-strict `jarsigner` accepted appended unsigned AAB entries. A real JDK reproduction returned exit 0 without strict mode and exit 20 with strict mode. Final author HEAD `31a08bb4` awaits fresh final review.
+- `[W1-B-REVIEW-01]` Author HEAD `48f436d8` awaits native-seam and race review.
+- `[W1-C-REVIEW-01]` Author HEAD `27de1e64` awaits independent review.
+- `[W1-D-IMPLEMENT-01]` Implementation remains in progress.
+- `[W1-E-REJECT-01]` Author `26a167998` was rejected for an unsafe double-GET probe, timeout misclassification, unbounded response and header handling, SSRF gaps, a MIME substring false positive, and scheduler reentrancy. Revision requested with probe removal and a reentrancy guard.
+- `[W1-STATE-01]` Release remains frozen. Nothing has merged.

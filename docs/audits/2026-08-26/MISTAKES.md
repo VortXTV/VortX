@@ -25,3 +25,11 @@ Guardrails:
 3. Do not run overlapping agents in one worktree.
 4. Each lane owns explicit files, adds a negative test, and receives independent review.
 5. Do not convert broad umbrella findings into speculative rewrites when narrower defects already explain the evidence.
+
+## Signing verification miss
+
+`[MIS-W1-A-JARSIGNER-01]` We accepted a signing verification path without proving that appended unsigned AAB entries fail. Non-strict `jarsigner` returned exit 0 on the tampered artifact, while strict mode returned exit 20.
+
+Guardrail:
+
+1. Every AAB signing gate must run `jarsigner` in strict verification mode against a negative fixture with an appended unsigned entry, assert a nonzero exit, and retain the exact exit-code receipt.
