@@ -103,3 +103,17 @@
 ## 2026-08-26 - Wave 1 exit
 
 - `[W1-EXIT-01]` Wave 1 is complete: every lane W1-A through W1-E was independently reviewed, integrated, pushed, and green. No public artifact was produced. Release remains frozen, and Wave 2 may begin.
+
+## 2026-08-26 - Wave 2 opened
+
+- `[W2-OPEN-01]` The CEO ordered the programme to continue without stopping: the goal was resumed by direct directive immediately after Wave 1 exit, and Wave 2 starts from the pushed exit commit `611dedaa3` (`docs: record W1-D approval and Wave 1 exit`, main in sync with origin/main).
+- `[W2-TEAM-01]` The Wave 2 team `vortx-ox-alpha-wave2` staffs five seats on Ox Alpha Free (opencode-go-2/ox-alpha-free): release-engineer, updater-engineer, backup-engineer, edge-auth-engineer, plus a permanent audit programme log and mistakes secretary.
+- `[W2-LANES-01]` Four isolated implementation worktrees are registered at exact baseline `611dedaa3`: `audit/w2-release-orchestration`, `audit/w2-updater-trust`, `audit/w2-backup-envelope`, and `audit/w2-edge-auth`.
+- `[W2-FINDINGS-01]` Finding allocation by seat:
+  - release-engineer: REL-02 (flavor naming) and REL-03 (secretless pull-request validation lanes).
+  - updater-engineer: SEC-01 (updater trusts the appcast install URL), SEC-07 (Later versus Skip dismissal semantics), and SEC-08 (unsynchronized concurrent update checks).
+  - backup-engineer: SEC-02 (backup envelope schema and keyCount validation) and SEC-06 (legacy export secret residue).
+  - edge-auth-engineer: SEC-05 (client-shipped HMAC treated as an authorization boundary).
+- `[W2-CROSSREVIEW-01]` Cross-review ring assigned, each seat reviewing the opposite lane and never its own: backup-engineer reviews the release lane and release-engineer reviews the backup lane; edge-auth-engineer reviews the updater lane and updater-engineer reviews the edge-auth lane.
+- `[W2-OPMODEL-01]` The department-operating-model skill was reloaded after a skill catalog refresh so the wave runs under the current operating model.
+- Release remains frozen. Nothing has merged.

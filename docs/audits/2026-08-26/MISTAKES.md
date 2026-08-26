@@ -121,3 +121,12 @@ Guardrails:
 1. Immutable identity fields must be consumed and enforced at the authority seam, not merely carried. Unused or un-enforced identity is dead weight and must be caught before it reaches review.
 2. Async owner binding requires the full principal/revision token captured at launch, so the mutation can fail closed on `expectedOwner` when the world has moved on.
 3. Revoke stale reviews atomically whenever the final HEAD changes, so a previous approval is never read as approving the updated lane.
+
+## Wave 2 opening guardrails
+
+`[MIS-W2-OPEN-01]` The department-operating-model skill was reloaded after a skill catalog refresh before Wave 2 dispatch. An unloaded or stale operating model would have let the new team run outside its standing orders, so the reload happened before any Wave 2 seat was tasked.
+
+Guardrails:
+
+1. After any skill catalog refresh, reload the department-operating-model skill before standing up a team, dispatching seats, or writing programme docs; never assume standing orders survived a catalog change unverified.
+2. Resuming the programme means resuming exactly from the recorded exit state: confirm the exit commit is pushed (here `611dedaa3`), cut every lane worktree at that exact baseline, and keep every standing hold such as the release freeze in force until the owner lifts it explicitly.
