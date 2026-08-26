@@ -3,8 +3,7 @@ name: Release Android
 # OWNER SETUP BEFORE THE FIRST REAL RUN:
 # Add VORTX_KEYSTORE_PATH, VORTX_KEYSTORE_PASSWORD, VORTX_KEY_ALIAS, and
 # VORTX_KEY_PASSWORD as secrets on the engine-ci environment. VORTX_KEYSTORE_PATH must contain the
-# base64 of the upload keystore. Until then this lane deliberately produces debug-signed release
-# artifacts with a -debug-signed suffix so the complete release path can be tested safely.
+# base64 of the upload keystore. This workflow fails closed before any build when one is absent.
 on:
   workflow_dispatch:
     inputs:
@@ -30,7 +29,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release_tag }}
           persist-credentials: false
+
+      - name: Bind the build to the requested release tag (fail closed)
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/tags/$RELEASE_TAG" >/dev/null || { echo "::error::invalid release tag"; exit 1; }
+          tag_ref="refs/tags/$RELEASE_TAG"
+          git show-ref --verify --quiet "$tag_ref" || { echo "::error::requested release tag was not checked out"; exit 1; }
+          source_commit="$(git rev-parse HEAD^{commit})"
+          tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
+          if [ "$source_commit" != "$tag_commit" ]; then
+            echo "::error::checked-out source does not match the requested release tag"
+            exit 1
+          fi
+          echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG_COMMIT=$tag_commit" >> "$GITHUB_ENV"
 
       # Private engine fetch is kept in lockstep with android.yml. Both checkouts are required because
       # every release variant packages libstremiox_core.so and libvortx_ffi.so.
@@ -43,6 +60,14 @@ jobs:
             echo "::error::ENGINE_REPO_TOKEN secret is not set; CI cannot fetch the private engine repos (VortXTV/stremiox-core + VortXTV/vortx-core)"
             exit 1
           fi
+
+      - name: Preflight release signing inputs (fail closed)
+        env:
+          VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
+          VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
+          VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
+          VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
+        run: scripts/verify-android-release-signing.sh preflight
 
       - name: Fetch stremiox-core (private, pinned)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,27 +133,6 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version "=3.5.4" --locked
 
-      # Secret presence is intentionally a soft gate. A missing or incomplete set is annotated, then
-      # Gradle falls back to debug signing so this workflow remains testable before owner provisioning.
-      - name: Preflight release signing (fail soft)
-        id: signing
-        env:
-          VORTX_KEYSTORE_PATH: ${{ secrets.VORTX_KEYSTORE_PATH }}
-          VORTX_KEYSTORE_PASSWORD: ${{ secrets.VORTX_KEYSTORE_PASSWORD }}
-          VORTX_KEY_ALIAS: ${{ secrets.VORTX_KEY_ALIAS }}
-          VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          if [ -n "${VORTX_KEYSTORE_PATH:-}" ] && [ -n "${VORTX_KEYSTORE_PASSWORD:-}" ] && [ -n "${VORTX_KEY_ALIAS:-}" ] && [ -n "${VORTX_KEY_PASSWORD:-}" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-            echo "suffix=" >> "$GITHUB_OUTPUT"
-            echo "release signing secrets are complete"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "suffix=-debug-signed" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Android release uses debug signing::Add all four VORTX_KEYSTORE_* secrets to the engine-ci environment before shipping. Artifacts from this run will be labeled -debug-signed."
-          fi
-
       - name: Build release APKs and Play bundle
         working-directory: android
         env:
@@ -168,18 +172,17 @@ jobs:
             done
           done
 
-      - name: Verify both APKs are signed
+      - name: Verify pinned production signer on every Android artifact
         run: |
           set -euo pipefail
           shopt -s nullglob
-          signers=("$ANDROID_HOME"/build-tools/*/apksigner)
-          test ${#signers[@]} -gt 0 || { echo "::error::apksigner was not installed"; exit 1; }
-          APKSIGNER="$(printf '%s\n' "${signers[@]}" | sort -V | tail -n1)"
-          for apk in android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk; do
-            output="$("$APKSIGNER" verify --verbose "$apk")"
-            grep -Eq 'Verified using v2 scheme \(APK Signature Scheme v2\): true' <<<"$output" || { echo "::error::$apk is not v2 signed"; exit 1; }
-            echo "ok: $apk is signed"
-          done
+          apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
+          bundles=(android/app/build/outputs/bundle/playRelease/*.aab)
+          if [ ${#apks[@]} -ne 2 ] || [ ${#bundles[@]} -ne 1 ]; then
+            echo "::error::expected exactly two release APKs and one release AAB before signer verification"
+            exit 1
+          fi
+          scripts/verify-android-release-signing.sh verify "${apks[@]}" "${bundles[@]}"
 
       - name: Verify Play APK remains GPL-native-library free
         run: |
@@ -193,10 +196,10 @@ jobs:
             fi
           done
 
-      - name: Stage clearly named release assets
+      - name: Stage verified release assets and provenance
         id: assets
         env:
-          SIGNING_SUFFIX: ${{ steps.signing.outputs.suffix }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -206,10 +209,26 @@ jobs:
           play=(android/app/build/outputs/apk/play/release/*.apk)
           bundle=(android/app/build/outputs/bundle/playRelease/*.aab)
           test ${#full[@]} -eq 1 && test ${#play[@]} -eq 1 && test ${#bundle[@]} -eq 1 || { echo "::error::expected one full APK, one play APK, and one play AAB"; exit 1; }
+          rm -rf dist
           mkdir -p dist
-          cp "${full[0]}" "dist/VortX-${version}-phone${SIGNING_SUFFIX}.apk"
-          cp "${play[0]}" "dist/VortX-${version}-tv${SIGNING_SUFFIX}.apk"
-          cp "${bundle[0]}" "dist/VortX-${version}-play${SIGNING_SUFFIX}.aab"
+          cp "${full[0]}" "dist/VortX-${version}-phone.apk"
+          cp "${play[0]}" "dist/VortX-${version}-tv.apk"
+          cp "${bundle[0]}" "dist/VortX-${version}-play.aab"
+          scripts/verify-android-release-signing.sh verify \
+            "dist/VortX-${version}-phone.apk" \
+            "dist/VortX-${version}-tv.apk" \
+            "dist/VortX-${version}-play.aab" | tee dist/SIGNING_PROVENANCE.txt
+          {
+            echo "release tag: $RELEASE_TAG"
+            echo "release tag commit: $RELEASE_TAG_COMMIT"
+            echo "source commit: $SOURCE_COMMIT"
+            echo "workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "workflow run attempt: $GITHUB_RUN_ATTEMPT"
+          } >> dist/SIGNING_PROVENANCE.txt
+          sha256sum \
+            "dist/VortX-${version}-phone.apk" \
+            "dist/VortX-${version}-tv.apk" \
+            "dist/VortX-${version}-play.aab" > dist/SHA256SUMS
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create or append to the draft release
@@ -227,7 +246,12 @@ jobs:
           else
             gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes "Android phone and Android TV beta artifacts."
           fi
-          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release upload "$RELEASE_TAG" \
+            dist/*.apk \
+            dist/*.aab \
+            dist/SHA256SUMS \
+            dist/SIGNING_PROVENANCE.txt \
+            --clobber
 
       - name: Publish the draft release
         if: inputs.publish_release

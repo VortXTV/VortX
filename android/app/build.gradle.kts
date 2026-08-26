@@ -35,12 +35,41 @@ fun externalSyncSecret(name: String): String =
 fun signingSecret(name: String): String? =
     System.getenv(name)?.trim()?.takeIf { it.isNotEmpty() }
 
-val releaseKeystoreValue = signingSecret("VORTX_KEYSTORE_PATH")
-val releaseStorePassword = signingSecret("VORTX_KEYSTORE_PASSWORD")
-val releaseKeyAlias = signingSecret("VORTX_KEY_ALIAS")
-val releaseKeyPassword = signingSecret("VORTX_KEY_PASSWORD")
-val releaseSigningReady =
-    listOf(releaseKeystoreValue, releaseStorePassword, releaseKeyAlias, releaseKeyPassword).all { it != null }
+val releaseSigningInputs = mapOf(
+    "VORTX_KEYSTORE_PATH" to signingSecret("VORTX_KEYSTORE_PATH"),
+    "VORTX_KEYSTORE_PASSWORD" to signingSecret("VORTX_KEYSTORE_PASSWORD"),
+    "VORTX_KEY_ALIAS" to signingSecret("VORTX_KEY_ALIAS"),
+    "VORTX_KEY_PASSWORD" to signingSecret("VORTX_KEY_PASSWORD"),
+)
+val missingReleaseSigningInputs = releaseSigningInputs.filterValues { it == null }.keys.sorted()
+fun requireReleaseSigningInputs() {
+    if (missingReleaseSigningInputs.isNotEmpty()) {
+        throw GradleException(
+            "Release signing inputs are required before configuring a release build. Missing: " +
+                missingReleaseSigningInputs.joinToString(", "),
+        )
+    }
+}
+
+val releaseSelectingLifecycleTasks = setOf("assemble", "build", "bundle")
+val releaseSigningRequested = gradle.startParameter.taskNames.any { requestedTask ->
+    val taskName = requestedTask.substringAfterLast(':')
+    taskName.contains("Release", ignoreCase = true) || taskName.lowercase() in releaseSelectingLifecycleTasks
+}
+if (releaseSigningRequested) {
+    requireReleaseSigningInputs()
+}
+gradle.taskGraph.whenReady {
+    if (allTasks.any { task -> task.name.contains("Release", ignoreCase = true) }) {
+        requireReleaseSigningInputs()
+    }
+}
+
+val releaseSigningReady = missingReleaseSigningInputs.isEmpty()
+val releaseKeystoreValue = releaseSigningInputs.getValue("VORTX_KEYSTORE_PATH")
+val releaseStorePassword = releaseSigningInputs.getValue("VORTX_KEYSTORE_PASSWORD")
+val releaseKeyAlias = releaseSigningInputs.getValue("VORTX_KEY_ALIAS")
+val releaseKeyPassword = releaseSigningInputs.getValue("VORTX_KEY_PASSWORD")
 val releaseStoreFile: File? = if (releaseSigningReady) {
     val directFile = rootProject.file(releaseKeystoreValue!!)
     if (directFile.isFile) {
@@ -105,9 +134,9 @@ android {
 
     buildTypes {
         release {
-            // Both fullRelease and playRelease use the same release identity. When credentials are absent,
-            // use debug signing so local release builds and pre-provisioning CI tests remain buildable.
-            signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
+            // Both fullRelease and playRelease always use the dedicated release signing configuration.
+            // Missing credentials fail release task configuration above and can never select the debug key.
+            signingConfig = signingConfigs.getByName("release")
             // The native engine JNI has no proven release keep rules in this repository. Keep beta builds
             // unminified and unshrunk to prioritize playback stability over download size.
             isMinifyEnabled = false
