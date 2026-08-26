@@ -42,7 +42,13 @@ MOCK
 cat > "$workdir/bin/jarsigner" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${MOCK_JARSIGNER_UNSIGNED:-0}" == "1" ]]; then
+if [[ "${MOCK_JARSIGNER_PARTIAL:-0}" == "1" ]]; then
+    printf '    ?      9 unsigned-entry.txt\n'
+    printf '  ? = unsigned entry\n'
+    printf 'jar verified, with signer errors.\n'
+    printf 'Error: This jar contains unsigned entries which have not been integrity-checked.\n'
+    exit 16
+elif [[ "${MOCK_JARSIGNER_UNSIGNED:-0}" == "1" ]]; then
     printf 'jar is unsigned.\n'
 else
     printf 'jar verified.\n'
@@ -108,6 +114,11 @@ unsigned_output="$(expect_failure "unsigned AAB" env "${common_env[@]}" \
 grep -Fq 'does not contain a verified JAR signature' <<<"$unsigned_output" || fail "unsigned bundle error was not explicit"
 printf 'ok: unsigned AAB is rejected\n'
 
+partial_output="$(expect_failure "partially unsigned AAB" env "${common_env[@]}" \
+    MOCK_JARSIGNER_PARTIAL=1 "$VERIFY_SCRIPT" verify "$workdir/release.aab")"
+grep -Fq 'contains unsigned entries' <<<"$partial_output" || fail "partially unsigned bundle error was not explicit"
+printf 'ok: partially unsigned AAB is rejected\n'
+
 debug_output="$(expect_failure "Android Debug APK signer" env "${common_env[@]}" \
     MOCK_SUBJECT='CN=Android Debug,O=Android,C=US' MOCK_FINGERPRINT="$EXPECTED_COMPACT" \
     "$VERIFY_SCRIPT" verify "$workdir/release.apk")"
@@ -119,6 +130,51 @@ debug_output="$(expect_failure "Android Debug AAB signer" env "${common_env[@]}"
     "$VERIFY_SCRIPT" verify "$workdir/release.aab")"
 grep -Fq 'Android Debug certificate' <<<"$debug_output" || fail "debug bundle signer rejection was not explicit"
 printf 'ok: Android Debug AAB signer is rejected\n'
+
+jdk_home="${JAVA_HOME:-}"
+if [[ ! -x "$jdk_home/bin/java" && -x /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home/bin/java ]]; then
+    jdk_home=/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home
+fi
+if [[ -x "$jdk_home/bin/jar" && -x "$jdk_home/bin/keytool" && -x "$jdk_home/bin/jarsigner" ]]; then
+    real_dir="$workdir/real-aab"
+    mkdir -p "$real_dir"
+    printf 'signed payload\n' > "$real_dir/signed-entry.txt"
+    "$jdk_home/bin/jar" --create --file "$real_dir/complete.aab" -C "$real_dir" signed-entry.txt
+    "$jdk_home/bin/keytool" -genkeypair \
+        -keystore "$real_dir/test.jks" \
+        -storepass changeit \
+        -keypass changeit \
+        -alias release \
+        -dname 'CN=VortX Test Release,O=VortXTV,C=US' \
+        -keyalg RSA \
+        -validity 365 >/dev/null 2>&1
+    "$jdk_home/bin/jarsigner" \
+        -keystore "$real_dir/test.jks" \
+        -storepass changeit \
+        -keypass changeit \
+        "$real_dir/complete.aab" release >/dev/null 2>&1
+    complete_output="$(expect_failure "real complete AAB with non-pinned signer" env \
+        APKSIGNER_BIN="$workdir/bin/apksigner" \
+        JARSIGNER_BIN="$jdk_home/bin/jarsigner" \
+        KEYTOOL_BIN="$jdk_home/bin/keytool" \
+        JAVA_HOME="$jdk_home" \
+        "$VERIFY_SCRIPT" verify "$real_dir/complete.aab")"
+    grep -Fq 'signer SHA-256 mismatch' <<<"$complete_output" || fail "real complete AAB did not pass strict entry verification before fingerprint rejection"
+    printf 'ok: real fully signed AAB reaches pinned fingerprint gate\n'
+    cp "$real_dir/complete.aab" "$real_dir/partial.aab"
+    printf 'unsigned payload\n' > "$real_dir/unsigned-entry.txt"
+    "$jdk_home/bin/jar" --update --file "$real_dir/partial.aab" -C "$real_dir" unsigned-entry.txt
+    partial_output="$(expect_failure "real partially unsigned AAB" env \
+        APKSIGNER_BIN="$workdir/bin/apksigner" \
+        JARSIGNER_BIN="$jdk_home/bin/jarsigner" \
+        KEYTOOL_BIN="$jdk_home/bin/keytool" \
+        JAVA_HOME="$jdk_home" \
+        "$VERIFY_SCRIPT" verify "$real_dir/partial.aab")"
+    grep -Fq 'contains unsigned entries' <<<"$partial_output" || fail "real partially unsigned bundle error was not explicit"
+    printf 'ok: real signed AAB with appended unsigned entry is rejected\n'
+else
+    printf 'skip: JDK tools unavailable for real partially unsigned AAB regression\n'
+fi
 
 workflow="$REPO_ROOT/.github/workflows/android-release.yml"
 gradle_build="$REPO_ROOT/android/app/build.gradle.kts"

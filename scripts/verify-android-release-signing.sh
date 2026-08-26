@@ -125,14 +125,22 @@ verify_bundle() {
     local jarsigner="$1"
     local keytool="$2"
     local bundle="$3"
-    local output verification_output fingerprint subject fingerprint_count
+    local output verification_output verification_status fingerprint subject fingerprint_count
 
     [[ -f "$bundle" ]] || { error "Android App Bundle does not exist: $bundle"; return 1; }
-    verification_output="$(LC_ALL=C "$jarsigner" -verify "$bundle")" || {
-        error "jarsigner verification failed for $bundle"
+    verification_status=0
+    verification_output="$(LC_ALL=C "$jarsigner" -verify -strict -verbose -certs "$bundle" 2>&1)" || verification_status=$?
+    if grep -Eiq 'unsigned entr(y|ies)|\? = unsigned entry|^[[:space:]]*\?' <<<"$verification_output"; then
+        error "$bundle contains unsigned entries that were not integrity-checked"
         return 1
-    }
-    grep -Fq 'jar verified.' <<<"$verification_output" || {
+    fi
+    # Android signing certificates are self-signed. jarsigner strict returns 4 for that untrusted
+    # certificate chain even when every entry is signed, so only status 0 or chain-only status 4 is safe.
+    if [[ "$verification_status" != "0" && "$verification_status" != "4" ]]; then
+        error "jarsigner strict verification failed for $bundle with status $verification_status"
+        return 1
+    fi
+    grep -Eq '^jar verified(\.|, with signer errors\.)$' <<<"$verification_output" || {
         error "$bundle does not contain a verified JAR signature"
         return 1
     }
