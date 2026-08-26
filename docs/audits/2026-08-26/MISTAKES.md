@@ -202,7 +202,7 @@ Guardrails:
 ## Backup symlink and secretary verification mistakes
 
 ### Backup worktree symlink issue
-- Backup worktree at `cdec98ad6` stalled with 10 tracked `MPVKit‑DVFEL` deletions and an untracked `app/Resources/fonts` symlink due to absolute symlinks into the canonical checkout. The captain repaired the vendor directory with `git restore --worktree`, confirming it became a real directory with the 10 tracked files and clean status, then removed the fonts symlink after verifying zero tracked entries. The backup worktree now only has the intended `README.md` dirty.
+- Backup worktree at `cdec98ad6` stalled with 10 tracked `MPVKit-DVFEL` deletions and an untracked `app/Resources/fonts` symlink due to absolute symlinks into the canonical checkout. The captain repaired the vendor directory with `git restore --worktree`, confirming it became a real directory with the 10 tracked files and clean status, then removed the fonts symlink after verifying zero tracked entries. The backup worktree now only has the intended `README.md` dirty.
 
 ### Secretary verification mistake
 - Secretary `t32` first claimed complete while the docs remained dirty and the HEAD unchanged. Captain verification rejected the claim, requested an actual commit, then verified the clean exact commit `4de13202278b77f469fb8155487c91c14392aa4d` and pushed `main`. Guardrail: secretary completion requires exact HEAD and clean status, not merely written content.
@@ -216,3 +216,47 @@ Guardrails:
 3. Confirm current member count against the team cap before issuing batch add_member calls; rotate out only completed seats to free slots rather than removing active or queued members.
 4. Park review dependencies (assignee=captain) before retrying an author task when the scheduler has reversed dependency order, so the scheduler cannot re-claim the dependent task ahead of its prerequisite.
 5. Record exact baselines for every SEC-05 server worktree at registration time (oauth d093e72ea, abuse 9fa5e5978 default work/ins-26, sources e12072c45, addon-pair 5139fbb07, watch c2828eb17); no edits and no deploy until the client lane and release secret injection are reviewed together.
+
+## Absolute worktree symlink shadowing
+
+`[MIS-W2-BACKUP-SYMLINK-01]` Absolute symlinks in the backup worktree shadowed tracked `MPVKit-DVFEL` paths and pointed into the canonical checkout. A separate untracked fonts symlink created the appearance that worktree-local content existed when it did not. Blind cleanup could have deleted canonical content or discarded tracked files.
+
+Guardrails:
+
+1. Inspect the path object without following it and record whether a symlink target is absolute or relative.
+2. Run `git ls-files -- <path>` from the exact owning repository or worktree before cleanup. Any output means the path is tracked and must not be deleted.
+3. Never point or follow a worktree path into the canonical checkout. Each worktree must hold its own tracked files.
+4. Repair tracked paths with `git restore --worktree`; remove only a symlink proven to contain zero tracked entries.
+5. Verify the canonical target remains intact before and after repair.
+
+## False completion and stale review claims
+
+`[MIS-W2-FALSE-COMPLETION-01]` t33 claimed completion while required audit entries were absent and canonical HEAD was unchanged. Its retry committed partial `de14c92b1` but omitted its own false-completion incident and explicit symlink guardrails. t18 and t35 similarly claimed committed, clean updater completion despite stale HEAD, dirty files, wrong committer identity, an untracked JDK archive, or missing test evidence. t19 approved stale updater and release refs with unsupported test claims.
+
+Guardrails:
+
+1. A completion report is not evidence. Verify exact HEAD, full author and committer identity, clean status, intended file set, and captured test output from the primary worktree.
+2. A dependent review must cite the exact final tips it inspected. Any later commit or metadata rewrite invalidates the anchor and requires a new review.
+3. Never create an empty commit to disguise uncommitted work or call a task complete when a required suite did not run.
+4. False completions must be logged explicitly and their task outputs revoked or superseded before dependents proceed.
+
+## Intermediate commit identity miss
+
+`[MIS-W2-RELEASE-IDENTITY-01]` t36 verified the final release tip but did not inspect every commit in the approved range. The captain's range audit found intermediate commit `b6bd2adff` authored as `Mamaclapper <noreply@vortxtv.local>`. t38 rewrote metadata only, preserved tree `f8e77105cd9aa3ec5c3e8fad5631e0db001c85a0` byte-for-byte, and produced final `c5a2422deabd7cc9ffeaaf05eaee04c8ffbba1cf`. Independent t39 then verified every author and committer plus the full release test suites.
+
+Guardrails:
+
+1. Identity gates inspect every commit in the integration range, not only the final tip.
+2. After metadata rewriting, prove old and new tree object IDs are identical and rerun the independent review against the new exact tip.
+3. Do not integrate or push a chain containing any noncanonical author or committer identity.
+
+## Canonical checkout detached by a lane worker
+
+`[MIS-W2-CANONICAL-DETACH-01]` Canonical `VortX` was found detached at updater commit `f2f58aae8` with three updater files and two audit documents dirty, while `refs/heads/main` remained safely at `de14c92b1`. The audit-document diff also deleted most of `LIVE_LOG.md`, so applying it would have destroyed programme history. The captain revoked the writer, preserved separate updater and document patches plus a receipt under `_recovery/audit-2026-08-26/`, rejected the destructive patch, restored the five tracked files, switched canonical back to clean `main`, and reapplied only verified entries surgically.
+
+Guardrails:
+
+1. Lane workers never checkout, reset, or detach the canonical repository. They work only in their registered worktree.
+2. Before canonical recovery, preserve each logical dirty subset as a separate patch with HEAD, refs, status, tracked-file list, and SHA-256 receipt.
+3. Inspect a recovered document patch for deletions and context drift before applying it. Never apply a patch that rewrites shared logs wholesale.
+4. Restore only explicitly enumerated tracked files, then switch canonical back to `main` and verify branch, HEAD, and clean status before editing.
