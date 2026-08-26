@@ -66,3 +66,11 @@ Guardrails:
 
 1. An out-of-memory or long-build failure in an unrelated module remains an environment-capacity observation until a controlled higher-memory rerun completes; never book it as a code verdict.
 2. Record pass and fail evidence side by side, here focused tests BUILD SUCCESSFUL against the compile OOM, so later readers cannot mistake capacity noise for a lane rejection.
+
+## Cherry-picked lane retirement ancestor miss
+
+`[MIS-W1-C-RETIRE-01]` The initial W1-C worktree retirement check failed because the cherry-picked integration commit `1c7504212` is a new commit: ancestry alone cannot prove it matches author HEAD `27de1e64`. Identical patch hashes then proved the two commits carry an equivalent change, and retirement proceeded.
+
+Guardrails:
+
+1. Retiring a lane whose patch landed through cherry-pick requires patch-id or equivalent hash verification of author HEAD against the integration commit; ancestor checks alone fail by design.

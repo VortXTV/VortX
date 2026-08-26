@@ -46,3 +46,12 @@
 - `[W1-C-OOM-01]` The captain-run focused Exo policy tests returned BUILD SUCCESSFUL. A separate compile invocation then failed after 1h25m with a Kotlin compiler out-of-memory error in the unrelated LocalizedMetadataStore.request path. This is classified as an environment-capacity failure pending a controlled higher-memory rerun, not a code verdict.
 - `[W1-C-OOM-RCPT-01]` Verification receipt: the captain Exo focused test task passed BUILD SUCCESSFUL; the subsequent standalone compile failed after 1h25m with the exact Kotlin compiler error `Not enough memory to run compilation` in the unrelated LocalizedMetadataStore.request path. Environment-capacity failure pending a controlled higher-memory rerun, not a code verdict.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - W1-C approved and integrated
+
+- `[W1-C-APPROVE-01]` The fallback seat exo-reviewer-v4flash (DeepSeek V4 Flash Vision) independently APPROVED W1-C at author HEAD `27de1e64`: the full FullDebug suite of 911 tests ran green and the Play production compile ran green.
+- The captain cherry-picked the equivalent patch onto main as `1c7504212`. Integrated FullDebug compile plus focused policy test returned BUILD SUCCESSFUL in 69s, and main was pushed.
+- The clean lane worktree was retired after identical patch-hash verification between author HEAD and the integration commit.
+- `[W1-C-PREDEFECT-01]` A pre-existing Play UNIT-TEST source-set defect surfaced: shared MpvPlayerHttpPropertiesTest references full-only MpvConfig/MpvPlayer. It is byte-identical to parent, so it is not a W1-C regression; it is scheduled for the CI/test wave.
+- `[W1-C-RETIRE-01]` The initial retirement ancestor check failed because a cherry-pick creates a new commit; identical patch hashes then proved equivalence and retirement proceeded.
+- Release remains frozen.
