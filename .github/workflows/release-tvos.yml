@@ -1147,8 +1147,13 @@ jobs:
           jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" \
             '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
             feed-artifact/manifest.json > "$RUNNER_TEMP/receipt-manifest.json"
-          jq -c --slurpfile manifest "$RUNNER_TEMP/receipt-manifest.json" --rawfile source feed-artifact/source.json --rawfile appcast feed-artifact/appcast.json --rawfile checksum feed-artifact/SHA256SUMS-ci.txt \
+          # -n is load-bearing: every payload comes from --slurpfile/--rawfile. Without a
+          # synthetic main input jq runs the filter zero times on Actions stdin and silently
+          # writes a zero-byte receipt, which the coordinator correctly rejects with HTTP 503.
+          jq -cn --slurpfile manifest "$RUNNER_TEMP/receipt-manifest.json" --rawfile source feed-artifact/source.json --rawfile appcast feed-artifact/appcast.json --rawfile checksum feed-artifact/SHA256SUMS-ci.txt \
             '{schemaVersion:2, action:"stage", manifest:$manifest[0], source:$source, appcast:$appcast, checksum:$checksum}' > "$RUNNER_TEMP/feed-receipt.json"
+          RECEIPT_BYTES="$(wc -c <"$RUNNER_TEMP/feed-receipt.json" | tr -d ' ')"
+          [ "$RECEIPT_BYTES" -gt 10000 ] || { echo "::error::receipt construction produced only $RECEIPT_BYTES bytes"; exit 1; }
           SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary <"$RUNNER_TEMP/feed-receipt.json" | od -An -tx1 | tr -d ' \n')"
           RECEIPT_RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS \
             -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" \
