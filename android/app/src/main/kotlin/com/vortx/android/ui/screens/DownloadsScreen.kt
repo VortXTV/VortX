@@ -38,6 +38,9 @@ import com.vortx.android.downloads.DownloadedMediaCapabilityResolver
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PlaybackContext
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
@@ -348,17 +351,13 @@ private fun DownloadRowActions(record: DownloadRecord, onPlay: (Playable) -> Uni
 
 /// Play a completed download from its LOCAL file.
 ///
-/// FIDELITY GAP, stated plainly rather than hidden: Apple rebuilds the engine `PlaybackMeta` from the record
-/// (`record.playbackMeta`) so progress / Continue Watching record against the same library item as a streamed play.
-/// Android has no `PlaybackMeta` port yet, so this hands the shell a local [Playable] and the engine attributes
-/// progress to whatever item its session currently points at. The record preserves known DV and Atmos routing
-/// flags; a legacy record is probed off the UI thread before routing. Per-title progress attribution for a download
-/// started from THIS screen is not yet guaranteed. It carries every id needed to close the gap (`contentId` /
-/// `videoId` / `type` / `season` / `episode`), so it is a wiring job for the round that ports PlaybackMeta, not a
-/// schema change.
-///
-/// Fail-soft if the file was purged out from under us (the eviction caption above is not hypothetical): drop the
-/// stale row instead of presenting a dead player.
+/// IDENTITY BINDING (closes the AND-DL-01 fidelity gap): the playable is built with the ACTIVE
+/// profile captured NOW, so its immutable [PlaybackContext] and derived mediaRef bind progress /
+/// scrobble / auto-next consumers to THIS title before playback starts, exactly like Apple's
+/// `record.playbackMeta` rebuild. The record preserves known DV and Atmos routing flags; a legacy
+/// record is probed off the UI thread before routing. Fail-soft if the file was purged out from
+/// under us (the eviction caption above is not hypothetical): drop the stale row instead of
+/// presenting a dead player.
 private suspend fun playLocal(record: DownloadRecord, onPlay: (Playable) -> Unit) {
     if (record.state != DownloadState.COMPLETED) return
 
@@ -385,8 +384,21 @@ private suspend fun playLocal(record: DownloadRecord, onPlay: (Playable) -> Unit
     }
     onPlay(
         resolution.record.localPlayable(
-            DownloadStore.fileFor(resolution.record).toURI().toString(),
+            localURL = DownloadStore.fileFor(resolution.record).toURI().toString(),
+            owner = activePlaybackOwner(),
         ),
+    )
+}
+
+/// Who is watching RIGHT NOW (a download index is device-local, so the owner binds at play time).
+/// Mirrors the repository's history split: engine/account history for the owner and own-account
+/// profiles, a private overlay history otherwise. Defaults match ProfileStore's own no-store
+/// fallbacks (owner id + engine history) so an uninitialized store still names a stable owner.
+internal fun activePlaybackOwner(): PlaybackContext.Owner {
+    val profiles = ProfileStore.sharedOrNull()
+    return PlaybackContext.Owner(
+        profileId = profiles?.activeProfileId ?: UserProfile.OWNER_ID,
+        usesEngineHistory = profiles?.activeUsesEngineHistory ?: true,
     )
 }
 

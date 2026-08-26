@@ -258,6 +258,92 @@ class HistoryOwnerFenceTest {
         }
     }
 
+    // ---- W1-D t16: delayed LOCAL begin must fail closed on any owner transition ----
+    //
+    // The shell captures the full ContinueWatchingOwner at play launch and begin verifies it with
+    // mutate(expectedOwner = token). Each test below simulates the world moving on between capture
+    // and the async begin, then proves the mutation NEVER runs (no Player.Load / progress / watched
+    // side effect) -- never a silent retarget onto the new owner.
+
+    @Test
+    fun `delayed local begin fails closed when profile changes between capture and mutation`() {
+        val state = OwnerState()
+        val fence = state.fence()
+        val boundOwner = requireNotNull(fence.captureRead()).owner
+        var sessionStarted = false
+
+        ContinueWatchingOwnerGate.transition(capture = { Unit }) {
+            state.profileId = "profile-b"
+            state.accountSlot = "primary.profile-b"
+        }
+
+        assertThrows(IllegalStateException::class.java) {
+            fence.mutate(expectedOwner = boundOwner) { sessionStarted = true }
+        }
+        assertFalse(sessionStarted)
+    }
+
+    @Test
+    fun `delayed local begin fails closed when account slot changes without profile change`() {
+        val state = OwnerState()
+        val fence = state.fence()
+        val boundOwner = requireNotNull(fence.captureRead()).owner
+        var sessionStarted = false
+
+        ContinueWatchingOwnerGate.transition(capture = { Unit }) {
+            state.accountSlot = "primary.alt-account"
+        }
+
+        assertThrows(IllegalStateException::class.java) {
+            fence.mutate(expectedOwner = boundOwner) { sessionStarted = true }
+        }
+        assertFalse(sessionStarted)
+    }
+
+    @Test
+    fun `delayed local begin fails closed when native principal changes without any profile change`() {
+        val state = OwnerState(usesEngineHistory = true, principal = "account-a")
+        val fence = state.fence()
+        val boundOwner = requireNotNull(fence.captureRead()).owner
+        var sessionStarted = false
+
+        state.principal = "account-b"
+
+        assertThrows(IllegalStateException::class.java) {
+            fence.mutate(expectedOwner = boundOwner) { sessionStarted = true }
+        }
+        assertFalse(sessionStarted)
+    }
+
+    @Test
+    fun `delayed local begin fails closed on same-profile owner revision bump`() {
+        val state = OwnerState()
+        val fence = state.fence()
+        val boundOwner = requireNotNull(fence.captureRead()).owner
+        var sessionStarted = false
+
+        // No field changes at all: the revision advances unconditionally under the gate, which alone
+        // must invalidate the captured token.
+        ContinueWatchingOwnerGate.transition(capture = { Unit }) { }
+
+        assertThrows(IllegalStateException::class.java) {
+            fence.mutate(expectedOwner = boundOwner) { sessionStarted = true }
+        }
+        assertFalse(sessionStarted)
+    }
+
+    @Test
+    fun `local begin succeeds while captured owner still matches including revision`() {
+        val state = OwnerState(usesEngineHistory = true, principal = "account-a")
+        val fence = state.fence()
+        val boundOwner = requireNotNull(fence.captureRead()).owner
+        var observed: ContinueWatchingOwner? = null
+
+        fence.mutate(expectedOwner = boundOwner) { observed = it }
+
+        assertEquals(boundOwner, observed)
+    }
+
     private fun owner(profileId: String): ContinueWatchingOwner = ContinueWatchingOwner(
         profileId = profileId,
         accountSlot = "primary.$profileId",

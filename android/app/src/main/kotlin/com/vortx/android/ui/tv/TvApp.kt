@@ -18,6 +18,7 @@ import androidx.tv.material3.MaterialTheme as TvMaterialTheme
 import androidx.tv.material3.darkColorScheme as tvDarkColorScheme
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
@@ -157,7 +158,12 @@ fun TvApp(
                 mutableStateOf(PlayerEpisodeHistoryIdentity(playable))
             }
             val playbackHistory = remember(historyIdentity) {
-                TvPlaybackHistorySession(historyIdentity, playbackSessions)
+                // The full owner token is captured SYNCHRONOUSLY at play launch (this remember runs once
+                // per identity) and the repository verifies it under the owner fence when the async
+                // begin executes -- any profile/account/principal/revision change in between fails
+                // closed instead of retargeting the session.
+                val ownerToken = repo.continueWatchingOwner()
+                TvPlaybackHistorySession(historyIdentity, playbackSessions, ownerToken)
             }
             val playerSourceState = if (playerVm != null) {
                 playerVm.streams.collectAsStateWithLifecycle().value
@@ -327,14 +333,24 @@ fun TvApp(
 internal class TvPlaybackHistorySession(
     historyIdentity: PlayerEpisodeHistoryIdentity,
     private val playbackSessions: PlaybackSessionLifecycle,
+    /// The full ContinueWatchingOwner-grade token captured at play launch. Begin hands exactly this
+    /// token (with the bound media context) to the repository, whose owner fence fails closed on any
+    /// profile/account/principal/route/revision change since capture -- never retargets.
+    private val ownerToken: ContinueWatchingOwner?,
 ) {
     private val handle = if (historyIdentity.playable.isTrailer) null else playbackSessions.newHandle()
+
+    /// The immutable playback identity captured at construction (the TV port of Apple binding the
+    /// launch `PlaybackMeta` once). Begin hands exactly this context to the repository, so later
+    /// shell or engine state changes cannot retarget the session's history writes.
+    private val boundContext = if (historyIdentity.playable.isTrailer) null else historyIdentity.playable.playbackContext
+
     private var lastPositionMs = 0L
     private var lastDurationMs = 0L
 
     fun begin() {
         val activeHandle = handle ?: return
-        playbackSessions.begin(activeHandle)
+        playbackSessions.begin(activeHandle, boundContext, ownerToken)
     }
 
     fun report(positionMs: Long, durationMs: Long) {

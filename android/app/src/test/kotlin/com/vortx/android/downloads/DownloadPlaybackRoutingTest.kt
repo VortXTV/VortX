@@ -16,6 +16,11 @@ import java.io.File
 
 class DownloadPlaybackRoutingTest {
 
+    private val testOwner = com.vortx.android.model.PlaybackContext.Owner(
+        profileId = "owner-profile",
+        usesEngineHistory = true,
+    )
+
     private fun record(
         isDolbyVision: Boolean? = false,
         isAtmos: Boolean? = false,
@@ -58,7 +63,7 @@ class DownloadPlaybackRoutingTest {
     @Test
     fun `new download local playback preserves known routing flags`() {
         val playable = record(isDolbyVision = true, isAtmos = true)
-            .localPlayable("file:///downloads/movie.mkv")
+            .localPlayable("file:///downloads/movie.mkv", owner = testOwner)
 
         assertEquals("file:///downloads/movie.mkv", playable.url)
         assertTrue(playable.isDolbyVision)
@@ -280,8 +285,8 @@ class DownloadPlaybackRoutingTest {
         assertEquals(resolution.record, persisted)
         assertEquals(true, resolution.record.isDolbyVision)
         assertNull(resolution.record.isAtmos)
-        assertTrue(resolution.record.localPlayable("file:///legacy.mkv").isDolbyVision)
-        assertFalse(resolution.record.localPlayable("file:///legacy.mkv").isAtmos)
+        assertTrue(resolution.record.localPlayable("file:///legacy.mkv", owner = testOwner).isDolbyVision)
+        assertFalse(resolution.record.localPlayable("file:///legacy.mkv", owner = testOwner).isAtmos)
     }
 
     @Test
@@ -293,8 +298,8 @@ class DownloadPlaybackRoutingTest {
         assertTrue(resolution.shouldPersist)
         assertNull(resolution.record.isDolbyVision)
         assertEquals(true, resolution.record.isAtmos)
-        assertFalse(resolution.record.localPlayable("file:///legacy.mkv").isDolbyVision)
-        assertTrue(resolution.record.localPlayable("file:///legacy.mkv").isAtmos)
+        assertFalse(resolution.record.localPlayable("file:///legacy.mkv", owner = testOwner).isDolbyVision)
+        assertTrue(resolution.record.localPlayable("file:///legacy.mkv", owner = testOwner).isAtmos)
     }
 
     @Test
@@ -331,8 +336,8 @@ class DownloadPlaybackRoutingTest {
         assertEquals(0, persistCalls)
         assertNull(resolution.record.isDolbyVision)
         assertNull(resolution.record.isAtmos)
-        assertFalse(resolution.record.localPlayable("file:///legacy.mkv").isDolbyVision)
-        assertFalse(resolution.record.localPlayable("file:///legacy.mkv").isAtmos)
+        assertFalse(resolution.record.localPlayable("file:///legacy.mkv", owner = testOwner).isDolbyVision)
+        assertFalse(resolution.record.localPlayable("file:///legacy.mkv", owner = testOwner).isAtmos)
     }
 
     @Test

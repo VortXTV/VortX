@@ -30,6 +30,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PlaybackContext
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
@@ -71,8 +72,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import kotlin.time.Duration.Companion.seconds
 
 internal data class DebridResolveTarget(
@@ -180,6 +184,47 @@ internal fun engineHistoryPrincipalMatches(profile: UserProfile?, state: AuthSta
     return expected == actual
 }
 
+/// Synthetic, clearly-local request base for locally-bound playback sessions. The engine's
+/// `ResourceRequest` requires a well-formed absolute base URL even though a local play never fetches
+/// through it; `vortx.local` parses as a Url while never colliding with a real add-on origin.
+internal const val LOCAL_PLAYBACK_REQUEST_BASE = "https://vortx.local/"
+
+/// Synthesize the engine Player `selected` struct PURELY from a LOCAL session's immutable
+/// [PlaybackContext] -- no resident state is read. This is the Android port of Apple's identity
+/// binding for plays that skip the detail page (offline downloads / direct resumes): the engine keys
+/// TimeChanged attribution on `stream_request.path.id`, resolves the Player's own library item from
+/// `ctx.library` by `meta_request.path.id`, and runs its watched threshold + Continue Watching push
+/// against that item, so a context-derived selected attributes every write to THIS title even when
+/// the resident detail page still describes an earlier one. The stream carries only a source-bearing
+/// marker URL (the engine parses the `Selected` struct but never opens it; actual media lives outside
+/// the engine), and both paths carry the required `extra: []`. Pure and deterministic: identical
+/// contexts produce byte-identical payloads on phone and TV.
+internal fun buildLocalPlayerSelected(context: PlaybackContext): JSONObject {
+    fun resourcePath(resource: String, id: String): JSONObject =
+        JSONObject()
+            .put("resource", resource)
+            .put("type", context.type)
+            .put("id", id)
+            .put("extra", JSONArray())
+    val streamUrl = LOCAL_PLAYBACK_REQUEST_BASE + "offline/" +
+        URLEncoder.encode(context.identityKey, StandardCharsets.UTF_8)
+    return JSONObject()
+        .put("stream", JSONObject().put("url", streamUrl))
+        .put(
+            "streamRequest",
+            JSONObject()
+                .put("base", LOCAL_PLAYBACK_REQUEST_BASE)
+                .put("path", resourcePath("stream", context.videoId)),
+        )
+        .put(
+            "metaRequest",
+            JSONObject()
+                .put("base", LOCAL_PLAYBACK_REQUEST_BASE)
+                .put("path", resourcePath("meta", context.contentId)),
+        )
+        .put("subtitlesPath", JSONObject.NULL)
+}
+
 internal data class PlaybackHistorySession(
     val token: PlaybackSessionToken,
     val owner: ContinueWatchingOwner,
@@ -189,6 +234,13 @@ internal data class PlaybackHistorySession(
     val overlayMetaId: String?,
     val name: String?,
     val poster: String?,
+    /// True when the identity was bound EXPLICITLY from an immutable local [PlaybackContext] at
+    /// begin time. Such a session never scrapes resident metadata, and its end must skip the
+    /// resident-keyed MarkVideoAsWatched / MarkAsWatched belt-and-suspenders: after a stream-A then
+    /// offline-B play the resident detail page can still describe A, and the loaded Player already
+    /// marks the bound identity watched through its own threshold path (stremio-core `Player` sets
+    /// `flagged_watched` + `send_watched` keyed on its OWN loaded requests).
+    val localIdentityBound: Boolean = false,
 )
 
 /** Holds exactly one playback session and rejects every callback carrying a replaced generation. */
@@ -2187,46 +2239,90 @@ class EngineStremioRepository(
     /// a no-op, including an old end that must never unload the replacement player.
     private val playbackHistorySessions = PlaybackHistorySessions()
 
-    override suspend fun beginPlaybackSession(): Result<PlaybackSessionToken> = withContext(Dispatchers.Default) { runCatching {
+    /// A LOCAL play binds its history identity from the immutable [PlaybackContext] the shell captured
+    /// at launch (the Android port of Apple's `DownloadRecord.playbackMeta` + direct-resume binding).
+    /// The session record derives ONLY from that context: no resident `meta_details` scrape, no overlay
+    /// detail fallback -- after a stream-A then offline-B switch the resident state still describes A,
+    /// and trusting it would write B's progress onto A (finding AND-DL-01). On the engine route the
+    /// Player is Loaded with a context-synthesized selected ([buildLocalPlayerSelected]) so every
+    /// TimeChanged tick, the watched threshold, and Continue Watching re-derivation attribute to THIS
+    /// title from the first tick. Null context (streaming) keeps the resident-scrape path unchanged.
+    ///
+    /// The local session ALSO binds the full owner token ([ownerToken], captured at play launch via
+    /// [continueWatchingOwner]) and verifies it under [historyOwnerFence] with
+    /// `mutate(expectedOwner = ownerToken)`: data-class equality covers profileId, accountSlot,
+    /// principal, route, and revision, so ANY ownership transition between launch and the (async)
+    /// begin fails closed -- the fence check throws, [runCatching] turns it into a failure, the shell's
+    /// token stays null, and NO Player.Load / progress / watched action ever runs. A context without a
+    /// token cannot prove ownership at all and is rejected outright. Streaming sessions pass
+    /// `expectedOwner = null` and keep the ambient-capture behavior byte-identical to before.
+    override suspend fun beginPlaybackSession(
+        context: PlaybackContext?,
+        ownerToken: ContinueWatchingOwner?,
+    ): Result<PlaybackSessionToken> = withContext(Dispatchers.Default) { runCatching {
+        check(context == null || ownerToken != null) {
+            "Local playback session requires the owner token captured at play launch."
+        }
         playbackHistorySessions.replace(
             unloadPrevious = { previous ->
                 if (previous.enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.unloadPlayer())
             },
         ) { token ->
-            historyOwnerFence.mutate { owner ->
-                val route = historyRouteLocked(owner)
-                val selected = buildPlayerSelected()
-                val detail = if (route is HistoryRoute.Overlay) currentMetaDetail() else null
-                val type = selected?.optJSONObject("metaRequest")
-                    ?.optJSONObject("path")
-                    ?.optString("type")
-                    ?.ifBlank { null }
-                    ?: detail?.type?.id
-                val videoId = selected?.optJSONObject("streamRequest")
-                    ?.optJSONObject("path")
-                    ?.optString("id")
-                    ?.ifBlank { null }
-                val overlayMetaId = if (route is HistoryRoute.Overlay) {
-                    selected?.optJSONObject("metaRequest")
+            historyOwnerFence.mutate(expectedOwner = if (context != null) ownerToken else null) { owner ->
+                if (context != null) {
+                    val route = historyRouteLocked(owner)
+                    val engineRoute = route is HistoryRoute.Engine
+                    if (engineRoute) {
+                        StremioCoreNative.dispatch(
+                            EngineActions.loadPlayer(buildLocalPlayerSelected(context)),
+                        )
+                    }
+                    PlaybackHistorySession(
+                        token = token,
+                        owner = owner,
+                        enginePlayerLoaded = engineRoute,
+                        type = context.type,
+                        videoId = context.videoId,
+                        overlayMetaId = if (route is HistoryRoute.Overlay) context.contentId else null,
+                        name = context.title,
+                        poster = context.poster,
+                        localIdentityBound = true,
+                    )
+                } else {
+                    val route = historyRouteLocked(owner)
+                    val selected = buildPlayerSelected()
+                    val detail = if (route is HistoryRoute.Overlay) currentMetaDetail() else null
+                    val type = selected?.optJSONObject("metaRequest")
+                        ?.optJSONObject("path")
+                        ?.optString("type")
+                        ?.ifBlank { null }
+                        ?: detail?.type?.id
+                    val videoId = selected?.optJSONObject("streamRequest")
                         ?.optJSONObject("path")
                         ?.optString("id")
                         ?.ifBlank { null }
-                        ?: detail?.id
-                } else {
-                    null
+                    val overlayMetaId = if (route is HistoryRoute.Overlay) {
+                        selected?.optJSONObject("metaRequest")
+                            ?.optJSONObject("path")
+                            ?.optString("id")
+                            ?.ifBlank { null }
+                            ?: detail?.id
+                    } else {
+                        null
+                    }
+                    val enginePlayerLoaded = route is HistoryRoute.Engine && selected != null
+                    if (enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.loadPlayer(selected!!))
+                    PlaybackHistorySession(
+                        token = token,
+                        owner = owner,
+                        enginePlayerLoaded = enginePlayerLoaded,
+                        type = type,
+                        videoId = videoId,
+                        overlayMetaId = overlayMetaId,
+                        name = detail?.name,
+                        poster = detail?.poster,
+                    )
                 }
-                val enginePlayerLoaded = route is HistoryRoute.Engine && selected != null
-                if (enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.loadPlayer(selected!!))
-                PlaybackHistorySession(
-                    token = token,
-                    owner = owner,
-                    enginePlayerLoaded = enginePlayerLoaded,
-                    type = type,
-                    videoId = videoId,
-                    overlayMetaId = overlayMetaId,
-                    name = detail?.name,
-                    poster = detail?.poster,
-                )
             }
         }
     } }
@@ -2310,7 +2406,11 @@ class EngineStremioRepository(
                             StremioCoreNative.dispatch(
                                 EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
                             )
-                            if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
+                            // The resident-keyed marks below assume resident == playing (true for every
+                            // streaming session). A locally-bound session must NOT touch them: the
+                            // resident page can still describe an earlier title, and the loaded Player
+                            // already flagged the bound identity watched at its own threshold.
+                            if (!active.localIdentityBound && positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
                                 val type = active.type
                                 val videoId = active.videoId
                                 if (type == MediaType.SERIES.id && !videoId.isNullOrEmpty()) {

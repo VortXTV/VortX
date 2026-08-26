@@ -16,6 +16,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PlaybackContext
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.delay
@@ -344,7 +345,20 @@ interface CatalogRepository {
 
     /// Load the engine Player for the title currently open in `meta_details` and return the opaque
     /// identity that every subsequent [reportProgress] and [endPlaybackSession] callback must carry.
-    suspend fun beginPlaybackSession(): Result<PlaybackSessionToken> = Result.success(PlaybackSessionToken.NOOP)
+    /// For a LOCAL play (an offline download), [context] carries the immutable playback identity the
+    /// session binds to: the implementation must derive every history write from it and never fall
+    /// back to resident engine/overlay metadata, which may still describe a different title. Null
+    /// (every streaming play) preserves the resident-scrape behavior unchanged.
+    ///
+    /// [ownerToken] is the full [ContinueWatchingOwner] captured at play launch (via
+    /// [continueWatchingOwner]). Implementations backing history by a switchable owner MUST verify it
+    /// against the live owner when the session begins and FAIL CLOSED on any mismatch -- profile,
+    /// account slot, principal, route, or revision -- so a delayed begin can never attach a local
+    /// session to an owner that changed after launch. Required whenever [context] is present.
+    suspend fun beginPlaybackSession(
+        context: PlaybackContext? = null,
+        ownerToken: ContinueWatchingOwner? = null,
+    ): Result<PlaybackSessionToken> = Result.success(PlaybackSessionToken.NOOP)
 
     /// Report the live playback position + duration (ms) for [session]. Replaced sessions are no-ops.
     suspend fun reportProgress(

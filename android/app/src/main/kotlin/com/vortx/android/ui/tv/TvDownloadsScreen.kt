@@ -42,6 +42,9 @@ import com.vortx.android.downloads.DownloadedMediaCapabilityResolver
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PlaybackContext
+import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -353,11 +356,12 @@ private fun TvDownloadRow(record: DownloadRecord, title: String?, onPlay: (Playa
 
 /// Play a completed download from its LOCAL file, off the UI thread.
 ///
-/// FIDELITY GAP (stated, not hidden), identical to the phone screen: Android has no `PlaybackMeta` port yet, so
-/// this hands the shell a local [Playable] and the engine attributes progress to whatever item its session
-/// currently points at. Per-title progress attribution for a play started here is not yet guaranteed; the record
-/// keeps every id needed to close it later. Fail-soft if the file was purged out from under us (the eviction
-/// caption is not hypothetical): drop the stale row rather than present a dead player.
+/// IDENTITY BINDING (closes the AND-DL-01 fidelity gap), identical to the phone screen: the playable
+/// is built with the ACTIVE profile captured NOW, so its immutable [PlaybackContext] and derived
+/// mediaRef bind progress / scrobble / auto-next consumers to THIS title before playback starts,
+/// exactly like Apple's `record.playbackMeta` rebuild. Fail-soft if the file was purged out from
+/// under us (the eviction caption is not hypothetical): drop the stale row rather than present a
+/// dead player.
 private suspend fun tvPlayLocal(record: DownloadRecord, onPlay: (Playable) -> Unit) {
     if (record.state != DownloadState.COMPLETED) return
     val resolution = withContext(Dispatchers.IO) {
@@ -383,8 +387,19 @@ private suspend fun tvPlayLocal(record: DownloadRecord, onPlay: (Playable) -> Un
     }
     onPlay(
         resolution.record.localPlayable(
-            DownloadStore.fileFor(resolution.record).toURI().toString(),
+            localURL = DownloadStore.fileFor(resolution.record).toURI().toString(),
+            owner = activeTvPlaybackOwner(),
         ),
+    )
+}
+
+/// TV twin of the phone screen's owner capture: who is watching RIGHT NOW. Defaults match
+/// ProfileStore's own no-store fallbacks (owner id + engine history).
+internal fun activeTvPlaybackOwner(): PlaybackContext.Owner {
+    val profiles = ProfileStore.sharedOrNull()
+    return PlaybackContext.Owner(
+        profileId = profiles?.activeProfileId ?: UserProfile.OWNER_ID,
+        usesEngineHistory = profiles?.activeUsesEngineHistory ?: true,
     )
 }
 

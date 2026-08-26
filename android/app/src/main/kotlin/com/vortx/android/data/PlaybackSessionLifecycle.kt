@@ -1,5 +1,6 @@
 package com.vortx.android.data
 
+import com.vortx.android.model.PlaybackContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -10,17 +11,22 @@ import java.util.concurrent.atomic.AtomicReference
  * Orders player composition lifecycle calls without blocking the UI thread. Compose disposes the old
  * keyed effect before starting the replacement; enqueueing synchronously preserves that order even
  * though repository work runs on [scope]. Progress stays independent and carries its immutable token,
- * so a delayed tick is rejected by the repository after replacement.
+ * so a delayed tick is rejected by the repository after replacement. The [PlaybackContext] and the
+ * [ContinueWatchingOwner] token handed to [begin] are each captured once: they flow into exactly one
+ * [beginSession] invocation and are then owned by the bound session, so later shell, profile, or
+ * engine state changes can never retarget the session's identity or owner.
  */
 class PlaybackSessionLifecycle internal constructor(
     private val scope: CoroutineScope,
-    private val beginSession: suspend () -> PlaybackSessionToken?,
+    private val beginSession: suspend (PlaybackContext?, ContinueWatchingOwner?) -> PlaybackSessionToken?,
     private val reportSession: suspend (PlaybackSessionToken, Long, Long) -> Unit,
     private val endSession: suspend (PlaybackSessionToken, Long, Long) -> Unit,
 ) {
     constructor(repository: CatalogRepository, scope: CoroutineScope) : this(
         scope = scope,
-        beginSession = { repository.beginPlaybackSession().getOrNull() },
+        beginSession = { context, ownerToken ->
+            repository.beginPlaybackSession(context, ownerToken).getOrNull()
+        },
         reportSession = { token, positionMs, durationMs ->
             repository.reportProgress(token, positionMs, durationMs)
         },
@@ -38,9 +44,13 @@ class PlaybackSessionLifecycle internal constructor(
 
     fun newHandle(): Handle = Handle()
 
-    fun begin(handle: Handle) {
+    fun begin(
+        handle: Handle,
+        context: PlaybackContext? = null,
+        ownerToken: ContinueWatchingOwner? = null,
+    ) {
         enqueue {
-            handle.token.set(beginSession())
+            handle.token.set(beginSession(context, ownerToken))
         }
     }
 

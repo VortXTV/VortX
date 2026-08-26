@@ -8,9 +8,9 @@ import java.util.UUID
  * local index: it is NEVER account-synced and NEVER written into a `libraryItem` document.
  *
  * The iOS-only HLS `.movpkg` branch (`hlsRelativePath` / `isHLSOffline`) is intentionally omitted (Android
- * has no `AVAssetDownloadTask`). The Apple `playbackMeta` convenience is also omitted for now because
- * `PlaybackMeta` is not yet ported to Android; the ids needed to rebuild it (`contentId` / `videoId` /
- * `type` / `season` / `episode`) are all retained so a later round can add it without a schema change.
+ * has no `AVAssetDownloadTask`). Apple's `playbackMeta` convenience IS ported: [PlaybackContext] carries
+ * the same identity (`contentId` / `videoId` / `type` / `season` / `episode` + title/poster) plus the
+ * play-time owner binding, and [localPlayable] attaches it to every local session.
  */
 
 /** Lifecycle of one download. Wire strings match Apple's `DownloadState` rawValues. */
@@ -116,16 +116,54 @@ data class DownloadRecord(
         get() = if (bytesTotal > 0) (bytesDone.toDouble() / bytesTotal.toDouble()).coerceIn(0.0, 1.0) else 0.0
 
     /**
+     * Rebuild the local playback identity (the Android port of Apple `record.playbackMeta`): an
+     * immutable [PlaybackContext] binding who is watching ([owner], captured at play time -- the
+     * download index itself is device-local, never per-profile) with the SAME content/video/type/
+     * season/episode/title/poster values the streaming play path resolves against, plus a provenance
+     * snapshot. Every progress / watched / scrobble / auto-next decision for this session must derive
+     * from this context, never from resident engine or detail-surface state (audit AND-DL-01).
+     */
+    fun playbackContext(owner: PlaybackContext.Owner): PlaybackContext = PlaybackContext(
+        owner = owner,
+        contentId = contentId,
+        videoId = videoId,
+        type = type,
+        season = season,
+        episode = episode,
+        title = name,
+        poster = poster,
+        provenance = PlaybackContext.Provenance(
+            sourceName = sourceName,
+            qualityText = qualityText,
+            torrentFetched = isTorrent,
+            debridOwnerIdentity = debridOwnerIdentity,
+            debridOwnerGeneration = debridOwnerGeneration,
+        ),
+    )
+
+    /**
      * Rebuild the local playback handle without losing known source capabilities. Unknown legacy
      * capabilities fail closed to false here; [com.vortx.android.downloads.DownloadedMediaCapabilityResolver]
      * probes them before this function is called and leaves them unknown when probing fails.
+     *
+     * The returned playable carries the immutable [PlaybackContext] for [owner] AND the derived
+     * [Playable.mediaRef], so every downstream identity consumer (scrobble, add-on subtitles, skip
+     * segments, trickplay keys, auto-skip memory) binds to THIS title before playback starts instead
+     * of falling back to whatever the resident engine surface held.
      */
-    fun localPlayable(localURL: String): Playable = Playable(
-        url = localURL,
-        title = displayTitle,
-        viaStreamingServer = false,
-        isTorrent = false,
-        isDolbyVision = isDolbyVision == true,
-        isAtmos = isAtmos == true,
-    )
+    fun localPlayable(localURL: String, owner: PlaybackContext.Owner): Playable {
+        val context = playbackContext(owner)
+        return Playable(
+            url = localURL,
+            title = displayTitle,
+            viaStreamingServer = false,
+            isTorrent = false,
+            isDolbyVision = isDolbyVision == true,
+            isAtmos = isAtmos == true,
+            // The downloaded item's own art on the system media session / lockscreen card.
+            posterUrl = poster,
+            mediaRef = context.toMediaRef(),
+            playbackContext = context,
+        )
+    }
 }

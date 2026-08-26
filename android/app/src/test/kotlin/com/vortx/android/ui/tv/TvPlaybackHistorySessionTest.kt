@@ -1,8 +1,10 @@
 package com.vortx.android.ui.tv
 
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PlaybackSessionToken
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PlaybackContext
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -24,7 +26,7 @@ class TvPlaybackHistorySessionTest {
             var generation = 0L
             val lifecycle = PlaybackSessionLifecycle(
                 scope = this,
-                beginSession = {
+                beginSession = { _, _ ->
                     val token = PlaybackSessionToken(++generation)
                     events += "begin-${token.generation}"
                     token
@@ -45,6 +47,7 @@ class TvPlaybackHistorySessionTest {
                     playable(title = "$residentKind trailer", isTrailer = true),
                 ),
                 playbackSessions = lifecycle,
+                ownerToken = null,
             )
 
             trailer.begin()
@@ -68,7 +71,7 @@ class TvPlaybackHistorySessionTest {
         var generation = 0L
         val lifecycle = PlaybackSessionLifecycle(
             scope = this,
-            beginSession = {
+            beginSession = { _, _ ->
                 val token = PlaybackSessionToken(++generation)
                 activeToken = token
                 events += "begin-${token.generation}"
@@ -95,12 +98,14 @@ class TvPlaybackHistorySessionTest {
                 playable(title = "resident movie", isTrailer = false),
             ),
             playbackSessions = lifecycle,
+            ownerToken = null,
         )
         val replacement = TvPlaybackHistorySession(
             historyIdentity = PlayerEpisodeHistoryIdentity(
                 playable(title = "resident episode", isTrailer = false),
             ),
             playbackSessions = lifecycle,
+            ownerToken = null,
         )
 
         first.begin()
@@ -156,6 +161,81 @@ class TvPlaybackHistorySessionTest {
             events,
         )
         assertEquals(null, activeToken)
+    }
+
+    @Test
+    fun `local download binds its playback context once and trailers bind none`() = runTest {
+        val received = mutableListOf<Pair<PlaybackContext?, ContinueWatchingOwner?>>()
+        var generation = 0L
+        val lifecycle = PlaybackSessionLifecycle(
+            scope = this,
+            beginSession = { context, ownerToken ->
+                received += context to ownerToken
+                PlaybackSessionToken(++generation)
+            },
+            reportSession = { _, _, _ -> },
+            endSession = { _, _, _ -> },
+        )
+
+        // A downloaded episode carries its full identity; begin() must hand EXACTLY that immutable
+        // context to the repository (never a resident-scrape null), and later report/end calls must
+        // not re-bind anything.
+        val downloadedEpisode = Playable(
+            url = "file:///data/user/0/com.vortx.android/files/offline/tt0108778-s3e1.mp4",
+            title = "Friends S3E1",
+            playbackContext = PlaybackContext(
+                owner = PlaybackContext.Owner("profile-overlay", usesEngineHistory = false),
+                contentId = "imdb:tt0108778",
+                videoId = "imdb:tt0108778:3:1",
+                type = "series",
+                season = 3,
+                episode = 1,
+                title = "Friends",
+                poster = null,
+                provenance = PlaybackContext.Provenance(
+                    sourceName = null,
+                    qualityText = null,
+                    torrentFetched = false,
+                    debridOwnerIdentity = null,
+                    debridOwnerGeneration = null,
+                ),
+            ),
+        )
+        val localOwnerToken = ContinueWatchingOwner(
+            profileId = "profile-overlay",
+            accountSlot = "primary.profile-overlay",
+            principal = "principal-a",
+            usesEngineHistory = false,
+            revision = 7L,
+        )
+        val local = TvPlaybackHistorySession(
+            historyIdentity = PlayerEpisodeHistoryIdentity(downloadedEpisode),
+            playbackSessions = lifecycle,
+            ownerToken = localOwnerToken,
+        )
+        local.begin()
+        runCurrent()
+        local.report(positionMs = 30_000L, durationMs = 100_000L)
+        local.end()
+        advanceUntilIdle()
+
+        assertEquals(1, received.size)
+        assertEquals("imdb:tt0108778", requireNotNull(received.single().first).contentId)
+        assertEquals("imdb:tt0108778:3:1", requireNotNull(received.single().first).videoId)
+        // The full owner token captured at play launch must ride along with the context.
+        assertEquals(localOwnerToken, received.single().second)
+
+        // A trailer play must keep the streaming (null-context) path so no history session exists.
+        val trailer = TvPlaybackHistorySession(
+            historyIdentity = PlayerEpisodeHistoryIdentity(playable(title = "trailer", isTrailer = true)),
+            playbackSessions = lifecycle,
+            ownerToken = null,
+        )
+        trailer.begin()
+        trailer.report(positionMs = 60_000L, durationMs = 120_000L)
+        trailer.end()
+        advanceUntilIdle()
+        assertEquals(1, received.size)
     }
 
     private fun playable(title: String, isTrailer: Boolean): Playable = Playable(

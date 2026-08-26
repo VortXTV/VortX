@@ -578,7 +578,16 @@ fun VortXApp(
             // dedicated player instances that never touch the library. Keyed on the history identity so an
             // in-player episode switch ends the finished episode's session and begins the new one.
             DisposableEffect(historyIdentity) {
-                if (!historyPlayable.isTrailer) playbackSessions.begin(playbackSession)
+                // Bind THIS play's immutable identity into the history session: for a local download
+                // the repository must never scrape resident metadata (it may still describe another
+                // title); for a stream the context is null and behavior is unchanged. The full owner
+                // token is captured SYNCHRONOUSLY here, at play launch, and the repository verifies it
+                // under the owner fence when the async begin runs -- any profile/account/principal/
+                // revision change in between fails closed instead of retargeting the session.
+                if (!historyPlayable.isTrailer) {
+                    val ownerToken = repo.continueWatchingOwner()
+                    playbackSessions.begin(playbackSession, historyPlayable.playbackContext, ownerToken)
+                }
                 onDispose {
                     if (!historyPlayable.isTrailer) {
                         playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1])

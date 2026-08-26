@@ -111,7 +111,7 @@ class AndroidParityIntegrationContractTest {
             Requirement(Source.TV_COMPONENTS, "if (item.watched)"),
             Requirement(Source.PHONE_APP, "playbackSessions.newHandle()"),
             Requirement(Source.PHONE_APP, "playbackSessions.report(playbackSession, pos, dur)"),
-            Requirement(Source.TV_APP, "TvPlaybackHistorySession(historyIdentity, playbackSessions)"),
+            Requirement(Source.TV_APP, "TvPlaybackHistorySession(historyIdentity, playbackSessions, ownerToken)"),
             Requirement(
                 Source.TV_APP,
                 "private val handle = if (historyIdentity.playable.isTrailer) null else playbackSessions.newHandle()",

@@ -207,6 +207,19 @@ fun PlayerScreen(
         subtitleOffsetContentKey(currentPlayable.mediaRef)
     }
 
+    // LOCAL SESSION BINDING (audit AND-DL-01): a local file play (an offline download) arrives with an
+    // immutable [PlaybackContext] bound by [DownloadRecord.localPlayable] -- owner/profile, content +
+    // video ids, type, season/episode, title/poster, resume identity, provenance -- and a mediaRef
+    // derived from THAT context, so every identity consumer below (scrobble, add-on subtitles, skip
+    // segments, trickplay keys, auto-skip memory) binds to the downloaded title itself. What a local
+    // session must NEVER do is feed host callbacks that resolve identity from AMBIENT state: the
+    // shell's detail ViewModel may still hold a previously streamed title A when downloaded B plays,
+    // and B's end/failure/preload ticks would then advance or retry A. So for a local session this
+    // screen routes its natural end to a plain exit (the TV shell's long-standing behavior) and keeps
+    // the preload + bad-source-retry ladders dormant; a context-less local file (never produced today,
+    // defensive only) is treated the same fail-safe way.
+    val isLocalSession = isLocalFilePlayback(currentPlayable)
+
     // Chrome-owned view state (not engine state): the aspect/zoom mode passed to the surface, and the
     // current playback speed reflected in the speed control. The aspect mode is seeded from the persisted
     // choice (Apple `stremiox.videoSize`) rather than always Fit, so the viewer's last pick is restored on
@@ -835,9 +848,13 @@ fun PlayerScreen(
     // (stallError), a wrong/junk file (runtimeMismatch) -- so the ladder is the single recovery
     // path. With no [onSourceFailed] wired this is inert and the chrome's error overlay + manual
     // "Choose another source" behavior stays available.
+    // A LOCAL session never feeds the ladder: the host's resolver belongs to whatever title its
+    // detail surface holds, which for a download play can be a DIFFERENT streamed title -- retrying
+    // it would resolve and play foreign sources over this session's file (AND-DL-01). The error
+    // overlay remains the recovery surface.
     var sourceFailureDispatched by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(effectiveError) {
-        if (!effectiveError || sourceFailureDispatched) return@LaunchedEffect
+        if (!effectiveError || sourceFailureDispatched || isLocalSession) return@LaunchedEffect
         val dispatch = currentOnSourceFailed ?: return@LaunchedEffect
         sourceFailureDispatched = true
         dispatch(latestState.positionMs.coerceAtLeast(0L))
@@ -1082,6 +1099,15 @@ fun PlayerScreen(
             currentOnBack()
             return@LaunchedEffect
         }
+        // A LOCAL session's end is a plain exit, never [currentOnEnded]: the host's ended handler asks
+        // its detail ViewModel for the next episode, and for a download play that ViewModel can belong
+        // to an EARLIER streamed title -- finishing downloaded B must never offer or auto-advance into
+        // A's successor (AND-DL-01). Exiting matches the TV shell, whose player has always closed on
+        // end; a future legitimate local Up Next needs an identity-carrying callback of its own.
+        if (isLocalSession) {
+            currentOnBack()
+            return@LaunchedEffect
+        }
         currentOnEnded()
     }
 
@@ -1110,7 +1136,9 @@ fun PlayerScreen(
                 currentOnProgress(s.positionMs, s.durationMs)
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
-                currentOnWarmNext(s.positionMs, s.durationMs)
+                // A LOCAL session never drives it: warming resolves through the host's detail ViewModel,
+                // which for a download play can belong to an earlier streamed title (AND-DL-01).
+                if (!isLocalSession) currentOnWarmNext(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1851,6 +1879,15 @@ private fun videoHeightOf(engine: PlayerEngine): Int {
         ?.firstOrNull { it.first == "Resolution" }?.second ?: return 0
     return resolution.substringAfter('x', "").toIntOrNull() ?: 0
 }
+
+/**
+ * True when this playable opens a device-LOCAL file (an offline download). Only the download screens
+ * produce `file://` playables today; every streamed / torrent / debrid / trailer source resolves to an
+ * http(s) or loopback URL. Used to gate the host callbacks that resolve identity from ambient state
+ * (auto-next, preload, bad-source ladder) so a local session can never act on a foreign title
+ * (audit AND-DL-01).
+ */
+internal fun isLocalFilePlayback(playable: Playable): Boolean = playable.url.startsWith("file:")
 
 /**
  * Stable media identity for automatic-skip lifecycle state. IMDb plus season/episode survives a source

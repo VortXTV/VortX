@@ -601,6 +601,15 @@ data class Playable(
     /// lockscreen shows the episode, not the show. Null for a movie / live / trailer. The show name rides
     /// [MediaRef.title]; the SxxEyy tag is derived from [MediaRef]. Mirrors Apple's Now-Playing metadata.
     val episodeTitle: String? = null,
+    /// Immutable identity for a LOCAL playback session (an offline download), bound by
+    /// [DownloadRecord.localPlayable] before the shell ever sees the playable: owner/profile, content +
+    /// video ids, type, season/episode, title/poster, resume identity, and source provenance. Null for
+    /// every streamed / ad-hoc / trailer source, which carry their identity in [mediaRef] instead.
+    /// Audit AND-DL-01: without it a local play had NO identity of its own, so progress, watched marks,
+    /// scrobbles, and auto-next fell back to whatever title the resident engine surface held -- stream A,
+    /// then play downloaded B, and A's row moved. Consumers of local sessions must read THIS, never
+    /// ambient engine state; see [PlaybackContext].
+    val playbackContext: PlaybackContext? = null,
 )
 
 /// Provider-agnostic description of the title being scrobbled, resolved ONCE at play time and handed to
