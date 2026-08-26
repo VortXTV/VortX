@@ -158,3 +158,12 @@ Guardrails:
 
 1. Production completeness of a client trust control must be checked against every platform-specific feeder it depends on; enumerate the emitters such as feed generators, workflows, and workers, not just the client code.
 2. Verify live emitted output such as the actual feed artifacts rather than inferring capability from source alone before calling a finding closed in production.
+
+## App-only closure is impossible while server verifiers remain (SEC-05)
+
+`[MIS-W2-SEC05-APPONLY-01]` The SEC-05 scope inventory found copied `edge_auth` verifiers in canonical `vortx-abuse`, `vortx-sources`, and `vortx-addon-pair`, plus inline `VORTX_EDGE_SECRET`/HMAC gates in `vortx-watch` and `vortx-oauth-broker`; `vortx-abuse` treats the shipped client HMAC as authorization for public mutation routes and the OAuth broker uses it too. Closing SEC-05 inside the client app alone would leave every server gate still trusting a recoverable client secret.
+
+Guardrails:
+
+1. Never close a security finding with an app-only change when a server-side verifier of the same secret exists elsewhere; enumerate all verifier copies and all privilege-bearing gates before declaring a trust boundary removed.
+2. Where real privilege is enforced, replace shipped-secret trust with VortX account short-lived server-issued tokens and keep HMAC only as optional abuse friction; do not fabricate changes for components whose source is absent from the canonical inventory, such as the generic `api.vortx.tv` issuer.

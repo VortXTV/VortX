@@ -137,3 +137,10 @@
 - `[W2-APPCAST-02]` Wave 2 scope was therefore expanded across repositories: a registered isolated worktree `audit/w2-android-metadata` was cut in the canonical `vortx-appcast` repository at exact baseline `79caab5`, owned by the Ox Alpha seat appcast-engineer running t10 (Publish Android appcast metadata), with independent review by the dedicated Ox Alpha seat appcast-reviewer in t11.
 - `[W2-APPCAST-03]` Boundaries: this lane publishes feed metadata only. There is no deploy and no release, and the VortX release freeze is unchanged.
 - Release remains frozen. Nothing has merged.
+
+## 2026-08-26 - SEC-05 server scope inventory
+
+- `[W2-SEC05-SERVER-01]` Captain primary-source inventory, spot-checked in the canonical repositories: copied `edge_auth` verifiers exist in `vortx-abuse`, `vortx-sources`, and `vortx-addon-pair` (which also carries a `check-edge-auth-sync.mjs` sync check), and inline `VORTX_EDGE_SECRET`/HMAC authorization gates exist in `vortx-watch` and `vortx-oauth-broker`.
+- `[W2-SEC05-SERVER-02]` `vortx-abuse` forcibly treats the shipped client HMAC as authorization for public mutation routes, and the OAuth broker uses it as well. SEC-05 therefore cannot be closed by removing client masking and documentation alone: the client lane (t4), release secret injection, and every privilege-bearing server gate must be reviewed together, with HMAC retained only as optional abuse friction and VortX account short-lived server tokens used wherever actual privilege is enforced.
+- `[W2-SEC05-SERVER-03]` The generic `api.vortx.tv` issuer source is not present in the canonical repository inventory, so no issuer changes are assumed or fabricated in this programme.
+- Release remains frozen. Nothing has merged.
