@@ -12,5 +12,13 @@ VortX builds on the components below. Each is owned by its respective authors an
   type and wordmark (`android/app/src/main/res/font/`), standing in for the Apple apps' New York/Iowan Old
   Style serif — the closest OFL match available for bundling. https://fonts.google.com/specimen/Lora,
   full license text: https://openfontlicense.org/
+- **libmpv-android** (Jarne Demeulemeester, MIT). The Android libmpv JNI glue (`android/mpv-seam/`)
+  is forked from this project at tag v1.0.0 and patched to carry `mpv_event_end_file` reason/error
+  to Kotlin (audit W1-B); the fork's provenance and exact deltas are documented in
+  `android/mpv-seam/README.md`, and its MIT license text ships as `android/mpv-seam/LICENSE`. The
+  heavy mpv/ffmpeg binaries the glue drives still come from the `dev.jdtech.mpv:libmpv` artifact
+  built from that same project's buildscripts (GPL, full flavor only). The vendored
+  `android/mpv-seam/src/main/cpp/include/mpv/*.h` client-API headers come from mpv v0.41.0 (ISC).
+  https://github.com/jarnedemeulemeester/libmpv-android
 
 If you are a rights holder and want something changed or removed, open an issue and it will be handled promptly.

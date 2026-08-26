@@ -291,16 +291,25 @@ dependencies {
     // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
     // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME
     // 0.41.0 line the Apple MPVKit-GPL build runs), ffmpeg 8.1 (--enable-gpl --enable-version3,
-    // mediacodec + jni hwaccel), libplacebo 7.360.1 (the gpu-next renderer), dav1d 1.5.3. It also
-    // ships a `dev.jdtech.mpv.MPVLib` JNI class that loads "mpv" + "player" via System.loadLibrary;
-    // our thin com.vortx.android.player.mpv.MPVLib wraps it to the VortX contract, and MpvConfig
-    // holds the option set ported from the Apple player.
+    // mediacodec + jni hwaccel), libplacebo 7.360.1 (the gpu-next renderer), dav1d 1.5.3.
+    //
+    // Since W1-B (AND-PLY-01) this artifact is consumed for its PREBUILT NATIVE SET ONLY: the
+    // source-built :mpv-seam module (fullImplementation below) replaces the artifact's JNI glue
+    // class + libplayer.so with an auditable fork that carries mpv_event_end_file reason/error to
+    // Kotlin, so dev.jdtech.mpv classes are no longer referenced by app code and libplayer.so is
+    // excluded from packaging further down (packaging {}).
     //
     // LICENSING: the mpv/ffmpeg native code is GPLv3 (ffmpeg built --enable-gpl --enable-version3),
     // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
     // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
     // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
     "fullImplementation"(libs.mpv.libmpv)
+
+    // The W1-B terminal seam itself: the source-built fork of the upstream JNI glue that exposes
+    // mpv_event_end_file.reason/error to Kotlin (MpvTerminalEvent.fromNative). MIT-licensed glue,
+    // built in-tree (:mpv-seam); it links against the AAR's prebuilt libmpv/avcodec .so files and is
+    // therefore bound to the same GPL full-flavor boundary as the artifact above.
+    "fullImplementation"(project(":mpv-seam"))
 
     debugImplementation(libs.compose.ui.tooling)
 
@@ -486,6 +495,11 @@ android {
     packaging {
         jniLibs {
             pickFirsts += "**/libc++_shared.so"
+            // W1-B: the AAR's own JNI glue is dead weight now -- :mpv-seam's source-built
+            // libvortx_mpv_seam.so replaces it (MpvSeam loads "mpv" + "vortx_mpv_seam", never
+            // "player"), so exclude libplayer.so instead of packaging an opaque binary nothing can
+            // reach. The dev.jdtech.mpv classes.jar still ships inside the APK but is unreferenced.
+            excludes += "**/libplayer.so"
         }
     }
 }

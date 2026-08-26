@@ -7,6 +7,8 @@
 // :app:compileFullDebugKotlin on it).
 plugins {
     alias(libs.plugins.android.application) apply false
+    // :mpv-seam (the W1-B source-built libmpv JNI seam) is an Android library module; same AGP pin.
+    alias(libs.plugins.android.library) apply false
     alias(libs.plugins.kotlin.android) apply false
     alias(libs.plugins.kotlin.compose) apply false
 }

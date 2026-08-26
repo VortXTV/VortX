@@ -2,28 +2,32 @@ package com.vortx.android.player.mpv
 
 import android.content.Context
 import android.view.Surface
-import dev.jdtech.mpv.MPVLib as JdtechMPVLib
+import com.vortx.android.player.mpv.seam.MpvSeam
 
 /// The VortX libmpv CONTRACT. This is the single surface every Android player phase codes against
 /// (Phase 1a defines it, Phase 1b + the player screen implement against it), mirroring the shape of
 /// the official mpv-android `MPVLib` JNI class so the seam is familiar and portable.
 ///
-/// It is a THIN wrapper over `dev.jdtech.mpv.MPVLib` (the maintained maven artifact
-/// `dev.jdtech.mpv:libmpv:1.0.0`, which ships the libmpv/ffmpeg/player `.so` set built from the
-/// mpv-android buildscripts: mpv 0.41.0, ffmpeg 8.1, libplacebo 7.360.1, dav1d 1.5.3, GPLv3). We do
-/// NOT re-declare `external fun`s here: the native symbols belong to `dev.jdtech.mpv.MPVLib`
-/// (`System.loadLibrary("mpv")` + `System.loadLibrary("player")` happen in that class's initializer),
-/// so this wrapper only adapts its instance API to the VortX contract and keeps the option/config
-/// surface in ONE place (see [MpvConfig]).
+/// It is a THIN wrapper over `:mpv-seam`'s `MpvSeam` -- the SOURCE-BUILT fork of the upstream JNI
+/// glue (jarnedemeulemeester/libmpv-android v1.0.0, MIT; see android/mpv-seam/README.md) that, unlike
+/// the prebuilt artifact glue it replaces since W1-B, delivers MPV_EVENT_END_FILE's real
+/// mpv_event_end_file payload (reason + error) instead of a bare event id. The heavy mpv/ffmpeg .so
+/// binaries still come exclusively from the `dev.jdtech.mpv:libmpv:1.0.0` AAR; only the thin bridge
+/// is compiled from audited in-tree source. We do NOT re-declare `external fun`s here: the native
+/// symbols belong to `com.vortx.android.player.mpv.seam.MpvSeam`
+/// (`System.loadLibrary("mpv")` + `System.loadLibrary("vortx_mpv_seam")` happen in that class's
+/// initializer), so this wrapper only adapts its instance API to the VortX contract and keeps the
+/// option/config surface in ONE place (see [MpvConfig]).
 ///
-/// Why a wrapper instead of using the artifact class directly:
-///   1. It pins the VortX contract independent of the upstream artifact's exact method shape, so a
-///      future artifact bump (or a swap to vendored `.so` + our own JNI) does not ripple into every
-///      caller. Only this file changes.
-///   2. The artifact's `MPVLib` is a per-instance class created via `MPVLib.create(context)`; VortX
+/// Why a wrapper instead of using the seam class directly:
+///   1. It pins the VortX contract independent of the native layer's exact callback shape, so a
+///      future seam change does not ripple into every caller. Only this file changes.
+///   2. The seam's `MpvSeam` is a per-instance class created via `MpvSeam.create(context)`; VortX
 ///      wants the mpv-android-style contract (create / init / destroy / attachSurface / command /
 ///      setOptionString / get*Property / observeProperty / addObserver(EventObserver)) with the
-///      [EventObserver] callback shape both phases build on.
+///      [EventObserver] callback shape both phases build on -- including the TYPED
+///      [EventObserver.eventTerminal] path translated from the raw `(reason, error)` ints by
+///      [MpvSeamBridge].
 ///
 /// Threading: [EventObserver] callbacks are delivered on a native mpv worker thread (the same as the
 /// Apple wakeup callback). Implementations must be thread-safe and must not touch the UI directly.
@@ -35,33 +39,20 @@ import dev.jdtech.mpv.MPVLib as JdtechMPVLib
 ///   4. [attachSurface] once the Android `Surface` is ready (the Android analogue of Apple's `wid`).
 ///   5. [command] `["loadfile", url, "replace"]` to play; [observeProperty] / [addObserver] for events.
 ///   6. [detachSurface] then [destroy] on teardown.
-class MPVLib private constructor(private val delegate: JdtechMPVLib) {
+class MPVLib private constructor(private val delegate: MpvSeam) {
 
     private val observers = mutableListOf<EventObserver>()
 
-    /// Bridges the artifact's `EventObserver` to the VortX [EventObserver]. Registered once with the
-    /// delegate; fans out to every VortX observer added via [addObserver]. The five `eventProperty`
-    /// overloads + `event(id)` match the artifact's callback surface one-for-one.
-    private val delegateObserver = object : JdtechMPVLib.EventObserver {
-        override fun eventProperty(property: String) {
-            synchronized(observers) { observers.forEach { it.eventProperty(property) } }
-        }
-        override fun eventProperty(property: String, value: Long) {
-            synchronized(observers) { observers.forEach { it.eventProperty(property, value) } }
-        }
-        override fun eventProperty(property: String, value: Double) {
-            synchronized(observers) { observers.forEach { it.eventProperty(property, value) } }
-        }
-        override fun eventProperty(property: String, value: Boolean) {
-            synchronized(observers) { observers.forEach { it.eventProperty(property, value) } }
-        }
-        override fun eventProperty(property: String, value: String) {
-            synchronized(observers) { observers.forEach { it.eventProperty(property, value) } }
-        }
-        override fun event(eventId: Int) {
-            synchronized(observers) { observers.forEach { it.event(eventId) } }
-        }
-    }
+    /// Snapshot getter handed to [MpvSeamBridge]: the live observer list under the same lock
+    /// add/remove use, materialized as an immutable list so fan-out never iterates a mutating list.
+    private val observerSink: () -> List<EventObserver> =
+        { synchronized(observers) { observers.toList() } }
+
+    /// Bridges the seam's raw observer surface to the VortX [EventObserver]. Registered ONCE with the
+    /// delegate; fans out to every VortX observer added via [addObserver]. END_FILE arrives through
+    /// eventEndFile(reason, error) and is translated to [EventObserver.eventTerminal]; every other
+    /// lifecycle event keeps its raw id on [EventObserver.event].
+    private val delegateObserver = MpvSeamBridge(observerSink)
 
     init {
         delegate.addObserver(delegateObserver)
@@ -114,45 +105,51 @@ class MPVLib private constructor(private val delegate: JdtechMPVLib) {
 
     /// Property + lifecycle-event sink, delivered on a native mpv worker thread. The overloads map to
     /// mpv's observed-property formats (STRING / INT64 -> Long / DOUBLE / FLAG -> Boolean) plus the
-    /// format-less "changed" signal; [event] carries a raw `MPV_EVENT_*` id (see [Event]).
+    /// format-less "changed" signal. [eventTerminal] is the typed END_FILE path carrying the REAL
+    /// mpv_event_end_file reason/error since W1-B; [event] carries every other raw `MPV_EVENT_*` id
+    /// (see [Event]).
     interface EventObserver {
         fun eventProperty(name: String)
         fun eventProperty(name: String, value: Long)
         fun eventProperty(name: String, value: Double)
         fun eventProperty(name: String, value: Boolean)
         fun eventProperty(name: String, value: String)
+        fun eventTerminal(event: MpvTerminalEvent)
         fun event(id: Int)
     }
 
     /// mpv property formats for [observeProperty] (the `MPV_FORMAT_*` values, re-exported from the
-    /// artifact so callers depend only on this contract).
+    /// seam so callers depend only on this contract).
     object Format {
-        const val NONE = JdtechMPVLib.MpvFormat.MPV_FORMAT_NONE
-        const val STRING = JdtechMPVLib.MpvFormat.MPV_FORMAT_STRING
-        const val FLAG = JdtechMPVLib.MpvFormat.MPV_FORMAT_FLAG
-        const val INT64 = JdtechMPVLib.MpvFormat.MPV_FORMAT_INT64
-        const val DOUBLE = JdtechMPVLib.MpvFormat.MPV_FORMAT_DOUBLE
+        const val NONE = MpvSeam.MpvFormat.MPV_FORMAT_NONE
+        const val STRING = MpvSeam.MpvFormat.MPV_FORMAT_STRING
+        const val FLAG = MpvSeam.MpvFormat.MPV_FORMAT_FLAG
+        const val INT64 = MpvSeam.MpvFormat.MPV_FORMAT_INT64
+        const val DOUBLE = MpvSeam.MpvFormat.MPV_FORMAT_DOUBLE
     }
 
-    /// `MPV_EVENT_*` ids delivered to [EventObserver.event], re-exported from the artifact. The ones
-    /// the player actually acts on: file load, end-of-file, and video reconfig (the Android analogue
-    /// of the Apple `MPV_EVENT_VIDEO_RECONFIG` that re-drives HDR/DV tagging).
+    /// `MPV_EVENT_*` ids delivered to [EventObserver.event], re-exported from the seam. END_FILE is
+    /// NOT delivered through [EventObserver.event]: the seam routes it (with its real payload) to
+    /// [EventObserver.eventTerminal]. The player also uses START_FILE to close the narrow replacement
+    /// window in which the old source's final terminal callback is expected.
     object Event {
-        const val END_FILE = JdtechMPVLib.MpvEvent.MPV_EVENT_END_FILE
-        const val FILE_LOADED = JdtechMPVLib.MpvEvent.MPV_EVENT_FILE_LOADED
-        const val PLAYBACK_RESTART = JdtechMPVLib.MpvEvent.MPV_EVENT_PLAYBACK_RESTART
-        const val VIDEO_RECONFIG = JdtechMPVLib.MpvEvent.MPV_EVENT_VIDEO_RECONFIG
-        const val SHUTDOWN = JdtechMPVLib.MpvEvent.MPV_EVENT_SHUTDOWN
+        const val START_FILE = MpvSeam.MpvEvent.MPV_EVENT_START_FILE
+        const val END_FILE = MpvSeam.MpvEvent.MPV_EVENT_END_FILE
+        const val FILE_LOADED = MpvSeam.MpvEvent.MPV_EVENT_FILE_LOADED
+        const val PLAYBACK_RESTART = MpvSeam.MpvEvent.MPV_EVENT_PLAYBACK_RESTART
+        const val VIDEO_RECONFIG = MpvSeam.MpvEvent.MPV_EVENT_VIDEO_RECONFIG
+        const val SHUTDOWN = MpvSeam.MpvEvent.MPV_EVENT_SHUTDOWN
     }
 
     companion object {
-        /// Create the mpv handle. Loads the native libmpv/player `.so` (via the artifact's class
-        /// initializer) and builds the underlying mpv context. Returns null if native creation fails
-        /// (out of memory, missing `.so` for the running ABI), so the caller can fall back to the
-        /// Media3/ExoPlayer engine rather than crash (the mandatory mpv <-> Exo runtime fallback in
-        /// the Android plan). Pass any [Context]; the application context is used internally.
+        /// Create the mpv handle. Loads the native libmpv `.so` set (from the AAR) + the source-built
+        /// seam `.so` (via the seam class initializer) and builds the underlying mpv context. Returns
+        /// null if native creation fails (out of memory, missing `.so` for the running ABI), so the
+        /// caller can fall back to the Media3/ExoPlayer engine rather than crash (the mandatory
+        /// mpv <-> Exo runtime fallback in the Android plan). Pass any [Context]; the application
+        /// context is used internally.
         fun create(appContext: Context): MPVLib? {
-            val delegate = JdtechMPVLib.create(appContext) ?: return null
+            val delegate = MpvSeam.create(appContext) ?: return null
             return MPVLib(delegate)
         }
     }

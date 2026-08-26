@@ -31,6 +31,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -86,17 +87,26 @@ class MpvPlayer private constructor(
     var surfaceFailed: Boolean = false
         private set
 
-    /// True once REAL playback happened for the current file: set on MPV_EVENT_PLAYBACK_RESTART (mpv's
-    /// "playback started, first frame is on its way" signal, also fired after each seek) or on the first
-    /// observed `time-pos` advance past zero. This is the error-vs-ended discriminator for END_FILE:
-    /// the jdtech JNI seam delivers `event(id)` with NO payload, so mpv's `mpv_event_end_file.reason`
-    /// (ERROR vs EOF) is unreachable from Kotlin -- an END_FILE that arrives BEFORE any real playback
-    /// (dead debrid link, exhausted reconnects, nothing decodable) can only be a failed open, never a
-    /// watched-through end, and maps to [PlayerState.hasError]; an END_FILE after real playback is the
-    /// genuine end-of-content and maps to [PlayerState.hasEnded]. Volatile: written on the mpv event
-    /// thread, reset on [load].
+    /// True once real playback happened for the current file. This controls connecting/buffering and
+    /// deferred-resume behavior only. It must never infer terminal reason: a midstream decoder or network
+    /// error can happen after playback started and is not EOF.
     @Volatile
     private var playbackStarted: Boolean = false
+
+    /// Typed, idempotent terminal state for the current source, guarded by [MpvTerminalGate]'s single
+    /// lock together with teardown + UI publication. Since W1-B the seam delivers the REAL
+    /// mpv_event_end_file payload, so EOF/ERROR/STOP/QUIT/REDIRECT are native facts; UNKNOWN remains
+    /// reachable only for reason codes a future libmpv might add, and fails safe (error, no advance).
+    /// The former eof-reached flag heuristic is GONE: it was a global, non-source-scoped property that
+    /// could stale-race across source generations; with real reasons there is nothing left to infer.
+    private val terminalGate = MpvTerminalGate { hasEnded, hasError, isBuffering ->
+        _state.update {
+            it.copy(hasEnded = hasEnded, hasError = hasError, isBuffering = isBuffering)
+        }
+    }
+
+    @Volatile
+    private var hasLoadedSource: Boolean = false
 
     /// The resume position (ms) to seek to ONCE the pipeline is warm, or 0 for none. A pre-first-frame
     /// absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold and wedges video output
@@ -133,24 +143,23 @@ class MpvPlayer private constructor(
         override fun eventProperty(name: String, value: Double) {
             when (name) {
                 PROP_TIME_POS -> {
-                    // A position advancing past zero is proof the demuxer/decoder delivered real data
-                    // (belt-and-suspenders alongside PLAYBACK_RESTART for the END_FILE discriminator).
+                    // A position advancing past zero is proof the demuxer/decoder delivered real data.
                     if (value > 0.0) {
                         playbackStarted = true
                         // RESUME WATCHDOG: if PLAYBACK_RESTART was missed, a real position advance is the
                         // fallback signal that the pipeline is warm enough to apply the deferred resume seek.
                         consumePendingResumeSeek()
                     }
-                    _state.value = _state.value.copy(positionMs = (value * 1000).toLong().coerceAtLeast(0L))
+                    _state.update { it.copy(positionMs = (value * 1000).toLong().coerceAtLeast(0L)) }
                 }
-                PROP_DURATION -> _state.value = _state.value.copy(durationMs = (value * 1000).toLong().coerceAtLeast(0L))
+                PROP_DURATION -> _state.update { it.copy(durationMs = (value * 1000).toLong().coerceAtLeast(0L)) }
                 // `demuxer-cache-time` is the ABSOLUTE timestamp (seconds) of the end of the forward cache,
                 // i.e. how far ahead of the playhead the demuxer has loaded. Feeds the scrubber's buffered
                 // band, the mpv analogue of ExoPlayer's `bufferedPosition`. A negative sentinel (no cache
                 // info) leaves the last value untouched so the band never flickers to 0 mid-play.
                 PROP_DEMUXER_CACHE_TIME ->
                     if (value >= 0.0) {
-                        _state.value = _state.value.copy(bufferedPositionMs = (value * 1000).toLong().coerceAtLeast(0L))
+                        _state.update { it.copy(bufferedPositionMs = (value * 1000).toLong().coerceAtLeast(0L)) }
                     }
             }
         }
@@ -158,7 +167,7 @@ class MpvPlayer private constructor(
         override fun eventProperty(name: String, value: Boolean) {
             when (name) {
                 PROP_PAUSE -> {
-                    _state.value = _state.value.copy(isPaused = value)
+                    _state.update { it.copy(isPaused = value) }
                     pausedStateChanged(value)
                 }
                 PROP_PAUSED_FOR_CACHE -> {
@@ -167,8 +176,8 @@ class MpvPlayer private constructor(
                     // Honoring that false would clear the spinner over a black frame that has not produced
                     // any video yet, so pre-playback only a TRUE (cache actually filling) passes through;
                     // once real playback started every value is authoritative again. The connecting state
-                    // itself is cleared by PLAYBACK_RESTART (first frame) or the END_FILE error branch.
-                    if (value || playbackStarted) _state.value = _state.value.copy(isBuffering = value)
+                    // itself is cleared by PLAYBACK_RESTART (first frame) or a terminal callback.
+                    if (value || playbackStarted) _state.update { it.copy(isBuffering = value) }
                 }
             }
         }
@@ -177,29 +186,28 @@ class MpvPlayer private constructor(
             // track-list is read via the property API (refreshTracks), not delivered as a string here.
         }
 
+        override fun eventTerminal(event: MpvTerminalEvent) {
+            // The gate drops the callback entirely when teardown won the race, when a duplicate
+            // arrives after the first terminal, or inside the replacement-suppression window; it
+            // publishes under its lock only for a state-changing verdict.
+            val applied = terminalGate.onTerminal(event)
+            if (applied?.nativeError != null) {
+                Log.e(TAG, "mpv terminal ${applied.reason}; native error=${applied.nativeError}")
+            }
+        }
+
         override fun event(id: Int) {
             when (id) {
+                MPVLib.Event.START_FILE -> terminalGate.onSourceStarted()
                 MPVLib.Event.PLAYBACK_RESTART -> {
-                    // Playback (re)started: the first frame is rendering. Marks real playback for the
-                    // END_FILE discriminator and ends the "connecting" state ([load] set isBuffering=true).
+                    // Playback (re)started: the first frame is rendering. Marks real playback for resume
+                    // handling and ends the "connecting" state ([load] set isBuffering=true).
                     playbackStarted = true
                     // The pipeline is now warm, so a stashed resume seek lands as an ordinary warm scrub
                     // instead of the cold pre-first-frame seek that wedged video output. No-op after the
                     // first apply (idempotent) and for a non-resume load. Mirrors Apple's first-frame apply.
                     consumePendingResumeSeek()
-                    _state.value = _state.value.copy(isBuffering = false)
-                }
-                MPVLib.Event.END_FILE -> {
-                    // The JNI seam exposes no END_FILE reason (see [playbackStarted]), so: an EOF before
-                    // any real playback is a FAILED SOURCE (dead link, unsupported codec, exhausted
-                    // reconnect) -> hasError, which drives the chrome's error overlay and, critically,
-                    // does NOT trip the host's hasEnded-gated next-episode auto-advance. An EOF after
-                    // real playback is the genuine end-of-content -> hasEnded, exactly as before.
-                    _state.value = if (playbackStarted) {
-                        _state.value.copy(hasEnded = true)
-                    } else {
-                        _state.value.copy(hasError = true, isBuffering = false)
-                    }
+                    _state.update { it.copy(isBuffering = false) }
                 }
                 MPVLib.Event.FILE_LOADED -> refreshTracks()
                 MPVLib.Event.VIDEO_RECONFIG -> refreshTracks()
@@ -273,14 +281,19 @@ class MpvPlayer private constructor(
 
     override fun load(playable: Playable) {
         val loadGeneration = subtitleLoadGeneration.incrementAndGet()
-        // Fresh terminal flags for the new file, and isBuffering=true as the CONNECTING state: from
-        // loadfile until the first frame (PLAYBACK_RESTART) or a failed open (END_FILE error branch),
-        // the chrome shows its spinner instead of a silent black frame. mpv only starts reporting
-        // `paused-for-cache` once the demuxer is up, so without this the open window had no signal.
+        // Fresh terminal flags for the new file, and isBuffering=true as the connecting state. For a
+        // replacement, the gate arms its suppression window: mpv queues the OLD source's END_FILE
+        // before the NEW source's START_FILE on this client's event queue, so exactly that span is
+        // where a stale old-source terminal must be dropped. START_FILE closes the window.
+        if (hasLoadedSource) {
+            terminalGate.beginReplacementLoad()
+        } else {
+            terminalGate.beginFirstLoad()
+        }
+        hasLoadedSource = true
         playbackStarted = false
         userPausedIntent = false
         preservePauseOnForeground = false
-        _state.value = _state.value.copy(hasEnded = false, hasError = false, isBuffering = true)
 
         // Every file starts from the known network-identity baseline. This player instance is reused across
         // `loadfile replace`, so conditional SET-only writes would leak a prior source's Referer / custom UA
@@ -797,6 +810,9 @@ class MpvPlayer private constructor(
     }
 
     override fun release() {
+        // Close the terminal gate before unregistering so an already-dispatched native callback racing
+        // teardown cannot publish EOF and trigger watched/auto-advance.
+        terminalGate.release()
         runtimePolicyScope.cancel()
         mpv.removeObserver(observer)
         mpv.detachSurface()
@@ -838,7 +854,7 @@ class MpvPlayer private constructor(
                 }
             }
         }
-        _state.value = _state.value.copy(audioTracks = audio, subtitleTracks = subs)
+        _state.update { it.copy(audioTracks = audio, subtitleTracks = subs) }
     }
 
     @Composable

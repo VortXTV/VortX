@@ -167,5 +167,8 @@ zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" 
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
+# The :mpv-seam library module (W1-B source-built libmpv JNI seam) rides the SAME AGP pin as the
+# app; no separate version, one Gradle/AGP per build.
+android-library = { id = "com.android.library", version.ref = "agp" }
 kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
