@@ -352,7 +352,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard videoFrameEverProduced,
               isRemuxMounted,
               forwardBufferMount == .localRemux,
-              let server = remuxHLSServer else { return }
+              let server = remuxHLSServer,
+              VortXRemuxForwardBufferCoupling.isAttemptDue(
+                  state: forwardBufferCouplingState,
+                  currentGeneration: itemGeneration) else { return }
         let decision = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
             state: forwardBufferCouplingState,
             currentGeneration: itemGeneration,

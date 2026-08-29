@@ -592,10 +592,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     /// Render and durably register every WebVTT URI before a subtitle playlist can advertise it. An empty cue
     /// overlap still produces a legal `WEBVTT` document, so each video segment ID has an atomic subtitle cohort.
+    enum SubtitleBackingOutcome: Equatable {
+        case ready
+        case pendingAdmission
+        case fatal(String)
+    }
+
     func ensureSubtitleBacking(renditionID: Int,
                                window: VortXHLSWindow,
-                               cues: [SubtitleRenditionPolicy.Cue]) -> Bool {
-        guard renditionID >= 0, let hlsSpool, !window.segments.isEmpty else { return false }
+                               cues: [SubtitleRenditionPolicy.Cue]) -> SubtitleBackingOutcome {
+        guard renditionID >= 0, let hlsSpool, !window.segments.isEmpty else {
+            return .fatal("invalid subtitle backing request")
+        }
         // Normalize ONCE for this array, not once per segment (FAIL-260804-06). The pure normalization is a
         // sort plus two copies of everything the collector has stored, and this runs on the producer thread for
         // every segment of every published window; memoizing it turns a per-segment, per-publication cost into
@@ -606,17 +614,23 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 renditionID: renditionID, segmentID: segment.id)
             if hlsSpool.contains(key) { continue }
             guard let duration = DVPlaybackPolicy.renderedDurationMilliseconds(
-                of: VortXHLSWindow(segments: [segment])) else { return false }
+                of: VortXHLSWindow(segments: [segment])) else {
+                return .fatal("invalid subtitle segment duration")
+            }
             let selected = SubtitleRenditionPolicy.normalizedCues(
                 normalized, overlapping: segment.start, end: segment.end)
             let data = Data(SubtitleRenditionPolicy.webVTTDocument(
                 cues: selected,
                 segmentStart: segment.start,
                 segmentEnd: segment.end).utf8)
-            guard hlsSpool.spill([.init(
-                key: key, data: data, durationMilliseconds: duration)]) else { return false }
+            switch hlsSpool.spillOutcome([.init(
+                key: key, data: data, durationMilliseconds: duration)]) {
+            case .committed: break
+            case .pendingAdmission: return .pendingAdmission
+            case .fatal: return .fatal("subtitle backing durable write failed")
+            }
         }
-        return true
+        return .ready
     }
 
     /// `SubtitleRenditionPolicy.normalizedCues` for one rendition, computed at most once per distinct cue array.

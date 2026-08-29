@@ -1194,6 +1194,12 @@ final class VortXRemuxBuffer: @unchecked Sendable {
 /// room. Playlist deadlines and open-handle leases decide when an individual resource may be reclaimed.
 final class VortXHLSSessionSpool: @unchecked Sendable {
 
+    enum SpillOutcome: Equatable {
+        case committed
+        case pendingAdmission
+        case fatal
+    }
+
     static let defaultCapacityBytes = VortXHLSConsumptionWindowPolicy.ordinarySessionCapacityBytes
     static let defaultChunkBytes = 512 * 1024
 
@@ -3486,7 +3492,11 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
     /// into `.part`, verify exact sizes, rename every member, then register the cohort together. Filesystem work
     /// runs outside the coordinator and buffer locks; registration is the only visibility edge.
     func spill(_ resources: [SpillResource]) -> Bool {
-        guard validate(resources: resources) != nil else { return false }
+        spillOutcome(resources) == .committed
+    }
+
+    func spillOutcome(_ resources: [SpillResource]) -> SpillOutcome {
+        guard validate(resources: resources) != nil else { return .fatal }
 
         // A closed segment can legitimately be shared by multiple variant playlists. Treat the same key,
         // duration and bytes as an idempotent publication, but reject a conflicting reuse of an absolute key.
@@ -3498,16 +3508,20 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             case .some(let metadata):
                 guard metadata.length == resource.length,
                       metadata.durationMilliseconds == resource.durationMilliseconds,
-                      let lease = openResource(resource.key, now: 0) else { return false }
+                      let lease = openResource(resource.key, now: 0) else { return .fatal }
                 let matches = payload(resource, exactlyMatches: lease)
                 lease.close(now: 0)
-                guard matches else { return false }
+                guard matches else { return .fatal }
             }
         }
-        guard !resourcesToStage.isEmpty else { return true }
-        guard let total = validate(resources: resourcesToStage) else { return false }
+        guard !resourcesToStage.isEmpty else { return .committed }
+        guard let total = validate(resources: resourcesToStage) else { return .fatal }
         let reservationID = UUID()
-        guard reserve(id: reservationID, resources: resourcesToStage, bytes: total) else { return false }
+        switch reserve(id: reservationID, resources: resourcesToStage, bytes: total) {
+        case .reserved: break
+        case .full: return .pendingAdmission
+        case .rejected: return .fatal
+        }
 
         var sourceLeases: [VortXRemuxBuffer.ReadLease] = []
         for resource in resourcesToStage {
@@ -3517,7 +3531,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                         id: reservationID,
                         keys: resourcesToStage.map(\.key),
                         temporaryBytes: 0)
-                    return false
+                    return .fatal
                 }
                 sourceLeases.append(lease)
             }
@@ -3609,7 +3623,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 throw SpoolError.invalidSource
             }
             withExtendedLifetime(sourceLeases) {}
-            return true
+            return .committed
         } catch {
             for item in staged {
                 notifyFileOperation()
@@ -3622,7 +3636,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 keys: resourcesToStage.map(\.key),
                 temporaryBytes: materializedBytes)
             withExtendedLifetime(sourceLeases) {}
-            return false
+            return .fatal
         }
     }
 
@@ -3874,21 +3888,23 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         probe?(self)
     }
 
-    private func reserve(id: UUID, resources: [SpillResource], bytes: Int) -> Bool {
+    private enum SpillReservationOutcome { case reserved, full, rejected }
+
+    private func reserve(id: UUID, resources: [SpillResource], bytes: Int) -> SpillReservationOutcome {
         lock.lock(); defer { lock.unlock() }
         let keys = Set(resources.map(\.key))
         guard let physical = currentAccounting.checkedPhysicalBytes(),
               !invalidated,
               keys.isDisjoint(with: pendingKeys),
               keys.allSatisfy({ entries[$0] == nil }),
-              physical <= capacityBytes,
-              bytes <= capacityBytes - physical else { return false }
+              physical <= capacityBytes else { return .rejected }
+        guard bytes <= capacityBytes - physical else { return .full }
         reservations[id] = bytes
         pendingKeys.formUnion(keys)
         currentAccounting.reservedBytes += bytes
         currentAccounting.peakReservedBytes = max(
             currentAccounting.peakReservedBytes, currentAccounting.reservedBytes)
-        return true
+        return .reserved
     }
 
     private func chunk(for resource: SpillResource, localOffset: Int, length: Int) -> Data? {

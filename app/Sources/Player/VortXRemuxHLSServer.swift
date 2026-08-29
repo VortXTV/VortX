@@ -1378,7 +1378,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
               snapshot.audioState != .pending,
               !snapshot.window.segments.isEmpty else { return nil }
         let audioPlan = snapshot.audioPlan
-        let subtitles = snapshot.subtitleRenditions
+        var subtitles = snapshot.subtitleRenditions
+        var withdrawnSubtitleIDs: Set<Int> = []
         var requiredWindows = [snapshot.window]
         if audioPlan != nil {
             guard snapshot.audioInitData != nil, let audioWindow = snapshot.audioWindow else { return nil }
@@ -1409,11 +1410,21 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 return nil
             }
             for rendition in subtitles {
-                guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count,
-                      stream.ensureSubtitleBacking(
-                          renditionID: rendition.id,
-                          window: subtitleWindow,
-                          cues: snapshot.subtitleCues[rendition.id]) else { return nil }
+                guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count else { return nil }
+                switch stream.ensureSubtitleBacking(
+                    renditionID: rendition.id,
+                    window: subtitleWindow,
+                    cues: snapshot.subtitleCues[rendition.id]) {
+                case .ready: break
+                case .pendingAdmission: return nil
+                case .fatal(let reason):
+                    withdrawnSubtitleIDs.insert(rendition.id)
+                    subtitles = SubtitleRenditionPolicy.survivors(
+                        snapshot.subtitleRenditions,
+                        withdrawing: withdrawnSubtitleIDs)
+                    DiagnosticsLog.log(
+                        "dv", "subtitle rendition \(rendition.id) withdrawn before master: \(reason)")
+                }
             }
         }
 
@@ -1421,7 +1432,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // stale files are harmless session-local artifacts, while a stale advertised topology would not be.
         snapshot = stream.hlsWindowSnapshot()
         guard snapshot.audioPlan == audioPlan,
-              snapshot.subtitleRenditions == subtitles,
+              SubtitleRenditionPolicy.survivors(
+                  snapshot.subtitleRenditions,
+                  withdrawing: withdrawnSubtitleIDs) == subtitles,
               snapshot.subtitleFailureReason == nil || subtitles.isEmpty,
               let finalVideoWindow = exactWindow(snapshot.window, ids: ids),
               ids.allSatisfy({ stream.hasHLSResource(.video(segmentID: $0)) }) else { return nil }
@@ -1525,16 +1538,30 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             if !advertisedSubtitles.isEmpty {
                 guard let subtitleWindow = snapshot.subtitleWindow else { return nil }
                 for rendition in advertisedSubtitles {
-                    guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count,
-                          stream.ensureSubtitleBacking(
-                              renditionID: rendition.id,
-                              window: subtitleWindow,
-                              cues: snapshot.subtitleCues[rendition.id]) else {
-                        stream.failHLS("subtitle HLS backing could not be committed")
+                    guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count else {
+                        advertisedSubtitles.removeAll { $0.id == rendition.id }
+                        continue
+                    }
+                    switch stream.ensureSubtitleBacking(
+                        renditionID: rendition.id,
+                        window: subtitleWindow,
+                        cues: snapshot.subtitleCues[rendition.id]) {
+                    case .ready:
+                        break
+                    case .pendingAdmission:
+                        // Optional WebVTT materialization can temporarily lose spool admission while the
+                        // producer's atomic video close owns its transient-copy reservation. Keep this
+                        // publication pending so `waitForResource` retries it after that transaction drains.
+                        // Poisoning the producer here turned a recoverable optional-rendition miss into a 410
+                        // on the healthy video playlist and forced true Dolby Vision down to libmpv/HDR10.
                         return nil
+                    case .fatal(let reason):
+                        advertisedSubtitles.removeAll { $0.id == rendition.id }
+                        DiagnosticsLog.log(
+                            "dv", "subtitle rendition \(rendition.id) withdrawn mid-play: \(reason)")
                     }
                 }
-                requiredWindows.append(subtitleWindow)
+                if !advertisedSubtitles.isEmpty { requiredWindows.append(subtitleWindow) }
             }
             guard requiredWindows.allSatisfy(windowConformsToFrozenTarget) else {
                 stream.failHLS("HLS rendition interval exceeded the frozen target before playlist publication")

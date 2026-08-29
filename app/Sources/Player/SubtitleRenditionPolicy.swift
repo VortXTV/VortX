@@ -84,6 +84,13 @@ enum SubtitleRenditionPolicy {
         let isForced: Bool
     }
 
+    /// Applies the server's explicit optional-rendition withdrawals to a producer snapshot. Reapplying the
+    /// same set to a later snapshot is also the stale-topology check: unrelated additions/removals remain
+    /// visible instead of being mistaken for the withdrawal itself.
+    static func survivors(_ snapshot: [Rendition], withdrawing ids: Set<Int>) -> [Rendition] {
+        snapshot.filter { !ids.contains($0.id) }
+    }
+
     /// Comparison form of a language tag: trimmed and lowercased. Same normalisation `MultiAudioPolicy` uses,
     /// repeated rather than shared because both files are deliberately dependency-free.
     static func languageKey(_ raw: String) -> String {

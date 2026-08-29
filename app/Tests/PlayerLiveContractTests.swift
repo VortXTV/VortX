@@ -202,6 +202,7 @@ enum PlayerLiveContractTests {
         testMutableOpenStageContract()
         testMutableOpenStageFailuresAndCleanup()
         testPlaylistRetentionAndFileLeases()
+        testOptionalSubtitleAdmissionCanRetryAfterCapacityDrains()
         testRetentionCapacityAndDeadlineAdmission()
         testSpoolResponsePump()
         testSessionLifecycleAndScavenge()
@@ -2194,6 +2195,55 @@ enum PlayerLiveContractTests {
               recentWindow.retentionDeadline(for: recentlyDeparted) == 3.002)
         check("retention window: the oversized resource retains only for its own final delivery window",
               recentWindow.retentionDeadline(for: historicalTail) == 601.001)
+    }
+
+    private static func testOptionalSubtitleAdmissionCanRetryAfterCapacityDrains() {
+        let root = scratchDirectory("optional-subtitle-retry")
+        defer { try? FileManager.default.removeItem(at: root) }
+        guard let spool = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 8,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("optional subtitle retry: fixture is creatable", false)
+            return
+        }
+        let video = VortXHLSSessionSpool.ResourceKey.video(segmentID: 0)
+        let subtitle = VortXHLSSessionSpool.ResourceKey.subtitle(renditionID: 0, segmentID: 0)
+        check("optional subtitle retry: primary video fills the temporary admission ceiling",
+              spool.spill([.init(
+                  key: video,
+                  data: Data(repeating: 0x01, count: 8),
+                  durationMilliseconds: 1_000)]))
+        _ = spool.recordPlaylistGeneration(playlistID: "video", resourceKeys: [video], now: 0)
+        check("optional subtitle retry: a capacity miss does not invalidate healthy video backing",
+              spool.spillOutcome([.init(
+                  key: subtitle,
+                  data: Data("WEBVTT\n\n".utf8),
+                  durationMilliseconds: 1_000)]) == .pendingAdmission
+                  && spool.openResource(video, now: 0) != nil)
+        _ = spool.recordPlaylistGeneration(playlistID: "video", resourceKeys: [], now: 1)
+        spool.collectExpired(now: 3.001)
+        check("optional subtitle retry: the same optional publication succeeds after capacity drains",
+              spool.spillOutcome([.init(
+                  key: subtitle,
+                  data: Data("WEBVTT\n\n".utf8),
+                  durationMilliseconds: 1_000)]) == .committed)
+
+        guard let broken = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 8,
+            chunkSize: 2,
+            failureInjection: .write(afterBytes: 0),
+            scavengeStaleSessions: false) else {
+            check("optional subtitle failure: fixture is creatable", false)
+            return
+        }
+        check("optional subtitle failure: permanent durable-write faults are fatal immediately",
+              broken.spillOutcome([.init(
+                  key: subtitle,
+                  data: Data("WEBVTT\n\n".utf8),
+                  durationMilliseconds: 1_000)]) == .fatal)
     }
 
     /// Scales the production C = 2W + O + H topology down to nine bytes so the real spool coordinator can

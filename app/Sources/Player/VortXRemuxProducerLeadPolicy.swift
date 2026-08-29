@@ -152,6 +152,12 @@ enum VortXRemuxForwardBufferCoupling {
             .max()
     }
 
+    /// A completed schedule is inert for its owning item. A new item generation is due immediately even when
+    /// the prior generation finished, because its bitrate evidence and configured AVPlayerItem are different.
+    static func isAttemptDue(state: AttemptState, currentGeneration: UInt64) -> Bool {
+        state.generation != currentGeneration || !state.finished
+    }
+
     /// One step of the bounded retry. Returns the duration to apply NOW (nil = leave the item alone this
     /// tick) and whether the schedule has finished for this generation. Fails OPEN: exhausting the attempts
     /// without any usable estimate leaves today's base duration untouched.

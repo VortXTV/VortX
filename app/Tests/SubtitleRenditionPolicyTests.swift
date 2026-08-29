@@ -279,6 +279,23 @@ check("master: variants reference the group when renditions exist",
 check("master: variants are untouched when there are no renditions",
       Policy.streamInfAttribute(renditionCount: 0) == "")
 
+let withdrawn = Policy.survivors([english], withdrawing: [english.id])
+let masterAfterFatalBacking = withdrawn.map(Policy.mediaTag) + [
+    "#EXT-X-STREAM-INF:BANDWIDTH=1" + Policy.streamInfAttribute(renditionCount: withdrawn.count),
+    "media.m3u8",
+]
+check("master withdrawal: a fatal optional backing fault removes its subtitle URI",
+      !masterAfterFatalBacking.joined(separator: "\n").contains("subs"))
+check("master withdrawal: primary video remains advertised after the last subtitle is removed",
+      masterAfterFatalBacking.last == "media.m3u8"
+          && !masterAfterFatalBacking[masterAfterFatalBacking.count - 2].contains("SUBTITLES="))
+let withdrawalPair = Policy.renditions(from: [
+    Track(index: 1, format: .subRip, language: "eng", title: "", isDefault: true, isForced: false),
+    Track(index: 2, format: .subRip, language: "spa", title: "", isDefault: false, isForced: true),
+])
+check("master withdrawal: only the named fatal rendition is removed",
+      Policy.survivors(withdrawalPair, withdrawing: [withdrawalPair[0].id]) == [withdrawalPair[1]])
+
 // MARK: - Request routing (the generator and the parser held against each other)
 
 let routedRendition = Policy.renditions(from: [

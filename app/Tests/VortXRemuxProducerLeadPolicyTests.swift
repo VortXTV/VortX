@@ -59,6 +59,7 @@ enum VortXRemuxProducerLeadPolicyTests {
         unknownBitrateKeepsCurrentBehaviour()
         extremeBitrateRespectsTheViableFloor()
         coupledTargetPlusMarginNeverReachesTheCeilingAcrossFieldBitrates()
+        completedCouplingIsInertUntilTheItemGenerationChanges()
         fieldLoopSimulationOldTargetStarvesNewTargetDoesNot()
 
         print("===== FAILURES: \(failures) =====")
@@ -312,6 +313,20 @@ enum VortXRemuxProducerLeadPolicyTests {
                       target <= affordable)
             }
         }
+    }
+
+    static func completedCouplingIsInertUntilTheItemGenerationChanges() {
+        var completed = VortXRemuxForwardBufferCoupling.AttemptState(
+            generation: 41,
+            attemptsUsed: 1,
+            bestBitsPerSecond: fieldBitsPerSecond)
+        completed.finished = true
+        check("completed coupling does not run again on periodic ticks",
+              !VortXRemuxForwardBufferCoupling.isAttemptDue(
+                  state: completed, currentGeneration: 41))
+        check("a replacement item starts a fresh coupling schedule",
+              VortXRemuxForwardBufferCoupling.isAttemptDue(
+                  state: completed, currentGeneration: 42))
     }
 
     /// State-machine replay of the diag-6 loop (branch review finding 3: the configured target must CHANGE
