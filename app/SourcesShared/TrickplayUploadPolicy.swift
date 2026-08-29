@@ -140,6 +140,34 @@ enum TrickplayOwnedWorkGate {
     }
 }
 
+/// Per accepted media load circuit breaker for local frame grabs. Remote/community previews remain
+/// available; this only stops repeatedly asking a renderer that has proven it cannot supply a frame.
+struct TrickplayLocalCaptureBreaker: Equatable, Sendable {
+    private(set) var consecutiveNilCaptures = 0
+    private(set) var isOpen = false
+    static let nilCaptureLimit = 3
+
+    mutating func reset() {
+        consecutiveNilCaptures = 0
+        isOpen = false
+    }
+
+    /// Returns true exactly once, when the breaker opens.
+    mutating func recordCapture(hadData: Bool) -> Bool {
+        if hadData {
+            reset()
+            return false
+        }
+        guard !isOpen else { return false }
+        consecutiveNilCaptures += 1
+        if consecutiveNilCaptures >= Self.nilCaptureLimit {
+            isOpen = true
+            return true
+        }
+        return false
+    }
+}
+
 /// Small state machine that keeps community trickplay useful without rebuilding the
 /// full sprite sheet every minute. Each exact content key gets one progressive
 /// attempt once its capture is storable, plus at most one teardown attempt after a

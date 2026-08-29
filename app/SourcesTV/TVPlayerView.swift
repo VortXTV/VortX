@@ -159,6 +159,7 @@ struct TVPlayerView: View {
     var bingeGroup: String? = nil              // the launching stream's release-group tag, for sticky auto-next
     var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
     var forceMPV: Bool = false                 // last-resort escape hatch: skip AVPlayer routing, mount libmpv directly
+    var initialEnginePreference: PlayerEngineRouter.Override? = nil
     var isTrailer: Bool = false                // FIX I: a trailer clip, not a content stream → never fail over to engine streams
     var trailerYouTubeID: String? = nil        // #95: the trailer's YouTube id, so a dead in-app trailer is handed to the YouTube app before "Trailer unavailable"
     var audioSidecarURL: URL? = nil            // yt-direct adaptive pair: external audio mpv mounts with the video-only url (forces libmpv)
@@ -746,6 +747,7 @@ struct TVPlayerView: View {
     @State private var statsRows: [(String, String)] = []
     @State private var showStreamQR = false             // QR overlay sharing the playing link to a phone
     @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
+    @State private var localTrickplayCaptureBreaker = TrickplayLocalCaptureBreaker()
     @State private var lastLocalTrickplayCapture = -1000.0
     @State private var localTrickplayCaptureInFlight = false
     @State private var localTrickplayCaptureGeneration: UInt64 = 0
@@ -773,7 +775,7 @@ struct TVPlayerView: View {
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, subtitleLanguage, aspect, playback, episodes, chapters, sources, quality, playerSettings, engine, sleep, skipEditor }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, subtitleLanguage, aspect, playback, episodes, chapters, sources, sourceAudio, quality, playerSettings, engine, sleep, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -1115,7 +1117,9 @@ struct TVPlayerView: View {
     /// (`avEngineFailed`) stays OUTSIDE the latch so an AVPlayer failure still falls back to libmpv in place.
     private var useAVPlayerEngine: Bool {
         if forceMPV || avEngineFailed || avToMPVHandoff != nil || avToMPVHandoffBlocked { return false }
-        if let forced = manualEngineAVPlayer { return forced }   // P3: the viewer's mid-title engine pick wins over the latch
+        if let forced = manualEngineAVPlayer { return forced }
+        if initialEnginePreference == .mpv { return false }
+        if initialEnginePreference == .avfoundation, canUseAVPlayerEngine { return true }
         return engineLatch ?? routedToAVPlayer
     }
 
@@ -1348,6 +1352,7 @@ struct TVPlayerView: View {
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
+        localTrickplayCaptureBreaker.reset()
         if !isCurrentLiveStream, pendingAdvance == nil, let m = curMeta, let u = curURL {
             let ref = curDebridRef
             let rawTorrent = curIsTorrent ? curSourceStream : nil
@@ -2946,6 +2951,8 @@ struct TVPlayerView: View {
             }
         case .sources:
             return sourceRows()
+        case .sourceAudio:
+            return audioLanguageFilterRows()
         case .quality:
             // Best playable stream per distinct resolution (4K / 1080p / …), best-first, mirroring the
             // iOS in-player quality picker. Picking one switches the stream in place at the same spot.
@@ -3254,7 +3261,13 @@ struct TVPlayerView: View {
         if groups.isEmpty {
             return [OptionRow(label: "Loading sources…", isHeader: true)]
         }
-        var rows: [OptionRow] = audioLanguageFilterRows()
+        var rows: [OptionRow] = []
+        let qualityOptions = StreamRanking.resolutionOptions(groups)
+        if !qualityOptions.isEmpty {
+            rows.append(OptionRow(label: "Quality", detail: "›") { openPanel(.quality) })
+        }
+        rows.append(OptionRow(label: "Audio", detail: "›") { openPanel(.sourceAudio) })
+        rows.append(OptionRow(label: "Sources", isHeader: true))
         // Install the session audio-language filter as a task-local for the ranking reads only (iOS parity,
         // #204): `StreamRanking.score` -> `languageScore` reads `TrackPreferences.current.audioLanguages` live
         // at score time, so this floats the chosen-audio release above a same-resolution foreign-audio one.
@@ -4120,6 +4133,7 @@ struct TVPlayerView: View {
         case .episodes:         return "Episodes"
         case .chapters:         return "Chapters"
         case .sources:          return "Sources"
+        case .sourceAudio:      return "Audio"
         case .quality:          return "Quality"
         case .playerSettings:   return "Player Settings"
         case .engine:           return "Player Engine"
@@ -8838,6 +8852,7 @@ struct TVPlayerView: View {
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
+        guard !localTrickplayCaptureBreaker.isOpen else { return }
         guard assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken) else { return }
         guard TrickplayCaptureCadencePolicy.shouldCapture(
             playbackTime: time,
@@ -8936,6 +8951,9 @@ struct TVPlayerView: View {
                     self.localTrickplayCaptureInFlight = false
                     self.trickplayCaptureCompletionsSinceReceipt &+= 1
                     self.trickplayCaptureNilSinceReceipt &+= 1
+                    if self.localTrickplayCaptureBreaker.recordCapture(hadData: false) {
+                        VXProbe.log("tp", "local capture breaker OPEN after 3 consecutive nil frames (tvOS); preserving remote/community previews")
+                    }
                     VXProbe.log("tp", "\(engine) captureFrameJPEGData returned NIL at \(Int(time))s (tvOS)")
                 }
                 return
@@ -8947,6 +8965,7 @@ struct TVPlayerView: View {
                 guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                 self.localTrickplayCaptureInFlight = false
                 self.trickplayCaptureCompletionsSinceReceipt &+= 1
+                _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
                 guard let decoded else { return }   // decode failed / near-black: already logged off-actor
                 self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
             }

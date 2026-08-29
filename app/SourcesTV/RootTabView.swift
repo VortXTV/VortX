@@ -26,6 +26,8 @@ struct PlaybackRequest: Identifiable {
     /// longer needed for the common load failure; it remains for any path that wants to bypass AVPlayer
     /// routing entirely and mount libmpv directly.
     var forceMPV: Bool = false
+    /// Detail-page, launch-local engine choice. It never modifies the global setting.
+    var initialEnginePreference: PlayerEngineRouter.Override? = nil
     /// FIX I: this request plays a TRAILER clip (the {server}/yt/{id} route), not a content stream. When a
     /// trailer fails to load, the player must NOT fall back to the engine's content streams (that would
     /// substitute the actual/random movie for the dead trailer); it shows the error overlay and stops.
@@ -164,6 +166,7 @@ struct RootView: View {
                              seriesInventoryAuthority: req.seriesInventoryAuthority,
                              sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
                              headers: req.headers, forceMPV: req.forceMPV, isTrailer: req.isTrailer,
+                             initialEnginePreference: req.initialEnginePreference,
                              trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              initialSourceStream: req.sourceStream,

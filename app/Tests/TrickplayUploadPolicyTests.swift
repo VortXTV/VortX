@@ -25,6 +25,8 @@ private enum TrickplayUploadPolicyTests {
         testStaleCompletionCannotAffectNewKey()
         testCoverageAndExistingSetGates()
         testOwnedCancellationStopsEveryHeavyStage()
+        testLocalCaptureBreakerOpensAndResets()
+        testPlayerSourceHierarchyAndLaunchSafetyWiring()
         print("TrickplayUploadPolicyTests: \(passed)/\(passed) passed")
     }
 
@@ -683,5 +685,50 @@ private enum TrickplayUploadPolicyTests {
                 "task cancellation blocks \(stage)"
             )
         }
+    }
+
+    private static func testLocalCaptureBreakerOpensAndResets() {
+        var breaker = TrickplayLocalCaptureBreaker()
+        expect(!breaker.recordCapture(hadData: false) && !breaker.isOpen,
+               "first nil capture stays below the local-capture breaker threshold")
+        expect(!breaker.recordCapture(hadData: false) && !breaker.isOpen,
+               "second nil capture stays below the local-capture breaker threshold")
+        expect(breaker.recordCapture(hadData: false) && breaker.isOpen,
+               "third consecutive nil capture opens the breaker exactly once")
+        expect(!breaker.recordCapture(hadData: false),
+               "an already-open breaker emits no duplicate transition")
+        _ = breaker.recordCapture(hadData: true)
+        expect(!breaker.isOpen && breaker.consecutiveNilCaptures == 0,
+               "a successful capture resets the local breaker for later captures")
+    }
+
+    private static func testPlayerSourceHierarchyAndLaunchSafetyWiring() {
+        let tv = try? String(contentsOfFile: "app/SourcesTV/TVPlayerView.swift", encoding: .utf8)
+        let detail = try? String(contentsOfFile: "app/SourcesTV/DetailView.swift", encoding: .utf8)
+        let sourceRows = tv.flatMap { sourceSection($0, from: "private func sourceRows()", to: "private func audioLanguageFilterRows()") }
+        expect(sourceContainsInOrder(sourceRows, [
+            "OptionRow(label: \"Quality\"", "OptionRow(label: \"Audio\"", "OptionRow(label: \"Sources\", isHeader: true)"
+        ]) && sourceRows?.contains("var rows: [OptionRow] = audioLanguageFilterRows()") == false,
+        "in-player source panel must present quality, then audio, then source rows without Audio-first flattening")
+        expect(detail?.contains("initialEnginePreference: launchEnginePreference") == true
+                   && tv?.contains("initialEnginePreference == .avfoundation, canUseAVPlayerEngine") == true
+                   && tv?.contains("if let forced = manualEngineAVPlayer { return forced }") == true,
+               "detail launch preference must be threaded before the route latch, conservatively gated, and superseded by live picker changes")
+    }
+
+    private static func sourceSection(_ source: String, from start: String, to end: String) -> String? {
+        guard let startRange = source.range(of: start),
+              let endRange = source.range(of: end, range: startRange.upperBound..<source.endIndex) else { return nil }
+        return String(source[startRange.lowerBound..<endRange.lowerBound])
+    }
+
+    private static func sourceContainsInOrder(_ source: String?, _ needles: [String]) -> Bool {
+        guard let source else { return false }
+        var cursor = source.startIndex
+        for needle in needles {
+            guard let range = source.range(of: needle, range: cursor..<source.endIndex) else { return false }
+            cursor = range.upperBound
+        }
+        return true
     }
 }

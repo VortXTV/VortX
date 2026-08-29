@@ -2436,6 +2436,8 @@ struct CoreStreamList: View {
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var showAudioLanguagePicker = false   // session audio-language filter dialog
+    @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
+    @State private var showPlayerPicker = false
     @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
     /// Focus anchors are visible action controls: Watch/Resume owns `.primary`, and the first secondary action
     /// owns `.secondary`. Setting either target performs a real row transition; no dummy button is inserted.
@@ -2822,6 +2824,16 @@ struct CoreStreamList: View {
                         ForEach(TrackPreferences.commonLanguages, id: \.id) { lang in
                             Button(lang.label) { sourceList.sessionAudioLanguages = [lang.id] }
                         }
+                    }
+
+                    Button { showPlayerPicker = true } label: {
+                        Label(launchEnginePreference?.label ?? "Player", systemImage: "play.rectangle")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: launchEnginePreference != nil))
+                    .confirmationDialog("Pick a player", isPresented: $showPlayerPicker, titleVisibility: .visible) {
+                        Button("Auto") { launchEnginePreference = nil }
+                        Button("VortX Player") { launchEnginePreference = .mpv }
+                        Button("AVPlayer") { launchEnginePreference = .avfoundation }
                     }
 
                     Button { withAnimation { showAllSources.toggle() } } label: {
@@ -3599,6 +3611,7 @@ struct CoreStreamList: View {
                                                     debridRef: ref, sourceStream: resumeSource,
                                                     debridCachedHashes: debridCache.cachedHashes,
                                                     enginePlayerVideoId: engineVideoID,
+                                                    initialEnginePreference: launchEnginePreference,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
                                                     startAtSeconds: admittedStart.seconds)
                 return
@@ -3631,6 +3644,7 @@ struct CoreStreamList: View {
                                                 sourceStream: win.stream,
                                                 debridCachedHashes: debridCache.cachedHashes,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
+                                                initialEnginePreference: launchEnginePreference,
                                                 startAtSeconds: admittedStart.seconds)
             return
         }
@@ -3693,6 +3707,7 @@ struct CoreStreamList: View {
                                                 sourceStream: stream,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
+                                            initialEnginePreference: launchEnginePreference,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
             return
@@ -3717,6 +3732,7 @@ struct CoreStreamList: View {
                                             headers: stream.requestHeaders, sourceStream: stream,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
+                                            initialEnginePreference: launchEnginePreference,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)

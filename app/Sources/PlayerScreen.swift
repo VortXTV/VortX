@@ -336,6 +336,7 @@ struct PlayerScreen: View {
 
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
     @StateObject private var scrubThumbnails = ScrubThumbnailsStore()
+    @State private var localTrickplayCaptureBreaker = TrickplayLocalCaptureBreaker()
     @State private var hoverPreviewTime: Double?
     @State private var hoverPreviewRatio: CGFloat?
     @State private var lastLocalTrickplayCapture = -1000.0
@@ -1521,6 +1522,7 @@ struct PlayerScreen: View {
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
+        localTrickplayCaptureBreaker.reset()
         recordLastStream()
         if let m = curMeta, !effectivelyLive {
             ScrobbleCoordinator.shared.playbackStarted(
@@ -2352,6 +2354,7 @@ struct PlayerScreen: View {
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
+        guard !localTrickplayCaptureBreaker.isOpen else { return }
         // Player-AGNOSTIC capture: both engines emit MPVProperty.timePos (libmpv's coalesced tick and the
         // AVPlayer engine's periodic time observer), so this drives capture on Mac/iOS for libmpv AND AVPlayer.
         // A parallel wall-clock timer (startTrickplayCaptureTimer) is the belt-and-suspenders backstop for a
@@ -2447,6 +2450,9 @@ struct PlayerScreen: View {
                     watchdog.cancel()
                     guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                     self.localTrickplayCaptureInFlight = false
+                    if self.localTrickplayCaptureBreaker.recordCapture(hadData: false) {
+                        VXProbe.log("tp", "local capture breaker OPEN after 3 consecutive nil frames; preserving remote/community previews")
+                    }
                     VXProbe.log("tp", "\(engine) captureFrameJPEGData returned NIL at \(Int(time))s (no video output / protected / not-ready)")
                 }
                 return
@@ -2457,6 +2463,7 @@ struct PlayerScreen: View {
                 watchdog.cancel()
                 guard self.ownsLocalTrickplayCapture(captureGeneration) else { return }
                 self.localTrickplayCaptureInFlight = false
+                _ = self.localTrickplayCaptureBreaker.recordCapture(hadData: true)
                 guard let decoded else { return }   // decode failed / near-black: already logged off-actor
                 self.scrubThumbnails.recordDecodedFrame(decoded, data: data, at: time)
             }
