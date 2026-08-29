@@ -100,6 +100,31 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
         current?.id == id && current?.owner == owner
     }
 
+    /// `drop-buffers` can make libmpv publish an EOF while the exact-position recovery seek is still owned by
+    /// this internal operation. That EOF is cache-maintenance noise, not media completion. Keep the decision
+    /// owner-bound and reason-agnostic so paused, memory-warning, and proactive flushes receive the same rule.
+    func suppressesEOF(owner: Owner) -> Bool {
+        guard let current else { return false }
+        return current.owner == owner && current.phase != .terminal
+    }
+
+    /// Consume exactly one cache-owned EOF. Retiring ownership here keeps suppression one-shot: if the media
+    /// genuinely reaches its end after the recovery seek, that later EOF is terminal even inside the former
+    /// settle window.
+    @discardableResult
+    mutating func consumeSyntheticEOF(owner: Owner) -> CacheFlushFlight<Owner>? {
+        guard let flight = current, suppressesEOF(owner: owner) else { return nil }
+        let result: CacheFlushFlight<Owner>.Result
+        if flight.result == .seekCommandError {
+            result = .seekCommandError
+        } else if flight.phase == .settling {
+            result = .commandAccepted
+        } else {
+            result = .canceled
+        }
+        return finish(result: result)
+    }
+
     mutating func markDropSucceeded(id: UInt64, owner: Owner) -> Bool {
         guard var flight = current, flight.id == id, flight.owner == owner else { return false }
         guard flight.phase == .dropping, flight.result == .pending else { return false }

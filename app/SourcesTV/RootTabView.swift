@@ -86,7 +86,8 @@ final class PlayerPresenter: ObservableObject {
             if let request {
                 receiptState.begin(requestID: request.id)
                 playbackCloseReceipt = nil
-            } else if let closing = oldValue {
+            } else if let closing = oldValue,
+                      receiptState.activeRequestID == closing.id {
                 playbackCloseReceipt = receiptState.close(requestID: closing.id)
             }
         }
@@ -94,6 +95,18 @@ final class PlayerPresenter: ObservableObject {
 
     func recordCommittedPlayback(_ meta: PlaybackMeta, requestID: UUID) {
         _ = receiptState.record(meta, requestID: requestID)
+    }
+
+    /// Publish the exact committed first-frame identity before observers can see `request == nil`. Assigning nil
+    /// directly publishes the request edge before didSet finishes, so mounted detail pages could read a nil
+    /// receipt and fall back to engine history several episodes behind. Direct nil assignment remains supported
+    /// by didSet as a defensive fallback; the player exit path uses this deterministic close operation.
+    @discardableResult
+    func close(requestID: UUID) -> Bool {
+        guard request?.id == requestID else { return false }
+        playbackCloseReceipt = receiptState.close(requestID: requestID)
+        request = nil
+        return true
     }
 }
 
@@ -165,7 +178,7 @@ struct RootView: View {
                              // cannot absorb the next title's TimeChanged ticks (matches iOS onClose). onClose is
                              // the single user-exit choke point (leavePlayback routes through it); a request-id
                              // rebuild fires onDisappear, not onClose, so an in-session source switch is untouched.
-                             onClose: { core.unloadEnginePlayer(); presenter.request = nil })
+                             onClose: { core.unloadEnginePlayer(); presenter.close(requestID: req.id) })
                     .id(req.id)   // clean player teardown per request
             }
             // The launch splash sits above everything for its ~2 seconds. It has no

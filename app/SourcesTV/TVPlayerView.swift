@@ -7223,6 +7223,19 @@ struct TVPlayerView: View {
     /// mounts and decodes that source here.
     private func play(episode v: CoreVideo) {
         guard let m = curMeta, !leftPlayback else { return }
+        // A repeated Prev/Next press while this exact target is resolving is reentry, not supersession. curMeta
+        // deliberately remains on the outgoing episode until first frame, so recomputing the neighbour otherwise
+        // selects the same target and cancels/restarts its slow resolve forever. A genuinely different episode
+        // still falls through and supersedes as before.
+        if let pending = pendingAdvance,
+           pending.meta.videoId == v.id,
+           !pending.terminal {
+            DiagnosticsLog.log(
+                "binge",
+                "episode reentry ignored target=\(VXProbeRedaction.identityToken(v.id)); pending resolution retained"
+            )
+            return
+        }
         let preparedEpisode = preloaded?.episodeID == v.id ? preloaded : nil
         // The old episode's producer and ranged warm read no longer own the player. Preserve only the engine
         // behind the exact prepared target being consumed below; every stale completion is generation-fenced.

@@ -125,6 +125,25 @@ check("rejects negatives", P.capBytes("-1") == nil && P.capBytes("-4MiB") == nil
 check("rejects other suffixes rather than misreading them",
       P.capBytes("48KiB") == nil && P.capBytes("1GiB") == nil && P.capBytes("") == nil)
 
+// MARK: - Internal cache-flush EOF ownership
+
+for reason in [CacheFlushReason.pausedCacheClamp, .memoryWarning, .proactiveMemoryPressure] {
+    var flight = CacheFlushSingleFlight<Int>()
+    _ = flight.install(
+        owner: 7, reason: reason, target: 42, targetArgument: "42.000", startUptime: 1,
+        timeoutWorkItem: DispatchWorkItem {}
+    )
+    check("\(reason.rawValue): exact live owner suppresses synthetic EOF",
+          flight.suppressesEOF(owner: 7))
+    check("\(reason.rawValue): another load owner remains terminal",
+          !flight.suppressesEOF(owner: 8))
+    let consumed = flight.consumeSyntheticEOF(owner: 7)
+    check("\(reason.rawValue): exact EOF consumes its one-shot ownership",
+          consumed?.owner == 7 && consumed?.reason == reason)
+    check("\(reason.rawValue): later EOF after synthetic edge remains genuine",
+          !flight.suppressesEOF(owner: 7))
+}
+
 // MARK: - Proactive tvOS dirty-memory headroom policy (thresholds unchanged; floor now the raised floor)
 
 check("proactive threshold has a 192 MiB minimum",

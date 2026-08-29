@@ -3670,6 +3670,39 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
+    /// Deliver EOF and retire its cache flight as one main-queue decision. `drop-buffers` may enqueue EOF before
+    /// the exact recovery seek has restarted the same file; forwarding that internal EOF marked the episode
+    /// watched and auto-advanced after every 60-second pause. An exact live cache-flight owner suppresses only
+    /// that synthetic edge. A genuine EOF, including one after the flight settles, is forwarded unchanged.
+    private func emitEndFileEOF(loadToken: PlayerLoadToken) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.mpv != nil,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: loadToken, activeToken: self.activeLoadToken
+                  ) else { return }
+            if let suppressed = self.cacheFlushFlight.consumeSyntheticEOF(owner: loadToken) {
+                self.finishCacheFlushFlight(suppressed)
+                DiagnosticsLog.log(
+                    "player",
+                    "internal-cache-flush synthetic EOF suppressed reason=\(suppressed.reason.rawValue) loadToken=\(loadToken.hashValue)"
+                )
+                return
+            }
+            self.finishCacheFlushFlight(self.cacheFlushFlight.reset(owner: loadToken))
+            #if os(tvOS)
+            if let generation = self.framePresentationDiagnostics.currentGeneration() {
+                self.scheduleFramePresentationTerminalCleanup(
+                    generation: generation, loadToken: loadToken
+                )
+            }
+            #endif
+            VXProbe.event(self.probeChannel, "endfile eof")
+            self.playDelegate?.propertyChange(
+                propertyName: MPVProperty.endFileEof, data: nil, loadToken: loadToken
+            )
+        }
+    }
+
     /// mpv emits time-pos changes far faster than the UI needs (often per decoded
     /// frame), and each one hops to the main actor and re-renders the player's
     /// scrubber. Coalesce to ~4 Hz: smooth for a scrubber, and it stops the playhead
@@ -3956,7 +3989,7 @@ final class MPVMetalViewController: PlatformViewController {
                             break
                         }
                         guard let loadToken = self.loadToken(forEntryID: ef.playlist_entry_id) else { break }
-                        if ef.reason == MPV_END_FILE_REASON_ERROR || ef.reason == MPV_END_FILE_REASON_EOF {
+                        if ef.reason == MPV_END_FILE_REASON_ERROR {
                             DispatchQueue.main.async { [weak self] in
                                 guard let self, self.mpv != nil,
                                       PlayerLoadProvenanceState.accepts(
@@ -3981,17 +4014,7 @@ final class MPVMetalViewController: PlatformViewController {
                             VXProbe.event(self.probeChannel, "endfile error \(msg)")
                             self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
-                            #if os(tvOS)
-                            DispatchQueue.main.async { [weak self] in
-                                guard let self,
-                                      let generation = self.framePresentationDiagnostics.currentGeneration()
-                                else { return }
-                                self.scheduleFramePresentationTerminalCleanup(
-                                    generation: generation, loadToken: loadToken)
-                            }
-                            #endif
-                            VXProbe.event(self.probeChannel, "endfile eof")
-                            self.emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
+                            self.emitEndFileEOF(loadToken: loadToken)
                         }
                     }
                 case MPV_EVENT_SHUTDOWN:

@@ -300,7 +300,8 @@ private enum MPVCacheFlushReceiptContractTests {
                 "let currentCapBytes = currentReadAheadBudgetBytes",
                 "let availableBytes = UInt64(os_proc_available_memory())",
                 "let cacheFillBytes = diagnosticInt(\"demuxer-cache-state/fw-bytes\") ?? Int.max",
-                "let deferFlush = VortXCacheShedPolicy.shouldDeferFlushOnWarning(",
+                "let policyDefer = VortXCacheShedPolicy.shouldDeferFlushOnWarning(",
+                "let deferFlush = VortXCacheShedPolicy.shouldDeferInBandFlush(",
                 "setString(\"demuxer-max-back-bytes\", \"8MiB\")",
                 "flushDisposition = flushDemuxerCachePreservingPosition(reason: .memoryWarning)",
             ],
@@ -312,7 +313,12 @@ private enum MPVCacheFlushReceiptContractTests {
         guard let lifecycle = lifecycleSource(source),
               let stop = stopSource(source),
               let load = loadFileSource(source),
-              let events = eventLoopSource(source) else { return false }
+              let events = eventLoopSource(source),
+              let eof = section(
+                source,
+                from: "private func emitEndFileEOF(loadToken: PlayerLoadToken)",
+                to: "    /// mpv emits time-pos changes"
+              ) else { return false }
         return ordered(
             [
                 "cacheFlushFlight.reset()",
@@ -333,6 +339,15 @@ private enum MPVCacheFlushReceiptContractTests {
             && load.contains("Rejected replace: preserve the previous source's cache lifecycle")
             && events.contains("case MPV_EVENT_END_FILE:")
             && events.contains("cacheFlushFlight.reset(owner: loadToken)")
+            && ordered(
+                [
+                    "cacheFlushFlight.consumeSyntheticEOF(owner: loadToken)",
+                    "internal-cache-flush synthetic EOF suppressed",
+                    "cacheFlushFlight.reset(owner: loadToken)",
+                    "propertyName: MPVProperty.endFileEof",
+                ],
+                in: eof
+            )
             && events.contains("MPV_END_FILE_REASON_REDIRECT")
     }
 
