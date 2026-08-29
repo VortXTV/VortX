@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // MARK: - Live Source Index authorization lifecycle
@@ -593,14 +594,16 @@ enum SourceIndexClient {
     /// titles routinely resolve far more than one POST can carry (the worker rejects a POST above
     /// `MAX_SOURCES_PER_CONTRIBUTE` = 16), so we chunk the whole deduped set into `batchSize`-descriptor POSTs.
     /// [SourceUploadCoordinator] provides one process-wide per-(content,hash) ledger and reserves every POST a
-    /// globally spaced start time, including overlapping detached detail/resume call sites. Each POST is
-    /// fire-and-forget from the caller. A started POST has one attempt; any non-2xx or transport failure stops
-    /// the current title's remaining batches and extends the shared pacing boundary by one interval.
+    /// globally spaced start time, including overlapping detached detail/resume call sites. Transient transport
+    /// and server failures receive a bounded, jittered retry. Validation/authentication rejection is terminal.
+    /// A descriptor becomes durably complete only after a successful response.
     @discardableResult
     static func contribute(
         contentID: String,
-        descriptors: [Descriptor]
+        descriptors: [Descriptor],
+        runtime injectedRuntime: SourceContributionRuntime? = nil
     ) async -> ContributionOutcome {
+        let runtime = injectedRuntime ?? .live()
         var acceptedByProcess = false
 
         // Every bail below used to be SILENT. A give-to-get pool whose "give" half fails invisibly is why this
@@ -641,6 +644,7 @@ enum SourceIndexClient {
         let chunkSize = batchSize
         let intervalNanoseconds = interBatchDelayMs * 1_000_000
         let timeout = requestTimeout
+        let lifecycle = SourceIndexLifecycleClock.snapshot()
         // Bound the whole title: a pathological title still never sends an unbounded number of batches.
         let all = Array(uploadable.prefix(perTitleCap))
         // batchSize MUST stay <= the worker's MAX_SOURCES_PER_CONTRIBUTE or the whole batch is rejected.
@@ -661,9 +665,10 @@ enum SourceIndexClient {
                      counts: [(.batch, i + 1), (.batches, batches.count)])
                 return acceptedByProcess ? .acceptedByProcess : .deferred
             }
-            guard let reservation = await SourceUploadCoordinator.shared.reserve(
+            guard let reservation = await runtime.coordinator.reserve(
                 contentID: contentID,
-                descriptors: candidates
+                descriptors: candidates,
+                lifecycle: lifecycle
             ) else {
                 // Not a failure: every descriptor in this batch is already claimed by this process. Named
                 // anyway, so a whole title contributing nothing on a re-open is legible as dedupe, not loss.
@@ -675,81 +680,114 @@ enum SourceIndexClient {
             guard let data = contributionBody(contentID: contentID,
                                               descriptors: reservation.descriptors,
                                               batchSize: chunkSize) else {
-                await SourceUploadCoordinator.shared.release(reservation)
+                await runtime.coordinator.release(reservation)
                 diag(.contributeSkip, reason: .bodyEncodingFailed,
                      counts: [(.batch, i + 1), (.batches, batches.count)])
                 continue
             }
 
-            var committed: [Descriptor]?
-            while committed == nil {
+            retryLoop: while true {
                 guard !Task.isCancelled else {
-                    await SourceUploadCoordinator.shared.release(reservation)
+                    await runtime.coordinator.release(reservation)
                     diag(.contributeStop, reason: .cancelled,
                          counts: [(.batch, i + 1), (.batches, batches.count)])
-                    return acceptedByProcess ? .acceptedByProcess : .deferred
+                    return .deferred
+                }
+                guard SourceIndexLifecycleClock.snapshot() == lifecycle, isEnabled else {
+                    await runtime.coordinator.release(reservation)
+                    diag(.contributeStop, reason: isEnabled ? .gateClosed : closedGateReason,
+                         counts: [(.batch, i + 1), (.batches, batches.count)])
+                    return .deferred
                 }
                 guard await contributionAllowedNow() else {
-                    await SourceUploadCoordinator.shared.release(reservation)
+                    await runtime.coordinator.release(reservation)
                     diag(.contributeStop, reason: .playbackActive,
                          counts: [(.batch, i + 1), (.batches, batches.count)])
-                    return acceptedByProcess ? .acceptedByProcess : .deferred
+                    return .deferred
                 }
-                switch await SourceUploadCoordinator.shared.prepareLaunch(
+                switch await runtime.coordinator.prepareLaunch(
                     reservation,
-                    nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
+                    nowNanoseconds: runtime.nowNanoseconds(),
                     intervalNanoseconds: intervalNanoseconds,
-                    gate: { SourceIndexClient.isEnabled }
+                    gate: {
+                        SourceIndexClient.isEnabled
+                            && SourceIndexLifecycleClock.snapshot() == lifecycle
+                    }
                 ) {
                 case let .wait(delayNanoseconds):
-                    do { try await Task<Never, Never>.sleep(nanoseconds: delayNanoseconds) }
+                    do { try await runtime.sleepNanoseconds(delayNanoseconds) }
                     catch {
-                        await SourceUploadCoordinator.shared.release(reservation)
+                        await runtime.coordinator.release(reservation)
                         diag(.contributeStop, reason: .cancelled,
                              counts: [(.batch, i + 1), (.batches, batches.count)])
-                        return acceptedByProcess ? .acceptedByProcess : .deferred
+                        return .deferred
                     }
                 case let .launch(descriptors):
-                    committed = descriptors
-                    acceptedByProcess = true
+                    guard !descriptors.isEmpty else {
+                        await runtime.coordinator.release(reservation)
+                        return .deferred
+                    }
+
+                    var req = URLRequest(
+                        url: baseURL.appendingPathComponent("sources").appendingPathComponent("contribute"),
+                        timeoutInterval: timeout
+                    )
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "content-type")
+                    req.httpBody = data
+                    VortXEdgeAuth.sign(&req)
+                    diag(.contributePost, counts: [(.batch, i + 1), (.batches, batches.count),
+                                                   (.descriptors, descriptors.count)])
+                    do {
+                        try await runtime.transport(req)
+                        diag(.contributePostResult, counts: [(.batch, i + 1), (.batches, batches.count),
+                                                             (.succeeded, 1)])
+                        _ = await runtime.coordinator.finishAttempt(
+                            reservation,
+                            result: .succeeded,
+                            nowNanoseconds: runtime.nowNanoseconds(),
+                            retryPolicy: runtime.retryPolicy
+                        )
+                        acceptedByProcess = true
+                        break retryLoop
+                    } catch {
+                        diag(.contributePostResult, counts: [(.batch, i + 1), (.batches, batches.count),
+                                                             (.succeeded, 0)])
+                        let kind = contributionFailureKind(for: error)
+                        let result: SourceUploadCoordinator.AttemptResult
+                        switch kind {
+                        case .transient:
+                            result = .transient(jitterPermille: runtime.jitterPermille())
+                        case .validation:
+                            result = .validationRejected
+                        case .authentication:
+                            result = .authorizationRejected
+                        case .permanent:
+                            result = .permanentRejected
+                        case .cancelled:
+                            result = .cancelled
+                        }
+                        let finish = await runtime.coordinator.finishAttempt(
+                            reservation,
+                            result: result,
+                            nowNanoseconds: runtime.nowNanoseconds(),
+                            retryPolicy: runtime.retryPolicy
+                        )
+                        if kind == .transient, finish == .retry { continue retryLoop }
+                        diag(.contributeStop, reason: kind == .cancelled ? .cancelled : .postFailed,
+                             counts: [(.batch, i + 1), (.batches, batches.count)])
+                        if kind == .validation || kind == .authentication || kind == .permanent {
+                            return .acceptedByProcess
+                        }
+                        return .deferred
+                    }
                 case .unavailable:
                     // The live gate closed while this batch waited for its pacing slot, or the reservation is
                     // already gone. Distinct from the pre-loop gate check: this one happened MID-TITLE.
                     diag(.contributeStop, reason: closedGateReason,
                          counts: [(.batch, i + 1), (.batches, batches.count)])
-                    return acceptedByProcess ? .acceptedByProcess : .deferred
+                    return .deferred
                 }
-            }
-
-            var req = URLRequest(url: baseURL.appendingPathComponent("sources").appendingPathComponent("contribute"),
-                                 timeoutInterval: timeout)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "content-type")
-            req.httpBody = data
-            VortXEdgeAuth.sign(&req)   // gated host: stamp X-VX-Ts / X-VX-Sig / X-VX-Kid
-            let request = req
-            let chunk = committed ?? []
-            guard !chunk.isEmpty else { continue }
-            diag(.contributePost, counts: [(.batch, i + 1), (.batches, batches.count),
-                                           (.descriptors, chunk.count)])
-            // Detached from caller cancellation after commit: once the at-most-once claim is held, exactly one
-            // network attempt is launched. The response is ignored and never buffered.
-            let transport = contributionTransport
-            let succeeded = await runCancellationIndependentAttempt {
-                try await transport(request)
-            }
-            // The POST OUTCOME. Without this a failed POST and a successful POST left byte-identical traces,
-            // so an endpoint rejecting every contribution read exactly like a healthy one.
-            diag(.contributePostResult, counts: [(.batch, i + 1), (.batches, batches.count),
-                                                 (.succeeded, succeeded ? 1 : 0)])
-            guard await SourceUploadCoordinator.shared.finishAttempt(
-                succeeded: succeeded,
-                nowNanoseconds: DispatchTime.now().uptimeNanoseconds,
-                intervalNanoseconds: intervalNanoseconds
-            ) else {
-                diag(.contributeStop, reason: .postFailed,
-                     counts: [(.batch, i + 1), (.batches, batches.count)])
-                return .acceptedByProcess
             }
         }
         return acceptedByProcess ? .acceptedByProcess : .deferred
@@ -1380,18 +1418,34 @@ enum SourceIndexClient {
         return components.url
     }
 
-    /// Launch one detached attempt even when the contributing parent task is canceled after commit. There is
-    /// no retry here; the Boolean only tells the current batch loop whether it must stop and extend its pacer.
-    static func runCancellationIndependentAttempt(
-        _ operation: @escaping @Sendable () async throws -> Void
-    ) async -> Bool {
-        let attempt = Task.detached { try await operation() }
-        do {
-            try await attempt.value
-            return true
-        } catch {
-            return false
+    static func contributionFailureKind(for error: Error) -> SourceContributionFailureKind {
+        if Task.isCancelled || error is CancellationError { return .cancelled }
+        if let transport = error as? SourceIndexTransportError {
+            switch transport {
+            case let .badStatus(status):
+                if status == 401 || status == 403 { return .authentication }
+                if status == 408 || status == 425 || status == 429 || (500...599).contains(status) {
+                    return .transient
+                }
+                if [400, 409, 413, 415, 422].contains(status) { return .validation }
+                return .permanent
+            case .invalidLength, .tooLarge:
+                return .permanent
+            }
         }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .cancelled:
+                return .cancelled
+            case .badURL, .unsupportedURL, .userAuthenticationRequired,
+                 .userCancelledAuthentication, .appTransportSecurityRequiresSecureConnection,
+                 .dataLengthExceedsMaximum:
+                return .permanent
+            default:
+                return .transient
+            }
+        }
+        return .transient
     }
 
     /// Build a `CoreStream` via JSON decode (the all-optional field set has no memberwise init), mirroring
@@ -1419,7 +1473,7 @@ enum SourceIndexClient {
 
 // MARK: - Source Index HTTP transport
 
-enum SourceIndexTransportError: Error, Equatable {
+enum SourceIndexTransportError: Error, Equatable, Sendable {
     case invalidLength
     case tooLarge
     case badStatus(Int)
@@ -1523,22 +1577,203 @@ final class SourceIndexHTTPTransport: @unchecked Sendable {
 
 // MARK: - Process-wide HOARD coordination
 
-/// One process-wide actor shared by detail and resume call sites. It atomically reserves descriptor claims, then
-/// makes every pending caller re-enter immediately before launch to claim the current global pacing slot.
-/// Cancellation before launch releases pending claims; launch commits claims for the process lifetime even when
-/// delivery fails. Once bounded capacity is full, new claims stop instead of evicting old claims.
+/// A small, fixed retry policy for contribution POSTs. Attempts are bounded, the delay doubles after each
+/// transient failure, and jitter is capped so tests can inject an exact value without changing production
+/// timing. Permanent HTTP rejection never reaches this policy.
+struct SourceContributionRetryPolicy: Equatable, Sendable {
+    static let live = SourceContributionRetryPolicy(
+        maximumAttempts: 3,
+        baseDelayNanoseconds: 1_100_000_000,
+        maximumDelayNanoseconds: 8_000_000_000,
+        jitterRangePermille: 200
+    )
+
+    let maximumAttempts: Int
+    let baseDelayNanoseconds: UInt64
+    let maximumDelayNanoseconds: UInt64
+    let jitterRangePermille: Int
+
+    init(
+        maximumAttempts: Int,
+        baseDelayNanoseconds: UInt64,
+        maximumDelayNanoseconds: UInt64,
+        jitterRangePermille: Int
+    ) {
+        self.maximumAttempts = max(1, maximumAttempts)
+        self.maximumDelayNanoseconds = min(
+            max(1, maximumDelayNanoseconds),
+            UInt64.max / 1_000
+        )
+        self.baseDelayNanoseconds = min(
+            max(1, baseDelayNanoseconds),
+            self.maximumDelayNanoseconds
+        )
+        self.jitterRangePermille = min(500, max(0, jitterRangePermille))
+    }
+
+    /// `attempt` is the failed one-based attempt number. nil means the retry budget is exhausted.
+    func retryDelayNanoseconds(afterAttempt attempt: Int, jitterPermille: Int) -> UInt64? {
+        guard attempt > 0, attempt < maximumAttempts else { return nil }
+        var delay = baseDelayNanoseconds
+        if attempt > 1 {
+            for _ in 1..<attempt {
+                let (doubled, overflow) = delay.multipliedReportingOverflow(by: 2)
+                delay = overflow ? maximumDelayNanoseconds : min(doubled, maximumDelayNanoseconds)
+            }
+        }
+        let boundedJitter = min(jitterRangePermille, max(-jitterRangePermille, jitterPermille))
+        let magnitude = UInt64(abs(boundedJitter))
+        let delta = delay * magnitude / 1_000
+        if boundedJitter < 0 { return delay - delta }
+        let (adjusted, overflow) = delay.addingReportingOverflow(delta)
+        return min(overflow ? maximumDelayNanoseconds : adjusted, maximumDelayNanoseconds)
+    }
+}
+
+enum SourceContributionFailureKind: Equatable, Sendable {
+    case transient
+    case validation
+    case authentication
+    case permanent
+    case cancelled
+}
+
+/// Only opaque SHA-256 receipts are persisted. No title id, infohash, URL, account value, or descriptor body
+/// enters preferences, SettingsBackup, or sync. The dedicated suite also keeps these local delivery receipts
+/// outside the app's ordinary settings domain.
+struct SourceContributionReceiptState: Codable, Equatable, Sendable {
+    static let schema = 1
+
+    let schema: Int
+    let delivered: [String]
+    let rejected: [String]
+
+    init(delivered: [String], rejected: [String]) {
+        schema = Self.schema
+        self.delivered = delivered
+        self.rejected = rejected
+    }
+}
+
+enum SourceContributionReceiptLoad: Sendable {
+    case empty
+    case loaded(SourceContributionReceiptState)
+    case unavailable
+}
+
+protocol SourceContributionReceiptPersisting: Sendable {
+    func load() -> SourceContributionReceiptLoad
+    @discardableResult func save(_ state: SourceContributionReceiptState) -> Bool
+}
+
+final class SourceContributionDefaultsReceiptStore: SourceContributionReceiptPersisting, @unchecked Sendable {
+    static let shared = SourceContributionDefaultsReceiptStore()
+
+    private static let dataKey = "delivery-receipts-v1"
+    private let defaults: UserDefaults
+    private let lock = NSLock()
+
+    init(defaults: UserDefaults = UserDefaults(suiteName: "tv.vortx.source-index-delivery")!) {
+        self.defaults = defaults
+    }
+
+    func load() -> SourceContributionReceiptLoad {
+        lock.withLock {
+            guard let data = defaults.data(forKey: Self.dataKey) else { return .empty }
+            guard let decoded = try? JSONDecoder().decode(SourceContributionReceiptState.self, from: data),
+                  decoded.schema == SourceContributionReceiptState.schema else {
+                return .unavailable
+            }
+            return .loaded(decoded)
+        }
+    }
+
+    @discardableResult
+    func save(_ state: SourceContributionReceiptState) -> Bool {
+        lock.withLock {
+            guard let data = try? JSONEncoder().encode(state) else { return false }
+            defaults.set(data, forKey: Self.dataKey)
+            return defaults.data(forKey: Self.dataKey) == data
+        }
+    }
+}
+
+private enum SourceContributionReceipt {
+    static func key(
+        contentID: String,
+        descriptor: SourceIndexClient.Descriptor
+    ) -> String {
+        let canonical = "\(contentID.utf8.count):\(contentID)"
+            + "\(descriptor.kind.utf8.count):\(descriptor.kind)"
+            + "\(descriptor.id.utf8.count):\(descriptor.id)"
+        return SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func isValid(_ value: String) -> Bool {
+        value.count == 64 && value.utf8.allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
+    }
+}
+
+/// One process-wide actor shared by detail and resume call sites. It atomically reserves descriptor work, keeps
+/// the reservation through bounded transient retries, and commits an opaque durable receipt only after a 2xx.
+/// Cancellation and terminal transport failure release the reservation. Validation rejection is durably terminal,
+/// while authentication/protocol rejection opens a lifecycle-scoped circuit. Once bounded capacity is full, new
+/// work stops instead of evicting an old success receipt and allowing a duplicate after restart.
 actor SourceUploadCoordinator {
-    static let shared = SourceUploadCoordinator()
+    static let shared = SourceUploadCoordinator(
+        persistence: SourceContributionDefaultsReceiptStore.shared
+    )
+
+    private struct StoredReservation {
+        let keys: [String]
+        let descriptors: [SourceIndexClient.Descriptor]
+        let lifecycle: SourceIndexLifecycleSnapshot
+        var attempts: Int = 0
+        var inFlight = false
+        var retryNotBeforeNanoseconds: UInt64?
+    }
 
     private let maxEntries: Int
-    private var seen: Set<String> = []
+    private let persistence: (any SourceContributionReceiptPersisting)?
+    private var storageAvailable = true
+    private var delivered: Set<String> = []
+    private var rejected: Set<String> = []
     private var pending: Set<String> = []
-    private var reservations: [UInt64: (keys: [String], descriptors: [SourceIndexClient.Descriptor])] = [:]
+    private var reservations: [UInt64: StoredReservation] = [:]
     private var nextReservationID: UInt64 = 1
     private var nextPostNanoseconds: UInt64?
+    private var circuitLifecycle: SourceIndexLifecycleSnapshot?
 
-    init(maxEntries: Int = 40_000) {
+    init(
+        maxEntries: Int = 40_000,
+        persistence: (any SourceContributionReceiptPersisting)? = nil
+    ) {
         self.maxEntries = maxEntries
+        self.persistence = persistence
+        guard maxEntries > 0, let persistence else { return }
+        switch persistence.load() {
+        case .empty:
+            break
+        case let .loaded(state):
+            let delivered = Set(state.delivered)
+            let rejected = Set(state.rejected)
+            let valuesAreCanonical = state.delivered.allSatisfy(SourceContributionReceipt.isValid)
+                && state.rejected.allSatisfy(SourceContributionReceipt.isValid)
+            guard valuesAreCanonical,
+                  delivered.count == state.delivered.count,
+                  rejected.count == state.rejected.count,
+                  delivered.isDisjoint(with: rejected),
+                  delivered.count + rejected.count <= maxEntries else {
+                storageAvailable = false
+                return
+            }
+            self.delivered = delivered
+            self.rejected = rejected
+        case .unavailable:
+            storageAvailable = false
+        }
     }
 
     struct Reservation: Sendable {
@@ -1552,21 +1787,43 @@ actor SourceUploadCoordinator {
         case unavailable
     }
 
+    enum AttemptResult: Sendable {
+        case succeeded
+        case transient(jitterPermille: Int)
+        case validationRejected
+        case authorizationRejected
+        case permanentRejected
+        case cancelled
+    }
+
+    enum FinishDecision: Equatable, Sendable {
+        case completed
+        case retry
+        case released
+    }
+
     func reserve(
         contentID: String,
-        descriptors: [SourceIndexClient.Descriptor]
+        descriptors: [SourceIndexClient.Descriptor],
+        lifecycle: SourceIndexLifecycleSnapshot = SourceIndexLifecycleClock.snapshot()
     ) -> Reservation? {
-        guard maxEntries > 0,
+        guard storageAvailable,
+              maxEntries > 0,
               nextReservationID < UInt64.max,
               SourceIndexContract.canonicalContentID(contentID) == contentID else { return nil }
+        if let circuitLifecycle {
+            guard circuitLifecycle != lifecycle else { return nil }
+            self.circuitLifecycle = nil
+        }
         var fresh: [SourceIndexClient.Descriptor] = []
         var keys: [String] = []
         var local = Set<String>()
         for descriptor in descriptors {
             guard SourceIndexClient.isCanonicalPoolID(kind: descriptor.kind, id: descriptor.id) else { continue }
-            let key = contentID + "|" + descriptor.kind + "|" + descriptor.id
-            guard !seen.contains(key), !pending.contains(key), local.insert(key).inserted else { continue }
-            guard seen.count + pending.count + keys.count < maxEntries else { break }
+            let key = SourceContributionReceipt.key(contentID: contentID, descriptor: descriptor)
+            guard !delivered.contains(key), !rejected.contains(key),
+                  !pending.contains(key), local.insert(key).inserted else { continue }
+            guard delivered.count + rejected.count + pending.count + keys.count < maxEntries else { break }
             keys.append(key)
             fresh.append(descriptor)
         }
@@ -1575,7 +1832,11 @@ actor SourceUploadCoordinator {
         let id = nextReservationID
         nextReservationID += 1
         pending.formUnion(keys)
-        reservations[id] = (keys, fresh)
+        reservations[id] = StoredReservation(
+            keys: keys,
+            descriptors: fresh,
+            lifecycle: lifecycle
+        )
         return Reservation(id: id, descriptors: fresh)
     }
 
@@ -1597,25 +1858,104 @@ actor SourceUploadCoordinator {
             release(reservation)
             return .unavailable
         }
-        guard let stored = reservations[reservation.id] else { return .unavailable }
-        let notBefore = nextPostNanoseconds ?? nowNanoseconds
+        guard var stored = reservations[reservation.id], !stored.inFlight else { return .unavailable }
+        let notBefore = max(
+            nextPostNanoseconds ?? nowNanoseconds,
+            stored.retryNotBeforeNanoseconds ?? nowNanoseconds
+        )
         if nowNanoseconds < notBefore { return .wait(notBefore - nowNanoseconds) }
 
-        reservations.removeValue(forKey: reservation.id)
-        pending.subtract(stored.keys)
-        seen.formUnion(stored.keys)
+        stored.attempts += 1
+        stored.inFlight = true
+        stored.retryNotBeforeNanoseconds = nil
+        reservations[reservation.id] = stored
         let (next, overflow) = nowNanoseconds.addingReportingOverflow(intervalNanoseconds)
         nextPostNanoseconds = overflow ? UInt64.max : next
         return .launch(stored.descriptors)
     }
 
-    /// A failed committed POST is never retried. It only pushes the next fresh POST at least one normal pacing
-    /// interval beyond the observed failure, preventing a broken endpoint from accelerating later batches.
-    func finishAttempt(succeeded: Bool, nowNanoseconds: UInt64, intervalNanoseconds: UInt64) -> Bool {
-        guard !succeeded else { return true }
-        let (candidate, overflow) = nowNanoseconds.addingReportingOverflow(intervalNanoseconds)
-        nextPostNanoseconds = max(nextPostNanoseconds ?? nowNanoseconds, overflow ? UInt64.max : candidate)
-        return false
+    func finishAttempt(
+        _ reservation: Reservation,
+        result: AttemptResult,
+        nowNanoseconds: UInt64,
+        retryPolicy: SourceContributionRetryPolicy
+    ) -> FinishDecision {
+        guard var stored = reservations[reservation.id], stored.inFlight else { return .released }
+        switch result {
+        case .succeeded:
+            reservations.removeValue(forKey: reservation.id)
+            pending.subtract(stored.keys)
+            delivered.formUnion(stored.keys)
+            persistTerminalState()
+            return .completed
+        case let .transient(jitterPermille):
+            guard let delay = retryPolicy.retryDelayNanoseconds(
+                afterAttempt: stored.attempts,
+                jitterPermille: jitterPermille
+            ) else {
+                reservations.removeValue(forKey: reservation.id)
+                pending.subtract(stored.keys)
+                return .released
+            }
+            let (notBefore, overflow) = nowNanoseconds.addingReportingOverflow(delay)
+            stored.inFlight = false
+            stored.retryNotBeforeNanoseconds = overflow ? UInt64.max : notBefore
+            reservations[reservation.id] = stored
+            nextPostNanoseconds = max(
+                nextPostNanoseconds ?? nowNanoseconds,
+                stored.retryNotBeforeNanoseconds ?? UInt64.max
+            )
+            return .retry
+        case .validationRejected:
+            reservations.removeValue(forKey: reservation.id)
+            pending.subtract(stored.keys)
+            rejected.formUnion(stored.keys)
+            persistTerminalState()
+            return .completed
+        case .authorizationRejected, .permanentRejected:
+            reservations.removeValue(forKey: reservation.id)
+            pending.subtract(stored.keys)
+            circuitLifecycle = stored.lifecycle
+            return .completed
+        case .cancelled:
+            reservations.removeValue(forKey: reservation.id)
+            pending.subtract(stored.keys)
+            return .released
+        }
+    }
+
+    @discardableResult
+    private func persistTerminalState() -> Bool {
+        guard let persistence else { return true }
+        let state = SourceContributionReceiptState(
+            delivered: delivered.sorted(),
+            rejected: rejected.sorted()
+        )
+        guard persistence.save(state) else {
+            storageAvailable = false
+            return false
+        }
+        return true
+    }
+}
+
+struct SourceContributionRuntime: Sendable {
+    let coordinator: SourceUploadCoordinator
+    let retryPolicy: SourceContributionRetryPolicy
+    let nowNanoseconds: @Sendable () -> UInt64
+    let sleepNanoseconds: @Sendable (UInt64) async throws -> Void
+    let jitterPermille: @Sendable () -> Int
+    let transport: @Sendable (URLRequest) async throws -> Void
+
+    static func live() -> SourceContributionRuntime {
+        SourceContributionRuntime(
+            coordinator: .shared,
+            retryPolicy: .live,
+            nowNanoseconds: { DispatchTime.now().uptimeNanoseconds },
+            sleepNanoseconds: { try await Task<Never, Never>.sleep(nanoseconds: $0) },
+            jitterPermille: { Int.random(in: -200...200) },
+            transport: SourceIndexClient.contributionTransport
+        )
     }
 }
 

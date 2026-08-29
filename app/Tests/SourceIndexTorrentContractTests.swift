@@ -165,6 +165,15 @@ final class CoreBridge {
     var playerActive = false
 }
 
+@MainActor
+final class JSProviderSource {
+    func refresh(call: AuxiliarySourcePipeline.Call) {}
+    func merged(
+        into groups: [CoreStreamSourceGroup],
+        call: AuxiliarySourcePipeline.Call
+    ) -> [CoreStreamSourceGroup] { groups }
+}
+
 actor AttemptProbe {
     private var attempts = 0
     func record() { attempts += 1 }
@@ -180,6 +189,75 @@ final class LockedGate: @unchecked Sendable {
     func value() -> Bool { lock.withLock { open } }
     func close() { lock.withLock { open = false } }
     func reopen() { lock.withLock { open = true } }
+}
+
+final class LockedNanosecondClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+    func now() -> UInt64 { lock.withLock { value } }
+    func advance(_ delta: UInt64) { lock.withLock { value &+= delta } }
+}
+
+final class ContributionSleepProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [UInt64] = []
+    private let clock: LockedNanosecondClock
+    private let onSleep: @Sendable () -> Void
+
+    init(clock: LockedNanosecondClock, onSleep: @escaping @Sendable () -> Void = {}) {
+        self.clock = clock
+        self.onSleep = onSleep
+    }
+
+    func sleep(_ delay: UInt64) async throws {
+        if Task.isCancelled { throw CancellationError() }
+        lock.withLock { recorded.append(delay) }
+        clock.advance(delay)
+        onSleep()
+    }
+
+    func delays() -> [UInt64] { lock.withLock { recorded } }
+}
+
+final class ContributionScript: @unchecked Sendable {
+    enum Step: Sendable { case success, status(Int), transient }
+    private let lock = NSLock()
+    private var steps: [Step]
+    private var calls = 0
+
+    init(_ steps: [Step]) { self.steps = steps }
+
+    func send(_ request: URLRequest) async throws {
+        let step: Step = lock.withLock {
+            calls += 1
+            return steps.isEmpty ? .success : steps.removeFirst()
+        }
+        switch step {
+        case .success: return
+        case let .status(code): throw SourceIndexTransportError.badStatus(code)
+        case .transient: throw URLError(.timedOut)
+        }
+    }
+
+    func callCount() -> Int { lock.withLock { calls } }
+}
+
+final class MemoryContributionReceiptStore: SourceContributionReceiptPersisting, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: SourceContributionReceiptLoad = .empty
+
+    func load() -> SourceContributionReceiptLoad { lock.withLock { value } }
+    func save(_ state: SourceContributionReceiptState) -> Bool {
+        lock.withLock { value = .loaded(state) }
+        return true
+    }
+
+    func state() -> SourceContributionReceiptState? {
+        lock.withLock {
+            guard case let .loaded(state) = value else { return nil }
+            return state
+        }
+    }
 }
 
 final class SequencedGate: @unchecked Sendable {
@@ -762,6 +840,15 @@ struct SourceIndexTorrentContractTests {
             await postProbe.record()
             playbackGate.reopen()
         }
+        let playbackClock = LockedNanosecondClock()
+        let playbackRuntime = SourceContributionRuntime(
+            coordinator: SourceUploadCoordinator(maxEntries: 100),
+            retryPolicy: .live,
+            nowNanoseconds: { playbackClock.now() },
+            sleepNanoseconds: { playbackClock.advance($0) },
+            jitterPermille: { 0 },
+            transport: SourceIndexClient.contributionTransport
+        )
         let blockedOutcome = await SourceIndexClient.contribute(
             contentID: "tt1234567:1:3",
             descriptors: [
@@ -772,7 +859,8 @@ struct SourceIndexTorrentContractTests {
                     sizeBytes: 1,
                     seeders: nil
                 )
-            ]
+            ],
+            runtime: playbackRuntime
         )
         expect(
             blockedOutcome == .deferred,
@@ -808,7 +896,8 @@ struct SourceIndexTorrentContractTests {
         }
         let admittedOutcome = await SourceIndexClient.contribute(
             contentID: "tt7654321:1:1",
-            descriptors: multiBatchDescriptors
+            descriptors: multiBatchDescriptors,
+            runtime: playbackRuntime
         )
         let admittedPostCount = await postProbe.count()
         expect(
@@ -828,11 +917,6 @@ struct SourceIndexTorrentContractTests {
         )
 
         playbackGate.close()
-        let failedPostProbe = AttemptProbe()
-        SourceIndexClient.contributionTransport = { _ in
-            await failedPostProbe.record()
-            throw SequenceFetchError.failed
-        }
         let failedDescriptor = SourceIndexClient.Descriptor(
             kind: "torrent",
             id: String(format: "%040x", 999),
@@ -840,24 +924,141 @@ struct SourceIndexTorrentContractTests {
             sizeBytes: 1,
             seeders: nil
         )
+        let retryClock = LockedNanosecondClock()
+        let retrySleep = ContributionSleepProbe(clock: retryClock)
+        let retryScript = ContributionScript([.transient, .success])
+        let retryCoordinator = SourceUploadCoordinator(maxEntries: 10)
+        let retryRuntime = SourceContributionRuntime(
+            coordinator: retryCoordinator,
+            retryPolicy: SourceContributionRetryPolicy(
+                maximumAttempts: 3,
+                baseDelayNanoseconds: 2_000_000_000,
+                maximumDelayNanoseconds: 4_000_000_000,
+                jitterRangePermille: 0
+            ),
+            nowNanoseconds: { retryClock.now() },
+            sleepNanoseconds: { try await retrySleep.sleep($0) },
+            jitterPermille: { 0 },
+            transport: { try await retryScript.send($0) }
+        )
         let failedOutcome = await SourceIndexClient.contribute(
             contentID: "tt7654322:1:1",
-            descriptors: [failedDescriptor]
+            descriptors: [failedDescriptor],
+            runtime: retryRuntime
         )
         let duplicateFailedOutcome = await SourceIndexClient.contribute(
             contentID: "tt7654322:1:1",
-            descriptors: [failedDescriptor]
+            descriptors: [failedDescriptor],
+            runtime: retryRuntime
         )
         expect(
             failedOutcome == .acceptedByProcess
                 && duplicateFailedOutcome == .acceptedByProcess,
-            "a committed transport failure remains a process-accepted one-shot attempt"
+            "a transient failure retries once, succeeds, and becomes process-terminal"
         )
-        let failedAttemptCount = await failedPostProbe.count()
         expect(
-            failedAttemptCount == 1,
-            "a failed committed attempt cannot become a refresh-driven transport storm"
+            retryScript.callCount() == 2 && retrySleep.delays() == [2_000_000_000],
+            "transient retry uses deterministic bounded backoff and success is never retried"
         )
+        let retryBounds = SourceContributionRetryPolicy(
+            maximumAttempts: 3,
+            baseDelayNanoseconds: 2_000,
+            maximumDelayNanoseconds: 5_000,
+            jitterRangePermille: 200
+        )
+        expect(retryBounds.retryDelayNanoseconds(afterAttempt: 1, jitterPermille: -999) == 1_600
+               && retryBounds.retryDelayNanoseconds(afterAttempt: 1, jitterPermille: 999) == 2_400
+               && retryBounds.retryDelayNanoseconds(afterAttempt: 3, jitterPermille: 0) == nil,
+               "retry jitter and attempt count stay inside their configured hard bounds")
+        expect(SourceIndexClient.contributionFailureKind(
+            for: SourceIndexTransportError.badStatus(401)
+        ) == .authentication,
+               "authentication rejection is classified as permanent, never transient retry work")
+
+        let receiptStore = MemoryContributionReceiptStore()
+        let receiptClock = LockedNanosecondClock()
+        let receiptScript = ContributionScript([.success])
+        let receiptDescriptor = SourceIndexClient.Descriptor(
+            kind: "torrent", id: String(format: "%040x", 1_001),
+            quality: "1080p", sizeBytes: 1, seeders: nil
+        )
+        let receiptCoordinator = SourceUploadCoordinator(maxEntries: 10, persistence: receiptStore)
+        let receiptRuntime = SourceContributionRuntime(
+            coordinator: receiptCoordinator,
+            retryPolicy: .live,
+            nowNanoseconds: { receiptClock.now() },
+            sleepNanoseconds: { receiptClock.advance($0) },
+            jitterPermille: { 0 },
+            transport: { try await receiptScript.send($0) }
+        )
+        _ = await SourceIndexClient.contribute(
+            contentID: "tt7654323:1:1", descriptors: [receiptDescriptor], runtime: receiptRuntime
+        )
+        let restartedScript = ContributionScript([.success])
+        let restartedRuntime = SourceContributionRuntime(
+            coordinator: SourceUploadCoordinator(maxEntries: 10, persistence: receiptStore),
+            retryPolicy: .live,
+            nowNanoseconds: { receiptClock.now() },
+            sleepNanoseconds: { receiptClock.advance($0) },
+            jitterPermille: { 0 },
+            transport: { try await restartedScript.send($0) }
+        )
+        let restartedOutcome = await SourceIndexClient.contribute(
+            contentID: "tt7654323:1:1", descriptors: [receiptDescriptor], runtime: restartedRuntime
+        )
+        let storedReceipts = receiptStore.state()
+        expect(receiptScript.callCount() == 1 && restartedScript.callCount() == 0
+               && restartedOutcome == .acceptedByProcess,
+               "a successful descriptor is not duplicated after coordinator restart")
+        expect(storedReceipts?.delivered.count == 1
+               && storedReceipts?.delivered.first?.count == 64
+               && storedReceipts?.delivered.first?.contains(receiptDescriptor.id) == false,
+               "restart persistence contains only one opaque receipt, never raw descriptor identity")
+
+        let rejectionStore = MemoryContributionReceiptStore()
+        let rejectionScript = ContributionScript([.status(422), .success])
+        let rejectionRuntime = SourceContributionRuntime(
+            coordinator: SourceUploadCoordinator(maxEntries: 10, persistence: rejectionStore),
+            retryPolicy: .live,
+            nowNanoseconds: { 0 },
+            sleepNanoseconds: { _ in },
+            jitterPermille: { 0 },
+            transport: { try await rejectionScript.send($0) }
+        )
+        _ = await SourceIndexClient.contribute(
+            contentID: "tt7654324:1:1", descriptors: [receiptDescriptor], runtime: rejectionRuntime
+        )
+        _ = await SourceIndexClient.contribute(
+            contentID: "tt7654324:1:1", descriptors: [receiptDescriptor], runtime: rejectionRuntime
+        )
+        expect(rejectionScript.callCount() == 1 && rejectionStore.state()?.rejected.count == 1,
+               "permanent validation rejection is terminal and never enters the retry loop")
+
+        let sessionClock = LockedNanosecondClock()
+        let sessionScript = ContributionScript([.status(503), .success])
+        let sessionSleep = ContributionSleepProbe(
+            clock: sessionClock,
+            onSleep: { _ = SourceIndexLifecycleClock.mutateSession() }
+        )
+        let sessionCoordinator = SourceUploadCoordinator(maxEntries: 10)
+        let sessionRuntime = SourceContributionRuntime(
+            coordinator: sessionCoordinator,
+            retryPolicy: SourceContributionRetryPolicy(
+                maximumAttempts: 3,
+                baseDelayNanoseconds: 2_000_000_000,
+                maximumDelayNanoseconds: 4_000_000_000,
+                jitterRangePermille: 0
+            ),
+            nowNanoseconds: { sessionClock.now() },
+            sleepNanoseconds: { try await sessionSleep.sleep($0) },
+            jitterPermille: { 0 },
+            transport: { try await sessionScript.send($0) }
+        )
+        let sessionOutcome = await SourceIndexClient.contribute(
+            contentID: "tt7654325:1:1", descriptors: [receiptDescriptor], runtime: sessionRuntime
+        )
+        expect(sessionOutcome == .deferred && sessionScript.callCount() == 1,
+               "session change during backoff cancels the stale retry and releases its descriptor")
         SourceIndexClient.diagnosticSink = previousPlaybackSink
         SourceIndexClient.playbackActiveProvider = previousPlaybackProvider
         SourceIndexClient.contributionTransport = previousContributionTransport
@@ -973,18 +1174,8 @@ struct SourceIndexTorrentContractTests {
         ) && discardedReads == 0 && discardCancellations == 1,
                "declared oversized POST response cancels before draining")
 
-        let launchProbe = AttemptProbe()
-        let canceledParent = Task {
-            while !Task.isCancelled { await Task.yield() }
-            return await SourceIndexClient.runCancellationIndependentAttempt {
-                await launchProbe.record()
-            }
-        }
-        canceledParent.cancel()
-        let canceledParentSucceeded = await canceledParent.value
-        let cancellationIndependentAttempts = await launchProbe.count()
-        expect(canceledParentSucceeded && cancellationIndependentAttempts == 1,
-               "parent cancellation after commit still launches exactly one detached attempt")
+        expect(SourceIndexClient.contributionFailureKind(for: CancellationError()) == .cancelled,
+               "task cancellation is terminal for the current retry owner")
 
         let mixed = CoreStreamSourceGroup(
             id: "raw",
@@ -2233,11 +2424,22 @@ struct SourceIndexTorrentContractTests {
                 alreadySleeping, nowNanoseconds: 10_000, intervalNanoseconds: 1_100
             ))
         } else { initialSleep = nil }
-        let continueFailedLoop = await failurePacer.finishAttempt(
-            succeeded: SourceIndexClient.isSuccessfulHTTPStatus(503),
-            nowNanoseconds: 11_000,
-            intervalNanoseconds: 1_100
-        )
+        let continueFailedLoop: SourceUploadCoordinator.FinishDecision
+        if let failedAttempt {
+            continueFailedLoop = await failurePacer.finishAttempt(
+                failedAttempt,
+                result: .transient(jitterPermille: 0),
+                nowNanoseconds: 11_000,
+                retryPolicy: SourceContributionRetryPolicy(
+                    maximumAttempts: 3,
+                    baseDelayNanoseconds: 1_100,
+                    maximumDelayNanoseconds: 4_400,
+                    jitterRangePermille: 0
+                )
+            )
+        } else {
+            continueFailedLoop = .released
+        }
         let retryFailedClaim = await failurePacer.reserve(
             contentID: "tt1234567", descriptors: [firstDescriptor]
         )
@@ -2253,8 +2455,8 @@ struct SourceIndexTorrentContractTests {
                 alreadySleeping, nowNanoseconds: 12_100, intervalNanoseconds: 1_100
             ))
         } else { afterFailure = [] }
-        expect(!continueFailedLoop && retryFailedClaim == nil,
-               "POST 503 stops the current loop and its held claim cannot fan out into a retry")
+        expect(continueFailedLoop == .retry && retryFailedClaim == nil,
+               "POST 503 retains one atomic owner while scheduling a bounded retry")
         expect(initialSleep == 1_100 && shiftedSleep == 1_000 && afterFailure.map(\.id) == [secondHash],
                "an overlapping sleeper rechecks and honors one full interval after failure")
 
