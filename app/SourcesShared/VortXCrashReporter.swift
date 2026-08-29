@@ -35,6 +35,10 @@ enum VortXCrashReporter {
         gInstalled = true
 
         let marker = markerURL
+        // Freeze evidence from the PRIOR process before folding or pre-opening the marker. open(O_CREAT)
+        // below necessarily makes an empty marker exist for this process; file existence after that point
+        // cannot distinguish a captured prior crash from ordinary reporter initialization.
+        launchHadPendingCrashMarker = hasNonemptyCrashMarker(at: marker)
 
         // 1) Report the previous run's crash (if any). Returns true when a crash marker was left in place
         //    (diagnostics was off), so the fresh handler must APPEND rather than truncate and clobber it.
@@ -139,12 +143,22 @@ enum VortXCrashReporter {
         return caches.appendingPathComponent("vortx-lastcrash.txt")
     }
 
-    /// True while a captured-but-unfolded crash marker is on disk. TerminationReceipt.classify
-    /// reads this BEFORE install() folds (and deletes) the marker, so a real crash is attributed
-    /// to `.crash` rather than guessed as a foreground kill from phase heuristics.
-    static var pendingCrashMarkerExists: Bool {
-        FileManager.default.fileExists(atPath: markerURL.path)
+    /// Whether `marker` contains evidence written by a prior fatal handler. Kept as a small pure file
+    /// boundary so launch classification can be tested without installing process-wide signal handlers.
+    static func hasNonemptyCrashMarker(at marker: URL) -> Bool {
+        guard let data = try? Data(contentsOf: marker) else { return false }
+        return !data.isEmpty
     }
+
+    /// Launch-time evidence from the prior process. This intentionally does not inspect the live marker:
+    /// `install()` pre-opens that file with O_CREAT before TerminationReceipt classifies the prior run.
+    static var pendingCrashMarkerExists: Bool {
+        launchHadPendingCrashMarker
+    }
+
+    // Written once during process launch, then read by TerminationReceipt immediately afterward.
+    // Signal handlers never touch it; `unsafe` documents that externally ordered launch lifetime.
+    nonisolated(unsafe) private static var launchHadPendingCrashMarker = false
 }
 
 // MARK: - Process-wide state (allocated once in install(); the handler only READS these)

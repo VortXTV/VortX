@@ -1747,9 +1747,17 @@ struct TVPlayerView: View {
                 // first so the post-first-frame resume watchdog can still see the real playhead.
                 lastRawTimePos = d
                 if let target = inFlightSeekTarget {
-                    if abs(d - target) <= inFlightSeekSnapRadius
+                    let landedNearTarget = abs(d - target) <= inFlightSeekSnapRadius
+                    if landedNearTarget
                         || Date().timeIntervalSinceReferenceDate - inFlightSeekIssuedAt > inFlightSeekSettleWindow {
                         inFlightSeekTarget = nil   // settled near the target, or the window expired: trust ticks again
+                        if landedNearTarget {
+                            // The deferred resume obligation is complete. Retire its watchdog now, while
+                            // the landed tick still proves the target, so a later user seek backward cannot
+                            // make the old target look failed when the 12-second task wakes.
+                            postFrameResumeSeekWatchdog?.cancel()
+                            postFrameResumeSeekWatchdog = nil
+                        }
                     } else {
                         return
                     }

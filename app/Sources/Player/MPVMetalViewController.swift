@@ -3007,7 +3007,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
         guard videoTracks > 1 || !dependentIDs.isEmpty else { return }   // ordinary single-layer source
         if dependentIDs.isEmpty {
-            VXProbe.log("dv", "FEL not paired: \(videoTracks) video tracks, none marked dependent (EL discarded, base layer only)")
+            VXProbe.log("dv", "FEL pairing unproven: \(videoTracks) video tracks, none marked dependent (no dependent-track/FEL pairing evidence)")
         } else {
             VXProbe.log("dv", "FEL paired: enhancement-layer track(s) \(dependentIDs) of \(videoTracks) video tracks")
         }
