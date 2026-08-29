@@ -498,10 +498,13 @@ require_grep "published feed recovery verifies release latest identity" 'repos/\
 require_grep "published feed recovery signs the recover action" 'action:"recover"' "$RECOVERY_WF"
 require_grep "published feed recovery binds the signed target source digest" 'targetSourceSha256:\$source' "$RECOVERY_WF"
 require_grep "published feed recovery CASes main source bytes" '--arg sha "\$CURRENT_SHA"' "$RECOVERY_WF"
+require_grep "published feed recovery marks edge mutation attempted before the POST" 'EDGE_ATTEMPTED=1' "$RECOVERY_WF"
+require_grep "published feed recovery marks source mutation attempted before the PUT" 'SOURCE_ATTEMPTED=1' "$RECOVERY_WF"
 require_grep "published feed recovery compensates an edge mutation on later failure" 'rollback_edge' "$RECOVERY_WF"
 require_grep "published feed recovery compensates a source mutation on later failure" 'rollback_source' "$RECOVERY_WF"
 require_grep "published feed recovery traps failure after recovery" 'trap on_failure EXIT' "$RECOVERY_WF"
 require_grep "published feed recovery handles ambiguous mutation acknowledgement by readback" 'recovery response was ambiguous' "$RECOVERY_WF"
+require_grep "published feed recovery emits an incident for incomplete compensation" 'incident: release recovery compensation was incomplete' "$RECOVERY_WF"
 require_absent "published feed recovery must never redraft a public release" 'draft=true|draft: true' "$RECOVERY_WF"
 ok "published feed recovery is protected, authenticated, source-CAS-bound, and never redrafts"
 grep -Eq '^    permissions:$' <<<"$verify_published_block" \
