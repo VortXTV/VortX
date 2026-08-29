@@ -251,10 +251,23 @@ enum PinnedHTTPClient {
             guard let colon = line.firstIndex(of: ":") else { throw Failure.malformedResponse }
             let key = String(line[..<colon]).lowercased()
             let value = trimOWS(String(line[line.index(after: colon)...]))
-            guard isHTTPToken(key), isValidFieldValue(value), headers[key] == nil else {
+            guard isHTTPToken(key), isValidFieldValue(value) else {
                 throw Failure.malformedResponse
             }
-            headers[key] = value
+            if let existing = headers[key] {
+                // Framing must have exactly one unambiguous declaration. This remains stricter
+                // than generic field combination so request smuggling cannot hide in duplicates.
+                guard key != "content-length", key != "transfer-encoding" else {
+                    throw Failure.malformedResponse
+                }
+                // Set-Cookie is not a list field and comma-folding changes cookie semantics. The
+                // pinned client does not persist response cookies, so retain the first value.
+                if key != "set-cookie" {
+                    headers[key] = existing + ", " + value
+                }
+            } else {
+                headers[key] = value
+            }
         }
         if statusLine.hasPrefix("HTTP/1.0 "), headers["transfer-encoding"] != nil {
             throw Failure.malformedResponse

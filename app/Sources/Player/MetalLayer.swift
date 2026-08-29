@@ -152,10 +152,18 @@ class MetalLayer: CAMetalLayer {
     /// chosen by MoltenVK/mpv and can change across SDR/HDR display-mode switches; a format outside
     /// this set skips the capture cleanly instead of risking an uncatchable MPS validation abort
     /// (MTLReportFailure -> SIGABRT on the VO thread; the #188 Apple TV HD crash class). HDR-path
-    /// captures therefore skip by design, mirroring the existing 4K-DV hard skip.
+    /// MoltenVK uses 10-bit extended-range or half-float drawables for HDR output, so those
+    /// formats must remain capturable on Apple3+ hardware. The separate 4K-DV hard skip still
+    /// prevents the known high-risk stream class from reaching this path.
     private static let captureSafePixelFormats: Set<MTLPixelFormat> = [
-        .bgra8Unorm, .bgra8Unorm_srgb, .rgba8Unorm, .rgba8Unorm_srgb
+        .bgra8Unorm, .bgra8Unorm_srgb, .rgba8Unorm, .rgba8Unorm_srgb,
+        .rgb10a2Unorm, .bgr10a2Unorm, .bgra10_xr, .bgra10_xr_srgb,
+        .rgba16Float
     ]
+
+    static func inlineDrawableCapturePixelFormatAllowed(_ pixelFormat: MTLPixelFormat) -> Bool {
+        captureSafePixelFormats.contains(pixelFormat)
+    }
 
     func setupCaptureQueue(_ queue: MTLCommandQueue) {
         captureLock.lock()
@@ -252,7 +260,7 @@ class MetalLayer: CAMetalLayer {
                 //    from one is meaningless and can trip validation.
                 // 2) Unvetted pixel formats: see captureSafePixelFormats above.
                 guard src.width > 2, src.height > 2,
-                      MetalLayer.captureSafePixelFormats.contains(src.pixelFormat) else {
+                      MetalLayer.inlineDrawableCapturePixelFormatAllowed(src.pixelFormat) else {
                     captureLeaseState.release(token: leaseToken)
                     delivery.complete(succeeded: false)
                     return d

@@ -95,6 +95,24 @@ struct PinnedHTTPClientFunctionalProofTests {
         expect(try! PinnedHTTPClient.decodeResponse(chunked, limits: .init())?.body == Data("hello".utf8), "chunked framing")
         let caseFoldedChunked = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: ChUnKeD\r\n\r\n1\r\nx\r\n0\r\n\r\n".utf8)
         expect(try! PinnedHTTPClient.decodeResponse(caseFoldedChunked, limits: .init())?.body == Data("x".utf8), "transfer-encoding token is case insensitive")
+        let subtitleBody = Data("1\n00:00:01,000 --> 00:00:02,000\nhello\n".utf8)
+        let subtitleHead = Data((
+            "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: application/x-subrip; charset=utf-8\r\n"
+                + "Transfer-Encoding: chunked\r\n"
+                + "Server-Timing: edge;dur=4\r\n"
+                + "Server-Timing: origin;dur=52\r\n"
+                + "Set-Cookie: first=one\r\n"
+                + "Set-Cookie: second=two\r\n\r\n"
+                + String(subtitleBody.count, radix: 16) + "\r\n"
+        ).utf8)
+        let duplicateMetadataSubtitle = subtitleHead + subtitleBody + Data("\r\n0\r\n\r\n".utf8)
+        let parsedSubtitle = try! PinnedHTTPClient.decodeResponse(duplicateMetadataSubtitle, limits: .init())!
+        expect(parsedSubtitle.body == subtitleBody, "duplicate metadata headers preserve the subtitle response body")
+        expect(parsedSubtitle.headers["server-timing"] == "edge;dur=4, origin;dur=52", "duplicate list metadata is comma-folded in wire order")
+        expect(parsedSubtitle.headers["set-cookie"] == "first=one", "Set-Cookie is never comma-folded")
+        expectFailure({ _ = try PinnedHTTPClient.decodeResponse(Data("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx".utf8), limits: .init()) }, .malformedResponse, "duplicate content-length is rejected even when values agree")
+        expectFailure({ _ = try PinnedHTTPClient.decodeResponse(Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".utf8), limits: .init()) }, .malformedResponse, "duplicate transfer-encoding is rejected")
         let withContinue = Data("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx".utf8)
         expect(try! PinnedHTTPClient.decodeResponse(withContinue, limits: .init())?.body == Data("x".utf8), "bounded interim response chain is consumed before final head")
         expect(try! PinnedHTTPClient.decodeResponse(Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), limits: .init(), isComplete: true) == nil, "EOF after informational response is not a final response")
