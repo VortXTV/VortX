@@ -96,7 +96,14 @@ object TmdbImdbResolver {
      * Accepts the canonical "tmdb:693134" and tolerates "tmdb:movie:693134" / "tmdb:tv:693134".
      */
     suspend fun resolveImdbId(context: Context, rawId: String, seriesHint: Boolean): String? =
-        (resolveImdbIdTyped(context, rawId, seriesHint) as? TmdbImdbResolution.Resolved)?.imdbId
+        resolveImdbId(context, rawId, seriesHint, CommunityTrickplayRequestControl())
+
+    internal suspend fun resolveImdbId(
+        context: Context,
+        rawId: String,
+        seriesHint: Boolean,
+        requestControl: CommunityTrickplayRequestControl,
+    ): String? = (resolveImdbIdTyped(context, rawId, seriesHint, requestControl) as? TmdbImdbResolution.Resolved)?.imdbId
 
     /**
      * Typed form of [resolveImdbId]. A missing IMDb id is different from an invalid input, a transport
@@ -107,6 +114,7 @@ object TmdbImdbResolver {
         context: Context,
         rawId: String,
         seriesHint: Boolean,
+        requestControl: CommunityTrickplayRequestControl = CommunityTrickplayRequestControl(),
     ): TmdbImdbResolution {
         ensureHydrated(context)
         val cacheKey = rawId.lowercase()
@@ -126,7 +134,7 @@ object TmdbImdbResolver {
 
         var failure: TmdbImdbResolution? = null
         for (media in order) {
-            when (val result = fetchExternalImdbId(media = media, tmdbId = numeric)) {
+            when (val result = fetchExternalImdbId(media = media, tmdbId = numeric, requestControl = requestControl)) {
                 is TmdbImdbResolution.Resolved -> {
                     val snapshot = synchronized(lock) {
                         cache[cacheKey] = result.imdbId
@@ -147,20 +155,25 @@ object TmdbImdbResolver {
      * + URL are set, before the connection opens, per the signer's contract). Runs on [Dispatchers.IO]; a
      * non-200 or any transport error resolves to null. Mirrors the edge half of Apple `fetchExternalIMDbID`.
      */
-    private suspend fun fetchExternalImdbId(
+    internal suspend fun fetchExternalImdbId(
         media: String,
         tmdbId: String,
+        requestControl: CommunityTrickplayRequestControl,
+        openConnection: (URL) -> HttpURLConnection = { url -> url.openConnection() as HttpURLConnection },
     ): TmdbImdbResolution = withContext(Dispatchers.IO) {
+        if (!requestControl.isActive()) return@withContext TmdbImdbResolution.TransportFailure
         var connection: HttpURLConnection? = null
         try {
             val url = URL("$EDGE_BASE/$media/$tmdbId/external_ids")
-            connection = (url.openConnection() as HttpURLConnection).apply {
+            connection = openConnection(url).apply {
                 requestMethod = "GET"
                 connectTimeout = TIMEOUT_MS
                 readTimeout = TIMEOUT_MS
                 useCaches = false
                 setRequestProperty("accept", "application/json")
             }
+            requestControl.register(connection)
+            if (!requestControl.isActive()) return@withContext TmdbImdbResolution.TransportFailure
             VortXEdgeAuth.sign(connection)
             val status = connection.responseCode
             if (status != 200) return@withContext TmdbImdbResolution.HttpFailure(status)
@@ -175,6 +188,7 @@ object TmdbImdbResolver {
         } catch (_: IOException) {
             TmdbImdbResolution.TransportFailure
         } finally {
+            connection?.let(requestControl::unregister)
             connection?.disconnect()
         }
     }

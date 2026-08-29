@@ -75,6 +75,7 @@ import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
+import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.Dispatchers
@@ -1057,7 +1058,7 @@ fun PlayerScreen(
             // configure above already refused to key the session on a junk duration).
             // The settle check keeps an unrendered mid-switch frame out of the shared timeline.
             if (s.isPaused || s.isBuffering || s.durationMs <= 0L || runtimeMismatch ||
-                afrHolder.get()?.isSettling() == true
+                afrHolder.get()?.isSettling() == true || !CommunityTrickplay.isEnabled(context)
             ) continue
             val jpeg = engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH) ?: continue
             // Read the source height HERE, while the engine is demonstrably alive and rendering, and bank

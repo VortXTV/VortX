@@ -60,6 +60,7 @@ import com.vortx.android.player.SeekStepSetting
 import com.vortx.android.player.StillWatchingSettings
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.skip.SkipConfig
+import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.prefs.AppLanguage
 import com.vortx.android.ui.theme.VortXIcons
@@ -123,6 +124,7 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var defaultVolume by remember { mutableStateOf(PlayerVolumeSettings.volume(appContext)) }
     var stillWatchingPrompt by remember { mutableStateOf(StillWatchingSettings.promptEnabled(appContext)) }
     var stillWatchingAfter by remember { mutableStateOf(StillWatchingSettings.afterEpisodes(appContext)) }
+    var communityScrub by remember { mutableStateOf(CommunityTrickplay.isEnabled(appContext)) }
 
     var skipProvider by remember {
         // SkipConfig.init MUST run before the first read/write here. SkipConfig holds its SharedPreferences
@@ -255,6 +257,21 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         },
                     )
                 }
+            }
+
+            SettingsSection(
+                title = "Community",
+                footer = "Share anonymized scrub previews so titles get instant thumbnails for everyone.",
+            ) {
+                ToggleRow(
+                    label = "Community scrub previews",
+                    detail = null,
+                    checked = communityScrub,
+                    onCheckedChange = {
+                        communityScrub = it
+                        CommunityTrickplay.setEnabled(appContext, it)
+                    },
+                )
             }
 
             SettingsSection(

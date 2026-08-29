@@ -82,7 +82,6 @@ import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
-import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.ui.viewmodel.AccountViewModel
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.home.HomeRailPreferences
@@ -194,9 +193,6 @@ fun TvSettingsScreen(
     // could never be turned on. This is its first (and the natural 10-foot) writer: refresh-rate matching is a
     // TV-panel setting. Same key/default as Apple, so the account restores one value.
     var matchFrameRate by remember { mutableStateOf(MatchFrameRateSetting.isEnabled(appContext)) }
-    // Community scrub previews (trickplay contribution). The read side existed on the same key Apple writes
-    // (`stremiox.communityTrickplay`); this row is its first writer via the new [CommunityTrickplay.setEnabled].
-    var communityScrub by remember { mutableStateOf(CommunityTrickplay.isEnabled(appContext)) }
     // The 10-foot settings search: filters which sections render. Blank shows everything.
     var settingsQuery by remember { mutableStateOf("") }
 
@@ -641,18 +637,6 @@ fun TvSettingsScreen(
                             val next = !matchFrameRate
                             matchFrameRate = next
                             MatchFrameRateSetting.setEnabled(appContext, next)
-                        },
-                    )
-                    // Community scrub previews: contribute anonymized scrub thumbnails so every viewer gets
-                    // instant previews. Writes the same key Apple writes (no token or PII is ever sent).
-                    TvToggleRow(
-                        label = "Community scrub previews",
-                        detail = "Share anonymized scrub previews so titles get instant thumbnails for everyone.",
-                        checked = communityScrub,
-                        onToggle = {
-                            val next = !communityScrub
-                            communityScrub = next
-                            CommunityTrickplay.setEnabled(appContext, next)
                         },
                     )
                 }

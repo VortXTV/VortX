@@ -1,6 +1,7 @@
 package com.vortx.android.trickplay
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -19,10 +20,36 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.UUID
 import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.sqrt
+
+/** Cancels active trickplay network I/O by disconnecting every request registered to this work item. */
+internal class CommunityTrickplayRequestControl {
+    private val connections = ConcurrentHashMap.newKeySet<HttpURLConnection>()
+
+    @Volatile
+    private var active = true
+
+    fun isActive(): Boolean = active
+
+    fun register(connection: HttpURLConnection) {
+        connections += connection
+        if (!active) connection.disconnect()
+    }
+
+    fun unregister(connection: HttpURLConnection) {
+        connections -= connection
+    }
+
+    fun cancel() {
+        active = false
+        connections.forEach(HttpURLConnection::disconnect)
+        connections.clear()
+    }
+}
 
 /**
  * Community trickplay: scrub-preview thumbnails SHARED across users, like Netflix / Plex storyboards.
@@ -55,8 +82,8 @@ import kotlin.math.sqrt
  *     `PlayerEngine.captureFrameJpeg` and hands it to [TrickplaySession.recordFrame], which buffers
  *     [CapturedFrame]s and calls [buildAndUpload].
  * [isEnabled] reads Apple's real setting key ([SETTING_KEY]) AND the RemoteConfig fleet kill-switch
- * (`features.communityTrickplay`), matching Apple. Still missing: a settings row that WRITES [SETTING_KEY],
- * so the user key sits at its unset default (on) until one lands.
+ * (`features.communityTrickplay`), matching Apple. Android phone and TV Playback settings both write the
+ * same shared preference through [setEnabled].
  *
  * ANDROID CONTRIBUTION ASYMMETRY (does not exist on Apple, do not "fix" it in this file): capture needs a
  * frame readback, and only the libmpv engine can attempt one. The ExoPlayer engine renders to a
@@ -96,9 +123,9 @@ object CommunityTrickplay {
      *
      * Now ALSO ANDs the RemoteConfig fleet kill-switch (`features.communityTrickplay`), exactly as Apple's
      * `isEnabled` does: a remote `false` disables contribution across the fleet with no app update, while the
-     * baked-true default keeps an unreachable RemoteConfig byte-identical to shipping. Still missing vs Apple:
-     * a user-reachable control that WRITES [SETTING_KEY]; Android's settings screen has no trickplay row, so
-     * today the user key sits at its unset default (true) and the effective gate is the fleet flag AND true.
+     * baked-true default keeps an unreachable RemoteConfig byte-identical to shipping. The phone and TV use
+     * one Playback settings control that writes [SETTING_KEY], so the effective gate is the fleet flag AND
+     * the persisted viewer choice.
      */
     fun isEnabled(context: Context): Boolean {
         if (!RemoteConfig.isFeatureOn(FEATURE_KEY, RemoteConfigDefaults.FEATURE_COMMUNITY_TRICKPLAY)) return false
@@ -114,8 +141,8 @@ object CommunityTrickplay {
      * Persist the viewer's opt-in choice under the SAME [SETTING_KEY] Apple writes, in the SAME
      * `vortx_settings` store the rest of the settings layer uses, so a change here rides the account backup
      * and the Apple/web value round-trips byte-for-byte. This is the write side [isEnabled] was always meant
-     * to pair with; the Android TV settings "Community scrub previews" row is its first writer. Once the key
-     * exists, [isEnabled] returns the stored value instead of the unset default (on).
+     * to pair with; the shared Android Playback settings control is its writer. Once the key exists,
+     * [isEnabled] returns the stored value instead of the unset default (on).
      */
     fun setEnabled(context: Context, enabled: Boolean) {
         context.applicationContext
@@ -123,6 +150,16 @@ object CommunityTrickplay {
             .edit()
             .putBoolean(SETTING_KEY, enabled)
             .apply()
+    }
+
+    /** Observe persisted consent so an active player can revoke queued and in-flight contribution work. */
+    internal fun observeEnabled(context: Context, onChanged: (Boolean) -> Unit): AutoCloseable {
+        val prefs = context.applicationContext.getSharedPreferences(SETTINGS_FILE, Context.MODE_PRIVATE)
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == SETTING_KEY) onChanged(isEnabled(context))
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        return AutoCloseable { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
 
     // MARK: - Worker-mirrored constants (kept in sync with vortx-trickplay decision.ts + RemoteConfig defaults)
@@ -198,9 +235,17 @@ object CommunityTrickplay {
 
     // MARK: - TMDB-keyed plays -> IMDb identity (delegated to the reusable resolver)
 
-    /** Delegates to [TmdbImdbResolver.resolveImdbId]; kept here so callers have one trickplay entry point. */
+    /** Delegates to [TmdbImdbResolver.resolveImdbId] with a standalone request control. */
     suspend fun resolveImdbId(context: Context, rawId: String, seriesHint: Boolean): String? =
         TmdbImdbResolver.resolveImdbId(context, rawId, seriesHint)
+
+    /** Delegates to [TmdbImdbResolver.resolveImdbId] with the session's cancellable request control. */
+    internal suspend fun resolveImdbId(
+        context: Context,
+        rawId: String,
+        seriesHint: Boolean,
+        requestControl: CommunityTrickplayRequestControl,
+    ): String? = TmdbImdbResolver.resolveImdbId(context, rawId, seriesHint, requestControl)
 
     /** Delegates to [TmdbImdbResolver.cachedImdbId]. */
     fun cachedImdbId(rawId: String): String? = TmdbImdbResolver.cachedImdbId(rawId)
@@ -248,7 +293,11 @@ object CommunityTrickplay {
      * / error (404, offline, decode failure) so the caller falls back to local generation. Never throws.
      * Mirrors Apple `CommunityTrickplay.fetch`.
      */
-    suspend fun fetch(key: String): Sheet? = withContext(Dispatchers.IO) {
+    internal suspend fun fetch(
+        key: String,
+        requestControl: CommunityTrickplayRequestControl = CommunityTrickplayRequestControl(),
+    ): Sheet? = withContext(Dispatchers.IO) {
+        if (!requestControl.isActive()) return@withContext null
         var metaConn: HttpURLConnection? = null
         var spriteConn: HttpURLConnection? = null
         var vttConn: HttpURLConnection? = null
@@ -261,9 +310,12 @@ object CommunityTrickplay {
                 useCaches = false
                 setRequestProperty("accept", "application/json")
             }
+            requestControl.register(metaConn)
+            if (!requestControl.isActive()) return@withContext null
             VortXEdgeAuth.sign(metaConn)
             if (metaConn.responseCode != 200) return@withContext null
             val text = metaConn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            if (!requestControl.isActive()) return@withContext null
             val meta = runCatching { JSONObject(text) }.getOrNull() ?: return@withContext null
 
             val spriteUrl = meta.optString("sprite", "")
@@ -293,6 +345,8 @@ object CommunityTrickplay {
                             readTimeout = 8_000
                             useCaches = false
                         }
+                        vttConn?.let(requestControl::register)
+                        if (!requestControl.isActive()) return@runCatching null
                         if (vttConn?.responseCode == 200) {
                             vttConn?.inputStream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
                         } else {
@@ -318,8 +372,11 @@ object CommunityTrickplay {
                 readTimeout = 12_000
                 useCaches = false
             }
+            requestControl.register(spriteConn)
+            if (!requestControl.isActive()) return@withContext null
             if (spriteConn.responseCode != 200) return@withContext null
             val bytes = spriteConn.inputStream.use { it.readBytes() }
+            if (!requestControl.isActive()) return@withContext null
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@withContext null
 
             Sheet(
@@ -334,6 +391,9 @@ object CommunityTrickplay {
         } catch (_: IOException) {
             null
         } finally {
+            metaConn?.let(requestControl::unregister)
+            spriteConn?.let(requestControl::unregister)
+            vttConn?.let(requestControl::unregister)
             metaConn?.disconnect()
             spriteConn?.disconnect()
             vttConn?.disconnect()
@@ -371,7 +431,7 @@ object CommunityTrickplay {
      * non-200 error or a local build failure that never POSTed. Never throws. Mirrors Apple
      * `CommunityTrickplay.buildAndUpload`.
      */
-    suspend fun buildAndUpload(
+    internal suspend fun buildAndUpload(
         context: Context,
         key: String,
         imdbId: String,
@@ -381,10 +441,12 @@ object CommunityTrickplay {
         srcHeight: Int,
         intervalS: Double,
         frames: List<CapturedFrame>,
+        canContribute: () -> Boolean = { isEnabled(context) },
+        requestControl: CommunityTrickplayRequestControl = CommunityTrickplayRequestControl(),
     ): UploadOutcome = withContext(Dispatchers.Default) {
         // [context] exists solely for this gate: the setting is now a real stored value, not a constant,
         // so the last line of defence before a POST has to read it.
-        if (!isEnabled(context)) return@withContext UploadOutcome.Failed
+        if (!canContribute() || !requestControl.isActive()) return@withContext UploadOutcome.Failed
         val retainedIndices = TrickplayTimeline.retainedIndices(
             captureTimes = frames.map { it.time },
             limit = maxOf(1, frames.size),
@@ -411,6 +473,7 @@ object CommunityTrickplay {
         var budget = minOf(sorted.size, maxTiles)
         var picked: PickedSheet? = null
         while (budget >= 2) {
+            if (!canContribute() || !requestControl.isActive()) return@withContext UploadOutcome.Failed
             val stride = if (sorted.size > budget) ceil(sorted.size.toDouble() / budget.toDouble()).toInt() else 1
             val targetCount = ceil(sorted.size.toDouble() / stride.toDouble()).toInt()
             val effectiveIndices = TrickplayTimeline.evenlySpacedIndices(sorted.size, targetCount)
@@ -476,7 +539,8 @@ object CommunityTrickplay {
             .put("interval_s", sheet.interval)
             .put("cols", sheet.cols)
             .put("src_height", srcHeight)
-        post(key, sheet.jpeg, vtt, meta)
+        if (!canContribute() || !requestControl.isActive()) return@withContext UploadOutcome.Failed
+        post(key, sheet.jpeg, vtt, meta, canContribute, requestControl)
     }
 
     /**
@@ -516,8 +580,16 @@ object CommunityTrickplay {
      * declined is [UploadOutcome.Rejected] (its `reason`); a transport error, a non-200, or a body we
      * cannot build is [UploadOutcome.Failed]. Signed for the gated host. Never throws. Mirrors Apple `post`.
      */
-    private suspend fun post(key: String, sprite: ByteArray, vtt: String, meta: JSONObject): UploadOutcome =
+    private suspend fun post(
+        key: String,
+        sprite: ByteArray,
+        vtt: String,
+        meta: JSONObject,
+        canContribute: () -> Boolean,
+        requestControl: CommunityTrickplayRequestControl,
+    ): UploadOutcome =
         withContext(Dispatchers.IO) {
+            if (!canContribute() || !requestControl.isActive()) return@withContext UploadOutcome.Failed
             val boundary = "vortx-tp-${UUID.randomUUID()}"
             val body = runCatching { multipartBody(boundary, sprite, vtt, meta.toString()) }.getOrNull()
                 ?: return@withContext UploadOutcome.Failed
@@ -532,8 +604,13 @@ object CommunityTrickplay {
                     doOutput = true
                     setRequestProperty("content-type", "multipart/form-data; boundary=$boundary")
                 }
+                requestControl.register(connection)
                 VortXEdgeAuth.sign(connection)
-                connection.outputStream.use { it.write(body) }
+                if (!canContribute() || !requestControl.isActive()) return@withContext UploadOutcome.Failed
+                connection.outputStream.use { output ->
+                    if (!canContribute() || !requestControl.isActive()) return@withContext UploadOutcome.Failed
+                    output.write(body)
+                }
 
                 val code = connection.responseCode
                 val stream = if (code in 200..399) connection.inputStream else connection.errorStream
@@ -551,6 +628,7 @@ object CommunityTrickplay {
                 Log.d(TAG, "POST /tp/$key httpStatus=err ok=false stored=false body=${e.toString().take(200)}")
                 UploadOutcome.Failed
             } finally {
+                connection?.let(requestControl::unregister)
                 connection?.disconnect()
             }
         }

@@ -10,10 +10,12 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The per-title community-trickplay lifecycle: key it, FETCH the shared sheet so the viewer sees previews
@@ -117,6 +119,38 @@ class TrickplaySession(context: Context) {
     /** The raw `tmdb:` id already sent for resolution, so per-tick calls mint exactly ONE network lookup. */
     private var resolveTriedFor: String? = null
 
+    /** Invalidates every contribution admitted before an opt-out, even if the viewer opts back in later. */
+    private val consentGate = TrickplayConsentGate()
+    private val activeRequests = ConcurrentHashMap.newKeySet<CommunityTrickplayRequestControl>()
+    private val consentObserver = CommunityTrickplay.observeEnabled(context) { enabled ->
+        if (!enabled) revokeContributionConsent()
+    }
+
+    private fun contributionIsCurrent(generation: Long): Boolean =
+        consentGate.permits(generation) && CommunityTrickplay.isEnabled(context)
+
+    /** Stop active fetch/build/upload work and discard frames that were captured under revoked consent. */
+    private fun revokeContributionConsent() {
+        consentGate.revoke()
+        activeRequests.forEach(CommunityTrickplayRequestControl::cancel)
+        scope.coroutineContext.cancelChildren()
+        sheet = null
+        localKey = null
+        scope.launch {
+            mutex.withLock {
+                contentKey = null
+                imdbId = null
+                season = null
+                episode = null
+                durationBucket = 0
+                srcHeight = 0
+                existingFrameCount = 0
+                frames.clear()
+                deferredUpload = null
+            }
+        }
+    }
+
     /**
      * Key this title and kick off the L1 community fetch. Idempotent: safe to call on every duration tick
      * (the player does), and a no-op once keyed on the same content key.
@@ -141,11 +175,14 @@ class TrickplaySession(context: Context) {
         if (!CommunityTrickplay.isEnabled(context)) return
         val ref = mediaRef ?: return
         if (durationSeconds <= 0.0) return
+        val generation = consentGate.admit()
 
         scope.launch {
+            if (!contributionIsCurrent(generation)) return@launch
             // Prefer the tt id the ref already carries; otherwise resolve the tmdb fallback identity.
             val tt = ref.imdb?.takeIf { it.startsWith("tt") } ?: resolveTt(ref) ?: return@launch
-            keyAndFetch(tt, ref.season, ref.episode, durationSeconds)
+            if (!contributionIsCurrent(generation)) return@launch
+            keyAndFetch(tt, ref.season, ref.episode, durationSeconds, generation)
         }
     }
 
@@ -163,13 +200,26 @@ class TrickplaySession(context: Context) {
             if (resolveTriedFor == rawId) return null
             resolveTriedFor = rawId
         }
-        val tt = CommunityTrickplay.resolveImdbId(context, rawId, seriesHint = ref.isSeries)
+        val requestControl = CommunityTrickplayRequestControl()
+        activeRequests += requestControl
+        val tt = try {
+            CommunityTrickplay.resolveImdbId(context, rawId, ref.isSeries, requestControl)
+        } finally {
+            activeRequests -= requestControl
+        }
         if (tt == null) Log.d(TAG, "tmdb->imdb resolve FAILED for $rawId (session contributes nothing)")
         return tt
     }
 
     /** Compute the content key and, if it changed, fetch the community sheet for it. */
-    private suspend fun keyAndFetch(tt: String, s: Int?, e: Int?, durationSeconds: Double) {
+    private suspend fun keyAndFetch(
+        tt: String,
+        s: Int?,
+        e: Int?,
+        durationSeconds: Double,
+        generation: Long,
+    ) {
+        if (!contributionIsCurrent(generation)) return
         val key = CommunityTrickplay.contentKey(tt, s, e, durationSeconds) ?: run {
             Log.d(TAG, "community NOT keyed (need tt id + duration>0): imdb=$tt dur=${durationSeconds.toInt()}")
             return
@@ -194,10 +244,16 @@ class TrickplaySession(context: Context) {
         localCache.warm(key)
         Log.d(TAG, "community ${if (rekeying) "re-keyed" else "keyed"}: $key (imdb=$tt)")
 
-        val fetched = CommunityTrickplay.fetch(key) ?: return
+        val requestControl = CommunityTrickplayRequestControl()
+        activeRequests += requestControl
+        val fetched = try {
+            CommunityTrickplay.fetch(key, requestControl)
+        } finally {
+            activeRequests -= requestControl
+        } ?: return
         // The title may have changed while the fetch was in flight; only publish if still current.
         mutex.withLock {
-            if (contentKey != key) return
+            if (!contributionIsCurrent(generation) || contentKey != key) return
             existingFrameCount = fetched.frameCount
         }
         sheet = fetched
@@ -224,7 +280,10 @@ class TrickplaySession(context: Context) {
      * not just waste a POST, it would poison other platforms' previews for that title.
      */
     fun recordFrame(jpeg: ByteArray, timeSeconds: Double, videoHeight: Int) {
+        if (!CommunityTrickplay.isEnabled(context)) return
+        val generation = consentGate.admit()
         admissionQueue.enqueue {
+            if (!contributionIsCurrent(generation)) return@enqueue
             if (!keepFrame(jpeg, timeSeconds)) return@enqueue
             // Bank the frame in the per-device local cache too (runs on this IO-backed queue), so this device
             // serves its OWN previews even before it has contributed enough to fetch a community sheet.
@@ -247,7 +306,7 @@ class TrickplaySession(context: Context) {
                 frames.clear()
                 frames += nextFrames
                 retainedRevision += 1L
-                uploadDecision(progressive = true)
+                uploadDecision(progressive = true, generation = generation)
             }
             push?.let(::launchUpload)
         }
@@ -320,7 +379,8 @@ class TrickplaySession(context: Context) {
      */
     fun finishAndFlush() {
         admissionQueue.closeAndEnqueue {
-            val push = mutex.withLock { uploadDecision(progressive = false) }
+            val generation = consentGate.admit()
+            val push = mutex.withLock { uploadDecision(progressive = false, generation = generation) }
             push?.let(::launchUpload)
         }
     }
@@ -331,7 +391,8 @@ class TrickplaySession(context: Context) {
      * how an empty pool gets diagnosed from a log instead of a guess. Mirrors Apple's
      * `maybeUploadProgressively` / `finishAndUploadIfNeeded`, which share these gates.
      */
-    private fun uploadDecision(progressive: Boolean): PendingUpload? {
+    private fun uploadDecision(progressive: Boolean, generation: Long): PendingUpload? {
+        if (!contributionIsCurrent(generation)) return null
         val key = contentKey
         val imdb = imdbId
         val now = SystemClock.elapsedRealtime()
@@ -385,6 +446,7 @@ class TrickplaySession(context: Context) {
             durationBucket = durationBucket,
             srcHeight = srcHeight,
             frames = frames.toList(),
+            consentGeneration = generation,
         )
         return when (admission) {
             is TrickplayUploadCoordinator.Admission.Start -> {
@@ -410,7 +472,10 @@ class TrickplaySession(context: Context) {
             "pushUpload FIRING key=${push.key} imdb=${push.imdb} revision=${push.revision} frames=${push.frames.size}",
         )
         var outcome: CommunityTrickplay.UploadOutcome = CommunityTrickplay.UploadOutcome.Failed
+        val requestControl = CommunityTrickplayRequestControl()
+        activeRequests += requestControl
         try {
+            if (!contributionIsCurrent(push.consentGeneration)) return
             outcome = CommunityTrickplay.buildAndUpload(
                 context = context,
                 key = push.key,
@@ -421,6 +486,8 @@ class TrickplaySession(context: Context) {
                 srcHeight = push.srcHeight,
                 intervalS = CAPTURE_INTERVAL_S,
                 frames = push.frames,
+                canContribute = { contributionIsCurrent(push.consentGeneration) },
+                requestControl = requestControl,
             )
             // Honest result labels: a 200 the Worker consciously declined is "rejected(reason)", NOT "failed".
             val label = when (outcome) {
@@ -434,6 +501,7 @@ class TrickplaySession(context: Context) {
         } catch (failure: Exception) {
             Log.d(TAG, "upload key=${push.key} revision=${push.revision} -> failed(${failure.javaClass.simpleName})")
         } finally {
+            activeRequests -= requestControl
             completeAndLaunchNextUpload(
                 complete = {
                     mutex.withLock {
@@ -450,12 +518,14 @@ class TrickplaySession(context: Context) {
                     }
                 },
                 launchNext = { next ->
-                    Log.d(
-                        TAG,
-                        "upload draining deferred final key=${next.key} revision=${next.revision} " +
-                            "frames=${next.frames.size}",
-                    )
-                    launchUpload(next)
+                    if (contributionIsCurrent(next.consentGeneration)) {
+                        Log.d(
+                            TAG,
+                            "upload draining deferred final key=${next.key} revision=${next.revision} " +
+                                "frames=${next.frames.size}",
+                        )
+                        launchUpload(next)
+                    }
                 },
             )
         }
@@ -472,6 +542,7 @@ class TrickplaySession(context: Context) {
         val durationBucket: Int,
         val srcHeight: Int,
         val frames: List<CommunityTrickplay.CapturedFrame>,
+        val consentGeneration: Long,
     )
 
     companion object {
