@@ -443,6 +443,7 @@ struct RootTabView: View {
         // automatic check trigger. The checker applies the hourly and single-flight gates itself.
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { updates.startMonitoring() }
+            else { updates.stopMonitoring() }
         }
         // A manual check may rediscover a release already shown earlier this launch. Its nonce is the explicit
         // request to present again, bypassing the once-per-launch claim while preserving the launch/player gate.

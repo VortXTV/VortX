@@ -13,6 +13,7 @@ final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
 
     typealias RequestLoader = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    typealias Sleeper = @Sendable (TimeInterval) async -> Void
 
     struct Release: Codable, Equatable, Identifiable {
         let version: String
@@ -48,9 +49,12 @@ final class UpdateChecker: ObservableObject {
     private var isChecking = false
     private var manualCheckPending = false
     private var restoredCache = false
+    private var monitoringTask: Task<Void, Never>?
+    private var didStartMonitoring = false
     private let defaults: UserDefaults
     private let now: @Sendable () -> Date
     private let requestLoader: RequestLoader
+    private let sleeper: Sleeper
     private let buildOverride: Int?
     private let versionOverride: String?
 
@@ -69,12 +73,16 @@ final class UpdateChecker: ObservableObject {
         defaults: UserDefaults = .standard,
         now: @escaping @Sendable () -> Date = { Date() },
         requestLoader: @escaping RequestLoader = { request in try await URLSession.shared.data(for: request) },
+        sleeper: @escaping Sleeper = { seconds in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        },
         currentBuild: Int? = nil,
         currentVersion: String? = nil
     ) {
         self.defaults = defaults
         self.now = now
         self.requestLoader = requestLoader
+        self.sleeper = sleeper
         self.buildOverride = currentBuild
         self.versionOverride = currentVersion
     }
@@ -98,11 +106,31 @@ final class UpdateChecker: ObservableObject {
         return Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
     }
 
-    /// Called by each platform shell. Restores the last successful result immediately, then starts a network
-    /// request only when the persisted hourly gate is stale. The request runs asynchronously and never blocks UI.
+    /// Starts one process-lifetime hourly scheduler while the app is active. The first process start always
+    /// fetches immediately, even when a previous launch wrote a recent success timestamp. Later lifecycle
+    /// callbacks merely retain the one scheduler and cannot duplicate its request.
     func startMonitoring() {
         restoreCachedReleaseIfNeeded()
-        checkIfStale()
+        if !didStartMonitoring {
+            didStartMonitoring = true
+            if !isChecking { check(forcePrompt: false) }
+        }
+        guard monitoringTask == nil else { return }
+        let sleeper = self.sleeper
+        monitoringTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await sleeper(Self.automaticInterval)
+                guard !Task.isCancelled, let self else { return }
+                self.checkIfStale()
+            }
+        }
+    }
+
+    /// Called when a platform scene becomes inactive/backgrounded. Cancelling the task releases the pending
+    /// timer promptly; foregrounding may start exactly one new scheduler without changing first-launch semantics.
+    func stopMonitoring() {
+        monitoringTask?.cancel()
+        monitoringTask = nil
     }
 
     func dismissPrompt() {

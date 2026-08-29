@@ -20,6 +20,27 @@ actor ScriptedLoader {
     }
 }
 
+actor ControlledSleeper {
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func sleep(_ seconds: TimeInterval) async {
+        await withCheckedContinuation { continuations.append($0) }
+    }
+
+    var waitingCount: Int { continuations.count }
+
+    func resumeNext() {
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume()
+    }
+}
+
+final class TestClock: @unchecked Sendable {
+    var seconds: TimeInterval
+    init(_ seconds: TimeInterval) { self.seconds = seconds }
+    func date() -> Date { Date(timeIntervalSince1970: seconds) }
+}
+
 func response(_ status: Int) -> URLResponse {
     HTTPURLResponse(url: URL(string: "https://api.github.com")!, statusCode: status,
                     httpVersion: nil, headerFields: nil)!
@@ -42,6 +63,13 @@ func waitForCalls(_ loader: ScriptedLoader, _ count: Int) async {
 func waitForAvailable(_ checker: UpdateChecker, build: Int) async {
     for _ in 0..<100 {
         if await MainActor.run(body: { checker.available?.build == build }) { return }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+}
+
+func waitForSleeper(_ sleeper: ControlledSleeper, _ count: Int) async {
+    for _ in 0..<100 {
+        if await sleeper.waitingCount >= count { return }
         try? await Task.sleep(for: .milliseconds(5))
     }
 }
@@ -122,6 +150,38 @@ struct UpdateCheckerTests {
         await waitForAvailable(historical, build: 233)
         let historicalBuild = await MainActor.run { historical.available?.build }
         check(historicalBuild == 233, "canonical title build wins over historical body markers")
+
+        // A persisted success from a former process cannot hide a release on this process's cold launch.
+        // The same controllable sleeper proves one hourly loop, repeated starts, and clean cancellation.
+        let schedulerDefaults = UserDefaults(suiteName: "\(suiteName).scheduler")!
+        defer { schedulerDefaults.removePersistentDomain(forName: "\(suiteName).scheduler") }
+        schedulerDefaults.set(400_000, forKey: "stremiox.update.lastChecked")
+        let schedulerLoader = ScriptedLoader([.success((release(build: 233), response(200))),
+                                              .success((release(build: 234), response(200)))])
+        let sleeper = ControlledSleeper()
+        let clock = TestClock(400_001)
+        let scheduled = await MainActor.run {
+            UpdateChecker(defaults: schedulerDefaults, now: { clock.date() },
+                          requestLoader: { request in try await schedulerLoader.load(request) },
+                          sleeper: { seconds in await sleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { scheduled.startMonitoring(); scheduled.startMonitoring() }
+        await waitForCalls(schedulerLoader, 1)
+        await waitForSleeper(sleeper, 1)
+        let initialCalls = await schedulerLoader.calls
+        check(initialCalls == 1, "cold launch ignores prior process timestamp and repeated starts stay single-flight")
+
+        clock.seconds += 3_600
+        await sleeper.resumeNext()
+        await waitForCalls(schedulerLoader, 2)
+        check(await schedulerLoader.calls == 2, "unattended scheduler performs the hourly request")
+
+        await waitForSleeper(sleeper, 1)
+        await MainActor.run { scheduled.stopMonitoring() }
+        await sleeper.resumeNext()
+        try? await Task.sleep(for: .milliseconds(20))
+        check(await schedulerLoader.calls == 2, "suspension cancels the pending hourly scheduler")
 
         exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE)
     }
