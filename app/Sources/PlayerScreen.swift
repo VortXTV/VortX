@@ -150,6 +150,8 @@ struct PlayerScreen: View {
     var initialSourceStream: CoreStream? = nil               // exact raw torrent selector for CW before groups are resident
     /// Exact engine episode identity confirmed by the launch presenter. nil keeps series engine writes closed.
     var initialEnginePlayerVideoId: String? = nil
+    /// Session-only engine route chosen on the detail/source surface. nil keeps the persisted automatic route.
+    var initialEnginePreference: PlayerEngineRouter.Override? = nil
     var isTrailer: Bool = false                             // a trailer preview: always plays in-app, never auto-routes external
     /// True when the LAUNCH source was an explicit user choice (a tapped source-list row / quality pick),
     /// false for an auto-pick (Watch Now / a Continue-Watching resume). An explicit pick is HONORED on a
@@ -268,14 +270,14 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, secondarySubtitles, subtitleLanguage(code: String, label: String), audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality, chapters, engine
+        case speed, subtitles, subtitleSettings, secondarySubtitles, subtitleLanguage(code: String, label: String), audio, audioSettings, video, sources, sourceAudio, episodes, info, playerSettings, sleep, quality, chapters, engine
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
             case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
             case .chapters: 12; case .engine: 13; case .secondarySubtitles: 14
-            case .subtitleLanguage: 15
+            case .subtitleLanguage: 15; case .sourceAudio: 16
             }
         }
         var title: String {
@@ -285,7 +287,7 @@ struct PlayerScreen: View {
             case .subtitleLanguage(_, let label): label
             case .audio: "Audio"
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
-            case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
+            case .sources: "Sources"; case .sourceAudio: "Audio"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
             case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
             case .chapters: "Chapters"; case .engine: "Player Engine"
             }
@@ -313,6 +315,7 @@ struct PlayerScreen: View {
         /// one line. Used by the Info panel's filename row so a long release name stays fully readable.
         var wraps: Bool = false
         var isEnabled: Bool = true
+        var accessibilityHint: String = ""
         var apply: () -> Void = {}
     }
 
@@ -979,6 +982,7 @@ struct PlayerScreen: View {
         // The live delivery flag gates rule (4b)'s Matroska half: with the HLS delivery lane rolled back a
         // plain MKV stays on libmpv instead of attempting an AVPlayer mount the engine could not remux.
         let chosen = PlayerEngineRouter.engine(for: url, isTorrent: loopback, isDolbyVision: isDV,
+                                               override: initialEnginePreference ?? PlayerEngineRouter.currentOverride,
                                                dvDisplayCapable: DVDisplaySupport.isCapable,
                                                plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled)
         // [dv] routing probe: the first line of the DV trail (route -> mount -> classify -> fallback -> demote).
@@ -6963,6 +6967,7 @@ struct PlayerScreen: View {
             .opacity(row.isEnabled ? 1 : 0.6)
             .accessibilityLabel(row.label)
             .accessibilityValue(row.detail)
+            .accessibilityHint(row.accessibilityHint)
         }
     }
 
@@ -7248,7 +7253,8 @@ struct PlayerScreen: View {
             if opts.isEmpty { return [Row(label: "No alternate qualities", isHeader: true)] }
             return opts.map { opt in
                 Row(label: opt.label, detail: StreamRanking.sizeText(opt.stream) ?? "",
-                    selected: playableURL(for: opt.stream) == curURL) {
+                    selected: playableURL(for: opt.stream) == curURL,
+                    accessibilityHint: "Switches at the current playback position") {
                     if let url = playableURL(for: opt.stream) {
                         switchStream(to: opt.stream, url: url, userInitiated: true, explicitPick: true,
                                      addon: addonName(for: opt.stream))
@@ -7257,6 +7263,8 @@ struct PlayerScreen: View {
             }
         case .sources:
             return sourceRows()
+        case .sourceAudio:
+            return audioLanguageFilterRows()
         case .info:
             var rows: [Row] = []
             // Title block: what is playing, named at the top of the sheet (movie name, or show · SxE).
@@ -7550,7 +7558,18 @@ struct PlayerScreen: View {
         let maxInPlayerSources = 60
         let groups = currentSourceGroups
         if groups.isEmpty { return [Row(label: "Loading sources…", isHeader: true)] }
-        var rs: [Row] = audioLanguageFilterRows()
+        var rs: [Row] = []
+        if !StreamRanking.resolutionOptions(groups).isEmpty {
+            rs.append(Row(label: "Quality", detail: "›",
+                          accessibilityHint: "Choose a quality and keep the current playback position") {
+                openPanel(.quality)
+            })
+        }
+        rs.append(Row(label: "Audio", detail: "›",
+                      accessibilityHint: "Filter sources by audio language") {
+            openPanel(.sourceAudio)
+        })
+        rs.append(Row(label: "Sources", isHeader: true))
         var count = 0
         // Install the session audio-language filter as a task-local for the ranking reads only: #204 does
         // the same in SourceListModel's detached rank. `StreamRanking.score` -> `languageScore` reads
@@ -7572,7 +7591,8 @@ struct PlayerScreen: View {
                     let info = StreamRanking.sourceDetail(stream)
                     let name = String(sourceLabel(stream).prefix(40))
                     rs.append(Row(label: "\(info.tags)   \(name)", detail: info.size ?? "",
-                                  selected: sURL == curURL) {
+                                  selected: sURL == curURL,
+                                  accessibilityHint: "Switches at the current playback position") {
                         switchStream(to: stream, url: sURL, userInitiated: true, explicitPick: true,
                                      addon: group.addon)
                     })

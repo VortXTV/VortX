@@ -3440,7 +3440,10 @@ struct CoreStreamList: View {
     /// byte-identical. A debrid URL is a remote direct link, so it is presented with `torrent: false` and
     /// skips `prepareTorrent` (no `/create`); the player keys torrent behaviour off the URL shape, so it
     /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
-    private func play(_ stream: CoreStream) {
+    private func play(
+        _ stream: CoreStream,
+        enginePreference: PlayerEngineRouter.Override? = nil
+    ) {
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
         // the trailer path (isTrailer:true, meta:nil) so a dead trailer hits TVPlayerView's isTrailer guard
         // ("Trailer unavailable") and STOPS, instead of failing over to the title's content streams and
@@ -3454,7 +3457,8 @@ struct CoreStreamList: View {
             await playResolving(
                 stream,
                 explicit: true,
-                startProposal: proposedStart
+                startProposal: proposedStart,
+                enginePreference: enginePreference
             )
         }   // a tapped source row / quality pick: honor it in the player
     }
@@ -3667,7 +3671,8 @@ struct CoreStreamList: View {
         _ stream: CoreStream,
         explicit: Bool,
         fromStart: Bool = false,
-        startProposal: AccountBoundResumeProposal<TraktSessionID>
+        startProposal: AccountBoundResumeProposal<TraktSessionID>,
+        enginePreference: PlayerEngineRouter.Override? = nil
     ) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
@@ -3706,7 +3711,7 @@ struct CoreStreamList: View {
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
                                                 headers: stream.requestHeaders,
-                                                initialEnginePreference: launchEnginePreference,
+                                                initialEnginePreference: enginePreference ?? launchEnginePreference,
                                                 debridRef: ref,
                                                 sourceStream: stream,
                                             debridCachedHashes: debridCache.cachedHashes,
@@ -3733,7 +3738,7 @@ struct CoreStreamList: View {
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             headers: stream.requestHeaders,
-                                            initialEnginePreference: launchEnginePreference,
+                                            initialEnginePreference: enginePreference ?? launchEnginePreference,
                                             sourceStream: stream,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
@@ -3768,7 +3773,12 @@ struct CoreStreamList: View {
         if playableURL(for: stream) != nil || (canResolveNatively(stream) && (stream.isTorrent || stream.isUsenet)) {
             Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream), lastPlayed: isLastPlayed(stream)) }
                 .buttonStyle(RowFocusStyle())
-                .contextMenu { pinMenu(addon, stream) }
+                .accessibilityHint("Press to play. Long-press for player options and source actions.")
+                .contextMenu {
+                    sourcePlayerMenu(stream)
+                    Divider()
+                    pinMenu(addon, stream)
+                }
         } else {
             // Non-playable (Ratings/RPDB, external/youtube): keep it FOCUSABLE via an inert Button so
             // the tvOS focus engine can land here and keep scrolling DOWN past it. A bare non-focusable
@@ -3776,6 +3786,41 @@ struct CoreStreamList: View {
             // label still dims and shows the lock icon, so it reads as non-playable.
             Button {} label: { streamLabel(addon, stream, enabled: false) }
                 .buttonStyle(RowFocusStyle())
+        }
+    }
+
+    /// One-launch choices for this exact source. Internal choices keep the existing resolver, headers,
+    /// debrid provenance, torrent preparation, resume position, and explicit-pick behavior. External
+    /// handoff is limited to detected players and self-contained remote URLs.
+    @ViewBuilder private func sourcePlayerMenu(_ stream: CoreStream) -> some View {
+        Button("VortX Player") {
+            play(stream, enginePreference: .mpv)
+        }
+        if !stream.isYouTubeTrailer,
+           let url = playableURL(for: stream),
+           PlayerEngineRouter.canHonorAVPlayerChoice(
+               for: url,
+               isTorrent: stream.isTorrent,
+               isDolbyVision: StreamRanking.isDolbyVision(StreamRanking.signature(stream)),
+               dvDisplayCapable: DVDisplaySupport.isCapable,
+               plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled
+           ) {
+            Button("AVPlayer") {
+                play(stream, enginePreference: .avfoundation)
+            }
+        }
+        if let url = playableURL(for: stream),
+           SourcePlayerChoicePolicy.canHandOffExternally(
+               url: url,
+               isTorrent: stream.isTorrent,
+               isUsenet: stream.isUsenet,
+               requestHeaders: stream.requestHeaders
+           ) {
+            ForEach(ExternalPlayers.detected()) { player in
+                Button("Play in \(player.name)") {
+                    ExternalPlayers.open(url, in: player)
+                }
+            }
         }
     }
 

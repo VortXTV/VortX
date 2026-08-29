@@ -238,6 +238,26 @@ enum PlayerEngineRouter {
         return .mpv
     }
 
+    /// Whether an explicit one-launch AVPlayer choice can be honored for this exact resolved URL. This is
+    /// deliberately a projection of `engine(... override: .avfoundation)`, so source menus cannot drift from
+    /// the real router's torrent, container, Dolby Vision, or plain-remux safety gates.
+    static func canHonorAVPlayerChoice(
+        for url: URL,
+        isTorrent: Bool,
+        isDolbyVision: Bool,
+        dvDisplayCapable: Bool,
+        plainRemuxDelivery: Bool
+    ) -> Bool {
+        engine(
+            for: url,
+            isTorrent: isTorrent,
+            isDolbyVision: isDolbyVision,
+            override: .avfoundation,
+            dvDisplayCapable: dvDisplayCapable,
+            plainRemuxDelivery: plainRemuxDelivery
+        ) == .avfoundation
+    }
+
     /// Platform gate for rule (4b): the non-DV AVPlayer default flip ships on iOS ONLY for this cut. PiP and
     /// native AirPlay, the whole point of the flip, exist on iPhone/iPad; tvOS has neither, so flipping the
     /// Apple TV's default MKV engine would change the primary platform's playback path in the same build the

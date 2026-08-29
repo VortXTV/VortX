@@ -327,6 +327,14 @@ struct FlowLayout: Layout {
     }
 }
 
+private struct EpisodeTopOffsetPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = .greatestFiniteMagnitude
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 /// Touch / Mac detail page. Loads meta through the shared engine, then presents the same cinematic
 /// composition the tvOS `DetailView` uses, a full-bleed backdrop from `meta.background` with a dark
 /// gradient scrim, the hero (logo or title, year · runtime · genres · rating, synopsis) over it, a
@@ -586,6 +594,7 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
+    @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
     @State private var initialResumeGate = OneShotResumeAdmissionGate<TraktSessionID>()
     @State private var downloadPicker: DownloadPickerRequest?   // pre-download quality picker payload (#30 follow-up)
     /// Owns the source-list assembly + ranking OFF the SwiftUI render path (snapshot -> merge -> rank
@@ -596,6 +605,7 @@ struct iOSDetailView: View {
     @StateObject private var sourceList = SourceListModel()
     @State private var season = 1
     @State private var didApplySeason = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
+    @State private var episodeTopOffset: CGFloat = .greatestFiniteMagnitude
     @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
     private static let sourceRefreshDebounceMs = 400     // trailing settle for the movie/live add-on load storm
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
@@ -731,6 +741,9 @@ struct iOSDetailView: View {
         var sourceStream: CoreStream? = nil
         /// Set only after the presenter synchronously dispatches an exact episode engine load.
         var enginePlayerVideoId: String? = nil
+        /// One-launch engine choice from the detail/source surface. nil keeps the persisted automatic route;
+        /// this value is never written back to Settings.
+        var enginePreference: PlayerEngineRouter.Override? = nil
         /// True when the user explicitly chose this exact source (a tapped source-list row / quality pick),
         /// false for an auto-pick (Watch Now / Continue-Watching resume). The player honors an explicit
         /// pick on a start-timeout (retry in place) instead of silently hopping to a lower-quality source.
@@ -821,6 +834,7 @@ struct iOSDetailView: View {
         // overflow, which is why this only bit iOS.
         GeometryReader { geo in
             ScrollViewReader { proxy in
+                ZStack(alignment: .bottomTrailing) {
                 // Terminal metadata failure short-circuits the whole page (both scroll models): there is no
                 // title, no art and no source path to render, so the skeleton would just spin forever.
                 if metaUnavailable {
@@ -875,8 +889,33 @@ struct iOSDetailView: View {
                         .padding(.bottom, Theme.Space.xl)
                         .frame(width: geo.size.width, alignment: .leading)
                     }
+                    .coordinateSpace(name: Self.detailScrollSpace)
                     #endif
                 }
+                #if !os(tvOS)
+                if hasLongEpisodeList && showEpisodeScrollToTop {
+                    Button {
+                        withAnimation(reduceMotion ? nil : Theme.Motion.state) {
+                            proxy.scrollTo(Self.episodesTopAnchor, anchor: .top)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                            .frame(width: 48, height: 48)
+                            .vortxGlassDisc()
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Scroll to top")
+                    .accessibilityHint("Moves to the first episode in the selected season")
+                    .padding(.trailing, Theme.Space.md)
+                    .padding(.bottom, Theme.Space.md)
+                    .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.9)))
+                }
+                #endif
+                }
+                .onPreferenceChange(EpisodeTopOffsetPreferenceKey.self) { episodeTopOffset = $0 }
             }
         }
         // Dynamic dominant-color backdrop: canvas stays the base, with the art's average color washed in
@@ -1048,6 +1087,7 @@ struct iOSDetailView: View {
                     recordDebridRef: launch.debridRef,
                     initialSourceStream: launch.sourceStream,
                     initialEnginePlayerVideoId: launch.enginePlayerVideoId,
+                    initialEnginePreference: launch.enginePreference,
                     startedFromExplicitPick: launch.wasExplicitPick,
                     // reportProgress feeds the engine Player (TimeChanged) so Continue Watching updates live and
                     // watched time is tracked. The ACCOUNT write (account.saveProgress) moved INTO PlayerScreen
@@ -1217,6 +1257,16 @@ struct iOSDetailView: View {
 
     /// Scroll-anchor id for the source section, so the hero's "Sources" action can jump to it.
     private static let sourcesAnchor = "iOSDetailSources"
+    private static let episodesTopAnchor = "iOSDetailEpisodesTop"
+    private static let detailScrollSpace = "iOSDetailScrollSpace"
+    private static let episodeScrollThreshold = 12
+
+    private var hasLongEpisodeList: Bool {
+        guard isEpisodic, let videos = meta?.videos else { return false }
+        return episodes(videos).count > Self.episodeScrollThreshold
+    }
+
+    private var showEpisodeScrollToTop: Bool { episodeTopOffset < -80 }
 
     /// Hero: full-bleed backdrop + scrim + title / meta / action row / synopsis. `scrollToSources`
     /// is wired into the movie action row's "Sources" button (the tvOS 3-action twin).
@@ -1268,6 +1318,7 @@ struct iOSDetailView: View {
                 .padding(.bottom, Theme.Space.xl)
                 .frame(width: geo.size.width, alignment: .leading)
             }
+            .coordinateSpace(name: Self.detailScrollSpace)
         }
         // Keep atmosphere behind the full detail page without decoding the hero art a second time or applying
         // a full-window Gaussian blur. The static material and already-computed dominant tint preserve the
@@ -2258,6 +2309,7 @@ struct iOSDetailView: View {
             // drops overflow onto the next line under the hero's hard width cap.
             FlowLayout(spacing: Theme.Space.sm) {
                 qualityMenu(groups)
+                launchPlayerMenu
 
                 #if !os(tvOS)
                 // Offline (#30): open the pre-download quality picker, the offline twin of Watch Now. The chip
@@ -2317,6 +2369,27 @@ struct iOSDetailView: View {
         }
     }
 
+    private var launchPlayerLabel: String {
+        switch launchEnginePreference {
+        case .mpv: return "VortX Player"
+        case .avfoundation: return "AVPlayer when compatible"
+        case .auto, .none: return "Player"
+        }
+    }
+
+    private var launchPlayerMenu: some View {
+        Menu {
+            Button("Auto") { launchEnginePreference = nil }
+            Button("VortX Player") { launchEnginePreference = .mpv }
+            Button("AVPlayer when compatible") { launchEnginePreference = .avfoundation }
+        } label: {
+            Label(launchPlayerLabel, systemImage: "play.rectangle")
+        }
+        .buttonStyle(ChipButtonStyle(selected: launchEnginePreference != nil))
+        .accessibilityLabel("Player for next launch")
+        .accessibilityHint("AVPlayer is used only for compatible sources. Other sources use the safe VortX route.")
+    }
+
     /// The full source list for a movie. The presentation now mirrors tvOS: a quality picker, an
     /// "All sources" toggle, per-add-on filter chips, and the streams grouped under collapsible
     /// per-add-on headers (so a title returning thousands of sources doesn't bury one add-on). The
@@ -2339,6 +2412,11 @@ struct iOSDetailView: View {
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
             play: { stream, url in Task { await playStream(stream, url: url) } },
+            playWithEngine: { stream, url, preference in
+                Task { await playStream(stream, url: url, enginePreference: preference) }
+            },
+            launchEnginePreference: launchEnginePreference,
+            onLaunchEnginePreferenceChange: { launchEnginePreference = $0 },
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
             sessionAudioLanguages: sourceList.sessionAudioLanguages,
@@ -2947,6 +3025,7 @@ struct iOSDetailView: View {
                                                     debridRef: DebridPlaybackRef(url: url, service: service,
                                                         infoHash: hash, torrentId: entry.debridTorrentId,
                                                         fileId: entry.debridFileId, fileIdx: entry.fileIdx),
+                                                    enginePreference: launchEnginePreference,
                                                     wasExplicitPick: true))
                 return
             }
@@ -2985,7 +3064,8 @@ struct iOSDetailView: View {
                                                 qualityText: StreamRanking.signature(win.stream),
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 isTorrent: false, debridRef: win.ref,
-                                                sourceStream: win.stream))
+                                                sourceStream: win.stream,
+                                                enginePreference: launchEnginePreference))
             return
         }
         // INSTANT FIRST-PLAY: the parallel-cached race above already tried every confirmed-cached candidate, so
@@ -3017,7 +3097,8 @@ struct iOSDetailView: View {
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: prime && stream.isTorrent, debridRef: ref,
-                                            sourceStream: stream))
+                                            sourceStream: stream,
+                                            enginePreference: launchEnginePreference))
     }
 
     /// #95: play a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable way the
@@ -3033,7 +3114,11 @@ struct iOSDetailView: View {
     /// Play an arbitrary chosen movie source (a tapped source-list row). `url` is the source's
     /// `playableURL`; a cached-debrid raw torrent overrides it with the direct link (fail-soft, no-key
     /// byte-identical; see `DebridCoordinator.resolvedPlaybackURL`).
-    private func playStream(_ stream: CoreStream, url: URL) async {
+    private func playStream(
+        _ stream: CoreStream,
+        url: URL,
+        enginePreference: PlayerEngineRouter.Override? = nil
+    ) async {
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
         // the trailer player (isTrailer:true, no meta) so a dead trailer shows "Trailer unavailable" and STOPS
         // instead of failing over to content and playing the actual movie. Content streams fall through below.
@@ -3074,6 +3159,7 @@ struct iOSDetailView: View {
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: prime && stream.isTorrent, debridRef: ref,
                                             sourceStream: stream,
+                                            enginePreference: enginePreference ?? launchEnginePreference,
                                             wasExplicitPick: true))
     }
 
@@ -3274,6 +3360,11 @@ struct iOSDetailView: View {
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             play: { stream, url in Task { await playLiveStream(stream, url: url) } },
+            playWithEngine: { stream, url, preference in
+                Task { await playLiveStream(stream, url: url, enginePreference: preference) }
+            },
+            launchEnginePreference: launchEnginePreference,
+            onLaunchEnginePreferenceChange: { launchEnginePreference = $0 },
             bestStream: sourceList.best,
             resolutionTiers: sourceList.tiers,
             sessionAudioLanguages: sourceList.sessionAudioLanguages,
@@ -3289,7 +3380,11 @@ struct iOSDetailView: View {
     /// channel's own live type (tv / channel / events), which the player reads via `LiveTypes` to
     /// engage live tuning and to NO-OP resume/progress. No resume offset is requested or recorded;
     /// a live stream has no meaningful position to restore.
-    private func playLiveStream(_ stream: CoreStream, url: URL) async {
+    private func playLiveStream(
+        _ stream: CoreStream,
+        url: URL,
+        enginePreference: PlayerEngineRouter.Override? = nil
+    ) async {
         guard !preparing, let m = meta else { return }
         preparing = true; defer { preparing = false }
         primePlayback(stream)
@@ -3299,7 +3394,8 @@ struct iOSDetailView: View {
                                             resume: 0, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
-                                            isTorrent: stream.isTorrent, sourceStream: stream))
+                                            isTorrent: stream.isTorrent, sourceStream: stream,
+                                            enginePreference: enginePreference ?? launchEnginePreference))
     }
 
     // MARK: Series season selector + episode cards
@@ -3362,6 +3458,19 @@ struct iOSDetailView: View {
                 batchStatusLine
                 if selectingEpisodes { episodeSelectionBar(videos) }
                 #endif
+
+                Color.clear
+                    .frame(height: 1)
+                    .id(Self.episodesTopAnchor)
+                    .background {
+                        GeometryReader { anchorGeo in
+                            Color.clear.preference(
+                                key: EpisodeTopOffsetPreferenceKey.self,
+                                value: anchorGeo.frame(in: .named(Self.detailScrollSpace)).minY
+                            )
+                        }
+                    }
+                    .accessibilityHidden(true)
 
                 // LAZY, not eager (FAIL-260804-09; tvOS twin in DetailView): this was a plain `VStack`, so
                 // opening a large series' detail page materialized EVERY row of the selected season at once -
@@ -3956,6 +4065,7 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
+    @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
     @State private var initialStartGate = OneShotResumeAdmissionGate<TraktSessionID>()
     /// Smart Source Selection (Lane A) auto-pick: when `SourcePreferences.autoPickBest` is on, this page
     /// resolves + plays the best source on appear instead of making the viewer pick from the list. Guarded so
@@ -4142,6 +4252,7 @@ struct iOSEpisodeStreams: View {
                     recordDebridRef: launch.debridRef,
                     initialSourceStream: launch.sourceStream,
                     initialEnginePlayerVideoId: launch.enginePlayerVideoId,
+                    initialEnginePreference: launch.enginePreference,
                     startedFromExplicitPick: launch.wasExplicitPick,
                     episodes: seasonEpisodes.map {
                         PlayerEpisodeRef(id: $0.id,
@@ -4279,6 +4390,11 @@ struct iOSEpisodeStreams: View {
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             isEpisode: true,
             play: { stream, url in Task { await play(stream, url: url) } },
+            playWithEngine: { stream, url, preference in
+                Task { await play(stream, url: url, enginePreference: preference) }
+            },
+            launchEnginePreference: launchEnginePreference,
+            onLaunchEnginePreferenceChange: { launchEnginePreference = $0 },
             playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
             playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
             bestStream: sourceList.best,
@@ -4447,7 +4563,12 @@ struct iOSEpisodeStreams: View {
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is an auto fallback (the ranked-best Watch path /
     /// the parallel-cached race's single-resolve fallback), which may hop normally.
-    private func play(_ stream: CoreStream, url: URL, explicit: Bool = true) async {
+    private func play(
+        _ stream: CoreStream,
+        url: URL,
+        explicit: Bool = true,
+        enginePreference: PlayerEngineRouter.Override? = nil
+    ) async {
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) inside an episode source list is NOT a
         // content stream. Route it to the trailer player (isTrailer:true, no meta) so a dead trailer shows
         // "Trailer unavailable" and STOPS instead of failing over to and playing the actual episode. This is
@@ -4501,6 +4622,7 @@ struct iOSEpisodeStreams: View {
                                             isTorrent: isTorrent, debridRef: ref,
                                             sourceStream: stream,
                                             enginePlayerVideoId: engineVideoID,
+                                            enginePreference: enginePreference ?? launchEnginePreference,
                                             wasExplicitPick: explicit))
     }
 
@@ -4554,7 +4676,8 @@ struct iOSEpisodeStreams: View {
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 isTorrent: false, debridRef: win.ref,
                                                 sourceStream: win.stream,
-                                                enginePlayerVideoId: engineVideoID))
+                                                enginePlayerVideoId: engineVideoID,
+                                                enginePreference: launchEnginePreference))
             return
         }
         preparing = false   // release before the fallback, which re-guards on `preparing` inside `play`
@@ -5323,6 +5446,11 @@ struct iOSSourceList: View {
     /// keep the default true; there the control bar is the only primary action.
     var showsPrimaryControls = true
     let play: (CoreStream, URL) -> Void
+    /// Explicit one-launch engine route from a source-row context menu. Optional for compatibility with
+    /// narrow callers; normal taps continue through `play` and inherit the visible session picker.
+    var playWithEngine: ((CoreStream, URL, PlayerEngineRouter.Override) -> Void)? = nil
+    var launchEnginePreference: PlayerEngineRouter.Override? = nil
+    var onLaunchEnginePreferenceChange: ((PlayerEngineRouter.Override?) -> Void)? = nil
     /// AUTO single-resolve for the primary "Watch in <quality>" button's FALLBACK (used only when
     /// `playBest` is nil): the ranked-best source played as an AUTO pick, so the player may hop normally on
     /// a start-timeout. Distinct from `play` (a per-row / quality tap), which is an EXPLICIT choice the
@@ -5380,6 +5508,9 @@ struct iOSSourceList: View {
     @State private var collapsed: Set<String> = []      // per-add-on sections the user folded away
     @State private var qualityTier: String? = nil       // second-level quality sheet (a resolution tier)
     @State private var sortMode: SourceSort = .best     // how the rows within each add-on are ordered
+    @State private var externalPlayerTargets: [ExternalPlayer.Target] = []
+    @State private var externalPlayerErrorMessage = ""
+    @State private var showExternalPlayerError = false
     @ObservedObject private var pinStore = SourcePinStore.shared   // re-render rows when a pin is added/removed (#15)
 
     /// How the streams inside each add-on section are ordered. Best is our ranking (resolution, source
@@ -5591,6 +5722,16 @@ struct iOSSourceList: View {
         // so it flips on a title change even while this view stays mounted across a navigation.
         .onChange(of: showAllSources) { _ in if !showAllSources { renderLimit = Self.sourceWindowInitial } }
         .onChange(of: pinContext) { _ in renderLimit = Self.sourceWindowInitial }
+        .onAppear {
+            if externalPlayerTargets.isEmpty {
+                externalPlayerTargets = ExternalPlayer.installed
+            }
+        }
+        .alert("External player unavailable", isPresented: $showExternalPlayerError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(externalPlayerErrorMessage)
+        }
     }
 
     // MARK: Controls (Watch-in-X · Quality picker · All sources)
@@ -5624,6 +5765,7 @@ struct iOSSourceList: View {
                     .opacity(loading ? 0.55 : 1)
 
                     qualityMenu
+                    launchPlayerMenu
                     audioLanguageMenu
                 }
             }
@@ -5676,6 +5818,31 @@ struct iOSSourceList: View {
                   systemImage: "captions.bubble")
         }
         .buttonStyle(ChipButtonStyle(selected: selected != nil))
+    }
+
+    /// Session-only route for the next launch from this source list. The parent owns the value, so
+    /// rebuilding the list preserves it while leaving the user's persistent Settings default untouched.
+    @ViewBuilder private var launchPlayerMenu: some View {
+        if let onLaunchEnginePreferenceChange {
+            Menu {
+                Button("Auto") { onLaunchEnginePreferenceChange(nil) }
+                Button("VortX Player") { onLaunchEnginePreferenceChange(.mpv) }
+                Button("AVPlayer when compatible") { onLaunchEnginePreferenceChange(.avfoundation) }
+            } label: {
+                Label(launchPlayerLabel, systemImage: "play.rectangle")
+            }
+            .buttonStyle(ChipButtonStyle(selected: launchEnginePreference != nil))
+            .accessibilityLabel("Player for next launch")
+            .accessibilityHint("AVPlayer is used only for compatible sources")
+        }
+    }
+
+    private var launchPlayerLabel: String {
+        switch launchEnginePreference {
+        case .mpv: return "VortX Player"
+        case .avfoundation: return "AVPlayer when compatible"
+        case .auto, .none: return "Player"
+        }
     }
 
     // MARK: Per-add-on filter chips
@@ -5789,7 +5956,10 @@ struct iOSSourceList: View {
                                    debridCached: isDebridCached(stream))
                 }
                 .buttonStyle(RowFocusStyle())
+                .accessibilityHint("Double-tap to play. Long-press for player options and source actions.")
                 .contextMenu {
+                    sourcePlayerMenu(stream, url)
+                    Divider()
                     pinMenu(addon, stream)
                     if let download {
                         Button { download(stream, url) } label: { Label("Download", systemImage: "arrow.down.circle") }
@@ -5823,6 +5993,51 @@ struct iOSSourceList: View {
                 // The disabled (no playable URL) source row sits on the shared card glass so it reads
                 // as the same surface family as the loading / empty state cards, just non-interactive.
                 .vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        }
+    }
+
+    /// One-launch choices for this exact source. Internal routes retain the existing resolver, headers,
+    /// debrid metadata, torrent preparation, resume position, and explicit-pick behavior through `play`.
+    /// External players are offered only for self-contained remote URLs because they cannot inherit headers
+    /// or reach the embedded torrent/usenet machinery.
+    @ViewBuilder private func sourcePlayerMenu(_ stream: CoreStream, _ url: URL) -> some View {
+        Button("VortX Player") {
+            if let playWithEngine {
+                playWithEngine(stream, url, .mpv)
+            } else {
+                play(stream, url)
+            }
+        }
+        if PlayerEngineRouter.canHonorAVPlayerChoice(
+            for: url,
+            isTorrent: stream.isTorrent,
+            isDolbyVision: StreamRanking.isDolbyVision(StreamRanking.signature(stream)),
+            dvDisplayCapable: DVDisplaySupport.isCapable,
+            plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled
+        ) {
+            Button("AVPlayer") {
+                if let playWithEngine {
+                    playWithEngine(stream, url, .avfoundation)
+                } else {
+                    play(stream, url)
+                }
+            }
+        }
+        if SourcePlayerChoicePolicy.canHandOffExternally(
+            url: url,
+            isTorrent: stream.isTorrent,
+            isUsenet: stream.isUsenet,
+            requestHeaders: stream.requestHeaders
+        ), ExternalPlayer.canRouteExternally(url, isTorrent: stream.isTorrent) {
+            ForEach(externalPlayerTargets) { target in
+                Button("Play in \(target.name)") {
+                    ExternalPlayer.open(target, stream: url) { launched in
+                        guard !launched else { return }
+                        externalPlayerErrorMessage = "Could not open \(target.name)."
+                        showExternalPlayerError = true
+                    }
+                }
+            }
         }
     }
 
@@ -5893,6 +6108,7 @@ extension iOSSourceList: Equatable {
             && lhs.bestStream == rhs.bestStream
             && lhs.resolutionTiers == rhs.resolutionTiers
             && lhs.sessionAudioLanguages == rhs.sessionAudioLanguages
+            && lhs.launchEnginePreference == rhs.launchEnginePreference
             && lhs.groups == rhs.groups
     }
 }
