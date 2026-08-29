@@ -4,6 +4,22 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 31 (Android versionCode 189)
+
+### Android: signed Full and Play beta
+
+**Android now has a production-signed release lane.** Beta 31 produces a sideloadable Full APK with the mpv engine, a Play APK with the Media3 engine, and a Play AAB. Every artifact is bound to the release tag and source commit, checked against the pinned production certificate, and published with checksums and signing provenance. The Play artifacts continue to exclude GPL player libraries.
+
+**The universal APK now includes 32-bit Fire TV support.** All required native layers are built and verified for `arm64-v8a`, `armeabi-v7a`, and `x86_64`, including both Rust engines, libmpv, the mpv seam, and the community-provider JNI library. The `armeabi-v7a` slice targets 32-bit Fire TV devices that meet the Android 8 / API 26 minimum.
+
+**Preview-install migration:** the Android APKs attached to Beta 10 and Beta 12 used an earlier preview certificate. Android will not install Beta 31 over those previews. Uninstall the preview build before installing Beta 31. Beta 31 establishes the production certificate used by future VortX Android updates.
+
+### Validation status
+
+Protected CI builds both Android flavors, verifies all three ABI directories and required JNI exports, scans the Play flavor for forbidden GPL native libraries, and exercises the production signing identity. This is the Android phone, Android TV, and Fire TV hardware-validation candidate. No physical Android or Fire TV device was connected to the release machine, so install, upgrade, remote-focus, HDR/Dolby Vision, torrent resume, and sustained playback checks remain device-test follow-up rather than completed claims.
+
+Apple TV, iPhone, iPad, and Mac remain on Beta 30 build 232; Beta 31 adds Android artifacts and does not replace the Apple packages.
+
 ## 0.3.14 Beta 30 (build 232)
 
 ### Apple: playback reliability and player controls
