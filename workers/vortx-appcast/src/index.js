@@ -405,8 +405,58 @@ export class FeedCoordinator {
         if (payload.restoreGeneration !== "none" && previous?.manifest?.generation !== payload.restoreGeneration) return failure(409, "rollback-target-mismatch", "trusted rollback generation is unavailable");
         if (previous) await storage.put(ACTIVE_KEY, previous); else await storage.delete(ACTIVE_KEY);
         await storage.put(`${ROLLED_BACK_PREFIX}${payload.expectedCurrentGeneration}`, { generation: payload.expectedCurrentGeneration, restoreGeneration: payload.restoreGeneration });
-        await storage.put(`${AUDIT_PREFIX}rollback:${payload.expectedCurrentGeneration}`, { action: "rollback", generation: payload.restoreGeneration });
+        await storage.put(`${AUDIT_PREFIX}rollback:${payload.expectedCurrentGeneration}`, { action: "rollback", expectedCurrentGeneration: payload.expectedCurrentGeneration, generation: payload.restoreGeneration });
         return jsonResponse({ rolledBack: true, generation: payload.restoreGeneration });
+      }
+      if (payload.action === "recover") {
+        if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "recovery requires a write-once operation ID");
+        if (payload.recoveryReason !== "post-publication-rollback") return failure(400, "recovery-contract", "recovery requires the exact post-publication rollback reason");
+        // Recovery is intentionally more restrictive than promotion.  It can
+        // only undo a recorded rollback from a durable active predecessor;
+        // a frozen KV fallback is never mutable recovery state.
+        if (!current) return failure(409, "recovery-active-not-durable", "recovery requires a durable active predecessor");
+        const staged = await storage.get(`${STAGED_RELEASE_PREFIX}${payload.releaseId}`);
+        if (!staged || staged.manifest.generation !== payload.generation || String(staged.manifest.releaseId) !== String(payload.releaseId)) return failure(404, "staged-generation-missing", "requested staged generation is not present");
+        if (payload.targetSourceSha256 !== staged.manifest.sourceSha256) return failure(409, "recovery-source-mismatch", "recovery source digest is not the exact staged source bytes");
+        const priorOperation = await storage.get(`${OPERATION_PREFIX}${payload.operationId}`);
+        const priorRecovery = await storage.get(`${AUDIT_PREFIX}recover:${staged.manifest.generation}`);
+        const exactTargetIsActive =
+          currentGeneration === staged.manifest.generation &&
+          String(current.manifest.releaseId) === String(staged.manifest.releaseId) &&
+          current.receiptSha256 === staged.receiptSha256;
+        if (priorRecovery) {
+          if (priorRecovery.operationId !== payload.operationId) return failure(409, "recovery-already-recorded", "a different recovery operation is permanently bound to this generation");
+          const sameOperation =
+            priorOperation?.action === "recover" &&
+            String(priorOperation.releaseId) === String(payload.releaseId) &&
+            priorOperation.generation === payload.generation &&
+            priorOperation.predecessorGeneration === payload.expectedActiveGeneration &&
+            priorOperation.receiptSha256 === staged.receiptSha256 &&
+            priorOperation.targetSourceSha256 === staged.manifest.sourceSha256 &&
+            priorRecovery.targetSourceSha256 === staged.manifest.sourceSha256;
+          if (!sameOperation || !exactTargetIsActive) return failure(409, "operation-state-conflict", "recovery operation cannot be replayed in the current state");
+          return jsonResponse({ recovered: true, idempotent: true, generation: staged.manifest.generation, previousGeneration: priorOperation.predecessorGeneration, receiptSha256: staged.receiptSha256 });
+        }
+        if (payload.expectedActiveGeneration !== currentGeneration) return failure(409, "recovery-generation-conflict", "active generation changed before recovery");
+        if (currentGeneration === staged.manifest.generation) return failure(409, "recovery-target-active", "a new recovery operation cannot claim an already active target");
+        const terminal = await storage.get(`${ROLLED_BACK_PREFIX}${staged.manifest.generation}`);
+        if (!terminal || terminal.generation !== staged.manifest.generation || terminal.restoreGeneration !== currentGeneration) return failure(409, "recovery-terminal-mismatch", "recovery requires the terminal rollback marker for this exact predecessor");
+        const rollback = await storage.get(`${ROLLBACK_PREFIX}${staged.manifest.generation}`);
+        if (!rollback || rollback.manifest?.generation !== currentGeneration || String(rollback.manifest?.releaseId) !== String(current.manifest.releaseId) || rollback.receiptSha256 !== current.receiptSha256) return failure(409, "recovery-rollback-mismatch", "recovery predecessor does not match the preserved rollback receipt");
+        const promoteAudit = await storage.get(`${AUDIT_PREFIX}promote:${staged.manifest.generation}`);
+        const rollbackAudit = await storage.get(`${AUDIT_PREFIX}rollback:${staged.manifest.generation}`);
+        const promoteOperation = promoteAudit?.operationId ? await storage.get(`${OPERATION_PREFIX}${promoteAudit.operationId}`) : null;
+        if (
+          !promoteAudit || promoteAudit.action !== "promote" || promoteAudit.generation !== staged.manifest.generation || promoteAudit.previousGeneration !== currentGeneration || promoteAudit.receiptSha256 !== staged.receiptSha256 ||
+          !promoteOperation || promoteOperation.action !== "promote" || String(promoteOperation.releaseId) !== String(staged.manifest.releaseId) || promoteOperation.generation !== staged.manifest.generation || promoteOperation.receiptSha256 !== staged.receiptSha256 ||
+          !rollbackAudit || rollbackAudit.action !== "rollback" || rollbackAudit.generation !== currentGeneration || (rollbackAudit.expectedCurrentGeneration !== undefined && rollbackAudit.expectedCurrentGeneration !== staged.manifest.generation)
+        ) return failure(409, "recovery-audit-mismatch", "recovery requires matching promotion and rollback audit records");
+        if (Number(staged.manifest.build) <= Number(current.manifest.build)) return failure(409, "recovery-build-order", "recovery target must be newer than the active predecessor");
+        if (staged.manifest.tag === current.manifest.tag) return failure(409, "recovery-tag-build-conflict", "recovery target tag must differ from the active predecessor");
+        await storage.put(ACTIVE_KEY, staged);
+        await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "recover", operationId: payload.operationId, generation: staged.manifest.generation, releaseId: staged.manifest.releaseId, predecessorGeneration: currentGeneration, receiptSha256: staged.receiptSha256, targetSourceSha256: staged.manifest.sourceSha256 });
+        await storage.put(`${AUDIT_PREFIX}recover:${staged.manifest.generation}`, { action: "recover", operationId: payload.operationId, generation: staged.manifest.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256, targetSourceSha256: staged.manifest.sourceSha256 });
+        return jsonResponse({ recovered: true, generation: staged.manifest.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
       }
       return failure(400, "coordinator-action", "unsupported coordinator action");
     });
@@ -422,7 +472,7 @@ async function handleReceipt(request, env) {
     const validated = await validateStage(payload);
     return stageReceipt({ ...payload, ...validated }, env);
   }
-  if (payload.action === "promote" || payload.action === "rollback") return coordinatorRequest(request, env, payload);
+  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover") return coordinatorRequest(request, env, payload);
   return failure(400, "receipt-action", "unsupported receipt action");
 }
 

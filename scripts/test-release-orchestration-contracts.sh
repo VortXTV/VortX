@@ -12,6 +12,7 @@ readonly RELEASE_WF="$REPO_ROOT/.github/workflows/android-release.yml"
 readonly VALIDATION_WF="$REPO_ROOT/.github/workflows/release-packaging-validation.yml"
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
 readonly APPLE_RELEASE_WF="$REPO_ROOT/.github/workflows/release-tvos.yml"
+readonly RECOVERY_WF="$REPO_ROOT/.github/workflows/recover-release-feed.yml"
 readonly ROOT_GRADLE_BUILD="$REPO_ROOT/android/build.gradle.kts"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly MPV_SEAM_BUILD="$REPO_ROOT/android/mpv-seam/build.gradle.kts"
@@ -28,7 +29,7 @@ ok() {
 
 require_grep() {
     local description="$1" pattern="$2" file="$3"
-    grep -Eq "$pattern" "$file" || fail "$description"
+    grep -Eq -- "$pattern" "$file" || fail "$description"
     ok "$description"
 }
 
@@ -470,6 +471,10 @@ require_grep "Apple coordinator requires the complete Android set before publish
     'Android checksum asset is missing' "$APPLE_RELEASE_WF"
 require_grep "Stable publish explicitly verifies latest release state" \
     'make_latest=true' "$APPLE_RELEASE_WF"
+require_absent "numeric release objects must not use the non-existent is_latest field" '\.is_latest' "$APPLE_RELEASE_WF"
+latest_identity_checks="$(grep -Fc 'repos/$GH_REPO/releases/latest' "$APPLE_RELEASE_WF")"
+[[ "$latest_identity_checks" -eq 3 ]] || fail "stable publication, readiness, and verifier must each query /releases/latest"
+ok "stable release identity uses the separate latest-release endpoint in every verifier"
 require_grep "staged publication does not byte-compare the dynamic appcast worker" \
     'combined Apple\+Android view' "$APPLE_RELEASE_WF"
 require_grep "live appcast validation binds to worker tag provenance" \
@@ -486,6 +491,19 @@ event_tag_prerelease() {
 [[ "$(event_tag_prerelease v0.3.15)" = false ]] || fail "stable event tag did not derive prerelease=false"
 [[ "$(event_tag_prerelease v0.3.14-beta.31)" = true ]] || fail "beta event tag did not derive prerelease=true"
 ok "published-release readiness derives stable and beta prerelease bits from the event tag"
+[[ -f "$RECOVERY_WF" ]] || fail "published feed recovery workflow is missing"
+require_grep "published feed recovery uses protected release approval" 'environment: release-approval' "$RECOVERY_WF"
+require_grep "published feed recovery requires immutable source commit" 'source commit must be immutable' "$RECOVERY_WF"
+require_grep "published feed recovery verifies release latest identity" 'repos/\$GH_REPO/releases/latest' "$RECOVERY_WF"
+require_grep "published feed recovery signs the recover action" 'action:"recover"' "$RECOVERY_WF"
+require_grep "published feed recovery binds the signed target source digest" 'targetSourceSha256:\$source' "$RECOVERY_WF"
+require_grep "published feed recovery CASes main source bytes" '--arg sha "\$CURRENT_SHA"' "$RECOVERY_WF"
+require_grep "published feed recovery compensates an edge mutation on later failure" 'rollback_edge' "$RECOVERY_WF"
+require_grep "published feed recovery compensates a source mutation on later failure" 'rollback_source' "$RECOVERY_WF"
+require_grep "published feed recovery traps failure after recovery" 'trap on_failure EXIT' "$RECOVERY_WF"
+require_grep "published feed recovery handles ambiguous mutation acknowledgement by readback" 'recovery response was ambiguous' "$RECOVERY_WF"
+require_absent "published feed recovery must never redraft a public release" 'draft=true|draft: true' "$RECOVERY_WF"
+ok "published feed recovery is protected, authenticated, source-CAS-bound, and never redrafts"
 grep -Eq '^    permissions:$' <<<"$verify_published_block" \
     && grep -Eq '^      contents: read$' <<<"$verify_published_block" \
     || fail "published-release verifier must hold contents: read only"
@@ -497,7 +515,7 @@ ok "published-release verifier has least privilege and runs no repository code"
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
-    for wf in "$RELEASE_WF" "$VALIDATION_WF" "$ANDROID_CI_WF"; do
+    for wf in "$RELEASE_WF" "$VALIDATION_WF" "$ANDROID_CI_WF" "$APPLE_RELEASE_WF" "$RECOVERY_WF"; do
         python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$wf" \
             || fail "$(basename "$wf") is not valid YAML"
         ok "$(basename "$wf") parses as valid YAML"

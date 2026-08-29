@@ -1390,7 +1390,9 @@ jobs:
               gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
             fi
             RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else .is_latest == true end)' <<<"$RELEASE_JSON" >/dev/null; then
+            LATEST_JSON='{}'
+            if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest" 2>/dev/null || true)"; fi
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null; then
               PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
               PUBLISHED=1
               break
@@ -1453,7 +1455,9 @@ jobs:
           READY=0
           while [ "$(date +%s)" -lt "$READ_DEADLINE" ]; do
             RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
-            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else .is_latest == true end)' <<<"$RELEASE_JSON" >/dev/null; then
+            LATEST_JSON='{}'
+            if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest" 2>/dev/null || true)"; fi
+            if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null; then
               READY=1
               break
             fi
@@ -1471,7 +1475,9 @@ jobs:
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
           RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
           IS_PRERELEASE=false; [[ "$EVENT_TAG" == *-* ]] && IS_PRERELEASE=true
-          jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else .is_latest == true end)' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag/latest identity changed or release was recreated"; exit 1; }
+          LATEST_JSON='{}'
+          if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest")"; fi
+          jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag/latest identity changed or release was recreated"; exit 1; }
           REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$EVENT_TAG")"
           TAG_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"; TAG_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"; HOPS=0
           while [ "$TAG_TYPE" = tag ]; do HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || exit 1; TAG_OBJECT="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"; TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"; TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"; done

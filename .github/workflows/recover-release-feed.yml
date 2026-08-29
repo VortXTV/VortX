@@ -1,0 +1,122 @@
+name: Recover published release feed
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Immutable public GitHub release ID
+        required: true
+        type: string
+      release_tag:
+        description: Immutable public release tag
+        required: true
+        type: string
+      generation:
+        description: Previously staged target feed generation
+        required: true
+        type: string
+      expected_active_generation:
+        description: Exact currently active rollback predecessor generation
+        required: true
+        type: string
+      source_commit:
+        description: Immutable commit containing the exact target altstore/source.json bytes
+        required: true
+        type: string
+
+concurrency:
+  group: vortx-published-feed-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    environment: release-approval
+    permissions:
+      contents: write
+    timeout-minutes: 12
+    steps:
+      - name: Recover only the recorded post-publication rollback
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          TAG: ${{ inputs.release_tag }}
+          GENERATION: ${{ inputs.generation }}
+          EXPECTED_ACTIVE: ${{ inputs.expected_active_generation }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
+        run: |
+          set -euo pipefail
+          RECOVERED=0
+          SOURCE_COMMITTED=0
+          rollback_edge() {
+            [ "$RECOVERED" = 1 ] || return 0
+            local body signature
+            body="$(jq -cn --arg generation "$GENERATION" --arg restore "$EXPECTED_ACTIVE" '{action:"rollback",expectedCurrentGeneration:$generation,restoreGeneration:$restore}')"
+            signature="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
+            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$signature" --data-binary "$body" https://vortx.tv/__release/receipt >/dev/null || true
+          }
+          rollback_source() {
+            [ "$SOURCE_COMMITTED" = 1 ] || return 0
+            local current sha source_b64
+            current="$(gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=main" 2>/dev/null || true)"
+            sha="$(jq -er '.sha' <<<"$current" 2>/dev/null || true)"
+            [ -n "$sha" ] || return 0
+            jq -er '.content' <<<"$current" | tr -d '\n' | base64 --decode > "$RUNNER_TEMP/rollback-current.json" || return 0
+            cmp -s "$RUNNER_TEMP/rollback-current.json" "$RUNNER_TEMP/target-source.json" || return 0
+            source_b64="$(base64 < "$RUNNER_TEMP/current-main-source.json" | tr -d '\n')"
+            jq -cn --arg message "chore(release): restore verified install feed" --arg content "$source_b64" --arg sha "$sha" '{message:$message,content:$content,sha:$sha,branch:"main"}' | gh api --method PUT --input - -- "repos/$GH_REPO/contents/altstore/source.json" >/dev/null || true
+          }
+          on_failure() { local status=$?; if [ "$status" -ne 0 ]; then rollback_source; rollback_edge; fi; exit "$status"; }
+          trap on_failure EXIT
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || { echo '::error::release ID must be numeric'; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo '::error::release tag is invalid'; exit 1; }
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || { echo '::error::source commit must be immutable'; exit 1; }
+          RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
+          LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest")"
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .prerelease == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag' <<<"$LATEST_JSON" >/dev/null
+          TAG_REF="$(gh api -- "repos/$GH_REPO/git/ref/tags/$TAG")"
+          TAG_SHA="$(jq -er '.object.sha' <<<"$TAG_REF")"; TAG_TYPE="$(jq -er '.object.type' <<<"$TAG_REF")"; HOPS=0
+          while [ "$TAG_TYPE" = tag ]; do HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || exit 1; TAG_OBJECT="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"; TAG_SHA="$(jq -er '.object.sha' <<<"$TAG_OBJECT")"; TAG_TYPE="$(jq -er '.object.type' <<<"$TAG_OBJECT")"; done
+          [ "$TAG_TYPE" = commit ] || { echo '::error::release tag does not resolve to a commit'; exit 1; }
+          gh api -- "repos/$GH_REPO/commits/$SOURCE_COMMIT" >/dev/null
+          gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=$SOURCE_COMMIT" | jq -er '.content' | tr -d '\n' | base64 --decode > "$RUNNER_TEMP/target-source.json"
+          jq -e --arg tag "$TAG" --arg repo "$GH_REPO" '.apps | type == "array" and length > 0 and all(.[]; .versions[0].downloadURL | startswith("https://github.com/" + $repo + "/releases/download/" + $tag + "/"))' "$RUNNER_TEMP/target-source.json" >/dev/null
+          CURRENT_CONTENT="$(gh api -- "repos/$GH_REPO/contents/altstore/source.json?ref=main")"
+          CURRENT_SHA="$(jq -er '.sha' <<<"$CURRENT_CONTENT")"
+          jq -er '.content' <<<"$CURRENT_CONTENT" | tr -d '\n' | base64 --decode > "$RUNNER_TEMP/current-main-source.json"
+          curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/predecessor.headers" https://vortx.tv/altstore.json -o "$RUNNER_TEMP/predecessor-source.json"
+          grep -Fqi "x-vortx-feed-generation: $EXPECTED_ACTIVE" "$RUNNER_TEMP/predecessor.headers"
+          cmp -s "$RUNNER_TEMP/current-main-source.json" "$RUNNER_TEMP/predecessor-source.json" || { echo '::error::main source no longer matches the recorded live predecessor'; exit 1; }
+          TARGET_SOURCE_SHA="$(shasum -a 256 "$RUNNER_TEMP/target-source.json" | awk '{print $1}')"
+          BODY="$(jq -cn --arg oid "recover:$RELEASE_ID:$GENERATION" --arg rid "$RELEASE_ID" --arg generation "$GENERATION" --arg expected "$EXPECTED_ACTIVE" --arg source "$TARGET_SOURCE_SHA" '{action:"recover",operationId:$oid,recoveryReason:"post-publication-rollback",releaseId:$rid,generation:$generation,targetSourceSha256:$source,expectedActiveGeneration:$expected}')"
+          SIGNATURE="$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
+          RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary "$BODY" https://vortx.tv/__release/receipt || true)"
+          if ! jq -e --arg generation "$GENERATION" '.recovered == true and .generation == $generation' <<<"$RESPONSE" >/dev/null; then
+            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/recover-readback.headers" https://vortx.tv/altstore.json -o "$RUNNER_TEMP/recover-readback.json" || true
+            grep -Fqi "x-vortx-feed-generation: $GENERATION" "$RUNNER_TEMP/recover-readback.headers" || { echo '::error::recovery response was ambiguous and active generation did not converge'; exit 1; }
+            RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary "$BODY" https://vortx.tv/__release/receipt)"
+          fi
+          jq -e --arg generation "$GENERATION" --arg expected "$EXPECTED_ACTIVE" '.recovered == true and .generation == $generation and .previousGeneration == $expected' <<<"$RESPONSE" >/dev/null
+          RECOVERED=1
+          for ROUTE in https://vortx.tv/altstore.json https://vortx.tv/vortx-altstore.json https://vortx.tv/appcast.json; do
+            NAME="$(basename "$ROUTE")"; curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/$NAME.headers" "$ROUTE" -o "$RUNNER_TEMP/$NAME"
+            grep -Fqi "x-vortx-feed-generation: $GENERATION" "$RUNNER_TEMP/$NAME.headers"
+          done
+          cmp -s "$RUNNER_TEMP/target-source.json" "$RUNNER_TEMP/altstore.json"
+          cmp -s "$RUNNER_TEMP/target-source.json" "$RUNNER_TEMP/vortx-altstore.json"
+          jq -e --arg tag "$TAG" '._generatedFromTag == $tag' "$RUNNER_TEMP/appcast.json" >/dev/null
+          TARGET_B64="$(base64 < "$RUNNER_TEMP/target-source.json" | tr -d '\n')"
+          jq -cn --arg message "chore(release): recover published install feed" --arg content "$TARGET_B64" --arg sha "$CURRENT_SHA" '{message:$message,content:$content,sha:$sha,branch:"main"}' | gh api --method PUT --input - -- "repos/$GH_REPO/contents/altstore/source.json" >/dev/null
+          SOURCE_COMMITTED=1
+          RAW="https://raw.githubusercontent.com/$GH_REPO/main/altstore/source.json"
+          DEADLINE=$(($(date +%s) + 90)); VERIFIED=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            if curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "$RAW" -o "$RUNNER_TEMP/raw-source.json" && cmp -s "$RUNNER_TEMP/target-source.json" "$RUNNER_TEMP/raw-source.json"; then VERIFIED=1; break; fi
+            sleep 5
+          done
+          [ "$VERIFIED" = 1 ] || { echo '::error::main source CAS did not converge'; exit 1; }
+          trap - EXIT
+          echo "recovered public release $RELEASE_ID without mutating release metadata"

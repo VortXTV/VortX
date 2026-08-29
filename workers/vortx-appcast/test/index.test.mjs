@@ -375,6 +375,79 @@ test("a replayed promote is idempotent while the exact target is active and 409 
   assert.equal(conflictBody.error, "generation-terminal");
 });
 
+test("post-publication recovery only restores the exact terminal rollback and remains rollbackable", async () => {
+  const env = environment(new MemoryKV());
+  const predecessor = makeReceipt({ releaseId: "230", build: 232, tag: "v0.3.14-beta.30" });
+  const target = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  for (const receipt of [predecessor, target]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-predecessor", releaseId: predecessor.manifest.releaseId, generation: predecessor.manifest.generation, expectedActiveGeneration: null,
+  }), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-stable", releaseId: target.manifest.releaseId, generation: target.manifest.generation, expectedActiveGeneration: predecessor.manifest.generation,
+  }), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback", expectedCurrentGeneration: target.manifest.generation, restoreGeneration: predecessor.manifest.generation,
+  }), env)).status, 200);
+  const recover = {
+    action: "recover", operationId: "recover-public-stable", recoveryReason: "post-publication-rollback", releaseId: target.manifest.releaseId,
+    generation: target.manifest.generation, targetSourceSha256: target.manifest.sourceSha256, expectedActiveGeneration: predecessor.manifest.generation,
+  };
+  const recovered = await worker.fetch(signedRequest("/__release/receipt", recover), env);
+  assert.equal(recovered.status, 200);
+  assert.equal((await recovered.json()).recovered, true);
+  assert.equal((await env.__state.storage.get("active")).manifest.generation, target.manifest.generation);
+  const replay = await worker.fetch(signedRequest("/__release/receipt", recover), env);
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).idempotent, true);
+  const recoveryAudit = structuredClone(await env.__state.storage.get(`audit:recover:${target.manifest.generation}`));
+  const secondOperation = await worker.fetch(signedRequest("/__release/receipt", { ...recover, operationId: "recover-again" }), env);
+  assert.equal(secondOperation.status, 409);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback", expectedCurrentGeneration: target.manifest.generation, restoreGeneration: predecessor.manifest.generation,
+  }), env)).status, 200);
+  const afterRollback = await worker.fetch(signedRequest("/__release/receipt", recover), env);
+  assert.equal(afterRollback.status, 409);
+  const differentAfterRollback = await worker.fetch(signedRequest("/__release/receipt", { ...recover, operationId: "recover-after-rollback" }), env);
+  assert.equal(differentAfterRollback.status, 409);
+  assert.deepEqual(await env.__state.storage.get(`audit:recover:${target.manifest.generation}`), recoveryAudit);
+});
+
+test("recovery rejects missing or mismatched terminal, snapshot, and audit evidence", async () => {
+  const setup = async () => {
+    const env = environment(new MemoryKV());
+    const predecessor = makeReceipt({ releaseId: "230", build: 232, tag: "v0.3.14-beta.30" });
+    const target = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+    for (const receipt of [predecessor, target]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "promote-predecessor", releaseId: predecessor.manifest.releaseId, generation: predecessor.manifest.generation, expectedActiveGeneration: null }), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "promote-stable", releaseId: target.manifest.releaseId, generation: target.manifest.generation, expectedActiveGeneration: predecessor.manifest.generation }), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "rollback", expectedCurrentGeneration: target.manifest.generation, restoreGeneration: predecessor.manifest.generation }), env)).status, 200);
+    return { env, predecessor, target };
+  };
+  for (const mutation of [
+    async ({ env, target }) => env.__state.storage.delete(`rolled-back:${target.manifest.generation}`),
+    async ({ env, target }) => env.__state.storage.put(`rolled-back:${target.manifest.generation}`, { generation: target.manifest.generation, restoreGeneration: "wrong" }),
+    async ({ env, target }) => env.__state.storage.delete(`rollback:${target.manifest.generation}`),
+    async ({ env, target }) => env.__state.storage.delete(`audit:promote:${target.manifest.generation}`),
+    async ({ env, target }) => env.__state.storage.delete(`audit:rollback:${target.manifest.generation}`),
+  ]) {
+    const fixture = await setup();
+    await mutation(fixture);
+    const response = await worker.fetch(signedRequest("/__release/receipt", {
+      action: "recover", operationId: `recover-${Math.random()}`, recoveryReason: "post-publication-rollback", releaseId: fixture.target.manifest.releaseId,
+      generation: fixture.target.manifest.generation, targetSourceSha256: fixture.target.manifest.sourceSha256, expectedActiveGeneration: fixture.predecessor.manifest.generation,
+    }), fixture.env);
+    assert.equal(response.status, 409, await response.text());
+    assert.equal((await fixture.env.__state.storage.get("active")).manifest.generation, fixture.predecessor.manifest.generation);
+  }
+  const fixture = await setup();
+  const sourceMismatch = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "recover", operationId: "recover-source-mismatch", recoveryReason: "post-publication-rollback", releaseId: fixture.target.manifest.releaseId,
+    generation: fixture.target.manifest.generation, targetSourceSha256: "0".repeat(64), expectedActiveGeneration: fixture.predecessor.manifest.generation,
+  }), fixture.env);
+  assert.equal(sourceMismatch.status, 409);
+});
+
 test("unsigned or malformed staged generations never reach the public routes", async () => {
   const kv = new MemoryKV();
   const env = environment(kv);
