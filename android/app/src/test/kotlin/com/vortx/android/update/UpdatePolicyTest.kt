@@ -14,7 +14,7 @@ import org.junit.Test
  */
 class UpdatePolicyTest {
 
-    private val pinnedSigner = "90DD0859BE63569B31F40BF93D3E3629094535013F3489C22BEE3B4655E0006A"
+    private val pinnedSigner = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA"
 
     /** Single seam for feed evaluation in tests: running build 188, flavor "full", app com.vortx.android. */
     private fun evaluate(
@@ -199,8 +199,8 @@ class UpdatePolicyTest {
         assertEquals(pinnedSigner, UpdatePolicy.normalizeFingerprint(pinnedSigner))
         assertEquals(
             pinnedSigner,
-            UpdatePolicy.normalizeFingerprint("90:DD:08:59:BE:63:56:9B:31:F4:0B:F9:3D:3E:36:29:" +
-                "09:45:35:01:3F:34:89:C2:2B:EE:3B:46:55:E0:00:6A"),
+            UpdatePolicy.normalizeFingerprint("FC:22:B8:7E:CD:9E:4F:A2:69:30:A1:C3:E2:27:D8:F7:" +
+                "D9:18:C6:46:B2:16:03:2B:5D:A8:20:EF:1A:C2:18:CA"),
         )
         assertEquals(pinnedSigner, UpdatePolicy.normalizeFingerprint(pinnedSigner.lowercase()))
         assertNull(UpdatePolicy.normalizeFingerprint("90DD")) // too short
@@ -573,8 +573,8 @@ class UpdatePolicyTest {
 
     @Test
     fun colonSeparatedPublishedSignerStillPinsCorrectly() {
-        val colonForm = "90:DD:08:59:BE:63:56:9B:31:F4:0B:F9:3D:3E:36:29:" +
-            "09:45:35:01:3F:34:89:C2:2B:EE:3B:46:55:E0:00:6A"
+        val colonForm = "FC:22:B8:7E:CD:9E:4F:A2:69:30:A1:C3:E2:27:D8:F7:" +
+            "D9:18:C6:46:B2:16:03:2B:5D:A8:20:EF:1A:C2:18:CA"
         val offer = evaluate(splitAppcast(flavorEntry("full", signer = colonForm), null))
             as UpdatePolicy.UpdateDecision.Offer
         assertFalse(offer.release.signerSha256.contains(':'))

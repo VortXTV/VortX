@@ -4,7 +4,7 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly VERIFY_SCRIPT="$SCRIPT_DIR/verify-android-release-signing.sh"
-readonly EXPECTED_COMPACT="90DD0859BE63569B31F40BF93D3E3629094535013F3489C22BEE3B4655E0006A"
+readonly EXPECTED_COMPACT="FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA"
 readonly WRONG_COMPACT="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 fail() {
@@ -31,7 +31,7 @@ touch "$workdir/release.apk" "$workdir/release.aab"
 cat > "$workdir/bin/apksigner" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
-fingerprint="${MOCK_FINGERPRINT:-90DD0859BE63569B31F40BF93D3E3629094535013F3489C22BEE3B4655E0006A}"
+fingerprint="${MOCK_FINGERPRINT:-FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA}"
 subject="${MOCK_SUBJECT:-CN=VortX Release, O=VortXTV, C=US}"
 printf 'Verifies\n'
 printf 'Verified using v2 scheme (APK Signature Scheme v2): true\n'
@@ -62,7 +62,7 @@ MOCK
 cat > "$workdir/bin/keytool" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
-fingerprint="${MOCK_FINGERPRINT:-90DD0859BE63569B31F40BF93D3E3629094535013F3489C22BEE3B4655E0006A}"
+fingerprint="${MOCK_FINGERPRINT:-FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA}"
 subject="${MOCK_SUBJECT:-CN=VortX Release, O=VortXTV, C=US}"
 printf 'Owner: %s\n' "$subject"
 printf 'SHA256: %s\n' "$fingerprint"

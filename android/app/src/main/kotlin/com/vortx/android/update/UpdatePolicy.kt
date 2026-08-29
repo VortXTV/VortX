@@ -30,7 +30,7 @@ internal object UpdatePolicy {
      * EXPECTED_SIGNER_SHA256_COMPACT in scripts/verify-android-release-signing.sh: CI refuses to ship an
      * APK that does not carry this identity, and the client refuses to install one that does not either.
      */
-    const val PINNED_SIGNER_SHA256 = "90DD0859BE63569B31F40BF93D3E3629094535013F3489C22BEE3B4655E0006A"
+    const val PINNED_SIGNER_SHA256 = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA"
 
     /** Manifest body cap: a bigger response is bogus, not a feed. */
     const val MAX_MANIFEST_BYTES = 512 * 1024

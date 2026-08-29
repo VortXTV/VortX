@@ -23,7 +23,7 @@ class ApkVerificationTest {
     @get:Rule
     val tmp = TemporaryFolder()
 
-    private val pinnedSigner = "90DD0859BE63569B31F40BF93D3E3629094535013F3489C22BEE3B4655E0006A"
+    private val pinnedSigner = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA"
 
     private fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
@@ -196,8 +196,8 @@ class ApkVerificationTest {
     @Test
     fun colonSeparatedSignerFromTheArchiveStillMatchesThePin() {
         val content = "ok".toByteArray()
-        val colonForm = "90:dd:08:59:be:63:56:9b:31:f4:0b:f9:3d:3e:36:29:" +
-            "09:45:35:01:3f:34:89:c2:2b:ee:3b:46:55:e0:00:6a"
+        val colonForm = "fc:22:b8:7e:cd:9e:4f:a2:69:30:a1:c3:e2:27:d8:f7:" +
+            "d9:18:c6:46:b2:16:03:2b:5d:a8:20:ef:1a:c2:18:ca"
         val inspector = ApkVerification.ApkInspector { identity(signer = colonForm) }
         val verdict = ApkVerification.verify(stagedApk(content), spec(content), "com.vortx.android", inspector)
         assertEquals(ApkVerification.Verdict.Accepted::class, verdict::class)
