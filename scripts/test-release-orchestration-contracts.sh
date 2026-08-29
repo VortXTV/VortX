@@ -188,7 +188,7 @@ for wf in "$RELEASE_WF" "$APPLE_RELEASE_WF" "$ANDROID_CI_WF"; do
 done
 ok "stub engine artifacts are isolated to the secretless validation lane"
 
-# --- Contract 3d: android.yml signing-variable contract -------------------------------------------
+# --- Contract 3d: android.yml release signing-variable mapping ------------------------------------
 # The Gradle signing config reads exactly four env vars (build.gradle.kts:38-43). The workflow
 # must export all four under the correct names, and must never carry the old misnamed variable
 # VORTX_KEYSTORE_FILE (which silently missed the Gradle contract before it was caught).
@@ -202,12 +202,93 @@ if grep -Eq '^[[:space:]]+VORTX_KEYSTORE_FILE:' "$ANDROID_CI_WF"; then
     fail "android CI exports the misnamed VORTX_KEYSTORE_FILE as an env var (must be VORTX_KEYSTORE_PATH)"
 fi
 ok "android CI never exports the misnamed VORTX_KEYSTORE_FILE as an env var"
-require_grep "android CI asserts the signing-variable contract inline" \
-    'Assert signing-variable contract' "$ANDROID_CI_WF"
+require_grep "android CI asserts the release signing-variable mapping inline" \
+    'Assert release signing-variable mapping' "$ANDROID_CI_WF"
 for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
-    require_grep "android CI signing-contract assertion checks $var" \
+    require_grep "android CI signing-variable mapping assertion checks $var" \
         "$var" "$ANDROID_CI_WF"
 done
+
+# Execute the assertion embedded in android.yml itself against disposable fixtures. This catches
+# self-scans: a forbidden value mentioned by the assertion must not make the clean workflow fail,
+# while an actual YAML signing key or Gradle signing-input map drift must fail closed.
+assertion_script="$(mktemp)"
+trap 'rm -f "$assertion_script"' EXIT
+awk '
+    /^      - name: Assert release signing-variable mapping \(exact four canonical vars\)$/ { in_step=1; next }
+    in_step && /^        run: \|$/ { in_script=1; next }
+    in_script && /^      - name:/ { exit }
+    in_script { sub(/^          /, ""); print }
+' "$ANDROID_CI_WF" > "$assertion_script"
+[[ -s "$assertion_script" ]] || fail "could not extract android CI signing-contract assertion"
+
+run_signing_assertion_fixture() {
+    local fixture="$1"
+    mkdir -p "$fixture/.github/workflows" "$fixture/android/app"
+    cp "$ANDROID_CI_WF" "$fixture/.github/workflows/android.yml"
+    cp "$GRADLE_BUILD" "$fixture/android/app/build.gradle.kts"
+    (cd "$fixture" && bash "$assertion_script")
+}
+
+fixture_root="$(mktemp -d)"
+trap 'rm -rf "$fixture_root"; rm -f "$assertion_script"' EXIT
+run_signing_assertion_fixture "$fixture_root/clean" >/dev/null
+ok "android CI signing-variable mapping assertion accepts the real workflow and Gradle configuration"
+
+run_signing_assertion_fixture "$fixture_root/misnamed-env" >/dev/null
+perl -0pi -e 's/(          VORTX_KEYSTORE_PATH:.*\n)/$1          VORTX_KEYSTORE_FILE: injected-test-value\n/' \
+    "$fixture_root/misnamed-env/.github/workflows/android.yml"
+if (cd "$fixture_root/misnamed-env" && bash "$assertion_script") >/dev/null 2>&1; then
+    fail "android CI signing-variable mapping assertion accepted a misnamed keystore env key"
+fi
+ok "android CI signing-variable mapping assertion rejects a misnamed keystore env key"
+
+run_signing_assertion_fixture "$fixture_root/missing-env" >/dev/null
+perl -0pi -e 's/^          VORTX_KEY_PASSWORD:.*\n//m' \
+    "$fixture_root/missing-env/.github/workflows/android.yml"
+if (cd "$fixture_root/missing-env" && bash "$assertion_script") >/dev/null 2>&1; then
+    fail "android CI signing-variable mapping assertion accepted a missing env key"
+fi
+ok "android CI signing-variable mapping assertion rejects a missing env key"
+
+run_signing_assertion_fixture "$fixture_root/extra-env" >/dev/null
+perl -0pi -e 's/(          VORTX_KEY_PASSWORD:.*\n)/$1          VORTX_KEY_EXTRA: injected-test-value\n/' \
+    "$fixture_root/extra-env/.github/workflows/android.yml"
+if (cd "$fixture_root/extra-env" && bash "$assertion_script") >/dev/null 2>&1; then
+    fail "android CI signing-variable mapping assertion accepted an extra env key"
+fi
+ok "android CI signing-variable mapping assertion rejects an extra env key"
+
+run_signing_assertion_fixture "$fixture_root/digit-env" >/dev/null
+perl -0pi -e 's/(          VORTX_KEY_PASSWORD:.*\n)/$1          VORTX_KEY2_EXTRA: injected-test-value\n/' \
+    "$fixture_root/digit-env/.github/workflows/android.yml"
+if (cd "$fixture_root/digit-env" && bash "$assertion_script") >/dev/null 2>&1; then
+    fail "android CI signing-variable mapping assertion accepted a digit-bearing extra env key"
+fi
+ok "android CI signing-variable mapping assertion rejects a digit-bearing extra env key"
+
+run_signing_assertion_fixture "$fixture_root/extra-signing-input" >/dev/null
+perl -0pi -e 's/(    "VORTX_KEY_PASSWORD" to signingSecret\("VORTX_KEY_PASSWORD"\),\n)/$1    "VORTX_EXTRA_SIGNING_INPUT" to\n        signingSecret("VORTX_EXTRA_SIGNING_INPUT"),\n/' \
+    "$fixture_root/extra-signing-input/android/app/build.gradle.kts"
+if (cd "$fixture_root/extra-signing-input" && bash "$assertion_script") >/dev/null 2>&1; then
+    fail "android CI signing-variable mapping assertion accepted a fifth signing input"
+fi
+ok "android CI signing-variable mapping assertion rejects a fifth signing input"
+
+run_signing_assertion_fixture "$fixture_root/missing-signing-input" >/dev/null
+perl -0pi -e 's/^    "VORTX_KEY_PASSWORD" to signingSecret\("VORTX_KEY_PASSWORD"\),\n//m' \
+    "$fixture_root/missing-signing-input/android/app/build.gradle.kts"
+if (cd "$fixture_root/missing-signing-input" && bash "$assertion_script") >/dev/null 2>&1; then
+    fail "android CI signing-variable mapping assertion accepted a missing signing input"
+fi
+ok "android CI signing-variable mapping assertion rejects a missing signing input"
+
+run_signing_assertion_fixture "$fixture_root/whitespace-only-signing-input" >/dev/null
+perl -0pi -e 's/(    "VORTX_KEYSTORE_PATH") to (signingSecret\("VORTX_KEYSTORE_PATH"\),)/$1\n        to\n        $2/' \
+    "$fixture_root/whitespace-only-signing-input/android/app/build.gradle.kts"
+(cd "$fixture_root/whitespace-only-signing-input" && bash "$assertion_script") >/dev/null \
+    || fail "android CI signing-variable mapping assertion rejected harmless Gradle map whitespace"
+ok "android CI signing-variable mapping assertion accepts harmless Gradle map whitespace"
 
 permissions_block="$(awk '/^permissions:/{flag=1} flag && /^[a-zA-Z_-]+:/ && !/^permissions:/{exit} flag{print}' "$VALIDATION_WF")"
 grep -Eq 'contents:\s*read' <<<"$permissions_block" \
@@ -310,7 +391,7 @@ require_grep "test covers tag/versionName coherence" \
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
-    for wf in "$RELEASE_WF" "$VALIDATION_WF"; do
+    for wf in "$RELEASE_WF" "$VALIDATION_WF" "$ANDROID_CI_WF"; do
         python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$wf" \
             || fail "$(basename "$wf") is not valid YAML"
         ok "$(basename "$wf") parses as valid YAML"

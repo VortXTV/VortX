@@ -456,41 +456,57 @@ jobs:
           VORTX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew assembleFullRelease bundleFullRelease --no-daemon --stacktrace
 
-      # Signing-contract assertion (fail-closed): prove the EXACT four env-var names the Gradle
-      # signing-config reads (build.gradle.kts:38-43) are present in this workflow's release build
-      # step, and that no debug-signing fallback exists anywhere in this file. A rename or removal
-      # of any one variable kills the release build silently (Gradle sees null, skips signing);
-      # this gate makes that regression loud. The assertion runs unconditionally (not gated on
-      # steps.signing.outputs.ready) because the CONTRACT must hold even when secrets are absent.
-      - name: Assert signing-variable contract (exact four names, no debug fallback)
+      # Signing-variable mapping assertion (fail-closed): prove the release build exports exactly
+      # the four signing variables Gradle reads (build.gradle.kts:38-43), and Gradle maps exactly
+      # those four names through signingSecret(). The assertion runs unconditionally (not gated on
+      # steps.signing.outputs.ready) because this source contract must hold even when secrets are absent.
+      - name: Assert release signing-variable mapping (exact four canonical vars)
         run: |
           set -euo pipefail
           wf=".github/workflows/android.yml"
           gradle="android/app/build.gradle.kts"
           fail=0
-          # 1. Gradle declares exactly these four variable names (the canonical source of truth).
+          # Extract the authoritative blocks before checking them. Do not search this whole workflow:
+          # the assertions below intentionally name forbidden values and regular expressions.
+          release_env="$(
+            awk '
+              $0 == "      - name: Build signed release (full flavor APK + AAB)" { in_release_step=1; next }
+              in_release_step && /^      - name:/ { exit }
+              in_release_step && /^        env:$/ { in_env=1; next }
+              in_env && /^          [[:alpha:]_][[:alnum:]_]*:/ { print; next }
+              in_env { exit }
+            ' "$wf"
+          )"
+          gradle_inputs="$(
+            awk '
+              /^val releaseSigningInputs = mapOf\(/ { in_inputs=1 }
+              in_inputs { print }
+              in_inputs && /^\)$/ { exit }
+            ' "$gradle"
+          )"
+          # 1. Gradle declares exactly these four variable names in its release-signing input map.
+          normalized_gradle_inputs="$(tr -d '[:space:]' <<<"$gradle_inputs")"
+          canonical_gradle_inputs='valreleaseSigningInputs=mapOf("VORTX_KEYSTORE_PATH"tosigningSecret("VORTX_KEYSTORE_PATH"),"VORTX_KEYSTORE_PASSWORD"tosigningSecret("VORTX_KEYSTORE_PASSWORD"),"VORTX_KEY_ALIAS"tosigningSecret("VORTX_KEY_ALIAS"),"VORTX_KEY_PASSWORD"tosigningSecret("VORTX_KEY_PASSWORD"),)'
           for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
-            grep -qF "\"$var\"" "$gradle" \
+            grep -qF "\"$var\"tosigningSecret(\"$var\")" <<<"$normalized_gradle_inputs" \
               || { echo "::error::Gradle signing contract missing $var in $gradle"; fail=1; }
           done
-          # 2. This workflow exports all four under the release-build step.
-          for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
-            grep -qE "^[[:space:]]+${var}:" "$wf" \
-              || { echo "::error::$wf does not export $var for the release build"; fail=1; }
-          done
-          # 3. No stale VORTX_KEYSTORE_FILE (the old misnamed variable that silently missed the
-          #    Gradle contract). Any occurrence means a future edit reintroduced the bug.
-          if grep -qF 'VORTX_KEYSTORE_FILE' "$wf"; then
-            echo "::error::$wf still references VORTX_KEYSTORE_FILE (must be VORTX_KEYSTORE_PATH)"
+          if [ "$normalized_gradle_inputs" != "$canonical_gradle_inputs" ]; then
+            echo "::error::$gradle releaseSigningInputs must exactly match the canonical four-entry signing map"
             fail=1
           fi
-          # 4. No debug-signing fallback anywhere in this file.
-          if grep -Eq 'signingConfigs\.getByName\("debug"\)|debug-signed|isDebuggable.*true' "$wf"; then
-            echo "::error::$wf contains a debug-signing fallback"
+          # 2. This workflow exports exactly those four signing keys under the release-build step.
+          for var in VORTX_KEYSTORE_PATH VORTX_KEYSTORE_PASSWORD VORTX_KEY_ALIAS VORTX_KEY_PASSWORD; do
+            grep -qE "^[[:space:]]*${var}:" <<<"$release_env" \
+              || { echo "::error::$wf does not export $var for the release build"; fail=1; }
+          done
+          release_signing_key_count="$(grep -Ec '^[[:space:]]*VORTX_KEY[[:alnum:]_]*:' <<<"$release_env" || true)"
+          if [ "$release_signing_key_count" -ne 4 ]; then
+            echo "::error::$wf release build must export exactly four VORTX_KEY* signing variables"
             fail=1
           fi
           if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "ok: signing-variable contract holds (4 vars match Gradle, no KEYSTORE_FILE, no debug fallback)"
+          echo "ok: release signing-variable mapping holds (exactly 4 canonical vars)"
 
       # Remove the decoded keystore as soon as the build is done, whatever the outcome.
       - name: Shred decoded keystore
