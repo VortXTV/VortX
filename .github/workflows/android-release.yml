@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       publish_release:
-        description: Publish the draft after uploading Android artifacts
+        description: Deprecated safety switch. Android may attach verified assets to a draft but may never publish it.
         required: true
         default: false
         type: boolean
@@ -48,6 +48,12 @@ jobs:
           fi
           echo "SOURCE_COMMIT=$source_commit" >> "$GITHUB_ENV"
           echo "RELEASE_TAG_COMMIT=$tag_commit" >> "$GITHUB_ENV"
+
+      - name: Refuse Android-only publication
+        if: inputs.publish_release == true
+        run: |
+          echo "::error::Android artifacts may only be attached to the draft. The Apple release coordinator validates the complete cross-platform set and publishes last."
+          exit 1
 
       # Private engine fetch is kept in lockstep with android.yml. Both checkouts are required because
       # every release variant packages libstremiox_core.so and libvortx_ffi.so.
@@ -239,7 +245,8 @@ jobs:
           sha256sum \
             "dist/VortX-${version}-full-mpv-universal.apk" \
             "dist/VortX-${version}-play-media3-universal.apk" \
-            "dist/VortX-${version}-play-media3.aab" > dist/SHA256SUMS
+            "dist/VortX-${version}-play-media3.aab" \
+            | sed 's#  dist/##' > dist/SHA256SUMS-android.txt
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create or append to the draft release
@@ -260,13 +267,6 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             dist/*.apk \
             dist/*.aab \
-            dist/SHA256SUMS \
+            dist/SHA256SUMS-android.txt \
             dist/SIGNING_PROVENANCE.txt \
             --clobber
-
-      - name: Publish the draft release
-        if: inputs.publish_release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: gh release edit "$RELEASE_TAG" --draft=false

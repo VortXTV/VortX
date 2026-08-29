@@ -180,6 +180,14 @@ require_grep "validation verifies StremioXCore stub marker" \
     'StremioXCore\.xcframework/STUB-CI-ONLY\.txt' "$VALIDATION_WF"
 require_grep "validation verifies VortxEngine stub marker" \
     'VortxEngine\.xcframework/STUB-CI-ONLY\.txt' "$VALIDATION_WF"
+require_grep "validation proves the x86_64 tvOS simulator link" \
+    'dd-tv-x86.*x86_64' "$VALIDATION_WF"
+require_grep "stub frameworks provide a universal simulator slice" \
+    'tvos-arm64_x86_64-simulator.*x86_64-apple-tvos' "$REPO_ROOT/scripts/build-stub-engine-xcframeworks.sh"
+require_grep "stub framework plist declares x86_64 simulator support" \
+    'architectures.*x86_64' "$REPO_ROOT/scripts/build-stub-engine-xcframeworks.sh"
+require_grep "validation uses one supported PKCS12 password for store and key" \
+    'ADHOC_KEY_PASS: vortx-adhoc-ci-store' "$VALIDATION_WF"
 require_grep "validation generates the Xcode project from project.yml" \
     'xcodegen generate' "$VALIDATION_WF"
 require_grep "validation builds tvOS shell via xcodebuild" \
@@ -448,6 +456,32 @@ require_grep "attach-release exposes immutable release ID to the downstream veri
 grep -Fq 'needs.attach-release.outputs.release_id' <<<"$verify_published_block" \
     || fail "downstream verifier does not consume attach-release's immutable release ID"
 ok "downstream verifier consumes the immutable release ID"
+require_grep "Apple coordinator derives prerelease state from the tag" \
+    'IS_PRERELEASE=false; \[\[ "\$TAG" == \*-\* \]\] && IS_PRERELEASE=true' "$APPLE_RELEASE_WF"
+require_grep "Android lane refuses partial publication" \
+    'Refuse Android-only publication' "$RELEASE_WF"
+require_grep "Android checksum lists downloadable basenames" \
+    "sed 's#  dist/##' > dist/SHA256SUMS-android.txt" "$RELEASE_WF"
+require_grep "Apple coordinator requires the complete Android set before publish" \
+    'Android checksum asset is missing' "$APPLE_RELEASE_WF"
+require_grep "Stable publish explicitly verifies latest release state" \
+    'make_latest=true' "$APPLE_RELEASE_WF"
+require_grep "staged publication does not byte-compare the dynamic appcast worker" \
+    'combined Apple\+Android view' "$APPLE_RELEASE_WF"
+require_grep "live appcast validation binds to worker tag provenance" \
+    '_generatedFromTag == \$tag' "$APPLE_RELEASE_WF"
+require_grep "published-release readiness derives prerelease state from event tag" \
+    'IS_PRERELEASE=false; \[\[ "\$EVENT_TAG" == \*-\* \]\] && IS_PRERELEASE=true' "$APPLE_RELEASE_WF"
+
+event_tag_prerelease() {
+    local event_tag="$1"
+    local is_prerelease=false
+    [[ "$event_tag" == *-* ]] && is_prerelease=true
+    printf '%s\n' "$is_prerelease"
+}
+[[ "$(event_tag_prerelease v0.3.15)" = false ]] || fail "stable event tag did not derive prerelease=false"
+[[ "$(event_tag_prerelease v0.3.14-beta.31)" = true ]] || fail "beta event tag did not derive prerelease=true"
+ok "published-release readiness derives stable and beta prerelease bits from the event tag"
 grep -Eq '^    permissions:$' <<<"$verify_published_block" \
     && grep -Eq '^      contents: read$' <<<"$verify_published_block" \
     || fail "published-release verifier must hold contents: read only"

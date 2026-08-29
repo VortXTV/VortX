@@ -85,12 +85,13 @@ command -v xcrun >/dev/null || { echo "error: xcrun not found (need Xcode)" >&2;
 command -v lipo >/dev/null || { echo "error: lipo not found (need Xcode)" >&2; exit 1; }
 command -v plutil >/dev/null || { echo "error: plutil not found (need Xcode)" >&2; exit 1; }
 
-# sdk | xcframework slice dir | target triple   (single-arch arm64 slices, matching the real frameworks)
+# sdk | xcframework slice dir | target triples. Simulator slices intentionally contain arm64 and
+# x86_64 so the secretless packaging lane exercises both Xcode simulator link paths.
 SDK_SPECS=(
     "iphoneos|ios-arm64|arm64-apple-ios16.0"
-    "iphonesimulator|ios-arm64-simulator|arm64-apple-ios16.0-simulator"
+    "iphonesimulator|ios-arm64_x86_64-simulator|arm64-apple-ios16.0-simulator,x86_64-apple-ios16.0-simulator"
     "appletvos|tvos-arm64|arm64-apple-tvos18.0"
-    "appletvsimulator|tvos-arm64-simulator|arm64-apple-tvos18.0-simulator"
+    "appletvsimulator|tvos-arm64_x86_64-simulator|arm64-apple-tvos18.0-simulator,x86_64-apple-tvos18.0-simulator"
     "macosx|macos-arm64|arm64-apple-macos14.0"
 )
 
@@ -286,13 +287,15 @@ generate_stub_framework() {
         local platform variant_keys=""
         case "$slice_name" in
             ios-arm64) platform="ios" ;;
-            ios-arm64-simulator) platform="ios"; variant_keys="<key>SupportedPlatformVariant</key><string>simulator</string>" ;;
+            ios-arm64_x86_64-simulator) platform="ios"; variant_keys="<key>SupportedPlatformVariant</key><string>simulator</string>" ;;
             tvos-arm64) platform="tvos" ;;
-            tvos-arm64-simulator) platform="tvos"; variant_keys="<key>SupportedPlatformVariant</key><string>simulator</string>" ;;
+            tvos-arm64_x86_64-simulator) platform="tvos"; variant_keys="<key>SupportedPlatformVariant</key><string>simulator</string>" ;;
             macos-arm64) platform="macos" ;;
             *) echo "error: unknown slice $slice_name" >&2; exit 1 ;;
         esac
-        lib_entries+=("<dict><key>BinaryPath</key><string>$lib_file</string><key>HeadersPath</key><string>Headers</string><key>LibraryIdentifier</key><string>$slice_name</string><key>LibraryPath</key><string>$lib_file</string><key>SupportedArchitectures</key><array><string>arm64</string></array><key>SupportedPlatform</key><string>$platform</string>$variant_keys</dict>")
+        architectures="<string>arm64</string>"
+        [[ "$triples" == *x86_64* ]] && architectures+="<string>x86_64</string>"
+        lib_entries+=("<dict><key>BinaryPath</key><string>$lib_file</string><key>HeadersPath</key><string>Headers</string><key>LibraryIdentifier</key><string>$slice_name</string><key>LibraryPath</key><string>$lib_file</string><key>SupportedArchitectures</key><array>$architectures</array><key>SupportedPlatform</key><string>$platform</string>$variant_keys</dict>")
         log "  slice $slice_name ($(stat -f%z "$slice_dir/$lib_file") bytes)"
     done
     {

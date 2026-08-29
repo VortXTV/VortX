@@ -75,7 +75,9 @@ jobs:
       - name: Generate ephemeral ad-hoc release keystore
         env:
           ADHOC_STORE_PASS: vortx-adhoc-ci-store
-          ADHOC_KEY_PASS: vortx-adhoc-ci-key
+          # JDK PKCS12 normalizes a distinct key password to the store password. Keep this
+          # deliberately equal so the Gradle release build below proves the exact supported path.
+          ADHOC_KEY_PASS: vortx-adhoc-ci-store
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/adhoc-signing"
@@ -86,6 +88,10 @@ jobs:
             -keyalg RSA -keysize 4096 -validity 1 \
             -storepass "$ADHOC_STORE_PASS" -keypass "$ADHOC_KEY_PASS" \
             -dname "CN=VortX CI Ad-hoc Release, O=VortXTV, C=US"
+          # The immediately following Gradle release build consumes both storePassword and
+          # keyPassword from these same inputs, proving the supported PKCS12 signing path.
+          keytool -list -v -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
+            -storetype PKCS12 -storepass "$ADHOC_STORE_PASS" -alias adhoc-release >/dev/null
 
       # Same task set as the privileged release build (android-release.yml), same fail-closed
       # signing-config path in app/build.gradle.kts (the four VORTX_* inputs are all provided,
@@ -99,7 +105,7 @@ jobs:
           VORTX_KEYSTORE_PATH: ${{ runner.temp }}/adhoc-signing/adhoc-release.jks
           VORTX_KEYSTORE_PASSWORD: vortx-adhoc-ci-store
           VORTX_KEY_ALIAS: adhoc-release
-          VORTX_KEY_PASSWORD: vortx-adhoc-ci-key
+          VORTX_KEY_PASSWORD: vortx-adhoc-ci-store
         run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
 
       - name: Require the exact release package set (two universal APKs, one AAB)
@@ -282,12 +288,12 @@ jobs:
         run: |
           set -euo pipefail
           build_shell() {
-            local scheme="$1" destination="$2" expected_bundle="$3" dd="$4" require_engines="$5"
+            local scheme="$1" destination="$2" expected_bundle="$3" dd="$4" require_engines="$5" arch="${6:-}"
             echo "::group::xcodebuild $scheme"
             xcodebuild -project app/VortX.xcodeproj -scheme "$scheme" \
               -destination "$destination" \
               -derivedDataPath "$dd" \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ${arch:+ARCHS=$arch ONLY_ACTIVE_ARCH=NO} \
               build
             echo '::endgroup::'
             local products_dir
@@ -312,5 +318,6 @@ jobs:
           }
           build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" core-only
           build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both
+          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv-x86" both x86_64
           build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    both
           build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    core-only
