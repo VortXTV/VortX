@@ -148,7 +148,8 @@ test("release and manual cut paths both require feed propagation", async () => {
   assert.match(workflow, /name: Atomically activate the staged feed, prove routes, then publish last/);
   assert.match(workflow, /node scripts\/release-feed\.mjs project-build --file app\/project\.yml/);
   assert.match(workflow, /PUBLISH_DEADLINE/);
-  assert.match(workflow, /\.prerelease == true/);
+  assert.match(workflow, /IS_PRERELEASE=false; \[\[ "\$TAG" == \*-\* \]\] && IS_PRERELEASE=true/);
+  assert.match(workflow, /\.prerelease == \$prerelease/);
   assert.match(workflow, /rollback-verify=\$restore/);
   assert.match(workflow, /rollback-raw-source\.json/);
   assert.match(workflow, /name: Verify the immutable published release and public feed/);

@@ -4,6 +4,33 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.15 (build 233)
+
+### Stable release from the complete 0.3.14 beta line
+
+**This is the cumulative stable release after 0.3.13.** It contains the complete work described in Beta 1 through Beta 31 below across Apple TV, iPhone, iPad, Mac, Android phone, Android TV, and supported Fire TV devices. That includes the VortX account and encrypted profile sync, Trakt and SIMKL, Plex, Jellyfin, Emby and Nuvio, Top Shelf and Match Frame Rate, rebuilt Apple and Android players, source ranking and filtering, subtitles and trickplay, downloads, IPTV, torrents and on-device usenet, the native Mac layout, update feeds, production Android signing, and three Android ABIs.
+
+**Diagnostic 8 closes a proven Dolby Vision fallback path.** Temporary pressure while materializing an optional WebVTT subtitle rendition no longer terminates an otherwise healthy A/V playlist and demotes true Dolby Vision to the HDR10 fallback. The completed forward-buffer coupling state is also inert instead of emitting a false failure every 250 ms. The two later AVPlayer stalls in that diagnostic did not expose a safe source-proven threshold change, so they remain hardware-soak targets rather than being hidden behind speculative tuning.
+
+**Player and source controls are consistent across platforms.** Apple and Android detail pages offer truthful per-launch player choices, player source panels begin with Quality and Audio before the matching sources, and the Apple source menu preserves protected headers, torrent and usenet handling, debrid provenance, resume position, and external-player eligibility. Long Apple episode lists also gain an accessible Scroll to Top action.
+
+**Search and diagnostics expose the useful path.** Debrid Cloud moves from a buried Settings navigation row to Search beside Play a Link on Apple platforms. Community trickplay failures retain a bounded reason category without logging URLs or secrets, and French Discover copy is complete for the new catalog rows.
+
+**Community traffic is bounded and consent-aware.** Android community trickplay capture, fetch, upload, and TMDB-to-IMDb resolution stop when consent is withdrawn, including requests already blocked in transport. Singularity contributions reserve work before delivery, retry only transient failures with bounded backoff, persist opaque completion receipts, and stop queued posts when an authentication or protocol circuit opens.
+
+**Release publication is one cross-platform transaction.** Android may build, sign, verify, and attach its Full mpv APK, Play Media3 APK, and Play AAB, but it cannot publish a partial stable release. The Apple coordinator validates the complete Apple and Android asset set, checks public bytes and the dynamic appcast, publishes stable last, marks it Latest, and verifies the result. Downloadable checksum files now use their published basenames.
+
+### Android signing migration
+
+Users of the public Android packages from Beta 1, Beta 6, Beta 10, or Beta 12 must uninstall that older package before installing 0.3.15 because those builds used a debug or preview certificate. Uninstalling removes that installation's local data, so sync or back up anything important first. The production certificate established by Beta 31 is retained for 0.3.15 and future in-place updates.
+
+### Validation limits
+
+- The protected release lanes verify source and tag identity, artifact checksums, Android signer identity, required JNI exports, the three Android ABI directories, and the Play flavor's GPL boundary.
+- No physical Android or Fire TV device was connected to the release machine. Fresh install, production-signed upgrade continuity, D-pad focus, HDR and Dolby Vision, torrent resume, and sustained playback still need representative device confirmation.
+- Dolby Vision fixes name the exact proven failure paths. They are not a claim that every source, display, cable, or AVPlayer stall cause is closed.
+- A stricter Android auto-delete transaction was withheld after review found destructive failure ordering and a local-play completion regression. The existing opt-in behavior remains, while the transactional repair stays on the follow-up list.
+
 ## 0.3.14 Beta 31 (Android versionCode 189)
 
 ### Android: signed Full and Play beta

@@ -5,7 +5,7 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.3.14"
+    static let version = "0.3.15"
     static let highlights: [String] = [
         "Pick an audio language right from the source picker. A new Audio control next to Quality on the detail page filters and re-ranks the source list by audio language, so a release that carries your chosen language floats up without changing your saved language preference; Auto keeps your profile's preferred audio languages. The choice is for this session only and is never saved. Apple TV, iPhone, iPad, and Mac.",
         "Home and Discover rows translate their catalog titles as whole phrases instead of word by word. Titles like Popular Shows were being translated one word at a time in the English order, which reads wrong in French and other languages where the adjective follows the noun: Popular Shows now becomes Séries populaires, Featured Movies becomes Films à la une, and the new and trending rows follow the same correct order. Languages that already had a phrase translation are unchanged, and a language without one keeps its previous wording. French.",

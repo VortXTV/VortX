@@ -99,8 +99,8 @@ android {
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 189
-        versionName = "0.3.14"
+        versionCode = 233
+        versionName = "0.3.15"
 
         // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /
         // SIMKLAuth). Empty default keeps the feature dormant on a public/unprovisioned build; see the
