@@ -106,12 +106,12 @@ verify_apk() {
     }
     reject_debug_signer "$apk" "$output"
 
-    fingerprint_count="$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' <<<"$output" | wc -l | tr -d '[:space:]')"
+    fingerprint_count="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$output" | wc -l | tr -d '[:space:]')"
     if [[ "$fingerprint_count" != "1" ]]; then
         error "$apk must have exactly one reported signer SHA-256 digest, found $fingerprint_count"
         return 1
     fi
-    fingerprint="$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' <<<"$output")"
+    fingerprint="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$output")"
     verify_expected_fingerprint "$apk" "$fingerprint"
     subject="$(sed -n 's/^Signer #[0-9][0-9]* certificate DN: //p' <<<"$output")"
     [[ -n "$subject" ]] || subject="<subject unavailable>"

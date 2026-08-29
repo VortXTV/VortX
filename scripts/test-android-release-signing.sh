@@ -35,8 +35,8 @@ fingerprint="${MOCK_FINGERPRINT:-FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032
 subject="${MOCK_SUBJECT:-CN=VortX Release, O=VortXTV, C=US}"
 printf 'Verifies\n'
 printf 'Verified using v2 scheme (APK Signature Scheme v2): true\n'
-printf 'Signer #1 certificate DN: %s\n' "$subject"
-printf 'Signer #1 certificate SHA-256 digest: %s\n' "$fingerprint"
+printf '  Signer #1 certificate DN: %s\n' "$subject"
+printf '  Signer #1 certificate SHA-256 digest: %s\n' "$fingerprint"
 MOCK
 
 cat > "$workdir/bin/jarsigner" <<'MOCK'
