@@ -1,11 +1,9 @@
 name: CodeQL
 
-# Static security analysis of the source tracked in this public repository, from source with no
-# cross-target build (build-mode: none). Covers Rust (incl. the desktop Tauri backend), the
-# TypeScript/JavaScript web + workers + desktop front ends, and the Python tooling.
-# The compiled apps are covered without a build by Semgrep (semgrep.yml): Swift (the Apple apps) and
-# Kotlin (the Android app, which CodeQL cannot extract in build-mode: none and whose autobuild would
-# need the full Android + private-engine build). The private engine lives in its own gated repos.
+# Static security analysis of the source tracked in this public repository. Rust (incl. the desktop
+# Tauri backend), TypeScript/JavaScript web + workers + desktop front ends, and Python use source-only
+# analysis. Kotlin needs a traced Gradle compilation, so it has a small dedicated manual-build lane.
+# Swift remains covered by Semgrep (semgrep.yml); the private engine lives in its own gated repos.
 
 on:
   push:
@@ -31,8 +29,8 @@ jobs:
       matrix:
         # Every one of these supports build-mode: none (source-only analysis, no compile step).
         # java-kotlin is intentionally NOT here: CodeQL cannot extract Kotlin in build-mode: none,
-        # and autobuild would require the full Android + private-engine build. Kotlin is covered by
-        # Semgrep instead (semgrep.yml).
+        # and autobuild would require the full Android + private-engine build. It is handled by the
+        # dedicated analyze-java-kotlin manual-build job below.
         language: [rust, javascript-typescript, python]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,3 +45,45 @@ jobs:
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         with:
           category: "/language:${{ matrix.language }}"
+
+  analyze-java-kotlin:
+    name: Analyze (java-kotlin)
+    runs-on: ubuntu-24.04
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+
+      # android/app and android/mpv-seam both pin this version. The older 27.0.12077973 CI report
+      # is not authoritative for this source tree: installing it would leave Gradle's pinned NDK absent.
+      - name: Install Android NDK 27.2.12479018
+        run: |
+          yes | sdkmanager "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: java-kotlin
+          build-mode: manual
+
+      # CodeQL only extracts Kotlin from a compilation it traces. This task configures the Android
+      # modules and compiles the Play variant without invoking the private-engine release pipeline.
+      - name: Compile Android Kotlin for CodeQL
+        working-directory: android
+        run: ./gradlew :app:compilePlayDebugKotlin --no-daemon --stacktrace
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: "/language:java-kotlin"
