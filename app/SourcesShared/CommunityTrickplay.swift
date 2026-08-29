@@ -732,7 +732,20 @@ enum CommunityTrickplay {
         let cols: Int
     }
 
-    enum FetchUnavailableReason { case metadataUnavailable, metadataInvalid, spriteUnavailable, advertisedIndexInvalid }
+    /// Finite, transport-free categories suitable for diagnostics and UI state. In particular, never carry a
+    /// URL, HTTP payload, request key, or thrown error out of the fetch layer.
+    enum FetchUnavailableReason: Sendable {
+        case metadataUnavailable, metadataInvalid, spriteUnavailable, advertisedIndexInvalid
+
+        var diagnosticCode: String {
+            switch self {
+            case .metadataUnavailable: return "metadata-unavailable"
+            case .metadataInvalid: return "metadata-invalid"
+            case .spriteUnavailable: return "sprite-unavailable"
+            case .advertisedIndexInvalid: return "advertised-index-invalid"
+            }
+        }
+    }
 
     enum FetchResult { case hit(Sheet), unavailable(FetchUnavailableReason), cancelled }
 

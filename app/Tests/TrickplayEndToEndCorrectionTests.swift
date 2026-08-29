@@ -469,8 +469,10 @@ private enum TrickplayEndToEndCorrectionTests {
         }
         let fetch = community[fetchStart.lowerBound..<fetchEnd.lowerBound]
         expect(["enum FetchUnavailableReason", "metadataUnavailable", "metadataInvalid", "spriteUnavailable", "advertisedIndexInvalid",
-                "case hit(Sheet)", "unavailable(FetchUnavailableReason)", "cancelled"].allSatisfy { fetch.contains($0) },
-               "community fetch must expose only finite typed outcomes")
+                "var diagnosticCode: String", "metadata-unavailable", "metadata-invalid", "sprite-unavailable", "advertised-index-invalid",
+                "case hit(Sheet)", "unavailable(FetchUnavailableReason)", "cancelled"].allSatisfy { fetch.contains($0) }
+                    && !fetch.contains("String(describing:"),
+               "community fetch must expose only finite typed outcomes and transport-free diagnostic codes")
         expect(["ContinuousClock.now.advanced(by: .seconds(3))", "ContinuousClock.now.advanced(by: .seconds(5))", "Task.sleep(until:",
                 "withTaskGroup", "group.cancelAll()", "group.addTask { .sprite", "group.addTask { .vtt"].allSatisfy { fetch.contains($0) },
                "metadata/assets must use absolute 3s/5s structured deadlines")
@@ -509,8 +511,8 @@ private enum TrickplayEndToEndCorrectionTests {
         expect(ui.contains("Loading previews…") && ui.contains("Previews unavailable") && ui.contains("previewState")
             && ui.contains("scrubThumbnails.previewState != .hidden") && ui.contains("value: scrubThumbnails.previewState") && !ui.contains("image != nil || scrubThumbnails.previewStatus"),
                "the TV scrubber must use PreviewState for text-only states and height")
-        expect(completion.components(separatedBy: "VXProbe.log(\"tp\"").count == 2 && completion.contains("outcome=") && !completion.contains("key=") && !completion.contains("url=") && !completion.contains("error="),
-               "fetch completion diagnostics must be fixed-category and redacted")
+        expect(completion.components(separatedBy: "VXProbe.log(\"tp\"").count == 2 && completion.contains("case .unavailable(let reason)") && completion.contains("communityUnavailableReason = reason") && completion.contains("detail=\\(diagnosticDetail)") && completion.contains("outcome=") && !completion.contains("key=") && !completion.contains("url=") && !completion.contains("error="),
+               "fetch completion diagnostics must preserve a fixed unavailable category and remain redacted")
     }
 
     private static func testProtectedUHDDVCaptureContract() {

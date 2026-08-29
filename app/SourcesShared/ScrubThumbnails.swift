@@ -62,6 +62,9 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// is strictly fuller than this, so a thin community set gets improved (keep-fuller) while a full one is
     /// not needlessly re-POSTed. The worker also keep-fuller-merges as a race safety net.
     private var communityExistingFrameCount = 0
+    /// The fixed, redacted reason for the latest settled community miss. It is diagnostic state only: local
+    /// capture and nearest-frame fallback selection must remain exactly independent of its category.
+    @Published private(set) var communityUnavailableReason: CommunityTrickplay.FetchUnavailableReason?
     private enum CommunityRemotePhase { case idle, loading, settled }
     private var communityRemotePhase = CommunityRemotePhase.idle
     private var communityFetchTask: Task<Void, Never>?; private var communityFetchEpoch: UInt64 = 0
@@ -138,6 +141,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         communitySheet = nil
         communityAlreadyExists = false
         communityExistingFrameCount = 0
+        communityUnavailableReason = nil
         communityRemotePhase = .idle
         communityKey = nil
         communityResolveTriedFor = nil
@@ -193,7 +197,12 @@ final class ScrubThumbnailsStore: ObservableObject {
         communityDurationBucket = CommunityTrickplay.durationBucket(duration)
         // A community duration-bucket re-key is separate from the stable local media identity above. It
         // invalidates only the fetched sheet; captured session frames remain valid because they are time-indexed.
-        if rekeying { communitySheet = nil; communityAlreadyExists = false; communityExistingFrameCount = 0 }
+        if rekeying {
+            communitySheet = nil
+            communityAlreadyExists = false
+            communityExistingFrameCount = 0
+            communityUnavailableReason = nil
+        }
         uploadPolicy.reset(for: key)
         if !rekeying { communityFetchEpoch &+= 1 }
         let fetchEpoch = communityFetchEpoch
@@ -216,16 +225,33 @@ final class ScrubThumbnailsStore: ObservableObject {
         ), communityKey == key else { return }
         communityFetchTask = nil
         communityFetchKey = nil
-        let receipt: String; let hit: Bool
+        let receipt: String
+        let diagnosticDetail: String
+        let hit: Bool
         switch result {
         case .hit(let sheet):
-            receipt = "hit"; hit = true; communitySheet = sheet; communityAlreadyExists = true; communityExistingFrameCount = sheet.frameCount
-        case .unavailable:
-            receipt = "unavailable"; hit = false; communitySheet = nil; communityAlreadyExists = false; communityExistingFrameCount = 0
+            receipt = "hit"
+            diagnosticDetail = "none"
+            hit = true
+            communitySheet = sheet
+            communityAlreadyExists = true
+            communityExistingFrameCount = sheet.frameCount
+            communityUnavailableReason = nil
+        case .unavailable(let reason):
+            receipt = "unavailable"
+            diagnosticDetail = reason.diagnosticCode
+            hit = false
+            communitySheet = nil
+            communityAlreadyExists = false
+            communityExistingFrameCount = 0
+            communityUnavailableReason = reason
         case .cancelled:
-            receipt = "cancelled"; hit = false
+            receipt = "cancelled"
+            diagnosticDetail = "none"
+            hit = false
+            communityUnavailableReason = nil
         }
-        VXProbe.log("tp", "community-fetch outcome=\(receipt)")
+        VXProbe.log("tp", "community-fetch outcome=\(receipt) detail=\(diagnosticDetail)")
         if case .cancelled = result {
             communityRemotePhase = .idle; previewState = .hidden; return
         }
@@ -311,12 +337,10 @@ final class ScrubThumbnailsStore: ObservableObject {
                           currentMediaKey: self.localCacheKey
                       ), self.pendingLocalReadToken == token else { return }
                 self.pendingLocalReadToken = nil
-                if let resolved {
-                    self.image = resolved; self.previewState = .ready
-                } else if let fallback = self.nearestCommunityFallback() {
+                if resolved == nil, let fallback = self.nearestCommunityFallback() {
                     self.image = fallback; self.previewState = .ready
                 } else {
-                    self.image = nil; self.previewState = self.previewStateForRemoteState()
+                    self.image = resolved; self.previewState = resolved == nil ? self.previewStateForRemoteState() : .ready
                 }
             }
         }
