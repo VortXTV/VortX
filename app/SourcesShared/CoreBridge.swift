@@ -84,6 +84,10 @@ final class CoreBridge: ObservableObject {
     }
     private var appleCWMetaRefreshGeneration = 0
     private var appleCWMetaRefreshRequest: AppleCWMetaRefreshRequest?
+    /// `rebuildContinueWatching` decodes on whichever engine worker delivered the event, then publishes on main.
+    /// Fence those asynchronous publications so a slower, older snapshot cannot overwrite a newer rebuild.
+    private let continueWatchingRebuildLock = NSLock()
+    private var continueWatchingRebuildGeneration = 0
 
     /// Re-find sources ("Re-find sources" control). A plain re-Load of the same meta is an engine
     /// eq_update no-op with ZERO add-on HTTP, so the only way to make expired sources get replaced is
@@ -1954,6 +1958,10 @@ final class CoreBridge: ObservableObject {
     /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
     /// synthesizes + publishes on main.
     func rebuildContinueWatching() {
+        continueWatchingRebuildLock.lock()
+        continueWatchingRebuildGeneration &+= 1
+        let generation = continueWatchingRebuildGeneration
+        continueWatchingRebuildLock.unlock()
         // "Mirror Continue Watching from Stremio": with a live Stremio session and the toggle OFF, a
         // Stremio-sourced position must not drag the RAIL backwards either, not just the account doc. Resolved
         // here off-main (a UserDefaults read plus the ctx auth probe, both thread-safe) and applied BEFORE
@@ -1964,6 +1972,10 @@ final class CoreBridge: ObservableObject {
         let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.continueWatchingRebuildLock.lock()
+            let isLatest = generation == self.continueWatchingRebuildGeneration
+            self.continueWatchingRebuildLock.unlock()
+            guard isLatest else { return }
             // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
             // profile rides `profiles.cwItems` and ignores this published value entirely.
             let ownerProfile = ProfileStore.shared.activeUsesEngineHistory
@@ -2017,12 +2029,11 @@ final class CoreBridge: ObservableObject {
     /// recency-leaning) and are pruned of finished titles. Pure + owner-only; the caller gates on
     /// `activeUsesEngineHistory`.
     static func unionOwnerContinueWatching(engine: [CoreCWItem], library: [CoreCWItem]) -> [CoreCWItem] {
-        var seen = Set(engine.map(\.id))
         var synthesized: [CoreCWItem] = []
         for item in library {
             // Real saved titles only: skip removed / temp markers, and skip anything the engine already
-            // surfaces with a live offset (dedup, engine wins).
-            guard !(item.removed ?? false), !(item.temp ?? false), !seen.contains(item.id) else { continue }
+            // surfaces with a live offset. Deduplication happens below so aliases as well as exact ids collapse.
+            guard !(item.removed ?? false), !(item.temp ?? false) else { continue }
             // Only titles with a positive CACHED offset are resumable; a finished/rewound title caches t == 0
             // (a finish that propagated) and is correctly excluded, so it never resurrects here.
             guard let entry = OwnerResumeStore.entry(forId: item.id), entry.t > 0 else { continue }
@@ -2035,9 +2046,20 @@ final class CoreBridge: ObservableObject {
                                         videoId: entry.v ?? item.state.videoId)
             synthesized.append(CoreCWItem(id: item.id, type: item.type, name: item.name,
                                           poster: item.poster, state: overlaid))
-            seen.insert(item.id)
         }
-        return engine + pruneFinished(synthesized)
+        var seenIDs = Set<String>()
+        var seenFingerprints = Set<String>()
+        let identity: (CoreCWItem) -> ContinueWatchingDedupe.Identity = {
+            .init(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster)
+        }
+        // Engine items are filtered first, preserving their order and making them win every collision with the
+        // synthesized recovery floor. The strong fingerprint also collapses tmdb/imdb aliases only when their
+        // type, title, and nonempty poster all agree; same-title distinct shows remain separate.
+        let uniqueEngine = ContinueWatchingDedupe.filterUnique(
+            engine, seenIDs: &seenIDs, seenFingerprints: &seenFingerprints, identity: identity)
+        let uniqueSynthesized = ContinueWatchingDedupe.filterUnique(
+            pruneFinished(synthesized), seenIDs: &seenIDs, seenFingerprints: &seenFingerprints, identity: identity)
+        return uniqueEngine + uniqueSynthesized
     }
 
     /// Drop a finished movie, or honor an explicit owner/profile finish action, by rewinding its saved
@@ -2927,7 +2949,7 @@ final class CoreBridge: ObservableObject {
             // value until an unrelated field changed or the page reloaded.
             || current.libraryItem?.state.flaggedWatched != next.libraryItem?.state.flaggedWatched
             || current.libraryItem?.state.timesWatched != next.libraryItem?.state.timesWatched
-            || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
+            || WatchedMembershipPolicy.changed(current.watchedVideoIds, next.watchedVideoIds) {
             return true
         }
         // Signature over BOTH stream surfaces: the meta-embedded groups (metaStreams, the HTTP/HLS

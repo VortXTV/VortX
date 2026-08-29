@@ -1515,6 +1515,18 @@ final class ProfileStore: ObservableObject {
         return cache
     }
 
+    /// Snapshot used by account sync. The active overlay's in-memory dictionary is newer than its deliberately
+    /// delayed UserDefaults serialization, so sync must read it directly or a 3-second push can miss up to a
+    /// minute of progress. Inactive profiles have no live dictionary and continue to read their durable cache.
+    func watchEntriesForSync(for profileID: UUID) -> [String: WatchEntry] {
+        OverlayWatchSyncPolicy.snapshot(
+            requestedID: profileID,
+            activeID: activeID,
+            live: watch,
+            persisted: watchEntries(for: profileID)
+        )
+    }
+
     /// Hydrate an OVERLAY profile's local watch overlay from a synced byProfile payload (cloud -> device,
     /// the missing sync-down leg, so a secondary profile's library + CW show in the app on every device,
     /// not just the dashboard). Merges per item last-writer-wins by lastWatched and UNIONs watchedVideoIds
@@ -1523,7 +1535,9 @@ final class ProfileStore: ObservableObject {
     func applyRemoteOverlay(profileID: UUID, entries: [String: WatchEntry]) {
         guard !entries.isEmpty else { return }
         if let p = profiles.first(where: { $0.id == profileID }), p.usesEngineHistory { return }
-        var current = watchEntries(for: profileID)
+        // Merge against the same authority the UI is currently mutating. Reading the delayed disk cache for the
+        // active profile could replace fresh progress for title A when a remote update for title B landed.
+        var current = watchEntriesForSync(for: profileID)
         var changed = false
         for (metaId, incoming) in entries {
             guard var existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }

@@ -1609,7 +1609,7 @@ final class VortXSyncManager: ObservableObject {
         // library, not a watch overlay). The dashboard derives CW from each item's t/d progress.
         var byProfile: [String: Any] = [:]
         for p in store.profiles where !p.isOwner {
-            let cache = store.watchEntries(for: p.id)
+            let cache = store.watchEntriesForSync(for: p.id)
             guard !cache.isEmpty else { continue }
             let library: [[String: Any]] = cache.map { (metaId, e) in
                 // t/d in seconds for the dashboard; v (resume episode/movie id) + w (watched episode ids)
