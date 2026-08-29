@@ -18,6 +18,16 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "0.3.15",
+          "buildVersion": "233",
+          "date": "2026-08-29",
+          "localizedDescription": "VortX 0.3.15 is the cumulative stable release from 0.3.13 through the complete 0.3.14 beta line, with Apple playback reliability, Dolby Vision, subtitles, source controls, watch-state fixes, and production-signed Android Full and Play builds.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.15/VortX-iOS-v0.3.15-ci.ipa",
+          "size": 64763243,
+          "sha256": "3345a872e545bf40ec9801ef0a2980c5ee481cfdefd21ab28c55e2831f15d026",
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.3.14",
           "buildVersion": "232",
           "date": "2026-08-29",
@@ -83,15 +93,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-iOS-v0.3.14-beta.15-ci.ipa",
           "size": 64172346,
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "216",
-          "date": "2026-08-11",
-          "localizedDescription": "0.3.14 Beta 14. The big one since Beta 12. The playback-stability campaign that fixes the Beta 12 constant-buffering regression plus a long list of stalls, freezes, and crashes traced on real Apple devices, a full account and credential security pass, audio and Continue Watching fixes, and deeper diagnostics. In-place update over any earlier build, nothing resets.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.14/VortX-iOS-v0.3.14-beta.14-ci.ipa",
-          "size": 64137204,
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -106,6 +107,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.3.15",
+          "buildVersion": "233",
+          "date": "2026-08-29",
+          "localizedDescription": "VortX 0.3.15 is the cumulative stable release from 0.3.13 through the complete 0.3.14 beta line, with Apple playback reliability, Dolby Vision, subtitles, source controls, watch-state fixes, and production-signed Android Full and Play builds.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.15/VortX-tvOS-v0.3.15-ci.ipa",
+          "size": 64301950,
+          "sha256": "7e4aad49f59db588f7f612795ca5602c6fee8974bd654f2377e73ecd25120628",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.14",
           "buildVersion": "232",
@@ -171,15 +182,6 @@
           "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. On Apple TV a stream that froze mid-play now recovers on its own instead of spinning forever, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. In-place update over any earlier build, nothing resets.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-tvOS-v0.3.14-beta.15-ci.ipa",
           "size": 63601691,
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "216",
-          "date": "2026-08-11",
-          "localizedDescription": "0.3.14 Beta 14. The big one since Beta 12. The playback-stability campaign that fixes the Beta 12 constant-buffering regression on Apple TV plus a long list of stalls, freezes, and crashes traced on real Apple TVs, a full account and credential security pass, audio and Continue Watching fixes, and deeper diagnostics. In-place update over any earlier build, nothing resets.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.14/VortX-tvOS-v0.3.14-beta.14-ci.ipa",
-          "size": 63561827,
           "minOSVersion": "18.0"
         }
       ]
