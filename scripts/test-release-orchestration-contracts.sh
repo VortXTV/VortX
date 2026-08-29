@@ -388,6 +388,46 @@ require_grep "test covers lower-case SHA-256 enforcement" \
 require_grep "test covers tag/versionName coherence" \
     'version mismatch with tag|tag version' "$FEED_TEST"
 
+# --- Contract 6: every workflow-driven publication reaches a read-only verifier ------------------
+# A release published by GITHUB_TOKEN does not emit a recursive release event. The verifier must
+# therefore be a downstream job in the same dispatch run, keyed by the immutable release ID emitted
+# by attach-release. Keep the external release-event path too, but neither verifier path may receive
+# write authority or execute repository-controlled code.
+
+verify_published_block="$(awk '
+    /^  verify-published:$/ { in_job=1 }
+    in_job { print }
+' "$APPLE_RELEASE_WF")"
+[[ -n "$verify_published_block" ]] || fail "Apple published-release verifier job is missing"
+
+grep -Fq 'needs: [attach-release]' <<<"$verify_published_block" \
+    || fail "published-release verifier does not depend on attach-release"
+ok "published-release verifier depends on attach-release"
+grep -Fq 'always()' <<<"$verify_published_block" \
+    || fail "published-release verifier can silently skip after an eligible dispatch publication"
+grep -Fq "github.event_name == 'workflow_dispatch'" <<<"$verify_published_block" \
+    || fail "published-release verifier has no workflow-dispatch path"
+grep -Fq 'inputs.publish_release == true' <<<"$verify_published_block" \
+    || fail "published-release verifier is not gated on actual publication"
+grep -Fq "needs.attach-release.result == 'success'" <<<"$verify_published_block" \
+    || fail "published-release verifier does not require successful publication"
+ok "workflow-driven publication always reaches the downstream verifier after successful attachment"
+grep -Fq "github.event_name == 'release'" <<<"$verify_published_block" \
+    || fail "published-release verifier no longer accepts external published-release events"
+ok "external published-release events retain independent verification"
+require_grep "attach-release exposes immutable release ID to the downstream verifier" \
+    'release_id: \$\{\{ steps\.identity\.outputs\.release_id \}\}' "$APPLE_RELEASE_WF"
+grep -Fq 'needs.attach-release.outputs.release_id' <<<"$verify_published_block" \
+    || fail "downstream verifier does not consume attach-release's immutable release ID"
+ok "downstream verifier consumes the immutable release ID"
+grep -Eq '^    permissions:$' <<<"$verify_published_block" \
+    && grep -Eq '^      contents: read$' <<<"$verify_published_block" \
+    || fail "published-release verifier must hold contents: read only"
+if grep -Eq 'contents:\s*write|actions/checkout' <<<"$verify_published_block"; then
+    fail "published-release verifier has write authority or executes repository code"
+fi
+ok "published-release verifier has least privilege and runs no repository code"
+
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then

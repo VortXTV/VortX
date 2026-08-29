@@ -970,6 +970,8 @@ jobs:
   # It never checks out a branch or executes a repository script with contents:write.
   attach-release:
     needs: [build-tvos]
+    outputs:
+      release_id: ${{ steps.identity.outputs.release_id }}
     if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag)
     concurrency:
       group: vortx-release-${{ inputs.release_tag }}
@@ -1389,12 +1391,22 @@ jobs:
           trap - EXIT
           echo "promoted feed generation $FEED_GENERATION, verified public/raw bytes, then published release $RELEASE_ID and completed read-only postchecks"
 
-  # A published event is verification and recovery only. It is bound to the immutable release ID
-  # from the event payload and never attaches assets, mutates main, promotes a feed, or republishes.
+  # A published release is verification and recovery only. GitHub deliberately suppresses a new
+  # `release: published` event when this workflow publishes with GITHUB_TOKEN, so the dispatch
+  # publication path runs this same read-only verifier downstream from attach-release. External
+  # published-release events continue to use their immutable event payload. Neither path attaches
+  # assets, mutates main, promotes a feed, or republishes.
   verify-published:
-    if: github.event_name == 'release'
+    needs: [attach-release]
+    if: >-
+      always() && (
+        github.event_name == 'release' ||
+        (github.event_name == 'workflow_dispatch' &&
+        inputs.publish_release == true &&
+        needs.attach-release.result == 'success')
+      )
     concurrency:
-      group: vortx-release-verify-${{ github.event.release.id }}
+      group: vortx-release-verify-${{ github.event.release.id || needs.attach-release.outputs.release_id }}
       cancel-in-progress: false
     runs-on: ubuntu-24.04
     permissions:
@@ -1405,8 +1417,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_ID: ${{ github.event.release.id }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ID: ${{ github.event.release.id || needs.attach-release.outputs.release_id }}
+          EVENT_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
@@ -1425,8 +1437,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_ID: ${{ github.event.release.id }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_ID: ${{ github.event.release.id || needs.attach-release.outputs.release_id }}
+          EVENT_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
         run: |
           set -euo pipefail
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
