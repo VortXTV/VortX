@@ -51,6 +51,9 @@ final class UpdateChecker: ObservableObject {
     private var restoredCache = false
     private var monitoringTask: Task<Void, Never>?
     private var didStartMonitoring = false
+    private var isMonitoring = false
+    private var monitoringGeneration: UInt64 = 0
+    private var pendingMonitoringGeneration: UInt64?
     private var lastSuccessfulCheckThisSession: TimeInterval?
     private var automaticCheckFailedThisSession = false
     private let defaults: UserDefaults
@@ -114,18 +117,31 @@ final class UpdateChecker: ObservableObject {
     /// callbacks merely retain the one scheduler and cannot duplicate its request.
     func startMonitoring() {
         restoreCachedReleaseIfNeeded()
+        if !isMonitoring {
+            isMonitoring = true
+            monitoringGeneration &+= 1
+        }
+        let generation = monitoringGeneration
         if !didStartMonitoring {
             didStartMonitoring = true
-            if !isChecking { check(forcePrompt: false) { [weak self] in self?.armScheduledCheck() } }
+            if !isChecking {
+                check(forcePrompt: false) { [weak self] in self?.completeMonitoringCheck(generation) }
+            } else {
+                pendingMonitoringGeneration = generation
+            }
         }
         // While the initial forced fetch is in flight, its completion owns the first deadline. A repeated
         // scene callback must not arm a timer from the previous process's persisted timestamp.
-        else if !isChecking { armScheduledCheck() }
+        else if !isChecking { armScheduledCheck(generation) }
+        else { pendingMonitoringGeneration = generation }
     }
 
     /// Called when a platform scene becomes inactive/backgrounded. Cancelling the task releases the pending
     /// timer promptly; foregrounding may start exactly one new scheduler without changing first-launch semantics.
     func stopMonitoring() {
+        isMonitoring = false
+        monitoringGeneration &+= 1
+        pendingMonitoringGeneration = nil
         monitoringTask?.cancel()
         monitoringTask = nil
     }
@@ -221,15 +237,29 @@ final class UpdateChecker: ObservableObject {
 
     /// Arms one one-shot task. The next deadline is always computed after the prior request finished,
     /// so transport latency cannot turn a one-hour cadence into nearly two hours.
-    private func armScheduledCheck() {
-        guard monitoringTask == nil else { return }
+    private func completeMonitoringCheck(_ generation: UInt64) {
+        guard isMonitoring, generation == monitoringGeneration else {
+            if isMonitoring, pendingMonitoringGeneration == monitoringGeneration {
+                let pending = monitoringGeneration
+                pendingMonitoringGeneration = nil
+                check(forcePrompt: false) { [weak self] in self?.completeMonitoringCheck(pending) }
+            }
+            return
+        }
+        pendingMonitoringGeneration = nil
+        armScheduledCheck(generation)
+    }
+
+    private func armScheduledCheck(_ generation: UInt64) {
+        guard isMonitoring, generation == monitoringGeneration, monitoringTask == nil else { return }
         let delay = nextScheduledDelay()
         let sleeper = self.sleeper
         monitoringTask = Task { [weak self] in
             await sleeper(delay)
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self, self.isMonitoring,
+                  self.monitoringGeneration == generation else { return }
             self.monitoringTask = nil
-            self.checkIfStale { [weak self] in self?.armScheduledCheck() }
+            self.checkIfStale { [weak self] in self?.completeMonitoringCheck(generation) }
         }
     }
 

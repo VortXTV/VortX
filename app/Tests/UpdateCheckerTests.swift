@@ -63,6 +63,32 @@ actor LatencyLoader {
     }
 }
 
+actor GateLoader {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private let gatedCall: Int
+    private let result: (Data, URLResponse)
+    private(set) var calls = 0
+
+    init(_ result: (Data, URLResponse), gatedCall: Int = 1) {
+        self.result = result
+        self.gatedCall = gatedCall
+    }
+
+    func load(_ request: URLRequest) async -> (Data, URLResponse) {
+        calls += 1
+        if calls == gatedCall {
+            await withCheckedContinuation { continuation = $0 }
+        }
+        return result
+    }
+
+    func resumeFirst() {
+        let pending = continuation
+        continuation = nil
+        pending?.resume()
+    }
+}
+
 func response(_ status: Int) -> URLResponse {
     HTTPURLResponse(url: URL(string: "https://api.github.com")!, statusCode: status,
                     httpVersion: nil, headerFields: nil)!
@@ -83,6 +109,13 @@ func waitForCalls(_ loader: ScriptedLoader, _ count: Int) async {
 }
 
 func waitForCalls(_ loader: LatencyLoader, _ count: Int) async {
+    for _ in 0..<100 {
+        if await loader.calls >= count { return }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+}
+
+func waitForCalls(_ loader: GateLoader, _ count: Int) async {
     for _ in 0..<100 {
         if await loader.calls >= count { return }
         try? await Task.sleep(for: .milliseconds(5))
@@ -258,6 +291,68 @@ struct UpdateCheckerTests {
         await failedSleeper.resumeNext() // foreground task
         await waitForCalls(failedLoader, 2)
         check(await failedLoader.calls == 2, "foreground after failed cold launch retries without inheriting the old timestamp")
+
+        // An in-flight initial request cannot re-arm monitoring after the app becomes inactive.
+        let stoppedDefaults = UserDefaults(suiteName: "\(suiteName).stopped")!
+        defer { stoppedDefaults.removePersistentDomain(forName: "\(suiteName).stopped") }
+        let stoppedSleeper = ControlledSleeper()
+        let stoppedLoader = GateLoader((release(build: 233), response(200)))
+        let stopped = await MainActor.run {
+            UpdateChecker(defaults: stoppedDefaults, now: { Date(timeIntervalSince1970: 800_000) },
+                          requestLoader: { request in await stoppedLoader.load(request) },
+                          sleeper: { seconds in await stoppedSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { stopped.startMonitoring() }
+        await waitForCalls(stoppedLoader, 1)
+        await MainActor.run { stopped.stopMonitoring() }
+        await stoppedLoader.resumeFirst()
+        try? await Task.sleep(for: .milliseconds(20))
+        check(await stoppedSleeper.waitingCount == 0, "stop during initial request leaves no stale scheduler")
+
+        // Stop/start while the old generation is in-flight may start one fresh generation after it completes,
+        // but the stale completion cannot create a second timer or replace that newer generation.
+        let restartDefaults = UserDefaults(suiteName: "\(suiteName).restart")!
+        defer { restartDefaults.removePersistentDomain(forName: "\(suiteName).restart") }
+        let restartSleeper = ControlledSleeper()
+        let restartLoader = GateLoader((release(build: 233), response(200)))
+        let restarted = await MainActor.run {
+            UpdateChecker(defaults: restartDefaults, now: { Date(timeIntervalSince1970: 900_000) },
+                          requestLoader: { request in await restartLoader.load(request) },
+                          sleeper: { seconds in await restartSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { restarted.startMonitoring() }
+        await waitForCalls(restartLoader, 1)
+        await MainActor.run { restarted.stopMonitoring(); restarted.startMonitoring() }
+        await restartLoader.resumeFirst()
+        await waitForCalls(restartLoader, 2)
+        await waitForSleeper(restartSleeper, 1)
+        check(await restartSleeper.waitingCount == 1, "stop/start stale completion creates only the new generation scheduler")
+        await MainActor.run { restarted.stopMonitoring() }
+        await restartSleeper.resumeNext()
+
+        // The same invalidation applies to an in-flight scheduled request, not just the launch request.
+        let scheduledStopDefaults = UserDefaults(suiteName: "\(suiteName).scheduled-stop")!
+        defer { scheduledStopDefaults.removePersistentDomain(forName: "\(suiteName).scheduled-stop") }
+        let scheduledStopSleeper = ControlledSleeper()
+        let scheduledStopLoader = GateLoader((release(build: 233), response(200)), gatedCall: 2)
+        let scheduledStopClock = TestClock(1_000_000)
+        let scheduledStop = await MainActor.run {
+            UpdateChecker(defaults: scheduledStopDefaults, now: { scheduledStopClock.date() },
+                          requestLoader: { request in await scheduledStopLoader.load(request) },
+                          sleeper: { seconds in await scheduledStopSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { scheduledStop.startMonitoring() }
+        await waitForSleeper(scheduledStopSleeper, 1)
+        scheduledStopClock.seconds += 3_600
+        await scheduledStopSleeper.resumeNext()
+        await waitForCalls(scheduledStopLoader, 2)
+        await MainActor.run { scheduledStop.stopMonitoring() }
+        await scheduledStopLoader.resumeFirst()
+        try? await Task.sleep(for: .milliseconds(20))
+        check(await scheduledStopSleeper.waitingCount == 0, "stop during scheduled request leaves no replacement scheduler")
 
         exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE)
     }
