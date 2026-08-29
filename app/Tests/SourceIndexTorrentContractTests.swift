@@ -2327,6 +2327,62 @@ struct SourceIndexTorrentContractTests {
                && secondLaunch.map(\.id) == [secondHash],
                "empty duplicates consume no slot and launch-time pacing stays global")
 
+        let circuitPacer = SourceUploadCoordinator(maxEntries: 10)
+        let circuitLifecycle = SourceIndexLifecycleSnapshot(
+            sourceGeneration: 7,
+            sessionGeneration: 8,
+            consentGeneration: 9
+        )
+        let circuitFirst = await circuitPacer.reserve(
+            contentID: "tt1234567", descriptors: [firstDescriptor], lifecycle: circuitLifecycle
+        )
+        let circuitQueued = await circuitPacer.reserve(
+            contentID: "tt1234567", descriptors: [secondDescriptor], lifecycle: circuitLifecycle
+        )
+        if let circuitFirst {
+            _ = await circuitPacer.prepareLaunch(
+                circuitFirst, nowNanoseconds: 10_000, intervalNanoseconds: 1_100
+            )
+        }
+        let circuitQueueDelay: UInt64?
+        if let circuitQueued {
+            circuitQueueDelay = waitDelay(await circuitPacer.prepareLaunch(
+                circuitQueued, nowNanoseconds: 10_000, intervalNanoseconds: 1_100
+            ))
+        } else { circuitQueueDelay = nil }
+        if let circuitFirst {
+            _ = await circuitPacer.finishAttempt(
+                circuitFirst,
+                result: .authorizationRejected,
+                nowNanoseconds: 10_100,
+                retryPolicy: SourceContributionRetryPolicy(
+                    maximumAttempts: 3,
+                    baseDelayNanoseconds: 1_100,
+                    maximumDelayNanoseconds: 4_400,
+                    jitterRangePermille: 0
+                )
+            )
+        }
+        let launchAfterAuthenticationRejection: SourceUploadCoordinator.LaunchDecision
+        if let circuitQueued {
+            launchAfterAuthenticationRejection = await circuitPacer.prepareLaunch(
+                circuitQueued, nowNanoseconds: 11_100, intervalNanoseconds: 1_100
+            )
+        } else { launchAfterAuthenticationRejection = .unavailable }
+        let releasedForNextLifecycle = await circuitPacer.reserve(
+            contentID: "tt1234567",
+            descriptors: [secondDescriptor],
+            lifecycle: SourceIndexLifecycleSnapshot(
+                sourceGeneration: 8,
+                sessionGeneration: 8,
+                consentGeneration: 9
+            )
+        )
+        expect(circuitQueueDelay == 1_100
+               && isUnavailable(launchAfterAuthenticationRejection)
+               && releasedForNextLifecycle != nil,
+               "authentication rejection cancels an already-reserved paced POST before launch")
+
         let closingPacer = SourceUploadCoordinator(maxEntries: 10)
         let closingFirst = await closingPacer.reserve(
             contentID: "tt1234567", descriptors: [firstDescriptor]

@@ -1859,6 +1859,13 @@ actor SourceUploadCoordinator {
             return .unavailable
         }
         guard var stored = reservations[reservation.id], !stored.inFlight else { return .unavailable }
+        // A sibling request can reject the shared authorization while this reservation is sleeping behind the
+        // global pacing boundary. Recheck the circuit at the actual launch edge so already-reserved work cannot
+        // escape after a 401/403 or protocol rejection. Releasing here also lets a later lifecycle reserve it.
+        if circuitLifecycle == stored.lifecycle {
+            release(reservation)
+            return .unavailable
+        }
         let notBefore = max(
             nextPostNanoseconds ?? nowNanoseconds,
             stored.retryNotBeforeNanoseconds ?? nowNanoseconds
