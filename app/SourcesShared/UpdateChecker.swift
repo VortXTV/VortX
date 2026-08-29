@@ -51,6 +51,8 @@ final class UpdateChecker: ObservableObject {
     private var restoredCache = false
     private var monitoringTask: Task<Void, Never>?
     private var didStartMonitoring = false
+    private var lastSuccessfulCheckThisSession: TimeInterval?
+    private var automaticCheckFailedThisSession = false
     private let defaults: UserDefaults
     private let now: @Sendable () -> Date
     private let requestLoader: RequestLoader
@@ -66,6 +68,7 @@ final class UpdateChecker: ObservableObject {
     /// This is deliberately much shorter than a day because sideloaded installs have no store daemon to
     /// surface a release on our behalf.
     private static let automaticInterval: TimeInterval = 3600
+    private static let retryInterval: TimeInterval = 60
 
     /// Injectable dependencies keep the updater testable without a real bundle, wall clock, or GitHub call.
     /// Shipping targets use the defaults.
@@ -113,17 +116,11 @@ final class UpdateChecker: ObservableObject {
         restoreCachedReleaseIfNeeded()
         if !didStartMonitoring {
             didStartMonitoring = true
-            if !isChecking { check(forcePrompt: false) }
+            if !isChecking { check(forcePrompt: false) { [weak self] in self?.armScheduledCheck() } }
         }
-        guard monitoringTask == nil else { return }
-        let sleeper = self.sleeper
-        monitoringTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await sleeper(Self.automaticInterval)
-                guard !Task.isCancelled, let self else { return }
-                self.checkIfStale()
-            }
-        }
+        // While the initial forced fetch is in flight, its completion owns the first deadline. A repeated
+        // scene callback must not arm a timer from the previous process's persisted timestamp.
+        else if !isChecking { armScheduledCheck() }
     }
 
     /// Called when a platform scene becomes inactive/backgrounded. Cancelling the task releases the pending
@@ -144,28 +141,34 @@ final class UpdateChecker: ObservableObject {
     /// automatic request and uses the fixed hourly gate, even when an older caller supplies a shorter age.
     /// A failed request is intentionally not timestamped: it must be retried the next time the shell becomes
     /// active, while `isChecking` keeps repeated appearance notifications single-flight.
-    func checkIfStale(maxAge: TimeInterval = 3600) {
+    func checkIfStale(maxAge: TimeInterval = 3600, onFinish: (() -> Void)? = nil) {
         restoreCachedReleaseIfNeeded()
         if maxAge <= 0 {
             if isChecking {
                 manualCheckPending = true
             } else {
-                check(forcePrompt: true)
+                check(forcePrompt: true, onFinish: onFinish)
             }
             return
         }
 
         let currentTime = now().timeIntervalSince1970
         let last = defaults.double(forKey: Self.lastCheckedKey)
-        guard currentTime - last >= Self.automaticInterval, !isChecking else { return }
-        check(forcePrompt: false)
+        // A timestamp from a previous process is not a successful result for this one. Once this session has
+        // failed its forced cold-launch request, its short retry loop must bypass that inherited timestamp.
+        guard (automaticCheckFailedThisSession || currentTime - last >= Self.automaticInterval), !isChecking else {
+            onFinish?()
+            return
+        }
+        check(forcePrompt: false, onFinish: onFinish)
     }
 
-    private func check(forcePrompt: Bool) {
+    private func check(forcePrompt: Bool, onFinish: (() -> Void)? = nil) {
         isChecking = true
         Task { [weak self] in
             guard let self else { return }
-            defer { self.finishCheck() }
+            var succeeded = false
+            defer { self.finishCheck(success: succeeded, forcePrompt: forcePrompt, onFinish: onFinish) }
             guard let url = URL(string: Self.releasesURL) else { return }
             var request = URLRequest(url: url)
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -180,6 +183,8 @@ final class UpdateChecker: ObservableObject {
             // Persist a check only after transport, status, and payload decoding all succeeded. Recording
             // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
             self.defaults.set(self.now().timeIntervalSince1970, forKey: Self.lastCheckedKey)
+            self.lastSuccessfulCheckThisSession = self.now().timeIntervalSince1970
+            succeeded = true
 
             guard let latest = releases
                 .filter({ !$0.draft && $0.publishedAt != nil })
@@ -205,11 +210,34 @@ final class UpdateChecker: ObservableObject {
         }
     }
 
-    private func finishCheck() {
+    private func finishCheck(success: Bool, forcePrompt: Bool, onFinish: (() -> Void)?) {
         isChecking = false
+        if !forcePrompt { automaticCheckFailedThisSession = !success }
+        onFinish?()
         guard manualCheckPending else { return }
         manualCheckPending = false
         check(forcePrompt: true)
+    }
+
+    /// Arms one one-shot task. The next deadline is always computed after the prior request finished,
+    /// so transport latency cannot turn a one-hour cadence into nearly two hours.
+    private func armScheduledCheck() {
+        guard monitoringTask == nil else { return }
+        let delay = nextScheduledDelay()
+        let sleeper = self.sleeper
+        monitoringTask = Task { [weak self] in
+            await sleeper(delay)
+            guard !Task.isCancelled, let self else { return }
+            self.monitoringTask = nil
+            self.checkIfStale { [weak self] in self?.armScheduledCheck() }
+        }
+    }
+
+    private func nextScheduledDelay() -> TimeInterval {
+        if let successful = lastSuccessfulCheckThisSession {
+            return max(0, successful + Self.automaticInterval - now().timeIntervalSince1970)
+        }
+        return automaticCheckFailedThisSession ? Self.retryInterval : Self.automaticInterval
     }
 
     private func restoreCachedReleaseIfNeeded() {

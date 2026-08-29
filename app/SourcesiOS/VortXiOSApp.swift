@@ -116,7 +116,7 @@ struct VortXiOSApp: App {
                     @unknown default: break
                     }
                     if phase == .active {
-                        UpdateChecker.shared.checkIfStale()
+                        UpdateChecker.shared.startMonitoring()
                         // RemoteConfig had NO foreground pull: `refreshIfForegroundDue` existed with zero
                         // call sites anywhere in the repo, so the only refreshes were the cold-launch fetch
                         // and the 6-hourly periodic Task, whose sleep does not advance while the process is
@@ -148,6 +148,8 @@ struct VortXiOSApp: App {
                             VortXSyncManager.shared.requestSyncSoon()     // then push THIS device's state (incl. the library + add-ons mirror) so the web dashboard repopulates on open, not only on background
                         }
                         VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
+                    } else {
+                        UpdateChecker.shared.stopMonitoring()
                     }
                     if phase == .background {
                         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
