@@ -38,10 +38,12 @@ struct SearchView: View {
                         .buttonStyle(ChipButtonStyle(selected: false))
                         .sheet(isPresented: $showOpenLink) { OpenLinkView() }
 
+                        #if !VORTX_NO_EMBEDDED_SERVER
                         NavigationLink { DebridLibraryView() } label: {
                             Label("Debrid Cloud", systemImage: "cloud")
                         }
                         .buttonStyle(ChipButtonStyle(selected: false))
+                        #endif
                     }
                     .focusSection()
                 }

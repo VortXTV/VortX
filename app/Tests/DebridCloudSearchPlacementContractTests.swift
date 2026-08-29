@@ -58,6 +58,8 @@ require(iosSearch.contains("ViewThatFits(in: .horizontal)"),
 let tvSearch = source("app/SourcesTV/SearchView.swift")
 require(containsInOrder(tvSearch, ["Button { showOpenLink = true }", "NavigationLink { DebridLibraryView() }"]),
         "Apple TV Search places Debrid Cloud beside Play Link")
+require(tvSearch.contains("#if !VORTX_NO_EMBEDDED_SERVER"),
+        "Apple TV Lite excludes the Debrid Cloud destination that is not in its target sources")
 require(tvSearch.contains(".focusSection()"), "Apple TV action row participates in remote focus")
 
 let settings = source("app/SourcesiOS/iOSSettingsView.swift")
