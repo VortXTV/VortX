@@ -2532,7 +2532,6 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
         }
 
-        let AVERROR_EOF_CONST: Int32 = -541478725
         var readRetries = 0
         let maxReadRetries = 4
         // One-shot startup diagnostic (#134): the stalled-mount logs froze with produced at a few KB and NO
@@ -2542,18 +2541,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // that takes pathologically long so the next diagnostics export separates "source went quiet"
         // (network) from "muxer wedged" (code) in one line. Date() twice per read until it fires, then free.
         var slowReadLogged = false
-        // B5 phase 1: arm the input-liveness watchdog for THIS loop only. It soft-interrupts a
-        // byte-flat parked read past the policy threshold into the same reconnect/retry ladder a
-        // natural rw_timeout expiry takes, five seconds sooner.
-        interruptCell.pointee.readLoopActive = 1
-        VortXRemuxInputLivenessWatchdog.startDetached(interruptCell: interruptCell)
-        while !isCancelled {
+        // Do not proactively interrupt a quiet read. FFmpeg's HTTP protocol owns stall recovery through
+        // rw_timeout + reconnect. Returning AVERROR_EXIT from our callback bypasses that reconnect path and
+        // leaves the AVIOContext's error sticky, so only hard cancellation may trip the callback.
+        readLoop: while !isCancelled {
             if let starve = hlsInitStarved() { buffer.fail(starve); return }
             let readBegan = slowReadLogged ? nil : Date()
             let rf = av_read_frame(inCtx, pkt)
-            // The read returned (normally, soft-kicked, or timed out): stand down any pending kick so
-            // the next blocked read earns a fresh watchdog window instead of an instant re-abort.
-            interruptCell.pointee.softInterrupt = 0
             if let readBegan {
                 let took = Date().timeIntervalSince(readBegan)
                 if took > 3.0 {
@@ -2562,11 +2556,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 }
             }
             if rf < 0 {
-                if rf == AVERROR_EOF_CONST {
-                    interruptCell.pointee.readLoopActive = 0   // disarm the liveness watchdog
+                switch VortXRemuxReadFailurePolicy.classify(
+                    readResult: rf,
+                    isCancelled: isCancelled
+                ) {
+                case .endOfFile:
+                    break readLoop   // genuine EOF: write the trailer + finish() below
+                case .cancelled:
+                    break readLoop
+                case .unexpectedInterrupt:
+                    // AVERROR_EXIT without our cancellation flag is not a retryable CDN error. Retrying the
+                    // same poisoned AVIOContext hot-loops the same sticky result and cannot reconnect.
+                    buffer.fail("source read interrupted unexpectedly (rc=\(rf))")
+                    return
+                case .sourceError:
                     break
-                }   // genuine EOF: write the trailer + finish() below
-                if isCancelled { break }
+                }
                 // A debrid CDN stall/drop mid-stream (rw_timeout rc=-60, or EIO) returns a non-EOF error. The
                 // reconnect flags re-establish the connection, so RETRY the read a few times before giving up,
                 // rather than failing on the first stall - libmpv tolerates the same chunked/slow debrid delivery
@@ -5815,15 +5820,6 @@ private struct VortXRemuxInputProbeCell {
     /// High-water mark of `AVIOContext.bytes_read` on the input. Non-zero proves the socket delivered payload,
     /// which is the one fact that separates a dead upstream from a slow one during the open.
     var inputBytesRead: Int64 = 0
-    /// 1 while the producer's post-open packet READ LOOP is running (B5 phase 1). Only this phase may be
-    /// soft-interrupted: the cold/warm open legitimately sits silent far longer, and `openInFlight`
-    /// already protects it. Set entering the read loop, never cleared (cancel ends the episode).
-    var readLoopActive: Int32 = 0
-    /// Set by the input-liveness watchdog once delivery has been byte-flat for its fire threshold while
-    /// the read loop is live. The interrupt callback returns it, so the parked `av_read_frame` aborts
-    /// into the existing reconnect/retry ladder instead of waiting out the full rw_timeout. Cleared by
-    /// the producer immediately after every `av_read_frame` return.
-    var softInterrupt: Int32 = 0
 }
 
 /// F1 interrupt callback for the remux INPUT context. libav polls this while blocked in a network
@@ -5846,8 +5842,7 @@ private func vortxRemuxInterruptCallback(_ opaque: UnsafeMutableRawPointer?) -> 
             if read > cell.pointee.inputBytesRead { cell.pointee.inputBytesRead = read }
         }
     }
-    if cell.pointee.cancel != 0 { return 1 }
-    return cell.pointee.softInterrupt
+    return cell.pointee.cancel != 0 ? 1 : 0
 }
 
 /// AVERROR_HTTP_BAD_REQUEST = -FFERRTAG(0xF8,'4','0','0') = -808465656: a transient HTTP 400 a still-warming
@@ -5886,65 +5881,4 @@ final class ManagedAtomicFlag: @unchecked Sendable {
     private let lock = NSLock()
     func set() { lock.lock(); value = true; lock.unlock() }
     func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
-}
-
-/// B5 phase 1: samples the input probe cell once per second and soft-interrupts a byte-flat read once
-/// delivery has been silent past the policy threshold, cutting the dead air of an upstream stall from
-/// the full rw_timeout (10s) to the fire threshold (5s) on the SAME recovery path. All state lives on
-/// this watchdog's own serial task; the only cross-thread touch is the plain Int32 `softInterrupt`
-/// store into the probe cell, the same single-word discipline every other cell field already uses.
-/// The task ends itself when cancellation trips or the producer disarms `readLoopActive`, so no
-/// explicit stop plumbing is needed on any of the loop's exit paths.
-private final class VortXRemuxInputLivenessWatchdog: @unchecked Sendable {
-    private let cell: UnsafeMutablePointer<VortXRemuxInputProbeCell>
-    private var watchedBytes: Int64 = 0
-    private var blockedSinceUptime: Double?
-    /// One kick per flat episode: after firing, hold until bytes move again or the flag is consumed,
-    /// so a reconnect handshake in progress is never double-aborted.
-    private var firedThisEpisode = false
-
-    private init(interruptCell: UnsafeMutablePointer<VortXRemuxInputProbeCell>) {
-        self.cell = interruptCell
-    }
-
-    static func startDetached(interruptCell: UnsafeMutablePointer<VortXRemuxInputProbeCell>) {
-        let watchdog = VortXRemuxInputLivenessWatchdog(interruptCell: interruptCell)
-        Task.detached(priority: .utility) {
-            await watchdog.run()
-        }
-    }
-
-    func run() async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(VortXRemuxReadLivenessPolicy.pollIntervalSeconds))
-            if Task.isCancelled { return }
-            let c = cell.pointee
-            if c.cancel != 0 || c.readLoopActive == 0 { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            if c.inputBytesRead > watchedBytes {
-                // Delivery moved since the last tick: the line is alive again, so a LATER stall
-                // earns its own kick.
-                firedThisEpisode = false
-            }
-            if c.softInterrupt != 0 || firedThisEpisode {
-                // Kick already outstanding or fired for this episode: hold the clock flat-steady.
-                continue
-            }
-            let verdict = VortXRemuxReadLivenessPolicy.sample(
-                bytesRead: c.inputBytesRead,
-                readLoopActive: true,
-                cancelled: false,
-                watchedBytes: watchedBytes,
-                blockedSinceUptime: blockedSinceUptime,
-                nowUptime: now)
-            watchedBytes = verdict.watchedBytes
-            blockedSinceUptime = verdict.blockedSinceUptime
-            if verdict.fire {
-                firedThisEpisode = true
-                cell.pointee.softInterrupt = 1
-                DiagnosticsLog.log("dv", "input quiet \(Int(VortXRemuxReadLivenessPolicy.flatDeliveryFireSeconds))s with zero delivered bytes -> soft-interrupting the parked read into reconnect")
-                VXProbe.log("dv", "input flat -> proactive reconnect kick")
-            }
-        }
-    }
 }
