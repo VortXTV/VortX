@@ -28,7 +28,10 @@ import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.BadSourceAutoRetrySetting
+import com.vortx.android.player.MpvEngineFactory
+import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
+import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
@@ -95,6 +98,16 @@ fun TvApp(
         // with the player, exactly as the phone shell keys [PlayerScreen] off its own `playing` slot.
         var playing by remember { mutableStateOf<Playable?>(null) }
         var playingMeta by remember { mutableStateOf<MetaDetail?>(null) }
+        var playingEngineOverride by remember {
+            mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
+        }
+        val automaticEngineFor: (Playable) -> PlayerEngineRouter.Override = { candidate ->
+            PlayerLaunchPolicy.effectivePreference(
+                requested = PlayerEngineRouter.Override.AUTO,
+                playable = candidate,
+                mpvAvailable = MpvEngineFactory.isBundled,
+            )
+        }
 
         LaunchedEffect(deepLinkEvent) {
             val event = deepLinkEvent ?: return@LaunchedEffect
@@ -214,6 +227,7 @@ fun TvApp(
             }
             PlayerScreen(
                 playable = playable,
+                engineOverride = playingEngineOverride,
                 sourceOptions = playerSourceOptions,
                 qualityOptions = playerQualityOptions,
                 episodeOptions = playerEpisodeOptions,
@@ -286,7 +300,12 @@ fun TvApp(
                         viewModel = detailVm,
                         title = current.name,
                         onBack = { detail = null },
-                        onPlay = { resolved, loadedMeta ->
+                        onPlay = { resolved, loadedMeta, requestedEngine ->
+                            playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                requested = requestedEngine,
+                                playable = resolved,
+                                mpvAvailable = MpvEngineFactory.isBundled,
+                            )
                             playingMeta = loadedMeta
                             playing = resolved
                         },
@@ -315,6 +334,7 @@ fun TvApp(
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
                     // local file, not a previous title's badges.
                     onPlayLocal = {
+                        playingEngineOverride = automaticEngineFor(it)
                         playingMeta = null
                         playing = it
                     },

@@ -271,7 +271,13 @@ fun PlayerChrome(
 ) {
     // Which selection sheet (if any) is open. Local to the chrome; the engine never sees it.
     var openSheet by remember(playable.url, playbackSessionRevision) { mutableStateOf(ControlSheet.NONE) }
-    val sourceChoices = remember(sourceOptions, currentSource) { playerSourceChoices(sourceOptions, currentSource) }
+    // Session-only source hint, deliberately separate from [trackPrefs]. It reorders release-name metadata in
+    // Sources but never writes the user's preferred audio language or selects an engine track. The live engine's
+    // [PlayerState.audioTracks] remains the authority once a source mounts.
+    var sourceAudioLanguageHint by remember { mutableStateOf<String?>(null) }
+    val sourceChoices = remember(sourceOptions, currentSource, sourceAudioLanguageHint) {
+        playerSourceChoices(sourceOptions, currentSource, sourceAudioLanguageHint)
+    }
     val qualityChoices = remember(qualityOptions, currentSource) { playerQualityChoices(qualityOptions, currentSource) }
     val episodeChoices = remember(episodeOptions, playable.mediaRef) {
         playerEpisodeChoices(episodeOptions, playable.mediaRef)
@@ -311,6 +317,7 @@ fun PlayerChrome(
         TrackPreferencesStore(context.applicationContext, PerformanceMode.isConstrainedDevice(context))
     }
     var trackPrefs by remember { mutableStateOf(trackStore.current) }
+    val engineChoices = remember { PlayerLaunchPolicy.choices(MpvEngineFactory.isBundled) }
 
     // WHY audit 07.5: only query the community pool when embedded + add-on choices are thin. IMDb is the
     // authority; the visible title/year and URL filename are soft release hints for fingerprint matching.
@@ -517,6 +524,33 @@ fun PlayerChrome(
             ControlSheet.SOURCES -> ControlSelectionSheet(
                 title = sourcesTitle,
                 options = buildList {
+                    // Apple TV parity: Sources starts with the Quality drill-in, then the session-only
+                    // release-metadata audio hint, then the matching/re-ranked source rows.
+                    add(
+                        SheetOption(
+                            label = qualityTitle,
+                            selected = false,
+                            detail = when (qualityChoices.size) {
+                                0 -> "Unavailable"
+                                1 -> "${qualityChoices.first().label} only"
+                                else -> "${qualityChoices.size} options ›"
+                            },
+                            enabled = !sourceSwitching && qualityChoices.isNotEmpty(),
+                            dismissOnPick = false,
+                            onPick = { openSheet = ControlSheet.QUALITY },
+                        ),
+                    )
+                    add(
+                        SheetOption(
+                            label = "Audio language",
+                            selected = sourceAudioLanguageHint != null,
+                            detail = sourceAudioLanguageHint?.let(::sourceLanguageLabel)?.plus(" ›") ?: "Auto ›",
+                            enabled = !sourceSwitching,
+                            dismissOnPick = false,
+                            onPick = { openSheet = ControlSheet.SOURCE_AUDIO },
+                        ),
+                    )
+                    add(SheetOption(sourcesTitle, false, enabled = false, isHeader = true))
                     if (sourceSwitching) {
                         add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
                     } else if (sourceSwitchError != null) {
@@ -539,6 +573,41 @@ fun PlayerChrome(
                                 isChoice = true,
                                 dismissOnPick = false,
                                 onPick = { onSwitchSource(choice.source) },
+                            ),
+                        )
+                    }
+                },
+                emberAccent = emberAccent,
+                onDismiss = { openSheet = ControlSheet.NONE },
+            )
+            ControlSheet.SOURCE_AUDIO -> ControlSelectionSheet(
+                title = "Source audio language",
+                options = buildList {
+                    add(
+                        SheetOption(
+                            label = "Auto",
+                            detail = "Use normal source ranking",
+                            selected = sourceAudioLanguageHint == null,
+                            isChoice = true,
+                            dismissOnPick = false,
+                            onPick = {
+                                sourceAudioLanguageHint = null
+                                openSheet = ControlSheet.SOURCES
+                            },
+                        ),
+                    )
+                    TrackPreferences.commonLanguages.forEach { (code, label) ->
+                        add(
+                            SheetOption(
+                                label = label,
+                                detail = "Release-name hint",
+                                selected = sourceAudioLanguageHint == code,
+                                isChoice = true,
+                                dismissOnPick = false,
+                                onPick = {
+                                    sourceAudioLanguageHint = code
+                                    openSheet = ControlSheet.SOURCES
+                                },
                             ),
                         )
                     }
@@ -1079,14 +1148,14 @@ fun PlayerChrome(
             )
             ControlSheet.ENGINE -> ControlSelectionSheet(
                 title = "Player Engine",
-                options = ENGINE_CHOICES.map { (pref, label, detail) ->
+                options = engineChoices.map { choice ->
                     SheetOption(
-                        label = label,
-                        detail = detail,
-                        selected = enginePreference == pref,
+                        label = choice.label,
+                        detail = choice.detail,
+                        selected = enginePreference == choice.preference,
                         isChoice = true,
                         dismissOnPick = false,
-                        onPick = { onSelectEnginePreference(pref) },
+                        onPick = { onSelectEnginePreference(choice.preference) },
                     )
                 },
                 emberAccent = emberAccent,
@@ -1214,6 +1283,7 @@ private fun nextChapterTargetMs(chapters: List<PlayerChapter>, positionMs: Long)
 private enum class ControlSheet {
     NONE,
     SOURCES,
+    SOURCE_AUDIO,
     QUALITY,
     EPISODES,
     VIDEO,
@@ -1248,15 +1318,6 @@ private val VIDEO_SCALE_MODES: List<Triple<VideoScaleMode, String, String>> = li
 
 /// Sleep-timer minute presets, matching the Apple player's set.
 private val SLEEP_TIMER_MINUTES: List<Int> = listOf(15, 30, 45, 60, 90)
-
-/// Engine-picker choices for the ENGINE sheet (tri-state auto / mpv / ExoPlayer). "Dolby Vision Player" is
-/// the user-facing name for the ExoPlayer engine, matching the chrome's other mpv-only "unavailable on the
-/// Dolby Vision player" copy.
-private val ENGINE_CHOICES: List<Triple<PlayerEngineRouter.Override, String, String>> = listOf(
-    Triple(PlayerEngineRouter.Override.AUTO, "Automatic", "recommended"),
-    Triple(PlayerEngineRouter.Override.MPV, "VortX Player", "all formats, styled subtitles"),
-    Triple(PlayerEngineRouter.Override.EXOPLAYER, "Dolby Vision Player", "Dolby Vision, HLS"),
-)
 
 /// The playback-speed presets offered in the speed sheet.
 private val SPEED_PRESETS = listOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)
@@ -1317,6 +1378,9 @@ private fun preferredLanguageDetail(languages: List<String>): String {
     val code = languages.firstOrNull() ?: return ""
     return TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second ?: code.uppercase()
 }
+
+private fun sourceLanguageLabel(code: String): String =
+    TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second ?: code.uppercase()
 
 /// The TV per-stream share overlay: a full-screen QR of [link] (a magnet for a torrent, else the raw stream
 /// URL) so a viewer can hand the exact stream to their phone. The 10-foot analogue of Apple's `StreamLinkQR`.

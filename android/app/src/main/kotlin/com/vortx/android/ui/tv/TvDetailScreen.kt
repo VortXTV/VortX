@@ -19,6 +19,8 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -41,6 +43,10 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.player.MpvEngineFactory
+import com.vortx.android.player.PlayerEngineRouter
+import com.vortx.android.player.PlayerLaunchChoice
+import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.catalog.CollectionClient
 import com.vortx.android.catalog.DiscoverRegion
 import com.vortx.android.catalog.FinancialsClient
@@ -112,7 +118,7 @@ fun TvDetailScreen(
     viewModel: DetailViewModel,
     title: String,
     onBack: () -> Unit,
-    onPlay: (Playable, MetaDetail) -> Unit,
+    onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
     modifier: Modifier = Modifier,
     onOpenTitle: (MetaItem) -> Unit = {},
 ) {
@@ -120,6 +126,15 @@ fun TvDetailScreen(
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
+    val launchPlayerChoices = remember { PlayerLaunchPolicy.choices(MpvEngineFactory.isBundled) }
+    var launchEnginePreference by remember {
+        mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
+    }
+    var pendingLaunchEnginePreference by remember { mutableStateOf(launchEnginePreference) }
+    val beginPlayback: (() -> Unit) -> Unit = { action ->
+        pendingLaunchEnginePreference = launchEnginePreference
+        action()
+    }
 
     BackHandler { onBack() }
 
@@ -127,7 +142,7 @@ fun TvDetailScreen(
     // playback latch, mirroring the phone DetailScreen exactly.
     LaunchedEffect(playback, metaState) {
         val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
-        onPlay(resolved.playable, resolved.metadata)
+        onPlay(resolved.playable, resolved.metadata, pendingLaunchEnginePreference)
         viewModel.clearPlayback()
     }
 
@@ -142,6 +157,10 @@ fun TvDetailScreen(
                 streamsState = streamsState,
                 playback = playback,
                 watchlisted = watchlisted,
+                launchPlayerChoices = launchPlayerChoices,
+                launchEnginePreference = launchEnginePreference,
+                onSelectLaunchEngine = { launchEnginePreference = it },
+                beginPlayback = beginPlayback,
                 onOpenTitle = onOpenTitle,
             )
         }
@@ -155,6 +174,10 @@ private fun TvDetailContent(
     streamsState: UiState<List<com.vortx.android.model.StreamGroup>>,
     playback: Playback,
     watchlisted: Boolean,
+    launchPlayerChoices: List<PlayerLaunchChoice>,
+    launchEnginePreference: PlayerEngineRouter.Override,
+    onSelectLaunchEngine: (PlayerEngineRouter.Override) -> Unit,
+    beginPlayback: (() -> Unit) -> Unit,
     onOpenTitle: (MetaItem) -> Unit,
 ) {
     val context = LocalContext.current
@@ -313,7 +336,7 @@ private fun TvDetailContent(
                     TvPlayButton(
                         label = if (resolving) "Starting…" else if (isResume) "Resume" else "Watch",
                         enabled = hasSources && !resolving,
-                        onClick = { viewModel.playBest() },
+                        onClick = { beginPlayback { viewModel.playBest() } },
                         focusRequester = playFocus,
                     )
                     if (resolving) {
@@ -342,7 +365,7 @@ private fun TvDetailContent(
                             TvFilterChip(
                                 label = "Trailer",
                                 selected = false,
-                                onClick = { viewModel.playTrailer() },
+                                onClick = { beginPlayback { viewModel.playTrailer() } },
                                 modifier = trailerModifier,
                             )
                         }
@@ -353,6 +376,13 @@ private fun TvDetailContent(
                             selected = detail.libraryItem?.savedToLibrary == true,
                             onClick = viewModel::toggleLibrary,
                             modifier = saveModifier,
+                        )
+                    }
+                    item {
+                        TvDetailPlayerChoiceChip(
+                            choices = launchPlayerChoices,
+                            selected = launchEnginePreference,
+                            onSelect = onSelectLaunchEngine,
                         )
                     }
                     if (WatchlistStore.isSafeId(detail.id)) {
@@ -417,7 +447,7 @@ private fun TvDetailContent(
                     onSortChange = viewModel::setSourceSort,
                     pin = pinUi,
                     entryNoun = viewModel.pinEntryNoun,
-                    onPlay = viewModel::play,
+                    onPlay = { source -> beginPlayback { viewModel.play(source) } },
                     onDownload = viewModel::download,
                     onPin = viewModel::pinSource,
                     onUnpin = viewModel::unpinSource,
@@ -531,6 +561,51 @@ private fun TvDetailContent(
     }
 }
 
+/** D-pad player picker. It is an additive secondary chip, so the established Trailer/Save focus target stays. */
+@Composable
+private fun TvDetailPlayerChoiceChip(
+    choices: List<PlayerLaunchChoice>,
+    selected: PlayerEngineRouter.Override,
+    onSelect: (PlayerEngineRouter.Override) -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val current = choices.firstOrNull { it.preference == selected } ?: choices.first()
+    Box {
+        TvFilterChip(
+            label = "Player · ${current.label}",
+            selected = selected != PlayerEngineRouter.Override.AUTO,
+            stateDescription = "Selected player: ${current.label}. Applies to this launch only.",
+            onClick = { menuOpen = true },
+        )
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            choices.forEach { choice ->
+                DropdownMenuItem(
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = if (choice.preference == selected) {
+                                    "${choice.label} · Selected"
+                                } else {
+                                    choice.label
+                                },
+                                style = VortXTheme.type.label,
+                            )
+                            Text(
+                                text = choice.detail,
+                                style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+                            )
+                        }
+                    },
+                    onClick = {
+                        onSelect(choice.preference)
+                        menuOpen = false
+                    },
+                )
+            }
+        }
+    }
+}
+
 /// Loading state for the detail page: the title the browse wall already knew (so the page has an identity
 /// the instant it opens) over the spinner, instead of a bare spinner while `meta_details` resolves.
 @Composable
@@ -550,4 +625,3 @@ private fun TvDetailLoading(title: String) {
         CircularProgressIndicator(color = colors.accent)
     }
 }
-

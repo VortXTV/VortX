@@ -81,6 +81,10 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
+import com.vortx.android.player.MpvEngineFactory
+import com.vortx.android.player.PlayerEngineRouter
+import com.vortx.android.player.PlayerLaunchChoice
+import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.metadata.PosterArtwork
 import com.vortx.android.metadata.rememberBackdropTint
 import com.vortx.android.ratings.MdbListClient
@@ -146,7 +150,7 @@ fun DetailScreen(
     viewModel: DetailViewModel,
     title: String,
     onBack: () -> Unit,
-    onPlay: (Playable, MetaDetail) -> Unit,
+    onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
@@ -377,11 +381,24 @@ fun DetailScreen(
         }
     }
 
+    // Per-title, per-launch player selection. It is local Compose state only: no settings store is touched.
+    // [pendingLaunchEnginePreference] freezes the choice at the initiating tap, so changing the menu while a
+    // source resolves cannot silently retarget that already-started launch.
+    val launchPlayerChoices = remember { PlayerLaunchPolicy.choices(MpvEngineFactory.isBundled) }
+    var launchEnginePreference by remember {
+        mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
+    }
+    var pendingLaunchEnginePreference by remember { mutableStateOf(launchEnginePreference) }
+    val beginPlayback: (() -> Unit) -> Unit = { action ->
+        pendingLaunchEnginePreference = launchEnginePreference
+        action()
+    }
+
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
     LaunchedEffect(playback, metaState) {
         val resolved = resolvedDetailPlayback(playback, metaState) ?: return@LaunchedEffect
-        onPlay(resolved.playable, resolved.metadata)
+        onPlay(resolved.playable, resolved.metadata, pendingLaunchEnginePreference)
         viewModel.clearPlayback()
     }
 
@@ -413,21 +430,24 @@ fun DetailScreen(
                         watchEnabled = viewModel.bestSource() != null && !resolving,
                         resolving = resolving,
                         sourcesOpen = sourcesOpen,
-                        onWatch = { viewModel.playBest() },
+                        launchPlayerChoices = launchPlayerChoices,
+                        launchEnginePreference = launchEnginePreference,
+                        onSelectLaunchEngine = { launchEnginePreference = it },
+                        onWatch = { beginPlayback { viewModel.playBest() } },
                         playFromStartEnabled = viewModel.resumeAvailable() && !resolving,
-                        onPlayFromStart = { viewModel.playBest(fromStart = true) },
+                        onPlayFromStart = { beginPlayback { viewModel.playBest(fromStart = true) } },
                         onToggleSources = { sourcesOpen = !sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
                         watchlisted = watchlisted,
                         onToggleWatchlist = viewModel::toggleWatchlist,
                         onToggleWatched = { viewModel.setWatched(!(m.data.libraryItem?.isWatched ?: false)) },
                         hasTrailer = m.data.trailerYouTubeId != null,
-                        onTrailer = { viewModel.playTrailer() },
+                        onTrailer = { beginPlayback { viewModel.playTrailer() } },
                         trailerLanguageChips = trailerLanguageChips,
                         onTrailerLanguage = { language ->
                             // Queue the override, then use the exact same ViewModel entry point as Trailer.
                             TrailerCoordinator.forceNextAudioLanguage(m.data.trailerYouTubeId.orEmpty(), language)
-                            viewModel.playTrailer()
+                            beginPlayback { viewModel.playTrailer() }
                         },
                     )
                 }
@@ -480,7 +500,7 @@ fun DetailScreen(
                                 entryNoun = viewModel.pinEntryNoun,
                                 onPin = viewModel::pinSource,
                                 onUnpin = viewModel::unpinSource,
-                                onPlay = viewModel::play,
+                                onPlay = { source -> beginPlayback { viewModel.play(source) } },
                                 onDownload = viewModel::download,
                             )
                         }
@@ -940,6 +960,9 @@ private fun ActionsCluster(
     watchEnabled: Boolean,
     resolving: Boolean,
     sourcesOpen: Boolean,
+    launchPlayerChoices: List<PlayerLaunchChoice>,
+    launchEnginePreference: PlayerEngineRouter.Override,
+    onSelectLaunchEngine: (PlayerEngineRouter.Override) -> Unit,
     onWatch: () -> Unit,
     playFromStartEnabled: Boolean,
     onPlayFromStart: () -> Unit,
@@ -978,6 +1001,13 @@ private fun ActionsCluster(
             leadingIcon = if (!resolving) VortXIcons.playFill else null,
         )
         LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+            item {
+                DetailPlayerChoiceChip(
+                    choices = launchPlayerChoices,
+                    selected = launchEnginePreference,
+                    onSelect = onSelectLaunchEngine,
+                )
+            }
             item {
                 Chip(
                     label = if (inLibrary) "Saved" else "Save",
@@ -1059,6 +1089,52 @@ private fun ActionsCluster(
                         onClick = { onTrailerLanguage(code) },
                     )
                 }
+            }
+        }
+    }
+}
+
+/** Phone/touch player picker. The menu reads the flavor-filtered policy, so Play never names an absent mpv. */
+@Composable
+private fun DetailPlayerChoiceChip(
+    choices: List<PlayerLaunchChoice>,
+    selected: PlayerEngineRouter.Override,
+    onSelect: (PlayerEngineRouter.Override) -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val current = choices.firstOrNull { it.preference == selected } ?: choices.first()
+    Box {
+        Chip(
+            label = "Player · ${current.label}",
+            selected = selected != PlayerEngineRouter.Override.AUTO,
+            leadingIcon = VortXIcons.playRectangle,
+            stateDescription = "Selected player: ${current.label}. Applies to this launch only.",
+            onClick = { menuOpen = true },
+        )
+        DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            choices.forEach { choice ->
+                DropdownMenuItem(
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = if (choice.preference == selected) {
+                                    "${choice.label} · Selected"
+                                } else {
+                                    choice.label
+                                },
+                                style = VortXTheme.type.label,
+                            )
+                            Text(
+                                text = choice.detail,
+                                style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
+                            )
+                        }
+                    },
+                    onClick = {
+                        onSelect(choice.preference)
+                        menuOpen = false
+                    },
+                )
             }
         }
     }

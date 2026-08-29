@@ -74,7 +74,10 @@ import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.NextEpisodePreloadPolicy
+import com.vortx.android.player.MpvEngineFactory
+import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
+import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.player.PlayerScreen
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
@@ -268,6 +271,19 @@ fun VortXApp(
         var detailGeneration by remember { mutableStateOf(0L) }
         var pendingDirectResumeId by remember { mutableStateOf<String?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
+        // Session-only route chosen on Detail. It rides source retries and episode advances inside the same
+        // player, but every non-detail launch below explicitly resets it to Automatic. No preference store is
+        // mutated, so one title's choice cannot become the next title's global default.
+        var playingEngineOverride by remember {
+            mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
+        }
+        val automaticEngineFor: (Playable) -> PlayerEngineRouter.Override = { candidate ->
+            PlayerLaunchPolicy.effectivePreference(
+                requested = PlayerEngineRouter.Override.AUTO,
+                playable = candidate,
+                mpvAvailable = MpvEngineFactory.isBundled,
+            )
+        }
         // "Still watching?" binge streak: consecutive auto-advanced episodes with no manual play between
         // them, so the player can raise the prompt at the binge boundary (Apple `consecutiveAutoAdvances`).
         // Incremented on each Up Next AUTO-advance (countdown expiry), reset on any manual play. A one-element
@@ -597,6 +613,7 @@ fun VortXApp(
             Box {
                 PlayerScreen(
                     playable = playable,
+                    engineOverride = playingEngineOverride,
                     // "Still watching?" binge boundary: how many episodes auto-advanced to reach this one.
                     autoAdvanceCount = autoAdvanceStreak[0],
                     onBingePrompted = { autoAdvanceStreak[0] = 0 },
@@ -898,7 +915,12 @@ fun VortXApp(
                 // A local download carries no catalog meta here, so the played title has no library
                 // identity: clear the binding rather than let the previous play's meta ride along. Auto-add
                 // then skips this play (Apple's `let m = curMeta` skip).
-                onPlay = { playing = it; playingMeta = null; autoAdvanceStreak[0] = 0 },
+                onPlay = {
+                    playingEngineOverride = automaticEngineFor(it)
+                    playing = it
+                    playingMeta = null
+                    autoAdvanceStreak[0] = 0
+                },
                 onManageQueue = { showDownloadQueue = true },
             )
             return@VortXTheme
@@ -957,6 +979,7 @@ fun VortXApp(
             PlayLinkScreen(
                 repo = repo,
                 onPlay = { playable ->
+                    playingEngineOverride = automaticEngineFor(playable)
                     playingMeta = null
                     playing = playable
                     showPlayLink = false
@@ -985,6 +1008,7 @@ fun VortXApp(
             DebridLibraryScreen(
                 keys = debridKeys,
                 onPlay = {
+                    playingEngineOverride = automaticEngineFor(it)
                     playing = it
                     playingMeta = null
                     showDebridLibrary = false
@@ -1072,7 +1096,12 @@ fun VortXApp(
                     onBack = { openDetail(null) },
                     // DetailScreen supplies the successfully loaded MetaDetail, not the provisional
                     // deep-link MetaItem. This keeps auto-add title/poster truth tied to engine metadata.
-                    onPlay = { playable, loadedMeta ->
+                    onPlay = { playable, loadedMeta, requestedEngine ->
+                        playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                            requested = requestedEngine,
+                            playable = playable,
+                            mpvAvailable = MpvEngineFactory.isBundled,
+                        )
                         playingMeta = loadedMeta
                         playing = playable
                         autoAdvanceStreak[0] = 0

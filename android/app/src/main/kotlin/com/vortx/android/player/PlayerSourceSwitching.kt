@@ -192,7 +192,8 @@ internal fun playerSourceIsCurrent(source: StreamSource, currentSource: StreamSo
 internal fun playerSourceChoices(
     sources: List<StreamSource>,
     currentSource: StreamSource?,
-): List<PlayerSourceChoice> = sources.map { source ->
+    audioLanguageHint: String? = null,
+): List<PlayerSourceChoice> = playerSourcesRankedByAudioHint(sources, audioLanguageHint).map { source ->
     val (tags, size) = StreamRanking.sourceDetail(source)
     val title = source.title.lineSequence().firstOrNull()?.trim().orEmpty()
         .ifBlank { source.addon }
@@ -203,6 +204,41 @@ internal fun playerSourceChoices(
         detail = listOfNotNull(source.addon.takeIf(String::isNotBlank), tags, size).distinct().joinToString(" · "),
         selected = playerSourceIsCurrent(source, currentSource),
     )
+}
+
+/**
+ * Reorder the in-player source list from conservative release-name metadata only. An explicit match floats
+ * first, an unlabelled or multi-language release stays in the middle, and a clearly different single-language
+ * release moves last. Every source remains visible in its original relative order inside each bucket because
+ * filenames are only a hint. The mounted engine's real [PlayerTrack] inventory remains authoritative for audio
+ * selection through [TrackSelector].
+ */
+internal fun playerSourcesRankedByAudioHint(
+    sources: List<StreamSource>,
+    audioLanguageHint: String?,
+): List<StreamSource> {
+    val wanted = TrackSelector.canonical(audioLanguageHint).takeIf(String::isNotEmpty) ?: return sources
+    return sources.withIndex()
+        .sortedWith(
+            compareByDescending<IndexedValue<StreamSource>> { playerSourceAudioHintPriority(it.value, wanted) }
+                .thenBy(IndexedValue<StreamSource>::index),
+        )
+        .map(IndexedValue<StreamSource>::value)
+}
+
+private fun playerSourceAudioHintPriority(source: StreamSource, wanted: String): Int {
+    val text = listOfNotNull(
+        source.title,
+        source.description,
+        source.filename,
+        source.quality,
+    ).joinToString(" ").lowercase()
+    val advertised = StreamRanking.languageCodesAdvertised(text).map(TrackSelector::canonical)
+    return when {
+        wanted in advertised -> 2
+        StreamRanking.isMultiLanguage(text) || advertised.isEmpty() -> 1
+        else -> 0
+    }
 }
 
 internal fun playerQualityChoices(

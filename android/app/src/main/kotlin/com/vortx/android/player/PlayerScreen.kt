@@ -313,7 +313,15 @@ fun PlayerScreen(
     // ExoPlayer), initialized from the host's [engineOverride] and re-picked from the Player Engine sheet.
     // Changing it rekeys the engine build below so the engine rebuilds on the chosen player. Distinct from
     // [forceExoPlayer], which is the involuntary surface-fail demotion.
-    var enginePreference by remember(playbackSessionKey) { mutableStateOf(engineOverride) }
+    var enginePreference by remember(playbackSessionKey) {
+        mutableStateOf(
+            PlayerLaunchPolicy.effectivePreference(
+                requested = engineOverride,
+                playable = currentPlayable,
+                mpvAvailable = MpvEngineFactory.isBundled,
+            ),
+        )
+    }
     // Position (ms) to resume at on the NEXT rebuild caused by a USER engine switch, so the swap continues
     // where the film is rather than restarting at the source's resume point (that is the surface-fail
     // path's behavior, which is left unchanged). -1 = no user switch pending. A plain array, not Compose
@@ -1614,14 +1622,20 @@ fun PlayerScreen(
             },
             // In-player engine switch. Hidden for torrents / trailers where the switch is not valid; the
             // live engine name shows which player is active, and picking a preference rebuilds at position.
-            engineSwitchAvailable = !currentPlayable.isTorrent && !currentPlayable.isTrailer,
+            engineSwitchAvailable = PlayerLaunchPolicy.choices(MpvEngineFactory.isBundled).size > 1 &&
+                !currentPlayable.isTorrent && !currentPlayable.isTrailer,
             enginePreference = enginePreference,
-            liveEngineLabel = if (engine is ExoPlayerEngine) "Dolby Vision Player" else "VortX Player",
+            liveEngineLabel = if (engine is ExoPlayerEngine) "Media3" else "VortX Player",
             onSelectEnginePreference = { pref ->
                 showControls()
-                if (pref != enginePreference) {
+                val effective = PlayerLaunchPolicy.effectivePreference(
+                    requested = pref,
+                    playable = currentPlayable,
+                    mpvAvailable = MpvEngineFactory.isBundled,
+                )
+                if (effective != enginePreference) {
                     engineSwitchResumeMs[0] = latestState.positionMs.coerceAtLeast(0L)
-                    enginePreference = pref
+                    enginePreference = effective
                 }
             },
             // Playback Info: read the live engine stats on each call so the overlay refreshes while open.

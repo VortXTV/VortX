@@ -56,6 +56,29 @@ class PlayerSourceSwitchingTest {
     }
 
     @Test
+    fun `source audio hint reorders conservatively without hiding sources or inventing tracks`() {
+        val french = source("fr", "Movie 1080p French WEB")
+        val unknown = source("unknown", "Movie 1080p WEB")
+        val english = source("en", "Movie 1080p English WEB")
+
+        val ranked = playerSourceChoices(listOf(french, unknown, english), currentSource = null, audioLanguageHint = "en")
+
+        assertEquals(listOf("en", "unknown", "fr"), ranked.map { it.source.id })
+        assertEquals(setOf("en", "unknown", "fr"), ranked.map { it.source.id }.toSet())
+        val actual = TrackSelector.select(
+            audio = listOf(PlayerTrack(id = 7, lang = "fr", title = "French")),
+            subtitles = emptyList(),
+            preferences = com.vortx.android.model.TrackPreferences(
+                audioLanguages = listOf("en"),
+                subtitleLanguages = listOf("en"),
+                forcedPolicy = com.vortx.android.model.TrackPreferences.ForcedPolicy.OFF,
+                rejectTerms = emptyList(),
+            ),
+        )
+        assertNull(actual.audioId)
+    }
+
+    @Test
     fun `failed switch retains the playing source and session key`() {
         val current = source("current", "Movie 1080p")
         val alternate = source("alternate", "Movie 4K")
