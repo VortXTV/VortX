@@ -705,6 +705,7 @@ private enum TrickplayUploadPolicyTests {
     private static func testPlayerSourceHierarchyAndLaunchSafetyWiring() {
         let tv = try? String(contentsOfFile: "app/SourcesTV/TVPlayerView.swift", encoding: .utf8)
         let detail = try? String(contentsOfFile: "app/SourcesTV/DetailView.swift", encoding: .utf8)
+        let root = try? String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
         let sourceRows = tv.flatMap { sourceSection($0, from: "private func sourceRows()", to: "private func audioLanguageFilterRows()") }
         expect(sourceContainsInOrder(sourceRows, [
             "OptionRow(label: \"Quality\"", "OptionRow(label: \"Audio\"", "OptionRow(label: \"Sources\", isHeader: true)"
@@ -720,6 +721,10 @@ private enum TrickplayUploadPolicyTests {
                     "headers: entry.headers,", "initialEnginePreference: launchEnginePreference,", "debridRef: ref"
                    ]),
                "the selector must describe AV compatibility honestly and thread its launch preference before later request members")
+        expect(sourceContainsInOrder(root, [
+            "forceMPV: req.forceMPV,", "initialEnginePreference: req.initialEnginePreference,", "isTrailer: req.isTrailer"
+        ]),
+               "the root handoff must preserve TVPlayerView memberwise argument order for the launch preference")
     }
 
     private static func sourceSection(_ source: String, from start: String, to end: String) -> String? {
