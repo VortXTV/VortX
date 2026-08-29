@@ -928,7 +928,7 @@ jobs:
           IS_PRERELEASE=false; [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
           BUILD="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
-          if [ -n "$RELEASE_ID_INPUT" ]; then
+          if [[ "$RELEASE_ID_INPUT" =~ ^[0-9]+$ ]]; then
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases/$RELEASE_ID_INPUT")"
           else
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "first(.[] | select(.tag_name == \"$TAG\"))")"
@@ -1024,7 +1024,7 @@ jobs:
             '.tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
           BUILD="$(jq -er '.build' "$MANIFEST")"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::feed artifact build is not numeric"; exit 1; }
-          if [ -n "$RELEASE_ID_INPUT" ]; then
+          if [[ "$RELEASE_ID_INPUT" =~ ^[0-9]+$ ]]; then
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases/$RELEASE_ID_INPUT")"
           else
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "first(.[] | select(.tag_name == \"$TAG\"))")"

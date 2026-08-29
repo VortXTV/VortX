@@ -456,6 +456,10 @@ require_grep "attach-release exposes immutable release ID to the downstream veri
 grep -Fq 'needs.attach-release.outputs.release_id' <<<"$verify_published_block" \
     || fail "downstream verifier does not consume attach-release's immutable release ID"
 ok "downstream verifier consumes the immutable release ID"
+numeric_release_id_guards="$(grep -Fc 'if [[ "$RELEASE_ID_INPUT" =~ ^[0-9]+$ ]]; then' "$APPLE_RELEASE_WF")"
+[[ "$numeric_release_id_guards" -eq 2 ]] \
+    || fail "Apple release workflow must validate both supplied draft release IDs as numeric before direct lookup"
+ok "Apple release workflow rejects nonnumeric draft release IDs and falls back to tag lookup"
 require_grep "Apple coordinator derives prerelease state from the tag" \
     'IS_PRERELEASE=false; \[\[ "\$TAG" == \*-\* \]\] && IS_PRERELEASE=true' "$APPLE_RELEASE_WF"
 require_grep "Android lane refuses partial publication" \
