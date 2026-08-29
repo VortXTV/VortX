@@ -19,10 +19,6 @@ import Foundation
 
 enum TorBoxSearch {
     private static let base = "https://search-api.torbox.app"
-    /// The HEALTHY account host, used ONLY as the A1 resilience fallback when `base` never answers (its DNS
-    /// went dead). Its torrent search is live and used by other clients; it returns torrent rows only (no
-    /// usenet). Never the primary path: the public index at `base` is what this source is built around.
-    private static let fallbackBase = "https://api.torbox.app"
 
     /// One usenet result parsed from the search index into a playable `CoreStream` (nzb link + optional
     /// pick regex), plus torrent results (infoHash / magnet). Tolerant decoding: the index wraps items
@@ -99,16 +95,10 @@ enum TorBoxSearch {
         let (u, t) = await (usenet, torrents)
         let combined = u.streams + t.streams
         let rateLimited = u.rateLimited || t.rateLimited
-        let transportError = u.transportError || t.transportError
-        // A1 resilience: `base` (search-api.torbox.app) is the DNS-dead host. When neither leg completed and
-        // we have nothing to show, fall back ONCE to the HEALTHY host's torrent search so a TorBox user still
-        // gets torrent sources instead of a silent nothing. A completed fallback (even an empty 200) clears the
-        // transportError signal, so the caller caches it and resets its consecutive-transport-error streak; a
-        // fallback that also fails to complete returns nil and we fall through to the existing transportError
-        // path (offline blip self-heals on the next open).
-        if transportError, combined.isEmpty, let fallback = await fallbackTorrentSearch(imdbId: imdbId, apiKey: apiKey) {
-            return (fallback, rateLimited, false)
-        }
+        // A completed leg that supplied rows is useful even when its sibling could not connect. Preserve those
+        // rows and let the normal successful-result path cache them; only an all-empty response is a transport
+        // failure that must remain uncached and advance the circuit breaker.
+        let transportError = combined.isEmpty && (u.transportError || t.transportError)
         return (combined, rateLimited, transportError)
     }
 
@@ -147,51 +137,6 @@ enum TorBoxSearch {
               let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], false, false) }
         let items = (decoded.data?.nzbs ?? []) + (decoded.data?.torrents ?? [])
         return (items.compactMap { stream(from: $0, imdbId: imdbId) }, false, false)
-    }
-
-    /// A1 resilience fallback. `search-api.torbox.app` (the public index this source normally uses) is the
-    /// dead host; the ACCOUNT host `api.torbox.app` is healthy and exposes a torrent search other clients use.
-    /// When the index never answers, hit the healthy host ONCE for TORRENT rows (no usenet) so a TorBox user
-    /// still gets sources. Bearer-auth, bounded, fail-soft. Returns `nil` ONLY when the fallback itself never
-    /// completes / answers non-2xx (so `streams` falls through to the existing transportError path); a 200 with
-    /// no torrents returns `[]` (a completed empty response), which the caller treats as a real "no results".
-    private static func fallbackTorrentSearch(imdbId: String, apiKey: String) async -> [CoreStream]? {
-        guard imdbId.hasPrefix("tt"), !apiKey.isEmpty else { return nil }
-        var comps = URLComponents(string: "\(fallbackBase)/v1/api/torrents/search")
-        comps?.queryItems = [URLQueryItem(name: "query", value: imdbId)]
-        guard let url = comps?.url else { return nil }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 12
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 12
-        let session = URLSession(configuration: cfg)
-        guard let (data, response) = try? await session.data(for: req),
-              let code = (response as? HTTPURLResponse)?.statusCode,
-              (200...299).contains(code),
-              let decoded = try? JSONDecoder().decode(FallbackResponse.self, from: data) else { return nil }
-        let mapped = decoded.torrentItems.compactMap { stream(from: $0, imdbId: imdbId) }
-        NSLog("[torbox-search] search-api unreachable; healthy-host fallback returned %d torrent row(s)", mapped.count)
-        return mapped
-    }
-
-    /// Tolerant decode of the healthy host's torrent search. TorBox wraps payloads under `data`, which is
-    /// either a torrents array directly or an object carrying a `torrents` array. Every shape falls back to []
-    /// rather than throwing, so a shape drift degrades to "no fallback results", never a decode crash.
-    private struct FallbackResponse: Decodable {
-        let torrentItems: [Response.Item]
-        enum CodingKeys: String, CodingKey { case data }
-        init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            if let arr = (try? c.decodeIfPresent([Response.Item].self, forKey: .data)) ?? nil {
-                torrentItems = arr
-            } else if let obj = (try? c.decodeIfPresent(Response.Payload.self, forKey: .data)) ?? nil {
-                torrentItems = obj.torrents ?? []
-            } else {
-                torrentItems = []
-            }
-        }
     }
 
     /// Build a `CoreStream` from one search item. Usenet vs torrent is discriminated by the index's own

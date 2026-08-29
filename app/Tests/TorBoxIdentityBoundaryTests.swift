@@ -179,6 +179,22 @@ actor CancellationProbe {
     func cancelledCount() -> Int { cancelled }
 }
 
+actor OutcomeProbe {
+    private var requests = 0
+    private let result: TorBoxSearchSource.SearchResult
+
+    init(result: TorBoxSearchSource.SearchResult) {
+        self.result = result
+    }
+
+    func run() -> TorBoxSearchSource.SearchResult {
+        requests += 1
+        return result
+    }
+
+    func count() -> Int { requests }
+}
+
 @main
 struct TorBoxIdentityBoundaryTests {
     @MainActor static var failures = 0
@@ -370,6 +386,52 @@ struct TorBoxIdentityBoundaryTests {
                    roles(catalog: nil, defaultVideo: nil, currentVideo: nil),
                    season: 0, episode: 0) == .absent,
                "nil identity remains absent even with complete zero coordinates")
+
+        // The production two-leg search keeps rows from a completed leg even if its sibling transport fails.
+        // `transportError` is therefore reserved for all-empty attempts, which must not poison the cache.
+        let partialProbe = OutcomeProbe(result: (streams: [rowA], rateLimited: false, transportError: false))
+        let partialSource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await partialProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        partialSource.refresh(target: targetA)
+        await waitUntil { await partialProbe.count() == 1 && partialSource.streams == [rowA] }
+        partialSource.refresh(target: targetA)
+        await Task.yield()
+        let partialCalls = await partialProbe.count()
+        expect(partialCalls == 1 && partialSource.streams == [rowA],
+               "a usable primary-leg result survives sibling transport failure and is cached")
+
+        let allTransportProbe = OutcomeProbe(result: (streams: [], rateLimited: false, transportError: true))
+        let allTransportSource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await allTransportProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        let transportTarget = SourceIndexIdentity.publicationTarget(
+            roles(catalog: "tt1375666", defaultVideo: "tt1375666:1:2", currentVideo: "tt1375666:1:2"),
+            season: 1, episode: 2
+        )
+        allTransportSource.refresh(target: transportTarget)
+        await waitUntil { await allTransportProbe.count() == 1 && !allTransportSource.ownerStateForTesting.hasTask }
+        allTransportSource.refresh(target: transportTarget)
+        await waitUntil { await allTransportProbe.count() == 2 && !allTransportSource.ownerStateForTesting.hasTask }
+        let allTransportCalls = await allTransportProbe.count()
+        expect(allTransportCalls == 2 && allTransportSource.streams.isEmpty,
+               "all-primary transport failure is not cached and advances a fresh retry")
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("SourcesShared/TorBoxSearchSource.swift")
+        let sourceText = (try? String(contentsOf: sourceURL, encoding: .utf8)) ?? ""
+        expect(!sourceText.contains("/v1/api/torrents/search"),
+               "the undocumented account-host fallback route is absent")
+        expect(sourceText.contains("guard (200...299).contains(code)")
+               && sourceText.contains("return ([], false, false)"),
+               "non-2xx search responses are unavailable rather than transport-success results")
+        expect(sourceText.contains("forHTTPHeaderField: \"Authorization\"")
+               && !sourceText.contains("URLQueryItem(name: \"apikey\"")
+               && !sourceText.contains("URLQueryItem(name: \"token\""),
+               "TorBox API keys stay in the Authorization header, never the URL")
 
         print("")
         print(failures == 0 ? "ALL PASS" : "FAILURES: \(failures)")
