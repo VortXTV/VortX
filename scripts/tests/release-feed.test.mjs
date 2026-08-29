@@ -312,6 +312,7 @@ test("content-addressed artifact records exact local bytes and keeps Android nul
 // =================================================================================================
 
 const VALID_ANDROID_FULL = Object.freeze({
+  flavor: "full",
   applicationId: "com.vortx.android",
   engine: "mpv",
   artifactType: "apk",
@@ -326,6 +327,7 @@ const VALID_ANDROID_FULL = Object.freeze({
 });
 
 const VALID_ANDROID_PLAY = Object.freeze({
+  flavor: "play",
   applicationId: "com.vortx.android",
   engine: "media3",
   artifactType: "apk",
@@ -446,6 +448,8 @@ test("buildAppcast round-trips split Android entries through assertAppcast", () 
   const appcast = buildAppcast(input);
   assertAppcast(appcast, expected);
   assert.equal(appcast.android.full.tag, TAG);
+  assert.equal(appcast.android.full.flavor, "full");
+  assert.equal(appcast.android.play.flavor, "play");
   assert.equal(appcast.android.play.name, expected.name);
   assert.equal(appcast.android.play.notes, expected.notes);
   assert.equal(buildAppcast({ ...input, android: null }).android, null);
@@ -458,6 +462,16 @@ test("assertAppcast rejects split Android drift and unsafe release URLs", () => 
       name: "flat root Android metadata",
       android: { signed: true, url: VALID_ANDROID_FULL.url },
       error: /split into full\/play/,
+    },
+    {
+      name: "missing required flavor",
+      mutate: (android) => delete android.full.flavor,
+      error: /missing required schema fields/,
+    },
+    {
+      name: "mismatched required flavor",
+      mutate: (android) => { android.full.flavor = "play"; },
+      error: /flavor, engine, or artifact type is invalid/,
     },
     {
       name: "missing signing metadata",
@@ -602,6 +616,14 @@ test("rejects unknown android flavor", () => {
 test("rejects wrong applicationId", () => {
   const m = validManifest({ android: { full: { ...VALID_ANDROID_FULL, applicationId: "com.evil.app" } } });
   assert.throws(() => validateReleaseFeedArtifact(m), /applicationId must be com\.vortx\.android/);
+});
+
+test("rejects missing and mismatched Android flavor fields", () => {
+  const missing = validManifest({ android: { full: { ...VALID_ANDROID_FULL } } });
+  delete missing.android.full.flavor;
+  assert.throws(() => validateReleaseFeedArtifact(missing), /non-empty string.*flavor|flavor.*required|flavor.*string/);
+  const mismatched = validManifest({ android: { full: { ...VALID_ANDROID_FULL, flavor: "play" } } });
+  assert.throws(() => validateReleaseFeedArtifact(mismatched), /flavor must equal full/);
 });
 
 test("rejects wrong engine for full flavor", () => {

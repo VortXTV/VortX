@@ -245,6 +245,7 @@ export function buildAppcast({
     mac: entry("mac", { ...mac, slug: "macOS", extension: "dmg" }, null, "dmg"),
     android: android === null ? null : Object.fromEntries(Object.entries(android).map(([flavor, artifact]) => [flavor, artifact === null ? null : {
       ...artifact,
+      flavor,
       tag: releaseTag,
       name: releaseName,
       notes: releaseNotes,
@@ -733,11 +734,11 @@ export function assertAppcast(manifest, expected) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       die(`appcast Android ${flavor} entry must be an object`, "appcast-schema");
     }
-    const requiredFields = ["tag", "version", "build", "name", "notes", "prerelease", "applicationId", "engine", "artifactType", "signed", "url", "size", "sha256", "signer"];
+    const requiredFields = ["tag", "version", "build", "name", "notes", "prerelease", "flavor", "applicationId", "engine", "artifactType", "signed", "url", "size", "sha256", "signer"];
     if (requiredFields.some((field) => !(field in entry))) {
       die(`appcast Android ${flavor} entry is missing required schema fields`, "appcast-schema");
     }
-    if (entry.applicationId !== "com.vortx.android" || entry.engine !== flavorContract.engine || !Object.hasOwn(flavorContract.artifacts, entry.artifactType)) {
+    if (entry.flavor !== flavor || entry.applicationId !== "com.vortx.android" || entry.engine !== flavorContract.engine || !Object.hasOwn(flavorContract.artifacts, entry.artifactType)) {
       die(`appcast Android ${flavor} flavor, engine, or artifact type is invalid`, "appcast-schema");
     }
     if (entry.tag !== expected.tag || entry.version !== expected.version || entry.name !== expected.name || entry.notes !== expected.notes || !Number.isInteger(entry.build) || entry.build !== Number(expected.build) || entry.signed !== true || entry.prerelease !== Boolean(expected.prerelease)) {
@@ -832,6 +833,10 @@ function validateAndroidFlavorEntry(flavor, entry, tagVersion, build, prerelease
     die(`${label} must be an object`, "feed-schema");
   }
   // Required metadata fields
+  assertStringField(entry, "flavor", label, null);
+  if (entry.flavor !== flavor) {
+    die(`${label}.flavor must equal ${flavor} (got ${JSON.stringify(entry.flavor)})`, "feed-schema");
+  }
   assertStringField(entry, "applicationId", label, null);
   if (entry.applicationId !== ANDROID_APPLICATION_ID) {
     die(`${label}.applicationId must be ${ANDROID_APPLICATION_ID} (got ${JSON.stringify(entry.applicationId)})`, "feed-schema");

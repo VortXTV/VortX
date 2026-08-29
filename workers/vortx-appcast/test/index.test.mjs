@@ -522,6 +522,8 @@ test("Android augmentation creates a content-addressed split feed while preservi
   for (const platform of ["ios", "tvos", "mac"]) assert.deepEqual(afterAppcast[platform], beforeAppcast[platform]);
   assert.equal(afterAppcast.android.full.engine, "mpv");
   assert.equal(afterAppcast.android.play.engine, "media3");
+  assert.equal(afterAppcast.android.full.flavor, "full");
+  assert.equal(afterAppcast.android.play.flavor, "play");
   assert.equal(afterAppcast.android.full.signer, ANDROID_SIGNER);
   assert.equal(afterAppcast.android.play.signer, ANDROID_SIGNER);
   assert.equal(successor.manifest.generation, `${receipt.manifest.tag}:${receipt.manifest.build}:${successor.manifest.feedSha256}`);
@@ -567,6 +569,70 @@ test("Android augmentation rejects stale CAS, wrong signer provenance, and non-n
   active.manifest.android = { already: "present" };
   await nonNull.env.__state.storage.put("active", active);
   assert.equal((await worker.fetch(signedRequest("/__release/receipt", nonNull.augmentation), nonNull.env)).status, 409);
+});
+
+test("Android augmentation never overwrites orphaned or cross-action operation IDs", async () => {
+  const setup = async (operation) => {
+    const env = environment(new MemoryKV());
+    const receipt = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: `promote-${Math.random()}`, releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: null }), env)).status, 200);
+    const augmentation = androidAugmentation(receipt, "occupied-operation");
+    augmentation.expectedReceiptSha256 = (await env.__state.storage.get("active")).receiptSha256;
+    await env.__state.storage.put("operation:occupied-operation", operation);
+    return { env, receipt, augmentation };
+  };
+  for (const operation of [
+    { action: "augment-android", operationId: "occupied-operation", predecessorGeneration: "orphan" },
+    { action: "promote", operationId: "occupied-operation", generation: "other" },
+  ]) {
+    const fixture = await setup(operation);
+    const before = structuredClone(await fixture.env.__state.storage.get("operation:occupied-operation"));
+    const response = await worker.fetch(signedRequest("/__release/receipt", fixture.augmentation), fixture.env);
+    assert.equal(response.status, 409);
+    assert.deepEqual(await fixture.env.__state.storage.get("operation:occupied-operation"), before);
+    assert.equal((await fixture.env.__state.storage.get("active")).manifest.generation, fixture.receipt.manifest.generation);
+  }
+});
+
+test("authenticated operation status resolves a committed no-response augmentation for exact compensation", async () => {
+  const env = environment(new MemoryKV());
+  const receipt = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "promote-before-ambiguous", releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: null }), env)).status, 200);
+  const predecessor = structuredClone(await env.__state.storage.get("active"));
+  const augmentation = androidAugmentation(receipt, "ambiguous-augmentation");
+  augmentation.expectedReceiptSha256 = predecessor.receiptSha256;
+  await worker.fetch(signedRequest("/__release/receipt", augmentation), env); // Simulate committed mutation whose response was lost.
+  const status = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "operation-status", operationId: augmentation.operationId, predecessorGeneration: predecessor.manifest.generation,
+  }), env);
+  assert.equal(status.status, 200);
+  const evidence = await status.json();
+  assert.equal(evidence.operation.action, "augment-android");
+  assert.deepEqual(evidence.audit, evidence.operation);
+  assert.equal(evidence.active.generation, evidence.operation.successorGeneration);
+  assert.equal(evidence.active.receiptSha256, evidence.operation.successorReceiptSha256);
+  const rollback = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback", expectedCurrentGeneration: evidence.operation.successorGeneration, restoreGeneration: predecessor.manifest.generation,
+  }), env);
+  assert.equal(rollback.status, 200);
+  assert.deepEqual(await env.__state.storage.get("active"), predecessor);
+});
+
+test("Android augmentation rejects an exact-operation replay when its paired audit is corrupt", async () => {
+  const env = environment(new MemoryKV());
+  const receipt = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: "promote-before-corrupt-audit", releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: null }), env)).status, 200);
+  const augmentation = androidAugmentation(receipt, "corrupt-audit-operation");
+  augmentation.expectedReceiptSha256 = (await env.__state.storage.get("active")).receiptSha256;
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 200);
+  const auditKey = `audit:augment-android:${receipt.manifest.generation}`;
+  const corruptAudit = await env.__state.storage.get(auditKey);
+  corruptAudit.successorReceiptSha256 = "0".repeat(64);
+  await env.__state.storage.put(auditKey, corruptAudit);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 409);
 });
 
 test("unsigned or malformed staged generations never reach the public routes", async () => {

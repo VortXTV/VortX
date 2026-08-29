@@ -403,6 +403,8 @@ require_grep "release-feed requires exact applicationId" \
     'applicationId.*com\.vortx\.android|ANDROID_APPLICATION_ID' "$FEED_SCRIPT"
 require_grep "release-feed requires engine field per flavor" \
     'engine.*mpv|engine.*media3' "$FEED_SCRIPT"
+require_grep "release-feed requires an exact declared flavor per entry" \
+    'entry\.flavor !== flavor' "$FEED_SCRIPT"
 require_grep "release-feed requires artifactType field" \
     'artifactType.*apk|VALID_ANDROID_ARTIFACT_TYPES' "$FEED_SCRIPT"
 require_grep "release-feed exposes validate-android-feed CLI command" \
@@ -518,7 +520,15 @@ require_grep "Android feed augmentation binds Apple-only appcast bytes" 'expecte
 require_grep "Android feed augmentation pins the production signer" 'FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA' "$ANDROID_AUGMENT_WF"
 require_grep "Android feed augmentation validates release asset digests" '\.digest \| sub\("\^sha256:"' "$ANDROID_AUGMENT_WF"
 require_grep "Android feed augmentation preserves Apple appcast entries" "jq -S 'del\(\.android\)'" "$ANDROID_AUGMENT_WF"
-require_grep "Android feed augmentation compensates later verification failure" '^          rollback\(\)' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation marks mutation attempted before the POST" 'MUTATION_ATTEMPTED=1' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation resolves ambiguous commits through authenticated operation status" 'action:"operation-status"' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation compensates later verification failure" '^          compensate\(\)' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation verifies exact predecessor bytes after compensation" 'cmp -s "\$RUNNER_TEMP/before-appcast.json" "\$RUNNER_TEMP/compensated-appcast.json"' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation hard-fails incomplete compensation" 'incident: Android feed augmentation compensation was incomplete' "$ANDROID_AUGMENT_WF"
+mutation_line="$(grep -n 'MUTATION_ATTEMPTED=1' "$ANDROID_AUGMENT_WF" | cut -d: -f1)"
+post_line="$(grep -n 'RESPONSE=.*curl --fail-with-body' "$ANDROID_AUGMENT_WF" | head -1 | cut -d: -f1)"
+[[ -n "$mutation_line" && -n "$post_line" && "$mutation_line" -lt "$post_line" ]] || fail "Android augmentation must mark mutation attempted before its POST"
+ok "Android augmentation marks ambiguous mutation before the network call"
 require_absent "Android feed augmentation must not check out or mutate repository source" 'actions/checkout|contents: write|gh api --method (PUT|PATCH|DELETE)|gh release (edit|upload|delete)' "$ANDROID_AUGMENT_WF"
 ok "Android feed augmentation is protected, authenticated, CAS-bound, rollbackable, and release-read-only"
 grep -Eq '^    permissions:$' <<<"$verify_published_block" \

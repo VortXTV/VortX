@@ -233,13 +233,14 @@ async function buildAndroidAugmentation(payload, current) {
     !provenanceText.includes(`source commit: ${current.manifest.sourceCommit}`)
   ) throw new Error("Android signing provenance does not bind both APKs, release identity, and production signer");
 
-  const androidEntry = (engine, asset) => ({
+  const androidEntry = (flavor, engine, asset) => ({
     tag,
     version,
     build: Number(current.manifest.build),
     name: current.manifest.name,
     notes: current.manifest.notes,
     prerelease: Boolean(current.manifest.prerelease),
+    flavor,
     applicationId: "com.vortx.android",
     engine,
     artifactType: "apk",
@@ -250,8 +251,8 @@ async function buildAndroidAugmentation(payload, current) {
     signer: ANDROID_SIGNER_SHA256,
   });
   const android = {
-    full: androidEntry("mpv", fullAsset),
-    play: androidEntry("media3", playAsset),
+    full: androidEntry("full", "mpv", fullAsset),
+    play: androidEntry("play", "media3", playAsset),
   };
   const appcastText = jsonText({ ...currentAppcast, android });
   const sourceText = current.sourceText;
@@ -514,18 +515,26 @@ export class FeedCoordinator {
         await storage.put(`${AUDIT_PREFIX}rollback:${payload.expectedCurrentGeneration}`, { action: "rollback", expectedCurrentGeneration: payload.expectedCurrentGeneration, generation: payload.restoreGeneration });
         return jsonResponse({ rolledBack: true, generation: payload.restoreGeneration });
       }
+      if (payload.action === "operation-status") {
+        if (!text(payload.operationId, "operationId") || !text(payload.predecessorGeneration, "predecessorGeneration")) return failure(400, "operation-status-contract", "operation status requires exact operation and predecessor IDs");
+        const operation = await storage.get(`${OPERATION_PREFIX}${payload.operationId}`);
+        const audit = await storage.get(`${AUDIT_PREFIX}augment-android:${payload.predecessorGeneration}`);
+        return jsonResponse({ operation: operation || null, audit: audit || null, active: current ? { generation: current.manifest.generation, receiptSha256: current.receiptSha256 } : null });
+      }
       if (payload.action === "augment-android") {
         if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "Android augmentation requires a write-once operation ID");
         if (!current) return failure(409, "augmentation-active-not-durable", "Android augmentation requires a durable active receipt");
         const priorOperation = await storage.get(`${OPERATION_PREFIX}${payload.operationId}`);
         const priorAudit = await storage.get(`${AUDIT_PREFIX}augment-android:${payload.expectedActiveGeneration}`);
-        if (priorAudit) {
-          if (priorAudit.operationId !== payload.operationId) return failure(409, "augmentation-already-recorded", "a different Android augmentation is permanently bound to this predecessor");
+        if (priorOperation || priorAudit) {
+          if (!priorOperation || !priorAudit || priorAudit.operationId !== payload.operationId) return failure(409, "augmentation-operation-conflict", "Android augmentation operation or audit state is already occupied");
           const sameOperation =
             priorOperation?.action === "augment-android" &&
+            priorOperation.operationId === payload.operationId &&
             priorOperation.predecessorGeneration === payload.expectedActiveGeneration &&
             priorOperation.successorGeneration === priorAudit.successorGeneration &&
-            priorOperation.successorReceiptSha256 === priorAudit.successorReceiptSha256;
+            priorOperation.successorReceiptSha256 === priorAudit.successorReceiptSha256 &&
+            JSON.stringify(canonicalValue(priorOperation)) === JSON.stringify(canonicalValue(priorAudit));
           const exactSuccessorIsActive = currentGeneration === priorAudit.successorGeneration && current.receiptSha256 === priorAudit.successorReceiptSha256;
           if (!sameOperation || !exactSuccessorIsActive) return failure(409, "operation-state-conflict", "Android augmentation cannot be replayed in the current state");
           return jsonResponse({ augmented: true, idempotent: true, generation: priorAudit.successorGeneration, previousGeneration: priorAudit.predecessorGeneration, receiptSha256: priorAudit.successorReceiptSha256 });
@@ -609,7 +618,7 @@ async function handleReceipt(request, env) {
     const validated = await validateStage(payload);
     return stageReceipt({ ...payload, ...validated }, env);
   }
-  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover" || payload.action === "augment-android") return coordinatorRequest(request, env, payload);
+  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover" || payload.action === "augment-android" || payload.action === "operation-status") return coordinatorRequest(request, env, payload);
   return failure(400, "receipt-action", "unsupported receipt action");
 }
 
