@@ -145,8 +145,10 @@ require_grep "validation builds the play release variant" 'assemblePlayRelease' 
 require_grep "validation bundles the play AAB" 'bundlePlayRelease' "$VALIDATION_WF"
 require_grep "validation requires APK Signature Scheme v2" \
     'Verified using v2 scheme \(APK Signature Scheme v2\): true' "$VALIDATION_WF"
-require_grep "validation accepts both APK certificate SHA-256 digest labels" \
-    'certificate SHA-\?256 digest' "$VALIDATION_WF"
+require_grep "validation derives APK identity from a PEM certificate" \
+    'print-certs-pem' "$VALIDATION_WF"
+require_grep "validation requires exactly one APK PEM signer certificate" \
+    'exactly one PEM signer certificate' "$VALIDATION_WF"
 require_grep "validation rejects Android Debug certificates" 'Android Debug' "$VALIDATION_WF"
 require_grep "validation uses strict jarsigner verification on the AAB" \
     'jarsigner" -verify -strict' "$VALIDATION_WF"
@@ -155,6 +157,8 @@ require_grep "validation enforces the GPL boundary on the play flavor" \
 require_grep "validation generates an explicitly non-debug ad-hoc identity" \
     'CN=VortX CI Ad-hoc Release' "$VALIDATION_WF"
 require_grep "validation shreds the ephemeral keystore" 'Shred ephemeral ad-hoc keystore' "$VALIDATION_WF"
+require_grep "candidate CI invokes the shared pinned signer verifier" \
+    'scripts/verify-android-release-signing\.sh verify' "$ANDROID_CI_WF"
 require_grep "validation exercises the release-feed script contract" \
     'node scripts/tests/release-feed\.test\.mjs' "$VALIDATION_WF"
 require_grep "validation exercises the AltStore source generator contract" \

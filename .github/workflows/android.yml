@@ -514,28 +514,19 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/signing/upload.jks" || true
 
-      # Prove the release APK is actually signed (not just built). apksigner ships in the SDK build-tools
-      # the AGP release build already installed; pick the highest-versioned one on disk. A build-tools
-      # bug once made `verify` exit 0 on an unsigned APK, so also require the human-readable
-      # "Verified using v2 scheme" line.
-      - name: Verify release APK is signed
+      # Run the same v2 + PEM certificate + pinned-production-identity verifier used by the release
+      # lane, so candidate CI catches signer-policy and parser regressions before publication.
+      - name: Verify signed release artifacts against the pinned production signer
         if: steps.signing.outputs.ready == 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
           apks=(android/app/build/outputs/apk/full/release/*.apk)
-          if [ ${#apks[@]} -eq 0 ]; then echo "::error::signed release APK missing"; exit 1; fi
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n1)"
-          if [ -z "${APKSIGNER:-}" ] || [ ! -x "$APKSIGNER" ]; then
-            echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1
+          bundles=(android/app/build/outputs/bundle/fullRelease/*.aab)
+          if [ ${#apks[@]} -ne 1 ] || [ ${#bundles[@]} -ne 1 ]; then
+            echo "::error::expected one signed full release APK and one signed full release AAB"; exit 1
           fi
-          for apk in "${apks[@]}"; do
-            out="$("$APKSIGNER" verify --verbose "$apk")"
-            echo "$out"
-            grep -Eq 'Verified using v2 scheme \(APK Signature Scheme v2\): true' <<<"$out" \
-              || { echo "::error::$apk is not signed with the v2 scheme"; exit 1; }
-            echo "ok: $apk is a signed release APK"
-          done
+          scripts/verify-android-release-signing.sh verify "${apks[@]}" "${bundles[@]}"
 
       - name: Upload signed release APK
         if: steps.signing.outputs.ready == 'true'

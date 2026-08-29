@@ -90,25 +90,14 @@ reject_debug_signer() {
     fi
 }
 
-extract_apk_certificate_sha256_digests() {
-    awk '
-        /^[[:space:]]*Signer #[0-9]+ certificate SHA-?256 digest:/ {
-            digest = $0
-            sub(/^[[:space:]]*Signer #[0-9]+ certificate SHA-?256 digest:[[:space:]]*/, "", digest)
-            if (digest != "") {
-                print digest
-            }
-        }
-    '
-}
-
 verify_apk() {
     local apksigner="$1"
-    local apk="$2"
-    local output fingerprint subject fingerprint_count
+    local keytool="$2"
+    local apk="$3"
+    local output certificate_output fingerprint subject begin_count end_count certificate_dir certificate_file
 
     [[ -f "$apk" ]] || { error "APK does not exist: $apk"; return 1; }
-    output="$("$apksigner" verify --verbose --print-certs "$apk")" || {
+    output="$("$apksigner" verify --verbose --print-certs-pem "$apk")" || {
         error "apksigner verification failed for $apk"
         return 1
     }
@@ -116,16 +105,26 @@ verify_apk() {
         error "$apk is not verified with APK Signature Scheme v2"
         return 1
     }
-    reject_debug_signer "$apk" "$output"
-
-    fingerprint_count="$(extract_apk_certificate_sha256_digests <<<"$output" | wc -l | tr -d '[:space:]')"
-    if [[ "$fingerprint_count" != "1" ]]; then
-        error "$apk must have exactly one reported signer SHA-256 digest, found $fingerprint_count"
+    begin_count="$(grep -Fc -- '-----BEGIN CERTIFICATE-----' <<<"$output" || true)"
+    end_count="$(grep -Fc -- '-----END CERTIFICATE-----' <<<"$output" || true)"
+    if [[ "$begin_count" != "1" || "$end_count" != "1" ]]; then
+        error "$apk must contain exactly one PEM signer certificate, found $begin_count begin and $end_count end blocks"
         return 1
     fi
-    fingerprint="$(extract_apk_certificate_sha256_digests <<<"$output")"
+    certificate_dir="$(mktemp -d)" || { error "could not create temporary certificate directory"; return 1; }
+    certificate_file="$certificate_dir/signer.pem"
+    awk '/-----BEGIN CERTIFICATE-----/{keep=1} keep{print} /-----END CERTIFICATE-----/{exit}' <<<"$output" > "$certificate_file"
+    certificate_output="$(LC_ALL=C "$keytool" -printcert -file "$certificate_file")" || {
+        rm -rf "$certificate_dir"
+        error "could not read PEM signer certificate from $apk"
+        return 1
+    }
+    rm -rf "$certificate_dir"
+    reject_debug_signer "$apk" "$certificate_output"
+    fingerprint="$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' <<<"$certificate_output")"
+    [[ -n "$fingerprint" ]] || { error "$apk PEM signer certificate has no SHA-256 fingerprint"; return 1; }
     verify_expected_fingerprint "$apk" "$fingerprint"
-    subject="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate DN:[[:space:]]*\(.*\)$/\1/p' <<<"$output")"
+    subject="$(sed -n 's/^Owner:[[:space:]]*//p' <<<"$certificate_output")"
     [[ -n "$subject" ]] || subject="<subject unavailable>"
 
     printf 'verified APK: %s\n' "$(basename "$apk")"
@@ -207,7 +206,7 @@ verify_artifacts() {
 
     for artifact in "$@"; do
         case "$artifact" in
-            *.apk) verify_apk "$apksigner" "$artifact" ;;
+            *.apk) verify_apk "$apksigner" "$keytool" "$artifact" ;;
             *.aab) verify_bundle "$jarsigner" "$keytool" "$artifact" ;;
             *) error "unsupported Android artifact type: $artifact"; return 1 ;;
         esac

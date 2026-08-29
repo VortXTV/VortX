@@ -34,10 +34,14 @@ set -euo pipefail
 fingerprint="${MOCK_FINGERPRINT:-FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA}"
 subject="${MOCK_SUBJECT:-CN=VortX Release, O=VortXTV, C=US}"
 digest_label="${MOCK_DIGEST_LABEL:-SHA256}"
+certificate_count="${MOCK_CERTIFICATE_COUNT:-1}"
 printf 'Verifies\n'
 printf 'Verified using v2 scheme (APK Signature Scheme v2): true\n'
 printf '  Signer #1 certificate DN: %s\n' "$subject"
 printf '  Signer #1 certificate %s digest: %s\n' "$digest_label" "$fingerprint"
+for (( index = 1; index <= certificate_count; index++ )); do
+    printf '%s\nmock certificate %s\n%s\n' '-----BEGIN CERTIFICATE-----' "$index" '-----END CERTIFICATE-----'
+done
 MOCK
 
 cat > "$workdir/bin/jarsigner" <<'MOCK'
@@ -105,13 +109,15 @@ verify_output="$(env "${common_env[@]}" "$VERIFY_SCRIPT" verify "$workdir/releas
 grep -Fq 'signer: CN=VortX Release, O=VortXTV, C=US' <<<"$verify_output" || fail "indented APK signer subject was not preserved"
 printf 'ok: pinned production signer is accepted for APK and AAB\n'
 
-env "${common_env[@]}" MOCK_DIGEST_LABEL=SHA-256 "$VERIFY_SCRIPT" verify "$workdir/release.apk" >/dev/null
-printf 'ok: hyphenated APK SHA-256 digest label is accepted\n'
-
 mismatch_output="$(expect_failure "APK fingerprint mismatch" env "${common_env[@]}" \
     MOCK_FINGERPRINT="$WRONG_COMPACT" "$VERIFY_SCRIPT" verify "$workdir/release.apk")"
 grep -Fq 'signer SHA-256 mismatch' <<<"$mismatch_output" || fail "mismatch error was not explicit"
 printf 'ok: APK fingerprint mismatch is rejected\n'
+
+pem_count_output="$(expect_failure "multiple APK PEM signer certificates" env "${common_env[@]}" \
+    MOCK_CERTIFICATE_COUNT=2 "$VERIFY_SCRIPT" verify "$workdir/release.apk")"
+grep -Fq 'exactly one PEM signer certificate' <<<"$pem_count_output" || fail "multi-certificate APK error was not explicit"
+printf 'ok: multiple APK PEM signer certificates are rejected\n'
 
 mismatch_output="$(expect_failure "AAB fingerprint mismatch" env "${common_env[@]}" \
     MOCK_FINGERPRINT="$WRONG_COMPACT" "$VERIFY_SCRIPT" verify "$workdir/release.aab")"
