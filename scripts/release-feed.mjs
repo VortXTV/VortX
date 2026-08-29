@@ -230,20 +230,44 @@ export function buildAppcast({
       artifactType,
     };
   };
-  if (android !== null && android !== undefined) {
-    if (!android.signed || !android.url || !android.size || !android.sha256 || !android.signer) {
-      die("Android appcast entry requires a signed artifact, signer, URL, size, and SHA-256", "appcast-android");
-    }
+  if (android !== null && (typeof android !== "object" || Array.isArray(android))) {
+    die("Android appcast entry must be split into full/play flavor objects", "appcast-android");
   }
-  return {
+  if (android !== null && ("signed" in android || "url" in android || "sha256" in android || "apk" in android)) {
+    die("Android appcast entry must be split into full/play flavor objects", "appcast-android");
+  }
+  const appcast = {
     schemaVersion: FEED_ARTIFACT_SCHEMA,
     _generatedFromTag: releaseTag,
     _generatedFromCommit: sourceCommit || undefined,
     ios: entry("ios", { ...ios, slug: "iOS" }, CANONICAL_ALTSTORE_URL, "ipa"),
     tvos: entry("tvos", { ...tvos, slug: "tvOS" }, null, "ipa"),
     mac: entry("mac", { ...mac, slug: "macOS", extension: "dmg" }, null, "dmg"),
-    android: android === undefined ? null : android,
+    android: android === null ? null : Object.fromEntries(Object.entries(android).map(([flavor, artifact]) => [flavor, artifact === null ? null : {
+      ...artifact,
+      tag: releaseTag,
+      name: releaseName,
+      notes: releaseNotes,
+    }])),
   };
+  assertAppcast(appcast, {
+    tag: releaseTag,
+    build: releaseBuild,
+    version: releaseVersion,
+    name: releaseName,
+    notes: releaseNotes,
+    prerelease: Boolean(prerelease),
+    iosURL: appcast.ios.url,
+    iosSize: appcast.ios.size,
+    iosSha256: appcast.ios.sha256,
+    tvosURL: appcast.tvos.url,
+    tvosSize: appcast.tvos.size,
+    tvosSha256: appcast.tvos.sha256,
+    macURL: appcast.mac.url,
+    macSize: appcast.mac.size,
+    macSha256: appcast.mac.sha256,
+  });
+  return appcast;
 }
 
 function checksumEntries(text) {
@@ -670,7 +694,7 @@ export async function verifyPublicRoutes(options) {
 
 export function assertAppcast(manifest, expected) {
   if (!manifest || typeof manifest !== "object") die("appcast is not an object", "appcast-schema");
-  if (Number(manifest.schemaVersion) !== FEED_ARTIFACT_SCHEMA) die("appcast schemaVersion is not current", "appcast-schema");
+  if (manifest.schemaVersion !== FEED_ARTIFACT_SCHEMA) die("appcast schemaVersion is not current", "appcast-schema");
   if (manifest._generatedFromTag !== expected.tag) die("appcast tag does not match release tag", "appcast-build");
   const expectedPlatforms = {
     ios: { url: expected.iosURL, size: expected.iosSize, sha256: expected.iosSha256, altstore: CANONICAL_ALTSTORE_URL, artifactType: "ipa" },
@@ -689,10 +713,53 @@ export function assertAppcast(manifest, expected) {
     if (entry.altstore !== platform.altstore || entry.artifactType !== platform.artifactType) die(`appcast ${key} install route or artifact type is incorrect`, "appcast-schema");
   }
   if (manifest.android === null) return true;
-  const entry = manifest.android;
-  if (!entry || typeof entry !== "object" || entry.signed !== true || !String(entry.apk || entry.url || "").startsWith("https://") || !Number.isInteger(Number(entry.build)) || Number(entry.build) !== Number(expected.build) || entry.tag !== expected.tag || entry.version !== expected.version || entry.name !== expected.name || entry.notes !== expected.notes || Boolean(entry.prerelease) !== Boolean(expected.prerelease) || !Number.isInteger(Number(entry.size)) || Number(entry.size) <= 0 || !/^[0-9a-f]{64}$/i.test(String(entry.sha256 || "")) || typeof entry.signer !== "string" || entry.signer.length === 0) {
-    die("appcast Android entry is not an exact signed HTTPS install artifact", "appcast-schema");
+  const android = manifest.android;
+  if (!android || typeof android !== "object" || Array.isArray(android)) {
+    die("appcast Android entry must be split into full/play flavor objects", "appcast-schema");
   }
+  if ("signed" in android || "url" in android || "sha256" in android || "apk" in android) {
+    die("appcast Android entry must be split into full/play flavor objects", "appcast-schema");
+  }
+  const flavors = {
+    full: { engine: "mpv", artifacts: { apk: "VortX-${version}-full-mpv-universal.apk" } },
+    play: { engine: "media3", artifacts: { apk: "VortX-${version}-play-media3-universal.apk", aab: "VortX-${version}-play-media3.aab" } },
+  };
+  let foundFlavor = false;
+  for (const [flavor, entry] of Object.entries(android)) {
+    const flavorContract = flavors[flavor];
+    if (!flavorContract) die(`appcast Android entry has unknown flavor ${JSON.stringify(flavor)}`, "appcast-schema");
+    if (entry === null || entry === undefined) continue;
+    foundFlavor = true;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      die(`appcast Android ${flavor} entry must be an object`, "appcast-schema");
+    }
+    const requiredFields = ["tag", "version", "build", "name", "notes", "prerelease", "applicationId", "engine", "artifactType", "signed", "url", "size", "sha256", "signer"];
+    if (requiredFields.some((field) => !(field in entry))) {
+      die(`appcast Android ${flavor} entry is missing required schema fields`, "appcast-schema");
+    }
+    if (entry.applicationId !== "com.vortx.android" || entry.engine !== flavorContract.engine || !Object.hasOwn(flavorContract.artifacts, entry.artifactType)) {
+      die(`appcast Android ${flavor} flavor, engine, or artifact type is invalid`, "appcast-schema");
+    }
+    if (entry.tag !== expected.tag || entry.version !== expected.version || entry.name !== expected.name || entry.notes !== expected.notes || !Number.isInteger(entry.build) || entry.build !== Number(expected.build) || entry.signed !== true || entry.prerelease !== Boolean(expected.prerelease)) {
+      die(`appcast Android ${flavor} release metadata or signing state differs`, "appcast-drift");
+    }
+    const assetName = flavorContract.artifacts[entry.artifactType].replace("${version}", expected.version);
+    const expectedURL = `https://github.com/${REPOSITORY}/releases/download/${expected.tag}/${assetName}`;
+    let parsed;
+    try {
+      if (typeof entry.url !== "string") throw new TypeError("URL must be a string");
+      parsed = new URL(entry.url);
+    } catch {
+      die(`appcast Android ${flavor} URL is invalid`, "appcast-schema");
+    }
+    if (parsed.protocol !== "https:" || parsed.hostname !== "github.com" || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.href !== expectedURL) {
+      die(`appcast Android ${flavor} URL must be the immutable VortXTV/VortX release asset without credentials, query, or fragment`, "appcast-drift");
+    }
+    if (!Number.isInteger(entry.size) || entry.size <= 0 || entry.size > FEED_CAPS.artifactBytes || typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256) || typeof entry.signer !== "string" || entry.signer.length === 0 || entry.signer.length > 256) {
+      die(`appcast Android ${flavor} artifact metadata is invalid`, "appcast-schema");
+    }
+  }
+  if (!foundFlavor) die("appcast Android entry must contain a full or play flavor", "appcast-schema");
   return true;
 }
 

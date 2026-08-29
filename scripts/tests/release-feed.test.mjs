@@ -10,6 +10,7 @@ import {
   assertAppcast,
   assertMonotonic,
   assertSource,
+  buildAppcast,
   buildReleaseFeedArtifact,
   fetchJSON,
   FEED_CAPS,
@@ -73,6 +74,18 @@ const expected = {
   macURL: MAC_URL,
 };
 
+function appcastFixture(android = null) {
+  return {
+    schemaVersion: 2,
+    _generatedFromTag: TAG,
+    _generatedFromCommit: "a".repeat(40),
+    ios: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: IOS_URL, url: IOS_URL, size: 101, sha256: IOS_SHA, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
+    tvos: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: TVOS_URL, url: TVOS_URL, size: 202, sha256: TVOS_SHA, altstore: null, artifactType: "ipa" },
+    mac: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: MAC_URL, url: MAC_URL, size: 303, sha256: MAC_SHA, altstore: null, artifactType: "dmg" },
+    android,
+  };
+}
+
 let temp;
 let server;
 let baseURL;
@@ -98,15 +111,7 @@ before(async () => {
       return;
     }
     if (url.pathname === "/appcast") {
-      response.end(JSON.stringify({
-        schemaVersion: 2,
-        _generatedFromTag: TAG,
-        _generatedFromCommit: "a".repeat(40),
-        ios: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: IOS_URL, url: IOS_URL, size: 101, sha256: IOS_SHA, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
-        tvos: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: TVOS_URL, url: TVOS_URL, size: 202, sha256: TVOS_SHA, altstore: null, artifactType: "ipa" },
-        mac: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: MAC_URL, url: MAC_URL, size: 303, sha256: MAC_SHA, altstore: null, artifactType: "dmg" },
-        android: null,
-      }));
+      response.end(JSON.stringify(appcastFixture()));
       return;
     }
     response.statusCode = 404;
@@ -254,13 +259,8 @@ test("public routes pass current schema, asset metadata, and appcast checks", as
 });
 
 test("appcast must state Android null until a signed artifact exists", () => {
-  const appcast = {
-    schemaVersion: 2,
-    _generatedFromTag: TAG,
-    ios: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: IOS_URL, url: IOS_URL, size: 101, sha256: IOS_SHA, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
-    tvos: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: TVOS_URL, url: TVOS_URL, size: 202, sha256: TVOS_SHA, altstore: null, artifactType: "ipa" },
-    mac: { tag: TAG, version: VERSION, build: BUILD, name: "Beta 19", notes: "Beta release notes.", prerelease: true, ipa: MAC_URL, url: MAC_URL, size: 303, sha256: MAC_SHA, altstore: null, artifactType: "dmg" },
-  };
+  const appcast = appcastFixture();
+  delete appcast.android;
   assert.throws(() => assertAppcast(appcast, expected), /Android/);
 });
 
@@ -338,6 +338,13 @@ const VALID_ANDROID_PLAY = Object.freeze({
   prerelease: true,
 });
 
+function appcastAndroidFixture() {
+  return {
+    full: { ...VALID_ANDROID_FULL, tag: TAG, name: expected.name, notes: expected.notes },
+    play: { ...VALID_ANDROID_PLAY, tag: TAG, name: expected.name, notes: expected.notes },
+  };
+}
+
 function validManifest({ android = null, hasApple = true } = {}) {
   const m = {
     schemaVersion: 2,
@@ -410,6 +417,119 @@ test("validateReleaseFeedArtifact accepts AAB artifact type", () => {
     android: { full: VALID_ANDROID_FULL, play: playAab },
   }));
   assert.equal(result.valid, true);
+});
+
+test("assertAppcast accepts schemaVersion 2 split Android release assets", () => {
+  const android = appcastAndroidFixture();
+  android.play = {
+    ...android.play,
+    artifactType: "aab",
+    url: android.play.url.replace("-universal.apk", ".aab"),
+  };
+  assert.doesNotThrow(() => assertAppcast(appcastFixture(android), expected));
+});
+
+test("buildAppcast round-trips split Android entries through assertAppcast", () => {
+  const input = {
+    tag: TAG,
+    build: BUILD,
+    version: VERSION,
+    name: expected.name,
+    notes: expected.notes,
+    prerelease: true,
+    ios: { url: IOS_URL, size: expected.iosSize, sha256: IOS_SHA },
+    tvos: { url: TVOS_URL, size: expected.tvosSize, sha256: TVOS_SHA },
+    mac: { url: MAC_URL, size: expected.macSize, sha256: MAC_SHA },
+    android: { full: VALID_ANDROID_FULL, play: VALID_ANDROID_PLAY },
+  };
+  const appcast = buildAppcast(input);
+  assertAppcast(appcast, expected);
+  assert.equal(appcast.android.full.tag, TAG);
+  assert.equal(appcast.android.play.name, expected.name);
+  assert.equal(appcast.android.play.notes, expected.notes);
+  assert.equal(buildAppcast({ ...input, android: null }).android, null);
+  assert.throws(() => buildAppcast({ ...input, android: { signed: true, url: VALID_ANDROID_FULL.url } }), /split into full\/play/);
+});
+
+test("assertAppcast rejects split Android drift and unsafe release URLs", () => {
+  const cases = [
+    {
+      name: "flat root Android metadata",
+      android: { signed: true, url: VALID_ANDROID_FULL.url },
+      error: /split into full\/play/,
+    },
+    {
+      name: "missing signing metadata",
+      mutate: (android) => delete android.full.signer,
+      error: /missing required schema fields/,
+    },
+    {
+      name: "missing Android tag",
+      mutate: (android) => delete android.full.tag,
+      error: /missing required schema fields/,
+    },
+    {
+      name: "missing Android name",
+      mutate: (android) => delete android.full.name,
+      error: /missing required schema fields/,
+    },
+    {
+      name: "missing Android notes",
+      mutate: (android) => delete android.full.notes,
+      error: /missing required schema fields/,
+    },
+    {
+      name: "Android tag drift",
+      mutate: (android) => { android.full.tag = "v9.9.9"; },
+      error: /release metadata or signing state differs/,
+    },
+    {
+      name: "Android name drift",
+      mutate: (android) => { android.full.name = "Other release"; },
+      error: /release metadata or signing state differs/,
+    },
+    {
+      name: "Android notes drift",
+      mutate: (android) => { android.full.notes = "Other notes."; },
+      error: /release metadata or signing state differs/,
+    },
+    {
+      name: "credential-bearing URL",
+      mutate: (android) => { android.full.url = android.full.url.replace("https://github.com", "https://token@github.com"); },
+      error: /without credentials, query, or fragment/,
+    },
+    {
+      name: "URL query",
+      mutate: (android) => { android.play.url += "?download=1"; },
+      error: /without credentials, query, or fragment/,
+    },
+    {
+      name: "wrong release asset",
+      mutate: (android) => { android.play.url = android.play.url.replace("play-media3-universal", "full-mpv-universal"); },
+      error: /immutable VortXTV\/VortX release asset/,
+    },
+    {
+      name: "wrong engine",
+      mutate: (android) => { android.full.engine = "media3"; },
+      error: /flavor, engine, or artifact type is invalid/,
+    },
+    {
+      name: "oversized artifact",
+      mutate: (android) => { android.full.size = FEED_CAPS.artifactBytes + 1; },
+      error: /artifact metadata is invalid/,
+    },
+    {
+      name: "noncanonical SHA-256",
+      mutate: (android) => { android.play.sha256 = "B".repeat(64); },
+      error: /artifact metadata is invalid/,
+    },
+  ];
+  for (const testCase of cases) {
+    const android = testCase.android || appcastAndroidFixture();
+    testCase.mutate?.(android);
+    assert.throws(() => assertAppcast(appcastFixture(android), expected), testCase.error, testCase.name);
+  }
+  assert.throws(() => assertAppcast({ ...appcastFixture(), schemaVersion: "2" }, expected), /schemaVersion/);
 });
 
 test("validateReleaseFeedArtifact accepts JSON string input with size check", () => {
