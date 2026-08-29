@@ -192,18 +192,38 @@ struct VortXHLSBackpressureWaitState: Equatable, Sendable {
     }
 }
 
-/// Decides whether an AVPlayer item-end notification is meaningful before it can claim the terminal latch.
-/// AVFoundation may send an end notification while the user's committed transport intent is paused; treating
-/// that as a completion advances the episode even though playback was explicitly stopped. Kept dependency-free
-/// so the notification contract is executable in isolation.
+/// Preserves an AVPlayer item-end receipt while a viewer is paused. AVFoundation can report an item end after
+/// the user pauses a DV/HLS mount; that must not advance the episode, but discarding a genuine terminal state
+/// would make a later explicit Play ask an ended item to resume. Kept dependency-free so the contract is
+/// executable in isolation.
 enum VortXPlaybackEndNotificationPolicy {
-    enum Decision: Equatable, Sendable {
-        case ignorePausedIntent
-        case inspectTerminalState
+    enum Terminal: Equatable, Sendable {
+        case eof
+        case error(String)
     }
 
-    static func decide(playbackRequested: Bool) -> Decision {
-        playbackRequested ? .inspectTerminalState : .ignorePausedIntent
+    struct DeferredTerminal: Equatable, Sendable {
+        private(set) var generation: UInt64 = 0
+        private(set) var terminal: Terminal?
+
+        mutating func reset(generation: UInt64) {
+            self.generation = generation
+            terminal = nil
+        }
+
+        /// The first exact-item terminal receipt wins. Duplicates must not replace a concrete failure with EOF.
+        mutating func capture(_ terminal: Terminal, generation: UInt64) -> Bool {
+            guard generation == self.generation, self.terminal == nil else { return false }
+            self.terminal = terminal
+            return true
+        }
+
+        /// A later item generation can never consume this receipt.
+        mutating func consume(generation: UInt64) -> Terminal? {
+            guard generation == self.generation else { return nil }
+            defer { terminal = nil }
+            return terminal
+        }
     }
 }
 

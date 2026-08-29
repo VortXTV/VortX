@@ -52,12 +52,42 @@ private func containsInOrder(_ source: String?, _ needles: [String]) -> Bool {
 @MainActor @main
 enum RemuxItemEndPolicyTests {
     static func main() {
+        var deferred = VortXPlaybackEndNotificationPolicy.DeferredTerminal()
+        deferred.reset(generation: 7)
+        var deferredEOFLatch = VortXPlaybackTerminalLatch(generation: 7)
         check(
-            "paused user intent ignores an AVPlayer item-end notification before terminal classification",
-            VortXPlaybackEndNotificationPolicy.decide(playbackRequested: false) == .ignorePausedIntent)
+            "paused genuine non-remux EOF is delivered exactly once only after an explicit later Play",
+            deferred.capture(.eof, generation: 7)
+                && !deferredEOFLatch.hasEmitted
+                && deferred.consume(generation: 7) == .eof
+                && deferredEOFLatch.claim(generation: 7)
+                && !deferredEOFLatch.claim(generation: 7)
+                && deferred.consume(generation: 7) == nil)
+        deferred.reset(generation: 8)
         check(
-            "playing user intent permits a genuine AVPlayer completion to be classified",
-            VortXPlaybackEndNotificationPolicy.decide(playbackRequested: true) == .inspectTerminalState)
+            "paused clean producer EOF is deferred exactly once",
+            deferred.capture(.eof, generation: 8)
+                && deferred.consume(generation: 8) == .eof
+                && deferred.consume(generation: 8) == nil)
+        deferred.reset(generation: 9)
+        check(
+            "temporary remux-tail failure is retained as an error and never becomes EOF",
+            VortXRemuxItemEndPolicy.classify(
+                isRemux: true,
+                producerEnded: false,
+                producerFailureReason: nil) == .remuxFailure(VortXRemuxItemEndPolicy.prematureEndReason)
+                && deferred.capture(.error(VortXRemuxItemEndPolicy.prematureEndReason), generation: 9)
+                && deferred.consume(generation: 9) == .error(VortXRemuxItemEndPolicy.prematureEndReason))
+        deferred.reset(generation: 10)
+        check(
+            "generation reset cannot replay an old deferred terminal",
+            deferred.capture(.error("real failure"), generation: 10)
+                && { deferred.reset(generation: 11); return deferred.consume(generation: 10) == nil }())
+        deferred.reset(generation: 12)
+        check(
+            "a real deferred failure remains an error when explicitly consumed",
+            deferred.capture(.error("real failure"), generation: 12)
+                && deferred.consume(generation: 12) == .error("real failure"))
 
         check(
             "raw AVPlayer end remains content EOF",
@@ -197,12 +227,19 @@ enum RemuxItemEndPolicyTests {
             from: "@objc private func didPlayToEnd",
             to: "@objc private func failedToEnd")
         check(
-            "wiring: paused intent is rejected before remux classification and terminal-latch claim",
+            "wiring: paused item-end evidence is classified then deferred before terminal-latch claim",
             containsInOrder(endHandler, [
-                "VortXPlaybackEndNotificationPolicy.decide(",
-                "ignored item-end notification while committed transport intent is paused",
                 "VortXRemuxItemEndPolicy.classify(",
-                "terminalLatch.claim(generation: itemGeneration)",
+                "if !playbackRequested {",
+                "deferredTerminal.capture(terminal, generation: itemGeneration)",
+            ]) && endHandler?.contains("terminalLatch.claim(generation: itemGeneration)") == false)
+        check(
+            "wiring: explicit Play consumes a deferred terminal before asking AVPlayer to run again",
+            containsInOrder(engine, [
+                "func play() {",
+                "deferredTerminal.consume(generation: itemGeneration)",
+                "deliverTerminal(deferred, loadToken: loadToken, generation: itemGeneration)",
+                "player.rate = requestedRate",
             ]))
         check(
             "wiring: nonterminal local remux EOF is one fatal error and never ordinary EOF",
@@ -224,19 +261,20 @@ enum RemuxItemEndPolicyTests {
             engine?.components(separatedBy:
                 "progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil").count == 3)
         check(
-            "wiring: item-end audio rollback runs before the shared terminal claim",
+            "wiring: item-end audio rollback runs before immediate terminal delivery",
             containsInOrder(endHandler, [
                 "recoverAudioReplacementIfNeeded(",
-                "terminalLatch.claim(generation: itemGeneration)",
-                "fatalErrorEmitted = true",
-                "emit(MPVProperty.endFileError, reason",
+                "terminal = .error(reason)",
+                "deliverTerminal(terminal, loadToken: loadToken, generation: itemGeneration)",
             ]))
         check(
-            "wiring: EOF and error share the exact-generation terminal latch",
-            endHandler?.components(separatedBy:
-                "terminalLatch.claim(generation: itemGeneration)").count == 3
+            "wiring: deferred and immediate EOF/error delivery share the exact-generation terminal latch",
+            engine?.contains("private func deliverTerminal(") == true
+                && engine?.contains("terminalLatch.claim(generation: generation)") == true
+                && engine?.contains("case .eof:") == true
+                && engine?.contains("case .error(let reason):") == true
                 && engine?.components(separatedBy:
-                    "terminalLatch.reset(generation: itemGeneration)").count == 4)
+                    "deferredTerminal.reset(generation: itemGeneration)").count == 4)
 
         print("")
         if failures == 0 {

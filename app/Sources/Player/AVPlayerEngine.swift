@@ -290,6 +290,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// EOF and error share one exact-item terminal edge. Unlike `fatalErrorEmitted`, this also suppresses a
     /// later failure after EOF and resets only when `itemGeneration` advances.
     private var terminalLatch = VortXPlaybackTerminalLatch()
+    /// A true terminal receipt captured while the viewer is paused. Its exact item generation prevents a
+    /// replacement item from replaying the previous item's completion when the viewer presses Play.
+    private var deferredTerminal = VortXPlaybackEndNotificationPolicy.DeferredTerminal()
     /// One-shot per mount for an explicit HDR-only recovery item. The initial DV item has exactly one video
     /// variant, so AVPlayer cannot jump into a stripped-DV representation inside the same adaptive set. An exact
     /// CoreMedia -12927 rejection on a healthy, base-layer-compatible mount gets one fresh item at
@@ -844,6 +847,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let issuedToken = loadToken ?? PlayerLoadToken()
         itemGeneration &+= 1
         terminalLatch.reset(generation: itemGeneration)
+        deferredTerminal.reset(generation: itemGeneration)
         playbackMountIdentity &+= 1
         let issuedGeneration = itemGeneration
         audioReplacement?.bind(to: issuedGeneration)
@@ -1602,6 +1606,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
         itemGeneration &+= 1
         terminalLatch.reset(generation: itemGeneration)
+        deferredTerminal.reset(generation: itemGeneration)
         if remuxRemoteMount != nil {
             remuxRemoteItemGeneration = itemGeneration
         }
@@ -1702,6 +1707,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     func play() {
         playbackRequested = true
         refreshPendingIntentTransport()
+        if let loadToken = activeLoadToken,
+           let deferred = deferredTerminal.consume(generation: itemGeneration) {
+            // A paused item has already reached its terminal state. Deliver the exact receipt now rather than
+            // issuing play() against an ended AVPlayerItem, which can restart or race the episode transition.
+            deliverTerminal(deferred, loadToken: loadToken, generation: itemGeneration)
+            logTransport("play -> delivered deferred terminal")
+            return
+        }
         player.rate = requestedRate
         logTransport("play")
         // OPTIMISTIC TRANSPORT PUBLISH. The chrome's pause glyph hangs off this property, and its only other
@@ -2047,6 +2060,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         remuxTimelineOrigin = 0
         itemGeneration &+= 1
         terminalLatch.reset(generation: itemGeneration)
+        deferredTerminal.reset(generation: itemGeneration)
         pendingRemuxGeneration = nil
         #if os(tvOS)
         nativePreAttachTask?.cancel()
@@ -3659,16 +3673,6 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let endedItem = note.object as? AVPlayerItem,
               let loadToken = activeLoadToken,
               owns(endedItem, loadToken: loadToken) else { return }
-        guard VortXPlaybackEndNotificationPolicy.decide(
-            playbackRequested: playbackRequested) == .inspectTerminalState else {
-            // A paused viewer owns transport even if AVFoundation later reports an item end while preserving or
-            // recovering a DV/HLS mount. Do not classify or latch it: either operation would turn a deliberate
-            // pause into the chrome's normal episode-completion path.
-            DiagnosticsLog.log(
-                "avplayer",
-                "ignored item-end notification while committed transport intent is paused")
-            return
-        }
         let remuxTerminal: (ended: Bool, failureReason: String?)?
         if let server = remuxHLSServer {
             remuxTerminal = (server.hasReachedEndOfStream, server.terminalFailureReason)
@@ -3685,27 +3689,49 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         } else {
             remuxTerminal = nil
         }
+        let terminal: VortXPlaybackEndNotificationPolicy.Terminal
         switch VortXRemuxItemEndPolicy.classify(
             isRemux: remuxTerminal != nil,
             producerEnded: remuxTerminal?.ended ?? true,
             producerFailureReason: remuxTerminal?.failureReason
         ) {
         case .contentEOF:
-            guard terminalLatch.claim(generation: itemGeneration) else { return }
-            VXProbe.event("player", "endfile eof")
-            emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
+            terminal = .eof
         case .remuxFailure(let reason):
             guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
-            if recoverAudioReplacementIfNeeded(
+            if playbackRequested, recoverAudioReplacementIfNeeded(
                 generation: itemGeneration,
                 reason: reason) {
                 return
             }
-            guard terminalLatch.claim(generation: itemGeneration) else { return }
+            terminal = .error(reason)
+        }
+        if !playbackRequested {
+            guard deferredTerminal.capture(terminal, generation: itemGeneration) else { return }
+            DiagnosticsLog.log(
+                "avplayer",
+                "deferred item-end terminal while committed transport intent is paused generation=\(itemGeneration) terminal=\(String(describing: terminal))")
+            return
+        }
+        deliverTerminal(terminal, loadToken: loadToken, generation: itemGeneration)
+    }
+
+    /// Emits one terminal chrome event only while the exact item generation is still current. A paused
+    /// terminal receipt reaches this method solely from `play()`, never from AVFoundation's background event.
+    private func deliverTerminal(_ terminal: VortXPlaybackEndNotificationPolicy.Terminal,
+                                 loadToken: PlayerLoadToken,
+                                 generation: UInt64) {
+        guard generation == itemGeneration,
+              terminalLatch.claim(generation: generation) else { return }
+        switch terminal {
+        case .eof:
+            VXProbe.event("player", "endfile eof")
+            emit(MPVProperty.endFileEof, nil, loadToken: loadToken)
+        case .error(let reason):
             fatalErrorEmitted = true
             DiagnosticsLog.log(
                 "dv",
-                "AVPlayer item ended without a clean remux completion -> endFileError: \(reason)")
+                "AVPlayer item reached a terminal failure -> endFileError: \(reason)")
             VXProbe.event("player", "endfile error \(reason)")
             emit(MPVProperty.endFileError, reason, loadToken: loadToken)
         }
@@ -3718,6 +3744,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               owns(failedItem, loadToken: loadToken) else { return }
         let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
         let message = err?.localizedDescription ?? "Playback failed"
+        if !playbackRequested {
+            guard deferredTerminal.capture(.error(message), generation: itemGeneration) else { return }
+            DiagnosticsLog.log(
+                "avplayer",
+                "deferred failed-to-end terminal while committed transport intent is paused generation=\(itemGeneration)")
+            return
+        }
         if recoverAudioReplacementIfNeeded(
             generation: itemGeneration,
             reason: message) {
