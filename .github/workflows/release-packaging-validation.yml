@@ -131,6 +131,17 @@ jobs:
             -storetype PKCS12 -storepass vortx-adhoc-ci-store -alias adhoc-release \
             | sed -n 's/^SHA256:[[:space:]]*//p' | head -n1 | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
           [ -n "$expected_fp" ] || { echo "::error::could not derive the ad-hoc certificate fingerprint from the ephemeral keystore"; exit 1; }
+          extract_apk_certificate_sha256_digests() {
+            awk '
+              /^[[:space:]]*Signer #[0-9]+ certificate SHA-?256 digest:/ {
+                digest = $0
+                sub(/^[[:space:]]*Signer #[0-9]+ certificate SHA-?256 digest:[[:space:]]*/, "", digest)
+                if (digest != "") {
+                  print digest
+                }
+              }
+            '
+          }
           apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
           for apk in "${apks[@]}"; do
             out="$("$apksigner" verify --verbose --print-certs "$apk")"
@@ -139,9 +150,9 @@ jobs:
             if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$out"; then
               echo "::error::$apk is signed by an Android Debug certificate"; exit 1
             fi
-            count="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$out" | wc -l | tr -d '[:space:]')"
+            count="$(extract_apk_certificate_sha256_digests <<<"$out" | wc -l | tr -d '[:space:]')"
             [ "$count" = "1" ] || { echo "::error::$apk must report exactly one signer digest, found $count"; exit 1; }
-            fp="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+            fp="$(extract_apk_certificate_sha256_digests <<<"$out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
             [ "$fp" = "$expected_fp" ] || { echo "::error::$apk signer does not match the ephemeral ad-hoc certificate"; exit 1; }
             dn="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate DN:[[:space:]]*\(.*\)$/\1/p' <<<"$out")"
             [ "$dn" = "$expected_dn" ] || { echo "::error::$apk signer DN is not the ad-hoc release identity: $dn"; exit 1; }

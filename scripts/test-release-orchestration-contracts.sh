@@ -145,6 +145,8 @@ require_grep "validation builds the play release variant" 'assemblePlayRelease' 
 require_grep "validation bundles the play AAB" 'bundlePlayRelease' "$VALIDATION_WF"
 require_grep "validation requires APK Signature Scheme v2" \
     'Verified using v2 scheme \(APK Signature Scheme v2\): true' "$VALIDATION_WF"
+require_grep "validation accepts both APK certificate SHA-256 digest labels" \
+    'certificate SHA-\?256 digest' "$VALIDATION_WF"
 require_grep "validation rejects Android Debug certificates" 'Android Debug' "$VALIDATION_WF"
 require_grep "validation uses strict jarsigner verification on the AAB" \
     'jarsigner" -verify -strict' "$VALIDATION_WF"
