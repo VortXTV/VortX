@@ -2047,19 +2047,19 @@ final class CoreBridge: ObservableObject {
             synthesized.append(CoreCWItem(id: item.id, type: item.type, name: item.name,
                                           poster: item.poster, state: overlaid))
         }
-        var seenIDs = Set<String>()
-        var seenFingerprints = Set<String>()
-        let identity: (CoreCWItem) -> ContinueWatchingDedupe.Identity = {
-            .init(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster)
+        // Engine order is already newest-first and remains authoritative when its clock is not exposed. The
+        // played video id supplies the cross-provider alias bridge (for example tmdb display id plus tt…:S:E),
+        // so poster rotations never split a title and unrelated same-name titles never meet.
+        return ContinueWatchingDedupe.fold(engine + pruneFinished(synthesized)) {
+            .init(
+                id: $0.id,
+                type: $0.type,
+                aliases: [$0.state.videoId].compactMap { $0 },
+                hasValidProgress: $0.state.timeOffset.isFinite && $0.state.timeOffset > 0
+                    && $0.state.duration.isFinite && $0.state.duration >= 0,
+                removed: $0.removed ?? false
+            )
         }
-        // Engine items are filtered first, preserving their order and making them win every collision with the
-        // synthesized recovery floor. The strong fingerprint also collapses tmdb/imdb aliases only when their
-        // type, title, and nonempty poster all agree; same-title distinct shows remain separate.
-        let uniqueEngine = ContinueWatchingDedupe.filterUnique(
-            engine, seenIDs: &seenIDs, seenFingerprints: &seenFingerprints, identity: identity)
-        let uniqueSynthesized = ContinueWatchingDedupe.filterUnique(
-            pruneFinished(synthesized), seenIDs: &seenIDs, seenFingerprints: &seenFingerprints, identity: identity)
-        return uniqueEngine + uniqueSynthesized
     }
 
     /// Drop a finished movie, or honor an explicit owner/profile finish action, by rewinding its saved

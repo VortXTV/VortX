@@ -1,0 +1,308 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "provider alias survives poster refresh",
+      "items": [
+        {
+          "key": "fresh-tmdb",
+          "id": "tmdb:1396",
+          "type": "series",
+          "name": "Breaking Bad",
+          "poster": "https://img/new-poster.jpg",
+          "aliases": [" IMDB:TT0903747:5:16 "],
+          "position": 1200,
+          "duration": 2700,
+          "updatedAt": 300
+        },
+        {
+          "key": "stale-imdb",
+          "id": " TT0903747 ",
+          "type": "series",
+          "name": "Breaking Bad",
+          "poster": "https://img/old-poster.jpg",
+          "aliases": ["tt0903747:5:15"],
+          "position": 900,
+          "duration": 2700,
+          "updatedAt": 200
+        }
+      ],
+      "expected": ["fresh-tmdb"]
+    },
+    {
+      "name": "series episode ids collapse to their title",
+      "items": [
+        {
+          "key": "episode-three",
+          "id": "TT1234567:2:3",
+          "type": "series",
+          "name": "Example Show",
+          "poster": "https://img/episode-three.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 2400,
+          "updatedAt": 500
+        },
+        {
+          "key": "episode-two",
+          "id": "imdb:tt1234567:2:2",
+          "type": "series",
+          "name": "Example Show",
+          "poster": "https://img/episode-two.jpg",
+          "aliases": [],
+          "position": 1200,
+          "duration": 2400,
+          "updatedAt": 400
+        }
+      ],
+      "expected": ["episode-three"]
+    },
+    {
+      "name": "same title and poster without identity overlap stay separate",
+      "items": [
+        {
+          "key": "original",
+          "id": "tmdb:tv:100",
+          "type": "series",
+          "name": "The Office",
+          "poster": "https://img/shared.jpg",
+          "aliases": [],
+          "position": 300,
+          "duration": 1800,
+          "updatedAt": 700
+        },
+        {
+          "key": "remake",
+          "id": "tmdb:tv:200",
+          "type": "series",
+          "name": "The Office",
+          "poster": "https://img/shared.jpg",
+          "aliases": [],
+          "position": 400,
+          "duration": 1800,
+          "updatedAt": 600
+        }
+      ],
+      "expected": ["original", "remake"]
+    },
+    {
+      "name": "tmdb movie and tv namespaces never collide",
+      "items": [
+        {
+          "key": "movie-eleven",
+          "id": "tmdb:movie:11",
+          "type": "movie",
+          "name": "Eleven",
+          "poster": "https://img/eleven.jpg",
+          "aliases": [],
+          "position": 300,
+          "duration": 7200,
+          "updatedAt": 900
+        },
+        {
+          "key": "series-eleven",
+          "id": "tmdb:tv:11",
+          "type": "series",
+          "name": "Eleven",
+          "poster": "https://img/eleven.jpg",
+          "aliases": [],
+          "position": 300,
+          "duration": 2400,
+          "updatedAt": 800
+        }
+      ],
+      "expected": ["movie-eleven", "series-eleven"]
+    },
+    {
+      "name": "freshest valid progress beats a newer invalid row",
+      "items": [
+        {
+          "key": "invalid-newest",
+          "id": "tt2345678",
+          "type": "movie",
+          "name": "Valid Progress",
+          "poster": "https://img/new.jpg",
+          "aliases": [],
+          "position": 0,
+          "duration": 7200,
+          "updatedAt": 1100
+        },
+        {
+          "key": "valid-older",
+          "id": "imdb:tt2345678",
+          "type": "movie",
+          "name": "Valid Progress",
+          "poster": "https://img/old.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 7200,
+          "updatedAt": 1000
+        }
+      ],
+      "expected": ["valid-older"]
+    },
+    {
+      "name": "newer tombstone suppresses every known alias",
+      "items": [
+        {
+          "key": "stale-live-alias",
+          "id": "tmdb:tv:1396",
+          "type": "series",
+          "name": "Breaking Bad",
+          "poster": "https://img/live.jpg",
+          "aliases": ["tt0903747:5:16"],
+          "position": 1200,
+          "duration": 2700,
+          "updatedAt": 1200
+        },
+        {
+          "key": "newer-removal",
+          "id": "imdb:tt0903747",
+          "type": "series",
+          "name": "Breaking Bad",
+          "poster": "https://img/removed.jpg",
+          "aliases": [],
+          "position": 0,
+          "duration": 0,
+          "updatedAt": 1300,
+          "removed": true
+        }
+      ],
+      "expected": []
+    },
+    {
+      "name": "newer playback is an explicit re-add after removal",
+      "items": [
+        {
+          "key": "older-removal",
+          "id": "tt3456789",
+          "type": "movie",
+          "name": "Rewatch",
+          "poster": "https://img/removed.jpg",
+          "aliases": [],
+          "position": 0,
+          "duration": 0,
+          "updatedAt": 1400,
+          "removed": true
+        },
+        {
+          "key": "newer-rewatch",
+          "id": "imdb:tt3456789",
+          "type": "movie",
+          "name": "Rewatch",
+          "poster": "https://img/rewatch.jpg",
+          "aliases": [],
+          "position": 120,
+          "duration": 6000,
+          "updatedAt": 1500
+        }
+      ],
+      "expected": ["newer-rewatch"]
+    },
+    {
+      "name": "transitive alias bridge forms one identity component",
+      "items": [
+        {
+          "key": "imdb-winner",
+          "id": "tt3333333",
+          "type": "series",
+          "name": "Bridge",
+          "poster": "https://img/imdb.jpg",
+          "aliases": [],
+          "position": 700,
+          "duration": 2400,
+          "updatedAt": 1800
+        },
+        {
+          "key": "tmdb-candidate",
+          "id": "tmdb:tv:333",
+          "type": "series",
+          "name": "Bridge",
+          "poster": "https://img/tmdb.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 2400,
+          "updatedAt": 1700
+        },
+        {
+          "key": "bridge-row",
+          "id": "tmdb:333",
+          "type": "series",
+          "name": "Bridge",
+          "poster": "https://img/bridge.jpg",
+          "aliases": ["tt3333333:1:2"],
+          "position": 500,
+          "duration": 2400,
+          "updatedAt": 1600
+        }
+      ],
+      "expected": ["imdb-winner"]
+    },
+    {
+      "name": "equal clocks preserve first occurrence and group order",
+      "items": [
+        {
+          "key": "first-a",
+          "id": "tt4444444",
+          "type": "movie",
+          "name": "A",
+          "poster": "https://img/a1.jpg",
+          "aliases": [],
+          "position": 100,
+          "duration": 1000,
+          "updatedAt": 2000
+        },
+        {
+          "key": "first-b",
+          "id": "tmdb:movie:55",
+          "type": "movie",
+          "name": "B",
+          "poster": "https://img/b.jpg",
+          "aliases": [],
+          "position": 100,
+          "duration": 1000,
+          "updatedAt": 2000
+        },
+        {
+          "key": "later-a",
+          "id": "imdb:tt4444444",
+          "type": "movie",
+          "name": "A",
+          "poster": "https://img/a2.jpg",
+          "aliases": [],
+          "position": 200,
+          "duration": 1000,
+          "updatedAt": 2000
+        }
+      ],
+      "expected": ["first-a", "first-b"]
+    },
+    {
+      "name": "newest-first source order resolves rows without clocks",
+      "items": [
+        {
+          "key": "newer-live-without-clock",
+          "id": "tt5555556",
+          "type": "movie",
+          "name": "Source Ordered",
+          "poster": "https://img/live.jpg",
+          "aliases": [],
+          "position": 100,
+          "duration": 1000
+        },
+        {
+          "key": "older-removal-without-clock",
+          "id": "imdb:tt5555556",
+          "type": "movie",
+          "name": "Source Ordered",
+          "poster": "https://img/removed.jpg",
+          "aliases": [],
+          "position": 0,
+          "duration": 0,
+          "removed": true
+        }
+      ],
+      "expected": ["newer-live-without-clock"]
+    }
+  ]
+}

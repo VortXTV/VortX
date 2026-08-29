@@ -69,16 +69,31 @@ class WatchOverlayStore(
      * offset), a series rolls forward (its keep-signal is EPISODE ids, never the series metaId).
      */
     fun continueWatching(): List<MetaItem> {
-        val dated = ArrayList<Pair<String, MetaItem>>()
+        data class Candidate(val metaId: String, val entry: WatchEntry, val item: MetaItem)
+        val dated = ArrayList<Candidate>()
         for ((metaId, entry) in watch) {
             if (entry.type == "movie" &&
                 (entry.watchedVideoIds.contains(metaId) ||
                     (entry.durationMs > 0 && entry.timeOffsetMs.toDouble() >= entry.durationMs.toDouble() * 0.95))
             ) continue
             if (!(entry.timeOffsetMs > 0 || entry.watchedVideoIds.isNotEmpty())) continue
-            dated += entry.lastWatched to metaItem(metaId, entry)
+            dated += Candidate(metaId, entry, metaItem(metaId, entry))
         }
-        return dated.sortedByDescending { it.first }.take(30).map { it.second }
+        val ordered = dated.sortedWith(
+            compareByDescending<Candidate> { it.entry.lastWatched }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.metaId }
+                .thenBy { it.metaId },
+        )
+        return ContinueWatchingDedupe.fold(ordered) { candidate ->
+            val entry = candidate.entry
+            ContinueWatchingDedupe.Identity(
+                id = candidate.metaId,
+                type = entry.type,
+                aliases = listOfNotNull(entry.videoId),
+                freshness = runCatching { Instant.parse(entry.lastWatched).toEpochMilli().toDouble() }.getOrNull(),
+                hasValidProgress = entry.timeOffsetMs > 0 && entry.durationMs >= 0,
+            )
+        }.take(30).map { it.item }
     }
 
     /**

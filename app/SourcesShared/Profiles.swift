@@ -1297,7 +1297,23 @@ final class ProfileStore: ObservableObject {
                                                       videoId: entry.videoId))
             dated.append((entry.lastWatched, item))
         }
-        return dated.sorted { $0.lastWatched > $1.lastWatched }.prefix(30).map(\.item)
+        let ordered = dated.sorted {
+            if $0.lastWatched != $1.lastWatched { return $0.lastWatched > $1.lastWatched }
+            let lhs = $0.item.id.lowercased()
+            let rhs = $1.item.id.lowercased()
+            if lhs != rhs { return lhs < rhs }
+            return $0.item.id < $1.item.id
+        }
+        let unique = ContinueWatchingDedupe.fold(ordered) {
+            .init(
+                id: $0.item.id,
+                type: $0.item.type,
+                aliases: [$0.item.state.videoId].compactMap { $0 },
+                hasValidProgress: $0.item.state.timeOffset.isFinite && $0.item.state.timeOffset > 0
+                    && $0.item.state.duration.isFinite && $0.item.state.duration >= 0
+            )
+        }
+        return unique.prefix(30).map(\.item)
     }
 
     /// The active overlay profile's full Library: EVERY title it has watched, newest first. Unlike

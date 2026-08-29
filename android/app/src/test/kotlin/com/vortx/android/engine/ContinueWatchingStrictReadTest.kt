@@ -44,6 +44,42 @@ class ContinueWatchingStrictReadTest {
     }
 
     @Test
+    fun `engine fold uses played aliases and lets newer removals suppress stale rows`() {
+        val items = EngineState.parseContinueWatching(
+            """{
+              "items": [
+                {
+                  "_id": "tmdb:1396", "type": "series", "name": "Breaking Bad",
+                  "poster": "https://img/new.jpg",
+                  "state": {"timeOffset": 1200000, "duration": 2700000, "video_id": "tt0903747:5:16", "lastWatched": "2026-08-29T20:00:00Z"}
+                },
+                {
+                  "_id": "imdb:tt0903747", "type": "series", "name": "Breaking Bad",
+                  "poster": "https://img/old.jpg",
+                  "state": {"timeOffset": 900000, "duration": 2700000, "video_id": "tt0903747:5:15", "lastWatched": "2026-08-29T19:00:00Z"}
+                },
+                {
+                  "_id": "tmdb:tv:200", "type": "series", "name": "Breaking Bad",
+                  "poster": "https://img/new.jpg",
+                  "state": {"timeOffset": 300000, "duration": 2700000, "lastWatched": "2026-08-29T18:00:00Z"}
+                },
+                {
+                  "_id": "tmdb:movie:50", "type": "movie", "name": "Removed",
+                  "state": {"timeOffset": 300000, "duration": 6000000, "video_id": "tt5555555", "lastWatched": "2026-08-29T17:00:00Z"}
+                },
+                {
+                  "_id": "tt5555555", "type": "movie", "name": "Removed", "removed": true,
+                  "state": {"timeOffset": 0, "duration": 0, "lastWatched": "2026-08-29T21:00:00Z"}
+                }
+              ]
+            }""".trimIndent(),
+        )
+
+        assertEquals(listOf("tmdb:1396", "tmdb:tv:200"), items.map { it.id })
+        assertEquals(1200.0, items.first().resumeSeconds ?: 0.0, 0.001)
+    }
+
+    @Test
     fun `bare-id native deletion fails closed when media types share the id`() {
         val target = ContinueWatchingDismissal(
             owner = ContinueWatchingOwner("profile", "account", "principal", true, 7L),

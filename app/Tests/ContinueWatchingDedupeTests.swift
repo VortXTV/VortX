@@ -1,28 +1,45 @@
 import Foundation
 
-private struct Item: Equatable {
-    let id: String
-    let type: String
-    let name: String
-    let poster: String?
+private struct Fixture: Decodable {
+    let version: Int
+    let cases: [Case]
+
+    struct Case: Decodable {
+        let name: String
+        let items: [Item]
+        let expected: [String]
+    }
+
+    struct Item: Decodable, Equatable {
+        let key: String
+        let id: String
+        let type: String
+        let name: String
+        let poster: String?
+        let aliases: [String]
+        let position: Double
+        let duration: Double
+        let updatedAt: Double?
+        let removed: Bool?
+
+        var hasValidProgress: Bool {
+            position.isFinite && duration.isFinite && position > 0 && duration >= 0
+        }
+    }
 }
 
-private func merge(engine: [Item], synthesized: [Item]) -> [Item] {
-    var ids = Set<String>()
-    var fingerprints = Set<String>()
-    let identity: (Item) -> ContinueWatchingDedupe.Identity = {
-        .init(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster)
-    }
-    let live = ContinueWatchingDedupe.filterUnique(
-        engine, seenIDs: &ids, seenFingerprints: &fingerprints, identity: identity)
-    let recovered = ContinueWatchingDedupe.filterUnique(
-        synthesized, seenIDs: &ids, seenFingerprints: &fingerprints, identity: identity)
-    return live + recovered
+private func fixture() throws -> Fixture {
+    let repository = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let url = repository.appendingPathComponent("test-fixtures/continue-watching-dedupe.json")
+    return try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
 }
 
 @main
 private enum ContinueWatchingDedupeTests {
-    static func main() {
+    static func main() throws {
         var failures = 0
         var checks = 0
         func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
@@ -31,26 +48,22 @@ private enum ContinueWatchingDedupeTests {
             else { failures += 1; print("FAIL: \(message)") }
         }
 
-        let live = Item(id: "tt0903747", type: "series", name: "Breaking Bad", poster: "https://img/poster.jpg")
-        let exact = Item(id: "TT0903747", type: "series", name: "Breaking Bad", poster: "https://img/poster.jpg")
-        let alias = Item(id: "tmdb:1396", type: "series", name: " breaking   bad ", poster: "https://img/poster.jpg")
-        let remake = Item(id: "tmdb:999", type: "series", name: "Breaking Bad", poster: "https://img/remake.jpg")
-        let noPoster = Item(id: "tmdb:1000", type: "series", name: "Breaking Bad", poster: nil)
+        let parity = try fixture()
+        expect(parity.version == 1, "cross-platform fixture schema is version 1")
+        for testCase in parity.cases {
+            let folded = ContinueWatchingDedupe.fold(testCase.items) {
+                .init(
+                    id: $0.id,
+                    type: $0.type,
+                    aliases: $0.aliases,
+                    freshness: $0.updatedAt,
+                    hasValidProgress: $0.hasValidProgress,
+                    removed: $0.removed ?? false
+                )
+            }
+            expect(folded.map(\.key) == testCase.expected, "parity: \(testCase.name)")
+        }
 
-        expect(merge(engine: [live, exact], synthesized: []).map(\.id) == [live.id],
-               "exact ids collapse case-insensitively")
-        expect(merge(engine: [live], synthesized: [alias]).map(\.id) == [live.id],
-               "strong tmdb/imdb display aliases collapse and the engine item wins")
-        let weakenedAlias = Item(
-            id: alias.id, type: alias.type, name: alias.name, poster: nil)
-        expect(merge(engine: [live, alias], synthesized: [weakenedAlias]).map(\.id) == [live.id],
-               "a rejected engine alias cannot resurrect from a later lane with weaker metadata")
-        expect(merge(engine: [live], synthesized: [remake]).map(\.id) == [live.id, remake.id],
-               "same-title series with different posters stay distinct")
-        expect(merge(engine: [live], synthesized: [noPoster]).map(\.id) == [live.id, noPoster.id],
-               "title alone never collapses an identity with missing poster evidence")
-        expect(merge(engine: [live, remake], synthesized: []).map(\.id) == [live.id, remake.id],
-               "engine order is preserved")
         expect(WatchedMembershipPolicy.changed(["s1e1"], ["s1e2"]),
                "same-count watched episode replacement is observable")
         expect(!WatchedMembershipPolicy.changed(["s1e2", "s1e1"], ["s1e1", "s1e2"]),

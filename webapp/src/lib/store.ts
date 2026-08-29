@@ -1,6 +1,13 @@
 import type { Addon, MetaItem } from "./types";
 import { CINEMETA_URL, loadAddon } from "./addon";
 import { activeScope } from "./profiles";
+import {
+  canonicalPlaybackIdentity,
+  continueWatchingIdentityKeys,
+  foldContinueWatching,
+  identityKeysIntersect,
+  type ContinueWatchingIdentity,
+} from "./continue-watching-dedupe";
 
 /** Per-profile storage key. The owner profile (scope "") uses the base key, so existing data, account
  *  hydration, and backup all stay on the canonical keys; overlay profiles get a suffixed key so each
@@ -243,9 +250,10 @@ export function clearHiddenRails(): void {
 }
 
 // --- Continue Watching --------------------------------------------------------------------------
-// In-progress titles, recorded by the player as you watch (position + duration). Local to this browser
-// (the web client has no account sync). A title past 95% is treated as finished and dropped.
+// In-progress titles, recorded by the player as you watch (position + duration). Storage is profile-scoped
+// in this browser and the account layer mirrors its live entries. A title past 95% is treated as finished.
 const CW_KEY = "vortx.web.cw.v1";
+const CW_TOMBSTONE_KEY = "vortx.web.cw.removed.v1";
 
 export interface CWEntry extends MetaItem {
   /** The actual PLAYED id the position belongs to: the episode id for a series, the title id for a movie.
@@ -257,48 +265,110 @@ export interface CWEntry extends MetaItem {
   updatedAt: number;
 }
 
-/** Every stored progress entry (one per played id), most-recently-watched first. */
-function rawCW(): CWEntry[] {
+interface CWTombstone {
+  keys: string[];
+  removedAt: number;
+}
+
+function cwIdentity(entry: CWEntry): ContinueWatchingIdentity {
+  return {
+    id: entry.id,
+    type: entry.type,
+    aliases: [entry.resumeId],
+    freshness: entry.updatedAt,
+    hasValidProgress:
+      Number.isFinite(entry.position) && Number.isFinite(entry.duration) && entry.position > 0 && entry.duration >= 0,
+  };
+}
+
+function readCWTombstones(key: string): CWTombstone[] {
   try {
-    const raw = localStorage.getItem(scopedKey(CW_KEY));
+    const raw = localStorage.getItem(key);
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(parsed)) return [];
-    return (parsed as CWEntry[])
-      .filter((e) => e && typeof e.id === "string" && typeof e.resumeId === "string")
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+    return (parsed as CWTombstone[]).filter(
+      (entry) =>
+        entry &&
+        Array.isArray(entry.keys) &&
+        entry.keys.every((value) => typeof value === "string") &&
+        Number.isFinite(entry.removedAt),
+    );
   } catch {
     return [];
   }
 }
 
+function isTombstoned(entry: CWEntry, tombstones: CWTombstone[]): boolean {
+  const keys = continueWatchingIdentityKeys(cwIdentity(entry));
+  const updatedAt = Number.isFinite(entry.updatedAt) ? entry.updatedAt : 0;
+  return tombstones.some(
+    (tombstone) => tombstone.removedAt >= updatedAt && identityKeysIntersect(keys, new Set(tombstone.keys)),
+  );
+}
+
+function readCWKey(key: string, tombstoneKey: string): CWEntry[] {
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    const tombstones = readCWTombstones(tombstoneKey);
+    return (parsed as CWEntry[])
+      .filter(
+        (entry) =>
+          entry &&
+          typeof entry.id === "string" &&
+          typeof entry.type === "string" &&
+          typeof entry.resumeId === "string",
+      )
+      .filter((entry) => !isTombstoned(entry, tombstones))
+      .sort((a, b) => {
+        const lhs = Number.isFinite(a.updatedAt) ? a.updatedAt : 0;
+        const rhs = Number.isFinite(b.updatedAt) ? b.updatedAt : 0;
+        return rhs - lhs;
+      });
+  } catch {
+    return [];
+  }
+}
+
+/** Every stored progress entry (one per played id), most-recently-watched first. */
+function rawCW(): CWEntry[] {
+  return readCWKey(scopedKey(CW_KEY), scopedKey(CW_TOMBSTONE_KEY));
+}
+
 /** In-progress titles for the rail, most-recent first, collapsed to ONE card per title (a series with
  *  several watched episodes shows once and links to its Detail). */
 export function continueWatching(): CWEntry[] {
-  const seen = new Set<string>();
-  const out: CWEntry[] = [];
-  for (const e of rawCW()) {
-    if (seen.has(e.id)) continue;
-    seen.add(e.id);
-    out.push(e);
-  }
-  return out;
+  return foldContinueWatching(rawCW(), cwIdentity);
 }
 
 /** The saved resume position (seconds) for a PLAYED id (episode id for a series), or 0 if none. */
 export function cwPosition(resumeId: string): number {
-  return rawCW().find((e) => e.resumeId === resumeId)?.position ?? 0;
+  return (
+    rawCW().find((entry) => canonicalPlaybackIdentity(entry.resumeId, entry.type) === canonicalPlaybackIdentity(resumeId, entry.type))
+      ?.position ?? 0
+  );
 }
 
 /** The saved watched FRACTION (0..1) for a played id, or 0 if none / unknown duration. */
 export function cwProgress(resumeId: string): number {
-  const e = rawCW().find((x) => x.resumeId === resumeId);
+  const e = rawCW().find(
+    (entry) => canonicalPlaybackIdentity(entry.resumeId, entry.type) === canonicalPlaybackIdentity(resumeId, entry.type),
+  );
   return e && e.duration > 0 ? Math.min(1, e.position / e.duration) : 0;
 }
 
 /** The PLAYED id to resume for a title (e.g. the last-watched episode id of a series), or null if the
  *  title has no in-progress entry. Drives the series "Resume S#E#" hero action. */
 export function cwResumeId(titleId: string): string | null {
-  return continueWatching().find((e) => e.id === titleId)?.resumeId ?? null;
+  return (
+    continueWatching().find((entry) =>
+      identityKeysIntersect(
+        continueWatchingIdentityKeys(cwIdentity(entry)),
+        continueWatchingIdentityKeys({ id: titleId, type: entry.type }),
+      ),
+    )?.resumeId ?? null
+  );
 }
 
 // Write-up trigger: fires after any local CW change so the account can push the active profile's web
@@ -347,7 +417,8 @@ export function recordProgress(
 ): void {
   if (!isFinite(position) || !isFinite(duration) || duration <= 0) return;
   const resumeId = item.resumeId ?? item.id;
-  const others = rawCW().filter((e) => e.resumeId !== resumeId);
+  const resumeKey = canonicalPlaybackIdentity(resumeId, item.type);
+  const others = rawCW().filter((entry) => canonicalPlaybackIdentity(entry.resumeId, entry.type) !== resumeKey);
   if (position / duration > 0.95) {
     persistCW(others);
     cwSyncPusher?.(); // finishing a title is a CW change too - push the dropped state up
@@ -369,8 +440,41 @@ export function recordProgress(
 
 /** Remove a title from Continue Watching (every played-id entry that shares this display id). */
 export function clearProgress(id: string): void {
-  persistCW(rawCW().filter((e) => e.id !== id));
-  cwSyncPusher?.(); // propagate the removal up (apps/other browsers drop it on next pull)
+  const entries = rawCW();
+  const visible = continueWatching().find((entry) => entry.id === id) ??
+    continueWatching().find((entry) => entry.id.trim().toLowerCase() === id.trim().toLowerCase());
+  if (!visible) return;
+  const removalKeys = continueWatchingIdentityKeys(cwIdentity(visible));
+  // Complete the alias component before deleting, including a late bridge row.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const entry of entries) {
+      const keys = continueWatchingIdentityKeys(cwIdentity(entry));
+      if (!identityKeysIntersect(removalKeys, keys)) continue;
+      for (const key of keys) {
+        if (!removalKeys.has(key)) {
+          removalKeys.add(key);
+          changed = true;
+        }
+      }
+    }
+  }
+  persistCW(entries.filter((entry) => !identityKeysIntersect(removalKeys, continueWatchingIdentityKeys(cwIdentity(entry)))));
+  const tombstoneKey = scopedKey(CW_TOMBSTONE_KEY);
+  const removedAt = Date.now();
+  const tombstones = readCWTombstones(tombstoneKey).filter(
+    (entry) => !identityKeysIntersect(removalKeys, new Set(entry.keys)),
+  );
+  try {
+    localStorage.setItem(
+      tombstoneKey,
+      JSON.stringify([{ keys: [...removalKeys].sort(), removedAt }, ...tombstones].slice(0, 100)),
+    );
+  } catch {
+    /* storage disabled or full: the local removal above still applies */
+  }
+  cwSyncPusher?.(); // publish the active live set; this scope's tombstone still blocks stale hydration
 }
 
 function persistCW(entries: CWEntry[]): void {
@@ -383,43 +487,52 @@ function persistCW(entries: CWEntry[]): void {
 
 /** Merge externally-sourced Continue Watching entries (derived from the synced account library's watch
  *  progress) into the OWNER (base) store - account watch history belongs to the owner, never an active
- *  overlay profile, mirroring how mergeLibrary always targets the base key. Union by resumeId; a fresher
+ *  overlay profile, mirroring how mergeLibrary always targets the base key. Union by canonical resumeId; a fresher
  *  local entry (newer updatedAt) is never clobbered. Only in-progress entries (0 < position/duration <
  *  0.95) are kept. Returns whether anything changed (so the caller can trigger a re-render). */
 export function mergeContinueWatching(entries: CWEntry[]): boolean {
+  return mergeContinueWatchingAt(CW_KEY, CW_TOMBSTONE_KEY, entries);
+}
+
+function mergeContinueWatchingAt(key: string, tombstoneKey: string, entries: CWEntry[]): boolean {
+  const tombstones = readCWTombstones(tombstoneKey);
   const incoming = entries.filter(
-    (e) =>
-      e &&
-      typeof e.id === "string" &&
-      typeof e.resumeId === "string" &&
-      e.duration > 0 &&
-      e.position > 0 &&
-      e.position / e.duration < 0.95,
+    (entry) =>
+      entry &&
+      typeof entry.id === "string" &&
+      typeof entry.type === "string" &&
+      typeof entry.resumeId === "string" &&
+      entry.duration > 0 &&
+      entry.position > 0 &&
+      entry.position / entry.duration < 0.95 &&
+      !isTombstoned(entry, tombstones),
   );
   if (!incoming.length) return false;
-  let existing: CWEntry[] = [];
-  try {
-    const raw = localStorage.getItem(CW_KEY); // base (owner) key, NOT the active scope
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) existing = parsed as CWEntry[];
-  } catch {
-    existing = [];
-  }
-  const byResume = new Map(
-    existing.filter((e) => e && typeof e.resumeId === "string").map((e) => [e.resumeId, e]),
-  );
+  const existing = readCWKey(key, tombstoneKey);
+  const byResume = new Map<string, CWEntry>();
   let changed = false;
-  for (const e of incoming) {
-    const cur = byResume.get(e.resumeId);
-    if (!cur || e.updatedAt > cur.updatedAt) {
-      byResume.set(e.resumeId, e);
+  const merge = (entry: CWEntry, incomingEntry: boolean) => {
+    const resumeKey = canonicalPlaybackIdentity(entry.resumeId, entry.type) ??
+      `${entry.type.trim().toLowerCase()}\u001f${entry.resumeId.trim().toLowerCase()}`;
+    const current = byResume.get(resumeKey);
+    if (!current) {
+      byResume.set(resumeKey, entry);
+      if (incomingEntry) changed = true;
+      return;
+    }
+    if (entry.updatedAt > current.updatedAt) {
+      byResume.set(resumeKey, entry);
       changed = true;
     }
-  }
+  };
+  for (const entry of existing) merge(entry, false);
+  for (const entry of incoming) merge(entry, true);
+  // Canonical variants already present on disk collapse on the next real merge too.
+  if (byResume.size < existing.length) changed = true;
   if (!changed) return false;
   const next = [...byResume.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 40);
   try {
-    localStorage.setItem(CW_KEY, JSON.stringify(next));
+    localStorage.setItem(key, JSON.stringify(next));
   } catch {
     /* best-effort */
   }
@@ -466,42 +579,8 @@ export function mergeLibraryForScope(scope: string, items: MetaItem[]): boolean 
 
 /** Merge a profile's synced continue-watching into its scoped key (union by resumeId, fresher wins). */
 export function mergeContinueWatchingForScope(scope: string, entries: CWEntry[]): boolean {
-  const incoming = entries.filter(
-    (e) =>
-      e &&
-      typeof e.id === "string" &&
-      typeof e.resumeId === "string" &&
-      e.duration > 0 &&
-      e.position > 0 &&
-      e.position / e.duration < 0.95,
-  );
-  if (!incoming.length) return false;
   const key = scopedBaseKey(CW_KEY, scope);
-  let existing: CWEntry[] = [];
-  try {
-    const raw = localStorage.getItem(key);
-    const parsed: unknown = raw ? JSON.parse(raw) : [];
-    if (Array.isArray(parsed)) existing = parsed as CWEntry[];
-  } catch {
-    existing = [];
-  }
-  const byResume = new Map(existing.filter((e) => e && typeof e.resumeId === "string").map((e) => [e.resumeId, e]));
-  let changed = false;
-  for (const e of incoming) {
-    const cur = byResume.get(e.resumeId);
-    if (!cur || e.updatedAt > cur.updatedAt) {
-      byResume.set(e.resumeId, e);
-      changed = true;
-    }
-  }
-  if (!changed) return false;
-  const next = [...byResume.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 40);
-  try {
-    localStorage.setItem(key, JSON.stringify(next));
-  } catch {
-    /* best-effort */
-  }
-  return true;
+  return mergeContinueWatchingAt(key, scopedBaseKey(CW_TOMBSTONE_KEY, scope), entries);
 }
 
 // --- Recent searches ----------------------------------------------------------------------------
@@ -551,6 +630,7 @@ const BACKUP_KEYS = [
   "vortx.web.addons.v1",
   "vortx.web.library.v1",
   "vortx.web.cw.v1",
+  "vortx.web.cw.removed.v1",
   "vortx.web.recent.v1",
 ];
 

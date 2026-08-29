@@ -20,9 +20,11 @@ import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.profile.ContinueWatchingDedupe
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
+import java.time.Instant
 
 internal sealed interface AuthAttemptOutcome {
     val requestId: String
@@ -234,32 +236,29 @@ internal object EngineState {
 
     /// Parse the `continue_watching_preview` field (`{ items: [CoreCWItem] }`) into UI [MetaItem]s for
     /// the leading Home rail. Each item mirrors Apple `CoreCWItem`: `_id`, `type`, `name`, `poster`,
-    /// a `state` progress block, and `removed`/`temp` library-bookkeeping flags. We drop `removed`
-    /// entries (they linger in the bucket but are not "in Continue Watching"), matching the reference
-    /// apps, and keep engine order (already sorted most-recent-first by the core).
+    /// a `state` progress block, and `removed`/`temp` library-bookkeeping flags. Removed or finished rows
+    /// remain only as terminal identity candidates, so they can suppress stale aliases but are never emitted.
+    /// Live groups keep engine order, which the core already supplies most-recent-first.
     fun parseContinueWatching(json: String): List<MetaItem> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
         val items = root.optJSONArray("items") ?: return emptyList()
-        val out = mutableListOf<MetaItem>()
+        val candidates = mutableListOf<Pair<MetaItem, ContinueWatchingDedupe.Identity>>()
         for (i in 0 until items.length()) {
             val obj = items.optJSONObject(i) ?: continue
-            if (obj.optBoolean("removed", false)) continue
             val state = obj.optJSONObject("state")
             val typeRaw = obj.optString("type", "movie")
+            val removed = obj.optBoolean("removed", false)
             // Finished-prune backstop, mirroring Apple `CoreCWItem.isFinished` applied in CoreBridge
             // before publishing the rail: the engine keeps any title with `time_offset > 0` (a movie
             // parked at the credits, a marked-watched title, one finished on another device and synced
-            // down) in the bucket forever. Drop it here so the rail matches the reference apps.
-            if (cwItemIsFinished(
+            // down) in the bucket forever. Retain it as a terminal candidate so the rail matches the reference apps.
+            val finished = cwItemIsFinished(
                     type = typeRaw,
                     progress = cwProgressFraction(state),
                     flaggedWatched = state?.optInt("flaggedWatched", 0) ?: 0,
                     timesWatched = state?.optInt("timesWatched", 0) ?: 0,
                 )
-            ) {
-                continue
-            }
-            out += MetaItem(
+            val item = MetaItem(
                 id = obj.optString("_id").ifEmpty { obj.optString("id") },
                 type = MediaType.fromId(typeRaw),
                 name = obj.optString("name"),
@@ -267,8 +266,25 @@ internal object EngineState {
                 progress = cwProgress(state),
                 resumeSeconds = cwResumeSeconds(state),
             )
+            val timeOffset = state?.optDouble("timeOffset", 0.0) ?: 0.0
+            val duration = state?.optDouble("duration", 0.0) ?: 0.0
+            val videoId = state?.optStringOrNull("video_id") ?: state?.optStringOrNull("videoId")
+            val freshness = state?.optStringOrNull("lastWatched")?.let { raw ->
+                runCatching { Instant.parse(raw).toEpochMilli().toDouble() }.getOrNull()
+            }
+            // Treat a finished engine row as a terminal state for its alias component. Otherwise an older alias
+            // can survive the prune and resurrect the movie/episode the engine just removed from the rail.
+            candidates += item to ContinueWatchingDedupe.Identity(
+                id = item.id,
+                type = typeRaw,
+                aliases = listOfNotNull(videoId),
+                freshness = freshness,
+                hasValidProgress = timeOffset.isFinite() && timeOffset > 0 &&
+                    duration.isFinite() && duration >= 0,
+                removed = removed || finished,
+            )
         }
-        return out
+        return ContinueWatchingDedupe.fold(candidates) { it.second }.map { it.first }
     }
 
     /**
