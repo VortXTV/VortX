@@ -3355,7 +3355,9 @@ struct TVPlayerView: View {
         if !isAVPlayerActive {
             rows.append(OptionRow(label: "Decoder", isHeader: true))
             let hw = coordinator.player?.hardwareDecoding ?? true
-            rows.append(OptionRow(label: "Hardware  ·  default", isSelected: hw) {
+            let hardwareDetail = (coordinator.player as? MPVMetalViewController)?
+                .hardwareDecoderSettingDetail ?? "recommended"
+            rows.append(OptionRow(label: "Hardware", detail: hardwareDetail, isSelected: hw) {
                 coordinator.player?.setHardwareDecoding(true)
             })
             rows.append(OptionRow(label: "Software  ·  if video misbehaves", isSelected: !hw) {

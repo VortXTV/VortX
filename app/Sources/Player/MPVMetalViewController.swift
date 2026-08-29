@@ -28,6 +28,23 @@ enum MPVDurationProbePolicy {
     }
 }
 
+/// Keeps the decoder REQUEST separate from mpv's negotiated decoder. `hwdec-current=no` can be a
+/// silent fallback even while the user still requests VideoToolbox, so it must never be treated as
+/// proof that the user selected Software.
+enum MPVHardwareDecodePolicy {
+    static let videoToolbox = "videotoolbox"
+
+    static func requestedDecoder(arguments: [String]) -> String {
+        guard let index = arguments.firstIndex(of: "-stremiox-hwdec"),
+              index + 1 < arguments.count else { return videoToolbox }
+        return arguments[index + 1]
+    }
+
+    static func isSoftwareFallback(requested: String, active: String?) -> Bool {
+        requested != "no" && active == "no"
+    }
+}
+
 // warning: metal API validation has been disabled to ignore crash when playing HDR videos.
 // Edit Scheme -> Run -> Diagnostics -> Metal API Validation -> Turn it off
 // https://github.com/KhronosGroup/MoltenVK/issues/2226
@@ -147,6 +164,12 @@ final class MPVMetalViewController: PlatformViewController {
     /// an event (load, pause, buffering, duration) or already coalesced to a few Hz, so the cost is noise.
     private var ownsSharedProbeState: Bool { probeChannel.description == "player" }
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
+    /// What the app/user asked mpv to use. This intentionally differs from `hwdec-current`, which is the
+    /// negotiated truth and can silently become `no` when VideoToolbox cannot decode the stream.
+    private var requestedHardwareDecoder = MPVHardwareDecodePolicy.videoToolbox
+    /// One negotiation receipt per file or explicit decoder change. Reset before either operation so a
+    /// later fallback is visible without repeating the same line in every 30-second performance receipt.
+    private var loggedHardwareDecoderNegotiation = false
     private var configuredLiveMode = false
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
@@ -731,13 +754,12 @@ final class MPVMetalViewController: PlatformViewController {
         // that path (vkAllocateMemory → MTLSimDevice) crashes the simulator's Metal driver on
         // large 4K frames. GPU-resident frames skip the upload entirely. A launch arg overrides
         // for diagnostics: -stremiox-hwdec <videotoolbox|no|auto-safe>.
-        let hwdec: String = {
-            let a = ProcessInfo.processInfo.arguments
-            if let i = a.firstIndex(of: "-stremiox-hwdec"), i + 1 < a.count { return a[i + 1] }
-            return "videotoolbox"
-        }()
+        let hwdec = MPVHardwareDecodePolicy.requestedDecoder(
+            arguments: ProcessInfo.processInfo.arguments)
+        requestedHardwareDecoder = hwdec
+        hardwareDecoding = hwdec != "no"
         checkError(mpv_set_option_string(mpv, "hwdec", hwdec))
-        mpvLog.log("hwdec = \(hwdec, privacy: .public)")
+        mpvLog.log("hwdec requested = \(hwdec, privacy: .public)")
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
         // Quality tone curve for any HDR -> SDR mapping (used when the Dolby Vision /
         // HDR compatibility toggle forces SDR output for displays that show DV P7
@@ -1319,6 +1341,7 @@ final class MPVMetalViewController: PlatformViewController {
         // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
         // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
         guard mpv != nil else { return issuedToken }
+        loggedHardwareDecoderNegotiation = false
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
         // colorspace; the new (HDR) episode then kept rendering in the previous SDR output (dull) until a
@@ -3390,7 +3413,37 @@ final class MPVMetalViewController: PlatformViewController {
     /// green frames, unsupported profile); it costs CPU, so hardware stays the default.
     func setHardwareDecoding(_ on: Bool) {
         hardwareDecoding = on
-        setString("hwdec", on ? "videotoolbox" : "no")
+        requestedHardwareDecoder = on ? MPVHardwareDecodePolicy.videoToolbox : "no"
+        loggedHardwareDecoderNegotiation = false
+        setString("hwdec", requestedHardwareDecoder)
+    }
+
+    /// Player-settings detail that preserves explicit intent while exposing negotiated truth. A silent
+    /// VideoToolbox fallback therefore leaves Hardware selected, but no longer presents it as active.
+    var hardwareDecoderSettingDetail: String {
+        if MPVHardwareDecodePolicy.isSoftwareFallback(
+            requested: requestedHardwareDecoder,
+            active: getString("hwdec-current")) {
+            return "VideoToolbox requested, software active"
+        }
+        return "recommended"
+    }
+
+    private func recordHardwareDecoderNegotiation(active: String?) {
+        guard !loggedHardwareDecoderNegotiation,
+              let active,
+              getInt("video-params/w") > 0,
+              getInt("video-params/h") > 0 else { return }
+        loggedHardwareDecoderNegotiation = true
+        let width = getInt("video-params/w")
+        let height = getInt("video-params/h")
+        let codec = getString("video-codec-name") ?? "unknown"
+        let fallback = MPVHardwareDecodePolicy.isSoftwareFallback(
+            requested: requestedHardwareDecoder, active: active)
+        DiagnosticsLog.log(
+            "player",
+            "hwdec negotiation requested=\(requestedHardwareDecoder) active=\(active) fallback=\(fallback) codec=\(codec) video=\(width)x\(height)"
+        )
     }
 
     /// Switch the audio output policy (Auto / Stereo / Surround / Passthrough) on the playing file.
@@ -3440,7 +3493,13 @@ final class MPVMetalViewController: PlatformViewController {
         let primaries = getString("video-params/primaries") ?? ""
         let range = gamma == "pq" ? "HDR (PQ)" : gamma == "hlg" ? "HLG" : "SDR"
         rows.append(("Range", primaries.isEmpty ? range : "\(range)  \(primaries)"))   // #76: primaries shows BT.2020 vs 709
-        rows.append(("Decode", getString("hwdec-current") ?? "software"))
+        let activeDecoder = getString("hwdec-current")
+        if MPVHardwareDecodePolicy.isSoftwareFallback(
+            requested: requestedHardwareDecoder, active: activeDecoder) {
+            rows.append(("Decode", "software (VideoToolbox unavailable)"))
+        } else {
+            rows.append(("Decode", activeDecoder ?? "software"))
+        }
         let fps = getDouble("container-fps")
         if fps > 0 { rows.append(("FPS", String(format: "%.3f", fps))) }
         // TOTAL AND RATE. This row used to show the bare cumulative frame-drop count, which reads as a burst:
@@ -3508,6 +3567,8 @@ final class MPVMetalViewController: PlatformViewController {
         #else
         framePresentation = nil
         #endif
+        let hardwareDecoder = diagnosticString("hwdec-current")
+        recordHardwareDecoderNegotiation(active: hardwareDecoder)
         return PlaybackDiagnostics(
             frameDropCount: diagnosticInt(MPVProperty.frameDropCount),
             decoderFrameDropCount: diagnosticInt(MPVProperty.decoderFrameDropCount),
@@ -3520,7 +3581,7 @@ final class MPVMetalViewController: PlatformViewController {
             cacheIdle: diagnosticFlag("demuxer-cache-state/idle"),
             cacheBufferingPercent: diagnosticInt("cache-buffering-state"),
             cacheDuration: diagnosticDouble("demuxer-cache-duration"),
-            hardwareDecoder: diagnosticString("hwdec-current"),
+            hardwareDecoder: hardwareDecoder,
             estimatedVideoFPS: diagnosticDouble("estimated-vf-fps"),
             containerFPS: diagnosticDouble("container-fps"),
             displayFPS: diagnosticDouble("display-fps"),

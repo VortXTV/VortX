@@ -7314,8 +7314,10 @@ struct PlayerScreen: View {
             // no-op there, so hide the Hardware/Software rows when the AVFoundation engine is active (#76).
             if !isAVPlayerActive {
                 let hw = coordinator.player?.hardwareDecoding ?? true
+                let hardwareDetail = (coordinator.player as? MPVMetalViewController)?
+                    .hardwareDecoderSettingDetail ?? "recommended"
                 rows.append(Row(label: "Decoder", isHeader: true))
-                rows.append(Row(label: "Hardware", detail: "recommended", selected: hw) {
+                rows.append(Row(label: "Hardware", detail: hardwareDetail, selected: hw) {
                     coordinator.player?.setHardwareDecoding(true)
                 })
                 rows.append(Row(label: "Software", detail: "rescues green / garbled frames", selected: !hw) {
