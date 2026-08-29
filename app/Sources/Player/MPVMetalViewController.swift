@@ -884,10 +884,10 @@ final class MPVMetalViewController: PlatformViewController {
         // receiver advertising >2 keeps native multichannel PCM, preserving the 0.2.43 eARC fix;
         // anything <=2 is forced to a stereo DOWNMIX so the endpoint always gets sound. The viewer
         // can override the whole policy with the Audio Output setting (Auto / Stereo / Surround).
-        // Audio output policy is iOS/tvOS only: mpv there uses the low-level audiounit AO that does
+        // Audio route policy is iOS/tvOS only: mpv there uses the low-level audiounit AO that does
         // not resample or downmix to the route on its own, so we drive it (the soundbar fixes). On
         // macOS mpv uses the coreaudio AO, which negotiates rate, channels, and routing natively
-        // like desktop mpv, so we leave audio at mpv's defaults.
+        // like desktop mpv. Only a saved Stereo compatibility override needs app-side setup there.
         #if canImport(UIKit)
         #if os(tvOS)
         // #78/#101: prefer the avfoundation AO (AVSampleBufferAudioRenderer) over audiounit on tvOS. The
@@ -950,6 +950,14 @@ final class MPVMetalViewController: PlatformViewController {
         }
         appliedAudioPolicy = (channelPolicy, sampleRatePolicy ?? 0)   // baseline so reapply only fires on a real change
         mpvLog.log("audio-channels = \(self.channelPolicy, privacy: .public), audio-samplerate = \(self.sampleRatePolicy.map(String.init) ?? "content", privacy: .public) (route \(self.outputChannels) ch @ \(Int(self.outputSampleRate)) Hz)")
+        #elseif os(macOS)
+        // Desktop mpv's CoreAudio output owns route, sample-rate, and multichannel negotiation. The
+        // one safe persisted override is Stereo, which must be installed before `mpv_initialize` so
+        // a saved compatibility choice survives relaunch. All other modes retain CoreAudio/mpv's
+        // normal automatic route and do not make an app-side SPDIF request at startup.
+        if AudioOutputMode.current == .stereo {
+            checkError(mpv_set_option_string(mpv, "audio-channels", "stereo"))
+        }
         #endif
 
         // Video upscaling / quality preset (Performance / Standard / High Quality / Anime4K). Applied as a
@@ -3396,6 +3404,10 @@ final class MPVMetalViewController: PlatformViewController {
         // Refresh AVAudioSession before mpv reopens its audio output. This makes an explicit Stereo
         // switch withdraw multichannel support and request two channels on the live route.
         applyChannelPolicy(force: true)
+        #elseif os(macOS)
+        // macOS CoreAudio owns normal route negotiation. Stereo is the supported persistent
+        // compatibility override; every other saved choice returns to mpv's safe automatic policy.
+        setString("audio-channels", mode == .stereo ? "stereo" : "auto-safe")
         #else
         setString("audio-channels", channelPolicy)
         #endif

@@ -518,6 +518,10 @@ struct SettingsView: View {
                 .buttonStyle(RowFocusStyle())
             }
             choiceRow(String(localized: "Audio output"), AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
+                .accessibilityLabel(String(localized: "Audio output"))
+                .accessibilityHint(String(localized: "Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv."))
+            Text(String(localized: "Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv."))
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Video upscaling"), VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)

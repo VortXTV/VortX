@@ -680,6 +680,7 @@ struct iOSSettingsView: View {
             Picker("Audio output", selection: $audioOutput) {
                 ForEach(AudioOutputMode.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            .accessibilityHint(String(localized: "Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture) and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv."))
             Picker("Video upscaling", selection: $videoUpscaling) {
                 ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
@@ -772,6 +773,7 @@ struct iOSSettingsView: View {
                 Text(PlaybackSettings.directLinksOnlyForced
                      ? String(localized: "This build does not bundle the torrent engine. Only direct and debrid links can play.")
                      : String(localized: "Hide torrent and magnet sources. Only direct and debrid links will play."))
+                Text(String(localized: "Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture) and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv."))
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 Text(diskCacheFooter)
