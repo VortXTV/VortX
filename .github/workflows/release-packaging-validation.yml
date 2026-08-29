@@ -139,11 +139,11 @@ jobs:
             if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$out"; then
               echo "::error::$apk is signed by an Android Debug certificate"; exit 1
             fi
-            count="$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' <<<"$out" | wc -l | tr -d '[:space:]')"
+            count="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$out" | wc -l | tr -d '[:space:]')"
             [ "$count" = "1" ] || { echo "::error::$apk must report exactly one signer digest, found $count"; exit 1; }
-            fp="$(sed -n 's/^Signer #[0-9][0-9]* certificate SHA-256 digest: //p' <<<"$out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+            fp="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$out" | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
             [ "$fp" = "$expected_fp" ] || { echo "::error::$apk signer does not match the ephemeral ad-hoc certificate"; exit 1; }
-            dn="$(sed -n 's/^Signer #[0-9][0-9]* certificate DN: //p' <<<"$out")"
+            dn="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate DN:[[:space:]]*\(.*\)$/\1/p' <<<"$out")"
             [ "$dn" = "$expected_dn" ] || { echo "::error::$apk signer DN is not the ad-hoc release identity: $dn"; exit 1; }
             echo "ok: $apk carries a valid v2 ad-hoc signature bound to the run-local certificate"
           done

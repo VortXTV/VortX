@@ -100,7 +100,8 @@ common_env=(
     KEYTOOL_BIN="$workdir/bin/keytool"
 )
 
-env "${common_env[@]}" "$VERIFY_SCRIPT" verify "$workdir/release.apk" "$workdir/release.aab" >/dev/null
+verify_output="$(env "${common_env[@]}" "$VERIFY_SCRIPT" verify "$workdir/release.apk" "$workdir/release.aab")"
+grep -Fq 'signer: CN=VortX Release, O=VortXTV, C=US' <<<"$verify_output" || fail "indented APK signer subject was not preserved"
 printf 'ok: pinned production signer is accepted for APK and AAB\n'
 
 mismatch_output="$(expect_failure "APK fingerprint mismatch" env "${common_env[@]}" \

@@ -113,7 +113,7 @@ verify_apk() {
     fi
     fingerprint="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate SHA-256 digest:[[:space:]]*\([^[:space:]].*\)$/\1/p' <<<"$output")"
     verify_expected_fingerprint "$apk" "$fingerprint"
-    subject="$(sed -n 's/^Signer #[0-9][0-9]* certificate DN: //p' <<<"$output")"
+    subject="$(sed -n 's/^[[:space:]]*Signer #[0-9][0-9]* certificate DN:[[:space:]]*\(.*\)$/\1/p' <<<"$output")"
     [[ -n "$subject" ]] || subject="<subject unavailable>"
 
     printf 'verified APK: %s\n' "$(basename "$apk")"
