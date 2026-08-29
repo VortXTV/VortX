@@ -5,27 +5,26 @@ builds share the same signing certificate. This document explains how the signin
 how to generate the keystore, and how the values are supplied on a dev box and in CI.
 
 The keystore and its passwords are secrets. They are NEVER committed (the tree is public). The
-`android/.gitignore` blocks `keystore.properties`, `*.jks`, and `*.keystore`. Back the keystore up
+`android/.gitignore` blocks `*.jks` and `*.keystore`. Back the keystore up
 somewhere durable and private (a password manager or an encrypted vault): if it is lost, sideload
 updates can no longer install over an existing VortX install, because Android refuses an update
 signed by a different certificate.
 
 ## How the build resolves the signing inputs
 
-`android/app/build.gradle.kts` reads four inputs, each looked up first in a gitignored
-`android/keystore.properties`, then in an environment variable of the same name:
+`android/app/build.gradle.kts` reads exactly four environment variables:
 
 | Input                     | Meaning                                                                 |
 | ------------------------- | ----------------------------------------------------------------------- |
-| `VORTX_KEYSTORE_FILE`     | Path to the keystore. Relative paths resolve against `android/`; absolute paths are used as-is. |
+| `VORTX_KEYSTORE_PATH`     | Absolute path to the decoded keystore file used by Gradle.             |
 | `VORTX_KEYSTORE_PASSWORD` | The store password.                                                     |
 | `VORTX_KEY_ALIAS`         | The key alias inside the keystore.                                      |
-| `VORTX_KEY_PASSWORD`      | The key password. Falls back to the store password when one password was used at generation. |
+| `VORTX_KEY_PASSWORD`      | The private-key password.                                               |
 
-When all four resolve, a `release` signing config is registered and the `release` build type uses it.
-When any input is missing, no `release` signing config exists and the release build stays UNSIGNED, so
-a fresh or public clone (and the existing debug CI) keeps building unchanged. The debug build type is
-never affected; it keeps the auto-generated debug keystore.
+When any Release task is requested, all four values are mandatory. A missing value, a missing or
+empty keystore, or an invalid credential fails configuration before packaging. Release tasks never
+fall back to an unsigned artifact or the debug signing identity. Debug builds remain independent and
+continue to use the generated debug keystore.
 
 ## Generate the upload keystore (one time)
 
@@ -41,26 +40,23 @@ keytool -genkeypair -v \
   -dname "CN=VortX, OU=VortX, O=VortX, C=US"
 ```
 
-`keytool` prompts for a store password (reused as the key password with `-storetype PKCS12`, which is
-why `VORTX_KEY_PASSWORD` falls back to `VORTX_KEYSTORE_PASSWORD` when only one was set). Record the
-password you choose. The alias here is `vortx-upload`; use whatever you set as `VORTX_KEY_ALIAS`.
+`keytool` prompts for the credentials. Record both the store password and the private-key password,
+even when they are intentionally the same. Gradle requires both inputs and does not infer one from
+the other. The alias here is `vortx-upload`; use the alias actually stored in the keystore as
+`VORTX_KEY_ALIAS`.
 
 ## Local dev signing
 
-Put a gitignored `android/keystore.properties` next to `android/local.properties`:
-
-```properties
-VORTX_KEYSTORE_FILE=vortx-upload.jks
-VORTX_KEYSTORE_PASSWORD=the-store-password
-VORTX_KEY_ALIAS=vortx-upload
-VORTX_KEY_PASSWORD=the-key-password
-```
-
-Then a release assemble produces a signed APK:
+Supply the four signing variables only in the process environment. Do not put credentials in Gradle
+properties, source files, shell startup files, or command-line arguments:
 
 ```bash
-./gradlew assembleFullRelease            # signed release APK
-./gradlew bundleFullRelease              # signed release AAB
+export VORTX_KEYSTORE_PATH=/private/path/vortx-upload.jks
+export VORTX_KEYSTORE_PASSWORD='from-your-secret-store'
+export VORTX_KEY_ALIAS='vortx-upload'
+export VORTX_KEY_PASSWORD='from-your-secret-store'
+./gradlew assembleFullRelease
+./gradlew bundleFullRelease
 ```
 
 Outputs land at `android/app/build/outputs/apk/full/release/*.apk` and
@@ -74,20 +70,24 @@ Outputs land at `android/app/build/outputs/apk/full/release/*.apk` and
 
 ## CI signing (GitHub Actions)
 
-`.github/workflows/android.yml` builds the signed release when the keystore secrets are set, and
-skips signing gracefully when they are absent (the debug build and its engine checks always run). The
-workflow base64-decodes the keystore secret to a temporary file, then hands the four `VORTX_*` env
-vars to Gradle.
+Keep signing secrets in the protected `engine-ci` GitHub environment. Do not store them as
+repository-wide secrets. The dedicated `.github/workflows/android-release.yml` consumes the
+authoritative `VORTX_*` names directly. `VORTX_KEYSTORE_PATH` is intentionally the base64 keystore
+blob at the workflow boundary; Gradle receives the path of the decoded temporary file.
 
-Set these repository (or environment) secrets in GitHub. The keystore secret is the base64 of the
-keystore binary:
+The ordinary `.github/workflows/android.yml` uses the parallel `ANDROID_*` names so it can decide
+whether to add an optional signed-release proof to its mandatory debug build. If
+`ANDROID_KEYSTORE_BASE64` is absent, only those signed-release proof steps are skipped. A requested
+Gradle Release task itself still fails closed when any of its four mapped inputs is missing.
 
-| Secret name                | Value                                                             |
-| -------------------------- | ----------------------------------------------------------------- |
-| `ANDROID_KEYSTORE_BASE64`  | Base64 of `vortx-upload.jks` (see below).                         |
-| `ANDROID_KEYSTORE_PASSWORD`| The store password.                                               |
-| `ANDROID_KEY_ALIAS`        | The key alias (`vortx-upload`).                                   |
-| `ANDROID_KEY_PASSWORD`     | The key password (same as the store password if only one was set).|
+Set both naming sets in `engine-ci` from the same verified credential source:
+
+| Dedicated release secret   | Ordinary CI secret              | Value                              |
+| -------------------------- | ------------------------------- | ---------------------------------- |
+| `VORTX_KEYSTORE_PATH`      | `ANDROID_KEYSTORE_BASE64`       | Base64 of the keystore binary.     |
+| `VORTX_KEYSTORE_PASSWORD`  | `ANDROID_KEYSTORE_PASSWORD`     | The verified store password.       |
+| `VORTX_KEY_ALIAS`          | `ANDROID_KEY_ALIAS`             | The alias present in the keystore. |
+| `VORTX_KEY_PASSWORD`       | `ANDROID_KEY_PASSWORD`          | The verified private-key password. |
 
 Produce the base64 blob for `ANDROID_KEYSTORE_BASE64`:
 
@@ -99,15 +99,21 @@ base64 -i vortx-upload.jks | pbcopy
 base64 -w0 vortx-upload.jks
 ```
 
-The workflow maps the GitHub secrets onto the Gradle env vars:
+The ordinary CI workflow maps its GitHub secrets onto the Gradle env vars:
 `ANDROID_KEYSTORE_PASSWORD` -> `VORTX_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` -> `VORTX_KEY_ALIAS`,
-`ANDROID_KEY_PASSWORD` -> `VORTX_KEY_PASSWORD`, and the decoded keystore path -> `VORTX_KEYSTORE_FILE`.
-If `ANDROID_KEYSTORE_BASE64` is unset, the signed-release steps are skipped and nothing else changes.
+`ANDROID_KEY_PASSWORD` -> `VORTX_KEY_PASSWORD`, and the decoded keystore path ->
+`VORTX_KEYSTORE_PATH`.
+
+Both release APKs and the Play AAB must pass `scripts/verify-android-release-signing.sh`. That verifier
+requires the pinned production certificate, rejects the Android Debug identity, requires APK
+Signature Scheme v2 for APKs, and performs strict signed-entry verification for the AAB.
 
 ## Rotating or replacing the keystore
 
 Because sideloaded updates must be signed by the same certificate, replacing the keystore breaks
 in-place updates for existing installs (users would have to uninstall and reinstall). Rotate only when
 you accept that break, or use the Android signing key rotation flow (`apksigner rotate`) if you have
-adopted an APK Signature Scheme v3 rotation lineage. Update the local `keystore.properties` and the
-GitHub secrets together whenever the keystore changes.
+adopted an APK Signature Scheme v3 rotation lineage. Update the pinned certificate, both protected
+environment naming sets, and the private recovery copy together whenever the keystore changes. A
+successful CI build is not sufficient proof unless the produced APKs and AAB pass the pinned-signer
+verification step.
