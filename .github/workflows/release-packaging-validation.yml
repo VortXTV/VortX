@@ -164,7 +164,7 @@ jobs:
 
       # Licensing boundary holds regardless of engines: the play flavor must never contain the
       # GPL mpv/ffmpeg set, and the full flavor must merge the mavenCentral libmpv natives for
-      # BOTH ABIs (real native-input packaging proof available without the private engines).
+      # ALL shipped ABIs (real native-input packaging proof available without the private engines).
       - name: Enforce the GPL boundary and prove native-lib merge packaging
         run: |
           set -euo pipefail
@@ -179,7 +179,7 @@ jobs:
           done
           echo "ok: play flavor is clean of GPL native libraries"
           full_apk="$(ls android/app/build/outputs/apk/full/release/*.apk)"
-          for abi in arm64-v8a x86_64; do
+          for abi in arm64-v8a armeabi-v7a x86_64; do
             unzip -p "$full_apk" "lib/$abi/libmpv.so" > /dev/null 2>&1 \
               || { echo "::error::lib/$abi/libmpv.so missing from $full_apk"; exit 1; }
             echo "ok: $full_apk packages merged native library for $abi"

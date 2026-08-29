@@ -2,7 +2,7 @@ name: Build Android APK
 
 # CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
 # workflow IS the build feedback loop. It builds BOTH product flavors on every push that touches
-# android/, verifies each flavor produced an APK carrying BOTH engine .so's for BOTH ABIs, and
+# android/, verifies each flavor produced an APK carrying BOTH engine .so's for every shipped ABI, and
 # enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
 # libmpv native libs. The engine crates live in PRIVATE repos (moved out of the public tree in
 # 33ff9b5) and are fetched below at pinned commits; bumping an engine pin means editing this file,
@@ -160,7 +160,7 @@ jobs:
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
       # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
-      # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
+      # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -p 26 ...`). That
       # needs: the NDK pinned in app/build.gradle.kts (ndkVersion), Rust nightly with the Android
       # targets (core/ pins nightly via rust-toolchain.toml; the android targets are tier-2, so no
       # build-std), and the cargo-ndk subcommand. Without these the task fails with
@@ -187,7 +187,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
         with:
           toolchain: nightly-2026-07-19
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
           components: rust-src
 
       # Second workspace line: the vortx-ffi cross-build's CARGO_TARGET_DIR is pinned by the gradle
@@ -257,7 +257,7 @@ jobs:
 
       # Engine-presence proof (fail-closed, strong): every built APK MUST embed BOTH engines for BOTH
       # shipped ABIs (the abiFilters/androidAbis list in app/build.gradle.kts): lib/<abi>/libstremiox_core.so
-      # AND lib/<abi>/libvortx_ffi.so, for arm64-v8a AND x86_64. Both engine tasks feed the `main`
+      # AND lib/<abi>/libvortx_ffi.so, for arm64-v8a, armeabi-v7a, and x86_64. Both tasks feed `main`
       # sourceSet's jniLibs, so BOTH flavors carry both engines (only the GPLv3 libmpv is play-gated).
       # A zip-listing grep is not proof: it matches a single ABI, and a zero-byte or decoy entry would
       # pass. Presence + ELF magic alone is not proof either: a valid ELF of the wrong architecture,
@@ -266,15 +266,15 @@ jobs:
       # llvm-readelf (the toolchain that produced the .so's, installed above; gate provenance now
       # rides the NDK pin instead of whatever binutils the runner image ships). llvm-readelf prints
       # GNU-readelf-compatible output by default and accepts -W as a GNU-compat no-op; the exact
-      # strings the greps below match ("Class: ELF64", "2's complement, little endian",
+      # strings the greps below match ("Class: ELF32" / "ELF64", "2's complement, little endian",
       # "Type: DYN (Shared object file)", "Machine: AArch64" / "Machine: Advanced Micro Devices
       # X86-64", and --dyn-syms rows ending in the bare symbol name) were verified verbatim against
-      # NDK 27.2.12479018's llvm-readelf 18.0.3 on real android26 .so's for both ABIs:
+      # NDK 27.2.12479018's llvm-readelf on real android26 .so's for all shipped ABIs:
       #   1. non-zero size + the ELF magic \x7fELF (cheap pre-checks with a clear byte-level error);
-      #   2. llvm-readelf -h: Class ELF64 (e_ident[EI_CLASS]=2), little-endian data (e_ident[EI_DATA]=1),
+      #   2. llvm-readelf -h: the ABI's expected ELF class, little-endian data (e_ident[EI_DATA]=1),
       #      Type DYN (e_type=ET_DYN: a shared object, not ET_EXEC/ET_REL), and the machine matching
-      #      the ABI dir: AArch64 (EM_AARCH64=183) under lib/arm64-v8a/, Advanced Micro Devices
-      #      X86-64 (EM_X86_64=62) under lib/x86_64/;
+      #      the ABI dir: AArch64/ELF64 under arm64-v8a, ARM/ELF32 under armeabi-v7a, and Advanced
+      #      Micro Devices X86-64/ELF64 under x86_64;
       #   3. llvm-readelf -W --dyn-syms: the lib actually EXPORTS the JNI surface the app binds. The
       #      required names are DERIVED from source, not guessed -- JNI resolves a Kotlin
       #      `external fun` to Java_<package with _>_<Class>_<method>, and both engines export those
@@ -290,7 +290,7 @@ jobs:
       #          features are ON in this build (build.gradle.kts:403 passes `--features jni,server`),
       #          so a .so built with a dropped feature (kernel bridge or server lane silently gone)
       #          fails this gate instead of shipping.
-      - name: Verify engine .so in every APK (both ABIs, ELF64 shared object, right arch, JNI exports)
+      - name: Verify engine .so in every APK (all ABIs, right ELF class/arch, JNI exports)
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -310,10 +310,11 @@ jobs:
           fail=0
           workdir="$(mktemp -d)"
           for apk in "${apks[@]}"; do
-            for abi in arm64-v8a x86_64; do
+            for abi in arm64-v8a armeabi-v7a x86_64; do
               case "$abi" in
-                arm64-v8a) machine='AArch64' ;;
-                x86_64)    machine='Advanced Micro Devices X86-64' ;;
+                arm64-v8a)   elf_class='ELF64'; machine='AArch64' ;;
+                armeabi-v7a) elf_class='ELF32'; machine='ARM' ;;
+                x86_64)      elf_class='ELF64'; machine='Advanced Micro Devices X86-64' ;;
               esac
               for lib in libstremiox_core.so libvortx_ffi.so; do
                 entry="lib/$abi/$lib"
@@ -332,8 +333,8 @@ jobs:
                 if ! hdr="$("$READELF" -h "$out" 2>/dev/null)"; then
                   echo "::error::$entry in $apk has an unparseable ELF header (llvm-readelf -h failed)"; fail=1; continue
                 fi
-                if ! grep -Eq 'Class:[[:space:]]+ELF64' <<<"$hdr"; then
-                  echo "::error::$entry in $apk is not ELF64 (e_ident[EI_CLASS] != 2): $(grep -E 'Class:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
+                if ! grep -Eq "Class:[[:space:]]+${elf_class}[[:space:]]*$" <<<"$hdr"; then
+                  echo "::error::$entry in $apk has the wrong ELF class (want $elf_class): $(grep -E 'Class:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
                 fi
                 if ! grep -Eq 'Data:.*little endian' <<<"$hdr"; then
                   echo "::error::$entry in $apk is not little-endian (e_ident[EI_DATA] != 1): $(grep -E 'Data:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
@@ -353,13 +354,13 @@ jobs:
                 if [ -n "$missing" ]; then
                   echo "::error::$entry in $apk is missing required JNI export(s):$missing"; fail=1; continue
                 fi
-                echo "ok: $apk $entry ($size bytes, ELF64 LE DYN $machine, all required JNI exports present)"
+                echo "ok: $apk $entry ($size bytes, $elf_class LE DYN $machine, all required JNI exports present)"
               done
             done
           done
           rm -rf "$workdir"
           if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "every APK embeds libstremiox_core.so + libvortx_ffi.so for arm64-v8a + x86_64 (ELF64 little-endian shared objects, correct machine per ABI, JNI export surface verified)"
+          echo "every APK embeds both engines for arm64-v8a + armeabi-v7a + x86_64 (correct ELF class/machine and JNI exports)"
 
       # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
       # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs

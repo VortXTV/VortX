@@ -9,6 +9,8 @@ plugins {
 }
 
 val generatedChangelogAssets = layout.buildDirectory.dir("generated/changelogAssets")
+@Suppress("UNCHECKED_CAST")
+val androidAbis = rootProject.extra["vortxAndroidAbis"] as List<String>
 val copyChangelogAsset by tasks.registering(Copy::class) {
     from(rootProject.file("../CHANGELOG.md"))
     into(generatedChangelogAssets)
@@ -108,14 +110,11 @@ android {
         buildConfigField("String", "SIMKL_CLIENT_ID", "\"${externalSyncSecret("SIMKL_CLIENT_ID")}\"")
         buildConfigField("String", "SIMKL_CLIENT_SECRET", "\"${externalSyncSecret("SIMKL_CLIENT_SECRET")}\"")
 
-        // Package ONLY the ABIs the Rust engine is cross-compiled for (the cargoNdkBuild task's
-        // androidAbis list below). Without this, the libmpv AAR's extra armeabi-v7a/x86 slices made
-        // AGP emit those ABIs too (verified by S03 APK inspection) -- and a 32-bit device would then
-        // install a slice that has mpv but NO libstremiox_core.so, silently degrading the whole app
-        // to preview data. One list, one truth: extend androidAbis + this together if 32-bit support
-        // lands (S15 schedules armeabi-v7a via per-ABI splits for old Fire TV sticks).
+        // Package ONLY the ABIs the Rust engines and source-built mpv seam are cross-compiled for.
+        // The root-project androidAbis contract includes armeabi-v7a for 32-bit Fire TV hardware
+        // and deliberately excludes the libmpv AAR's unsupported x86 slice.
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += androidAbis
         }
     }
 
@@ -398,10 +397,6 @@ val coreCrateDir: File =
         ?: rootProject.file("../core")
 val jniLibsOutDir = layout.buildDirectory.dir("rustJniLibs/android")
 
-// ABIs to ship. arm64 + x86_64 cover real devices (phones, Android TV, Fire TV) and the emulator.
-// Add "armeabi-v7a" / "x86" only if 32-bit support becomes a requirement (it doubles build time).
-val androidAbis = listOf("arm64-v8a", "x86_64")
-
 // minSdk must match the android {} block above; passed to cargo-ndk as the platform level (-p 26).
 val nativeApiLevel = 26
 
@@ -411,7 +406,7 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
     workingDir = coreCrateDir
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
-    // -o writes per-ABI subdirs (arm64-v8a/, x86_64/, ...) of .so files, the jniLibs layout.
+    // -o writes per-ABI subdirs (arm64-v8a/, armeabi-v7a/, x86_64/) of .so files, the jniLibs layout.
     // --locked: the engine repo tracks Cargo.lock, so a drifted dependency resolution FAILS the
     // build instead of silently linking a different graph than the CI-proven runs.
     commandLine(

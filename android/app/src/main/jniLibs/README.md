@@ -1,6 +1,7 @@
 # libvortx_ffi.so (vortx-core JNI cdylib)
 
-This directory holds the prebuilt `libvortx_ffi.so` per ABI (`arm64-v8a/`, `x86_64/`), the OWN
+This directory holds the prebuilt `libvortx_ffi.so` per ABI (`arm64-v8a/`, `armeabi-v7a/`,
+`x86_64/`), the OWN
 vortx-core engine's JNI surface. ONE .so carries BOTH Kotlin bridges:
 
 * `com.vortx.android.engine.VortxCore` - the kernel bridge powering the shadow-ranking lane
@@ -39,7 +40,7 @@ Manual equivalent, with the Android NDK + `cargo-ndk` + the Rust Android targets
 cd <engine-branch-checkout>/vortx-core
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"   # match android/app ndkVersion
 export CARGO_TARGET_DIR=<engine-branch-checkout>/vortx-core/target-andx  # keep the checkout's target/ clean
-cargo ndk -t arm64-v8a -t x86_64 -p 26 \
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -p 26 \
   -o <this-repo>/android/app/src/main/jniLibs \
   build -p vortx-ffi --no-default-features --features jni,server --release
 ```

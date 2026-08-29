@@ -9,6 +9,9 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+@Suppress("UNCHECKED_CAST")
+val androidAbis = rootProject.extra["vortxAndroidAbis"] as List<String>
+
 android {
     namespace = "com.vortx.android.player.mpv.seam"
     compileSdk = 36
@@ -20,6 +23,10 @@ android {
     defaultConfig {
         minSdk = 26
         consumerProguardFiles("consumer-rules.pro")
+        ndk {
+            // Keep the source-built JNI bridge identical to the app and Rust engine ABI set.
+            abiFilters += androidAbis
+        }
         externalNativeBuild {
             cmake {
                 // c++_static: this glue is self-contained C++ (no C++ objects cross its .so boundary

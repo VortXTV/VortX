@@ -120,7 +120,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2 # nightly branch, 2026-07-19
         with:
           toolchain: nightly-2026-07-19
-          targets: aarch64-linux-android,x86_64-linux-android
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
           components: rust-src
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -149,7 +149,7 @@ jobs:
           VORTX_KEY_PASSWORD: ${{ secrets.VORTX_KEY_PASSWORD }}
         run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease --no-daemon --stacktrace
 
-      - name: Verify each APK embeds libstremiox_core.so for both ABIs
+      - name: Verify each APK embeds both engines for every shipped ABI
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -161,14 +161,16 @@ jobs:
           workdir="$(mktemp -d)"
           trap 'rm -rf "$workdir"' EXIT
           for apk in "${apks[@]}"; do
-            for abi in arm64-v8a x86_64; do
-              entry="lib/$abi/libstremiox_core.so"
-              out="$workdir/$(basename "$apk").$abi.libstremiox_core.so"
-              unzip -p "$apk" "$entry" > "$out" 2>/dev/null || { echo "::error::$entry missing from $apk"; exit 1; }
-              test -s "$out" || { echo "::error::$entry is empty in $apk"; exit 1; }
-              magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
-              test "$magic" = "7f454c46" || { echo "::error::$entry is not ELF in $apk"; exit 1; }
-              echo "ok: $apk contains non-empty ELF $entry"
+            for abi in arm64-v8a armeabi-v7a x86_64; do
+              for lib in libstremiox_core.so libvortx_ffi.so; do
+                entry="lib/$abi/$lib"
+                out="$workdir/$(basename "$apk").$abi.$lib"
+                unzip -p "$apk" "$entry" > "$out" 2>/dev/null || { echo "::error::$entry missing from $apk"; exit 1; }
+                test -s "$out" || { echo "::error::$entry is empty in $apk"; exit 1; }
+                magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
+                test "$magic" = "7f454c46" || { echo "::error::$entry is not ELF in $apk"; exit 1; }
+                echo "ok: $apk contains non-empty ELF $entry"
+              done
             done
           done
 
@@ -202,7 +204,7 @@ jobs:
       #   play-media3  = Google Play-bound build carrying only the Media3/ExoPlayer engine
       # BOTH variants contain the phone AND the Android TV activities (one APK per flavor runs
       # on both device classes; the flavor never selects a UI), and both are universal APKs:
-      # one binary per flavor packages every shipped ABI (arm64-v8a + x86_64). The canonical
+      # one binary per flavor packages every shipped ABI (arm64-v8a + armeabi-v7a + x86_64). The canonical
       # dimension table, old-to-new name mapping, and consumer guidance live in
       # docs/RELEASE-ARTIFACTS.md.
       - name: Stage verified release assets and provenance

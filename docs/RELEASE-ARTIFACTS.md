@@ -12,7 +12,7 @@ An Android artifact name answers exactly three questions:
 | Dimension | Values | Meaning |
 |---|---|---|
 | Flavor (engine and distribution) | `full-mpv`, `play-media3` | Which playback engine is packaged and where the build is meant to ship. `full` carries the GPLv3 libmpv native engine and is sideloaded from GitHub releases. `play` carries only the Media3/ExoPlayer engine with no GPL native code and is bound for Google Play. |
-| ABI | `universal` | One APK packages every shipped ABI (`arm64-v8a` plus `x86_64`). There are no per-ABI splits today; if splits land, each gains an explicit ABI segment in its name. |
+| ABI | `universal` | One APK packages every shipped ABI (`arm64-v8a`, `armeabi-v7a`, and `x86_64`). The 32-bit ARM slice supports older Fire TV hardware. There are no per-ABI splits today; if splits land, each gains an explicit ABI segment in its name. |
 | Package type | `.apk`, `.aab` | Sideloadable APK or Play App Bundle. |
 
 ### What a flavor is NOT
@@ -25,8 +25,8 @@ Staged by `.github/workflows/android-release.yml` after signer verification:
 
 | Artifact | Old (misleading) name | Contents |
 |---|---|---|
-| `VortX-x.y.z-full-mpv-universal.apk` | `VortX-x.y.z-phone.apk` | Sideload build, GPL mpv engine primary player, Media3 fallback, phone + TV UI, both ABIs |
-| `VortX-x.y.z-play-media3-universal.apk` | `VortX-x.y.z-tv.apk` | Play-bound build, Media3 only, GPL native free, phone + TV UI, both ABIs |
+| `VortX-x.y.z-full-mpv-universal.apk` | `VortX-x.y.z-phone.apk` | Sideload build, GPL mpv engine primary player, Media3 fallback, phone + TV UI, all three ABIs |
+| `VortX-x.y.z-play-media3-universal.apk` | `VortX-x.y.z-tv.apk` | Play-bound build, Media3 only, GPL native free, phone + TV UI, all three ABIs |
 | `VortX-x.y.z-play-media3.aab` | `VortX-x.y.z-play.aab` | Play App Bundle form of the `play-media3` build |
 
 Consumers that fetch "the newest APK" (for example the `dl.vortx.tv` redirect worker) match on

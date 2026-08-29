@@ -12,7 +12,9 @@ readonly RELEASE_WF="$REPO_ROOT/.github/workflows/android-release.yml"
 readonly VALIDATION_WF="$REPO_ROOT/.github/workflows/release-packaging-validation.yml"
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
 readonly APPLE_RELEASE_WF="$REPO_ROOT/.github/workflows/release-tvos.yml"
+readonly ROOT_GRADLE_BUILD="$REPO_ROOT/android/build.gradle.kts"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
+readonly MPV_SEAM_BUILD="$REPO_ROOT/android/mpv-seam/build.gradle.kts"
 readonly ARTIFACTS_DOC="$REPO_ROOT/docs/RELEASE-ARTIFACTS.md"
 
 fail() {
@@ -78,6 +80,26 @@ require_grep "docs map the old misleading names to canonical ones" \
     'VortX-x\.y\.z-phone\.apk' "$ARTIFACTS_DOC"
 require_grep "gradle still declares the distribution flavor dimension" \
     'flavorDimensions \+= "distribution"' "$GRADLE_BUILD"
+
+# The universal label is only honest when every native producer and verifier carries the same ABI
+# set. In particular, armeabi-v7a must never be enabled at packaging level without both Rust engines,
+# the source-built libmpv seam, CI rust-std installation, and artifact inspection following it.
+require_grep "root Gradle contract includes the 32-bit Fire TV ABI" \
+    'vortxAndroidAbis.*arm64-v8a.*armeabi-v7a.*x86_64' "$ROOT_GRADLE_BUILD"
+require_grep "app ABI filter consumes the shared native ABI contract" \
+    'abiFilters \+= androidAbis' "$GRADLE_BUILD"
+require_grep "mpv seam ABI filter consumes the shared native ABI contract" \
+    'abiFilters \+= androidAbis' "$MPV_SEAM_BUILD"
+for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    require_grep "$(basename "$wf") installs the armv7 Rust target" \
+        'targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android' "$wf"
+    require_grep "$(basename "$wf") verifies all three shipped ABI directories" \
+        'for abi in arm64-v8a armeabi-v7a x86_64' "$wf"
+done
+require_grep "secretless packaging proves libmpv for all three shipped ABIs" \
+    'for abi in arm64-v8a armeabi-v7a x86_64' "$VALIDATION_WF"
+require_grep "release docs name all three universal APK ABIs" \
+    'arm64-v8a.*, `armeabi-v7a`.*, and `x86_64`' "$ARTIFACTS_DOC"
 
 # --- Contract 2: event/ref binding ----------------------------------------------------------------
 

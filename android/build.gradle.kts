@@ -12,3 +12,8 @@ plugins {
     alias(libs.plugins.kotlin.android) apply false
     alias(libs.plugins.kotlin.compose) apply false
 }
+
+// One native ABI contract for every Android module. The app, Rust cargo-ndk tasks, source-built
+// libmpv seam, CI toolchain installer, and APK verification gates must all carry this same set.
+// armeabi-v7a is required by 32-bit Fire TV hardware; x86 stays intentionally unsupported.
+extra["vortxAndroidAbis"] = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
