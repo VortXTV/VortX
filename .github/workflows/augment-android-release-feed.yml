@@ -67,6 +67,9 @@ jobs:
             body="$(jq -cn --arg oid "augment-android:$RELEASE_ID:$EXPECTED_ACTIVE" --arg predecessor "$EXPECTED_ACTIVE" '{action:"operation-status",operationId:$oid,predecessorGeneration:$predecessor}')"
             signed_post "$body"
           }
+          status_is_exact_predecessor() {
+            jq -e --arg generation "$EXPECTED_ACTIVE" --arg receipt "$EXPECTED_RECEIPT_SHA" '.active.generation == $generation and .active.receiptSha256 == $receipt' <<<"$1" >/dev/null 2>&1
+          }
           verify_predecessor() {
             local route
             for route in altstore.json vortx-altstore.json appcast.json; do
@@ -81,7 +84,7 @@ jobs:
             [ "$MUTATION_ATTEMPTED" = 1 ] || return 0
             local status body response readback
             status="$(operation_status 2>/dev/null || true)"
-            if jq -e --arg predecessor "$EXPECTED_ACTIVE" '.active.generation == $predecessor' <<<"$status" >/dev/null 2>&1; then
+            if status_is_exact_predecessor "$status"; then
               verify_predecessor || COMPENSATION_FAILED=1
               return 0
             fi
@@ -97,10 +100,9 @@ jobs:
             SUCCESSOR="$(jq -er .operation.successorGeneration <<<"$status")"
             body="$(jq -cn --arg current "$SUCCESSOR" --arg restore "$EXPECTED_ACTIVE" '{action:"rollback",expectedCurrentGeneration:$current,restoreGeneration:$restore}')"
             response="$(signed_post "$body" 2>/dev/null || true)"
-            if ! jq -e --arg generation "$EXPECTED_ACTIVE" '.rolledBack == true and .generation == $generation' <<<"$response" >/dev/null 2>&1; then
-              readback="$(operation_status 2>/dev/null || true)"
-              jq -e --arg generation "$EXPECTED_ACTIVE" '.active.generation == $generation' <<<"$readback" >/dev/null 2>&1 || COMPENSATION_FAILED=1
-            fi
+            readback="$(operation_status 2>/dev/null || true)"
+            status_is_exact_predecessor "$readback" || COMPENSATION_FAILED=1
+            jq -e --arg generation "$EXPECTED_ACTIVE" '.rolledBack == true and .generation == $generation' <<<"$response" >/dev/null 2>&1 || status_is_exact_predecessor "$readback" || COMPENSATION_FAILED=1
             verify_predecessor || COMPENSATION_FAILED=1
           }
           on_failure() {
@@ -169,23 +171,38 @@ jobs:
           RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary @"$RUNNER_TEMP/augment.json" https://vortx.tv/__release/receipt || true)"
           SUCCESSOR="$(jq -er '.generation // empty' <<<"$RESPONSE" 2>/dev/null || true)"
           if [ -z "$SUCCESSOR" ]; then
-            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/ambiguous.headers" https://vortx.tv/appcast.json -o "$RUNNER_TEMP/ambiguous.json"
-            SUCCESSOR="$(awk 'BEGIN{IGNORECASE=1} /^x-vortx-feed-generation:/ {gsub(/\r/, ""); print $2}' "$RUNNER_TEMP/ambiguous.headers")"
-            [ -n "$SUCCESSOR" ] && [ "$SUCCESSOR" != "$EXPECTED_ACTIVE" ] && jq -e '.android.full != null and .android.play != null' "$RUNNER_TEMP/ambiguous.json" >/dev/null
-            RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary @"$RUNNER_TEMP/augment.json" https://vortx.tv/__release/receipt)"
+            FORWARD_STATUS="$(operation_status)"
+            if jq -e --arg oid "augment-android:$RELEASE_ID:$EXPECTED_ACTIVE" --arg predecessor "$EXPECTED_ACTIVE" '
+              .operation.action == "augment-android" and .operation.operationId == $oid and
+              .operation.predecessorGeneration == $predecessor and .audit == .operation and
+              .active.generation == .operation.successorGeneration and
+              .active.receiptSha256 == .operation.successorReceiptSha256
+            ' <<<"$FORWARD_STATUS" >/dev/null; then
+              RESPONSE="$(jq -cn --arg generation "$(jq -er .operation.successorGeneration <<<"$FORWARD_STATUS")" --arg previous "$EXPECTED_ACTIVE" --arg receipt "$(jq -er .operation.successorReceiptSha256 <<<"$FORWARD_STATUS")" '{augmented:true,idempotent:true,generation:$generation,previousGeneration:$previous,receiptSha256:$receipt}')"
+            elif status_is_exact_predecessor "$FORWARD_STATUS" && jq -e '.operation == null and .audit == null' <<<"$FORWARD_STATUS" >/dev/null; then
+              RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary @"$RUNNER_TEMP/augment.json" https://vortx.tv/__release/receipt)"
+            else
+              echo '::error::ambiguous Android augmentation did not match an exact committed operation or untouched predecessor'
+              exit 1
+            fi
           fi
           jq -e --arg previous "$EXPECTED_ACTIVE" '.augmented == true and .previousGeneration == $previous' <<<"$RESPONSE" >/dev/null
           SUCCESSOR="$(jq -er .generation <<<"$RESPONSE")"
           [ "$SUCCESSOR" != "$EXPECTED_ACTIVE" ]
-          for ROUTE in altstore.json vortx-altstore.json appcast.json; do
-            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/after-$ROUTE.headers" "https://vortx.tv/$ROUTE" -o "$RUNNER_TEMP/after-$ROUTE"
-            grep -Fqi "x-vortx-feed-generation: $SUCCESSOR" "$RUNNER_TEMP/after-$ROUTE.headers"
-          done
-          cmp -s "$RUNNER_TEMP/before-altstore.json" "$RUNNER_TEMP/after-altstore.json"
-          cmp -s "$RUNNER_TEMP/before-vortx-altstore.json" "$RUNNER_TEMP/after-vortx-altstore.json"
           jq -S 'del(.android)' "$RUNNER_TEMP/before-appcast.json" > "$RUNNER_TEMP/before-apple.json"
-          jq -S 'del(.android)' "$RUNNER_TEMP/after-appcast.json" > "$RUNNER_TEMP/after-apple.json"
-          cmp -s "$RUNNER_TEMP/before-apple.json" "$RUNNER_TEMP/after-apple.json"
-          jq -e --arg signer "$EXPECTED_SIGNER" --arg full "$FULL_SHA" --arg play "$PLAY_SHA" '.android.full.flavor == "full" and .android.play.flavor == "play" and .android.full.engine == "mpv" and .android.play.engine == "media3" and .android.full.signer == $signer and .android.play.signer == $signer and .android.full.sha256 == $full and .android.play.sha256 == $play' "$RUNNER_TEMP/after-appcast.json" >/dev/null
+          DEADLINE=$(($(date +%s) + 90)); CONVERGED=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            ROUTES_OK=1
+            for ROUTE in altstore.json vortx-altstore.json appcast.json; do
+              curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/after-$ROUTE.headers" "https://vortx.tv/$ROUTE" -o "$RUNNER_TEMP/after-$ROUTE" || ROUTES_OK=0
+              grep -Fqi "x-vortx-feed-generation: $SUCCESSOR" "$RUNNER_TEMP/after-$ROUTE.headers" || ROUTES_OK=0
+            done
+            if [ "$ROUTES_OK" = 1 ] && cmp -s "$RUNNER_TEMP/before-altstore.json" "$RUNNER_TEMP/after-altstore.json" && cmp -s "$RUNNER_TEMP/before-vortx-altstore.json" "$RUNNER_TEMP/after-vortx-altstore.json"; then
+              jq -S 'del(.android)' "$RUNNER_TEMP/after-appcast.json" > "$RUNNER_TEMP/after-apple.json"
+              if cmp -s "$RUNNER_TEMP/before-apple.json" "$RUNNER_TEMP/after-apple.json" && jq -e --arg signer "$EXPECTED_SIGNER" --arg full "$FULL_SHA" --arg play "$PLAY_SHA" '.android.full.flavor == "full" and .android.play.flavor == "play" and .android.full.engine == "mpv" and .android.play.engine == "media3" and .android.full.signer == $signer and .android.play.signer == $signer and .android.full.sha256 == $full and .android.play.sha256 == $play' "$RUNNER_TEMP/after-appcast.json" >/dev/null; then CONVERGED=1; break; fi
+            fi
+            sleep 5
+          done
+          [ "$CONVERGED" = 1 ] || { echo '::error::authenticated Android augmentation committed but public routes did not converge'; exit 1; }
           trap - EXIT
           echo "augmented release $RELEASE_ID as feed generation $SUCCESSOR without mutating release or source metadata"
