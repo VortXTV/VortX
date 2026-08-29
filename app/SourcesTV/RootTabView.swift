@@ -255,6 +255,7 @@ struct RootView: View {
 struct RootTabView: View {
     let launchReady: Bool
 
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
@@ -430,7 +431,7 @@ struct RootTabView: View {
             // card. Stand it down once at shell appear so every field on tvOS shows the VortX surface
             // authored behind it instead of an opaque near-white slab. See VortXGlass.applyTextFieldAppearance.
             VortXGlass.applyTextFieldAppearance()
-            updates.startMonitoring()   // cached result immediately, network at most once per day
+            updates.startMonitoring()   // cached result immediately, network at most once per hour
             presentUpdateIfReady()
             let name = Self.tabName(selection)
             VXProbeState.shared.setRoute(name)
@@ -438,6 +439,14 @@ struct RootTabView: View {
         }
         .onChange(of: launchReady) { _, _ in presentUpdateIfReady() }
         .onChange(of: updates.available?.key) { _, _ in presentUpdateIfReady() }
+        // A tvOS shell commonly stays mounted across background/foreground, so onAppear cannot be the only
+        // automatic check trigger. The checker applies the hourly and single-flight gates itself.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { updates.startMonitoring() }
+        }
+        // A manual check may rediscover a release already shown earlier this launch. Its nonce is the explicit
+        // request to present again, bypassing the once-per-launch claim while preserving the launch/player gate.
+        .onChange(of: updates.forcePresentationNonce) { _, _ in presentUpdateIfReady(force: true) }
         // Reset the tab being LEFT to its root, so returning to it lands on the root page.
         .onChange(of: selection) { old, new in
             if old >= 0, old < resetTokens.count { resetTokens[old] += 1 }
@@ -535,9 +544,9 @@ struct RootTabView: View {
     }
 
     /// Present only after the real Home shell is visible, never behind the splash, picker, or player.
-    private func presentUpdateIfReady() {
+    private func presentUpdateIfReady(force: Bool = false) {
         guard launchReady, selection == 0 else { return }
-        updates.presentAvailableIfNeeded()
+        updates.presentAvailableIfNeeded(force: force)
     }
 
     private func applyTabBarAccent() {

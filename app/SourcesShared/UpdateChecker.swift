@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// Checks GitHub's published releases for a newer build of this platform and remembers it so the UI can
@@ -10,6 +11,8 @@ import Foundation
 @MainActor
 final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
+
+    typealias RequestLoader = @Sendable (URLRequest) async throws -> (Data, URLResponse)
 
     struct Release: Codable, Equatable, Identifiable {
         let version: String
@@ -45,14 +48,39 @@ final class UpdateChecker: ObservableObject {
     private var isChecking = false
     private var manualCheckPending = false
     private var restoredCache = false
+    private let defaults: UserDefaults
+    private let now: @Sendable () -> Date
+    private let requestLoader: RequestLoader
+    private let buildOverride: Int?
+    private let versionOverride: String?
 
     private static let lastCheckedKey = "stremiox.update.lastChecked"
     private static let dismissedKey = "stremiox.update.dismissedVersion"
     private static let cachedReleaseKey = "stremiox.update.cachedRelease"
     private static let releasesURL = "https://api.github.com/repos/VortXTV/VortX/releases?per_page=100"
-    private static let automaticInterval: TimeInterval = 24 * 3600
+    /// A fresh automatic request is allowed on launch and once per hour while the app remains alive.
+    /// This is deliberately much shorter than a day because sideloaded installs have no store daemon to
+    /// surface a release on our behalf.
+    private static let automaticInterval: TimeInterval = 3600
+
+    /// Injectable dependencies keep the updater testable without a real bundle, wall clock, or GitHub call.
+    /// Shipping targets use the defaults.
+    init(
+        defaults: UserDefaults = .standard,
+        now: @escaping @Sendable () -> Date = { Date() },
+        requestLoader: @escaping RequestLoader = { request in try await URLSession.shared.data(for: request) },
+        currentBuild: Int? = nil,
+        currentVersion: String? = nil
+    ) {
+        self.defaults = defaults
+        self.now = now
+        self.requestLoader = requestLoader
+        self.buildOverride = currentBuild
+        self.versionOverride = currentVersion
+    }
 
     private var currentBuild: Int {
+        if let buildOverride { return buildOverride }
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-stremiox-fake-build"), i + 1 < args.count,
            let build = Int(args[i + 1]) {
@@ -62,6 +90,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     private var currentVersion: String {
+        if let versionOverride { return versionOverride }
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-stremiox-fake-version"), i + 1 < args.count {
             return args[i + 1]
@@ -70,7 +99,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     /// Called by each platform shell. Restores the last successful result immediately, then starts a network
-    /// request only when the persisted daily gate is stale. The request runs asynchronously and never blocks UI.
+    /// request only when the persisted hourly gate is stale. The request runs asynchronously and never blocks UI.
     func startMonitoring() {
         restoreCachedReleaseIfNeeded()
         checkIfStale()
@@ -78,16 +107,16 @@ final class UpdateChecker: ObservableObject {
 
     func dismissPrompt() {
         if let key = prompt?.key {
-            UserDefaults.standard.set(key, forKey: Self.dismissedKey)
+            defaults.set(key, forKey: Self.dismissedKey)
         }
         prompt = nil
     }
 
     /// Passing zero is the explicit manual path and always requests a fresh fetch. Every nonzero call is an
-    /// automatic request and uses the fixed one-day gate, even when an older caller supplies a shorter age.
-    /// Automatic attempts are timestamped before the request so failures remain silent without causing a retry
-    /// loop on foreground or shell appearance.
-    func checkIfStale(maxAge: TimeInterval = 24 * 3600) {
+    /// automatic request and uses the fixed hourly gate, even when an older caller supplies a shorter age.
+    /// A failed request is intentionally not timestamped: it must be retried the next time the shell becomes
+    /// active, while `isChecking` keeps repeated appearance notifications single-flight.
+    func checkIfStale(maxAge: TimeInterval = 3600) {
         restoreCachedReleaseIfNeeded()
         if maxAge <= 0 {
             if isChecking {
@@ -98,10 +127,9 @@ final class UpdateChecker: ObservableObject {
             return
         }
 
-        let now = Date().timeIntervalSince1970
-        let last = UserDefaults.standard.double(forKey: Self.lastCheckedKey)
-        guard now - last >= Self.automaticInterval, !isChecking else { return }
-        UserDefaults.standard.set(now, forKey: Self.lastCheckedKey)
+        let currentTime = now().timeIntervalSince1970
+        let last = defaults.double(forKey: Self.lastCheckedKey)
+        guard currentTime - last >= Self.automaticInterval, !isChecking else { return }
         check(forcePrompt: false)
     }
 
@@ -115,11 +143,15 @@ final class UpdateChecker: ObservableObject {
             request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
             request.setValue("VortX-UpdateChecker", forHTTPHeaderField: "User-Agent")
             request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
-            guard let (data, response) = try? await URLSession.shared.data(for: request),
+            guard let (data, response) = try? await self.requestLoader(request),
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
                 return
             }
+
+            // Persist a check only after transport, status, and payload decoding all succeeded. Recording
+            // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
+            self.defaults.set(self.now().timeIntervalSince1970, forKey: Self.lastCheckedKey)
 
             guard let latest = releases
                 .filter({ !$0.draft && $0.publishedAt != nil })
@@ -127,12 +159,12 @@ final class UpdateChecker: ObservableObject {
                 .max(by: { self.compare($0, $1) == .orderedAscending }) else {
                 self.available = nil
                 self.prompt = nil
-                UserDefaults.standard.removeObject(forKey: Self.cachedReleaseKey)
+                self.defaults.removeObject(forKey: Self.cachedReleaseKey)
                 return
             }
 
             if let encoded = try? JSONEncoder().encode(latest) {
-                UserDefaults.standard.set(encoded, forKey: Self.cachedReleaseKey)
+                self.defaults.set(encoded, forKey: Self.cachedReleaseKey)
             }
 
             guard self.isNewer(latest) else {
@@ -155,10 +187,10 @@ final class UpdateChecker: ObservableObject {
     private func restoreCachedReleaseIfNeeded() {
         guard !restoredCache else { return }
         restoredCache = true
-        guard let data = UserDefaults.standard.data(forKey: Self.cachedReleaseKey),
+        guard let data = defaults.data(forKey: Self.cachedReleaseKey),
               let release = try? JSONDecoder().decode(Release.self, from: data),
               isNewer(release) else {
-            UserDefaults.standard.removeObject(forKey: Self.cachedReleaseKey)
+            defaults.removeObject(forKey: Self.cachedReleaseKey)
             return
         }
         available = release
@@ -175,7 +207,9 @@ final class UpdateChecker: ObservableObject {
 
     private func release(from github: GitHubRelease) -> Release? {
         guard let version = marketingVersion(in: github.tagName),
-              let build = buildNumber(in: [github.name, github.body].compactMap { $0 }.joined(separator: "\n")),
+              // The public release title is canonical. Release-note bodies carry older beta history, so their
+              // first "Build" marker is not necessarily the build of this release.
+              let build = buildNumber(in: github.name ?? "") ?? highestBuildNumber(in: github.body ?? ""),
               build > 0,
               let asset = github.assets.first(where: platformAsset) else {
             return nil
@@ -221,6 +255,19 @@ final class UpdateChecker: ObservableObject {
     private func buildNumber(in text: String) -> Int? {
         guard let value = firstMatch(in: text, pattern: #"(?i)\bbuild\s*[:#-]?\s*(\d+)\b"#) else { return nil }
         return Int(value)
+    }
+
+    private func highestBuildNumber(in text: String) -> Int? {
+        guard let expression = try? NSRegularExpression(pattern: #"(?i)\bbuild\s*[:#-]?\s*(\d+)\b"#) else {
+            return nil
+        }
+        let range = NSRange(text.startIndex..., in: text)
+        return expression.matches(in: text, range: range)
+            .compactMap { match in
+                guard let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+                return Int(text[valueRange])
+            }
+            .max()
     }
 
     private func firstMatch(in text: String, pattern: String) -> String? {
