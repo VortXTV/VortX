@@ -1,6 +1,76 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "Browse by Decade": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Parcourir par décennie"
+          }
+        }
+      }
+    },
+    "Browse by decade": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Parcourir par décennie"
+          }
+        }
+      }
+    },
+    "Coming soon to theaters and TV": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bientôt au cinéma et à la télévision"
+          }
+        }
+      }
+    },
+    "Most popular movies and shows": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Les films et séries les plus populaires"
+          }
+        }
+      }
+    },
+    "New movies and episodes": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Nouveaux films et épisodes"
+          }
+        }
+      }
+    },
+    "Upcoming": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "À venir"
+          }
+        }
+      }
+    },
+    "What's hot right now": {
+      "localizations": {
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ce qui fait le buzz en ce moment"
+          }
+        }
+      }
+    },
     "@%@": {
       "localizations": {
         "af": {
