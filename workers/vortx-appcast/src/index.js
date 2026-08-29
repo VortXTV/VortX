@@ -18,6 +18,7 @@ const SHA_RE = /^[0-9a-f]{64}$/i;
 const COMMIT_RE = /^[0-9a-f]{40}$/i;
 const REPOSITORY = "VortXTV/VortX";
 const CANONICAL_ALTSTORE = "https://vortx.tv/altstore.json";
+const ANDROID_SIGNER_SHA256 = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA";
 
 function jsonText(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
@@ -166,6 +167,111 @@ function validateChecksum(checksumText, assets) {
   for (const asset of Object.values(assets)) {
     if (records.get(asset.checksumName) !== asset.sha256) throw new Error(`checksum does not match ${asset.name}`);
   }
+}
+
+function validateReleaseAssetEvidence(asset, expectedName, expectedURL, field) {
+  if (!asset || asset.name !== expectedName || asset.url !== expectedURL) throw new Error(`${field} release asset identity is invalid`);
+  positiveInteger(Number(asset.assetId), `${field} assetId`);
+  positiveInteger(Number(asset.size), `${field} size`);
+  asset.sha256 = digest(asset.sha256, `${field} sha256`);
+  return asset;
+}
+
+function checksumRecord(checksumText, expectedName) {
+  const records = checksumText.split(/\r?\n/).filter(Boolean).map((line) => line.match(/^([0-9a-f]{64})\s+\*?([^\s]+)$/i));
+  if (records.some((record) => !record)) throw new Error("Android checksum evidence contains an invalid line");
+  const matches = records.filter((record) => record[2] === expectedName);
+  if (matches.length !== 1) throw new Error(`Android checksum evidence must contain exactly one ${expectedName} record`);
+  return matches[0][1].toLowerCase();
+}
+
+function provenanceBindsAPK(provenanceText, name) {
+  const fingerprint = ANDROID_SIGNER_SHA256.match(/../g).join(":");
+  const section = provenanceText.split(`verified APK: ${name}\n`)[1]?.split(/\nverified (?:APK|AAB): /)[0] || "";
+  return section.split(/\r?\n/).some((line) => line.trim().toUpperCase() === `SIGNER SHA-256: ${fingerprint}`);
+}
+
+async function buildAndroidAugmentation(payload, current) {
+  if (!current?.manifest || !current.receiptSha256) throw new Error("Android augmentation requires a durable active receipt");
+  if (
+    payload.expectedActiveGeneration !== current.manifest.generation ||
+    payload.expectedReceiptSha256 !== current.receiptSha256 ||
+    payload.expectedSourceSha256 !== current.manifest.sourceSha256 ||
+    payload.expectedAppcastSha256 !== current.manifest.appcastSha256
+  ) throw new Error("Android augmentation active receipt CAS does not match");
+  if (String(payload.releaseId) !== String(current.manifest.releaseId) || payload.releaseTag !== current.manifest.tag) throw new Error("Android augmentation release identity does not match the active receipt");
+  if (current.manifest.android !== null) throw new Error("Android augmentation requires a null manifest Android entry");
+  const currentAppcast = parseJSON(current.appcastText, "active appcast");
+  if (currentAppcast.android !== null) throw new Error("Android augmentation requires a null appcast Android entry");
+
+  const version = current.manifest.version;
+  const tag = current.manifest.tag;
+  const names = {
+    full: `VortX-${version}-full-mpv-universal.apk`,
+    play: `VortX-${version}-play-media3-universal.apk`,
+    checksum: "SHA256SUMS-android.txt",
+    provenance: "SIGNING_PROVENANCE.txt",
+  };
+  const evidence = payload.evidence;
+  if (!evidence || !evidence.assets) throw new Error("Android augmentation release evidence is required");
+  const releaseURL = (name) => releaseAssetURL(tag, name);
+  const fullAsset = validateReleaseAssetEvidence(evidence.assets.full, names.full, releaseURL(names.full), "Android full");
+  const playAsset = validateReleaseAssetEvidence(evidence.assets.play, names.play, releaseURL(names.play), "Android play");
+  const checksumAsset = validateReleaseAssetEvidence(evidence.assets.checksum, names.checksum, releaseURL(names.checksum), "Android checksum");
+  const provenanceAsset = validateReleaseAssetEvidence(evidence.assets.provenance, names.provenance, releaseURL(names.provenance), "Android provenance");
+  if (new Set([fullAsset.assetId, playAsset.assetId, checksumAsset.assetId, provenanceAsset.assetId]).size !== 4) throw new Error("Android release evidence asset IDs must be distinct");
+  const androidChecksumText = text(evidence.checksumText, "Android checksum evidence");
+  const provenanceText = text(evidence.provenanceText, "Android provenance evidence");
+  if (new TextEncoder().encode(androidChecksumText).byteLength !== checksumAsset.size || await sha256(androidChecksumText) !== checksumAsset.sha256) throw new Error("Android checksum evidence bytes do not match the immutable release asset");
+  if (new TextEncoder().encode(provenanceText).byteLength !== provenanceAsset.size || await sha256(provenanceText) !== provenanceAsset.sha256) throw new Error("Android provenance evidence bytes do not match the immutable release asset");
+  if (checksumRecord(androidChecksumText, names.full) !== fullAsset.sha256 || checksumRecord(androidChecksumText, names.play) !== playAsset.sha256) throw new Error("Android APK digests do not match checksum evidence");
+  if (
+    !provenanceBindsAPK(provenanceText, names.full) ||
+    !provenanceBindsAPK(provenanceText, names.play) ||
+    !provenanceText.includes(`release tag: ${tag}`) ||
+    !provenanceText.includes(`release tag commit: ${current.manifest.sourceCommit}`) ||
+    !provenanceText.includes(`source commit: ${current.manifest.sourceCommit}`)
+  ) throw new Error("Android signing provenance does not bind both APKs, release identity, and production signer");
+
+  const androidEntry = (engine, asset) => ({
+    tag,
+    version,
+    build: Number(current.manifest.build),
+    name: current.manifest.name,
+    notes: current.manifest.notes,
+    prerelease: Boolean(current.manifest.prerelease),
+    applicationId: "com.vortx.android",
+    engine,
+    artifactType: "apk",
+    signed: true,
+    url: asset.url,
+    size: Number(asset.size),
+    sha256: asset.sha256,
+    signer: ANDROID_SIGNER_SHA256,
+  });
+  const android = {
+    full: androidEntry("mpv", fullAsset),
+    play: androidEntry("media3", playAsset),
+  };
+  const appcastText = jsonText({ ...currentAppcast, android });
+  const sourceText = current.sourceText;
+  const checksumText = current.checksumText;
+  const sourceSha256 = await sha256(sourceText);
+  const appcastSha256 = await sha256(appcastText);
+  const checksumSha256 = await sha256(checksumText);
+  const feedSha256 = await sha256(`${sourceText}\n${appcastText}\n${checksumText}`);
+  const manifest = {
+    ...current.manifest,
+    generation: `${tag}:${current.manifest.build}:${feedSha256}`,
+    feedSha256,
+    sourceSha256,
+    appcastSha256,
+    checksumSha256,
+    android,
+  };
+  const successor = { manifest, sourceText, appcastText, checksumText };
+  successor.receiptSha256 = await sha256(JSON.stringify(canonicalValue(successor)));
+  return successor;
 }
 
 function validateAndroidArtifact(android, manifest) {
@@ -408,6 +514,37 @@ export class FeedCoordinator {
         await storage.put(`${AUDIT_PREFIX}rollback:${payload.expectedCurrentGeneration}`, { action: "rollback", expectedCurrentGeneration: payload.expectedCurrentGeneration, generation: payload.restoreGeneration });
         return jsonResponse({ rolledBack: true, generation: payload.restoreGeneration });
       }
+      if (payload.action === "augment-android") {
+        if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "Android augmentation requires a write-once operation ID");
+        if (!current) return failure(409, "augmentation-active-not-durable", "Android augmentation requires a durable active receipt");
+        const priorOperation = await storage.get(`${OPERATION_PREFIX}${payload.operationId}`);
+        const priorAudit = await storage.get(`${AUDIT_PREFIX}augment-android:${payload.expectedActiveGeneration}`);
+        if (priorAudit) {
+          if (priorAudit.operationId !== payload.operationId) return failure(409, "augmentation-already-recorded", "a different Android augmentation is permanently bound to this predecessor");
+          const sameOperation =
+            priorOperation?.action === "augment-android" &&
+            priorOperation.predecessorGeneration === payload.expectedActiveGeneration &&
+            priorOperation.successorGeneration === priorAudit.successorGeneration &&
+            priorOperation.successorReceiptSha256 === priorAudit.successorReceiptSha256;
+          const exactSuccessorIsActive = currentGeneration === priorAudit.successorGeneration && current.receiptSha256 === priorAudit.successorReceiptSha256;
+          if (!sameOperation || !exactSuccessorIsActive) return failure(409, "operation-state-conflict", "Android augmentation cannot be replayed in the current state");
+          return jsonResponse({ augmented: true, idempotent: true, generation: priorAudit.successorGeneration, previousGeneration: priorAudit.predecessorGeneration, receiptSha256: priorAudit.successorReceiptSha256 });
+        }
+        let successor;
+        try {
+          successor = await buildAndroidAugmentation(payload, current);
+        } catch (error) {
+          return failure(409, "augmentation-evidence-conflict", error instanceof Error ? error.message : "Android augmentation evidence is invalid");
+        }
+        if (successor.manifest.generation === currentGeneration) return failure(409, "augmentation-generation-conflict", "Android augmentation did not produce a distinct content-addressed generation");
+        await storage.put(`${ROLLBACK_PREFIX}${successor.manifest.generation}`, current);
+        await storage.put(`${STAGED_GENERATION_PREFIX}${successor.manifest.generation}`, successor);
+        await storage.put(ACTIVE_KEY, successor);
+        const operation = { action: "augment-android", operationId: payload.operationId, predecessorGeneration: currentGeneration, successorGeneration: successor.manifest.generation, predecessorReceiptSha256: current.receiptSha256, successorReceiptSha256: successor.receiptSha256 };
+        await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, operation);
+        await storage.put(`${AUDIT_PREFIX}augment-android:${currentGeneration}`, operation);
+        return jsonResponse({ augmented: true, generation: successor.manifest.generation, previousGeneration: currentGeneration, receiptSha256: successor.receiptSha256 });
+      }
       if (payload.action === "recover") {
         if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "recovery requires a write-once operation ID");
         if (payload.recoveryReason !== "post-publication-rollback") return failure(400, "recovery-contract", "recovery requires the exact post-publication rollback reason");
@@ -472,7 +609,7 @@ async function handleReceipt(request, env) {
     const validated = await validateStage(payload);
     return stageReceipt({ ...payload, ...validated }, env);
   }
-  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover") return coordinatorRequest(request, env, payload);
+  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover" || payload.action === "augment-android") return coordinatorRequest(request, env, payload);
   return failure(400, "receipt-action", "unsupported receipt action");
 }
 

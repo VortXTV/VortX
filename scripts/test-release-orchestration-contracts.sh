@@ -13,6 +13,7 @@ readonly VALIDATION_WF="$REPO_ROOT/.github/workflows/release-packaging-validatio
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
 readonly APPLE_RELEASE_WF="$REPO_ROOT/.github/workflows/release-tvos.yml"
 readonly RECOVERY_WF="$REPO_ROOT/.github/workflows/recover-release-feed.yml"
+readonly ANDROID_AUGMENT_WF="$REPO_ROOT/.github/workflows/augment-android-release-feed.yml"
 readonly ROOT_GRADLE_BUILD="$REPO_ROOT/android/build.gradle.kts"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly MPV_SEAM_BUILD="$REPO_ROOT/android/mpv-seam/build.gradle.kts"
@@ -507,6 +508,19 @@ require_grep "published feed recovery handles ambiguous mutation acknowledgement
 require_grep "published feed recovery emits an incident for incomplete compensation" 'incident: release recovery compensation was incomplete' "$RECOVERY_WF"
 require_absent "published feed recovery must never redraft a public release" 'draft=true|draft: true' "$RECOVERY_WF"
 ok "published feed recovery is protected, authenticated, source-CAS-bound, and never redrafts"
+[[ -f "$ANDROID_AUGMENT_WF" ]] || fail "Android feed augmentation workflow is missing"
+require_grep "Android feed augmentation uses protected release approval" 'environment: release-approval' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation is read-only to repository contents" 'contents: read' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation signs the narrow coordinator action" 'action augment-android' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation binds the active receipt digest" 'expectedReceiptSha256:\$receipt' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation binds source bytes" 'expectedSourceSha256:\$source' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation binds Apple-only appcast bytes" 'expectedAppcastSha256:\$appcast' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation pins the production signer" 'FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation validates release asset digests" '\.digest \| sub\("\^sha256:"' "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation preserves Apple appcast entries" "jq -S 'del\(\.android\)'" "$ANDROID_AUGMENT_WF"
+require_grep "Android feed augmentation compensates later verification failure" '^          rollback\(\)' "$ANDROID_AUGMENT_WF"
+require_absent "Android feed augmentation must not check out or mutate repository source" 'actions/checkout|contents: write|gh api --method (PUT|PATCH|DELETE)|gh release (edit|upload|delete)' "$ANDROID_AUGMENT_WF"
+ok "Android feed augmentation is protected, authenticated, CAS-bound, rollbackable, and release-read-only"
 grep -Eq '^    permissions:$' <<<"$verify_published_block" \
     && grep -Eq '^      contents: read$' <<<"$verify_published_block" \
     || fail "published-release verifier must hold contents: read only"
@@ -518,7 +532,7 @@ ok "published-release verifier has least privilege and runs no repository code"
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
-    for wf in "$RELEASE_WF" "$VALIDATION_WF" "$ANDROID_CI_WF" "$APPLE_RELEASE_WF" "$RECOVERY_WF"; do
+    for wf in "$RELEASE_WF" "$VALIDATION_WF" "$ANDROID_CI_WF" "$APPLE_RELEASE_WF" "$RECOVERY_WF" "$ANDROID_AUGMENT_WF"; do
         python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$wf" \
             || fail "$(basename "$wf") is not valid YAML"
         ok "$(basename "$wf") parses as valid YAML"

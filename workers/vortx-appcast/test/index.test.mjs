@@ -10,6 +10,7 @@ const TAG = "v0.3.14-beta.19";
 const BUILD = 221;
 const SECRET = "release-feed-test-secret";
 const COMMIT = "a".repeat(40);
+const ANDROID_SIGNER = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -136,6 +137,54 @@ function signedRequest(path, payload) {
     headers: { "content-type": "application/json", "x-vortx-receipt": `sha256=${signature}` },
     body,
   });
+}
+
+function androidAugmentation(receipt, operationId = "augment-android-test") {
+  const version = receipt.manifest.version;
+  const tag = receipt.manifest.tag;
+  const fullName = `VortX-${version}-full-mpv-universal.apk`;
+  const playName = `VortX-${version}-play-media3-universal.apk`;
+  const fullSha = sha256("full-production-apk");
+  const playSha = sha256("play-production-apk");
+  const checksumText = `${fullSha}  ${fullName}\n${playSha}  ${playName}\n${sha256("play-production-aab")}  VortX-${version}-play-media3.aab\n`;
+  const fingerprint = ANDROID_SIGNER.match(/../g).join(":");
+  const provenanceText = [
+    `verified APK: ${fullName}`,
+    `  signer SHA-256: ${fingerprint}`,
+    `verified APK: ${playName}`,
+    `  signer SHA-256: ${fingerprint}`,
+    `release tag: ${tag}`,
+    `release tag commit: ${receipt.manifest.sourceCommit}`,
+    `source commit: ${receipt.manifest.sourceCommit}`,
+    "",
+  ].join("\n");
+  const releaseAsset = (assetId, name, size, digestValue) => ({
+    assetId,
+    name,
+    url: `https://github.com/VortXTV/VortX/releases/download/${tag}/${name}`,
+    size,
+    sha256: digestValue,
+  });
+  return {
+    action: "augment-android",
+    operationId,
+    releaseId: receipt.manifest.releaseId,
+    releaseTag: tag,
+    expectedActiveGeneration: receipt.manifest.generation,
+    expectedReceiptSha256: null,
+    expectedSourceSha256: receipt.manifest.sourceSha256,
+    expectedAppcastSha256: receipt.manifest.appcastSha256,
+    evidence: {
+      assets: {
+        full: releaseAsset(101, fullName, 150_000_000, fullSha),
+        play: releaseAsset(102, playName, 72_000_000, playSha),
+        checksum: releaseAsset(103, "SHA256SUMS-android.txt", Buffer.byteLength(checksumText), sha256(checksumText)),
+        provenance: releaseAsset(104, "SIGNING_PROVENANCE.txt", Buffer.byteLength(provenanceText), sha256(provenanceText)),
+      },
+      checksumText,
+      provenanceText,
+    },
+  };
 }
 
 test("staging, promotion, exact bytes, query invariance, and rollback are fail-closed", async () => {
@@ -446,6 +495,78 @@ test("recovery rejects missing or mismatched terminal, snapshot, and audit evide
     generation: fixture.target.manifest.generation, targetSourceSha256: "0".repeat(64), expectedActiveGeneration: fixture.predecessor.manifest.generation,
   }), fixture.env);
   assert.equal(sourceMismatch.status, 409);
+});
+
+test("Android augmentation creates a content-addressed split feed while preserving Apple and source bytes", async () => {
+  const env = environment(new MemoryKV());
+  const receipt = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-android-predecessor", releaseId: receipt.manifest.releaseId,
+    generation: receipt.manifest.generation, expectedActiveGeneration: null,
+  }), env)).status, 200);
+  const predecessor = structuredClone(await env.__state.storage.get("active"));
+  const augmentation = androidAugmentation(receipt);
+  augmentation.expectedReceiptSha256 = predecessor.receiptSha256;
+  const response = await worker.fetch(signedRequest("/__release/receipt", augmentation), env);
+  const result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(result.augmented, true);
+  assert.notEqual(result.generation, predecessor.manifest.generation);
+  const successor = await env.__state.storage.get("active");
+  assert.equal(successor.sourceText, predecessor.sourceText);
+  assert.equal(successor.manifest.sourceSha256, predecessor.manifest.sourceSha256);
+  assert.equal(successor.checksumText, predecessor.checksumText);
+  const beforeAppcast = JSON.parse(predecessor.appcastText);
+  const afterAppcast = JSON.parse(successor.appcastText);
+  for (const platform of ["ios", "tvos", "mac"]) assert.deepEqual(afterAppcast[platform], beforeAppcast[platform]);
+  assert.equal(afterAppcast.android.full.engine, "mpv");
+  assert.equal(afterAppcast.android.play.engine, "media3");
+  assert.equal(afterAppcast.android.full.signer, ANDROID_SIGNER);
+  assert.equal(afterAppcast.android.play.signer, ANDROID_SIGNER);
+  assert.equal(successor.manifest.generation, `${receipt.manifest.tag}:${receipt.manifest.build}:${successor.manifest.feedSha256}`);
+  assert.deepEqual(await env.__state.storage.get(`rollback:${successor.manifest.generation}`), predecessor);
+
+  const replay = await worker.fetch(signedRequest("/__release/receipt", augmentation), env);
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).idempotent, true);
+  const differentOperation = await worker.fetch(signedRequest("/__release/receipt", { ...augmentation, operationId: "different-augmentation" }), env);
+  assert.equal(differentOperation.status, 409);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback", expectedCurrentGeneration: successor.manifest.generation, restoreGeneration: predecessor.manifest.generation,
+  }), env)).status, 200);
+  assert.equal((await env.__state.storage.get("active")).manifest.generation, predecessor.manifest.generation);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 409);
+});
+
+test("Android augmentation rejects stale CAS, wrong signer provenance, and non-null Android state", async () => {
+  const setupAugmentation = async () => {
+    const env = environment(new MemoryKV());
+    const receipt = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", { action: "promote", operationId: `promote-${Math.random()}`, releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: null }), env)).status, 200);
+    const augmentation = androidAugmentation(receipt, `augment-${Math.random()}`);
+    augmentation.expectedReceiptSha256 = (await env.__state.storage.get("active")).receiptSha256;
+    return { env, receipt, augmentation };
+  };
+
+  const stale = await setupAugmentation();
+  stale.augmentation.expectedAppcastSha256 = "0".repeat(64);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", stale.augmentation), stale.env)).status, 409);
+  assert.equal((await stale.env.__state.storage.get("active")).manifest.generation, stale.receipt.manifest.generation);
+
+  const wrongSigner = await setupAugmentation();
+  wrongSigner.augmentation.evidence.provenanceText = wrongSigner.augmentation.evidence.provenanceText.replaceAll(ANDROID_SIGNER.match(/../g).join(":"), "00:".repeat(31) + "00");
+  wrongSigner.augmentation.evidence.assets.provenance.size = Buffer.byteLength(wrongSigner.augmentation.evidence.provenanceText);
+  wrongSigner.augmentation.evidence.assets.provenance.sha256 = sha256(wrongSigner.augmentation.evidence.provenanceText);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", wrongSigner.augmentation), wrongSigner.env)).status, 409);
+  assert.equal((await wrongSigner.env.__state.storage.get("active")).manifest.generation, wrongSigner.receipt.manifest.generation);
+
+  const nonNull = await setupAugmentation();
+  const active = await nonNull.env.__state.storage.get("active");
+  active.manifest.android = { already: "present" };
+  await nonNull.env.__state.storage.put("active", active);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", nonNull.augmentation), nonNull.env)).status, 409);
 });
 
 test("unsigned or malformed staged generations never reach the public routes", async () => {

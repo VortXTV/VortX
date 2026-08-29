@@ -1,0 +1,145 @@
+name: Augment published release feed with Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: Immutable public GitHub release ID
+        required: true
+        type: string
+      release_tag:
+        description: Exact public release tag
+        required: true
+        type: string
+      expected_active_generation:
+        description: Exact active Apple-only feed generation
+        required: true
+        type: string
+      expected_receipt_sha256:
+        description: Exact active durable receipt SHA-256
+        required: true
+        type: string
+      expected_source_sha256:
+        description: Exact active source.json SHA-256
+        required: true
+        type: string
+      expected_appcast_sha256:
+        description: Exact active Apple-only appcast SHA-256
+        required: true
+        type: string
+
+concurrency:
+  group: vortx-android-feed-augmentation
+  cancel-in-progress: false
+
+jobs:
+  augment:
+    runs-on: ubuntu-24.04
+    environment: release-approval
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Validate immutable Android evidence and atomically augment the active feed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          TAG: ${{ inputs.release_tag }}
+          EXPECTED_ACTIVE: ${{ inputs.expected_active_generation }}
+          EXPECTED_RECEIPT_SHA: ${{ inputs.expected_receipt_sha256 }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha256 }}
+          EXPECTED_APPCAST_SHA: ${{ inputs.expected_appcast_sha256 }}
+          RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
+          EXPECTED_SIGNER: FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA
+        run: |
+          set -euo pipefail
+          AUGMENTED=0
+          SUCCESSOR=""
+          rollback() {
+            [ "$AUGMENTED" = 1 ] || return 0
+            local body signature response
+            body="$(jq -cn --arg current "$SUCCESSOR" --arg restore "$EXPECTED_ACTIVE" '{action:"rollback",expectedCurrentGeneration:$current,restoreGeneration:$restore}')"
+            signature="$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
+            response="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$signature" --data-binary "$body" https://vortx.tv/__release/receipt 2>/dev/null || true)"
+            jq -e --arg generation "$EXPECTED_ACTIVE" '.rolledBack == true and .generation == $generation' <<<"$response" >/dev/null || echo '::error::incident: Android feed augmentation rollback failed'
+          }
+          on_failure() { local status=$?; if [ "$status" -ne 0 ]; then rollback; fi; exit "$status"; }
+          trap on_failure EXIT
+
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]
+          [[ "$EXPECTED_RECEIPT_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_APPCAST_SHA" =~ ^[0-9a-f]{64}$ ]]
+          RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
+          jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null
+          VERSION="${TAG#v}"; VERSION="${VERSION%%-*}"
+          FULL="VortX-$VERSION-full-mpv-universal.apk"
+          PLAY="VortX-$VERSION-play-media3-universal.apk"
+          for SPEC in "full:$FULL" "play:$PLAY" "checksum:SHA256SUMS-android.txt" "provenance:SIGNING_PROVENANCE.txt"; do
+            KEY="${SPEC%%:*}"; NAME="${SPEC#*:}"
+            COUNT="$(jq --arg name "$NAME" '[.assets[] | select(.name == $name and .state == "uploaded")] | length' <<<"$RELEASE_JSON")"
+            [ "$COUNT" = 1 ] || { echo "::error::$NAME must be present exactly once"; exit 1; }
+            jq -c --arg name "$NAME" '.assets[] | select(.name == $name and .state == "uploaded") | {assetId:.id,name,url:.browser_download_url,size,sha256:(.digest | sub("^sha256:"; ""))}' <<<"$RELEASE_JSON" > "$RUNNER_TEMP/$KEY-asset.json"
+            jq -e --arg tag "$TAG" --arg name "$NAME" --arg repo "$GH_REPO" '.assetId > 0 and .size > 0 and (.sha256 | test("^[0-9a-f]{64}$")) and .url == ("https://github.com/" + $repo + "/releases/download/" + $tag + "/" + $name)' "$RUNNER_TEMP/$KEY-asset.json" >/dev/null
+          done
+          CHECKSUM_ID="$(jq -r .assetId "$RUNNER_TEMP/checksum-asset.json")"
+          PROVENANCE_ID="$(jq -r .assetId "$RUNNER_TEMP/provenance-asset.json")"
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$CHECKSUM_ID" > "$RUNNER_TEMP/SHA256SUMS-android.txt"
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$PROVENANCE_ID" > "$RUNNER_TEMP/SIGNING_PROVENANCE.txt"
+          for KEY in checksum provenance; do
+            FILE="$RUNNER_TEMP/$( [ "$KEY" = checksum ] && echo SHA256SUMS-android.txt || echo SIGNING_PROVENANCE.txt )"
+            [ "$(wc -c < "$FILE" | tr -d ' ')" = "$(jq -r .size "$RUNNER_TEMP/$KEY-asset.json")" ]
+            [ "$(sha256sum "$FILE" | awk '{print $1}')" = "$(jq -r .sha256 "$RUNNER_TEMP/$KEY-asset.json")" ]
+          done
+          FULL_SHA="$(awk -v name="$FULL" '$2 == name {print $1}' "$RUNNER_TEMP/SHA256SUMS-android.txt")"
+          PLAY_SHA="$(awk -v name="$PLAY" '$2 == name {print $1}' "$RUNNER_TEMP/SHA256SUMS-android.txt")"
+          [ "$FULL_SHA" = "$(jq -r .sha256 "$RUNNER_TEMP/full-asset.json")" ]
+          [ "$PLAY_SHA" = "$(jq -r .sha256 "$RUNNER_TEMP/play-asset.json")" ]
+          FINGERPRINT="$(sed 's/../&:/g;s/:$//' <<<"$EXPECTED_SIGNER")"
+          for NAME in "$FULL" "$PLAY"; do
+            awk -v name="$NAME" -v signer="$FINGERPRINT" '
+              $0 == "verified APK: " name { in_apk=1; next }
+              /^verified (APK|AAB): / { in_apk=0 }
+              in_apk && toupper($0) == "  SIGNER SHA-256: " signer { found=1 }
+              END { exit(found ? 0 : 1) }
+            ' "$RUNNER_TEMP/SIGNING_PROVENANCE.txt"
+          done
+          grep -Fx "release tag: $TAG" "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" >/dev/null
+
+          for ROUTE in altstore.json vortx-altstore.json appcast.json; do
+            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/before-$ROUTE.headers" "https://vortx.tv/$ROUTE" -o "$RUNNER_TEMP/before-$ROUTE"
+            grep -Fqi "x-vortx-feed-generation: $EXPECTED_ACTIVE" "$RUNNER_TEMP/before-$ROUTE.headers"
+          done
+          cmp -s "$RUNNER_TEMP/before-altstore.json" "$RUNNER_TEMP/before-vortx-altstore.json"
+          [ "$(sha256sum "$RUNNER_TEMP/before-altstore.json" | awk '{print $1}')" = "$EXPECTED_SOURCE_SHA" ]
+          [ "$(sha256sum "$RUNNER_TEMP/before-appcast.json" | awk '{print $1}')" = "$EXPECTED_APPCAST_SHA" ]
+          jq -e --arg tag "$TAG" '._generatedFromTag == $tag and .android == null' "$RUNNER_TEMP/before-appcast.json" >/dev/null
+
+          jq -n --arg action augment-android --arg operationId "augment-android:$RELEASE_ID:$EXPECTED_ACTIVE" --arg releaseId "$RELEASE_ID" --arg releaseTag "$TAG" --arg generation "$EXPECTED_ACTIVE" --arg receipt "$EXPECTED_RECEIPT_SHA" --arg source "$EXPECTED_SOURCE_SHA" --arg appcast "$EXPECTED_APPCAST_SHA" --slurpfile full "$RUNNER_TEMP/full-asset.json" --slurpfile play "$RUNNER_TEMP/play-asset.json" --slurpfile checksum "$RUNNER_TEMP/checksum-asset.json" --slurpfile provenance "$RUNNER_TEMP/provenance-asset.json" --rawfile checksumText "$RUNNER_TEMP/SHA256SUMS-android.txt" --rawfile provenanceText "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" '{action:$action,operationId:$operationId,releaseId:$releaseId,releaseTag:$releaseTag,expectedActiveGeneration:$generation,expectedReceiptSha256:$receipt,expectedSourceSha256:$source,expectedAppcastSha256:$appcast,evidence:{assets:{full:$full[0],play:$play[0],checksum:$checksum[0],provenance:$provenance[0]},checksumText:$checksumText,provenanceText:$provenanceText}}' > "$RUNNER_TEMP/augment.json"
+          SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary < "$RUNNER_TEMP/augment.json" | od -An -tx1 | tr -d ' \n')"
+          RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary @"$RUNNER_TEMP/augment.json" https://vortx.tv/__release/receipt || true)"
+          SUCCESSOR="$(jq -er '.generation // empty' <<<"$RESPONSE" 2>/dev/null || true)"
+          if [ -z "$SUCCESSOR" ]; then
+            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/ambiguous.headers" https://vortx.tv/appcast.json -o "$RUNNER_TEMP/ambiguous.json"
+            SUCCESSOR="$(awk 'BEGIN{IGNORECASE=1} /^x-vortx-feed-generation:/ {gsub(/\r/, ""); print $2}' "$RUNNER_TEMP/ambiguous.headers")"
+            [ -n "$SUCCESSOR" ] && [ "$SUCCESSOR" != "$EXPECTED_ACTIVE" ] && jq -e '.android.full != null and .android.play != null' "$RUNNER_TEMP/ambiguous.json" >/dev/null
+            RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" --data-binary @"$RUNNER_TEMP/augment.json" https://vortx.tv/__release/receipt)"
+          fi
+          jq -e --arg previous "$EXPECTED_ACTIVE" '.augmented == true and .previousGeneration == $previous' <<<"$RESPONSE" >/dev/null
+          SUCCESSOR="$(jq -er .generation <<<"$RESPONSE")"
+          [ "$SUCCESSOR" != "$EXPECTED_ACTIVE" ]
+          AUGMENTED=1
+          for ROUTE in altstore.json vortx-altstore.json appcast.json; do
+            curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/after-$ROUTE.headers" "https://vortx.tv/$ROUTE" -o "$RUNNER_TEMP/after-$ROUTE"
+            grep -Fqi "x-vortx-feed-generation: $SUCCESSOR" "$RUNNER_TEMP/after-$ROUTE.headers"
+          done
+          cmp -s "$RUNNER_TEMP/before-altstore.json" "$RUNNER_TEMP/after-altstore.json"
+          cmp -s "$RUNNER_TEMP/before-vortx-altstore.json" "$RUNNER_TEMP/after-vortx-altstore.json"
+          jq -S 'del(.android)' "$RUNNER_TEMP/before-appcast.json" > "$RUNNER_TEMP/before-apple.json"
+          jq -S 'del(.android)' "$RUNNER_TEMP/after-appcast.json" > "$RUNNER_TEMP/after-apple.json"
+          cmp -s "$RUNNER_TEMP/before-apple.json" "$RUNNER_TEMP/after-apple.json"
+          jq -e --arg signer "$EXPECTED_SIGNER" --arg full "$FULL_SHA" --arg play "$PLAY_SHA" '.android.full.engine == "mpv" and .android.play.engine == "media3" and .android.full.signer == $signer and .android.play.signer == $signer and .android.full.sha256 == $full and .android.play.sha256 == $play' "$RUNNER_TEMP/after-appcast.json" >/dev/null
+          trap - EXIT
+          echo "augmented release $RELEASE_ID as feed generation $SUCCESSOR without mutating release or source metadata"
