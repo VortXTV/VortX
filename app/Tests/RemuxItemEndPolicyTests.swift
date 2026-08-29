@@ -53,6 +53,13 @@ private func containsInOrder(_ source: String?, _ needles: [String]) -> Bool {
 enum RemuxItemEndPolicyTests {
     static func main() {
         check(
+            "paused user intent ignores an AVPlayer item-end notification before terminal classification",
+            VortXPlaybackEndNotificationPolicy.decide(playbackRequested: false) == .ignorePausedIntent)
+        check(
+            "playing user intent permits a genuine AVPlayer completion to be classified",
+            VortXPlaybackEndNotificationPolicy.decide(playbackRequested: true) == .inspectTerminalState)
+
+        check(
             "raw AVPlayer end remains content EOF",
             VortXRemuxItemEndPolicy.classify(
                 isRemux: false,
@@ -189,6 +196,14 @@ enum RemuxItemEndPolicyTests {
             engine,
             from: "@objc private func didPlayToEnd",
             to: "@objc private func failedToEnd")
+        check(
+            "wiring: paused intent is rejected before remux classification and terminal-latch claim",
+            containsInOrder(endHandler, [
+                "VortXPlaybackEndNotificationPolicy.decide(",
+                "ignored item-end notification while committed transport intent is paused",
+                "VortXRemuxItemEndPolicy.classify(",
+                "terminalLatch.claim(generation: itemGeneration)",
+            ]))
         check(
             "wiring: nonterminal local remux EOF is one fatal error and never ordinary EOF",
             server?.contains("stream.hlsSnapshot().ended") == true

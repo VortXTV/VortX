@@ -3659,6 +3659,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let endedItem = note.object as? AVPlayerItem,
               let loadToken = activeLoadToken,
               owns(endedItem, loadToken: loadToken) else { return }
+        guard VortXPlaybackEndNotificationPolicy.decide(
+            playbackRequested: playbackRequested) == .inspectTerminalState else {
+            // A paused viewer owns transport even if AVFoundation later reports an item end while preserving or
+            // recovering a DV/HLS mount. Do not classify or latch it: either operation would turn a deliberate
+            // pause into the chrome's normal episode-completion path.
+            DiagnosticsLog.log(
+                "avplayer",
+                "ignored item-end notification while committed transport intent is paused")
+            return
+        }
         let remuxTerminal: (ended: Bool, failureReason: String?)?
         if let server = remuxHLSServer {
             remuxTerminal = (server.hasReachedEndOfStream, server.terminalFailureReason)

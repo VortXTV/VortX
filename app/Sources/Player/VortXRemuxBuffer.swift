@@ -192,6 +192,21 @@ struct VortXHLSBackpressureWaitState: Equatable, Sendable {
     }
 }
 
+/// Decides whether an AVPlayer item-end notification is meaningful before it can claim the terminal latch.
+/// AVFoundation may send an end notification while the user's committed transport intent is paused; treating
+/// that as a completion advances the episode even though playback was explicitly stopped. Kept dependency-free
+/// so the notification contract is executable in isolation.
+enum VortXPlaybackEndNotificationPolicy {
+    enum Decision: Equatable, Sendable {
+        case ignorePausedIntent
+        case inspectTerminalState
+    }
+
+    static func decide(playbackRequested: Bool) -> Decision {
+        playbackRequested ? .inspectTerminalState : .ignorePausedIntent
+    }
+}
+
 /// Classifies AVPlayer's item-end notification without mistaking the current tail of a growing remux playlist
 /// for the end of the source. Kept dependency-free so the notification contract is executable in isolation.
 enum VortXRemuxItemEndPolicy {
