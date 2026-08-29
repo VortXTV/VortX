@@ -214,7 +214,10 @@ async function validateStage(payload) {
   if (Number(payload.schemaVersion) !== ARTIFACT_SCHEMA || !["stage", "repair"].includes(payload.action)) throw new Error("unsupported feed receipt schema or action");
   const manifest = payload.manifest;
   if (!manifest || Number(manifest.schemaVersion) !== ARTIFACT_SCHEMA || !RELEASE_TAG_RE.test(String(manifest.tag || ""))) throw new Error("manifest identity is invalid");
-  if (manifest.prerelease !== true || !String(manifest.tag).includes("-")) throw new Error("release feed accepts immutable prerelease receipts only");
+  const tagIsPrerelease = String(manifest.tag).includes("-");
+  if (typeof manifest.prerelease !== "boolean" || manifest.prerelease !== tagIsPrerelease) {
+    throw new Error("manifest prerelease state must match the release tag");
+  }
   positiveInteger(manifest.build, "manifest build");
   text(manifest.name, "manifest name");
   text(manifest.notes, "manifest notes");

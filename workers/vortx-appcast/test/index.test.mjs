@@ -28,6 +28,9 @@ function asset(tag, slug, extension, checksumName, byte, assetId) {
 }
 
 function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
+  const version = tag.replace(/^v/, "").replace(/-.*/, "");
+  const prerelease = tag.includes("-");
+  const releaseName = prerelease ? "Beta 19" : `VortX ${version}`;
   const assets = {
     ios: asset(tag, "iOS", "ipa", "VortX-iOS-ci.ipa", "ios-bytes", 11),
     tvos: asset(tag, "tvOS", "ipa", "VortX-tvOS-ci.ipa", "tvos-bytes", 12),
@@ -42,12 +45,12 @@ function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
       {
         name: "VortX",
         bundleIdentifier: "com.stremiox.app.native",
-        versions: [{ version: "0.3.14", buildVersion: String(build), date: "2026-08-20", localizedDescription: note, downloadURL: assets.ios.url, size: assets.ios.size, sha256: assets.ios.sha256, minOSVersion: "16.0" }],
+        versions: [{ version, buildVersion: String(build), date: "2026-08-20", localizedDescription: note, downloadURL: assets.ios.url, size: assets.ios.size, sha256: assets.ios.sha256, minOSVersion: "16.0" }],
       },
       {
         name: "VortX (Apple TV)",
         bundleIdentifier: "com.stremiox.tv",
-        versions: [{ version: "0.3.14", buildVersion: String(build), date: "2026-08-20", localizedDescription: note, downloadURL: assets.tvos.url, size: assets.tvos.size, sha256: assets.tvos.sha256, minOSVersion: "18.0" }],
+        versions: [{ version, buildVersion: String(build), date: "2026-08-20", localizedDescription: note, downloadURL: assets.tvos.url, size: assets.tvos.size, sha256: assets.tvos.sha256, minOSVersion: "18.0" }],
       },
     ],
   };
@@ -56,9 +59,9 @@ function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
     schemaVersion: 2,
     _generatedFromTag: tag,
     _generatedFromCommit: COMMIT,
-    ios: { tag, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.ios.url, url: assets.ios.url, size: assets.ios.size, sha256: assets.ios.sha256, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
-    tvos: { tag, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.tvos.url, url: assets.tvos.url, size: assets.tvos.size, sha256: assets.tvos.sha256, altstore: null, artifactType: "ipa" },
-    mac: { tag, version: "0.3.14", build, name: "Beta 19", notes: note, prerelease: true, ipa: assets.mac.url, url: assets.mac.url, size: assets.mac.size, sha256: assets.mac.sha256, altstore: null, artifactType: "dmg" },
+    ios: { tag, version, build, name: releaseName, notes: note, prerelease, ipa: assets.ios.url, url: assets.ios.url, size: assets.ios.size, sha256: assets.ios.sha256, altstore: "https://vortx.tv/altstore.json", artifactType: "ipa" },
+    tvos: { tag, version, build, name: releaseName, notes: note, prerelease, ipa: assets.tvos.url, url: assets.tvos.url, size: assets.tvos.size, sha256: assets.tvos.sha256, altstore: null, artifactType: "ipa" },
+    mac: { tag, version, build, name: releaseName, notes: note, prerelease, ipa: assets.mac.url, url: assets.mac.url, size: assets.mac.size, sha256: assets.mac.sha256, altstore: null, artifactType: "dmg" },
     android: null,
   };
   const appcastText = `${JSON.stringify(appcast, null, 2)}\n`;
@@ -68,10 +71,10 @@ function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
     schemaVersion: 2,
     tag,
     build,
-    version: "0.3.14",
-    name: "Beta 19",
+    version,
+    name: releaseName,
     notes: note,
-    prerelease: true,
+    prerelease,
     sourceCommit: COMMIT,
     releaseId,
     generation: `${tag}:${build}:${feedSha256}`,
@@ -151,6 +154,30 @@ test("staging, promotion, exact bytes, query invariance, and rollback are fail-c
   assert.equal(rolledBack.status, 200);
   const unavailable = await worker.fetch(new Request("https://vortx.tv/altstore.json"), env);
   assert.equal(unavailable.status, 503);
+});
+
+test("stable and prerelease receipts require tag-matching prerelease state", async () => {
+  const stableEnv = environment(new MemoryKV());
+  const stable = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  assert.equal(stable.manifest.prerelease, false);
+  const stableResponse = await worker.fetch(signedRequest("/__release/receipt", stable), stableEnv);
+  assert.equal(stableResponse.status, 200, await stableResponse.text());
+
+  const stableMismatch = makeReceipt({ releaseId: "316", build: 234, tag: "v0.3.16" });
+  stableMismatch.manifest.prerelease = true;
+  const stableMismatchResponse = await worker.fetch(
+    signedRequest("/__release/receipt", stableMismatch),
+    environment(new MemoryKV()),
+  );
+  assert.equal(stableMismatchResponse.status, 503);
+
+  const prereleaseMismatch = makeReceipt();
+  prereleaseMismatch.manifest.prerelease = false;
+  const prereleaseMismatchResponse = await worker.fetch(
+    signedRequest("/__release/receipt", prereleaseMismatch),
+    environment(new MemoryKV()),
+  );
+  assert.equal(prereleaseMismatchResponse.status, 503);
 });
 
 test("feed routes answer HEAD with GET metadata and honor If-None-Match with 304", async () => {
