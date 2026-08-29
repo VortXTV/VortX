@@ -27,10 +27,10 @@ enum ContinueWatchingDedupe {
                 name: value.name,
                 poster: value.poster
             ) else { return true }
-            guard seenFingerprints.insert(fingerprint).inserted else {
-                seenIDs.remove(id)
-                return false
-            }
+            // Keep every observed raw id monotonic even when its strong fingerprint loses to an earlier item.
+            // A later lane may carry that alias with missing or changed display metadata; forgetting the id here
+            // would let the rejected alias resurrect despite the engine winner already establishing its identity.
+            guard seenFingerprints.insert(fingerprint).inserted else { return false }
             return true
         }
     }

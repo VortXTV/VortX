@@ -41,6 +41,10 @@ private enum ContinueWatchingDedupeTests {
                "exact ids collapse case-insensitively")
         expect(merge(engine: [live], synthesized: [alias]).map(\.id) == [live.id],
                "strong tmdb/imdb display aliases collapse and the engine item wins")
+        let weakenedAlias = Item(
+            id: alias.id, type: alias.type, name: alias.name, poster: nil)
+        expect(merge(engine: [live, alias], synthesized: [weakenedAlias]).map(\.id) == [live.id],
+               "a rejected engine alias cannot resurrect from a later lane with weaker metadata")
         expect(merge(engine: [live], synthesized: [remake]).map(\.id) == [live.id, remake.id],
                "same-title series with different posters stay distinct")
         expect(merge(engine: [live], synthesized: [noPoster]).map(\.id) == [live.id, noPoster.id],
