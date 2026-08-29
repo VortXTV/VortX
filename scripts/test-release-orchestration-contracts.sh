@@ -461,7 +461,7 @@ require_grep "Apple coordinator derives prerelease state from the tag" \
 require_grep "Android lane refuses partial publication" \
     'Refuse Android-only publication' "$RELEASE_WF"
 require_grep "Android checksum lists downloadable basenames" \
-    "sed 's#  dist/##' > dist/SHA256SUMS-android.txt" "$RELEASE_WF"
+    "sed 's#  dist/#  #' > dist/SHA256SUMS-android.txt" "$RELEASE_WF"
 require_grep "Apple coordinator requires the complete Android set before publish" \
     'Android checksum asset is missing' "$APPLE_RELEASE_WF"
 require_grep "Stable publish explicitly verifies latest release state" \

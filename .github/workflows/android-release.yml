@@ -246,7 +246,7 @@ jobs:
             "dist/VortX-${version}-full-mpv-universal.apk" \
             "dist/VortX-${version}-play-media3-universal.apk" \
             "dist/VortX-${version}-play-media3.aab" \
-            | sed 's#  dist/##' > dist/SHA256SUMS-android.txt
+            | sed 's#  dist/#  #' > dist/SHA256SUMS-android.txt
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Create or append to the draft release
