@@ -297,9 +297,29 @@ export class FeedCoordinator {
       const active = await this.state.storage.get(ACTIVE_KEY);
       return jsonResponse({ active: active || null });
     }
+    // LEGACY_LASTGOOD is immutable fallback state.  Capture it outside the
+    // Durable Object transaction so release serialization never waits on KV.
+    const legacySnapshot = await this.env.LEGACY_LASTGOOD?.get("feed:active", { type: "json" });
+    let legacyPredecessor = null;
+    let legacyBootstrapInvalid = false;
+    if (legacySnapshot) {
+      try {
+        // Older frozen receipts predate receiptSha256.  Validate their exact
+        // canonical artifacts and derive the same semantic digest used by new
+        // durable receipts before they are eligible for migration.
+        legacyPredecessor = await validateStage(legacySnapshot);
+      } catch {
+        legacyBootstrapInvalid = true;
+      }
+    }
     return this.state.storage.transaction(async (storage) => {
       const current = await storage.get(ACTIVE_KEY);
-      const currentGeneration = current?.manifest?.generation || null;
+      // During the one-time migration, public routes can still serve the
+      // immutable last-known-good receipt from KV before the Durable Object
+      // has an active record.  Use that exact visible predecessor for CAS and
+      // rollback, but only while no durable record exists.
+      const predecessor = current || (!current ? legacyPredecessor : null);
+      const currentGeneration = predecessor?.manifest?.generation || null;
       if (payload.action === "stage") {
         const releaseKey = `${STAGED_RELEASE_PREFIX}${payload.manifest.releaseId}`;
         const generationKey = `${STAGED_GENERATION_PREFIX}${payload.manifest.generation}`;
@@ -323,7 +343,7 @@ export class FeedCoordinator {
         if (current) return failure(409, "repair-active-exists", "integrity repair is only allowed when no durable active receipt exists");
         if (payload.repairReason !== "integrity-repair") return failure(400, "repair-contract", "integrity repair requires the exact repair reason");
         if (!text(payload.operationId, "operationId") || !this.env.LEGACY_OBSERVED_GENERATION || !this.env.LEGACY_OBSERVED_DIGEST || payload.expectedLegacyGeneration !== this.env.LEGACY_OBSERVED_GENERATION || payload.expectedLegacyDigest !== this.env.LEGACY_OBSERVED_DIGEST || payload.manifest.generation === payload.expectedLegacyGeneration) return failure(409, "repair-generation", "integrity repair must bind distinct observed and corrected generations");
-        const observed = await this.env.LEGACY_LASTGOOD?.get("feed:active", { type: "json" });
+        const observed = legacySnapshot;
         if (!observed || observed?.manifest?.generation !== payload.expectedLegacyGeneration || await sha256(JSON.stringify(canonicalValue(observed))) !== payload.expectedLegacyDigest) return failure(409, "repair-observed", "frozen legacy receipt does not match the observed migration guard");
         const legacy = payload.legacyRelease;
         if (!legacy || String(legacy.releaseId) !== String(payload.manifest.releaseId) || legacy.tag !== payload.manifest.tag || legacy.sourceCommit !== payload.manifest.sourceCommit || legacy.prerelease !== true || legacy.tagCommit !== payload.manifest.sourceCommit) return failure(400, "repair-identity", "integrity repair release identity does not match the immutable receipt");
@@ -343,6 +363,7 @@ export class FeedCoordinator {
         if (!text(payload.operationId, "operationId")) return failure(400, "operation-contract", "promotion requires a write-once operation ID");
         const staged = await storage.get(`${STAGED_RELEASE_PREFIX}${payload.releaseId}`);
         if (!staged || staged.manifest.generation !== payload.generation || String(staged.manifest.releaseId) !== String(payload.releaseId)) return failure(404, "staged-generation-missing", "requested staged generation is not present");
+        if (!current && legacyBootstrapInvalid) return failure(409, "legacy-active-invalid", "frozen legacy receipt cannot be used as a promotion predecessor");
         if (await storage.get(`${ROLLED_BACK_PREFIX}${staged.manifest.generation}`)) return failure(409, "generation-terminal", "a rolled-back generation cannot be promoted again");
         const priorOperation = await storage.get(`${OPERATION_PREFIX}${payload.operationId}`);
         if (priorOperation) {
@@ -353,23 +374,25 @@ export class FeedCoordinator {
             priorOperation.receiptSha256 === staged.receiptSha256;
           const exactTargetIsActive =
             currentGeneration === staged.manifest.generation &&
-            String(current?.manifest?.releaseId) === String(staged.manifest.releaseId) &&
-            current?.receiptSha256 === staged.receiptSha256;
+            String(predecessor?.manifest?.releaseId) === String(staged.manifest.releaseId) &&
+            predecessor?.receiptSha256 === staged.receiptSha256;
           if (!sameOperation || !exactTargetIsActive) {
             return failure(409, "operation-state-conflict", "promotion operation cannot be replayed in the current state");
           }
-          return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: current.receiptSha256 });
+          if (!current) await storage.put(ACTIVE_KEY, staged);
+          return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
         }
         if (payload.expectedActiveGeneration === undefined || payload.expectedActiveGeneration !== currentGeneration) return failure(409, "active-generation-conflict", "active generation changed before promotion");
         if (currentGeneration === staged.manifest.generation) {
-          if (String(current.manifest.releaseId) !== String(staged.manifest.releaseId) || current.receiptSha256 !== staged.receiptSha256) return failure(409, "active-receipt-conflict", "active generation is not the exact staged receipt");
-          await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: currentGeneration, releaseId: payload.releaseId, receiptSha256: current.receiptSha256, idempotent: true });
-          return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: current.receiptSha256 });
+          if (String(predecessor.manifest.releaseId) !== String(staged.manifest.releaseId) || predecessor.receiptSha256 !== staged.receiptSha256) return failure(409, "active-receipt-conflict", "active generation is not the exact staged receipt");
+          if (!current) await storage.put(ACTIVE_KEY, staged);
+          await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: currentGeneration, releaseId: payload.releaseId, receiptSha256: staged.receiptSha256, idempotent: true });
+          return jsonResponse({ promoted: true, idempotent: true, generation: currentGeneration, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });
         }
-        if (current && Number(staged.manifest.build) < Number(current.manifest.build)) return failure(409, "promote-build-order", "a staged generation cannot downgrade a newer active build");
-        if (current && Number(staged.manifest.build) === Number(current.manifest.build) && staged.manifest.tag !== current.manifest.tag) return failure(409, "promote-build-tag-conflict", "a build is permanently bound to one active release tag");
-        if (current && staged.manifest.tag === current.manifest.tag && Number(staged.manifest.build) !== Number(current.manifest.build)) return failure(409, "promote-tag-build-conflict", "an active release tag is permanently bound to one build");
-        if (current) await storage.put(`${ROLLBACK_PREFIX}${payload.generation}`, current);
+        if (predecessor && Number(staged.manifest.build) < Number(predecessor.manifest.build)) return failure(409, "promote-build-order", "a staged generation cannot downgrade a newer active build");
+        if (predecessor && Number(staged.manifest.build) === Number(predecessor.manifest.build) && staged.manifest.tag !== predecessor.manifest.tag) return failure(409, "promote-build-tag-conflict", "a build is permanently bound to one active release tag");
+        if (predecessor && staged.manifest.tag === predecessor.manifest.tag && Number(staged.manifest.build) !== Number(predecessor.manifest.build)) return failure(409, "promote-tag-build-conflict", "an active release tag is permanently bound to one build");
+        if (predecessor) await storage.put(`${ROLLBACK_PREFIX}${payload.generation}`, predecessor);
         await storage.put(ACTIVE_KEY, staged);
         await storage.put(`${OPERATION_PREFIX}${payload.operationId}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, releaseId: payload.releaseId, receiptSha256: staged.receiptSha256 });
         await storage.put(`${AUDIT_PREFIX}promote:${payload.generation}`, { action: "promote", operationId: payload.operationId, generation: payload.generation, previousGeneration: currentGeneration, receiptSha256: staged.receiptSha256 });

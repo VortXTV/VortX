@@ -122,6 +122,12 @@ function environment(kv, extra = {}) {
   return env;
 }
 
+function frozenLegacy(record) {
+  const legacy = structuredClone(record);
+  delete legacy.receiptSha256;
+  return legacy;
+}
+
 function signedRequest(path, payload) {
   const body = JSON.stringify(payload);
   const signature = createHmac("sha256", SECRET).update(body).digest("hex");
@@ -178,6 +184,133 @@ test("stable and prerelease receipts require tag-matching prerelease state", asy
     environment(new MemoryKV()),
   );
   assert.equal(prereleaseMismatchResponse.status, 503);
+});
+
+test("promotion migrates a valid legacy active receipt into durable rollback state without weakening CAS", async () => {
+  const kv = new MemoryKV();
+  const legacyEnv = environment(kv);
+  const legacy = makeReceipt({ releaseId: "230", build: 232, tag: "v0.3.14-beta.30" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", legacy), legacyEnv)).status, 200);
+  const legacyActive = await legacyEnv.__state.storage.get(`staged:release:${legacy.manifest.releaseId}`);
+  await kv.put("feed:active", JSON.stringify(frozenLegacy(legacyActive)));
+
+  // A fresh Durable Object has no ACTIVE_KEY, but users are still seeing this
+  // trusted legacy generation on public feed routes.
+  const env = environment(kv);
+  const stable = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", stable), env)).status, 200);
+  const stale = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote",
+    operationId: "legacy-stale",
+    releaseId: "315",
+    generation: stable.manifest.generation,
+    expectedActiveGeneration: "not-the-visible-legacy-generation",
+  }), env);
+  assert.equal(stale.status, 409);
+
+  const promoted = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote",
+    operationId: "legacy-promote",
+    releaseId: "315",
+    generation: stable.manifest.generation,
+    expectedActiveGeneration: legacy.manifest.generation,
+  }), env);
+  const promotedBody = await promoted.json();
+  assert.equal(promoted.status, 200, JSON.stringify(promotedBody));
+  assert.equal(promotedBody.previousGeneration, legacy.manifest.generation);
+  const rollbackReceipt = await env.__state.storage.get(`rollback:${stable.manifest.generation}`);
+  assert.deepEqual(rollbackReceipt.manifest, legacyActive.manifest);
+  assert.equal(rollbackReceipt.sourceText, legacyActive.sourceText);
+  assert.equal(rollbackReceipt.appcastText, legacyActive.appcastText);
+  assert.equal(rollbackReceipt.checksumText, legacyActive.checksumText);
+  assert.equal(rollbackReceipt.receiptSha256, legacyActive.receiptSha256);
+
+  const rolledBack = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback",
+    expectedCurrentGeneration: stable.manifest.generation,
+    restoreGeneration: legacy.manifest.generation,
+  }), env);
+  assert.equal(rolledBack.status, 200, await rolledBack.text());
+  const restored = await env.__state.storage.get("active");
+  assert.deepEqual(restored.manifest, legacyActive.manifest);
+  assert.equal(restored.sourceText, legacyActive.sourceText);
+  assert.equal(restored.appcastText, legacyActive.appcastText);
+  assert.equal(restored.checksumText, legacyActive.checksumText);
+  assert.equal(restored.receiptSha256, legacyActive.receiptSha256);
+  for (const [path, bytes] of [["/altstore.json", legacyActive.sourceText], ["/vortx-altstore.json", legacyActive.sourceText], ["/appcast.json", legacyActive.appcastText]]) {
+    const response = await worker.fetch(new Request(`https://vortx.tv${path}`), env);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-vortx-feed-generation"), legacy.manifest.generation);
+    assert.equal(await response.text(), bytes);
+  }
+});
+
+test("same-generation legacy migration materializes the exact staged receipt", async () => {
+  const kv = new MemoryKV();
+  const sourceEnv = environment(kv);
+  const legacy = makeReceipt({ releaseId: "230", build: 232, tag: "v0.3.14-beta.30" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", legacy), sourceEnv)).status, 200);
+  const legacyActive = await sourceEnv.__state.storage.get(`staged:release:${legacy.manifest.releaseId}`);
+  await kv.put("feed:active", JSON.stringify(frozenLegacy(legacyActive)));
+
+  const env = environment(kv);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", legacy), env)).status, 200);
+  const migrated = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote",
+    operationId: "legacy-materialize",
+    releaseId: legacy.manifest.releaseId,
+    generation: legacy.manifest.generation,
+    expectedActiveGeneration: legacy.manifest.generation,
+  }), env);
+  assert.equal(migrated.status, 200, await migrated.text());
+  assert.deepEqual(await env.__state.storage.get("active"), await env.__state.storage.get(`staged:release:${legacy.manifest.releaseId}`));
+});
+
+test("a durable active receipt always wins over a conflicting legacy snapshot", async () => {
+  const kv = new MemoryKV();
+  const sourceEnv = environment(kv);
+  const legacy = makeReceipt({ releaseId: "230", build: 232, tag: "v0.3.14-beta.30" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", legacy), sourceEnv)).status, 200);
+  await kv.put("feed:active", JSON.stringify(frozenLegacy(await sourceEnv.__state.storage.get(`staged:release:${legacy.manifest.releaseId}`))));
+
+  const env = environment(kv);
+  const durable = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  const target = makeReceipt({ releaseId: "316", build: 234, tag: "v0.3.16" });
+  for (const receipt of [durable, target]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  await env.__state.storage.put("active", await env.__state.storage.get(`staged:release:${durable.manifest.releaseId}`));
+  const staleLegacy = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "durable-stale-legacy", releaseId: target.manifest.releaseId, generation: target.manifest.generation, expectedActiveGeneration: legacy.manifest.generation,
+  }), env);
+  assert.equal(staleLegacy.status, 409);
+  const promoted = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "durable-target", releaseId: target.manifest.releaseId, generation: target.manifest.generation, expectedActiveGeneration: durable.manifest.generation,
+  }), env);
+  assert.equal(promoted.status, 200, await promoted.text());
+  assert.equal((await env.__state.storage.get("active")).manifest.generation, target.manifest.generation);
+});
+
+test("an integrity-invalid legacy snapshot cannot bootstrap a promotion", async () => {
+  const kv = new MemoryKV();
+  const sourceEnv = environment(kv);
+  const legacy = makeReceipt({ releaseId: "230", build: 232, tag: "v0.3.14-beta.30" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", legacy), sourceEnv)).status, 200);
+  const malformed = frozenLegacy(await sourceEnv.__state.storage.get(`staged:release:${legacy.manifest.releaseId}`));
+  malformed.manifest.feedSha256 = "0".repeat(64);
+  await kv.put("feed:active", JSON.stringify(malformed));
+
+  const env = environment(kv);
+  const stable = makeReceipt({ releaseId: "315", build: 233, tag: "v0.3.15" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", stable), env)).status, 200);
+  const response = await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote",
+    operationId: "invalid-legacy",
+    releaseId: stable.manifest.releaseId,
+    generation: stable.manifest.generation,
+    expectedActiveGeneration: legacy.manifest.generation,
+  }), env);
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).error, "legacy-active-invalid");
+  assert.equal(await env.__state.storage.get("active"), undefined);
 });
 
 test("feed routes answer HEAD with GET metadata and honor If-None-Match with 304", async () => {
