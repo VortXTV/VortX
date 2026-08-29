@@ -2827,13 +2827,14 @@ struct CoreStreamList: View {
                     }
 
                     Button { showPlayerPicker = true } label: {
-                        Label(launchEnginePreference?.label ?? "Player", systemImage: "play.rectangle")
+                        Label(launchPlayerLabel, systemImage: "play.rectangle")
                     }
                     .buttonStyle(ChipButtonStyle(selected: launchEnginePreference != nil))
+                    .accessibilityHint("AVPlayer is used only for compatible sources. Other sources use the safe player route.")
                     .confirmationDialog("Pick a player", isPresented: $showPlayerPicker, titleVisibility: .visible) {
                         Button("Auto") { launchEnginePreference = nil }
                         Button("VortX Player") { launchEnginePreference = .mpv }
-                        Button("AVPlayer") { launchEnginePreference = .avfoundation }
+                        Button("AVPlayer when compatible") { launchEnginePreference = .avfoundation }
                     }
 
                     Button { withAnimation { showAllSources.toggle() } } label: {
@@ -3608,10 +3609,10 @@ struct CoreStreamList: View {
                                                     seriesInventoryAuthority: seriesInventoryAuthority,
                                                     sourceHint: entry.qualityText, torrent: false,
                                                     bingeGroup: entry.bingeGroup, headers: entry.headers,
+                                                    initialEnginePreference: launchEnginePreference,
                                                     debridRef: ref, sourceStream: resumeSource,
                                                     debridCachedHashes: debridCache.cachedHashes,
                                                     enginePlayerVideoId: engineVideoID,
-                                                    initialEnginePreference: launchEnginePreference,
                                                     wasExplicitPick: true, wasResume: true, startFromZero: fromStart,
                                                     startAtSeconds: admittedStart.seconds)
                 return
@@ -3640,11 +3641,12 @@ struct CoreStreamList: View {
                                                 seriesInventoryAuthority: seriesInventoryAuthority,
                                                 sourceHint: StreamRanking.signature(win.stream), torrent: false,
                                                 bingeGroup: win.stream.behaviorHints?.bingeGroup,
-                                                headers: win.stream.requestHeaders, debridRef: win.ref,
+                                                headers: win.stream.requestHeaders,
+                                                initialEnginePreference: launchEnginePreference,
+                                                debridRef: win.ref,
                                                 sourceStream: win.stream,
                                                 debridCachedHashes: debridCache.cachedHashes,
                                                 enginePlayerVideoId: engineVideoID, startFromZero: fromStart,
-                                                initialEnginePreference: launchEnginePreference,
                                                 startAtSeconds: admittedStart.seconds)
             return
         }
@@ -3703,11 +3705,12 @@ struct CoreStreamList: View {
                                                 seriesInventoryAuthority: seriesInventoryAuthority,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,
                                                 bingeGroup: stream.behaviorHints?.bingeGroup,
-                                                headers: stream.requestHeaders, debridRef: ref,
+                                                headers: stream.requestHeaders,
+                                                initialEnginePreference: launchEnginePreference,
+                                                debridRef: ref,
                                                 sourceStream: stream,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
-                                            initialEnginePreference: launchEnginePreference,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
             return
@@ -3729,13 +3732,22 @@ struct CoreStreamList: View {
                                             seriesInventoryAuthority: seriesInventoryAuthority,
                                             sourceHint: StreamRanking.signature(stream), torrent: stream.isTorrent,
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
-                                            headers: stream.requestHeaders, sourceStream: stream,
+                                            headers: stream.requestHeaders,
+                                            initialEnginePreference: launchEnginePreference,
+                                            sourceStream: stream,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
-                                            initialEnginePreference: launchEnginePreference,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
+    }
+
+    private var launchPlayerLabel: String {
+        switch launchEnginePreference {
+        case .mpv: return "VortX Player"
+        case .avfoundation: return "AVPlayer when compatible"
+        case .auto, .none: return "Player"
+        }
     }
 
     private func filterBar(_ groups: [CoreStreamSourceGroup], total: Int) -> some View {

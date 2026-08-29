@@ -714,6 +714,12 @@ private enum TrickplayUploadPolicyTests {
                    && tv?.contains("initialEnginePreference == .avfoundation, canUseAVPlayerEngine") == true
                    && tv?.contains("if let forced = manualEngineAVPlayer { return forced }") == true,
                "detail launch preference must be threaded before the route latch, conservatively gated, and superseded by live picker changes")
+        expect(detail?.contains("AVPlayer when compatible") == true
+                   && detail?.contains("Other sources use the safe player route.") == true
+                   && sourceContainsInOrder(detail, [
+                    "headers: entry.headers,", "initialEnginePreference: launchEnginePreference,", "debridRef: ref"
+                   ]),
+               "the selector must describe AV compatibility honestly and thread its launch preference before later request members")
     }
 
     private static func sourceSection(_ source: String, from start: String, to end: String) -> String? {
