@@ -489,6 +489,9 @@ targets:
       - path: SourcesTV
         excludes:
           - TopShelfExtension/**
+      # The same Debrid Cloud browser used by iOS and Mac, with tvOS focus and player routing gated
+      # inside the view. Keeping one source preserves the existing provider and keychain boundaries.
+      - SourcesiOS/DebridLibraryView.swift
       # Tooling hook logs land inside the source tree and XcodeGen otherwise sweeps them in as bundle
       # resources, which fails the build with "Multiple commands produce .../hook-log.jsonl" because the
       # same basename appears under several roots. They are generated artifacts, never sources.

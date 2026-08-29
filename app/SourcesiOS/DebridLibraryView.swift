@@ -6,20 +6,26 @@ import SwiftUI
 /// item straight through the normal player, with no add-on and no re-download.
 ///
 /// Self-contained by design: it reads the existing `DebridKeys` for configured providers, lists + resolves
-/// through `DebridCoordinator`, and hands the resolved DIRECT url to the same `PlayerScreen` cover every
-/// browse screen uses (`iOSPlayerCover`). The only thing it needs from the app shell is the two environment
-/// objects that shell already injects app-wide (`StremioAccount`, `CoreBridge`), so the Settings pass can
-/// reach it with a plain `NavigationLink { DebridLibraryView() }`, no extra plumbing.
+/// through `DebridCoordinator`, and hands the resolved direct URL to each platform's established player
+/// presentation. The only thing it needs from the app shell is the environment object that shell already
+/// injects app-wide. Search reaches it with a plain
+/// `NavigationLink { DebridLibraryView() }`, with no duplicate provider or credential plumbing.
 ///
 /// Fail-soft throughout: a provider with no key is simply absent; a provider that errors or returns nothing
-/// hides its section; a resolve that fails shows an inline notice, never a crash. This UI ALSO runs on macOS
-/// (the `VortXMac` target reuses `SourcesiOS`), so it stays touch-and-pointer friendly with no tvOS focus.
+/// hides its section; a resolve that fails shows an inline notice, never a crash. This UI runs on iOS,
+/// macOS, and tvOS. The content is shared while each platform keeps its established player presentation.
 struct DebridLibraryView: View {
+    #if os(tvOS)
+    @EnvironmentObject private var presenter: PlayerPresenter
+    #else
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
+    #endif
     @ObservedObject private var debrid = DebridKeys.shared
     @StateObject private var model = DebridLibraryModel()
+    #if !os(tvOS)
     @State private var launch: iOSPlayerLaunch?
+    #endif
 
     var body: some View {
         ScrollView {
@@ -35,7 +41,9 @@ struct DebridLibraryView: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .task { await model.loadIfNeeded(hasKey: debrid.hasAnyKey) }
         .refreshable { await model.reload(hasKey: debrid.hasAnyKey) }
+        #if !os(tvOS)
         .iOSPlayerCover($launch, account: account, core: core)
+        #endif
     }
 
     // MARK: Header
@@ -135,7 +143,11 @@ struct DebridLibraryView: View {
             .contentShape(Rectangle())
             .vortxSettingsCard()
         }
+        #if os(tvOS)
+        .vortxCardButton()
+        #else
         .buttonStyle(.plain)
+        #endif
         .disabled(model.resolvingID != nil)
         .opacity(model.resolvingID != nil && model.resolvingID != item.id ? 0.5 : 1)
     }
@@ -222,7 +234,11 @@ struct DebridLibraryView: View {
             do {
                 let url = try await DebridCoordinator.shared.resolveLibraryItem(item)
                 // Paste-a-link style launch: a direct URL with no library item to record progress against.
+                #if os(tvOS)
+                presenter.request = PlaybackRequest(url: url, title: item.name)
+                #else
                 launch = iOSPlayerLaunch(url: url, title: item.name, isTorrent: false)
+                #endif
             } catch {
                 model.resolveError = "Could not start \"\(item.name)\". The file may have expired from your cloud."
             }

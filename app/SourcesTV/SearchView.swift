@@ -31,11 +31,19 @@ struct SearchView: View {
                     historySection
                 }
                 if !isTyping {
-                    Button { showOpenLink = true } label: {
-                        Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
+                    HStack(spacing: Theme.Space.sm) {
+                        Button { showOpenLink = true } label: {
+                            Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
+                        }
+                        .buttonStyle(ChipButtonStyle(selected: false))
+                        .sheet(isPresented: $showOpenLink) { OpenLinkView() }
+
+                        NavigationLink { DebridLibraryView() } label: {
+                            Label("Debrid Cloud", systemImage: "cloud")
+                        }
+                        .buttonStyle(ChipButtonStyle(selected: false))
                     }
-                    .buttonStyle(ChipButtonStyle(selected: false))
-                    .sheet(isPresented: $showOpenLink) { OpenLinkView() }
+                    .focusSection()
                 }
                 resultGrid
             }

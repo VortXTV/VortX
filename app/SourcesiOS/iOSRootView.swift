@@ -2234,12 +2234,7 @@ struct iOSSearchView: View {
                 // past the viewport and clip both edges (systemic fix S1).
                 LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Search tab -> scroll here
-                    // Stremio's "paste a link" feature, at the top like tvOS.
-                    Button { showOpenLink = true } label: {
-                        Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
-                    }
-                    .buttonStyle(ChipButtonStyle(selected: false))
-                    .padding(.horizontal, Theme.Space.md)
+                    quickActions
 
                     // macOS search lives in the PERSISTENT window top bar (iOSRootView.macTopBar), NOT in
                     // a toolbar `.searchable`: a toolbar search item is realized as an NSToolbarItem on the
@@ -2326,6 +2321,32 @@ struct iOSSearchView: View {
             MacSearchBridge.shared.pending = nil
         }
         #endif
+    }
+
+    /// Playback actions live together at the top of Search. The compact phone width stacks them while
+    /// iPad and Mac keep Debrid Cloud directly beside Play Link.
+    private var quickActions: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: Theme.Space.sm) { quickActionButtons }
+            VStack(alignment: .leading, spacing: Theme.Space.sm) { quickActionButtons }
+        }
+        .padding(.horizontal, Theme.Space.md)
+    }
+
+    @ViewBuilder private var quickActionButtons: some View {
+        Button { showOpenLink = true } label: {
+            Label(directLinksOnly ? "Play a direct link" : "Play a link or magnet", systemImage: "link")
+                .lineLimit(1)
+        }
+        .buttonStyle(ChipButtonStyle(selected: false))
+        .fixedSize(horizontal: true, vertical: false)
+
+        NavigationLink { DebridLibraryView() } label: {
+            Label("Debrid Cloud", systemImage: "cloud")
+                .lineLimit(1)
+        }
+        .buttonStyle(ChipButtonStyle(selected: false))
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     /// Below ≥2 chars the engine never searches, so the page reads as "start typing"; once the query
