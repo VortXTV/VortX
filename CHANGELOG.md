@@ -4,6 +4,29 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.14 Beta 30 (build 232)
+
+### Apple: playback reliability and player controls
+
+**Dolby Vision no longer falls back to HDR10 after a quiet remux read.** A quiet read can no longer set a sticky soft interrupt that poisons later reads and forces the HDR10/libmpv fallback. Apple TV, iPhone, iPad, and Mac. On Apple TV, a completed resume seek also cancels its watchdog as soon as playback proves it reached the target, so a later manual seek cannot be mistaken for a failed resume and reapply stale recovery state. Apple TV's Dolby Vision diagnostics also report dependent-layer evidence honestly instead of claiming that an ordinary multi-video-track file discarded an enhancement layer.
+
+**Pause, episode, and source controls behave like the action you chose.** Manual pause no longer lets an internal cache-flush EOF masquerade as episode completion and trigger auto-advance. Series playback keeps the selected episode when you return to the detail page, and the in-player Previous Episode and Next Episode actions now resolve and play their intended neighbours. The source selector again starts with Quality and Audio-language filters, with matching sources beneath them, rather than leading with audio. A title detail page also lets you choose the player before playback starts. Apple TV.
+
+**Watching state is more reliable.** Episode watched marks no longer depend on a transient in-memory route, and Continue Watching deduplicates the same series rather than rendering it twice. Apple TV, iPhone, iPad, and Mac.
+
+**Subtitles and seek previews recover their real data paths.** Subtitle fetches now accept repeated harmless non-framing response headers while still rejecting ambiguous duplicate `Content-Length` or `Transfer-Encoding` headers. Seek previews use the repaired capture path and stop repeatedly requesting unsupported HDR pixel formats after a failure. Apple TV, iPhone, iPad, and Mac.
+
+### Diagnostics and source resolution
+
+- Internal cache-flush EOFs are now suppressed instead of being mistaken for media completion; long flush durations seen in this diagnostic were background-suspended wall time, not foreground hangs.
+- Crash reporting now distinguishes a prior unclean exit from a crash with captured signal or stack evidence.
+- Frame telemetry showed rendering and capture pressure, not decoder drops, so this build fixes unsupported HDR capture handling and adds a repeated-capture circuit breaker. Physical Apple TV pacing verification remains part of the release follow-up.
+- TorBox now removes the invalid account-host search fallback while preserving partial results from healthy search legs when the primary service is unavailable.
+
+### Availability
+
+**Apple-only beta.** Beta 30 is available for Apple TV, iPhone, iPad, and Mac. Android is nearly ready and is planned for Beta 31; only these release gates remain: production signing, signed install and upgrade verification, the 32-bit Fire TV `armeabi-v7a` support decision, and the physical phone and TV playback matrix. This beta does not include Android artifacts.
+
 ## 0.3.14 Beta 29 (build 231)
 
 ### Apple: the Mac app, rebuilt for the desktop
