@@ -464,12 +464,34 @@ struct Issue164TraktContractTests {
                     && iosCapturedFallback.contains("traktSessionID: provenance.traktSessionID")
                     && !iosCapturedFallback.contains("continueWatchingSelection"),
                 "iOS A-to-B account changes during direct-resume await must fail closed before fallback")
+        let iosMovieContentLaunches = segment(
+            in: iosDetail,
+            from: "private func playMovie(",
+            to: "#if !os(tvOS)\n    // MARK: Offline download"
+        )
+        let iosEpisodeContentLaunches = segment(
+            in: iosDetail,
+            from: "private func play(_ stream: CoreStream, url: URL, explicit: Bool = true) async",
+            to: "private func autoPickAndPlayEpisode() async"
+        )
+        let iosEpisodeAutoPick = segment(
+            in: iosDetail,
+            from: "private func autoPickAndPlayEpisode() async",
+            to: "#if !os(tvOS)"
+        )
         require(iosDetail.contains("var initialResumeSeconds: Double? = nil")
                     && iosDetail.contains("var initialVideoID: String? = nil")
                     && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: iosDetail) >= 2
                     && occurrences(of: "TraktAuth.storedSessionID == initialTraktSessionID", in: iosDetail) >= 3
                     && occurrences(of: "OneShotResumeAdmissionGate<TraktSessionID>()", in: iosDetail) == 2
-                    && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: iosDetail) == 7
+                    && occurrences(of: "initialResumeGate.admit(", in: iosMovieContentLaunches) == 4
+                    && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: iosMovieContentLaunches) == 4
+                    && occurrences(of: "presentation = .player", in: iosMovieContentLaunches) == 4
+                    && occurrences(of: "initialStartGate.admit(", in: iosEpisodeContentLaunches) == 2
+                    && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: iosEpisodeContentLaunches) == 2
+                    && occurrences(of: "presentation = .player", in: iosEpisodeContentLaunches) == 2
+                    && iosEpisodeAutoPick.contains("await playBest(candidates, labeledBest: best)")
+                    && !iosEpisodeAutoPick.contains("presentation = .player")
                     && !iosDetail.contains("didConsumeInitialResume")
                     && !iosDetail.contains("didConsumeInitialStart"),
                 "iOS detail/source selection must revalidate the remote session on the first content play")
@@ -506,7 +528,8 @@ struct Issue164TraktContractTests {
         // Final review boundaries: stale login attempts, aggregate reads, Upcoming, and remote CW privacy.
         require(auth.contains("struct TraktLoginAttemptAuthority")
                     && auth.contains("expectedLoginGeneration: loginGeneration")
-                    && auth.contains("loginAttempts.owns(code: deviceCode")
+                    && auth.contains("loginAttempts.owns(code: session")
+                    && auth.contains("CredentialScopeRegistry.shared.isCurrent(capture)")
                     && auth.contains("func cancelLoginAttempt()"),
                 "Trakt device-login responses must remain owned by one live generation")
         require(simklAuth.contains("struct SIMKLLoginAttemptAuthority")

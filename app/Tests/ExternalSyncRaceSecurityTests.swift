@@ -94,6 +94,24 @@ struct ExternalSyncRaceSecurityTestRunner {
                "an A-rendered suggestion is rejected when B becomes current before the tap")
         expect(!resumeGate.isConsumed,
                "a rejected account-switched suggestion remains unconsumed")
+        expect(resumeGate.admit(accountAResume, currentSessionID: nil) == nil,
+               "an A-rendered suggestion is rejected after sign-out before first content play")
+        expect(!resumeGate.isConsumed,
+               "a signed-out rejection cannot consume the remote suggestion")
+
+        var localResumeGate = OneShotResumeAdmissionGate<String>()
+        let localResume = AccountBoundResumeProposal(
+            seconds: 321,
+            expectedSessionID: Optional<String>.none,
+            consumesInitial: false
+        )
+        expect(localResumeGate.admit(localResume, currentSessionID: nil)?.seconds == 321,
+               "signed-out local playback remains admissible")
+        expect(localResumeGate.admit(localResume, currentSessionID: "trakt-B")?.seconds == 321,
+               "a Trakt session rotation cannot block local playback")
+        expect(!localResumeGate.isConsumed,
+               "local playback does not consume a remote one-shot gate")
+
         let admittedA = resumeGate.admit(accountAResume, currentSessionID: "trakt-A")
         expect(admittedA?.seconds == 2_403,
                "the matching exact session admits the original offset")
