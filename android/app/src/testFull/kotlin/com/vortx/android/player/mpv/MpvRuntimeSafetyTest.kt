@@ -1,5 +1,10 @@
 package com.vortx.android.player.mpv
 
+import com.vortx.android.player.EngineFailureCoordinator
+import com.vortx.android.player.EngineFailureResolution
+import com.vortx.android.player.EngineFallbackReason
+import com.vortx.android.player.PlayerState
+import com.vortx.android.player.requestEngineFallback
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -36,6 +41,68 @@ class MpvRuntimeSafetyTest {
             MpvAudioOutputHealthAction.FAIL_SOURCE,
             mpvAudioOutputHealthAction(true, null, null, recoveryAttempted = true),
         )
+    }
+
+    @Test
+    fun `terminal first still resolves failed AO to exactly one engine demotion`() {
+        val coordinator = EngineFailureCoordinator<PlayerState>()
+        val opportunity = coordinator.beginOpportunity()
+        val terminal = PlayerState(positionMs = 37_000L, hasError = true)
+        assertEquals(EngineFailureResolution.None, coordinator.onTerminal(terminal))
+
+        val aoVerdict = mpvAudioOutputHealthAction(
+            hasAudioTrack = true,
+            currentAo = null,
+            outputChannelCount = null,
+            recoveryAttempted = true,
+        )
+        val resolution = coordinator.completeOpportunity(
+            opportunity,
+            fallbackReason = if (aoVerdict == MpvAudioOutputHealthAction.FAIL_SOURCE) {
+                EngineFallbackReason.AUDIO_OUTPUT_FAILED
+            } else {
+                null
+            },
+        )
+        assertEquals(
+            EngineFailureResolution.Demote(EngineFallbackReason.AUDIO_OUTPUT_FAILED),
+            resolution,
+        )
+        val replacementState = terminal.requestEngineFallback(EngineFallbackReason.AUDIO_OUTPUT_FAILED)
+        assertEquals(37_000L, replacementState.positionMs)
+        assertFalse(replacementState.hasError)
+        assertEquals(
+            EngineFailureResolution.None,
+            coordinator.onTerminal(terminal.copy(positionMs = 38_000L)),
+        )
+        assertEquals(
+            EngineFailureResolution.None,
+            coordinator.completeOpportunity(opportunity, EngineFallbackReason.AUDIO_OUTPUT_FAILED),
+        )
+    }
+
+    @Test
+    fun `healthy AO explicitly releases pending genuine terminal`() {
+        val coordinator = EngineFailureCoordinator<PlayerState>()
+        val opportunity = coordinator.beginOpportunity()
+        val terminal = PlayerState(positionMs = 19_000L, hasError = true)
+        assertEquals(EngineFailureResolution.None, coordinator.onTerminal(terminal))
+
+        val aoVerdict = mpvAudioOutputHealthAction(
+            hasAudioTrack = true,
+            currentAo = "audiotrack",
+            outputChannelCount = 2,
+            recoveryAttempted = false,
+        )
+        val resolution = coordinator.completeOpportunity(
+            opportunity,
+            fallbackReason = if (aoVerdict == MpvAudioOutputHealthAction.FAIL_SOURCE) {
+                EngineFallbackReason.AUDIO_OUTPUT_FAILED
+            } else {
+                null
+            },
+        )
+        assertEquals(EngineFailureResolution.CommitTerminal(terminal), resolution)
     }
 
     @Test

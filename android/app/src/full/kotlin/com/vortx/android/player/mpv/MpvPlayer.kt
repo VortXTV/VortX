@@ -914,7 +914,7 @@ class MpvPlayer private constructor(
         val state = _state.value
         return !released.get() && subtitleLoadGeneration.get() == generation &&
             audioFileLoadedGeneration == generation &&
-            !state.hasError && !state.hasEnded && !failureCoordinator.hasPendingTerminal()
+            !state.hasError && !state.hasEnded
     }
 
     override fun release() {

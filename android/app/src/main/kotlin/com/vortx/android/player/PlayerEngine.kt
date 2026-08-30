@@ -303,9 +303,6 @@ internal class EngineFailureCoordinator<T> {
     }
 
     @Synchronized
-    fun hasPendingTerminal(): Boolean = pendingTerminal != null
-
-    @Synchronized
     fun onTerminal(terminal: T): EngineFailureResolution<T> {
         if (fallbackConsumed || terminalCommitted) return EngineFailureResolution.None
         if (activeOpportunities.isNotEmpty()) {
