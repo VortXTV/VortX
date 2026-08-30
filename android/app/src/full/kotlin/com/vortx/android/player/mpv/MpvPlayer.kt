@@ -37,6 +37,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -161,7 +162,9 @@ class MpvPlayer private constructor(
     private var pendingResumeSeekMs: Long = 0L
 
     private val runtimePolicyScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val subtitleLoadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val subtitleLoadGeneration = AtomicLong()
+    private val subtitleGenerationGate = Any()
     private val released = AtomicBoolean(false)
     private val audioHealthLock = Any()
     private var audioHealthJob: Job? = null
@@ -333,7 +336,9 @@ class MpvPlayer private constructor(
 
     override fun load(playable: Playable) {
         if (released.get()) return
-        val loadGeneration = subtitleLoadGeneration.incrementAndGet()
+        val loadGeneration = synchronized(subtitleGenerationGate) {
+            subtitleLoadGeneration.incrementAndGet()
+        }
         // Reset terminal classification and invalidate the previous source's opportunity tokens before
         // cancelling its jobs. Their finally blocks may run immediately; completion must be a no-op for
         // this new source generation.
@@ -342,6 +347,9 @@ class MpvPlayer private constructor(
         } else {
             terminalGate.beginFirstLoad()
         }
+        // A replacement never retains work started for its predecessor. The final command is also gated
+        // below, covering a job that completed its copy at exactly the same time as this cancellation.
+        subtitleLoadScope.coroutineContext.cancelChildren()
         synchronized(audioHealthLock) {
             audioHealthJob?.cancel()
             audioHealthJob = null
@@ -536,18 +544,28 @@ class MpvPlayer private constructor(
     }
 
     private fun mountExternalSubtitle(source: ExternalSubtitle, generation: Long) {
-        runtimePolicyScope.launch(Dispatchers.IO) {
+        subtitleLoadScope.launch {
             val local = boundedSubtitleFile(source)
             if (local == null) {
                 Log.w(TAG, "external subtitle skipped: bounded fetch failed")
                 return@launch
             }
-            if (!MpvExternalSubtitleTransport.shouldMount(generation, subtitleLoadGeneration.get())) return@launch
-            mpv.command(arrayOf("sub-add", local.absolutePath))
+            synchronized(subtitleGenerationGate) {
+                if (released.get() || !MpvExternalSubtitleTransport.shouldMount(generation, subtitleLoadGeneration.get())) {
+                    return@launch
+                }
+                mpv.command(arrayOf("sub-add", local.absolutePath))
+            }
         }
     }
 
     private suspend fun boundedSubtitleFile(source: ExternalSubtitle): File? {
+        MpvExternalSubtitleTransport.localFileFor(source.url)?.let { local ->
+            return local.takeIf { it.isFile && it.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES }
+        }
+        if (MpvExternalSubtitleTransport.isContentUri(source.url)) {
+            return boundedContentSubtitleFile(source.url)
+        }
         val request = MpvExternalSubtitleTransport.requestFor(source) ?: return null
         val uri = request.uri
         val digest = MpvExternalSubtitleTransport.cacheKey(request)
@@ -609,6 +627,45 @@ class MpvPlayer private constructor(
                 }
             }
             null
+        } catch (error: Throwable) {
+            MpvExternalSubtitleTransport.rethrowIfFatal(error)
+            null
+        } finally {
+            temp?.delete()
+        }
+    }
+
+    private suspend fun boundedContentSubtitleFile(source: String): File? {
+        val uri = runCatching { android.net.Uri.parse(source) }.getOrNull() ?: return null
+        val extension = uri.lastPathSegment?.substringAfterLast('.', "")
+            ?.lowercase()?.takeIf { it in SUBTITLE_EXTENSIONS } ?: "srt"
+        val target = File(appContext.cacheDir, "vortx-extsub-content-${MpvExternalSubtitleTransport.localCacheKey(source)}.$extension")
+        if (target.isFile && target.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES) return target
+        var temp: File? = null
+        return try {
+            temp = File.createTempFile("vortx-extsub-", ".$extension", appContext.cacheDir)
+            val complete = appContext.contentResolver.openInputStream(uri)?.use { input ->
+                temp!!.outputStream().use outputUse@{ output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var total = 0L
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        if (total > MAX_EXTERNAL_SUBTITLE_BYTES) return@outputUse false
+                        output.write(buffer, 0, read)
+                    }
+                    total > 0
+                }
+            } ?: false
+            if (!complete) return null
+            if (temp!!.renameTo(target)) {
+                temp = null
+                target
+            } else {
+                target.takeIf { it.isFile && it.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES }
+            }
         } catch (error: Throwable) {
             MpvExternalSubtitleTransport.rethrowIfFatal(error)
             null
@@ -948,6 +1005,10 @@ class MpvPlayer private constructor(
 
     override fun release() {
         if (!released.compareAndSet(false, true)) return
+        synchronized(subtitleGenerationGate) {
+            subtitleLoadGeneration.incrementAndGet()
+        }
+        subtitleLoadScope.cancel()
         // Close the terminal gate before unregistering so an already-dispatched native callback racing
         // teardown cannot publish EOF and trigger watched/auto-advance.
         terminalGate.release()
@@ -1205,6 +1266,23 @@ internal object MpvExternalSubtitleTransport {
 
     fun normalizedTracks(playable: Playable): List<ExternalSubtitle> =
         normalizedExternalSubtitles(playable).distinct()
+
+    /** Schemeless and file references are offline media, never candidates for the remote HTTP transport. */
+    fun localFileFor(source: String): File? {
+        val uri = runCatching { URI(source) }.getOrNull()
+        return when {
+            uri?.scheme == null -> File(source)
+            uri.scheme.equals("file", ignoreCase = true) -> runCatching { File(uri) }.getOrNull()
+            else -> null
+        }
+    }
+
+    fun isContentUri(source: String): Boolean = runCatching { URI(source).scheme.equals("content", ignoreCase = true) }
+        .getOrDefault(false)
+
+    fun localCacheKey(source: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(source.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
 
     /** The public DNS result supplied to OkHttp is also the only address it may connect to. */
     fun protectedClient(timeoutMs: Long, dns: Dns = publicDns(timeoutMs)): OkHttpClient =

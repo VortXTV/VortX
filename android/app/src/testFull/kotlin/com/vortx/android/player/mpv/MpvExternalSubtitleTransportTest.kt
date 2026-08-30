@@ -31,6 +31,19 @@ class MpvExternalSubtitleTransportTest {
     }
 
     @Test
+    fun `offline subtitle paths stay local while remote private URLs remain rejected`() {
+        assertEquals("/storage/emulated/0/Downloads/sub.srt", MpvExternalSubtitleTransport.localFileFor(
+            "/storage/emulated/0/Downloads/sub.srt",
+        )?.path)
+        assertEquals("/storage/emulated/0/Downloads/sub.srt", MpvExternalSubtitleTransport.localFileFor(
+            "file:///storage/emulated/0/Downloads/sub.srt",
+        )?.path)
+        assertTrue(MpvExternalSubtitleTransport.isContentUri("content://documents/subtitle/42"))
+        assertEquals(null, MpvExternalSubtitleTransport.localFileFor("https://127.0.0.1/private.srt"))
+        assertEquals(null, MpvExternalSubtitleTransport.requestFor(ExternalSubtitle("https://127.0.0.1/private.srt")))
+    }
+
+    @Test
     fun `sidecar headers are isolated sanitized and cache identity does not expose credentials`() {
         val first = MpvExternalSubtitleTransport.sanitizeHeaders(
             linkedMapOf(
