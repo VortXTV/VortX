@@ -2,6 +2,7 @@ package com.vortx.android.engine
 
 import android.content.Context
 import android.util.Log
+import com.vortx.android.VortXApplication
 import com.vortx.android.auth.AuthIdentityStore
 import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
@@ -1920,7 +1921,7 @@ class EngineStremioRepository(
         // An explicit install is intent to HAVE the add-on: clear any removal tombstone so a re-install of a
         // previously removed add-on is honored, not re-suppressed on the next read (SRC-2, Apple
         // `CoreBridge.installAddon` -> `AddonTombstones.forget`).
-        addonTombstones.forget(normalized)
+        if (addonTombstones.forget(normalized)) requestAddonTombstoneSync()
     }
 
     override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {
@@ -1929,7 +1930,12 @@ class EngineStremioRepository(
         // gone across an engine reset (#137). PROTECTED stubs (Cinemeta, Local) are never tombstoned: a logout
         // resets the engine to exactly those, so a tombstone would wrongly suppress an essential default
         // forever (SRC-2, Apple `CoreBridge.uninstallAddon` -> `AddonTombstones.tombstone`).
-        if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)
+        if (!addon.isProtected && addonTombstones.tombstone(addon.transportUrl)) requestAddonTombstoneSync()
+    }
+
+    /** A successful local add-on remove/reinstall is account data, unlike a remote fold. */
+    private fun requestAddonTombstoneSync() {
+        (appContext as? VortXApplication)?.syncManager?.requestSyncSoon()
     }
 
     override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String): Result<Unit> = runCatching {

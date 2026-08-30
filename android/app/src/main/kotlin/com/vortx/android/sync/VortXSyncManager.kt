@@ -925,6 +925,10 @@ class VortXSyncManager(context: Context) {
     /** True whenever a session is present (a token + data key were adopted and persisted). */
     val isSignedIn: Boolean get() = session != null
 
+    init {
+        AddonTombstones.activateAccount(session?.account?.id)
+    }
+
     /**
      * A persistence-backed owner snapshot for account-scoped device credentials. `null account` is only
      * published as a definitive signed-out state after the encrypted session store was read successfully.
@@ -1346,6 +1350,7 @@ class VortXSyncManager(context: Context) {
             }
             cancelSessionWork()
             sessionState.clear {
+                AddonTombstones.activateAccount(null)
                 _account.value = null
                 _sessionUiState.value = SessionUiState.SignedOut
             }
@@ -1378,6 +1383,7 @@ class VortXSyncManager(context: Context) {
     ) {
         require(testSession.account.id.isNotBlank())
         sessionState.restore(testSession)
+        AddonTombstones.activateAccount(testSession.account.id)
         _account.value = testSession.account
         _sessionUiState.value = SessionUiState.SignedIn(testSession.account)
         syncState.setLastVersion(testSession.account.id, highWaterVersion)
@@ -2214,6 +2220,7 @@ class VortXSyncManager(context: Context) {
                 onCommitted = ::cancelSessionWork,
             ) {
                 sessionState.replace(s) {
+                    AddonTombstones.activateAccount(account.id)
                     _account.value = account
                     _sessionUiState.value = SessionUiState.SignedIn(account)
                 }

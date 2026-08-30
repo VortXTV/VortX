@@ -56,8 +56,14 @@ private class SharedPrefsTombstonePersistence(
 
 class AddonTombstones internal constructor(
     private val persistence: AddonTombstonePersistence,
-    private val nowMs: () -> Double = { System.currentTimeMillis().toDouble() },
+    private val nowMs: () -> Double,
+    private val accountScope: () -> String?,
 ) {
+    internal constructor(
+        persistence: AddonTombstonePersistence,
+        nowMs: () -> Double = { System.currentTimeMillis().toDouble() },
+    ) : this(persistence, nowMs, { activeAccountScope })
+
     constructor(context: Context) : this(
         SharedPrefsTombstonePersistence(
             context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE),
@@ -69,18 +75,21 @@ class AddonTombstones internal constructor(
         val addedAt: MutableMap<String, Double>,
     )
 
-    private val lock = Any()
+    private fun currentScope(): String? = accountScope()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
 
     /** The current durable removal set (normalized transportUrls that are EFFECTIVELY removed). */
-    fun all(): Set<String> = synchronized(lock) { effectiveRemoved(load()) }
+    fun all(): Set<String> = synchronized(PROCESS_LOCK) {
+        currentScope()?.let { effectiveRemoved(load(it)) } ?: emptySet()
+    }
 
     /**
      * The per-url timestamp map for the wire (`doc.vortx.deletedAddonsTs`). Carries BOTH stamps for every
      * tracked url, not just the effectively-removed ones, so a peer folding this learns a genuine reinstall's
      * `addedAt` and stops re-emitting a stale removal.
      */
-    fun timestampsForSync(): Map<String, Map<String, Double>> = synchronized(lock) {
-        val state = load()
+    fun timestampsForSync(): Map<String, Map<String, Double>> = synchronized(PROCESS_LOCK) {
+        val scope = currentScope() ?: return@synchronized emptyMap()
+        val state = load(scope)
         val urls = state.removedAt.keys + state.addedAt.keys
         val out = LinkedHashMap<String, Map<String, Double>>(urls.size)
         for (url in urls) {
@@ -96,13 +105,14 @@ class AddonTombstones internal constructor(
      * Record an add-on removal so it sticks across devices. Callers MUST guard PROTECTED before calling.
      * Returns true when the url becomes NEWLY effectively-removed.
      */
-    fun tombstone(transportUrl: String): Boolean = synchronized(lock) {
+    fun tombstone(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
+        val scope = currentScope() ?: return@synchronized false
         val key = normalize(transportUrl)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
-        val state = load()
+        val state = load(scope)
         val wasRemoved = isRemoved(key, state)
         state.removedAt[key] = maxOf(state.removedAt[key] ?: 0.0, nowMs())
-        save(state)
+        save(scope, state)
         !wasRemoved && isRemoved(key, state)
     }
 
@@ -110,13 +120,14 @@ class AddonTombstones internal constructor(
      * Forget a removal tombstone so an EXPLICIT fresh install of the same add-on is honored instead of being
      * suppressed forever by an old removal. Returns true when the url flips from removed to present.
      */
-    fun forget(transportUrl: String): Boolean = synchronized(lock) {
+    fun forget(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
+        val scope = currentScope() ?: return@synchronized false
         val key = normalize(transportUrl)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
-        val state = load()
+        val state = load(scope)
         val wasRemoved = isRemoved(key, state)
         state.addedAt[key] = maxOf(state.addedAt[key] ?: 0.0, nowMs())
-        save(state)
+        save(scope, state)
         wasRemoved && !isRemoved(key, state)
     }
 
@@ -133,8 +144,9 @@ class AddonTombstones internal constructor(
         legacyIds: List<String>,
         stamps: Map<String, Map<String, Double>>,
         webIds: List<String> = emptyList(),
-    ): Boolean = synchronized(lock) {
-        val state = load()
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        val scope = currentScope() ?: return@synchronized false
+        val state = load(scope)
         val before = effectiveRemoved(state)
         val futureThresholdMs = nowMs() + 48.0 * 60.0 * 60.0 * 1000.0
         var maxFutureSeen = 0.0
@@ -172,11 +184,11 @@ class AddonTombstones internal constructor(
             state.removedAt[url] = nowMs()
         }
 
-        save(state)
+        save(scope, state)
         if (maxFutureSeen > 0.0) {
             Log.d(TAG, "add-on tombstone fold saw a stamp ${maxFutureSeen.toLong()} beyond now+48h (peer clock skew)")
         }
-        effectiveRemoved(load()) != before
+        effectiveRemoved(load(scope)) != before
     }
 
     /**
@@ -184,9 +196,10 @@ class AddonTombstones internal constructor(
      * currently-installed add-ons, so a stale pre-tombstone peer array cannot re-uninstall an add-on the user
      * demonstrably has. Skips any url whose folded removedAt is a real, post-epoch removal.
      */
-    fun baselineInstalled(transportUrls: List<String>) = synchronized(lock) {
+    fun baselineInstalled(transportUrls: List<String>) = synchronized(PROCESS_LOCK) {
+        val scope = currentScope() ?: return@synchronized
         if (transportUrls.isEmpty()) return
-        val state = load()
+        val state = load(scope)
         val now = nowMs()
         for (raw in transportUrls) {
             val url = normalize(raw)
@@ -195,7 +208,7 @@ class AddonTombstones internal constructor(
             if (removed != null && removed > MIGRATION_EPOCH_MS) continue
             state.addedAt[url] = maxOf(state.addedAt[url] ?: 0.0, now)
         }
-        save(state)
+        save(scope, state)
     }
 
     // ---- State ----
@@ -211,29 +224,25 @@ class AddonTombstones internal constructor(
         return out
     }
 
-    private fun load(): State {
-        val removedAt = loadMap(REMOVED_AT_KEY)
-        val addedAt = loadMap(ADDED_AT_KEY)
+    private fun load(scope: String): State {
+        val removedAt = loadMap(scopedKey(REMOVED_AT_KEY, scope))
+        val addedAt = loadMap(scopedKey(ADDED_AT_KEY, scope))
         // Fold the legacy plain removal array at the migration epoch on EVERY load. The max-fold is monotone
         // and idempotent, so no once-flag is needed (a flag has three holes: a kill between setting it and
         // doing the work loses the set, a downgrade reads a frozen array, and a downgrade-then-upgrade skips
         // re-migration). Mirrors Apple `load`.
-        readArray(LEGACY_DELETED_KEY)?.take(MAX_ENTRIES)?.forEach { raw ->
-            val url = normalize(raw)
-            if (url.isNotEmpty() && url.length <= MAX_ID_LENGTH) {
-                removedAt[url] = maxOf(removedAt[url] ?: 0.0, MIGRATION_EPOCH_MS)
-            }
-        }
+        // Pre-scope values have no trustworthy owner. Deliberately quarantine them rather than assigning a
+        // prior account's removals to whichever account signs in next.
         return State(removedAt, addedAt)
     }
 
-    private fun save(state: State) {
+    private fun save(scope: String, state: State) {
         val bounded = capped(state)
-        persistence.write(REMOVED_AT_KEY, encodeMap(bounded.removedAt))
-        persistence.write(ADDED_AT_KEY, encodeMap(bounded.addedAt))
+        persistence.write(scopedKey(REMOVED_AT_KEY, scope), encodeMap(bounded.removedAt))
+        persistence.write(scopedKey(ADDED_AT_KEY, scope), encodeMap(bounded.addedAt))
         // Dual-write the effective removed set back to the legacy key so an older build still reads current
         // removals (it reads this array directly; load() re-folds it at the epoch on the next upgrade).
-        persistence.write(LEGACY_DELETED_KEY, JSONArray(effectiveRemoved(bounded).toList()).toString())
+        persistence.write(scopedKey(LEGACY_DELETED_KEY, scope), JSONArray(effectiveRemoved(bounded).toList()).toString())
     }
 
     /**
@@ -293,6 +302,16 @@ class AddonTombstones internal constructor(
 
         private const val MAX_ENTRIES = 10_000
         private const val MAX_ID_LENGTH = 2048
+        private val PROCESS_LOCK = Any()
+
+        @Volatile private var activeAccountScope: String? = null
+
+        /** Session ownership comes only from VortXSyncManager; signed-out callers see no persisted state. */
+        fun activateAccount(accountId: String?) {
+            activeAccountScope = accountId?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        }
+
+        private fun scopedKey(key: String, scope: String): String = "$key.account.$scope"
 
         /** Trim + lowercase, applied on both the write and the match side, matching Apple `normalize`. */
         fun normalize(url: String): String = url.trim().lowercase()

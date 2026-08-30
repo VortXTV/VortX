@@ -7,7 +7,11 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 private class MemoryAddonTombstonePersistence : AddonTombstonePersistence {
     private val values = HashMap<String, String>()
@@ -22,6 +26,58 @@ private class MemoryAddonTombstonePersistence : AddonTombstonePersistence {
 class AddonTombstoneSyncTest {
 
     private val url = "https://example.com/manifest.json"
+
+    @Before
+    fun activateTestAccount() {
+        AddonTombstones.activateAccount("test-account")
+    }
+
+    @Test
+    fun `tombstones are isolated by account and survive switching back`() {
+        var scope = "account-a"
+        var now = 100.0
+        val persistence = MemoryAddonTombstonePersistence()
+        val tombstones = AddonTombstones(persistence, { now }) { scope }
+        val aUrl = "https://a.example/manifest.json"
+        val bUrl = "https://b.example/manifest.json"
+
+        assertTrue(tombstones.tombstone(aUrl))
+        scope = "account-b"
+        assertFalse(aUrl in tombstones.all())
+        now = 200.0
+        assertTrue(tombstones.tombstone(bUrl))
+        assertTrue(bUrl in tombstones.all())
+        scope = "account-a"
+        assertTrue(aUrl in tombstones.all())
+        assertFalse(bUrl in tombstones.all())
+    }
+
+    @Test
+    fun `separate tombstone instances retain concurrent independent removals`() {
+        var scope = "account"
+        val persistence = MemoryAddonTombstonePersistence()
+        val first = AddonTombstones(persistence, { 100.0 }) { scope }
+        val second = AddonTombstones(persistence, { 200.0 }) { scope }
+        val start = CountDownLatch(1)
+        val done = CountDownLatch(2)
+
+        thread {
+            start.await(2, TimeUnit.SECONDS)
+            first.tombstone("https://first.example/manifest.json")
+            done.countDown()
+        }
+        thread {
+            start.await(2, TimeUnit.SECONDS)
+            second.tombstone("https://second.example/manifest.json")
+            done.countDown()
+        }
+        start.countDown()
+        assertTrue(done.await(2, TimeUnit.SECONDS))
+        assertEquals(
+            setOf("https://first.example/manifest.json", "https://second.example/manifest.json"),
+            first.all(),
+        )
+    }
 
     @Test
     fun `peer deletion suppresses seeded state and later explicit reinstall wins`() {
