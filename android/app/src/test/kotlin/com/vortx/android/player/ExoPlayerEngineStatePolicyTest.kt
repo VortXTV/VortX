@@ -94,10 +94,11 @@ class ExoPlayerEngineStatePolicyTest {
         val loadEnd = source.indexOf("override fun play()", startIndex = loadStart)
         val load = source.substring(loadStart, loadEnd)
 
-        assertTrue(load.contains("val http = DefaultHttpDataSource.Factory().apply"))
-        assertTrue(load.contains("setAllowCrossProtocolRedirects(true)"))
-        assertTrue(load.contains("DefaultDataSource.Factory(appContext, http)"))
-        assertTrue(load.contains("DefaultDataSource.Factory(appContext, trailerHttp)"))
+        assertTrue(source.contains("val http = DefaultHttpDataSource.Factory().apply"))
+        assertTrue(source.contains("setAllowCrossProtocolRedirects(true)"))
+        assertTrue(source.contains("return DefaultDataSource.Factory(appContext, http)"))
+        assertTrue(load.contains("val videoDataSource = media3DataSourceFactory"))
+        assertTrue(load.contains("SingleSampleMediaSource") || source.contains("SingleSampleMediaSource.Factory"))
         assertFalse(load.contains("else {\n            DefaultMediaSourceFactory(appContext)"))
     }
 

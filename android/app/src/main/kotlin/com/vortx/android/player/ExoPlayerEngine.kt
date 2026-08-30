@@ -27,8 +27,10 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.source.SingleSampleMediaSource
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
@@ -222,22 +224,21 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // External sidecars need a concrete Media3 MIME. Admit recognized path extensions and explicit
         // format metadata carried by extensionless URLs. Opaque extensionless URLs are rejected with a
         // reason instead of guessed as a parser type or synchronously fetched on the playback thread.
-        val subtitleTracks = if (playable.externalSubtitleTracks.isEmpty()) {
-            playable.externalSubtitles.map { com.vortx.android.model.ExternalSubtitle(it) }
-        } else {
-            playable.externalSubtitleTracks
-        }
-        val subtitleConfigs = subtitleTracks.mapNotNull { subtitle ->
+        val subtitleTracks = normalizedExternalSubtitles(playable)
+        val requestHeaderPlan = media3RequestHeaderPlan(playable, subtitleTracks)
+        val subtitleConfigs = subtitleTracks.mapIndexedNotNull { index, subtitle ->
             val subUrl = subtitle.url
             val decision = externalSubtitleMimeDecision(subUrl)
             val mime = decision.mimeType ?: run {
                 Log.w(TAG, "Skipping external subtitle: ${decision.rejectionReason}")
-                return@mapNotNull null
+                return@mapIndexedNotNull null
             }
             MediaItem.SubtitleConfiguration.Builder(Uri.parse(subUrl))
                 .setMimeType(mime)
+                .setLanguage(subtitle.language)
+                .setLabel(subtitle.name)
                 .setSelectionFlags(C.SELECTION_FLAG_DEFAULT)
-                .build()
+                .build() to requestHeaderPlan.subtitleHeaders(index)
         }
 
         // yt-direct ADAPTIVE trailer: the InnerTube answer is a video-only leg + a separate audio-only leg
@@ -254,14 +255,18 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             }
             val videoItem = MediaItem.Builder()
                 .setUri(playable.url)
-                .setSubtitleConfigurations(subtitleConfigs)
                 .build()
             val videoSource = DefaultMediaSourceFactory(appContext)
-                .setDataSourceFactory(DefaultDataSource.Factory(appContext, trailerHttp))
+                .setDataSourceFactory(media3DataSourceFactory(requestHeaderPlan.videoHeaders(), playable.userAgent))
                 .createMediaSource(videoItem)
             val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
                 .createMediaSource(MediaItem.fromUri(playable.audioUrl))
-            player.setMediaSource(MergingMediaSource(videoSource, audioSource))
+            player.setMediaSource(
+                mergeMediaSources(
+                    videoSource,
+                    listOf(audioSource) + createExternalSubtitleSources(subtitleConfigs),
+                ),
+            )
             player.playWhenReady = true
             admittedResumePosition(playable.startPositionMs)?.let(player::seekTo)
             player.prepare()
@@ -272,32 +277,54 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // DefaultHttpDataSource factory so both the manifest and media requests carry them. A muxed trailer /
         // worker-fallback trailer (single [url], [userAgent] possibly set) rides this path; fold its UA in.
         val trailerUa = playable.userAgent?.takeIf { it.isNotEmpty() }
-        val http = DefaultHttpDataSource.Factory().apply {
-            if (playable.headers.isNotEmpty()) setDefaultRequestProperties(playable.headers)
-            // A muxed googlevideo trailer (single proxied url) still needs the minting UA as the
-            // belt-and-suspenders fallback for the raw-URL path (UA/URL lockstep).
-            trailerUa?.let { setUserAgent(it) }
-            // Add-ons frequently redirect signed links across http/https CDN endpoints. This must apply
-            // even to ordinary empty-header streams, not only the header-gated branch above.
-            setAllowCrossProtocolRedirects(true)
-        }
+        val videoDataSource = media3DataSourceFactory(requestHeaderPlan.videoHeaders(), trailerUa)
         val mediaSourceFactory = DefaultMediaSourceFactory(appContext)
-            .setDataSourceFactory(DefaultDataSource.Factory(appContext, http))
+            .setDataSourceFactory(videoDataSource)
 
         val item = MediaItem.Builder()
             .setUri(playable.url)
-            .setSubtitleConfigurations(subtitleConfigs)
             .build()
 
-        // ExoPlayer has no runtime setMediaSourceFactory (that is a Builder-only API); the factory is
-        // applied per-load by creating the MediaSource here. DefaultMediaSourceFactory still handles the
-        // sidecar SubtitleConfigurations on the MediaItem (it merges them as side-loaded text tracks).
-        player.setMediaSource(mediaSourceFactory.createMediaSource(item))
+        // ExoPlayer has no runtime setMediaSourceFactory (that is a Builder-only API); create the video
+        // source and each credential-isolated sidecar explicitly, then merge them for this load.
+        player.setMediaSource(
+            mergeMediaSources(
+                mediaSourceFactory.createMediaSource(item),
+                createExternalSubtitleSources(subtitleConfigs),
+            ),
+        )
         player.playWhenReady = true
         // Both Exo load routes use the same resume-admission policy. A tail guard cannot run here because
         // Media3 does not know the duration until after prepare; it clamps a past-end seek once known.
         admittedResumePosition(playable.startPositionMs)?.let(player::seekTo)
         player.prepare()
+    }
+
+    /**
+     * Keep every sidecar on its own data-source factory. Provider subtitle credentials are independent
+     * from the video credentials and must never become defaults for the video or another subtitle.
+     */
+    private fun createExternalSubtitleSources(
+        subtitles: List<Pair<MediaItem.SubtitleConfiguration, Map<String, String>>>,
+    ): List<MediaSource> = subtitles.map { (configuration, headers) ->
+        SingleSampleMediaSource.Factory(media3DataSourceFactory(headers))
+            .createMediaSource(configuration, C.TIME_UNSET)
+    }
+
+    private fun mergeMediaSources(primary: MediaSource, additions: List<MediaSource>): MediaSource =
+        if (additions.isEmpty()) primary else MergingMediaSource(primary, *additions.toTypedArray())
+
+    /** DefaultDataSource keeps local file/content support while its HTTP leg handles redirecting CDNs. */
+    private fun media3DataSourceFactory(
+        headers: Map<String, String>,
+        userAgent: String? = null,
+    ): DefaultDataSource.Factory {
+        val http = DefaultHttpDataSource.Factory().apply {
+            if (headers.isNotEmpty()) setDefaultRequestProperties(headers)
+            userAgent?.takeIf(String::isNotEmpty)?.let(::setUserAgent)
+            setAllowCrossProtocolRedirects(true)
+        }
+        return DefaultDataSource.Factory(appContext, http)
     }
 
     override fun play() { player.play() }
@@ -588,6 +615,39 @@ internal fun ExoMuteState.withRequestedVolume(requestedVolume: Float): ExoMuteTr
 /** Resume admission shared by every Exo media-source route. */
 internal fun admittedResumePosition(startPositionMs: Long): Long? =
     startPositionMs.takeIf { it > EXO_RESUME_FLOOR_MS }
+
+/**
+ * Immutable, log-safe request-header routing for one Media3 load. This is deliberately not a data class:
+ * credentials must not participate in generated equality/hash keys or appear in generated `toString` text.
+ */
+internal class Media3RequestHeaderPlan(
+    videoHeaders: Map<String, String>,
+    subtitleHeaders: List<Map<String, String>>,
+) {
+    private val video = videoHeaders.toMap()
+    private val subtitles = subtitleHeaders.map { it.toMap() }
+
+    fun videoHeaders(): Map<String, String> = video.toMap()
+
+    fun subtitleHeaders(index: Int): Map<String, String> =
+        subtitles.getOrNull(index)?.toMap().orEmpty()
+
+    override fun toString(): String =
+        "Media3RequestHeaderPlan(videoHeaderCount=${video.size}, subtitleHeaderCounts=${subtitles.map { it.size }})"
+}
+
+internal fun media3RequestHeaderPlan(
+    playable: Playable,
+    subtitles: List<com.vortx.android.model.ExternalSubtitle>,
+): Media3RequestHeaderPlan = Media3RequestHeaderPlan(
+    videoHeaders = playable.headers,
+    subtitleHeaders = subtitles.map { it.headers },
+)
+
+internal fun normalizedExternalSubtitles(playable: Playable): List<com.vortx.android.model.ExternalSubtitle> =
+    playable.externalSubtitleTracks.ifEmpty {
+        playable.externalSubtitles.map { com.vortx.android.model.ExternalSubtitle(url = it) }
+    }
 
 internal data class ExternalSubtitleMimeDecision(
     val mimeType: String? = null,

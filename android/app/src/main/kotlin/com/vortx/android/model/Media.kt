@@ -501,12 +501,21 @@ data class StreamSource(
     }
 }
 
-data class ExternalSubtitle(
+class ExternalSubtitle(
     val url: String,
     val headers: Map<String, String> = emptyMap(),
     val language: String? = null,
     val name: String? = null,
-)
+) {
+    // Credentials are transport metadata, not subtitle identity, and must never enter diagnostics.
+    override fun equals(other: Any?): Boolean = other is ExternalSubtitle &&
+        url == other.url && language == other.language && name == other.name
+
+    override fun hashCode(): Int = 31 * (31 * url.hashCode() + language.hashCode()) + name.hashCode()
+
+    override fun toString(): String =
+        "ExternalSubtitle(url=$url, language=$language, name=$name, headerCount=${headers.size})"
+}
 
 /// Sources grouped by the add-on that returned them, mirroring `CoreStreamSourceGroup`. The detail
 /// page renders one labeled block per group, best source first.
