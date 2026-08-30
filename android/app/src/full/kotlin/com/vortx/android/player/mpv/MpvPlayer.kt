@@ -12,7 +12,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
 import com.vortx.android.model.ExternalSubtitle
 import com.vortx.android.communityjs.CommunityJsUrlPolicy
-import com.vortx.android.engine.PublicAddressPolicy
+import com.vortx.android.engine.DeadlinePublicDns
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
@@ -39,6 +39,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -50,13 +51,20 @@ import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
+import java.net.Proxy
 import java.net.URI
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.TimeUnit
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 
 /// The libmpv [PlayerEngine] (PRIMARY player, `full` flavor only). Owns one [MPVLib] for its lifetime,
 /// renders into an Android [SurfaceView] (the Android analogue of Apple's Metal `wid` layer), applies
@@ -548,30 +556,32 @@ class MpvPlayer private constructor(
         var temp: File? = null
         return try {
             var current = request
+            val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(EXTERNAL_SUBTITLE_TIMEOUT_MS.toLong())
             repeat(MpvExternalSubtitleTransport.MAX_REDIRECTS + 1) { hop ->
-                var connection: HttpURLConnection? = null
-                try {
-                    connection = (URL(current.uri.toString()).openConnection() as HttpURLConnection).apply {
-                        requestMethod = "GET"
-                        connectTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
-                        readTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
-                        instanceFollowRedirects = false
-                        useCaches = false
-                        current.headers.forEach { (name, value) -> setRequestProperty(name, value) }
-                    }
-                    val code = connection.responseCode
+                currentCoroutineContext().ensureActive()
+                val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(1L)
+                val client = MpvExternalSubtitleTransport.protectedClient(remainingMs)
+                val httpUrl = current.uri.toString().toHttpUrlOrNull() ?: return null
+                val response = client.awaitResponse(
+                    Request.Builder().url(httpUrl).get().apply {
+                        current.headers.forEach { (name, value) -> header(name, value) }
+                    }.build(),
+                    remainingMs,
+                )
+                response.use { currentResponse ->
+                    val code = currentResponse.code
                     if (code in 300..399) {
                         val redirect = MpvExternalSubtitleTransport.redirectFor(
                             current = current,
-                            location = connection.getHeaderField("Location"),
+                            location = currentResponse.header("Location"),
                             hop = hop,
                         ) ?: return null
                         current = redirect
                         return@repeat
                     }
-                    if (code !in 200..299 || connection.contentLengthLong > MAX_EXTERNAL_SUBTITLE_BYTES) return null
+                    if (code !in 200..299 || currentResponse.body?.contentLength()?.let { it > MAX_EXTERNAL_SUBTITLE_BYTES } == true) return null
                     temp = File.createTempFile("vortx-extsub-", ".$extension", appContext.cacheDir)
-                    val complete = connection.inputStream.use { input ->
+                    val complete = currentResponse.body?.byteStream()?.use { input ->
                         temp!!.outputStream().use outputUse@{ output ->
                             val buffer = ByteArray(16 * 1024)
                             var total = 0L
@@ -585,7 +595,7 @@ class MpvPlayer private constructor(
                             }
                             total > 0
                         }
-                    }
+                    } ?: false
                     if (!complete) return null
                     if (temp!!.renameTo(target)) {
                         temp = null
@@ -593,8 +603,6 @@ class MpvPlayer private constructor(
                     }
                     if (target.isFile && target.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES) return target
                     return null
-                } finally {
-                    connection?.disconnect()
                 }
             }
             null
@@ -1195,6 +1203,18 @@ internal object MpvExternalSubtitleTransport {
     fun normalizedTracks(playable: Playable): List<ExternalSubtitle> =
         normalizedExternalSubtitles(playable).distinct()
 
+    /** The public DNS result supplied to OkHttp is also the only address it may connect to. */
+    fun protectedClient(timeoutMs: Long, dns: Dns = DeadlinePublicDns(timeoutMs)): OkHttpClient =
+        OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
+            .dns(dns)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+
     fun requestFor(subtitle: ExternalSubtitle): Request? {
         val uri = runCatching { URI(subtitle.url) }.getOrNull() ?: return null
         if (!CommunityJsUrlPolicy.isPublicHttpsUrl(subtitle.url) || uri.host.isNullOrBlank()) return null
@@ -1271,6 +1291,33 @@ internal object MpvExternalSubtitleTransport {
 
     private fun isControl(character: Char): Boolean = character.code < 32 || character.code == 127
 }
+
+private suspend fun OkHttpClient.awaitResponse(request: Request, timeoutMs: Long): Response =
+    suspendCancellableCoroutine { continuation ->
+        val call = newCall(request)
+        call.timeout().timeout(timeoutMs, TimeUnit.MILLISECONDS)
+        val completed = AtomicBoolean(false)
+        fun complete(result: Result<Response>) {
+            if (completed.compareAndSet(false, true)) continuation.resumeWith(result)
+        }
+        continuation.invokeOnCancellation {
+            completed.set(true)
+            call.cancel()
+        }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                complete(Result.failure(e))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                if (completed.compareAndSet(false, true)) {
+                    continuation.resumeWith(Result.success(response))
+                } else {
+                    response.close()
+                }
+            }
+        })
+    }
 
 internal fun requireMpvSecurityOption(name: String, result: Int) {
     check(result >= 0) {
