@@ -237,6 +237,22 @@ enum VortXCacheShedPolicy {
     /// only truthful and safe cache budgets.
     static let diskCachePayloadOffloadConfirmed = false
 
+    /// Settings may retain a viewer's disk-cache choice for a future verified MPVKit build, but must not
+    /// render that dormant choice as an active cache size while payloads still remain in RAM.
+    static var diskCacheSizeSelectionAvailable: Bool {
+        diskCachePayloadOffloadConfirmed
+    }
+
+    /// A nil selection deliberately represents the unavailable state, rather than silently substituting
+    /// "Off" and overwriting a saved preference that can become valid after capability confirmation.
+    static func presentedDiskCacheSizeSelection(storedBytes: Int64) -> Int64? {
+        diskCacheSizeSelectionAvailable ? storedBytes : nil
+    }
+
+    static let unavailableDiskCacheState = "Automatic RAM-bounded buffer"
+    static let unavailableDiskCacheAccessibilityHint =
+        "Disk cache sizes are unavailable until this MPVKit build confirms payload offload. Playback uses an automatic RAM-bounded buffer. Your saved cache size is preserved for a future supported build."
+
     /// Whether setup may arm mpv's disk-cache options. Muted preview players never participate even after a
     /// future capability confirmation.
     static func shouldArmDiskCache(payloadOffloadRequested: Bool, muted: Bool) -> Bool {

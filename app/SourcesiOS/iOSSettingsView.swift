@@ -683,8 +683,21 @@ struct iOSSettingsView: View {
             Picker("Video upscaling", selection: $videoUpscaling) {
                 ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
-            Picker("Streaming cache", selection: $diskCacheBytes) {
-                ForEach(DiskCacheSetting.pickerOptions, id: \.id) { Text($0.label).tag(Int($0.id)) }
+            if VortXCacheShedPolicy.diskCacheSizeSelectionAvailable {
+                Picker("Streaming cache", selection: $diskCacheBytes) {
+                    ForEach(DiskCacheSetting.pickerOptions, id: \.id) { Text($0.label).tag(Int($0.id)) }
+                }
+            } else {
+                HStack {
+                    Text("Streaming cache")
+                    Spacer()
+                    Label(VortXCacheShedPolicy.unavailableDiskCacheState, systemImage: "lock.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(String(localized: "Streaming cache unavailable"))
+                .accessibilityValue(String(localized: VortXCacheShedPolicy.unavailableDiskCacheState))
+                .accessibilityHint(String(localized: VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint))
             }
             #if os(iOS) || os(macOS)
             Picker("Player engine", selection: $playerEngine) {
@@ -928,9 +941,12 @@ struct iOSSettingsView: View {
 
     private var effectiveDirectLinksOnly: Bool { PlaybackSettings.directLinksOnly }
 
-    /// Explains the streaming cache and, when on, shows the live on-disk usage. Unlimited is always
-    /// capped at half of free disk and cleared when a title finishes, so it can never fill the device.
+    /// Describes only the capability that is active on this MPVKit build. A stored disk-size preference is
+    /// intentionally preserved but not shown as active until payload offload has been confirmed.
     private var diskCacheFooter: String {
+        guard VortXCacheShedPolicy.diskCacheSizeSelectionAvailable else {
+            return String(localized: VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint)
+        }
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free space and the cache clears when a title finishes, so it never fills your device.")
         guard diskCacheBytes != 0 else { return base }
         // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the

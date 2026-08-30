@@ -527,10 +527,23 @@ struct SettingsView: View {
             choiceRow(String(localized: "Video upscaling"), VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
             Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow(String(localized: "Streaming cache"),
-                      DiskCacheSetting.pickerOptions.map { (String($0.id), $0.label) },
-                      selection: Binding(get: { String(diskCacheBytes) },
-                                         set: { diskCacheBytes = Int($0) ?? Int(DiskCacheSetting.defaultBytes) }))
+            if VortXCacheShedPolicy.diskCacheSizeSelectionAvailable {
+                choiceRow(String(localized: "Streaming cache"),
+                          DiskCacheSetting.pickerOptions.map { (String($0.id), $0.label) },
+                          selection: Binding(get: { String(diskCacheBytes) },
+                                             set: { diskCacheBytes = Int($0) ?? Int(DiskCacheSetting.defaultBytes) }))
+            } else {
+                HStack {
+                    Text("Streaming cache")
+                    Spacer()
+                    Label(VortXCacheShedPolicy.unavailableDiskCacheState, systemImage: "lock.fill")
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(String(localized: "Streaming cache unavailable"))
+                .accessibilityValue(String(localized: VortXCacheShedPolicy.unavailableDiskCacheState))
+                .accessibilityHint(String(localized: VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint))
+            }
             Text(diskCacheFooter)
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
@@ -714,10 +727,12 @@ struct SettingsView: View {
         externalPlayerChoices = [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
     }
 
-    /// Explains the streaming cache and shows live on-disk usage when on. On the Apple TV HD the cache
-    /// is additionally capped tight; Unlimited is always bounded to half of free storage and cleared
-    /// when a title finishes, so it never fills the device.
+    /// Describes only the capability that is active on this MPVKit build. A stored disk-size preference is
+    /// intentionally preserved but not shown as active until payload offload has been confirmed.
     private var diskCacheFooter: String {
+        guard VortXCacheShedPolicy.diskCacheSizeSelectionAvailable else {
+            return String(localized: VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint)
+        }
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free storage and the cache clears when a title finishes, so it never fills your Apple TV.")
         guard diskCacheBytes != 0 else { return base }
         // currentUsageBytes sums the on-disk mpv-cache dir, which stays EMPTY on this MPVKit build (the

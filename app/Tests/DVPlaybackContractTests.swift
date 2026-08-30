@@ -32,8 +32,14 @@ enum DiagnosticsLog {
     if condition { print("PASS  \(name)") } else { failures += 1; print("FAIL  \(name)") }
 }
 
-private func sourceSlice(_ source: String, from start: String, to end: String) -> String? {
-    guard let lower = source.range(of: start),
+private func sourceSlice(
+    _ source: String,
+    from start: String,
+    to end: String,
+    after anchor: String? = nil
+) -> String? {
+    let searchStart = anchor.flatMap { source.range(of: $0)?.lowerBound } ?? source.startIndex
+    guard let lower = source.range(of: start, range: searchStart..<source.endIndex),
           let upper = source.range(of: end, range: lower.upperBound..<source.endIndex) else {
         return nil
     }
@@ -80,6 +86,8 @@ private struct StartupWiringRule {
     let start: String
     let end: String
     let exactSection: String
+    let mutationAnchor: String?
+    let mutationScopeEnd: String?
     let mutationTarget: String
     let mutationReplacement: String
     let allowsExecutablePrefix: Bool
@@ -92,6 +100,8 @@ private struct StartupWiringRule {
         start: String,
         end: String,
         exactSection: String,
+        mutationAnchor: String? = nil,
+        mutationScopeEnd: String? = nil,
         mutationTarget: String,
         mutationReplacement: String,
         allowsExecutablePrefix: Bool = false,
@@ -103,6 +113,8 @@ private struct StartupWiringRule {
         self.start = start
         self.end = end
         self.exactSection = exactSection
+        self.mutationAnchor = mutationAnchor
+        self.mutationScopeEnd = mutationScopeEnd
         self.mutationTarget = mutationTarget
         self.mutationReplacement = mutationReplacement
         self.allowsExecutablePrefix = allowsExecutablePrefix
@@ -112,7 +124,15 @@ private struct StartupWiringRule {
 
     func passes(engine: String, server: String) -> Bool {
         let source = usesServer ? server : engine
-        return sourceSlice(source, from: start, to: end).map {
+        if let mutationAnchor, let mutationScopeEnd,
+           let governedSlice = sourceSlice(
+               source,
+               from: mutationAnchor,
+               to: mutationScopeEnd
+           ), !governedSlice.contains(start) {
+            return false
+        }
+        return sourceSlice(source, from: start, to: end, after: mutationAnchor).map {
             let compactActual = compactSwift($0)
             let compactExpected = compactSwift(exactSection)
             return allowsExecutablePrefix
@@ -189,9 +209,11 @@ private struct StartupWiringRule {
             exactSection: """
             freshItem.preferredForwardBufferDuration =
                 VortXRemuxForwardBufferPolicy.preferredDuration(
-                    mount: forwardBufferMount,
-                    hasProducedFirstFrame: false)
+                mount: forwardBufferMount,
+                hasProducedFirstFrame: false)
             """,
+            mutationAnchor: "private func retryFreshHDRItemOnHealthyMount(\n        error:",
+            mutationScopeEnd: "/// AVPlayer can report item-end at the current edge of a still-growing HLS playlist.",
             mutationTarget: "freshItem.preferredForwardBufferDuration =",
             mutationReplacement: "_ ="),
         StartupWiringRule(
@@ -327,7 +349,7 @@ private struct StartupWiringRule {
         let source = rule.usesServer ? server : engine
         let mutated = replacingFirst(
             source,
-            after: rule.start,
+            after: rule.mutationAnchor ?? rule.start,
             target: rule.mutationTarget,
             with: rule.mutationReplacement)
         let caught = mutated.map {

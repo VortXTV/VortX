@@ -294,6 +294,14 @@ check("iOS and macOS baseline selection is unchanged when disk cache is off",
 
 check("disk cache: pinned MPVKit payload offload remains explicitly unconfirmed",
       P.diskCachePayloadOffloadConfirmed == false)
+check("disk cache settings: unconfirmed offload exposes an honest automatic RAM-bounded state",
+      !P.diskCacheSizeSelectionAvailable
+        && P.unavailableDiskCacheState == "Automatic RAM-bounded buffer"
+        && P.unavailableDiskCacheAccessibilityHint.contains("unavailable")
+        && P.unavailableDiskCacheAccessibilityHint.contains("RAM-bounded"))
+check("disk cache settings: dormant nonzero and unlimited preferences cannot appear selected",
+      P.presentedDiskCacheSizeSelection(storedBytes: 2 << 30) == nil
+        && P.presentedDiskCacheSizeSelection(storedBytes: -1) == nil)
 check("disk cache: a nonzero user preference cannot arm unsupported payload offload",
       P.shouldArmDiskCache(payloadOffloadRequested: true, muted: false) == false)
 check("disk cache: the muted preview remains unarmed",
