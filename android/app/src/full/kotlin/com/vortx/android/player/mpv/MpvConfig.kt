@@ -69,6 +69,11 @@ object MpvConfig {
     /// frames through CPU memory and lose the passthrough, so use plain `mediacodec`.
     const val HWDEC = "mediacodec"
 
+    /// Conservative AO list used only after mpv proves that no output opened for a file with audio.
+    /// AudioTrack is Android's primary mpv output, OpenSL ES is the compatibility fallback, and the
+    /// trailing comma keeps mpv's normal auto-probe fallback available if neither can initialize.
+    const val SAFE_AUDIO_OUTPUTS = "audiotrack,opensles,"
+
     /// HDR -> SDR tone curve, used only when DV/HDR is force-mapped to SDR. IDENTICAL to Apple.
     const val TONE_MAPPING = "bt.2446a"
 

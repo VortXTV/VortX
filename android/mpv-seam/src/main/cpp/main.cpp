@@ -1,5 +1,6 @@
 // Forked from jarnedemeulemeester/libmpv-android v1.0.0 (MIT), file libmpv/src/main/cpp/main.cpp.
-// Renamed to the VortX seam JNI symbol prefix; no behavioral change vs upstream.
+// Renamed to the VortX seam JNI symbol prefix. VortX additionally cleans partial creation and keeps
+// final surface ownership inside native destruction so Java teardown cannot race a freed instance.
 #include <jni.h>
 #include <cstdlib>
 #include <cstdio>
@@ -51,12 +52,27 @@ jni_func(jlong, nativeCreate, jobject thiz, jobject appctx) {
     auto instance = new MPVInstance();
     instance->event_thread_id = 0;
     instance->event_thread_request_exit = false;
+    instance->mpv = nullptr;
+    instance->vm = nullptr;
+    instance->surface = nullptr;
     instance->javaObject = env->NewGlobalRef(thiz);
     instance->appCtx = env->NewGlobalRef(appctx);
+    if (!instance->javaObject || !instance->appCtx) {
+        if (instance->appCtx)
+            env->DeleteGlobalRef(instance->appCtx);
+        if (instance->javaObject)
+            env->DeleteGlobalRef(instance->javaObject);
+        delete instance;
+        return 0;
+    }
     prepare_environment(env, instance);
 
     instance->mpv = mpv_create();
     if (!instance->mpv) {
+        if (instance->appCtx)
+            env->DeleteGlobalRef(instance->appCtx);
+        if (instance->javaObject)
+            env->DeleteGlobalRef(instance->javaObject);
         delete instance;
         return 0;
     }
@@ -101,6 +117,7 @@ jni_func(void, nativeDestroy, jlong instance) {
     }
 
     mpv_terminate_destroy(mpv_instance->mpv);
+    mpv_instance->mpv = nullptr;
     if (mpv_instance->surface) {
         env->DeleteGlobalRef(mpv_instance->surface);
         mpv_instance->surface = nullptr;

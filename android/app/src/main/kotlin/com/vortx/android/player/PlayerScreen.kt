@@ -1135,11 +1135,12 @@ fun PlayerScreen(
         currentOnEnded()
     }
 
-    // Fail-soft watchdog: if the mpv engine flagged a surface-attach failure, rebuild on ExoPlayer. Only
-    // the mpv engine exposes this signal; the check is a safe no-op for ExoPlayer.
+    // Fail-soft watchdog: SurfaceView creates its native surface after this composition commits, so a
+    // one-shot read here races ahead of surfaceCreated and misses a real asynchronous attach failure.
+    // Poll only across the bounded initial-attach window; the full-only mpv engine exposes the signal,
+    // while ExoPlayer/play-flavor engines remain a safe always-false no-op.
     LaunchedEffect(engine) {
-        val failedFlag = mpvSurfaceFailed(engine)
-        if (failedFlag) forceExoPlayer = true
+        if (awaitMpvSurfaceFailure { mpvSurfaceFailed(engine) }) forceExoPlayer = true
     }
 
     // Periodic progress writeback while playing, so Continue Watching updates live. The engine's state
@@ -1898,6 +1899,28 @@ private fun mpvSurfaceFailed(engine: PlayerEngine): Boolean {
         (prop?.invoke(engine) as? Boolean) ?: false
     }.getOrDefault(false)
 }
+
+/**
+ * Watch the bounded interval in which Compose commits [PlayerEngine.VideoSurface] and Android delivers
+ * `SurfaceHolder.surfaceCreated`. The first check stays immediate; later checks cover asynchronous native
+ * attach without leaving a permanent reflection poll in every playback session.
+ */
+internal suspend fun awaitMpvSurfaceFailure(
+    maxChecks: Int = MPV_SURFACE_FAILURE_MAX_CHECKS,
+    pollIntervalMs: Long = MPV_SURFACE_FAILURE_POLL_MS,
+    readFailed: () -> Boolean,
+): Boolean {
+    require(maxChecks > 0) { "maxChecks must be positive" }
+    require(pollIntervalMs >= 0L) { "pollIntervalMs must not be negative" }
+    repeat(maxChecks) { checkIndex ->
+        if (readFailed()) return true
+        if (checkIndex + 1 < maxChecks) delay(pollIntervalMs)
+    }
+    return false
+}
+
+private const val MPV_SURFACE_FAILURE_POLL_MS = 100L
+private const val MPV_SURFACE_FAILURE_MAX_CHECKS = 101
 
 /// The source video height tagged onto an uploaded community sheet (the Worker's `src_height` metadata,
 /// which lets it prefer a set built from a better source). Derived from the engine-agnostic

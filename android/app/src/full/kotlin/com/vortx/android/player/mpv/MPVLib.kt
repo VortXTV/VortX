@@ -38,7 +38,8 @@ import com.vortx.android.player.mpv.seam.MpvSeam
 ///   3. [init] to `mpv_initialize` the handle.
 ///   4. [attachSurface] once the Android `Surface` is ready (the Android analogue of Apple's `wid`).
 ///   5. [command] `["loadfile", url, "replace"]` to play; [observeProperty] / [addObserver] for events.
-///   6. [detachSurface] then [destroy] on teardown.
+///   6. [destroy] on teardown. It owns final cleanup of any still-attached surface; a later holder
+///      detach is an idempotent no-op.
 class MPVLib private constructor(private val delegate: MpvSeam) {
 
     private val observers = mutableListOf<EventObserver>()
@@ -138,6 +139,7 @@ class MPVLib private constructor(private val delegate: MpvSeam) {
         const val FILE_LOADED = MpvSeam.MpvEvent.MPV_EVENT_FILE_LOADED
         const val PLAYBACK_RESTART = MpvSeam.MpvEvent.MPV_EVENT_PLAYBACK_RESTART
         const val VIDEO_RECONFIG = MpvSeam.MpvEvent.MPV_EVENT_VIDEO_RECONFIG
+        const val AUDIO_RECONFIG = MpvSeam.MpvEvent.MPV_EVENT_AUDIO_RECONFIG
         const val SHUTDOWN = MpvSeam.MpvEvent.MPV_EVENT_SHUTDOWN
     }
 

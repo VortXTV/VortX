@@ -1,8 +1,10 @@
 package com.vortx.android.player.audio
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.Build
 
 /**
  * The live audio OUTPUT route, classified into a [kind] plus the two facts the channel-layout policy
@@ -62,41 +64,61 @@ data class AudioRoute(
         val STEREO_DEFAULT = AudioRoute(AudioRouteKind.SPEAKER, 2)
 
         /**
-         * Media routing precedence used to pick the ACTIVE route when several output devices are connected:
-         * a wired / USB / Bluetooth endpoint overrides the built-in speaker, and a TV's HDMI overrides its
-         * panel. Earlier in the list wins. This reproduces Android's own "transient device beats speaker"
-         * ordering closely enough for the stereo-vs-multichannel decision; the exact tie-breaking only
-         * matters in physically unusual multi-endpoint setups.
-         */
-        private val PRECEDENCE = listOf(
-            AudioRouteKind.WIRED,
-            AudioRouteKind.BLUETOOTH,
-            AudioRouteKind.USB,
-            AudioRouteKind.HDMI,
-            AudioRouteKind.CAST,
-            AudioRouteKind.SPEAKER,
-            AudioRouteKind.UNKNOWN,
-        )
-
-        /**
-         * Inspect the current audio output route via [AudioManager]. Fail-soft: returns [STEREO_DEFAULT] on
-         * any read failure or when no output device can be classified, so a route that cannot be read can
-         * never push playback onto a multichannel/bitstream config it might not survive.
+         * Inspect the current media route via [AudioManager]. Android 13+ exposes the route anticipated for
+         * media [AudioAttributes], which distinguishes the active Shield HDMI sink from merely connected
+         * Bluetooth or wired devices. Older Android only exposes the connected-device inventory. That
+         * fallback promotes an external route only when its kind is unambiguous; multiple external kinds
+         * fail closed to stereo rather than arming multichannel or bitstream against the wrong sink.
          */
         fun current(context: Context): AudioRoute {
             val manager = context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
                 ?: return STEREO_DEFAULT
-            val devices = runCatching { manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS) }.getOrNull()
-            if (devices.isNullOrEmpty()) return STEREO_DEFAULT
-            val classified = devices.mapNotNull { device ->
-                val kind = kindFor(device.type) ?: return@mapNotNull null
-                kind to maxChannelsOf(device, kind)
+
+            val routed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                runCatching {
+                    val mediaAttributes = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
+                    manager.getAudioDevicesForAttributes(mediaAttributes)
+                }
+                    .getOrNull()
+                    .orEmpty()
+                    .mapNotNull(::classify)
+            } else {
+                emptyList()
             }
-            if (classified.isEmpty()) return STEREO_DEFAULT
-            val active = classified.minByOrNull { (kind, _) ->
-                PRECEDENCE.indexOf(kind).let { index -> if (index < 0) Int.MAX_VALUE else index }
-            } ?: return STEREO_DEFAULT
-            return AudioRoute(active.first, active.second.coerceAtLeast(2))
+            val connected = if (routed.isEmpty()) {
+                runCatching { manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS) }
+                    .getOrNull()
+                    .orEmpty()
+                    .mapNotNull(::classify)
+            } else {
+                emptyList()
+            }
+            return selectRoute(routed, connected)
+        }
+
+        /** Pure route-selection seam for policy tests. [routed] is already ordered by Android preference. */
+        internal fun selectRoute(
+            routed: List<AudioRoute>,
+            connected: List<AudioRoute>,
+        ): AudioRoute {
+            routed.firstOrNull()?.let { return it.copy(maxChannels = it.maxChannels.coerceAtLeast(2)) }
+
+            val external = connected.filter { route ->
+                route.kind != AudioRouteKind.SPEAKER && route.kind != AudioRouteKind.UNKNOWN
+            }
+            val externalKinds = external.map(AudioRoute::kind).distinct()
+            if (externalKinds.size != 1) return STEREO_DEFAULT
+
+            val selected = external.maxByOrNull(AudioRoute::maxChannels) ?: return STEREO_DEFAULT
+            return selected.copy(maxChannels = selected.maxChannels.coerceAtLeast(2))
+        }
+
+        private fun classify(device: AudioDeviceInfo): AudioRoute? {
+            val kind = kindFor(device.type) ?: return null
+            return AudioRoute(kind, maxChannelsOf(device, kind).coerceAtLeast(2))
         }
 
         /** Map an [AudioDeviceInfo] type to a route kind, or null for a non-media output (telephony, FM, ...). */

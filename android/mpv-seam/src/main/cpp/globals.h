@@ -1,6 +1,6 @@
 // Forked from jarnedemeulemeester/libmpv-android v1.0.0 (MIT), file libmpv/src/main/cpp/globals.h,
 // then renamed to the VortX seam class (see README.md in this directory for provenance and the
-// single behavioral patch this fork carries). Upstream MIT license text ships as LICENSE one level up.
+// complete event/lifecycle delta inventory). Upstream MIT license text ships as LICENSE one level up.
 #pragma once
 
 #include <atomic>

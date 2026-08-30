@@ -1,10 +1,9 @@
 # :mpv-seam -- the VortX source-built libmpv JNI seam
 
-This module exists for exactly ONE reason: the published `dev.jdtech.mpv:libmpv:1.0.0` AAR's JNI
-glue (`libplayer.so`) drops `mpv_event_end_file`'s payload, so Android could never learn WHY an mpv
-file ended (natural EOF vs error vs user stop vs quit vs redirect). VortX audit finding AND-PLY-01
-(Wave 1, `docs/audits/2026-08-26/REMEDIATION_PLAN.md` W1-B) requires that payload: watched /
-auto-advance may key only off a REAL end-file reason, never a heuristic.
+This module replaces the published `dev.jdtech.mpv:libmpv:1.0.0` AAR's JNI glue (`libplayer.so`).
+The original reason was its loss of `mpv_event_end_file` payloads, which prevented Android from
+distinguishing natural EOF from error, stop, quit, or redirect. The source seam now also owns the
+native handle and Surface lifetime hardening needed for safe rapid Back and SurfaceHolder churn.
 
 ## What is forked, from where, under which license
 
@@ -18,11 +17,9 @@ verbatim license text is in [`LICENSE`](LICENSE).
 
 ## The complete upstream delta inventory
 
-Every difference between upstream tag v1.0.0 and this module, verified by mechanical diff and
-categorized by kind. Exactly ONE item is behavioral; everything else is a rename, a forward-ported
-upstream fix, an API-surface adaptation, or build configuration.
+Every intentional difference between upstream tag v1.0.0 and this module is categorized below.
 
-**Behavioral (the sole one -- the W1-B patch):**
+**Event protocol (the W1-B patch):**
 
 1. **END_FILE payload seam.** `event.cpp`: an explicit `MPV_EVENT_END_FILE` case reads
    `struct mpv_event_end_file` and calls the new `MpvSeam.eventEndFile(reason, error)` dispatcher
@@ -33,28 +30,31 @@ upstream fix, an API-surface adaptation, or build configuration.
    can keep binding its replacement-suppression window to START_FILE. Kotlin side: the matching
    dispatcher + `EventObserver.eventEndFile(reason, error)` interface method were added.
 
-**Lifecycle fix forward-ported from upstream (post-v1.0.0):**
+**Lifecycle and malformed-payload hardening:**
 
-2. **Idempotent destroy guard.** Upstream v1.0.0's `destroy()` is `checkCreated(); nativeDestroy(...);
-   nativeInstance = 0`; this fork carries upstream commit `bf5e0d8` ("fix: make destroy idempotent",
-   landed after the tag) instead: `if (nativeInstance != 0L) { nativeDestroy(...); nativeInstance =
-   0L }`. Adopted deliberately so double-teardown cannot reach native twice; VortX's app-side wrapper
-   also single-calls destroy, so behavior is identical either way today.
+2. **Linearized native handle destruction.** `MpvNativeHandleGate` leases the pointer to every JNI
+   call, rejects new leases after destruction starts, waits for existing calls, and destroys exactly
+   once. This closes the check-then-free race in the upstream non-zero-pointer guard.
+3. **Single-owner Surface lifetime.** Kotlin serializes attach, detach, and destroy. Native attach
+   replaces a GlobalRef without leaking the old one, detach is idempotent, and final destroy owns any
+   residual ref. A late SurfaceHolder callback therefore cannot double-delete or use a freed instance.
+4. **Partial-create and payload guards.** Native creation releases GlobalRefs on failure. Property,
+   log, and end-file dispatch drop null/malformed payloads instead of dereferencing them.
 
 **API-surface adaptation (Kotlin constants/interfaces only; no dispatch behavior):**
 
-3. `object MpvLogLevel` (the eight `MPV_LOG_LEVEL_*` constants) from upstream is NOT carried: VortX
+5. `object MpvLogLevel` (the eight `MPV_LOG_LEVEL_*` constants) from upstream is NOT carried: VortX
    registers no log observers, and the native side still requests/dispatches log messages exactly as
    upstream does.
-4. `object MpvEndFileReason` added (EOF=0, STOP=2, QUIT=3, ERROR=4, REDIRECT=5 from the vendored
+6. `object MpvEndFileReason` added (EOF=0, STOP=2, QUIT=3, ERROR=4, REDIRECT=5 from the vendored
    client.h) documenting the values `eventEndFile` delivers.
-5. Library load list changed from `System.loadLibrary("mpv"); System.loadLibrary("player")` to
+7. Library load list changed from `System.loadLibrary("mpv"); System.loadLibrary("player")` to
    `"mpv"` then `"vortx_mpv_seam"`: the AAR still supplies libmpv.so, but the glue itself is this
    module's source-built library, not the AAR's libplayer.so.
 
 **Mechanical renames (no semantic change):**
 
-6. Package/class `dev.jdtech.mpv.MPVLib` -> `com.vortx.android.player.mpv.seam.MpvSeam`; JNI symbols
+8. Package/class `dev.jdtech.mpv.MPVLib` -> `com.vortx.android.player.mpv.seam.MpvSeam`; JNI symbols
    `Java_dev_jdtech_mpv_MPVLib_*` -> `Java_com_vortx_android_player_mpv_seam_MpvSeam_*`; cached
    method-id globals renamed with a `seam_` prefix; FindClass string updated to match; logcat tag
    `mpv` -> `VortxMpvSeam`; `checkCreated()` exception text "MPVLib is not initialized" ->
@@ -62,31 +62,29 @@ upstream fix, an API-surface adaptation, or build configuration.
 
 **Compile-time substitution (link behavior unchanged):**
 
-7. `main.cpp` replaces upstream's `#include <libavcodec/jni.h>` with exact extern-"C" prototypes of
+9. `main.cpp` replaces upstream's `#include <libavcodec/jni.h>` with exact extern-"C" prototypes of
    the two symbols it uses (`av_jni_set_java_vm`, `av_jni_set_android_app_ctx`, verbatim FFmpeg 8.1
    signatures), so the LGPL header is not vendored. Both still link from libavcodec.so.
 
 **Build configuration (VortX-native; not upstream code):**
 
-8. `CMakeLists.txt` is rewritten for this repo rather than carried: project/target name
+10. `CMakeLists.txt` is rewritten for this repo rather than carried: project/target name
    `vortx_mpv_seam`, imported prebuilts resolved from `${MPV_AAR_JNI_DIR}` (the Gradle-extracted AAR
    libs) with fail-closed configure-time existence checks, and the vendored-header include dir --
    versus upstream's buildscripts-prefix paths and its `player` target name.
-9. `build.gradle.kts` is VortX-native (AGP/Kotlin plugins from our version catalog, no maven
+11. `build.gradle.kts` is VortX-native (AGP/Kotlin plugins from our version catalog, no maven
    publishing): NDK pinned to the app-wide pin `27.2.12479018` (upstream builds with NDK 29),
    CMake 3.22.1 (upstream pins 4.1.2), and `-DANDROID_STL=c++_static` instead of upstream's
    `c++_shared` -- this glue is self-contained C++ (JNI primitives + mpv's C API cross its
    boundary), so it adds no second `libc++_shared.so` copy to the APK.
-10. A minimal `src/main/AndroidManifest.xml` was added (upstream's published artifact generates one);
+12. A minimal `src/main/AndroidManifest.xml` was added (upstream's published artifact generates one);
     `consumer-rules.pro` carries only the retargeted keep rule.
 
 **Files not derived from upstream at all:** `include/mpv/client.h` / `include/mpv/stream_cb.h`
 (verbatim mpv v0.41.0, ISC), both README files, and `LICENSE`.
 
-Everything else in `main.cpp`, `event.*`, `property.cpp`, `render.cpp`, `log.cpp`, `jni_utils.*`,
-`globals.h` and `MpvSeam.kt` (create/init lifecycle, event thread, wid surface attach, property
-get/set/observe, command argv handling, log forwarding, exception semantics) is upstream v1.0.0
-code, character-for-character beyond the items listed above.
+Everything not listed above in `main.cpp`, `event.*`, `property.cpp`, `render.cpp`, `log.cpp`,
+`jni_utils.*`, `globals.h`, and `MpvSeam.kt` remains upstream v1.0.0 behavior.
 
 ## Supply chain: what is built vs consumed
 

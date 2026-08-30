@@ -44,6 +44,7 @@ import java.net.URI
 import java.net.URL
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /// The libmpv [PlayerEngine] (PRIMARY player, `full` flavor only). Owns one [MPVLib] for its lifetime,
@@ -119,6 +120,11 @@ class MpvPlayer private constructor(
 
     private val runtimePolicyScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val subtitleLoadGeneration = AtomicLong()
+    private val released = AtomicBoolean(false)
+    private val audioHealthLock = Any()
+    private var audioHealthJob: Job? = null
+    @Volatile private var audioRecoveryAttempted = false
+    @Volatile private var audioFileLoadedGeneration = 0L
     private var pausedClampJob: Job? = null
     private var memoryRecoveryJob: Job? = null
     private var normalReadAheadBytes: Long? = null
@@ -208,9 +214,15 @@ class MpvPlayer private constructor(
                     // first apply (idempotent) and for a non-resume load. Mirrors Apple's first-frame apply.
                     consumePendingResumeSeek()
                     _state.update { it.copy(isBuffering = false) }
+                    scheduleAudioOutputHealthCheck()
                 }
-                MPVLib.Event.FILE_LOADED -> refreshTracks()
+                MPVLib.Event.FILE_LOADED -> {
+                    audioFileLoadedGeneration = subtitleLoadGeneration.get()
+                    refreshTracks()
+                    scheduleAudioOutputHealthCheck(replaceExisting = true)
+                }
                 MPVLib.Event.VIDEO_RECONFIG -> refreshTracks()
+                MPVLib.Event.AUDIO_RECONFIG -> scheduleAudioOutputHealthCheck()
             }
         }
     }
@@ -280,7 +292,14 @@ class MpvPlayer private constructor(
     }
 
     override fun load(playable: Playable) {
+        if (released.get()) return
         val loadGeneration = subtitleLoadGeneration.incrementAndGet()
+        synchronized(audioHealthLock) {
+            audioHealthJob?.cancel()
+            audioHealthJob = null
+            audioRecoveryAttempted = false
+            audioFileLoadedGeneration = 0L
+        }
         // Fresh terminal flags for the new file, and isBuffering=true as the connecting state. For a
         // replacement, the gate arms its suppression window: mpv queues the OLD source's END_FILE
         // before the NEW source's START_FILE on this client's event queue, so exactly that span is
@@ -599,6 +618,7 @@ class MpvPlayer private constructor(
         for ((name, value) in mode.mpvLiveProperties(appContext)) {
             mpv.setPropertyString(name, value)
         }
+        scheduleAudioOutputHealthCheck()
     }
 
     /// Re-read `stremiox.hdrToneMapMode` and apply the SDR-force (or HDR-passthrough) target-trc/target-prim
@@ -641,6 +661,8 @@ class MpvPlayer private constructor(
         mpv.getPropertyString("audio-codec")?.takeIf { it.isNotEmpty() }?.let { stats += "Audio codec" to it }
         mpv.getPropertyString("audio-params/hr-channels")?.takeIf { it.isNotEmpty() }
             ?.let { stats += "Channels" to it }
+        mpv.getPropertyString(PROP_CURRENT_AO)?.takeIf { it.isNotBlank() && it != "null" }
+            ?.let { stats += "Audio output" to it }
         // Performance rows (the on-screen equivalent of a stats overlay): how many decoded frames mpv had to
         // drop to keep sync, and how many seconds of forward buffer the demuxer is holding ahead of the
         // playhead. Both surface a struggling device or a starving link at a glance. Mirrors the Apple
@@ -736,20 +758,19 @@ class MpvPlayer private constructor(
     /// exactly what a scrub thumbnail wants (subtitles burned into a shared community sheet would be a
     /// bug, since the pool is language-agnostic).
     ///
-    /// HONEST CAVEAT -- this is the ONE step of the trickplay chain that cannot be verified without a
-    /// device, so it is designed to fail CLOSED rather than to fail wrong. [MpvConfig.HWDEC] is plain
+    /// SAFETY GATE. [MpvConfig.HWDEC] is plain
     /// `mediacodec` (surface-direct), deliberately NOT `mediacodec-copy`, because the direct path is what
     /// carries HDR/DV to the panel. Surface-direct mediacodec hands decoded frames to the Android Surface
-    /// without ever staging them in CPU-addressable memory, so mpv may hold no readable copy and the
-    /// screenshot can come back missing, empty, or unrendered. We do NOT "fix" that by switching to
-    /// `mediacodec-copy`: that would trade the DV mandate for the trickplay mandate. Instead every
-    /// failure mode degrades to null (no file / empty file / undecodable), and the near-black guard in
-    /// [com.vortx.android.trickplay.TrickplaySession] drops an unrendered frame BEFORE it can reach the
-    /// shared pool. A device test decides whether this yields real frames on `mediacodec`; if it does
-    /// not, the fix is a capture-only software-decode path, never a change to the DV pipeline.
+    /// without staging them in CPU-addressable memory. Entering mpv's synchronous screenshot command on
+    /// that path is driver-dependent and can terminate the process rather than return an error. The guard
+    /// below therefore permits only software or explicit copy-back decode. We do NOT switch normal playback
+    /// to `mediacodec-copy`: that would trade the DV mandate for the preview mandate.
     ///
     /// Fail-soft on every step; never throws. The temp file is always cleaned up.
     override suspend fun captureFrameJpeg(maxWidth: Int): ByteArray? = withContext(Dispatchers.IO) {
+        if (!canSafelyCaptureMpvFrame(mpv.getPropertyString(PROP_HWDEC_CURRENT))) {
+            return@withContext null
+        }
         // Write into the app cache dir: mpv needs a real filesystem path it can open for writing, and the
         // frame is transient (it is re-encoded below and the file is deleted in the same call).
         val file = File(appContext.cacheDir, "vortx-tp-grab-${UUID.randomUUID()}.jpg")
@@ -809,13 +830,82 @@ class MpvPlayer private constructor(
         return sample
     }
 
+    /**
+     * Verify that an audio-bearing file opened a real AO. One failure gets a decoded-stereo reopen;
+     * a second failure enters the normal bad-source path instead of leaving a silent video running.
+     */
+    private fun scheduleAudioOutputHealthCheck(replaceExisting: Boolean = false) {
+        val generation = subtitleLoadGeneration.get()
+        synchronized(audioHealthLock) {
+            if (released.get() || audioFileLoadedGeneration != generation) return
+            if (audioHealthJob?.isActive == true) {
+                if (!replaceExisting) return
+                audioHealthJob?.cancel()
+            }
+            audioHealthJob = runtimePolicyScope.launch {
+                verifyAudioOutput(generation)
+            }
+        }
+    }
+
+    private suspend fun verifyAudioOutput(generation: Long) {
+        delay(AUDIO_OUTPUT_SETTLE_MS)
+        if (!audioOutputCheckActive(generation)) return
+
+        val initialAction = mpvAudioOutputHealthAction(
+            hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
+            currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
+            outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
+            recoveryAttempted = audioRecoveryAttempted,
+        )
+        if (initialAction == MpvAudioOutputHealthAction.NONE) return
+        if (initialAction == MpvAudioOutputHealthAction.FAIL_SOURCE) {
+            failSilentAudioSource()
+            return
+        }
+
+        synchronized(audioHealthLock) {
+            if (!audioOutputCheckActive(generation) || audioRecoveryAttempted) return
+            audioRecoveryAttempted = true
+        }
+        Log.w(TAG, "libmpv opened no audio output; retrying decoded stereo")
+        for ((name, value) in safeMpvAudioRecoveryProperties()) {
+            if (!audioOutputCheckActive(generation)) return
+            mpv.setPropertyString(name, value)
+        }
+
+        delay(AUDIO_OUTPUT_RECOVERY_MS)
+        if (!audioOutputCheckActive(generation)) return
+        val recoveredAction = mpvAudioOutputHealthAction(
+            hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
+            currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
+            outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
+            recoveryAttempted = true,
+        )
+        if (recoveredAction == MpvAudioOutputHealthAction.FAIL_SOURCE) failSilentAudioSource()
+    }
+
+    private fun audioOutputCheckActive(generation: Long): Boolean {
+        val state = _state.value
+        return !released.get() && subtitleLoadGeneration.get() == generation &&
+            audioFileLoadedGeneration == generation &&
+            !state.hasError && !state.hasEnded
+    }
+
+    private fun failSilentAudioSource() {
+        val applied = terminalGate.onTerminal(MpvTerminalEvent(MpvTerminalReason.ERROR))
+        if (applied != null) Log.e(TAG, "libmpv audio output failed after decoded-stereo retry")
+    }
+
     override fun release() {
+        if (!released.compareAndSet(false, true)) return
         // Close the terminal gate before unregistering so an already-dispatched native callback racing
         // teardown cannot publish EOF and trigger watched/auto-advance.
         terminalGate.release()
         runtimePolicyScope.cancel()
         mpv.removeObserver(observer)
-        mpv.detachSurface()
+        // Native destruction owns final cleanup of any still-attached surface. SurfaceHolder may deliver
+        // surfaceDestroyed before or after this call; both paths are idempotent at the seam.
         mpv.destroy()
         // A finished title must not leave a large on-disk cache behind (DiskCacheSetting's second owner
         // guardrail: the cache is wiped on a genuine playback exit). No-op when the disk cache is OFF.
@@ -938,6 +1028,9 @@ class MpvPlayer private constructor(
         private const val PROP_SUB_DELAY = "sub-delay"
         private const val PROP_AUDIO_DELAY = "audio-delay"
         private const val PROP_HWDEC = "hwdec"
+        private const val PROP_HWDEC_CURRENT = "hwdec-current"
+        private const val PROP_CURRENT_AO = "current-ao"
+        private const val PROP_AUDIO_OUTPUT_CHANNEL_COUNT = "audio-out-params/channel-count"
         private const val PROP_VID = "vid"
         private const val PROP_SPEED = "speed"
         private const val PROP_PANSCAN = "panscan"
@@ -962,6 +1055,8 @@ class MpvPlayer private constructor(
         /// [CAPTURE_JPEG_QUALITY] after downscaling, and compressing twice at the final quality would
         /// stack artifacts. The file is deleted in the same call, so its size never matters on disk.
         private const val SCREENSHOT_INTERMEDIATE_QUALITY = "90"
+        private const val AUDIO_OUTPUT_SETTLE_MS = 2_500L
+        private const val AUDIO_OUTPUT_RECOVERY_MS = 2_500L
 
         /// Final tile quality, 0.7 == Apple's `kCGImageDestinationLossyCompressionQuality: 0.7` on both of
         /// its capture paths. Kept identical so an Android-contributed tile matches an Apple one.

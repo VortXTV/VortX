@@ -7,21 +7,26 @@
 //      mpv_event_end_file payload. Upstream 1.0.0 delivers END_FILE only as a bare event id through
 //      `event(int)`, which is exactly why VortX audit AND-PLY-01 required this source-built fork.
 //
-// Everything else mirrors upstream v1.0.0 one-for-one (create/init/destroy/attachSurface/detachSurface/
-// command/options/properties/observe/log fan-out), so behavior parity with the audited artifact glue is
-// reviewable line-by-line. Provenance + license: see README.md / LICENSE in the module root.
+// Valid-call behavior mirrors upstream v1.0.0 (create/init/destroy/attachSurface/detachSurface/command/
+// options/properties/observe/log fan-out). VortX additionally gates every native-handle lease against
+// destruction and serializes surface ownership, preventing use-after-free during rapid Back/surface churn.
+// Provenance + license: see README.md / LICENSE in the module root.
 package com.vortx.android.player.mpv.seam
 
 import android.content.Context
 import android.view.Surface
 
 @Suppress("unused")
-class MpvSeam private constructor(nativePtr: Long) {
-    private var nativeInstance: Long = 0
+class MpvSeam private constructor() {
+    @Volatile
+    private var handleGate: MpvNativeHandleGate? = null
+    private val surfaceLock = Any()
     private val observers = mutableListOf<EventObserver>()
     private val logObservers = mutableListOf<LogObserver>()
 
     companion object {
+        private const val NATIVE_CALL_UNAVAILABLE = Int.MIN_VALUE
+
         init {
             // "mpv" first (libmpv.so + its ffmpeg deps come from the dev.jdtech.mpv:libmpv AAR), then
             // THIS module's own source-built glue. The AAR's own "player" glue is intentionally NOT
@@ -36,115 +41,113 @@ class MpvSeam private constructor(nativePtr: Long) {
         fun create(context: Context): MpvSeam? {
             val appCtx = context.applicationContext
 
-            val instance = MpvSeam(0L)
+            val instance = MpvSeam()
 
             val ptr = instance.nativeCreate(instance, appCtx)
             if (ptr == 0L) {
                 return null
             }
 
-            instance.nativeInstance = ptr
+            instance.handleGate = MpvNativeHandleGate(ptr)
             return instance
-        }
-    }
-
-    private fun checkCreated() {
-        if (nativeInstance == 0L) {
-            throw IllegalStateException("MpvSeam is not initialized")
         }
     }
 
     private external fun nativeCreate(thiz: MpvSeam, appctx: Context): Long
 
     fun init() {
-        checkCreated()
-        nativeInit(nativeInstance)
+        val initialized = handleGate?.withHandle(false) { instance ->
+            nativeInit(instance)
+            true
+        } ?: false
+        check(initialized) { "MpvSeam is not initialized" }
     }
     private external fun nativeInit(instance: Long)
 
     fun destroy() {
-        if (nativeInstance != 0L) {
-            nativeDestroy(nativeInstance)
-            nativeInstance = 0L
-        }
+        val gate = handleGate ?: return
+        // Do not hold surfaceLock while nativeDestroy joins mpv's event thread. The handle gate first
+        // rejects new surface leases and waits for any active attach/detach call, so the mutex is not
+        // needed during the join and a final Java callback can never deadlock on it.
+        gate.destroy(::nativeDestroy)
     }
     private external fun nativeDestroy(instance: Long)
 
     fun attachSurface(surface: Surface) {
-        checkCreated()
-        nativeAttachSurface(nativeInstance, surface)
+        val result = synchronized(surfaceLock) {
+            handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE) { instance ->
+                nativeAttachSurface(instance, surface)
+            } ?: NATIVE_CALL_UNAVAILABLE
+        }
+        if (result == NATIVE_CALL_UNAVAILABLE) return
+        check(result >= 0) { "mpv surface attach failed ($result)" }
     }
-    private external fun nativeAttachSurface(instance: Long, surface: Surface)
+    private external fun nativeAttachSurface(instance: Long, surface: Surface): Int
 
     fun detachSurface() {
-        checkCreated()
-        nativeDetachSurface(nativeInstance)
+        val result = synchronized(surfaceLock) {
+            handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE, ::nativeDetachSurface)
+                ?: NATIVE_CALL_UNAVAILABLE
+        }
+        if (result == NATIVE_CALL_UNAVAILABLE) return
+        check(result >= 0) { "mpv surface detach failed ($result)" }
     }
-    private external fun nativeDetachSurface(instance: Long)
+    private external fun nativeDetachSurface(instance: Long): Int
 
     fun command(cmd: Array<String>) {
-        checkCreated()
-        nativeCommand(nativeInstance, cmd)
+        handleGate?.withHandle(Unit) { instance -> nativeCommand(instance, cmd) }
     }
     private external fun nativeCommand(instance: Long, cmd: Array<String>)
 
     fun setOptionString(name: String, value: String): Int {
-        checkCreated()
-        return nativeSetOptionString(nativeInstance, name, value)
+        return handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE) { instance ->
+            nativeSetOptionString(instance, name, value)
+        } ?: NATIVE_CALL_UNAVAILABLE
     }
     private external fun nativeSetOptionString(instance: Long, name: String, value: String): Int
 
     fun getPropertyInt(property: String): Int? {
-        checkCreated()
-        return nativeGetPropertyInt(nativeInstance, property)
+        return handleGate?.withHandle<Int?>(null) { instance -> nativeGetPropertyInt(instance, property) }
     }
     private external fun nativeGetPropertyInt(instance: Long, property: String): Int?
 
     fun setPropertyInt(property: String, value: Int) {
-        checkCreated()
-        nativeSetPropertyInt(nativeInstance, property, value)
+        handleGate?.withHandle(Unit) { instance -> nativeSetPropertyInt(instance, property, value) }
     }
     private external fun nativeSetPropertyInt(instance: Long, property: String, value: Int)
 
     fun getPropertyDouble(property: String): Double? {
-        checkCreated()
-        return nativeGetPropertyDouble(nativeInstance, property)
+        return handleGate?.withHandle<Double?>(null) { instance -> nativeGetPropertyDouble(instance, property) }
     }
     private external fun nativeGetPropertyDouble(instance: Long, property: String): Double?
 
     fun setPropertyDouble(property: String, value: Double) {
-        checkCreated()
-        nativeSetPropertyDouble(nativeInstance, property, value)
+        handleGate?.withHandle(Unit) { instance -> nativeSetPropertyDouble(instance, property, value) }
     }
     private external fun nativeSetPropertyDouble(instance: Long, property: String, value: Double)
 
     fun getPropertyBoolean(property: String): Boolean? {
-        checkCreated()
-        return nativeGetPropertyBoolean(nativeInstance, property)
+        return handleGate?.withHandle<Boolean?>(null) { instance -> nativeGetPropertyBoolean(instance, property) }
     }
     private external fun nativeGetPropertyBoolean(instance: Long, property: String): Boolean?
 
     fun setPropertyBoolean(property: String, value: Boolean) {
-        checkCreated()
-        nativeSetPropertyBoolean(nativeInstance, property, value)
+        handleGate?.withHandle(Unit) { instance -> nativeSetPropertyBoolean(instance, property, value) }
     }
     private external fun nativeSetPropertyBoolean(instance: Long, property: String, value: Boolean)
 
     fun getPropertyString(property: String): String? {
-        checkCreated()
-        return nativeGetPropertyString(nativeInstance, property)
+        return handleGate?.withHandle<String?>(null) { instance -> nativeGetPropertyString(instance, property) }
     }
     private external fun nativeGetPropertyString(instance: Long, property: String): String?
 
     fun setPropertyString(property: String, value: String) {
-        checkCreated()
-        nativeSetPropertyString(nativeInstance, property, value)
+        handleGate?.withHandle(Unit) { instance -> nativeSetPropertyString(instance, property, value) }
     }
     private external fun nativeSetPropertyString(instance: Long, property: String, value: String)
 
     fun observeProperty(property: String, format: Int) {
-        checkCreated()
-        nativeObserveProperty(nativeInstance, property, format)
+        handleGate?.withHandle(Unit) { instance -> nativeObserveProperty(instance, property, format) }
     }
     private external fun nativeObserveProperty(instance: Long, property: String, format: Int)
 
@@ -298,4 +301,5 @@ class MpvSeam private constructor(nativePtr: Long) {
         const val ERROR: Int = 4
         const val REDIRECT: Int = 5
     }
+
 }
