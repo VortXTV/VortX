@@ -64,3 +64,51 @@ enum PlayerMidPlaybackStallPolicy {
         bufferedAheadSeconds >= bufferedReloadThresholdSeconds
     }
 }
+
+/// Detects the rapid cache-empty loop that a coarse playhead watchdog cannot see: mpv can briefly advance
+/// between rebuffer events, resetting a "frozen for N polls" counter while remaining unwatchable. The caller
+/// supplies only eligible buffering-start transitions, keeping startup, live playback, seeks and user pauses
+/// outside this policy.
+struct PlayerRapidBufferingRecoveryState: Equatable {
+    enum Action: Equatable {
+        case none
+        case reloadSameSource
+        case hopSource
+    }
+
+    static let requiredStarts = 6
+    static let windowSeconds: TimeInterval = 12
+
+    private(set) var bufferingStarts: [TimeInterval] = []
+    private(set) var hasRecoveredInCurrentProgressBudget = false
+
+    mutating func recordBufferingStart(at now: TimeInterval) -> Action {
+        bufferingStarts.removeAll { now - $0 > Self.windowSeconds }
+        guard bufferingStarts.last != now else { return .none }
+        bufferingStarts.append(now)
+        guard bufferingStarts.count >= Self.requiredStarts else { return .none }
+
+        bufferingStarts.removeAll()
+        if hasRecoveredInCurrentProgressBudget {
+            return .hopSource
+        }
+        hasRecoveredInCurrentProgressBudget = true
+        return .reloadSameSource
+    }
+
+    /// A new title, source, episode, engine, explicit user interruption or terminal exit gets no inherited
+    /// history. `preservingProgressBudget` is used only immediately after the first automatic reload: a second
+    /// rapid loop on that source must escalate instead of reloading forever.
+    mutating func reset(preservingProgressBudget: Bool = false) {
+        bufferingStarts.removeAll()
+        if !preservingProgressBudget {
+            hasRecoveredInCurrentProgressBudget = false
+        }
+    }
+
+    /// Mirrors the existing one-minute stable-progress budget. Only sustained playback earns a fresh same-source
+    /// recovery after an earlier rapid-starvation episode.
+    mutating func resetAfterStableProgress() {
+        reset()
+    }
+}

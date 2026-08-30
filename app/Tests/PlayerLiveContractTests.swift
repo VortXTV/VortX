@@ -210,6 +210,7 @@ enum PlayerLiveContractTests {
         testSelectionRefreshLifecycle()
         testBoundaryKeyAgreement()
         testMidPlaybackStallPolicy()
+        testRapidBufferingRecoveryPolicy()
         testProductionWiring()
 
         print("")
@@ -314,6 +315,66 @@ enum PlayerLiveContractTests {
                     recoveries: 3,
                     stableProgressTicks:
                         PlayerMidPlaybackStallPolicy.stableProgressTicksToResetRecoveryBudget))
+    }
+
+    private static func testRapidBufferingRecoveryPolicy() {
+        var state = PlayerRapidBufferingRecoveryState()
+        for time in [0.0, 1.0, 2.0, 4.0, 6.0] {
+            _ = state.recordBufferingStart(at: time)
+        }
+        check("rapid buffering: five starts in twelve seconds do not recover",
+              state.bufferingStarts.count == 5)
+        check("rapid buffering: sixth start in twelve seconds reloads the source",
+              state.recordBufferingStart(at: 11.9) == .reloadSameSource)
+
+        state.reset()
+        for time in [0.0, 1.0, 2.0, 4.0, 6.0] {
+            _ = state.recordBufferingStart(at: time)
+        }
+        _ = state.recordBufferingStart(at: 7.0)
+        for time in [8.0, 9.0, 10.0, 11.0, 11.9] {
+            _ = state.recordBufferingStart(at: time)
+        }
+        check("rapid buffering: repeat before stable progress hops instead of reloading forever",
+              state.recordBufferingStart(at: 12.0) == .hopSource)
+
+        state.reset()
+        for time in [0.0, 3.0, 6.0, 9.0, 12.1, 15.1] {
+            _ = state.recordBufferingStart(at: time)
+        }
+        check("rapid buffering: spaced starts expire outside the rolling window",
+              state.bufferingStarts.count < PlayerRapidBufferingRecoveryState.requiredStarts)
+
+        state.reset()
+        for time in [0.0, 1.0, 2.0, 3.0, 4.0] {
+            _ = state.recordBufferingStart(at: time)
+        }
+        _ = state.recordBufferingStart(at: 4.0)
+        check("rapid buffering: duplicate transitions do not manufacture a recovery",
+              state.bufferingStarts.count == 5)
+        state.reset()
+        check("rapid buffering: startup, pause, live, failure and seek suppression reset the window",
+              state.bufferingStarts.isEmpty && !state.hasRecoveredInCurrentProgressBudget)
+
+        state.reset()
+        // First observed buffering edge in the Reddit report was 11:01:58; six reported starts land well
+        // inside the following 12 seconds and must take the same-source recovery, not wait for five 6s polls.
+        let redditFirstStart = 11 * 3_600.0 + 60.0 + 58.0
+        var redditAction: PlayerRapidBufferingRecoveryState.Action = .none
+        for offset in [0.0, 0.8, 2.0, 3.2, 5.0, 6.1] {
+            redditAction = state.recordBufferingStart(at: redditFirstStart + offset)
+        }
+        check("rapid buffering: Reddit 11:01:58 burst triggers the early recovery", redditAction == .reloadSameSource)
+
+        state.reset()
+        for time in [0.0, 2.0, 5.0, 8.0] {
+            _ = state.recordBufferingStart(at: time)
+        }
+        check("rapid buffering: healthy local sequence of four starts stays below threshold",
+              state.bufferingStarts.count == 4)
+        state.resetAfterStableProgress()
+        check("rapid buffering: stable progress renews the one-reload budget",
+              !state.hasRecoveredInCurrentProgressBudget)
     }
 
     private static func testInitialMountPinsStartupBytes() {
@@ -3542,16 +3603,16 @@ enum PlayerLiveContractTests {
                     "player.configureResumeOrigin(seconds: requestedResumeOrigin)",
                     "candidateToken = player.loadFile(",
                   ]))
-        check("wiring: tvOS preserves selection only for owned AVPlayer recovery",
+        check("wiring: tvOS preserves explicit subtitles across every automatic stall replacement",
               sourceContainsInOrder(tvStallReload, [
                   "let recoveryToken = coordinator.player is AVPlayerEngineController",
-                  "if recoveryToken == nil {",
+                  "let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil",
                   "appliedAutoTracks = false",
-                  "userPickedSubtitle = false",
+                  "userPickedSubtitle = subtitleChoice != nil",
+                  "pendingSubtitleReapply = subtitleChoice",
                   "reusing: recoveryToken",
               ])
-                  && tvStallReload?.components(separatedBy: "appliedAutoTracks = false").count == 2
-                  && tvStallReload?.components(separatedBy: "userPickedSubtitle = false").count == 2)
+                  && tvStallReload?.contains("if recoveryToken == nil { addedSubURLs = []; addedPooledIDs = [] }") == true)
         check("wiring: subtitle sync is gated by the exact live capability on both surfaces",
               engineContract?.contains("var subtitleDelayAvailable: Bool { get }") == true
                   && engine?.contains("var subtitleDelayAvailable: Bool { externalSubActive }") == true
@@ -4043,6 +4104,24 @@ enum PlayerLiveContractTests {
                     "recoveryTickThreshold(",
                     "buffering: buffering",
                   ]))
+        let rapidBufferingRecovery = sourceSection(
+            tvPlayer,
+            from: "private func recordRapidBufferingStartIfEligible()",
+            to: "/// Watch for a hard stall after the first frame")
+        check("wiring: rapid cache starvation counts only eligible buffering starts and escalates once",
+              sourceContainsInOrder(rapidBufferingRecovery, [
+                  "hasStartedPlaying",
+                  "firstFrameRenderedAt != nil",
+                  "!isPaused",
+                  "!loadFailed",
+                  "!isCurrentLiveStream",
+                  "inFlightSeekTarget == nil",
+                  "rapidBufferingRecovery.recordBufferingStart",
+                  ".reloadSameSource",
+                  "reloadAtPlayhead()",
+                  ".hopSource",
+                  "hopToNextSource(reason: \"rapid cache starvation\"",
+              ]))
         check("wiring: periodic playhead reporting never enters the publication lock",
               playheadReceipt?.contains("playbackClockLock.lock()") == true
                   && sourceSection(

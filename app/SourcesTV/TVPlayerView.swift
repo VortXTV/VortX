@@ -734,6 +734,9 @@ struct TVPlayerView: View {
     @State private var stallRecoveries = 0
     @State private var stallStableProgressTicks = 0
     @State private var stallNudgesIssued = 0          // B2 seek-nudge counter, per continuous stall episode
+    // The six-second playhead watchdog cannot see a source that advances briefly between 0-byte cache refills.
+    // This is a separate, edge-driven owner for that rapid loop, bounded to one reload then one source hop.
+    @State private var rapidBufferingRecovery = PlayerRapidBufferingRecoveryState()
     @State private var midPlayBufferedReloadUsed = false  // B3 one same-engine reload before any mid-play demote
     // Direct-resume launches (Continue Watching) start without an episode list;
     // it loads in the background so Next/auto-advance still work.
@@ -1569,7 +1572,14 @@ struct TVPlayerView: View {
             return
         }
         switch name {
-        case MPVProperty.pausedForCache: if let b = data as? Bool { buffering = b }
+        case MPVProperty.pausedForCache:
+            if let b = data as? Bool {
+                let startedBuffering = b && !buffering
+                buffering = b
+                if startedBuffering {
+                    recordRapidBufferingStartIfEligible()
+                }
+            }
         case MPVProperty.pause:
             // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
             // value, so gate every side effect on a real change: the scrobble pause/resume, saveProgress and
@@ -1578,6 +1588,7 @@ struct TVPlayerView: View {
             // real change is correct.
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
+                if b { resetRapidBufferingRecovery(reason: "user pause") }
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
                 // #157: reflect play/pause on the system card AT ONCE. The play head stops ticking while
                 // paused, so without this the published rate would stay at "playing" and the Control Center
@@ -3677,7 +3688,10 @@ struct TVPlayerView: View {
         }
     }
 
-    private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool) {
+    private func resetRuntimeForIssuedSourceSwitch(
+        userInitiated: Bool,
+        preservingSubtitleChoice: SubtitleChoice? = nil
+    ) {
         clearCachedAudioOutputTruth()
         avToMPVHandoffTask?.cancel()
         avToMPVHandoff = nil
@@ -3687,6 +3701,7 @@ struct TVPlayerView: View {
         directAVNoFrameRecovery = nil
         libmpvStartupNudgeIssued = false
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
+        resetRapidBufferingRecovery(reason: "issued source switch")
         sourceHops = 0; exhaustedURLs = []
         if userInitiated {
             avEngineFailed = false
@@ -3703,9 +3718,9 @@ struct TVPlayerView: View {
         resumeIsMidPlayRecovery = false
         bufferedTime = 0
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false
-        autoAddonSubTried = false; userPickedSubtitle = false
+        autoAddonSubTried = false; userPickedSubtitle = preservingSubtitleChoice != nil
         addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""
-        pendingSubtitleReapply = nil; suppressedResumeFloor = nil
+        pendingSubtitleReapply = preservingSubtitleChoice; suppressedResumeFloor = nil
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
         watchedZoneSince = nil
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
@@ -3722,7 +3737,8 @@ struct TVPlayerView: View {
                               userInitiated: Bool = true,
                               resumeOverride: Double? = nil,
                               sourceGenerationAlreadyClaimed: Bool = false,
-                              addon: String? = nil) -> Bool {
+                              addon: String? = nil,
+                              preservingSubtitleChoice: SubtitleChoice? = nil) -> Bool {
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
@@ -3805,7 +3821,10 @@ struct TVPlayerView: View {
             return false
         }
         if debridRef == nil { prepareTorrent(stream) }
-        resetRuntimeForIssuedSourceSwitch(userInitiated: userInitiated)
+        resetRuntimeForIssuedSourceSwitch(
+            userInitiated: userInitiated,
+            preservingSubtitleChoice: preservingSubtitleChoice
+        )
         curURL = newURL
         curDebridRef = debridRef
         curSourceStream = stream
@@ -3958,13 +3977,18 @@ struct TVPlayerView: View {
         let hops = sourceHops + 1
         let resume: Double? = resumeOverride
             ?? (hasStartedPlaying ? currentTime : resumeSeconds)
+        // A hop is an automatic replacement of the same title, not a new viewer choice. Preserve the explicit
+        // subtitle intent before switchStream resets per-load state; autoSelectTracks re-applies it on the new
+        // mount instead of silently returning to language preferences.
+        let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
         DiagnosticsLog.log(
             "player",
             "source hop \(hops)/\(maxSourceHops) reason=\(safeFailureClass(reason)) next=candidate"
         )
         guard switchStream(
             to: stream, url: newURL, targetMeta: sourceTargetMeta,
-            userInitiated: false, resumeOverride: resume
+            userInitiated: false, resumeOverride: resume,
+            preservingSubtitleChoice: subtitleChoice
         ) else {
             DiagnosticsLog.log(
                 "player",
@@ -4453,6 +4477,44 @@ struct TVPlayerView: View {
         .transition(.opacity)
     }
 
+    /// Clear rapid-buffering edges at every semantic boundary. The optional retained budget is exclusively for
+    /// the automatic same-source recovery, so the next proved burst promotes to the existing bounded hop.
+    private func resetRapidBufferingRecovery(reason: String, preservingProgressBudget: Bool = false) {
+        rapidBufferingRecovery.reset(preservingProgressBudget: preservingProgressBudget)
+        DiagnosticsLog.log("player", "rapid-buffer reset reason=\(reason) retain=\(preservingProgressBudget)")
+    }
+
+    /// Admit only on-demand, post-first-frame cache starts. A seek or fresh track list may legitimately refill
+    /// the cache and must never be confused with a source that cannot sustain delivery.
+    private func recordRapidBufferingStartIfEligible() {
+        guard hasStartedPlaying,
+              firstFrameRenderedAt != nil,
+              !isPaused,
+              !loadFailed,
+              !isCurrentLiveStream,
+              duration > 0,
+              inFlightSeekTarget == nil,
+              pendingLibmpvResumeSeek == nil,
+              !switchingEpisode else { return }
+
+        switch rapidBufferingRecovery.recordBufferingStart(at: ProcessInfo.processInfo.systemUptime) {
+        case .none:
+            return
+        case .reloadSameSource:
+            DiagnosticsLog.log("player", "rapid-buffer burst 6/12s -> same-source reload at \(Int(currentTime))s")
+            resetRapidBufferingRecovery(reason: "rapid same-source recovery", preservingProgressBudget: true)
+            reloadAtPlayhead()
+        case .hopSource:
+            let resume = max(currentTime, suppressedResumeFloor ?? 0)
+            DiagnosticsLog.log("player", "rapid-buffer burst repeated before stable progress -> source hop at \(Int(resume))s")
+            resetRapidBufferingRecovery(reason: "rapid source hop")
+            if !hopToNextSource(reason: "rapid cache starvation", resumeOverride: resume) {
+                loadErrorMsg = "Playback kept running out of buffered data on this source."
+                presentTerminalLoadFailure()
+            }
+        }
+    }
+
     /// Watch for a hard stall after the first frame. Buffering is deliberately observable: AVPlayer can
     /// remain in its waiting state indefinitely (root-cause report section 1), so the visible spinner must
     /// still have a bounded recovery owner instead of the old `!buffering` exemption resetting the counter
@@ -4537,6 +4599,8 @@ struct TVPlayerView: View {
                         stallStableProgressTicks = 0
                         stallNudgesIssued = 0
                         midPlayBufferedReloadUsed = false
+                        rapidBufferingRecovery.resetAfterStableProgress()
+                        DiagnosticsLog.log("player", "rapid-buffer reset after stable progress")
                     }
                 }
                 lastObservedTime = currentTime
@@ -4765,13 +4829,17 @@ struct TVPlayerView: View {
     private func reloadAtPlayhead() {
         let recoveryToken = coordinator.player is AVPlayerEngineController
             ? coordinator.player?.activeLoadToken : nil
+        // Same-title automatic recovery must retain the viewer's explicit subtitle intent. libmpv creates a
+        // fresh mount here (unlike AVPlayer's token reuse), so clearing this flag used to turn an explicit Off
+        // or language selection back into the preference-derived automatic selection after every stall.
+        let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
         resumeSeconds = currentTime
         resumeIsMidPlayRecovery = true   // the live play head of the stalled mount, not a stored offset
-        appliedResume = false; autoAddonSubTried = false; addonSubsResolveTried = false
+        appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; addonSubsResolveTried = false
         if recoveryToken == nil {
-            appliedAutoTracks = false
-            userPickedSubtitle = false
+            userPickedSubtitle = subtitleChoice != nil
         }
+        pendingSubtitleReapply = subtitleChoice
         pendingLibmpvResumeSeek = nil   // reloading the same source at a fresh mount: drop any deferred resume seek
         buffering = true
         hasStartedPlaying = false
@@ -4781,8 +4849,17 @@ struct TVPlayerView: View {
         // Mirrors iOS PlayerScreen.recoverFromStall.
         firstFrameRenderedAt = nil
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
-        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
-                       reusing: recoveryToken, resumeOrigin: currentTime)
+        let issuedToken = loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
+                                         reusing: recoveryToken, resumeOrigin: currentTime)
+        guard issuedToken != nil else {
+            // The old mount remains authoritative if the replacement was refused, including its external
+            // subtitle rows. Dropping the deferred choice avoids re-adding a duplicate to that live mount.
+            pendingSubtitleReapply = nil
+            return
+        }
+        // A newly accepted libmpv mount does not own external subtitle rows from the retired controller. Clear
+        // bookkeeping only now, never before an accepted load, so a refused recovery cannot duplicate rows.
+        if recoveryToken == nil { addedSubURLs = []; addedPooledIDs = [] }
         startLoadTimeout()
     }
 
@@ -4965,6 +5042,7 @@ struct TVPlayerView: View {
         demoteFollowedDeadInput = false
         guard useAVPlayerEngine,
               let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return false }
+        resetRapidBufferingRecovery(reason: "engine demote")
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
@@ -5168,6 +5246,7 @@ struct TVPlayerView: View {
             showEngineNote("This source can only play on the built-in (libmpv) engine.")
             withAnimation { showOptions = false }; return
         }
+        resetRapidBufferingRecovery(reason: "user engine switch")
         DiagnosticsLog.log("player", "user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
@@ -8535,6 +8614,7 @@ struct TVPlayerView: View {
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
     private func leavePlayback() {
+        resetRapidBufferingRecovery(reason: "playback exit")
         let exitLoadToken = coordinator.player?.activeLoadToken
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
@@ -8750,6 +8830,7 @@ struct TVPlayerView: View {
     /// (an absolute `seek(to:)` arms the cache hold and empties the forward buffer, which a small hop must
     /// not), but they emit the same line for a complete trail. maybeResume logs its own resume line.
     private func issueSeek(to target: Double, reason: String) {
+        resetRapidBufferingRecovery(reason: "user seek")
         DiagnosticsLog.log(
             "playback",
             String(format: "seek reason=%@ from=%.3f to=%.3f duration=%.3f", reason, currentTime, target, duration)
@@ -8758,6 +8839,7 @@ struct TVPlayerView: View {
     }
 
     private func seek(_ delta: Double) {
+        resetRapidBufferingRecovery(reason: "user relative seek")
         DiagnosticsLog.log(
             "playback",
             String(format: "seek reason=relative from=%.3f to=%.3f duration=%.3f", currentTime, currentTime + delta, duration)
