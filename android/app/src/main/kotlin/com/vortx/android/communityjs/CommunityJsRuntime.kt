@@ -69,12 +69,19 @@ class CommunityJsRuntime(
         }
     }
 
-    private suspend fun evaluate(invocation: Invocation, host: NativeFetchImpl): Result = runCatching {
+    private suspend fun evaluate(invocation: Invocation, host: NativeFetchImpl): Result = try {
         val output = executeInBroker(invocation, host)
         val envelope = JSONObject(output)
-        if (!envelope.optBoolean("ok")) return Result.Failure(envelope.optString("error", "Provider execution failed."))
-        decodeStreams(envelope.optJSONArray("payload")?.toString() ?: "[]")
-    }.getOrElse { Result.Failure("Provider execution failed.") }
+        if (!envelope.optBoolean("ok")) {
+            Result.Failure(envelope.optString("error", "Provider execution failed."))
+        } else {
+            decodeStreams(envelope.optJSONArray("payload")?.toString() ?: "[]")
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        Result.Failure("Provider execution failed.")
+    }
 
     private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String = suspendCancellableCoroutine { continuation ->
         val token = UUID.randomUUID().toString()

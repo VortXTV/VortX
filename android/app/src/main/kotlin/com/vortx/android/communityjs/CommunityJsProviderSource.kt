@@ -6,11 +6,37 @@ import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
+
+internal class CommunityJsRefreshJobOwner {
+    private var active: Job? = null
+
+    fun replace(next: Job) {
+        active?.cancel()
+        active = next
+    }
+
+    fun cancel() {
+        active?.cancel()
+        active = null
+    }
+}
+
+internal class CommunityJsGenerationFence {
+    private val active = AtomicLong(-1L)
+
+    fun begin(generation: Long) = active.set(generation)
+
+    fun isCurrent(generation: Long): Boolean = generation >= 0L && active.get() == generation
+
+    fun invalidate() = active.incrementAndGet()
+}
 
 /** Auxiliary source which turns enabled community-provider results into ordinary ranked source groups. */
 class CommunityJsProviderSource(context: Context) {
@@ -22,7 +48,8 @@ class CommunityJsProviderSource(context: Context) {
     val epoch: StateFlow<Int> = _epoch
     private val _settled = MutableStateFlow(true)
     val settled: StateFlow<Boolean> = _settled
-    private val activeGeneration = AtomicLong(-1L)
+    private val generationFence = CommunityJsGenerationFence()
+    private val refreshJobs = CommunityJsRefreshJobOwner()
 
     fun refresh(
         scope: CoroutineScope,
@@ -32,9 +59,9 @@ class CommunityJsProviderSource(context: Context) {
         episode: Int?,
         requestGeneration: Long,
     ) {
-        activeGeneration.set(requestGeneration)
+        generationFence.begin(requestGeneration)
         _settled.value = false
-        scope.launch(Dispatchers.IO) {
+        val next = scope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
             val tmdbId = resolveTmdbId(imdbId, mediaType)
             val result = if (tmdbId == null) emptyList() else store.providers()
                 .filter { it.enabled && it.supports(mediaType) }
@@ -46,20 +73,26 @@ class CommunityJsProviderSource(context: Context) {
                 }
             // Publication is fenced immediately before mutation. A cancelled or slower earlier request must
             // never replace a newer title's sources merely because it completed afterward.
-            if (requestGeneration >= 0L && activeGeneration.get() == requestGeneration) {
+            if (generationFence.isCurrent(requestGeneration)) {
                 _groups.value = result
                 _epoch.value += 1
                 _settled.value = true
             }
         }
+        refreshJobs.replace(next)
+        next.start()
     }
 
     fun reset() {
-        activeGeneration.incrementAndGet()
+        refreshJobs.cancel()
+        generationFence.invalidate()
         _groups.value = emptyList()
         _epoch.value += 1
         _settled.value = true
     }
+
+    /** Releases the in-flight provider execution when the detail owner is being destroyed. */
+    fun close() = reset()
 
     private suspend fun resolveTmdbId(imdbId: String?, mediaType: String): String? {
         val imdb = imdbId?.takeIf { it.startsWith("tt") } ?: return null

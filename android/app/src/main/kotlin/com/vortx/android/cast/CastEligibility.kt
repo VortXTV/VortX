@@ -23,6 +23,9 @@ object CastEligibility {
     fun isCastable(playable: Playable): Boolean {
         if (playable.isTorrent) return false
         if (playable.isTrailer) return false
+        // The default Cast receiver fetches independently and cannot receive VortX's per-stream HTTP
+        // headers (Referer, cookies, or a required User-Agent), so offering these links would fail remotely.
+        if (playable.headers.isNotEmpty()) return false
         return isRemoteHttpUrl(playable.url)
     }
 

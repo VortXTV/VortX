@@ -179,6 +179,13 @@ internal fun StreamSource.usenetResolveTarget(
     fileIdx = fileIdx,
 )
 
+/** Uses a structured direct URL when an add-on supplied one, then retains the legacy id handle fallback. */
+internal fun StreamSource.directPlaybackUrl(fallbackHandle: String): String? =
+    url?.takeIf(::isHttpPlaybackUrl) ?: fallbackHandle.takeIf(::isHttpPlaybackUrl)
+
+private fun isHttpPlaybackUrl(value: String): Boolean =
+    value.startsWith("http://", ignoreCase = true) || value.startsWith("https://", ignoreCase = true)
+
 internal fun usenetPlaybackFailure(error: Throwable): Throwable = when (error) {
     DebridResolver.DebridException.NoKey ->
         UnsupportedOperationException("Usenet playback needs a TorBox debrid key.", error)
@@ -2169,14 +2176,14 @@ class EngineStremioRepository(
                 isDolbyVision = isDolbyVision,
                 isAtmos = isAtmos,
             )
-        } else if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
+        } else if (!source.isTorrent && source.directPlaybackUrl(handle) != null) {
             // The stream's declared proxyHeaders ride onto the Playable so a header-gated CDN (a
             // Referer / User-Agent requirement) actually plays: both engines already apply
             // [Playable.headers] (mpv http-header-fields, ExoPlayer data-source factory), and the
             // download path forwards them off the same Playable. Direct-URL streams only: a
             // debrid-resolved link below is a DIFFERENT host the add-on's headers were never meant for.
             Playable(
-                url = handle,
+                url = requireNotNull(source.directPlaybackUrl(handle)),
                 title = source.title,
                 viaStreamingServer = false,
                 isDolbyVision = isDolbyVision,

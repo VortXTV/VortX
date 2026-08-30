@@ -48,6 +48,19 @@ class CastEligibilityTest {
     }
 
     @Test
+    fun `header-gated stream is not castable because the receiver cannot replay headers`() {
+        assertFalse(
+            CastEligibility.isCastable(
+                Playable(
+                    url = "https://cdn.example.com/protected.m3u8",
+                    title = "Protected",
+                    headers = mapOf("Referer" to "https://addon.example/"),
+                ),
+            ),
+        )
+    }
+
+    @Test
     fun `non-http urls are not castable`() {
         assertFalse(CastEligibility.isCastable(playable("magnet:?xt=urn:btih:abcdef")))
         assertFalse(CastEligibility.isCastable(playable("file:///data/local/clip.mp4")))

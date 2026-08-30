@@ -116,6 +116,17 @@ class VortXDeepLinkTest {
     }
 
     @Test
+    fun `phone and tv activities forward pre-S home presses to the shared PiP bridge`() {
+        listOf(
+            readProjectFile("src/main/kotlin/com/vortx/android/MainActivity.kt"),
+            readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvActivity.kt"),
+        ).forEach { source ->
+            assertTrue(source.contains("override fun onUserLeaveHint()"))
+            assertTrue(source.contains("PlayerPipBridge.onUserLeaveHint()"))
+        }
+    }
+
+    @Test
     fun `invalid delivery does not block the next valid intent`() {
         val state = DeepLinkDeliveryState()
         assertNull(state.consume("delivery-a", "vortx://open?type=channel&id=bad"))

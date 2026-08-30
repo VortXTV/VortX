@@ -88,6 +88,19 @@ class ExoPlayerEngineStatePolicyTest {
     }
 
     @Test
+    fun `all ordinary Media3 streams use a redirect-capable http factory`() {
+        val source = readSource("ExoPlayerEngine.kt")
+        val loadStart = source.indexOf("override fun load(playable: Playable)")
+        val loadEnd = source.indexOf("override fun play()", startIndex = loadStart)
+        val load = source.substring(loadStart, loadEnd)
+
+        assertTrue(load.contains("val http = DefaultHttpDataSource.Factory().apply"))
+        assertTrue(load.contains("setAllowCrossProtocolRedirects(true)"))
+        assertTrue(load.contains("DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)"))
+        assertFalse(load.contains("else {\n            DefaultMediaSourceFactory(appContext)"))
+    }
+
+    @Test
     fun `signed and declared extensionless subtitle urls resolve safely`() {
         assertEquals(
             MimeTypes.APPLICATION_SUBRIP,

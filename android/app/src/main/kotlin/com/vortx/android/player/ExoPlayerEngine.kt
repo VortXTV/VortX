@@ -265,18 +265,16 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // DefaultHttpDataSource factory so both the manifest and media requests carry them. A muxed trailer /
         // worker-fallback trailer (single [url], [userAgent] possibly set) rides this path; fold its UA in.
         val trailerUa = playable.userAgent?.takeIf { it.isNotEmpty() }
-        val mediaSourceFactory = if (playable.headers.isNotEmpty() || trailerUa != null) {
-            val http = DefaultHttpDataSource.Factory().apply {
-                if (playable.headers.isNotEmpty()) setDefaultRequestProperties(playable.headers)
-                // A muxed googlevideo trailer (single proxied url) still needs the minting UA as the
-                // belt-and-suspenders fallback for the raw-URL path (UA/URL lockstep).
-                trailerUa?.let { setUserAgent(it) }
-                setAllowCrossProtocolRedirects(true)
-            }
-            DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)
-        } else {
-            DefaultMediaSourceFactory(appContext)
+        val http = DefaultHttpDataSource.Factory().apply {
+            if (playable.headers.isNotEmpty()) setDefaultRequestProperties(playable.headers)
+            // A muxed googlevideo trailer (single proxied url) still needs the minting UA as the
+            // belt-and-suspenders fallback for the raw-URL path (UA/URL lockstep).
+            trailerUa?.let { setUserAgent(it) }
+            // Add-ons frequently redirect signed links across http/https CDN endpoints. This must apply
+            // even to ordinary empty-header streams, not only the header-gated branch above.
+            setAllowCrossProtocolRedirects(true)
         }
+        val mediaSourceFactory = DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)
 
         val item = MediaItem.Builder()
             .setUri(playable.url)

@@ -8,6 +8,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import com.vortx.android.player.PlayerPipBridge
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
@@ -97,6 +98,13 @@ class TvActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         routeDeepLink(intent, forceNewDelivery = true)
+    }
+
+    /// TV shares the phone Activity's pre-S Home-press PiP bridge. The bridge is intentionally a no-op
+    /// on API 31+ where params-based auto-enter owns the transition.
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        PlayerPipBridge.onUserLeaveHint()
     }
 
     private fun routeDeepLink(
