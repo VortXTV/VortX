@@ -4768,6 +4768,10 @@ struct TVPlayerView: View {
         resumeSeconds = currentTime
         resumeIsMidPlayRecovery = true   // the live play head of the stalled mount, not a stored offset
         appliedResume = false; autoAddonSubTried = false; addonSubsResolveTried = false
+        if recoveryToken == nil {
+            appliedAutoTracks = false
+            userPickedSubtitle = false
+        }
         pendingLibmpvResumeSeek = nil   // reloading the same source at a fresh mount: drop any deferred resume seek
         buffering = true
         hasStartedPlaying = false

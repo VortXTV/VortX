@@ -2721,6 +2721,10 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "private func loadIntoPlayer(",
             to: "/// Switch the playing source")
+        let tvStallReload = sourceSection(
+            tvPlayer,
+            from: "private func reloadAtPlayhead()",
+            to: "/// REQ-260721-78 option A")
         let remuxSeekMapping = sourceSection(
             engine,
             from: "func seek(to seconds: Double)",
@@ -3538,6 +3542,16 @@ enum PlayerLiveContractTests {
                     "player.configureResumeOrigin(seconds: requestedResumeOrigin)",
                     "candidateToken = player.loadFile(",
                   ]))
+        check("wiring: tvOS preserves selection only for owned AVPlayer recovery",
+              sourceContainsInOrder(tvStallReload, [
+                  "let recoveryToken = coordinator.player is AVPlayerEngineController",
+                  "if recoveryToken == nil {",
+                  "appliedAutoTracks = false",
+                  "userPickedSubtitle = false",
+                  "reusing: recoveryToken",
+              ])
+                  && tvStallReload?.components(separatedBy: "appliedAutoTracks = false").count == 2
+                  && tvStallReload?.components(separatedBy: "userPickedSubtitle = false").count == 2)
         check("wiring: subtitle sync is gated by the exact live capability on both surfaces",
               engineContract?.contains("var subtitleDelayAvailable: Bool { get }") == true
                   && engine?.contains("var subtitleDelayAvailable: Bool { externalSubActive }") == true
