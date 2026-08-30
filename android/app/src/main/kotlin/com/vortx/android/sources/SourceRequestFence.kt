@@ -39,7 +39,7 @@ internal class SourceRequestFence(initialProfileId: String) {
     private fun next(profileId: String, targetId: String?): Token {
         generation += 1L
         this.profileId = profileId
-        Token(generation, profileId, targetId).also { current = it }
+        return Token(generation, profileId, targetId).also { current = it }
     }
 
     fun invalidate(profileId: String): Long = synchronized(lock) {
