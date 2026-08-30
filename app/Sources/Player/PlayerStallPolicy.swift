@@ -79,6 +79,14 @@ struct PlayerRapidBufferingRecoveryState: Equatable {
     static let requiredStarts = 6
     static let windowSeconds: TimeInterval = 12
 
+    static func suppressionDeadline(from now: TimeInterval) -> TimeInterval {
+        now + windowSeconds
+    }
+
+    static func isSuppressed(now: TimeInterval, until deadline: TimeInterval) -> Bool {
+        now < deadline
+    }
+
     private(set) var bufferingStarts: [TimeInterval] = []
     private(set) var hasRecoveredInCurrentProgressBudget = false
 

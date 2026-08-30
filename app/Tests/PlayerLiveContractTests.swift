@@ -355,6 +355,10 @@ enum PlayerLiveContractTests {
         state.reset()
         check("rapid buffering: startup, pause, live, failure and seek suppression reset the window",
               state.bufferingStarts.isEmpty && !state.hasRecoveredInCurrentProgressBudget)
+        let seekSuppression = PlayerRapidBufferingRecoveryState.suppressionDeadline(from: 100)
+        check("rapid buffering: a seek or manual track change suppresses a full detector window",
+              PlayerRapidBufferingRecoveryState.isSuppressed(now: 111.999, until: seekSuppression)
+                  && !PlayerRapidBufferingRecoveryState.isSuppressed(now: 112, until: seekSuppression))
 
         state.reset()
         // First observed buffering edge in the Reddit report was 11:01:58; six reported starts land well
@@ -4112,6 +4116,7 @@ enum PlayerLiveContractTests {
               sourceContainsInOrder(rapidBufferingRecovery, [
                   "hasStartedPlaying",
                   "firstFrameRenderedAt != nil",
+                  "coordinator.player is MPVMetalViewController",
                   "!isPaused",
                   "!loadFailed",
                   "!isCurrentLiveStream",
@@ -4121,6 +4126,30 @@ enum PlayerLiveContractTests {
                   "reloadAtPlayhead()",
                   ".hopSource",
                   "hopToNextSource(reason: \"rapid cache starvation\"",
+              ]))
+        check("wiring: user seeks and track changes start a full rapid-buffer suppression window",
+              tvPlayer?.contains("private func suppressRapidBufferingRecovery(reason: String)") == true
+                  && tvPlayer?.contains("PlayerRapidBufferingRecoveryState.suppressionDeadline") == true
+                  && tvPlayer?.contains("PlayerRapidBufferingRecoveryState.isSuppressed") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user seek\")") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user relative seek\")") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user audio track\")") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user subtitle off\")") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user embedded subtitle\")") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user external subtitle\")") == true
+                  && tvPlayer?.contains("suppressRapidBufferingRecovery(reason: \"user pooled subtitle\")") == true)
+        check("wiring: refused stall reload restores the still-live surface state",
+              sourceContainsInOrder(tvStallReload, [
+                  "let previousAppliedResume = appliedResume",
+                  "let previousAppliedAutoTracks = appliedAutoTracks",
+                  "let previousBuffering = buffering",
+                  "let previousHasStartedPlaying = hasStartedPlaying",
+                  "guard issuedToken != nil else {",
+                  "appliedResume = previousAppliedResume",
+                  "appliedAutoTracks = previousAppliedAutoTracks",
+                  "buffering = previousBuffering",
+                  "hasStartedPlaying = previousHasStartedPlaying",
+                  "firstFrameRenderedAt = previousFirstFrameRenderedAt",
               ]))
         check("wiring: periodic playhead reporting never enters the publication lock",
               playheadReceipt?.contains("playbackClockLock.lock()") == true
