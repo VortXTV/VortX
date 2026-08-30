@@ -247,9 +247,22 @@ data class PlayerState(
     /// a dead black frame. Mutually exclusive with [hasEnded] by construction: a failed source must
     /// never read as a finished one (the host's next-episode auto-advance keys off [hasEnded]).
     val hasError: Boolean = false,
+    /** Same-source engine demotion request. This is not a bad-source verdict. */
+    val engineFallbackReason: EngineFallbackReason? = null,
     val audioTracks: List<PlayerTrack> = emptyList(),
     val subtitleTracks: List<PlayerTrack> = emptyList(),
 )
+
+enum class EngineFallbackReason {
+    SURFACE_ATTACH_FAILED,
+    AUDIO_OUTPUT_FAILED,
+}
+
+internal fun PlayerState.requestEngineFallback(reason: EngineFallbackReason): PlayerState =
+    copy(engineFallbackReason = reason)
+
+internal fun shouldDemoteEngine(reason: EngineFallbackReason?, alreadyDemoted: Boolean): Boolean =
+    reason != null && !alreadyDemoted
 
 /** Fresh per-item state. No terminal, timing, buffering, or track data may leak across [PlayerEngine.load]. */
 internal fun freshPlayerStateForLoad(): PlayerState = PlayerState(isBuffering = true)

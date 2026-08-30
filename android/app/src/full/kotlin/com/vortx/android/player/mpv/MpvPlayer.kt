@@ -13,6 +13,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
+import com.vortx.android.player.EngineFallbackReason
 import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.PlayerChapter
@@ -22,6 +23,7 @@ import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
 import com.vortx.android.player.recoverNativeFailure
+import com.vortx.android.player.requestEngineFallback
 import com.vortx.android.player.tuning.AdaptiveTuning
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -58,7 +60,7 @@ import java.util.concurrent.atomic.AtomicLong
 /// per-file header handling (`http-header-fields`), same external-subtitle mount (`sub-add`).
 ///
 /// Fail-soft: constructed only through [com.vortx.android.player.MpvEngineFactory], which returns
-/// null when [MPVLib.create] fails; a surface-attach failure additionally flips [surfaceFailed], which
+/// null when [MPVLib.create] fails; runtime engine failures publish [EngineFallbackReason], which
 /// the caller reads to demote to ExoPlayer. mpv callbacks arrive on a native worker thread, so [state]
 /// is updated with a plain volatile write to a [MutableStateFlow] (thread-safe).
 class MpvPlayer private constructor(
@@ -82,12 +84,6 @@ class MpvPlayer private constructor(
     /// makes mpv flag BOTH tracks `selected`. Mirrors Apple `primarySubtitleID` / `secondarySubtitleID`.
     override val primarySubtitleId: Int get() = mpv.getPropertyInt(PROP_SID) ?: -1
     override val secondarySubtitleId: Int get() = mpv.getPropertyInt(PROP_SECONDARY_SID) ?: -1
-
-    /// Set true if attaching the render surface ever throws. The caller can consult it to fall back to
-    /// ExoPlayer on a hard surface failure instead of showing a black frame.
-    @Volatile
-    var surfaceFailed: Boolean = false
-        private set
 
     /// True once real playback happened for the current file. This controls connecting/buffering and
     /// deferred-resume behavior only. It must never infer terminal reason: a midstream decoder or network
@@ -134,8 +130,6 @@ class MpvPlayer private constructor(
     private var memoryShedConsumed = false
     private var memoryShedActive = false
     private var memoryShedPositionMs = 0L
-    @Volatile private var userPausedIntent = false
-    private var preservePauseOnForeground = false
 
     private val observer = object : MPVLib.EventObserver {
         override fun eventProperty(name: String) {
@@ -312,8 +306,6 @@ class MpvPlayer private constructor(
         }
         hasLoadedSource = true
         playbackStarted = false
-        userPausedIntent = false
-        preservePauseOnForeground = false
 
         // Every file starts from the known network-identity baseline. This player instance is reused across
         // `loadfile replace`, so conditional SET-only writes would leak a prior source's Referer / custom UA
@@ -472,12 +464,6 @@ class MpvPlayer private constructor(
     override fun togglePause() {
         val paused = mpv.getPropertyString(PROP_PAUSE) == "yes"
         mpv.setPropertyString(PROP_PAUSE, if (paused) "no" else "yes")
-    }
-
-    /** WHY audit 05.5: only chrome transport intent survives an app background pause. System and route
-     * pauses remain transient so foregrounding can resume them. Called reflectively by the shared screen. */
-    fun setUserPausedIntent(paused: Boolean) {
-        userPausedIntent = paused
     }
 
     override fun seekTo(positionMs: Long) {
@@ -734,16 +720,12 @@ class MpvPlayer private constructor(
         // Drop video decode off-screen either way (matches Apple enterBackground: `vid=no`), which saves
         // power while backgrounded. Pause the audio too ONLY when "keep playing in the background" is off.
         val pauseInBackground = !com.vortx.android.player.extras.KeepPlayingBackgroundSetting.isEnabled(appContext)
-        // WHY audit 05.5: preserve only a deliberate chrome pause. System and route-loss pauses still resume.
-        preservePauseOnForeground = pauseInBackground && _state.value.isPaused && userPausedIntent
         if (pauseInBackground) pause()
         mpv.setPropertyString(PROP_VID, "no")
     }
 
     override fun onEnterForeground() {
         mpv.setPropertyString(PROP_VID, "auto")
-        if (!preservePauseOnForeground) play()
-        preservePauseOnForeground = false
     }
 
     /// Grab the current frame as JPEG, downscaled to at most [maxWidth] wide. The libmpv half of the
@@ -894,8 +876,8 @@ class MpvPlayer private constructor(
     }
 
     private fun failSilentAudioSource() {
-        val applied = terminalGate.onTerminal(MpvTerminalEvent(MpvTerminalReason.ERROR))
-        if (applied != null) Log.e(TAG, "libmpv audio output failed after decoded-stereo retry")
+        _state.update { it.requestEngineFallback(EngineFallbackReason.AUDIO_OUTPUT_FAILED) }
+        Log.e(TAG, "libmpv audio output failed after decoded-stereo retry; requesting Media3 fallback")
     }
 
     override fun release() {
@@ -961,7 +943,11 @@ class MpvPlayer private constructor(
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
                             runCatching { mpv.attachSurface(holder.surface) }
-                                .onFailure { surfaceFailed = true }
+                                .onFailure {
+                                    _state.update {
+                                        it.requestEngineFallback(EngineFallbackReason.SURFACE_ATTACH_FAILED)
+                                    }
+                                }
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {

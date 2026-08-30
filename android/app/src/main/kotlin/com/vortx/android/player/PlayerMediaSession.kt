@@ -59,6 +59,7 @@ import java.util.concurrent.atomic.AtomicInteger
 internal class EngineSessionPlayer(
     private val engine: PlayerEngine,
     private val playable: Playable,
+    private val setUserPlaying: (Boolean) -> Unit,
     looper: Looper,
 ) : SimpleBasePlayer(looper) {
 
@@ -143,7 +144,7 @@ internal class EngineSessionPlayer(
     }
 
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
-        if (playWhenReady) engine.play() else engine.pause()
+        setUserPlaying(playWhenReady)
         return Futures.immediateVoidFuture()
     }
 
@@ -238,12 +239,13 @@ internal fun PlayerMediaSessionEffect(
     engine: PlayerEngine,
     playable: Playable,
     speed: Float,
+    setUserPlaying: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
     val currentSpeed by rememberUpdatedState(speed)
     DisposableEffect(engine, playable.url) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-        val player = EngineSessionPlayer(engine, playable, Looper.getMainLooper())
+        val player = EngineSessionPlayer(engine, playable, setUserPlaying, Looper.getMainLooper())
         // Fail-soft: a session build failure (an OEM MediaSessionManager quirk) must never take
         // playback down with it; the player simply runs session-less, as it did before this file.
         val session = runCatching {

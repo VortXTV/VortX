@@ -115,6 +115,7 @@ internal fun pipAspect(width: Int, height: Int): Pair<Int, Int> {
 @Composable
 internal fun rememberPlayerPip(
     engine: PlayerEngine,
+    onToggleUserPlayback: () -> Unit,
     isActivelyPlaying: Boolean,
     isPaused: Boolean,
     durationKnown: Boolean,
@@ -151,7 +152,7 @@ internal fun rememberPlayerPip(
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(receiverContext: Context?, intent: Intent?) {
                 when (intent?.action) {
-                    PIP_ACTION_TOGGLE_PLAY -> engine.togglePause()
+                    PIP_ACTION_TOGGLE_PLAY -> onToggleUserPlayback()
                     // Relative seeks by the viewer's Skip step (Apple `stremiox.seekStep`), the same seam the
                     // transport +/- buttons drive, so the PiP window's controls match the full player.
                     PIP_ACTION_SKIP_BACK -> engine.seekBy(-SeekStepSetting.stepMs(appContext))

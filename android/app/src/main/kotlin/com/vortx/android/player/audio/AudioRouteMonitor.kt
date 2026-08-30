@@ -25,12 +25,12 @@ class AudioRouteMonitor(
     private val appContext = context.applicationContext
     private val audioManager = appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val handler = Handler(Looper.getMainLooper())
-    private var started = false
+    private val refreshGate = AudioRouteRefreshGate()
     private var callbackRegistered = false
     private var receiverRegistered = false
 
     private val notifyRouteChanged = Runnable {
-        if (started) runCatching(onRouteChanged)
+        if (refreshGate.consume()) runCatching(onRouteChanged)
     }
 
     private val deviceCallback = object : AudioDeviceCallback() {
@@ -52,8 +52,7 @@ class AudioRouteMonitor(
 
     /** Starts listening. Repeated calls are harmless and registration failures leave playback unchanged. */
     fun start() {
-        if (started) return
-        started = true
+        if (!refreshGate.start()) return
         callbackRegistered = runCatching {
             audioManager?.registerAudioDeviceCallback(deviceCallback, handler)
             audioManager != null
@@ -67,12 +66,12 @@ class AudioRouteMonitor(
             )
             true
         }.getOrDefault(false)
+        debounce(delayMs = 0L)
     }
 
     /** Stops listening and cancels any pending coalesced transaction. Repeated calls are harmless. */
     fun stop() {
-        if (!started) return
-        started = false
+        if (!refreshGate.stop()) return
         handler.removeCallbacks(notifyRouteChanged)
         if (callbackRegistered) runCatching { audioManager?.unregisterAudioDeviceCallback(deviceCallback) }
         if (receiverRegistered) runCatching { appContext.unregisterReceiver(noisyReceiver) }
@@ -80,14 +79,46 @@ class AudioRouteMonitor(
         receiverRegistered = false
     }
 
-    private fun debounce() {
-        if (!started) return
+    private fun debounce(delayMs: Long = ROUTE_DEBOUNCE_MS) {
+        if (!refreshGate.schedule()) return
         // WHY: one physical route switch emits several device events; apply policy once after they settle.
         handler.removeCallbacks(notifyRouteChanged)
-        handler.postDelayed(notifyRouteChanged, ROUTE_DEBOUNCE_MS)
+        handler.postDelayed(notifyRouteChanged, delayMs)
     }
 
     private companion object {
         const val ROUTE_DEBOUNCE_MS = 500L
+    }
+}
+
+/** Pure idempotence/coalescing state behind [AudioRouteMonitor]'s main-thread Handler. */
+internal class AudioRouteRefreshGate {
+    private var started = false
+    private var pending = false
+
+    @Synchronized fun start(): Boolean {
+        if (started) return false
+        started = true
+        pending = true
+        return true
+    }
+
+    @Synchronized fun schedule(): Boolean {
+        if (!started) return false
+        pending = true
+        return true
+    }
+
+    @Synchronized fun consume(): Boolean {
+        if (!started || !pending) return false
+        pending = false
+        return true
+    }
+
+    @Synchronized fun stop(): Boolean {
+        if (!started) return false
+        started = false
+        pending = false
+        return true
     }
 }
