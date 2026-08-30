@@ -503,18 +503,37 @@ data class StreamSource(
 
 class ExternalSubtitle(
     val url: String,
-    val headers: Map<String, String> = emptyMap(),
+    headers: Map<String, String> = emptyMap(),
     val language: String? = null,
     val name: String? = null,
 ) {
-    // Credentials are transport metadata, not subtitle identity, and must never enter diagnostics.
-    override fun equals(other: Any?): Boolean = other is ExternalSubtitle &&
-        url == other.url && language == other.language && name == other.name
+    val headers: Map<String, String> = headers.toMap()
 
-    override fun hashCode(): Int = 31 * (31 * url.hashCode() + language.hashCode()) + name.hashCode()
+    // Credential rotation must invalidate enclosing StreamSource/StreamGroup equality so StateFlow
+    // publishes the fresh transport metadata. Keep only a one-way fingerprint in the equality key.
+    private val transportFingerprint = externalSubtitleTransportFingerprint(this.headers)
+
+    override fun equals(other: Any?): Boolean = other is ExternalSubtitle &&
+        url == other.url && language == other.language && name == other.name &&
+        transportFingerprint == other.transportFingerprint
+
+    override fun hashCode(): Int =
+        31 * (31 * (31 * url.hashCode() + language.hashCode()) + name.hashCode()) + transportFingerprint.hashCode()
 
     override fun toString(): String =
         "ExternalSubtitle(url=$url, language=$language, name=$name, headerCount=${headers.size})"
+}
+
+private fun externalSubtitleTransportFingerprint(headers: Map<String, String>): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+    headers.entries.sortedWith(compareBy({ it.key }, { it.value })).forEach { (name, value) ->
+        listOf(name, value).forEach { field ->
+            val bytes = field.toByteArray(Charsets.UTF_8)
+            digest.update(java.nio.ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes.size).array())
+            digest.update(bytes)
+        }
+    }
+    return digest.digest().joinToString(separator = "") { byte -> "%02x".format(byte) }
 }
 
 /// Sources grouped by the add-on that returned them, mirroring `CoreStreamSourceGroup`. The detail

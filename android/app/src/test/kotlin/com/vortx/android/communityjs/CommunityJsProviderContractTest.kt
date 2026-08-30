@@ -1,5 +1,8 @@
 package com.vortx.android.communityjs
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.Path
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -73,5 +76,26 @@ class CommunityJsProviderContractTest {
         assertTrue(fence.publishIfCurrent(42) {})
         fence.invalidate()
         assertFalse(fence.publishIfCurrent(42) { error("invalidated request published") })
+    }
+
+    @Test
+    fun `late broker binding cannot execute after cancellation`() {
+        val sourcePath = sequenceOf(
+            Path.of("src/main/kotlin/com/vortx/android/communityjs/CommunityJsRuntime.kt"),
+            Path.of("app/src/main/kotlin/com/vortx/android/communityjs/CommunityJsRuntime.kt"),
+        ).first(Files::exists)
+        val source = String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8)
+        val connected = source.substringAfter("override fun onServiceConnected")
+            .substringBefore("override fun onServiceDisconnected")
+
+        val inactiveGuard = connected.indexOf("if (!continuation.isActive)")
+        val cleanup = connected.indexOf("cleanup()", startIndex = inactiveGuard)
+        val brokerAssignment = connected.indexOf("broker = ICommunityJsBroker.Stub.asInterface(service)")
+        val execute = connected.indexOf("broker?.execute(")
+
+        assertTrue(inactiveGuard >= 0)
+        assertTrue(cleanup > inactiveGuard)
+        assertTrue(brokerAssignment > cleanup)
+        assertTrue(execute > brokerAssignment)
     }
 }

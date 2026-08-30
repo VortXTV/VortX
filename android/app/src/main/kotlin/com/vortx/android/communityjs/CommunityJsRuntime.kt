@@ -107,6 +107,10 @@ class CommunityJsRuntime(
         }
         connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
+                if (!continuation.isActive) {
+                    cleanup()
+                    return
+                }
                 broker = ICommunityJsBroker.Stub.asInterface(service)
                 runCatching {
                     broker?.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,

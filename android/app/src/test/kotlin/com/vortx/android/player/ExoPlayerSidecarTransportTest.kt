@@ -2,11 +2,15 @@ package com.vortx.android.player
 
 import com.vortx.android.model.ExternalSubtitle
 import com.vortx.android.model.Playable
+import com.vortx.android.model.StreamGroup
+import com.vortx.android.model.StreamSource
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -78,7 +82,7 @@ class ExoPlayerSidecarTransportTest {
         assertTrue(plan.toString().contains("videoHeaderCount=1"))
         assertFalse(plan == Media3RequestHeaderPlan(mapOf("Authorization" to secret), listOf(mapOf("X-Token" to secret))))
         assertFalse(subtitle.toString().contains(secret))
-        assertEquals(
+        assertNotEquals(
             subtitle,
             ExternalSubtitle(
                 url = subtitle.url,
@@ -87,6 +91,66 @@ class ExoPlayerSidecarTransportTest {
                 name = subtitle.name,
             ),
         )
+    }
+
+    @Test
+    fun `rotated sidecar credential publishes through groups and reaches playback plan`() {
+        fun groupWith(token: String): StreamGroup = StreamGroup(
+            addon = "Provider",
+            streams = listOf(
+                StreamSource(
+                    id = "stable-source",
+                    addon = "Provider",
+                    title = "Movie",
+                    url = "https://video.example/movie.mkv",
+                    externalSubtitleTracks = listOf(
+                        ExternalSubtitle(
+                            url = "https://subs.example/en.vtt",
+                            headers = mapOf("Authorization" to token),
+                            language = "en",
+                            name = "English",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val oldSecret = "old-secret"
+        val rotatedSecret = "rotated-secret"
+        val groups = MutableStateFlow(listOf(groupWith(oldSecret)))
+        groups.value = listOf(groupWith(rotatedSecret))
+
+        val publishedSubtitle = groups.value.single().streams.single().externalSubtitleTracks.single()
+        val playable = Playable(
+            url = "https://video.example/movie.mkv",
+            title = "Movie",
+            externalSubtitleTracks = listOf(publishedSubtitle),
+        )
+        val plan = media3RequestHeaderPlan(playable, normalizedExternalSubtitles(playable))
+
+        assertEquals(mapOf("Authorization" to rotatedSecret), publishedSubtitle.headers)
+        assertEquals(mapOf("Authorization" to rotatedSecret), plan.subtitleHeaders(0))
+        assertFalse(publishedSubtitle.toString().contains(oldSecret))
+        assertFalse(publishedSubtitle.toString().contains(rotatedSecret))
+    }
+
+    @Test
+    fun `sidecar snapshots caller-owned header maps`() {
+        val callerHeaders = mutableMapOf("Authorization" to "original-secret")
+        val subtitle = ExternalSubtitle(
+            url = "https://subs.example/en.vtt",
+            headers = callerHeaders,
+            language = "en",
+            name = "English",
+        )
+        val originalHash = subtitle.hashCode()
+
+        callerHeaders["Authorization"] = "mutated-secret"
+
+        assertEquals(mapOf("Authorization" to "original-secret"), subtitle.headers)
+        assertEquals(originalHash, subtitle.hashCode())
+        assertFalse(subtitle.toString().contains("original-secret"))
+        assertFalse(subtitle.toString().contains("mutated-secret"))
     }
 
     @Test
