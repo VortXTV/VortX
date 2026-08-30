@@ -107,6 +107,14 @@ internal fun foldAddonTombstonesForSyncDown(
 
 internal const val INITIAL_SESSION_OWNER_EPOCH = 1L
 
+/** Injectable transport used only by local production-path sync tests. */
+internal typealias SyncRequestTestSeam = suspend (
+    method: String,
+    path: String,
+    body: JSONObject?,
+    bearerToken: String?,
+) -> Pair<Int, JSONObject?>
+
 /**
  * Publishes a session value only after its encrypted persistence mutation succeeds. Failed replacement
  * and clear operations leave [value] unchanged, so live state and restart state cannot disagree.
@@ -889,6 +897,9 @@ class VortXSyncManager(context: Context) {
     /** IO scope for the debounced auto-push (requestSyncSoon) and background catch-up pulls. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    @Volatile private var requestTestSeam: SyncRequestTestSeam? = null
+    @Volatile private var versionedPayloadTestObserver: (() -> Unit)? = null
+
     /** The roster/overlay store the sync engine reads + folds into. Set by [attachSyncSeams]. */
     @Volatile private var profileStore: ProfileStore? = null
 
@@ -1354,6 +1365,26 @@ class VortXSyncManager(context: Context) {
      * of the public API (the data key never leaves this package).
      */
     internal fun currentSession(): Session? = session
+
+    /**
+     * Installs an in-memory signed-in state and transport for a local test. It bypasses encrypted session
+     * persistence only for setup; [syncDown] and every H-1/H-2 pull, decrypt, and apply guard remain live.
+     */
+    internal fun installSyncTestSeam(
+        testSession: Session,
+        highWaterVersion: Long,
+        transport: SyncRequestTestSeam,
+        onVersionedPayloadApply: () -> Unit = {},
+    ) {
+        require(testSession.account.id.isNotBlank())
+        sessionState.restore(testSession)
+        _account.value = testSession.account
+        _sessionUiState.value = SessionUiState.SignedIn(testSession.account)
+        syncState.setLastVersion(testSession.account.id, highWaterVersion)
+        requestTestSeam = transport
+        versionedPayloadTestObserver = onVersionedPayloadApply
+        refreshSettingsShadow()
+    }
 
     // MARK: - Encrypted sync document: the engine (syncUp / syncDown)
     //
@@ -1904,6 +1935,7 @@ class VortXSyncManager(context: Context) {
         if (!shouldApplyVersionedPayload) {
             return libraryTombstonesChanged || addonTombstonesChanged
         }
+        versionedPayloadTestObserver?.invoke()
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
             pulledBlob = doc.opt("settings"),
             fallbackRoster = parsed.roster,
@@ -2213,6 +2245,14 @@ class VortXSyncManager(context: Context) {
         bearerToken: String? = null,
         callPermit: SessionOperationCoordinator.OutboundCallPermit,
     ): Pair<Int, JSONObject?> {
+        requestTestSeam?.let { testTransport ->
+            if (!callPermit.isCurrent()) return 0 to null
+            return try {
+                testTransport(method, path, body, bearerToken)
+            } finally {
+                callPermit.close()
+            }
+        }
         try {
             return withContext(Dispatchers.IO) {
                 val bodyBytes = body?.toString()?.toByteArray(Charsets.UTF_8)
