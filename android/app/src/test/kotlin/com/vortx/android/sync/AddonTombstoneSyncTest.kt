@@ -41,7 +41,17 @@ class AddonTombstoneSyncTest {
                     ),
             ),
         )
-        assertTrue(tombstones.merge(pulled.deletedAddons, pulled.deletedAddonsTs))
+        // syncDown calls this production seam before its equal/older-version return, so the remote stamp
+        // converges even when the rest of the account document is skipped by version-wins.
+        val equalVersionFold = foldAddonTombstonesForSyncDown(
+            tombstones = tombstones,
+            parsed = pulled,
+            pulledVersion = 10L,
+            lastSyncedVersion = 10L,
+            force = false,
+        )
+        assertTrue(equalVersionFold.changed)
+        assertFalse(equalVersionFold.shouldApplyVersionedPayload)
         assertTrue(url in tombstones.all())
 
         // EngineStremioRepository calls forget only after a successful explicit install.
@@ -62,8 +72,9 @@ class AddonTombstoneSyncTest {
                 .put("vortx", JSONObject().put("deletedAddons", JSONArray().put(appLegacy))),
         )
 
-        assertTrue(tombstones.merge(pulled.deletedAddons, pulled.deletedAddonsTs))
-        assertTrue(tombstones.merge(emptyList(), emptyMap(), pulled.webAddonRemovals))
+        assertTrue(
+            foldAddonTombstonesForSyncDown(tombstones, pulled, 10L, 0L, force = false).changed,
+        )
         assertTrue(appLegacy in tombstones.all())
         assertTrue(webLegacy in tombstones.all())
 
@@ -71,6 +82,57 @@ class AddonTombstoneSyncTest {
         now = 600.0
         assertTrue(tombstones.forget(appLegacy))
         assertFalse(appLegacy in tombstones.all())
+    }
+
+    @Test
+    fun `add-on wire parsing ignores malformed mixed entries`() {
+        val valid = "https://valid.example/manifest.json"
+        val parsed = VortXSyncDoc.parse(
+            JSONObject()
+                .put(
+                    "webAddonRemovals",
+                    JSONArray().put(valid).put(99).put(JSONObject.NULL).put(JSONObject().put("url", valid)),
+                )
+                .put(
+                    "vortx",
+                    JSONObject()
+                        .put(
+                            "deletedAddons",
+                            JSONArray().put(valid).put(false).put(JSONObject.NULL).put(JSONArray().put(valid)),
+                        )
+                        .put(
+                            "deletedAddonsTs",
+                            JSONObject()
+                                .put(valid, JSONObject().put("removedAt", 123.0).put("addedAt", 122.0))
+                                .put("not-an-object", "bad")
+                                .put("null-entry", JSONObject.NULL)
+                                .put("non-numeric", JSONObject().put("removedAt", "bad")),
+                        ),
+                ),
+        )
+
+        assertEquals(listOf(valid), parsed.deletedAddons)
+        assertEquals(listOf(valid), parsed.webAddonRemovals)
+        assertEquals(mapOf("removedAt" to 123.0, "addedAt" to 122.0), parsed.deletedAddonsTs[valid])
+        assertEquals(setOf(valid), parsed.deletedAddonsTs.keys)
+    }
+
+    @Test
+    fun `identical legacy web removal is minted once`() {
+        var now = 700.0
+        val tombstones = AddonTombstones(MemoryAddonTombstonePersistence()) { now }
+        val webUrl = "https://web.example/manifest.json"
+        val parsed = VortXSyncDoc.parse(JSONObject().put("webAddonRemovals", JSONArray().put(webUrl)))
+
+        assertTrue(
+            foldAddonTombstonesForSyncDown(tombstones, parsed, 10L, 0L, force = false).changed,
+        )
+        val firstStamp = tombstones.timestampsForSync().getValue(webUrl).getValue("removedAt")
+        now = 900.0
+        assertFalse(
+            foldAddonTombstonesForSyncDown(tombstones, parsed, 10L, 10L, force = false).changed,
+        )
+        assertEquals(firstStamp, tombstones.timestampsForSync().getValue(webUrl).getValue("removedAt"), 0.0)
     }
 
     @Test

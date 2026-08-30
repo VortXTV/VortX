@@ -71,7 +71,7 @@ object VortXSyncDoc {
     // ---- Read: doc.vortx -> local-state view ----
 
     fun parse(doc: JSONObject): Parsed {
-        val webAddonRemovals = doc.optJSONArray("webAddonRemovals")?.toStringList() ?: emptyList()
+        val webAddonRemovals = parseAddonIds(doc.optJSONArray("webAddonRemovals"))
         val vortx = doc.optJSONObject("vortx")
             ?: return Parsed(
                 null,
@@ -125,8 +125,8 @@ object VortXSyncDoc {
         val deleted = vortx.optJSONArray("deletedProfiles")?.toStringList() ?: emptyList()
         val deletedLibrary = vortx.optJSONArray("deletedLibrary")?.toStringList() ?: emptyList()
         val deletedLibraryTs = parseLibraryTimestamps(vortx.optJSONObject("deletedLibraryTs"))
-        val deletedAddons = vortx.optJSONArray("deletedAddons")?.toStringList() ?: emptyList()
-        val deletedAddonsTs = parseLibraryTimestamps(vortx.optJSONObject("deletedAddonsTs"))
+        val deletedAddons = parseAddonIds(vortx.optJSONArray("deletedAddons"))
+        val deletedAddonsTs = parseAddonTimestamps(vortx.optJSONObject("deletedAddonsTs"))
         val active = vortx.optStringOrNull("activeProfile")
         return Parsed(
             roster,
@@ -153,6 +153,32 @@ object VortXSyncDoc {
                     finiteClock(source.opt("addedAt"))?.let { put("addedAt", it) }
                 }
                 if (entry.isNotEmpty()) put(id, entry)
+            }
+        }
+    }
+
+    /** Strict only for the add-on wire fields introduced in this sync lane. Other array readers keep their
+     * established compatibility behavior, while malformed peer values here are simply ignored. */
+    private fun parseAddonIds(raw: JSONArray?): List<String> {
+        raw ?: return emptyList()
+        return buildList {
+            for (index in 0 until raw.length()) {
+                (raw.opt(index) as? String)?.let(::add)
+            }
+        }
+    }
+
+    /** Accept only object-shaped per-URL stamp entries with finite numeric clocks. */
+    private fun parseAddonTimestamps(raw: JSONObject?): Map<String, Map<String, Double>> {
+        raw ?: return emptyMap()
+        return buildMap {
+            for (url in raw.keys()) {
+                val source = raw.opt(url) as? JSONObject ?: continue
+                val entry = buildMap {
+                    finiteClock(source.opt("removedAt"))?.let { put("removedAt", it) }
+                    finiteClock(source.opt("addedAt"))?.let { put("addedAt", it) }
+                }
+                if (entry.isNotEmpty()) put(url, entry)
             }
         }
     }

@@ -64,6 +64,43 @@ internal fun applyAddonTombstonesToVortx(
     return vortx
 }
 
+/**
+ * The version-independent add-on portion of `syncDown`: a successfully decrypted account doc always advances
+ * its monotone LWW tombstone state before `syncDown` decides whether profile/settings payload is old enough to
+ * skip. Keeping this as a production seam makes the equal-version convergence rule directly testable.
+ */
+internal data class AddonTombstoneSyncDownFold(
+    val changed: Boolean,
+    val shouldApplyVersionedPayload: Boolean,
+)
+
+internal fun foldAddonTombstonesForSyncDown(
+    tombstones: AddonTombstones,
+    parsed: VortXSyncDoc.Parsed,
+    pulledVersion: Long,
+    lastSyncedVersion: Long,
+    force: Boolean,
+): AddonTombstoneSyncDownFold {
+    val appChanged = if (parsed.deletedAddons.isEmpty() && parsed.deletedAddonsTs.isEmpty()) {
+        false
+    } else {
+        tombstones.merge(parsed.deletedAddons, parsed.deletedAddonsTs)
+    }
+    val webChanged = if (parsed.webAddonRemovals.isEmpty()) {
+        false
+    } else {
+        tombstones.merge(
+            legacyIds = emptyList(),
+            stamps = emptyMap(),
+            webIds = parsed.webAddonRemovals,
+        )
+    }
+    return AddonTombstoneSyncDownFold(
+        changed = appChanged || webChanged,
+        shouldApplyVersionedPayload = force || pulledVersion > lastSyncedVersion,
+    )
+}
+
 internal const val INITIAL_SESSION_OWNER_EPOCH = 1L
 
 /**
@@ -1799,8 +1836,10 @@ class VortXSyncManager(context: Context) {
             else -> return false                                 // .empty / .failed: never wipe local
         }
         val parsed = VortXSyncDoc.parse(doc)
+        val lastVersion = lastSyncedVersion(lease)
         var libraryTombstonesChanged = false
         var addonTombstonesChanged = false
+        var shouldApplyVersionedPayload = false
         val foldedTombstones = withContext(Dispatchers.Main) {
             publishIfSyncLeaseCurrent(lease) {
                 applyingRemote = true
@@ -1820,19 +1859,15 @@ class VortXSyncManager(context: Context) {
                     // it lets a newer peer reinstall (addedAt) make a previously removed URL present again.
                     // Fold the persistent, stamp-less web mirror second and only here: merge mints it only
                     // for an entirely untracked URL, so a known explicit Android install is never re-removed.
-                    if (parsed.deletedAddons.isNotEmpty() || parsed.deletedAddonsTs.isNotEmpty()) {
-                        addonTombstonesChanged = addonTombstones.merge(
-                            parsed.deletedAddons,
-                            parsed.deletedAddonsTs,
-                        )
-                    }
-                    if (parsed.webAddonRemovals.isNotEmpty()) {
-                        addonTombstonesChanged = addonTombstones.merge(
-                            legacyIds = emptyList(),
-                            stamps = emptyMap(),
-                            webIds = parsed.webAddonRemovals,
-                        ) || addonTombstonesChanged
-                    }
+                    val addonFold = foldAddonTombstonesForSyncDown(
+                        tombstones = addonTombstones,
+                        parsed = parsed,
+                        pulledVersion = version,
+                        lastSyncedVersion = lastVersion,
+                        force = force,
+                    )
+                    addonTombstonesChanged = addonFold.changed
+                    shouldApplyVersionedPayload = addonFold.shouldApplyVersionedPayload
                     if (addonTombstonesChanged) {
                         doc.optJSONObject("vortx")?.let { applyAddonTombstonesToVortx(it, addonTombstones) }
                     }
@@ -1845,7 +1880,7 @@ class VortXSyncManager(context: Context) {
         if (libraryTombstonesChanged || addonTombstonesChanged) requestSyncSoon()
         // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Library and add-on
         // tombstone stamps are monotone MAX folds and therefore apply from every successfully decrypted doc.
-        if (!force && version <= lastSyncedVersion(lease)) {
+        if (!shouldApplyVersionedPayload) {
             return libraryTombstonesChanged || addonTombstonesChanged
         }
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
