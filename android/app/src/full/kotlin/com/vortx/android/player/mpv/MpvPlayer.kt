@@ -10,6 +10,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import com.vortx.android.model.Playable
+import com.vortx.android.model.ExternalSubtitle
+import com.vortx.android.communityjs.CommunityJsUrlPolicy
+import com.vortx.android.engine.PublicAddressPolicy
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
@@ -24,6 +27,7 @@ import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
+import com.vortx.android.player.normalizedExternalSubtitles
 import com.vortx.android.player.recoverNativeFailure
 import com.vortx.android.player.requestEngineFallback
 import com.vortx.android.player.tuning.AdaptiveTuning
@@ -33,6 +37,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -45,8 +51,8 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
-import java.net.URI
 import java.net.URL
+import java.net.URI
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -403,7 +409,7 @@ class MpvPlayer private constructor(
 
         // WHY audit 07.5: never hand an untrusted remote subtitle URL to mpv. Download under the same
         // 8 MiB / 20s bounds as Apple, then mount only the local cache file. Failure never affects playback.
-        for (sub in playable.externalSubtitles) {
+        for (sub in MpvExternalSubtitleTransport.normalizedTracks(playable)) {
             mountExternalSubtitle(sub, loadGeneration)
         }
 
@@ -515,76 +521,88 @@ class MpvPlayer private constructor(
     }
 
     override fun addExternalSubtitle(url: String) {
-        mountExternalSubtitle(url, subtitleLoadGeneration.get())
+        mountExternalSubtitle(ExternalSubtitle(url = url), subtitleLoadGeneration.get())
     }
 
-    private fun mountExternalSubtitle(source: String, generation: Long) {
+    private fun mountExternalSubtitle(source: ExternalSubtitle, generation: Long) {
         runtimePolicyScope.launch(Dispatchers.IO) {
             val local = boundedSubtitleFile(source)
             if (local == null) {
                 Log.w(TAG, "external subtitle skipped: bounded fetch failed")
                 return@launch
             }
-            if (subtitleLoadGeneration.get() != generation) return@launch
+            if (!MpvExternalSubtitleTransport.shouldMount(generation, subtitleLoadGeneration.get())) return@launch
             mpv.command(arrayOf("sub-add", local.absolutePath))
         }
     }
 
-    private fun boundedSubtitleFile(source: String): File? {
-        val uri = runCatching { URI(source) }.getOrNull()
-        if (uri?.scheme == null || uri.scheme.equals("file", ignoreCase = true)) {
-            val file = if (uri?.scheme == null) File(source) else runCatching { File(uri) }.getOrNull()
-            return file?.takeIf { it.isFile && it.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES }
-        }
-        if (!uri.scheme.equals("https", ignoreCase = true) || uri.host.isNullOrBlank()) return null
-
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest(source.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
+    private suspend fun boundedSubtitleFile(source: ExternalSubtitle): File? {
+        val request = MpvExternalSubtitleTransport.requestFor(source) ?: return null
+        val uri = request.uri
+        val digest = MpvExternalSubtitleTransport.cacheKey(request)
         val extension = uri.path?.substringAfterLast('.', "")
             ?.lowercase()?.takeIf { it in SUBTITLE_EXTENSIONS } ?: "srt"
         val target = File(appContext.cacheDir, "vortx-extsub-$digest.$extension")
         if (target.isFile && target.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES) return target
 
-        var connection: HttpURLConnection? = null
+        var temp: File? = null
         return try {
-            connection = (URL(source).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
-                readTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
-                instanceFollowRedirects = false
-                useCaches = false
-            }
-            if (connection.responseCode !in 200..299 ||
-                connection.contentLengthLong > MAX_EXTERNAL_SUBTITLE_BYTES
-            ) return null
-            val tmp = File.createTempFile("vortx-extsub-", ".$extension", appContext.cacheDir)
-            val complete = connection.inputStream.use { input ->
-                tmp.outputStream().use outputUse@{ output ->
-                    val buffer = ByteArray(16 * 1024)
-                    var total = 0L
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        total += read
-                        if (total > MAX_EXTERNAL_SUBTITLE_BYTES) return@outputUse false
-                        output.write(buffer, 0, read)
+            var current = request
+            repeat(MpvExternalSubtitleTransport.MAX_REDIRECTS + 1) { hop ->
+                var connection: HttpURLConnection? = null
+                try {
+                    connection = (URL(current.uri.toString()).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
+                        readTimeout = EXTERNAL_SUBTITLE_TIMEOUT_MS
+                        instanceFollowRedirects = false
+                        useCaches = false
+                        current.headers.forEach { (name, value) -> setRequestProperty(name, value) }
                     }
-                    total > 0
+                    val code = connection.responseCode
+                    if (code in 300..399) {
+                        val redirect = MpvExternalSubtitleTransport.redirectFor(
+                            current = current,
+                            location = connection.getHeaderField("Location"),
+                            hop = hop,
+                        ) ?: return null
+                        current = redirect
+                        return@repeat
+                    }
+                    if (code !in 200..299 || connection.contentLengthLong > MAX_EXTERNAL_SUBTITLE_BYTES) return null
+                    temp = File.createTempFile("vortx-extsub-", ".$extension", appContext.cacheDir)
+                    val complete = connection.inputStream.use { input ->
+                        temp!!.outputStream().use outputUse@{ output ->
+                            val buffer = ByteArray(16 * 1024)
+                            var total = 0L
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                total += read
+                                if (total > MAX_EXTERNAL_SUBTITLE_BYTES) return@outputUse false
+                                output.write(buffer, 0, read)
+                            }
+                            total > 0
+                        }
+                    }
+                    if (!complete) return null
+                    if (temp!!.renameTo(target)) {
+                        temp = null
+                        return target
+                    }
+                    if (target.isFile && target.length() in 1..MAX_EXTERNAL_SUBTITLE_BYTES) return target
+                    return null
+                } finally {
+                    connection?.disconnect()
                 }
             }
-            if (!complete) {
-                tmp.delete()
-                null
-            } else if (tmp.renameTo(target)) {
-                target
-            } else {
-                tmp
-            }
-        } catch (_: Throwable) {
+            null
+        } catch (error: Throwable) {
+            MpvExternalSubtitleTransport.rethrowIfFatal(error)
             null
         } finally {
-            connection?.disconnect()
+            temp?.delete()
         }
     }
 
@@ -1153,6 +1171,105 @@ internal fun attachMpvSurfaceOrFallback(attach: () -> Unit): EngineFallbackReaso
         true
     } ?: false
     return if (attached) null else EngineFallbackReason.SURFACE_ATTACH_FAILED
+}
+
+/**
+ * Sidecar-only HTTP admission and cache identity. This deliberately remains separate from mpv's stream
+ * properties: a subtitle credential must never be replayed against the video URL or written to libmpv.
+ */
+internal object MpvExternalSubtitleTransport {
+    const val MAX_REDIRECTS = 5
+    private const val MAX_HEADER_COUNT = 32
+    private const val MAX_HEADER_BYTES = 8 * 1024
+    private val HEADER_TOKEN = Regex("[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+    private val FORBIDDEN_HEADERS = setOf(
+        "host", "content-length", "transfer-encoding", "connection", "keep-alive", "te",
+        "trailer", "upgrade", "proxy-authorization", "proxy-connection",
+    )
+
+    internal data class Request(
+        val uri: URI,
+        val headers: Map<String, String>,
+    )
+
+    fun normalizedTracks(playable: Playable): List<ExternalSubtitle> =
+        normalizedExternalSubtitles(playable).distinct()
+
+    fun requestFor(subtitle: ExternalSubtitle): Request? {
+        val uri = runCatching { URI(subtitle.url) }.getOrNull() ?: return null
+        if (!CommunityJsUrlPolicy.isPublicHttpsUrl(subtitle.url) || uri.host.isNullOrBlank()) return null
+        if (runCatching { PublicAddressPolicy.requirePublic(uri.host) }.isFailure) return null
+        return Request(uri = uri, headers = sanitizeHeaders(subtitle.headers))
+    }
+
+    /** Only request identity headers that provider sidecars commonly require are admitted. */
+    fun sanitizeHeaders(headers: Map<String, String>): Map<String, String> {
+        if (headers.size > MAX_HEADER_COUNT) return emptyMap()
+        var byteCount = 0
+        val accepted = mutableListOf<Pair<String, String>>()
+        for ((rawName, rawValue) in headers) {
+            val name = rawName.trim()
+            val value = rawValue.trim()
+            val lowerName = name.lowercase()
+            if (!HEADER_TOKEN.matches(name) || value.any(::isControl) || lowerName in FORBIDDEN_HEADERS) continue
+            if (lowerName !in setOf("authorization", "referer", "user-agent") && !lowerName.startsWith("x-")) continue
+            byteCount += name.toByteArray(Charsets.UTF_8).size + value.toByteArray(Charsets.UTF_8).size
+            if (byteCount > MAX_HEADER_BYTES) return emptyMap()
+            accepted += name to value
+        }
+        return accepted.sortedWith(compareBy<Pair<String, String>>({ it.first.lowercase() }, { it.second }))
+            .toMap(LinkedHashMap())
+    }
+
+    fun cacheKey(request: Request): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        fun update(value: String) {
+            val bytes = value.toByteArray(Charsets.UTF_8)
+            digest.update(java.nio.ByteBuffer.allocate(Int.SIZE_BYTES).putInt(bytes.size).array())
+            digest.update(bytes)
+        }
+        update(request.uri.toString())
+        request.headers.entries.sortedWith(compareBy({ it.key.lowercase() }, { it.value })).forEach { (name, value) ->
+            update(name)
+            update(value)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    fun redirectFor(current: Request, location: String?, hop: Int): Request? {
+        if (hop >= MAX_REDIRECTS || location.isNullOrBlank() || location.any(::isControl)) return null
+        val next = runCatching { current.uri.resolve(location) }.getOrNull() ?: return null
+        if (!CommunityJsUrlPolicy.isPublicHttpsUrl(next.toString()) || next.host.isNullOrBlank()) return null
+        if (runCatching { PublicAddressPolicy.requirePublic(next.host) }.isFailure) return null
+        return Request(
+            uri = next,
+            headers = if (sameOrigin(current.uri, next)) current.headers else emptyMap(),
+        )
+    }
+
+    fun shouldMount(expectedGeneration: Long, currentGeneration: Long): Boolean =
+        expectedGeneration == currentGeneration
+
+    fun rethrowIfFatal(error: Throwable) {
+        when (error) {
+            is kotlinx.coroutines.CancellationException,
+            is VirtualMachineError,
+            is ThreadDeath -> throw error
+        }
+    }
+
+    private fun sameOrigin(first: URI, second: URI): Boolean =
+        first.scheme.equals(second.scheme, ignoreCase = true) &&
+            first.host.equals(second.host, ignoreCase = true) &&
+            effectivePort(first) == effectivePort(second)
+
+    private fun effectivePort(uri: URI): Int = when {
+        uri.port >= 0 -> uri.port
+        uri.scheme.equals("https", ignoreCase = true) -> 443
+        else -> -1
+    }
+
+    private fun isControl(character: Char): Boolean = character.code < 32 || character.code == 127
 }
 
 internal fun requireMpvSecurityOption(name: String, result: Int) {
