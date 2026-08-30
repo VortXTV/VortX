@@ -10,7 +10,7 @@ const startMarker = "}, function(module, exports, __webpack_require__) {\n    va
 const endMarker = "}, function(module, exports) {\n    module.exports = [ \"udp://";
 const start = source.indexOf(startMarker);
 const end = source.indexOf(endMarker, start + startMarker.length);
-if (start < 0 || end < 0 || source.indexOf(startMarker, start + 1) >= 0) {
+if (start < 0 || end < 0 || source.indexOf(startMarker, start + 1) >= 0 || source.indexOf(endMarker, end + 1) >= 0) {
     throw new Error("patch-server-proxy: unique proxy module anchors not found");
 }
 
@@ -64,7 +64,6 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
         }
         return next();
     }
-    function urlJoin(segments) { return segments.join("/").replace(/\\/+/g, "/"); }
     module.exports = { getRouter: function() {
         var router = Router(), agents = { http: new http.Agent, https: new https.Agent };
         return router.all("/:opts/:pathname(*)?", function(req, res, next) {
@@ -97,8 +96,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                 function armIdle() { clearTimeout(idle); idle = setTimeout(abort, 10000); }
                 result.body.on("data", armIdle); armIdle();
                 if (!isPlaylist) return stream.pipeline(result.body, res, settle);
-                var virtualRoot = req.originalUrl.slice(0, -req.url.length) + "/" + querystring.stringify(opts);
-                var rewrite = (function(virtualRoot, baseDest) {
+                var rewrite = (function(baseDest) {
                     var partialLine = "", eol = null;
                     function childProxy(lineUrl) {
                         var same = sameOrigin(baseDest, lineUrl), childOpts = {};
@@ -115,9 +113,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                     function parseUrl(line) {
                         var resolved = url.parse(url.resolve(url.format(baseDest), line));
                         if (resolved.protocol !== "https:" && resolved.protocol !== "http:") return line;
-                        return sameOrigin(baseDest, resolved)
-                            ? urlJoin([ virtualRoot, resolved.pathname ]) + (resolved.search || "")
-                            : childProxy(resolved);
+                        return childProxy(resolved);
                     }
                     function parseLine(line) {
                         if (!line.startsWith("#") && line.length > 0) return parseUrl(line);
@@ -137,7 +133,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                         },
                         flush: function(done) { done(null, parseLine(partialLine)); partialLine = ""; eol = null; }
                     });
-                })(virtualRoot, finalDest);
+                })(finalDest);
                 stream.pipeline(result.body, rewrite, res, settle);
             }).catch(error => {
                 clearTimeout(timer); clearTimeout(idle);
