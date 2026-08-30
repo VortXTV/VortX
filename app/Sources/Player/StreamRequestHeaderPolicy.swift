@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// The trust boundary for request headers supplied by stream add-ons.
 ///
@@ -7,7 +8,8 @@ import Foundation
 /// issuing their own seek/read ranges and can permanently starve playback after the first byte window.
 enum StreamRequestHeaderPolicy {
     private static let transportHeaders: Set<String> = [
-        "connection", "content-length", "host", "proxy-connection", "range",
+        "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "proxy-connection", "range", "te", "trailer",
         "transfer-encoding", "upgrade"
     ]
 
@@ -23,17 +25,29 @@ enum StreamRequestHeaderPolicy {
     }
 
     static func isLocalPlaybackURL(_ url: URL) -> Bool {
-        guard let rawHost = url.host?.lowercased() else { return false }
-        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        guard let rawHost = url.host else { return false }
+        return isLocalPlaybackHost(rawHost)
+    }
+
+    static func isLocalPlaybackHost(_ rawHost: String) -> Bool {
+        let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         if host == "localhost" || host == "::1" { return true }
-        if host.contains(":"), host.hasPrefix("fc") || host.hasPrefix("fd")
-            || ["fe8", "fe9", "fea", "feb"].contains(where: { host.hasPrefix($0) }) { return true }
-        let octets = host.split(separator: ".", omittingEmptySubsequences: false).compactMap { UInt8($0) }
-        guard octets.count == 4 else { return false }
-        if octets[0] == 127 || octets[0] == 10 { return true }
-        if octets[0] == 172, (16...31).contains(octets[1]) { return true }
-        if octets[0] == 192, octets[1] == 168 { return true }
-        if octets[0] == 169, octets[1] == 254 { return true }
+        var ipv4 = in_addr()
+        if host.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            let octets = withUnsafeBytes(of: &ipv4) { Array($0) }
+            if octets[0] == 127 || octets[0] == 10 { return true }
+            if octets[0] == 172, (16...31).contains(octets[1]) { return true }
+            if octets[0] == 192, octets[1] == 168 { return true }
+            if octets[0] == 169, octets[1] == 254 { return true }
+            return false
+        }
+        var ipv6 = in6_addr()
+        if host.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 {
+            let octets = withUnsafeBytes(of: &ipv6) { Array($0) }
+            if octets.dropLast().allSatisfy({ $0 == 0 }), octets.last == 1 { return true }
+            if octets[0] & 0xfe == 0xfc { return true }
+            if octets[0] == 0xfe, octets[1] & 0xc0 == 0x80 { return true }
+        }
         return false
     }
 

@@ -21,6 +21,11 @@ private struct StreamRequestHeaderPolicyTests {
             "Content-Length": "999",
             "Transfer-Encoding": "chunked",
             "Connection": "keep-alive",
+            "tE": "trailers",
+            "Trailer": "X-Checksum",
+            "Keep-Alive": "timeout=5",
+            "Proxy-Authorization": "Basic secret",
+            "Proxy-Authenticate": "Basic",
             "Upgrade": "websocket",
             "Proxy-Connection": "keep-alive",
             "Bad Name": "invalid",
@@ -30,8 +35,9 @@ private struct StreamRequestHeaderPolicyTests {
                && sanitized["Cookie"] == sentinelCookie
                && sanitized["Referer"] != nil && sanitized["User-Agent"] != nil,
                "origin identity headers survive sanitization")
-        expect(["Range", "Host", "Content-Length", "Transfer-Encoding", "Connection", "Upgrade", "Proxy-Connection"]
-            .allSatisfy { sanitized[$0] == nil },
+        let blockedNames = Set(["range", "host", "content-length", "transfer-encoding", "connection", "te", "trailer",
+                                "keep-alive", "proxy-authorization", "proxy-authenticate", "upgrade", "proxy-connection"])
+        expect(sanitized.keys.allSatisfy { !blockedNames.contains($0.lowercased()) },
                "add-on transport and framing headers are stripped")
         expect(sanitized["Bad Name"] == nil && sanitized["X-Injected"] == nil,
                "invalid names and CRLF field values are stripped")
@@ -48,6 +54,8 @@ private struct StreamRequestHeaderPolicyTests {
                "IPv6 unique-local routes are local")
         expect(StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "http://[fe80::1]/file")!),
                "IPv6 link-local routes are local")
+        expect(!StreamRequestHeaderPolicy.isLocalPlaybackHost("fczz::1"), "malformed IPv6 is remote")
+        expect(!StreamRequestHeaderPolicy.isLocalPlaybackHost("127.a.0.0.1"), "malformed IPv4 is remote")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "https://foo.strem.io/file")!),
                "a strem.io subdomain is remote")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "https://evilstrem.io/file")!),

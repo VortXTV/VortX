@@ -18,7 +18,8 @@ const patchSource = fs.readFileSync(patcher, "utf8");
 const start = "}, function(module, exports, __webpack_require__) {\n    var path = __webpack_require__(5), url = __webpack_require__(6), querystring = __webpack_require__(24), Router = __webpack_require__(100), stream = __webpack_require__(3), https = __webpack_require__(20), fetch = __webpack_require__(34)";
 const end = "}, function(module, exports) {\n    module.exports = [ \"udp://fixture\" ];\n}";
 const fixture = path.join(os.tmpdir(), `vortx-proxy-fixture-${process.pid}.js`);
-fs.writeFileSync(fixture, "var modules = [function(module, exports, __webpack_require__) {\n" + start + "\n" + end + "];\n");
+const fixtureSource = "var modules = [function(module, exports, __webpack_require__) {\n" + start + "\n" + end + "];\n";
+fs.writeFileSync(fixture, fixtureSource);
 try {
     child.execFileSync(process.execPath, [patcher, fixture], { stdio: "pipe" });
     child.execFileSync(process.execPath, ["--check", fixture], { stdio: "pipe" });
@@ -44,9 +45,13 @@ try {
         && fetchScript.indexOf('verify_sha256 "$SERVER_DEST"') < fetchScript.indexOf('node scripts/patch-server-proxy.js'),
         "only the checksum-pinned 4.21 bundle may be patched");
     const ambiguous = fixture + ".ambiguous";
-    fs.writeFileSync(ambiguous, fs.readFileSync(fixture, "utf8") + "\n" + end);
-    assert.throws(() => child.execFileSync(process.execPath, [patcher, ambiguous], { stdio: "pipe" }),
-        "a duplicate end anchor must fail closed");
+    const ambiguousSource = fixtureSource.replace(end, end + "\n" + end);
+    assert.strictEqual(ambiguousSource.split(start).length - 1, 1, "duplicate-end fixture retains exactly one start anchor");
+    assert.strictEqual(ambiguousSource.split(end).length - 1, 2, "duplicate-end fixture contains exactly two end anchors");
+    fs.writeFileSync(ambiguous, ambiguousSource);
+    const ambiguousResult = child.spawnSync(process.execPath, [patcher, ambiguous], { encoding: "utf8" });
+    assert.notStrictEqual(ambiguousResult.status, 0, "a duplicate end anchor must fail closed");
+    assert(ambiguousResult.stderr.includes("unique proxy module anchors not found"), "duplicate end reports the explicit anchor-integrity error");
     fs.unlinkSync(ambiguous);
     executeRedirectedPlaylistFixture(output).then(({ rewritten, calls }) => {
         const childURL = new URL(rewritten.trim(), "http://127.0.0.1");
@@ -59,7 +64,7 @@ try {
         assert.strictEqual(new URL(segment.target).href, "https://b.example/segment.ts",
             "following the rewritten child performs the segment request against the final origin");
         assert(!segment.headers.has("authorization"), "the executed child request contains no initial-origin authorization");
-        console.log("Embedded server proxy hardening: PASS (20 checks)");
+        console.log("Embedded server proxy hardening: PASS (23 checks)");
     }).catch(error => { process.nextTick(() => { throw error; }); });
 } finally {
     // The behavior promise has already loaded the generated module source into memory.

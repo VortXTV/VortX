@@ -63,6 +63,13 @@ private final class MockOrigin: @unchecked Sendable {
     }
 }
 
+private final class CancellationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    func record() { lock.lock(); value = true; lock.unlock() }
+    func snapshot() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+}
+
 @main
 private struct CommunityStreamGatewayBehaviorTests {
     static func main() async {
@@ -76,12 +83,44 @@ private struct CommunityStreamGatewayBehaviorTests {
         let gateway = CommunityStreamGateway(streamOperation: { request, onHead, onBody in
             try await origin.stream(request, onHead: onHead, onBody: onBody)
         })
+
+        let credentials = ["Authorization": "Bearer origin-secret", "Cookie": "session=origin-cookie",
+                           "Referer": "https://origin.example/page", "Range": "bytes=4096-8191"]
+        let originURL = URL(string: "https://origin.example/start")!
+        let sameHeaders = CommunityGatewayTransportPolicy.childHeaders(
+            credentials, parent: originURL, child: URL(string: "https://origin.example/final")!)
+        expect(sameHeaders == credentials, "pure redirect policy preserves same-origin headers")
+        let crossHeaders = CommunityGatewayTransportPolicy.childHeaders(
+            credentials, parent: originURL, child: URL(string: "https://other.example/final")!)
+        expect(crossHeaders["Range"] == "bytes=4096-8191"
+               && crossHeaders.keys.allSatisfy { !["authorization", "cookie", "referer"].contains($0.lowercased()) },
+               "pure redirect policy strips cross-origin credentials but retains transport-owned Range")
+
+        let cleanHalfClose = GatewayClientLifetime()
+        expect(!GatewayDownstreamReceivePolicy.shouldMonitor(
+            initialRead: true, complete: true, hasError: false, lifetime: cleanHalfClose),
+            "request bytes plus clean initial EOF are treated as a legal half-close")
+        let cancellationProbe = CancellationProbe()
+        let disconnectLifetime = GatewayClientLifetime()
+        disconnectLifetime.install(Task {
+            do { try await Task.sleep(nanoseconds: 10_000_000_000) }
+            catch { cancellationProbe.record() }
+        })
+        expect(!GatewayDownstreamReceivePolicy.shouldMonitor(
+            initialRead: false, complete: true, hasError: false, lifetime: disconnectLifetime),
+            "EOF observed by the post-request monitor cancels the upstream lifetime")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        expect(cancellationProbe.snapshot(), "pure lifecycle seam delivers cancellation to active upstream work")
+
         do { try await gateway.start() }
         catch {
             // Network.framework listeners are unavailable in some restricted command-line test hosts. The
             // executable remains a real loopback behavior suite and runs in full on an unrestricted macOS host.
             if String(describing: error).contains("rawValue: 22") {
-                print("Community stream gateway behavior: SKIP (Network.framework listener unavailable: \(error))")
+                if ProcessInfo.processInfo.environment["CI"] != nil {
+                    fatalError("loopback behavior unavailable in CI: \(error)")
+                }
+                print("Community stream gateway behavior: PURE PASS (\(checks) checks); LOOPBACK NOT RUN (Network.framework listener unavailable: \(error))")
                 return
             }
             fatalError("gateway start: \(error)")

@@ -212,6 +212,18 @@ final class CommunityStreamGateway: @unchecked Sendable {
                 await self.serve(connection, request: parsed)
             }
             lifetime.install(task)
+            if GatewayDownstreamReceivePolicy.shouldMonitor(initialRead: true, complete: complete, hasError: error != nil, lifetime: lifetime) {
+                self.monitorDownstream(connection, lifetime: lifetime)
+            }
+        }
+    }
+
+    private func monitorDownstream(_ connection: NWConnection, lifetime: GatewayClientLifetime) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { [weak self] _, _, complete, error in
+            guard let self else { return }
+            if GatewayDownstreamReceivePolicy.shouldMonitor(initialRead: false, complete: complete, hasError: error != nil, lifetime: lifetime) {
+                self.monitorDownstream(connection, lifetime: lifetime)
+            }
         }
     }
 
@@ -306,7 +318,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
                       JSProviderURLPolicy.default.isAllowed(next) else {
                     throw PinnedHTTPClient.Failure.redirect(redirect.head.statusCode)
                 }
-                currentHeaders = childHeaders(currentHeaders, parent: currentURL, child: next)
+                currentHeaders = CommunityGatewayTransportPolicy.childHeaders(currentHeaders, parent: currentURL, child: next)
                 currentURL = next
             } catch {
                 if state.hasSentHead { throw GatewayForwardFailure.downstreamStarted }
@@ -368,20 +380,8 @@ final class CommunityStreamGateway: @unchecked Sendable {
 
     private func rewriteChild(_ value: String, upstream: URL, headers: [String: String]) -> String {
         guard !value.isEmpty, let child = URL(string: value, relativeTo: upstream)?.absoluteURL,
-              let local = try? register(upstream: child, headers: childHeaders(headers, parent: upstream, child: child)) else { return value }
+              let local = try? register(upstream: child, headers: CommunityGatewayTransportPolicy.childHeaders(headers, parent: upstream, child: child)) else { return value }
         return local.absoluteString
-    }
-
-    private func childHeaders(_ headers: [String: String], parent: URL, child: URL) -> [String: String] {
-        guard !sameOrigin(parent, child) else { return headers }
-        let sensitive = Set(["authorization", "cookie", "origin", "referer"])
-        return headers.filter { !sensitive.contains($0.key.lowercased()) }
-    }
-
-    private func sameOrigin(_ first: URL, _ second: URL) -> Bool {
-        first.scheme?.lowercased() == second.scheme?.lowercased()
-            && first.host?.lowercased() == second.host?.lowercased()
-            && (first.port ?? 443) == (second.port ?? 443)
     }
 
     private func filteredHeaders(_ input: [String: String], bodyLength: Int, preserveLength: Bool) -> [String: String] {
@@ -446,7 +446,7 @@ private final class GatewayStartCompletion: @unchecked Sendable {
     }
 }
 
-private final class GatewayClientLifetime: @unchecked Sendable {
+final class GatewayClientLifetime: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Void, Never>?
     private var cancelled = false
@@ -465,6 +465,34 @@ private final class GatewayClientLifetime: @unchecked Sendable {
         self.task = nil
         lock.unlock()
         task?.cancel()
+    }
+}
+
+enum GatewayDownstreamReceivePolicy {
+    /// Bytes plus EOF in the initial receive are a legal TCP half-close: the player finished its GET and may
+    /// still read the response. Once the request was parsed without EOF, a later receive EOF or transport error
+    /// is a disconnect and cancels upstream. NWConnection failed/cancelled state is the remaining close signal.
+    static func shouldMonitor(initialRead: Bool, complete: Bool, hasError: Bool, lifetime: GatewayClientLifetime) -> Bool {
+        if hasError || (complete && !initialRead) { lifetime.cancel(); return false }
+        return !complete
+    }
+}
+
+enum CommunityGatewayTransportPolicy {
+    static func childHeaders(_ headers: [String: String], parent: URL, child: URL) -> [String: String] {
+        guard !sameOrigin(parent, child) else { return headers }
+        let sensitive = Set(["authorization", "cookie", "origin", "referer"])
+        return headers.filter { !sensitive.contains($0.key.lowercased()) }
+    }
+
+    static func sameOrigin(_ first: URL, _ second: URL) -> Bool {
+        first.scheme?.lowercased() == second.scheme?.lowercased()
+            && first.host?.lowercased() == second.host?.lowercased()
+            && effectivePort(first) == effectivePort(second)
+    }
+
+    private static func effectivePort(_ url: URL) -> Int? {
+        url.port ?? (url.scheme?.lowercased() == "https" ? 443 : url.scheme?.lowercased() == "http" ? 80 : nil)
     }
 }
 

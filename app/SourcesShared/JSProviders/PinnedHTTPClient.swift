@@ -37,7 +37,7 @@ enum PinnedHTTPClient {
         init(url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil) {
             self.url = url
             self.method = method.uppercased()
-            self.headers = headers
+            self.headers = PinnedHTTPClient.sanitizedRequestHeaders(headers)
             self.body = body
         }
     }
@@ -108,9 +108,8 @@ enum PinnedHTTPClient {
 
     static func requestBytes(for request: Request, endpoint: Endpoint, limits: Limits = .init()) throws -> Data {
         guard request.method == "GET" || request.method == "HEAD" else { throw Failure.unsupportedMethod }
-        let forbidden = Set(["host", "content-length", "transfer-encoding", "connection", "upgrade", "proxy-connection"])
         guard request.headers.allSatisfy({ name, value in
-            isHTTPToken(name) && !forbidden.contains(name.lowercased()) && isValidFieldValue(value)
+            isHTTPToken(name) && !requestTransportHeaders.contains(name.lowercased()) && isValidFieldValue(value)
         }) else { throw Failure.unsafeHeader }
         guard request.body == nil else { throw Failure.unsupportedMethod }
         guard let components = URLComponents(url: request.url, resolvingAgainstBaseURL: false) else { throw Failure.invalidURL }
@@ -122,6 +121,19 @@ enum PinnedHTTPClient {
         let wire = fields.joined(separator: "\r\n") + "\r\n\r\n"
         guard wire.utf8.count <= limits.maximumHeaderBytes else { throw Failure.requestTooLarge }
         return Data(wire.utf8)
+    }
+
+    private static let requestTransportHeaders: Set<String> = [
+        "connection", "content-length", "host", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"
+    ]
+
+    static func sanitizedRequestHeaders(_ headers: [String: String]) -> [String: String] {
+        headers.reduce(into: [:]) { result, entry in
+            guard isHTTPToken(entry.key), isValidFieldValue(entry.value),
+                  !requestTransportHeaders.contains(entry.key.lowercased()) else { return }
+            result[entry.key] = entry.value
+        }
     }
 
     static func execute(_ request: Request, limits: Limits = .init(), resolver: @escaping Resolver = PinnedHTTPClient.systemResolver) async throws -> Response {

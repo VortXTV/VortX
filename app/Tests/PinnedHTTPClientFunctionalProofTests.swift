@@ -60,9 +60,20 @@ struct PinnedHTTPClientFunctionalProofTests {
         var cappedPeers = PinnedHTTPClient.Limits(); cappedPeers.maximumPeers = 2; cappedPeers.maximumPeersPerFamily = 2
         let capped = try! PinnedHTTPClient.endpoints(for: signed, answers: ["1.1.1.1", "8.8.8.8", "9.9.9.9"], limits: cappedPeers)
         expect(capped.count == 2, "peer snapshot is bounded per transport policy")
-        expectFailure({ _ = try PinnedHTTPClient.requestBytes(for: .init(url: signed, headers: ["Host": "bad"]), endpoint: endpoint) }, .unsafeHeader, "caller cannot override Host")
+        let hostileRequest = try! String(decoding: PinnedHTTPClient.requestBytes(for: .init(url: signed, headers: [
+            "Authorization": "Bearer safe", "Range": "bytes=10-20", "Host": "bad", "Content-Length": "9",
+            "Transfer-Encoding": "chunked", "Connection": "keep-alive", "tE": "trailers", "Trailer": "X-Test",
+            "Keep-Alive": "timeout=5", "Proxy-Authorization": "Basic secret", "Proxy-Authenticate": "Basic",
+            "Proxy-Connection": "keep-alive", "Upgrade": "websocket"
+        ]), endpoint: endpoint), as: UTF8.self)
+        expect(hostileRequest.contains("Authorization: Bearer safe") && hostileRequest.contains("Range: bytes=10-20"),
+               "origin and dynamic Range headers survive request defense")
+        expect(!["Host: bad", "Content-Length: 9", "Transfer-Encoding:", "Connection: keep-alive", "tE:",
+                 "Trailer:", "Keep-Alive:", "Proxy-Authorization:", "Proxy-Authenticate:", "Proxy-Connection:", "Upgrade:"]
+            .contains(where: hostileRequest.contains), "request defense strips hop and framing headers case-insensitively")
         ["bad\u{0000}", "bad\u{000B}", "bad\u{000C}", "bad\u{007F}"].forEach { value in
-            expectFailure({ _ = try PinnedHTTPClient.requestBytes(for: .init(url: signed, headers: ["X-Test": value]), endpoint: endpoint) }, .unsafeHeader, "outbound field bytes are strict")
+            let clean = try! String(decoding: PinnedHTTPClient.requestBytes(for: .init(url: signed, headers: ["X-Test": value]), endpoint: endpoint), as: UTF8.self)
+            expect(!clean.contains("X-Test:"), "invalid outbound field bytes are stripped")
         }
 
         // A DNS snapshot yields every vetted peer. The first dead peer does not prevent the next peer from
