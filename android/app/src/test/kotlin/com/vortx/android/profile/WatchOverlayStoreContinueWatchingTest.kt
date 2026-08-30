@@ -12,7 +12,7 @@ class WatchOverlayStoreContinueWatchingTest {
         val prefs = preferences()
         val profileId = "overlay"
         prefs.edit().putString(
-            WatchOverlayStore.cacheKey(profileId),
+            WatchOverlayStore.cacheKey(UserProfile.normalizeId(profileId)),
             WatchEntry.encodeMap(
                 linkedMapOf(
                     "tmdb:1396" to WatchEntry(
