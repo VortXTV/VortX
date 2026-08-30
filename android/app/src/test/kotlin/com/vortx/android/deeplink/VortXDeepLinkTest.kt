@@ -127,6 +127,16 @@ class VortXDeepLinkTest {
     }
 
     @Test
+    fun `detail teardown releases every auxiliary source owner`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
+        val onCleared = source.substring(source.indexOf("override fun onCleared()"))
+
+        assertTrue(onCleared.contains("torbox.close()"))
+        assertTrue(onCleared.contains("singularity.close()"))
+        assertTrue(onCleared.contains("communityJs.close()"))
+    }
+
+    @Test
     fun `invalid delivery does not block the next valid intent`() {
         val state = DeepLinkDeliveryState()
         assertNull(state.consume("delivery-a", "vortx://open?type=channel&id=bad"))

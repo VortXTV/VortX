@@ -1991,6 +1991,7 @@ class DetailViewModel(
         sourceModel.close()
         torbox.close()
         singularity.close()
+        communityJs.close()
     }
 
     private companion object {
