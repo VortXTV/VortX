@@ -64,11 +64,18 @@ enum StremioServer {
     /// the Lite build, a custom remote server, a torrent/local URL, or a non-HTTP URL.
     /// Server-side route format (from server.js): `/proxy/d={origin}&h={Name:Value}.../{path}{?query}`.
     static func proxiedURL(for streamURL: URL, headers: [String: String]) -> URL? {
-        guard canProxy, !isCustom, !headers.isEmpty,
+        let safeHeaders = StreamRequestHeaderPolicy.sanitized(headers)
+        guard canProxy, !isCustom, !safeHeaders.isEmpty,
               let scheme = streamURL.scheme?.lowercased(), scheme == "http" || scheme == "https",
               let host = streamURL.host else { return nil }
         // Never proxy the local torrent server back through itself.
         if host == "127.0.0.1" || host == "localhost" { return nil }
+        // The embedded server's legacy route format carries headers in the loopback URL. Keep bearer and cookie
+        // material on the direct player header channel, where diagnostics redact it and no URL logger can see it.
+        if safeHeaders.keys.contains(where: {
+            $0.caseInsensitiveCompare("authorization") == .orderedSame
+                || $0.caseInsensitiveCompare("cookie") == .orderedSame
+        }) { return nil }
 
         var origin = "\(scheme)://\(host)"
         if let port = streamURL.port { origin += ":\(port)" }
@@ -82,7 +89,7 @@ enum StremioServer {
         // The server splits each h= on its FIRST colon into Name:Value, so a value may contain ':'
         // (it survives, e.g. a URL value) but a NAME with a colon would mis-split. Skip malformed
         // names defensively; a valid HTTP header name never contains a colon anyway.
-        for (name, value) in headers where !name.isEmpty && !name.contains(":") {
+        for (name, value) in safeHeaders {
             qs += "&h=\(enc("\(name):\(value)"))"
         }
 

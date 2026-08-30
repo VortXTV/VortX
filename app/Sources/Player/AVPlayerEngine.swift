@@ -1105,7 +1105,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                  loadToken: issuedToken)
             return issuedToken
         } else {
-            let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
+            let safeHeaders = StreamRequestHeaderPolicy.sanitized(headers)
+            let options = safeHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": safeHeaders]
             newAsset = AVURLAsset(url: url, options: options)
         }
         let newItem = AVPlayerItem(asset: newAsset)

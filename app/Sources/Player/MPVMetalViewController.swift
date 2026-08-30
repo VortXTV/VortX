@@ -1363,7 +1363,7 @@ final class MPVMetalViewController: PlatformViewController {
         var fields: [String] = []
         var userAgent = ""
         var referrer = ""
-        for (name, value) in headers ?? [:] {
+        for (name, value) in StreamRequestHeaderPolicy.sanitized(headers) {
             switch name.lowercased() {
             case "user-agent":         userAgent = value
             case "referer", "referrer": referrer = value
@@ -1447,8 +1447,7 @@ final class MPVMetalViewController: PlatformViewController {
         // 161 -> 499 MB and still rising) until tvOS jetsam-killed the app -- the "server died" with the
         // torrent still playing. So a LOCAL (torrent) stream gets a small read-ahead; a remote debrid or
         // direct CDN keeps the full buffer for network resilience. Set per file at runtime.
-        let isLocalStream = playURL.host == "127.0.0.1" || playURL.host == "localhost"
-            || (playURL.host?.hasSuffix("strem.io") ?? false)
+        let isLocalStream = StreamRequestHeaderPolicy.isLocalPlaybackURL(playURL)
             // A trailer is a short clip and never needs the big remote read-ahead. A googlevideo trailer is
             // already proxied to 127.0.0.1 (small), but a worker-fallback trailer (trailer.vortx.tv, a remote
             // host) otherwise takes the full 256 MiB remote buffer and contributes to the tvOS jetsam that the

@@ -158,24 +158,35 @@ final class CommunityStreamGateway: @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
+        let lifetime = GatewayClientLifetime()
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed, .cancelled: lifetime.cancel()
+            default: break
+            }
+        }
         connection.start(queue: queue)
-        receiveRequest(connection, buffer: Data())
+        receiveRequest(connection, buffer: Data(), lifetime: lifetime)
     }
 
-    private func receiveRequest(_ connection: NWConnection, buffer: Data) {
+    private func receiveRequest(_ connection: NWConnection, buffer: Data, lifetime: GatewayClientLifetime) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8 * 1024) { [weak self] content, _, complete, error in
             guard let self else { return }
             var buffer = buffer
             if let content { buffer.append(content) }
             if buffer.count > self.maximumClientHeaderBytes { self.reply(connection, status: "431 Request Header Fields Too Large"); return }
             guard let end = buffer.range(of: Data("\r\n\r\n".utf8)) else {
-                if complete || error != nil { self.reply(connection, status: "400 Bad Request") } else { self.receiveRequest(connection, buffer: buffer) }
+                if complete || error != nil { self.reply(connection, status: "400 Bad Request") } else { self.receiveRequest(connection, buffer: buffer, lifetime: lifetime) }
                 return
             }
             guard let header = String(data: buffer[..<end.lowerBound], encoding: .utf8), let parsed = self.parseRequest(header) else {
                 self.reply(connection, status: "400 Bad Request"); return
             }
-            Task { [weak self] in await self?.serve(connection, request: parsed) }
+            let task = Task { [weak self] in
+                guard let self else { return }
+                await self.serve(connection, request: parsed)
+            }
+            lifetime.install(task)
         }
     }
 
@@ -206,62 +217,79 @@ final class CommunityStreamGateway: @unchecked Sendable {
         var headers = route.headers
         if let range = request.range { headers["Range"] = range }
         do {
-            let result = try await destinationFollowingRedirects(url: route.upstream, method: request.method, headers: headers)
-            try await forward(connection, request: request, upstream: result.url, headers: result.headers)
+            try await forwardFollowingRedirects(connection, request: request, upstream: route.upstream, headers: headers)
         } catch PinnedHTTPClient.Failure.unsafeResolution {
             reply(connection, status: "403 Forbidden")
+        } catch PinnedHTTPClient.Failure.timedOut {
+            reply(connection, status: "504 Gateway Timeout")
+        } catch PinnedHTTPClient.Failure.cancelled {
+            connection.cancel()
+        } catch GatewayForwardFailure.downstreamStarted {
+            connection.cancel()
         } catch {
             reply(connection, status: "502 Bad Gateway")
         }
     }
 
-    /// Probes with the client method but cancels the exact-pinned connection immediately after the response
-    /// head. A final request is then streamed; redirects never cause an unvalidated URLSession lookup.
-    private func destinationFollowingRedirects(url: URL, method: String, headers: [String: String]) async throws -> (url: URL, headers: [String: String]) {
-        var currentURL = url
+    private struct RedirectReceived: Error { let head: PinnedHTTPClient.ResponseHead }
+    private enum GatewayForwardFailure: Error { case downstreamStarted }
+
+    /// Follows redirects and streams the first non-redirect response from the request that discovered it.
+    /// The old probe-then-forward shape fetched the final origin twice, which doubled signed-CDN hits and could
+    /// consume a one-use URL before the player received any bytes.
+    private func forwardFollowingRedirects(_ connection: NWConnection, request: ClientRequest,
+                                            upstream: URL, headers: [String: String]) async throws {
+        var currentURL = upstream
         var currentHeaders = headers
         for hop in 0...3 {
-            let head = try await probe(url: currentURL, method: method, headers: currentHeaders)
-            guard (300...399).contains(head.statusCode) else { return (currentURL, currentHeaders) }
-            guard hop < 3, let value = head.headers["location"], let next = URL(string: value, relativeTo: currentURL)?.absoluteURL,
-                  next.scheme?.lowercased() == "https", JSProviderURLPolicy.default.isAllowed(next) else { throw PinnedHTTPClient.Failure.redirect(head.statusCode) }
-            currentHeaders = redirectHeaders(currentHeaders, from: currentURL, to: next)
-            currentURL = next
+            let state = ForwardState(method: request.method, upstream: currentURL, headers: currentHeaders,
+                                     maximumPlaylistBytes: maximumPlaylistBytes)
+            do {
+                try await PinnedHTTPClient.stream(
+                    .init(url: currentURL, method: request.method, headers: currentHeaders),
+                    onHead: { head in
+                        if (300...399).contains(head.statusCode) { throw RedirectReceived(head: head) }
+                        try await state.accept(head: head, send: { [weak self] status, responseHeaders in
+                            guard let self else { throw Failure.unavailable }
+                            try await self.sendHead(connection, status: status, headers: responseHeaders)
+                        })
+                    },
+                    onBody: { [weak self] bytes in
+                        guard let self else { throw Failure.unavailable }
+                        try await state.accept(bytes: bytes, send: { body in
+                            try await self.sendBody(connection, body: body)
+                        })
+                    }
+                )
+                if let body = try state.finish(rewrite: { body, base, routeHeaders, responseHeaders in
+                    try self.rewritePlaylistIfNeeded(body, upstream: base, routeHeaders: routeHeaders,
+                                                     responseHeaders: responseHeaders)
+                }) {
+                    let sent = request.method == "HEAD" ? Data() : body
+                    try await sendHead(connection, status: state.status,
+                                       headers: filteredHeaders(state.responseHeaders, bodyLength: body.count,
+                                                                preserveLength: false))
+                    if !sent.isEmpty { try await sendBody(connection, body: sent) }
+                }
+                connection.cancel()
+                return
+            } catch let redirect as RedirectReceived {
+                guard hop < 3,
+                      let value = redirect.head.headers["location"],
+                      let next = URL(string: value, relativeTo: currentURL)?.absoluteURL,
+                      next.scheme?.lowercased() == "https",
+                      JSProviderURLPolicy.default.isAllowed(next) else {
+                    throw PinnedHTTPClient.Failure.redirect(redirect.head.statusCode)
+                }
+                currentHeaders = redirectedHeaders(currentHeaders, response: redirect.head,
+                                                   from: currentURL, to: next)
+                currentURL = next
+            } catch {
+                if state.hasSentHead { throw GatewayForwardFailure.downstreamStarted }
+                throw error
+            }
         }
         throw PinnedHTTPClient.Failure.redirect(310)
-    }
-
-    private struct ProbeFinished: Error { let head: PinnedHTTPClient.ResponseHead }
-
-    private func probe(url: URL, method: String, headers: [String: String]) async throws -> PinnedHTTPClient.ResponseHead {
-        do {
-            try await PinnedHTTPClient.stream(.init(url: url, method: method, headers: headers),
-                                              onHead: { head in throw ProbeFinished(head: head) }, onBody: { _ in })
-            throw PinnedHTTPClient.Failure.malformedResponse
-        } catch let finished as ProbeFinished {
-            return finished.head
-        }
-    }
-
-    private func forward(_ connection: NWConnection, request: ClientRequest, upstream: URL, headers: [String: String]) async throws {
-        let state = ForwardState(method: request.method, upstream: upstream, headers: headers, maximumPlaylistBytes: maximumPlaylistBytes)
-        try await PinnedHTTPClient.stream(.init(url: upstream, method: request.method, headers: headers), onHead: { [weak self] head in
-            guard let self else { throw Failure.unavailable }
-            try await state.accept(head: head, send: { status, responseHeaders in
-                try await self.sendHead(connection, status: status, headers: responseHeaders)
-            })
-        }, onBody: { [weak self] bytes in
-            guard let self else { throw Failure.unavailable }
-            try await state.accept(bytes: bytes, send: { body in try await self.sendBody(connection, body: body) })
-        })
-        if let body = try state.finish(rewrite: { body, base, routeHeaders, responseHeaders in
-            try self.rewritePlaylistIfNeeded(body, upstream: base, routeHeaders: routeHeaders, responseHeaders: responseHeaders)
-        }) {
-            let sent = request.method == "HEAD" ? Data() : body
-            try await sendHead(connection, status: state.status, headers: filteredHeaders(state.responseHeaders, bodyLength: body.count, preserveLength: false))
-            if !sent.isEmpty { try await sendBody(connection, body: sent) }
-        }
-        connection.cancel()
     }
 
     private func route(for token: String, now: Date = Date()) -> Route? {
@@ -321,14 +349,35 @@ final class CommunityStreamGateway: @unchecked Sendable {
     }
 
     private func childHeaders(_ headers: [String: String], parent: URL, child: URL) -> [String: String] {
-        let sameOrigin = parent.scheme?.lowercased() == child.scheme?.lowercased() && parent.host?.lowercased() == child.host?.lowercased() && parent.port == child.port
-        guard !sameOrigin else { return headers }
+        guard !sameOrigin(parent, child) else { return headers }
         let sensitive = Set(["authorization", "cookie", "origin", "referer"])
         return headers.filter { !sensitive.contains($0.key.lowercased()) }
     }
 
-    private func redirectHeaders(_ headers: [String: String], from: URL, to: URL) -> [String: String] {
-        childHeaders(headers, parent: from, child: to)
+    private func redirectedHeaders(_ headers: [String: String], response: PinnedHTTPClient.ResponseHead,
+                                   from: URL, to: URL) -> [String: String] {
+        guard sameOrigin(from, to) else { return childHeaders(headers, parent: from, child: to) }
+        guard let setCookie = response.headers["set-cookie"],
+              let cookie = Self.safeRedirectCookie(setCookie) else { return headers }
+        var result = headers.filter { $0.key.caseInsensitiveCompare("cookie") != .orderedSame }
+        let existing = headers.first { $0.key.caseInsensitiveCompare("cookie") == .orderedSame }?.value
+        result["Cookie"] = [existing, cookie].compactMap { $0 }.joined(separator: "; ")
+        return result
+    }
+
+    private func sameOrigin(_ first: URL, _ second: URL) -> Bool {
+        first.scheme?.lowercased() == second.scheme?.lowercased()
+            && first.host?.lowercased() == second.host?.lowercased()
+            && (first.port ?? 443) == (second.port ?? 443)
+    }
+
+    static func safeRedirectCookie(_ setCookie: String) -> String? {
+        let pair = setCookie.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true).first?
+            .trimmingCharacters(in: .whitespaces)
+        guard let pair, let equals = pair.firstIndex(of: "="), equals != pair.startIndex,
+              PinnedHTTPClient.isHTTPToken(String(pair[..<equals])),
+              PinnedHTTPClient.isValidFieldValue(String(pair[pair.index(after: equals)...])) else { return nil }
+        return String(pair)
     }
 
     private func filteredHeaders(_ input: [String: String], bodyLength: Int, preserveLength: Bool) -> [String: String] {
@@ -342,12 +391,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
     }
 
     private func safeHeaders(_ input: [String: String]) -> [String: String] {
-        let forbidden = Set(["host", "connection", "content-length", "transfer-encoding", "upgrade", "proxy-connection", "range"])
-        return input.reduce(into: [:]) { result, entry in
-            let name = entry.key.lowercased()
-            guard PinnedHTTPClient.isHTTPToken(entry.key), !forbidden.contains(name), !entry.value.contains("\r"), !entry.value.contains("\n") else { return }
-            result[entry.key] = entry.value
-        }
+        StreamRequestHeaderPolicy.sanitized(input)
     }
 
     private func sendHead(_ connection: NWConnection, status: String, headers: [String: String]) async throws {
@@ -398,6 +442,28 @@ private final class GatewayStartCompletion: @unchecked Sendable {
     }
 }
 
+private final class GatewayClientLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var cancelled = false
+
+    func install(_ task: Task<Void, Never>) {
+        lock.lock()
+        if cancelled { lock.unlock(); task.cancel(); return }
+        self.task = task
+        lock.unlock()
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = self.task
+        self.task = nil
+        lock.unlock()
+        task?.cancel()
+    }
+}
+
 /// Mutable per-client forwarding state. Access is serialized by `PinnedHTTPClient.stream`: a new upstream
 /// receive is scheduled only after the previous callback returns, so this object cannot observe concurrent
 /// body mutation and does not need an actor or an unbounded queue.
@@ -411,6 +477,8 @@ private final class ForwardState: @unchecked Sendable {
     private var playlist = false
     private var playlistBody = Data()
     private var headSent = false
+
+    var hasSentHead: Bool { headSent }
 
     init(method: String, upstream: URL, headers: [String: String], maximumPlaylistBytes: Int) {
         self.method = method; self.upstream = upstream; self.routeHeaders = headers; self.maximumPlaylistBytes = maximumPlaylistBytes

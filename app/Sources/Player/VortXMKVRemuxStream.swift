@@ -1269,8 +1269,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var ifmt: UnsafeMutablePointer<AVFormatContext>? = makeInterruptibleInputContext()
         guard ifmt != nil else { buffer.fail("avformat_alloc_context failed"); return }
         var openOpts: OpaquePointer? = nil    // AVDictionary*
-        if let headers, !headers.isEmpty {
-            let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
+        let safeHeaders = StreamRequestHeaderPolicy.sanitized(headers)
+        if !safeHeaders.isEmpty {
+            let joined = safeHeaders.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
             av_dict_set(&openOpts, "headers", joined, 0)
         }
         // Reasonable network timeouts so a dead debrid link fails instead of hanging the thread forever. Kept
@@ -1308,8 +1309,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             VXProbe.log("dv", "probe open failed rc=\(openRc) (transient); retrying once (cold-debrid warm-up)")
             clearProbeInputContext()   // libav freed the cold-open context; never leave a dangling sample target
             var retryOpts: OpaquePointer? = nil
-            if let headers, !headers.isEmpty {
-                let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
+            if !safeHeaders.isEmpty {
+                let joined = safeHeaders.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
                 av_dict_set(&retryOpts, "headers", joined, 0)
             }
             av_dict_set(&retryOpts, "rw_timeout", "10000000", 0)      // 10s on the warm retry
