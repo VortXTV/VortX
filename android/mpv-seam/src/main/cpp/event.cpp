@@ -15,6 +15,7 @@
 // replacement-suppression window to START_FILE. Defensive payload guards below preserve that valid-event
 // protocol while dropping malformed/null native payloads instead of dereferencing them.
 #include <jni.h>
+#include <thread>
 
 #include <mpv/client.h>
 
@@ -119,13 +120,20 @@ void *event_thread(void *arg) {
     acquire_jni_env(instance->vm, &env);
     if (!env) {
         ALOGE("failed to acquire java env");
+        instance->event_thread_start_state.store(
+            EVENT_THREAD_JNI_ATTACH_FAILED,
+            std::memory_order_release);
         return nullptr;
     }
+    instance->event_thread_start_state.store(EVENT_THREAD_READY, std::memory_order_release);
 
     while (true) {
         mpv_event *mp_event;
         mpv_event_property *mp_property;
         mpv_event_log_message *msg;
+
+        if (instance->event_thread_request_exit)
+            break;
 
         mp_event = mpv_wait_event(instance->mpv, -1.0);
 
@@ -162,9 +170,23 @@ void *event_thread(void *arg) {
             sendEventToJava(env, instance, mp_event->event_id);
             break;
         }
+
+        // A listener can synchronously call MpvSeam.destroy from inside CallVoidMethod. Stop before the
+        // next wait and defer all final cleanup until the Java callback and JNI local-ref handling above
+        // have fully unwound.
+        if (instance->event_thread_request_exit)
+            break;
     }
 
-    instance->vm->DetachCurrentThread();
+    // nativeDestroy sets the exit flag before mpv_wakeup. Do not delete mpv/MPVInstance until its
+    // caller has completed the wakeup and every remaining instance dereference.
+    while (!instance->teardown_request_complete.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    JavaVM *vm = instance->vm;
+    finalize_mpv_instance(env, instance);
+    vm->DetachCurrentThread();
 
     return nullptr;
 }

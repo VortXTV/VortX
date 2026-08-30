@@ -16,8 +16,8 @@ class MpvNativeHandleGateTest {
         val destroyCount = AtomicInteger()
 
         assertEquals(42L, gate.withHandle(-1L) { it + 1L })
-        gate.destroy { destroyCount.incrementAndGet() }
-        gate.destroy { destroyCount.incrementAndGet() }
+        gate.requestDestroy { destroyCount.incrementAndGet() }?.invoke()
+        gate.requestDestroy { destroyCount.incrementAndGet() }?.invoke()
 
         assertEquals(1, destroyCount.get())
         assertEquals(-1L, gate.withHandle(-1L) { error("must not run") })
@@ -39,9 +39,8 @@ class MpvNativeHandleGateTest {
             }
             assertTrue(enteredCall.await(5, TimeUnit.SECONDS))
 
-            pool.execute {
-                gate.destroy { destroyed.countDown() }
-            }
+            val destroyAction = gate.requestDestroy { destroyed.countDown() }
+            assertEquals(null, destroyAction)
             assertFalse(destroyed.await(100, TimeUnit.MILLISECONDS))
 
             finishCall.countDown()
@@ -49,6 +48,75 @@ class MpvNativeHandleGateTest {
             assertEquals(null, gate.withHandle<String?>(null) { "unsafe" })
         } finally {
             finishCall.countDown()
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `serialized call releases monitor before deferred destroy joins event thread`() {
+        val gate = MpvNativeHandleGate(79L)
+        val surfaceMonitor = Any()
+        val enteredSurfaceCall = CountDownLatch(1)
+        val finishSurfaceCall = CountDownLatch(1)
+        val destroyed = CountDownLatch(1)
+        val destroyHeldSurfaceMonitor = AtomicInteger()
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            pool.execute {
+                gate.withSerializedHandle(surfaceMonitor, Unit) {
+                    assertTrue(Thread.holdsLock(surfaceMonitor))
+                    enteredSurfaceCall.countDown()
+                    assertTrue(finishSurfaceCall.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(enteredSurfaceCall.await(5, TimeUnit.SECONDS))
+
+            assertEquals(
+                null,
+                gate.requestDestroy {
+                    if (Thread.holdsLock(surfaceMonitor)) destroyHeldSurfaceMonitor.incrementAndGet()
+                    destroyed.countDown()
+                },
+            )
+            finishSurfaceCall.countDown()
+
+            assertTrue(destroyed.await(5, TimeUnit.SECONDS))
+            assertEquals(0, destroyHeldSurfaceMonitor.get())
+        } finally {
+            finishSurfaceCall.countDown()
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `reentrant destroy returns while another destroy is still finalizing`() {
+        val gate = MpvNativeHandleGate(89L)
+        val firstDestroyEntered = CountDownLatch(1)
+        val finishFirstDestroy = CountDownLatch(1)
+        val reentrantReturned = CountDownLatch(1)
+        val destroyCount = AtomicInteger()
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val firstDestroyAction = gate.requestDestroy {
+                    firstDestroyEntered.countDown()
+                    assertTrue(finishFirstDestroy.await(5, TimeUnit.SECONDS))
+                    destroyCount.incrementAndGet()
+            }
+            pool.execute { firstDestroyAction?.invoke() }
+            assertTrue(firstDestroyEntered.await(5, TimeUnit.SECONDS))
+
+            pool.execute {
+                gate.requestDestroy { error("reentrant destroy must not run") }?.invoke()
+                reentrantReturned.countDown()
+            }
+            assertTrue(reentrantReturned.await(1, TimeUnit.SECONDS))
+
+            finishFirstDestroy.countDown()
+            pool.shutdown()
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS))
+            assertEquals(1, destroyCount.get())
+        } finally {
+            finishFirstDestroy.countDown()
             pool.shutdownNow()
         }
     }
@@ -75,10 +143,10 @@ class MpvNativeHandleGateTest {
             val destroyers = (0 until 4).map {
                 pool.submit {
                     assertTrue(start.await(5, TimeUnit.SECONDS))
-                    gate.destroy {
+                    gate.requestDestroy {
                         destroyed.set(true)
                         destroyCount.incrementAndGet()
-                    }
+                    }?.invoke()
                 }
             }
 

@@ -20,13 +20,13 @@ import android.view.Surface
 class MpvSeam private constructor() {
     @Volatile
     private var handleGate: MpvNativeHandleGate? = null
+    private val destroyDispatcher = MpvNativeDestroyDispatcher()
     private val surfaceLock = Any()
     private val observers = mutableListOf<EventObserver>()
     private val logObservers = mutableListOf<LogObserver>()
 
     companion object {
         private const val NATIVE_CALL_UNAVAILABLE = Int.MIN_VALUE
-
         init {
             // "mpv" first (libmpv.so + its ffmpeg deps come from the dev.jdtech.mpv:libmpv AAR), then
             // THIS module's own source-built glue. The AAR's own "player" glue is intentionally NOT
@@ -66,29 +66,32 @@ class MpvSeam private constructor() {
 
     fun destroy() {
         val gate = handleGate ?: return
-        // Do not hold surfaceLock while nativeDestroy joins mpv's event thread. The handle gate first
-        // rejects new surface leases and waits for any active attach/detach call, so the mutex is not
-        // needed during the join and a final Java callback can never deadlock on it.
-        gate.destroy(::nativeDestroy)
+        // Close admission synchronously so no observer/thread can race in after destroy. With no active
+        // lease, defer the returned action until this callback unwinds. With an active lease, its last
+        // releaser owns finalization, so this callback still returns without waiting.
+        val destroyAction = gate.requestDestroy(::nativeDestroy) ?: return
+        destroyDispatcher.dispatchDestroy(destroyAction)
     }
     private external fun nativeDestroy(instance: Long)
 
     fun attachSurface(surface: Surface) {
-        val result = synchronized(surfaceLock) {
-            handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE) { instance ->
-                nativeAttachSurface(instance, surface)
-            } ?: NATIVE_CALL_UNAVAILABLE
-        }
+        val result = handleGate?.withSerializedHandle(
+            monitor = surfaceLock,
+            defaultValue = NATIVE_CALL_UNAVAILABLE,
+        ) { instance ->
+            nativeAttachSurface(instance, surface)
+        } ?: NATIVE_CALL_UNAVAILABLE
         if (result == NATIVE_CALL_UNAVAILABLE) return
         check(result >= 0) { "mpv surface attach failed ($result)" }
     }
     private external fun nativeAttachSurface(instance: Long, surface: Surface): Int
 
     fun detachSurface() {
-        val result = synchronized(surfaceLock) {
-            handleGate?.withHandle(NATIVE_CALL_UNAVAILABLE, ::nativeDetachSurface)
-                ?: NATIVE_CALL_UNAVAILABLE
-        }
+        val result = handleGate?.withSerializedHandle(
+            monitor = surfaceLock,
+            defaultValue = NATIVE_CALL_UNAVAILABLE,
+            call = ::nativeDetachSurface,
+        ) ?: NATIVE_CALL_UNAVAILABLE
         if (result == NATIVE_CALL_UNAVAILABLE) return
         check(result >= 0) { "mpv surface detach failed ($result)" }
     }
@@ -165,56 +168,51 @@ class MpvSeam private constructor() {
 
     // ---- Native dispatch surface (called by libvortx_mpv_seam.so on the mpv event thread). ----
 
-    fun eventProperty(property: String, value: Long) {
-        synchronized(observers) {
-            for (o in observers)
-                o.eventProperty(property, value)
+    private fun dispatchEvent(callback: (EventObserver) -> Unit) {
+        destroyDispatcher.withinNativeCallback {
+            synchronized(observers) {
+                for (observer in observers) callback(observer)
+            }
         }
+    }
+
+    private fun dispatchLog(callback: (LogObserver) -> Unit) {
+        destroyDispatcher.withinNativeCallback {
+            synchronized(logObservers) {
+                for (observer in logObservers) callback(observer)
+            }
+        }
+    }
+
+    fun eventProperty(property: String, value: Long) {
+        dispatchEvent { it.eventProperty(property, value) }
     }
 
     fun eventProperty(property: String, value: Double) {
-        synchronized(observers) {
-            for (o in observers)
-                o.eventProperty(property, value)
-        }
+        dispatchEvent { it.eventProperty(property, value) }
     }
 
     fun eventProperty(property: String, value: Boolean) {
-        synchronized(observers) {
-            for (o in observers)
-                o.eventProperty(property, value)
-        }
+        dispatchEvent { it.eventProperty(property, value) }
     }
 
     fun eventProperty(property: String, value: String) {
-        synchronized(observers) {
-            for (o in observers)
-                o.eventProperty(property, value)
-        }
+        dispatchEvent { it.eventProperty(property, value) }
     }
 
     fun eventProperty(property: String) {
-        synchronized(observers) {
-            for (o in observers)
-                o.eventProperty(property)
-        }
+        dispatchEvent { it.eventProperty(property) }
     }
 
     /// THE W1-B SEAM DISPATCHER. Called by the patched native event loop with
     /// mpv_event_end_file.reason verbatim (client.h MPV_END_FILE_REASON_* values; unknown future
     /// codes pass through untouched) and .error when reason == MPV_END_FILE_REASON_ERROR else 0.
     fun eventEndFile(reason: Int, error: Int) {
-        synchronized(observers) {
-            for (o in observers)
-                o.eventEndFile(reason, error)
-        }
+        dispatchEvent { it.eventEndFile(reason, error) }
     }
 
     fun event(eventId: Int) {
-        synchronized(observers) {
-            for (o in observers)
-                o.event(eventId)
-        }
+        dispatchEvent { it.event(eventId) }
     }
 
     fun addLogObserver(o: LogObserver) {
@@ -230,10 +228,7 @@ class MpvSeam private constructor() {
     }
 
     fun logMessage(prefix: String, level: Int, text: String) {
-        synchronized(logObservers) {
-            for (o in logObservers)
-                o.logMessage(prefix, level, text)
-        }
+        dispatchLog { it.logMessage(prefix, level, text) }
     }
 
     interface EventObserver {

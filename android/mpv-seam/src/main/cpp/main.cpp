@@ -7,6 +7,7 @@
 #include <ctime>
 #include <clocale>
 #include <atomic>
+#include <thread>
 
 #include <mpv/client.h>
 
@@ -48,10 +49,32 @@ static void prepare_environment(JNIEnv *env, MPVInstance* instance) {
     init_methods_cache(env);
 }
 
+void finalize_mpv_instance(JNIEnv *env, MPVInstance *instance) {
+    if (instance->mpv) {
+        mpv_terminate_destroy(instance->mpv);
+        instance->mpv = nullptr;
+    }
+    if (instance->surface) {
+        env->DeleteGlobalRef(instance->surface);
+        instance->surface = nullptr;
+    }
+    if (instance->appCtx) {
+        env->DeleteGlobalRef(instance->appCtx);
+        instance->appCtx = nullptr;
+    }
+    if (instance->javaObject) {
+        env->DeleteGlobalRef(instance->javaObject);
+        instance->javaObject = nullptr;
+    }
+    delete instance;
+}
+
 jni_func(jlong, nativeCreate, jobject thiz, jobject appctx) {
     auto instance = new MPVInstance();
     instance->event_thread_id = 0;
     instance->event_thread_request_exit = false;
+    instance->teardown_request_complete = false;
+    instance->event_thread_start_state = EVENT_THREAD_STARTING;
     instance->mpv = nullptr;
     instance->vm = nullptr;
     instance->surface = nullptr;
@@ -94,8 +117,25 @@ jni_func(void, nativeInit, jlong instance) {
     }
 
     mpv_instance->event_thread_request_exit = false;
-    if (pthread_create(&mpv_instance->event_thread_id, nullptr, event_thread, mpv_instance) != 0) {
+    mpv_instance->teardown_request_complete = false;
+    mpv_instance->event_thread_start_state = EVENT_THREAD_STARTING;
+    pthread_t created_event_thread;
+    if (pthread_create(&created_event_thread, nullptr, event_thread, mpv_instance) != 0) {
+        mpv_instance->event_thread_id = 0;
         die(env, "thread create failed");
+        return;
+    }
+    mpv_instance->event_thread_id = created_event_thread;
+
+    int start_state;
+    while ((start_state = mpv_instance->event_thread_start_state.load(std::memory_order_acquire)) ==
+        EVENT_THREAD_STARTING) {
+        std::this_thread::yield();
+    }
+    if (start_state == EVENT_THREAD_JNI_ATTACH_FAILED) {
+        pthread_join(mpv_instance->event_thread_id, nullptr);
+        mpv_instance->event_thread_id = 0;
+        die(env, "event thread failed to attach to Java VM");
         return;
     }
     pthread_setname_np(mpv_instance->event_thread_id, "event_thread");
@@ -108,23 +148,37 @@ jni_func(void, nativeDestroy, jlong instance) {
         return;
     }
 
+    const pthread_t event_thread_id = mpv_instance->event_thread_id;
+    if (event_thread_id == 0) {
+        finalize_mpv_instance(env, mpv_instance);
+        return;
+    }
+
+    // The event thread is the final-teardown owner whenever it exists. This makes a destroy requested
+    // synchronously by a Java event listener safe: nativeDestroy only requests exit and returns, then the
+    // event loop unwinds past CallVoidMethod before freeing mpv, GlobalRefs, and MPVInstance. For an
+    // ordinary caller, copy the pthread id before wakeup and never dereference mpv_instance after wakeup;
+    // the event thread may legally free it before pthread_join returns.
     mpv_instance->event_thread_request_exit = true;
     mpv_wakeup(mpv_instance->mpv);
+    // Publish only after the last caller-side dereference. The awakened event thread is allowed to
+    // finalize and delete MPVInstance as soon as this release-store becomes visible.
+    mpv_instance->teardown_request_complete.store(true, std::memory_order_release);
 
-    if (mpv_instance->event_thread_id != 0) {
-        pthread_join(mpv_instance->event_thread_id, nullptr);
-        mpv_instance->event_thread_id = 0;
+    if (pthread_equal(pthread_self(), event_thread_id)) {
+        const int detach_result = pthread_detach(event_thread_id);
+        if (detach_result != 0)
+            ALOGE("event thread self-detach failed (%d)", detach_result);
+        return;
     }
 
-    mpv_terminate_destroy(mpv_instance->mpv);
-    mpv_instance->mpv = nullptr;
-    if (mpv_instance->surface) {
-        env->DeleteGlobalRef(mpv_instance->surface);
-        mpv_instance->surface = nullptr;
+    const int join_result = pthread_join(event_thread_id, nullptr);
+    if (join_result != 0) {
+        // Cleanup is still owned by the awakened event thread. A join failure must not fall through and
+        // free state that the event loop can still touch.
+        ALOGE("event thread join failed (%d); deferred teardown remains event-thread owned", join_result);
+        pthread_detach(event_thread_id);
     }
-    env->DeleteGlobalRef(mpv_instance->appCtx);
-    env->DeleteGlobalRef(mpv_instance->javaObject);
-    delete mpv_instance;
 }
 
 jni_func(void, nativeCommand, jlong instance, jobjectArray jarray) {

@@ -32,9 +32,12 @@ Every intentional difference between upstream tag v1.0.0 and this module is cate
 
 **Lifecycle and malformed-payload hardening:**
 
-2. **Linearized native handle destruction.** `MpvNativeHandleGate` leases the pointer to every JNI
-   call, rejects new leases after destruction starts, waits for existing calls, and destroys exactly
-   once. This closes the check-then-free race in the upstream non-zero-pointer guard.
+2. **Linearized and callback-safe native destruction.** `MpvNativeHandleGate` leases the pointer to
+   every JNI call, rejects new leases after destruction starts, waits for existing calls, and destroys
+   exactly once. Reentrant destroy calls return without waiting. Listener-requested teardown is moved
+   off the JNI callback stack; native code independently transfers final cleanup to the event loop and
+   frees the instance only after `CallVoidMethod` unwinds. This closes both the check-then-free race and
+   the event-thread self-join/use-after-free path.
 3. **Single-owner Surface lifetime.** Kotlin serializes attach, detach, and destroy. Native attach
    replaces a GlobalRef without leaking the old one, detach is idempotent, and final destroy owns any
    residual ref. A late SurfaceHolder callback therefore cannot double-delete or use a freed instance.
