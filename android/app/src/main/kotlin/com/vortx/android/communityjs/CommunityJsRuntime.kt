@@ -14,6 +14,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 /**
@@ -86,8 +87,11 @@ class CommunityJsRuntime(
     private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String = suspendCancellableCoroutine { continuation ->
         val token = UUID.randomUUID().toString()
         var broker: ICommunityJsBroker? = null
-        var bound = false
+        val bound = AtomicBoolean(false)
         lateinit var connection: ServiceConnection
+        fun cleanup() {
+            if (bound.compareAndSet(true, false)) runCatching { appContext.unbindService(connection) }
+        }
         val callback = object : ICommunityJsBrokerCallback.Stub() {
             override fun fetch(tokenValue: String, url: String, optionsJson: String, remainingTimeoutMs: Long): String =
                 if (tokenValue == token) host.fetch(url, optionsJson, remainingTimeoutMs) else EMPTY_RESPONSE
@@ -96,8 +100,7 @@ class CommunityJsRuntime(
 
             override fun complete(tokenValue: String, envelope: String) {
                 if (tokenValue == token && continuation.isActive) {
-                    if (bound) runCatching { appContext.unbindService(connection) }
-                    bound = false
+                    cleanup()
                     continuation.resume(envelope)
                 }
             }
@@ -109,23 +112,23 @@ class CommunityJsRuntime(
                     broker?.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
                         JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
                         timeoutMs, MAX_MEMORY_BYTES, callback)
-                }.onFailure { if (continuation.isActive) continuation.resume(FAILURE_ENVELOPE) }
+                }.onFailure { if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) } }
             }
 
             override fun onServiceDisconnected(name: ComponentName) {
-                if (continuation.isActive) { bound = false; continuation.resume(FAILURE_ENVELOPE) }
+                if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) }
             }
 
             override fun onBindingDied(name: ComponentName) {
-                if (continuation.isActive) { bound = false; continuation.resume(FAILURE_ENVELOPE) }
+                if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) }
             }
         }
-        bound = appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE)
-        if (!bound && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
+        bound.set(appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE))
+        if (!bound.get() && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
         continuation.invokeOnCancellation {
             host.cancel()
             runCatching { broker?.cancel(token) }
-            if (bound) runCatching { appContext.unbindService(connection) }
+            cleanup()
         }
     }
 

@@ -96,7 +96,8 @@ class ExoPlayerEngineStatePolicyTest {
 
         assertTrue(load.contains("val http = DefaultHttpDataSource.Factory().apply"))
         assertTrue(load.contains("setAllowCrossProtocolRedirects(true)"))
-        assertTrue(load.contains("DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)"))
+        assertTrue(load.contains("DefaultDataSource.Factory(appContext, http)"))
+        assertTrue(load.contains("DefaultDataSource.Factory(appContext, trailerHttp)"))
         assertFalse(load.contains("else {\n            DefaultMediaSourceFactory(appContext)"))
     }
 

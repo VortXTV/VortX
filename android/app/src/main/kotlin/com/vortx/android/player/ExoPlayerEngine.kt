@@ -23,6 +23,7 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -250,7 +251,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                 .setSubtitleConfigurations(subtitleConfigs)
                 .build()
             val videoSource = DefaultMediaSourceFactory(appContext)
-                .setDataSourceFactory(trailerHttp)
+                .setDataSourceFactory(DefaultDataSource.Factory(appContext, trailerHttp))
                 .createMediaSource(videoItem)
             val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
                 .createMediaSource(MediaItem.fromUri(playable.audioUrl))
@@ -274,7 +275,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
             // even to ordinary empty-header streams, not only the header-gated branch above.
             setAllowCrossProtocolRedirects(true)
         }
-        val mediaSourceFactory = DefaultMediaSourceFactory(appContext).setDataSourceFactory(http)
+        val mediaSourceFactory = DefaultMediaSourceFactory(appContext)
+            .setDataSourceFactory(DefaultDataSource.Factory(appContext, http))
 
         val item = MediaItem.Builder()
             .setUri(playable.url)

@@ -69,9 +69,9 @@ class CommunityJsProviderContractTest {
         fence.begin(41)
         fence.begin(42)
 
-        assertFalse(fence.isCurrent(41))
-        assertTrue(fence.isCurrent(42))
+        assertFalse(fence.publishIfCurrent(41) { error("stale request published") })
+        assertTrue(fence.publishIfCurrent(42) {})
         fence.invalidate()
-        assertFalse(fence.isCurrent(42))
+        assertFalse(fence.publishIfCurrent(42) { error("invalidated request published") })
     }
 }

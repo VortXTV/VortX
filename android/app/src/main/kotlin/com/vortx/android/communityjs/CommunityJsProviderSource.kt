@@ -12,30 +12,32 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import java.util.concurrent.atomic.AtomicLong
-
 internal class CommunityJsRefreshJobOwner {
+    private val lock = Any()
     private var active: Job? = null
 
-    fun replace(next: Job) {
+    fun replace(next: Job) = synchronized(lock) {
         active?.cancel()
         active = next
     }
 
-    fun cancel() {
+    fun cancel() = synchronized(lock) {
         active?.cancel()
         active = null
     }
 }
 
 internal class CommunityJsGenerationFence {
-    private val active = AtomicLong(-1L)
+    private val lock = Any()
+    private var active = -1L
 
-    fun begin(generation: Long) = active.set(generation)
+    fun begin(generation: Long) = synchronized(lock) { active = generation }
 
-    fun isCurrent(generation: Long): Boolean = generation >= 0L && active.get() == generation
+    fun publishIfCurrent(generation: Long, publish: () -> Unit): Boolean = synchronized(lock) {
+        if (generation < 0L || active != generation) false else { publish(); true }
+    }
 
-    fun invalidate() = active.incrementAndGet()
+    fun invalidate() = synchronized(lock) { active += 1L }
 }
 
 /** Auxiliary source which turns enabled community-provider results into ordinary ranked source groups. */
@@ -73,7 +75,7 @@ class CommunityJsProviderSource(context: Context) {
                 }
             // Publication is fenced immediately before mutation. A cancelled or slower earlier request must
             // never replace a newer title's sources merely because it completed afterward.
-            if (generationFence.isCurrent(requestGeneration)) {
+            generationFence.publishIfCurrent(requestGeneration) {
                 _groups.value = result
                 _epoch.value += 1
                 _settled.value = true
