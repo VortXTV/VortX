@@ -865,6 +865,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             currentLoadResumeOrigin = 0
         }
         let requestedRemuxOrigin = currentLoadResumeOrigin
+        if carriesSameSourceIntent,
+           let existingToken = activeLoadToken,
+           retryFreshItemOnHealthyMount(
+               reason: "surface same-source stall recovery",
+               claimsPublishedTailRetry: false) {
+            preparedCandidate?.handle.abandon(reason: "same-mount-item-replacement")
+            return existingToken
+        }
         let issuedToken = loadToken ?? PlayerLoadToken()
         itemGeneration &+= 1
         terminalLatch.reset(generation: itemGeneration)
@@ -1673,8 +1681,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// AVPlayer can report item-end at the current edge of a still-growing HLS playlist. Replace only the item,
     /// never the healthy producer, and carry the same DV/HDR route, source playhead and media selections. One
     /// replacement is allowed per mount so an actually stuck playlist cannot loop forever.
-    private func retryFreshItemAtPublishedTail() -> Bool {
-        guard !publishedTailItemRecoveryRetried,
+    private func retryFreshItemOnHealthyMount(reason: String,
+                                               claimsPublishedTailRetry: Bool) -> Bool {
+        guard (!claimsPublishedTailRetry || !publishedTailItemRecoveryRetried),
               let progress = remuxMountProgress,
               progress.initPublished,
               !progress.ended,
@@ -1684,10 +1693,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               let loadToken = activeLoadToken else { return false }
 
         pendingPlaybackIntent = capturePlaybackIntent(from: currentItem)
-        publishedTailItemRecoveryRetried = true
+        if claimsPublishedTailRetry { publishedTailItemRecoveryRetried = true }
         DiagnosticsLog.log(
             "avplayer",
-            "healthy remux item reached published tail -> one same-mount item replacement "
+            "healthy remux \(reason) -> same-mount item replacement "
                 + "sourceTime=\(String(format: "%.3f", playbackPositionSeconds))s "
                 + "segments=\(progress.segmentCount) bytes=\(progress.producedBytes)")
 
@@ -1794,7 +1803,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if deferredPublishedTailRecoveryGeneration == itemGeneration,
            let loadToken = activeLoadToken {
             deferredPublishedTailRecoveryGeneration = nil
-            if retryFreshItemAtPublishedTail() {
+            if retryFreshItemOnHealthyMount(
+                reason: "deferred published-tail recovery",
+                claimsPublishedTailRetry: true) {
                 logTransport("play -> resumed deferred published-tail recovery")
                 return
             }
@@ -3806,7 +3817,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     "deferred healthy published-tail recovery while committed transport intent is paused generation=\(itemGeneration)")
                 return
             }
-            if retryFreshItemAtPublishedTail() { return }
+            if retryFreshItemOnHealthyMount(
+                reason: "published-tail recovery",
+                claimsPublishedTailRetry: true) { return }
             terminal = .error(VortXRemuxItemEndPolicy.prematureEndReason)
         case .remuxFailure(let reason):
             guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }

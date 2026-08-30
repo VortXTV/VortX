@@ -291,7 +291,7 @@ enum RemuxItemEndPolicyTests {
                 && containsInOrder(endHandler, [
                     "VortXRemuxItemEndPolicy.classify(",
                     "case .recoverablePublishedTail:",
-                    "retryFreshItemAtPublishedTail()",
+                    "retryFreshItemOnHealthyMount(",
                     "case .remuxFailure(let reason):",
                     "guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }",
                     "fatalErrorEmitted = true",
@@ -315,7 +315,7 @@ enum RemuxItemEndPolicyTests {
             ]))
         let tailRecovery = sourceSection(
             engine,
-            from: "private func retryFreshItemAtPublishedTail",
+            from: "private func retryFreshItemOnHealthyMount",
             to: "private func refreshPendingIntentTransport")
         let loadFile = sourceSection(
             engine,
@@ -327,6 +327,8 @@ enum RemuxItemEndPolicyTests {
                 "PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(",
                 "pendingPlaybackIntent = capturePlaybackIntent(from: item)",
                 "pendingPlaybackIntent?.updateSourceSeconds(configured)",
+                "retryFreshItemOnHealthyMount(",
+                "return existingToken",
                 "teardownRemux()",
                 "disableExternalSubtitle(discardingCues: !isIntentRemount)",
             ]))
@@ -352,12 +354,12 @@ enum RemuxItemEndPolicyTests {
                 "if !playbackRequested {",
                 "deferredPublishedTailRecoveryGeneration = itemGeneration",
                 "return",
-                "retryFreshItemAtPublishedTail()",
+                "retryFreshItemOnHealthyMount(",
             ])
                 && containsInOrder(engine, [
                     "func play() {",
                     "deferredPublishedTailRecoveryGeneration == itemGeneration",
-                    "retryFreshItemAtPublishedTail()",
+                    "retryFreshItemOnHealthyMount(",
                 ]))
         check(
             "wiring: deferred and immediate EOF/error delivery share the exact-generation terminal latch",
