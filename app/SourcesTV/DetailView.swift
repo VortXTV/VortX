@@ -2888,7 +2888,7 @@ struct CoreStreamList: View {
                 }
                 if showAllSources {
                     VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        if groups.count > 1 {
+                        if TVDetailSourceColumnFocusPolicy.filterBarOwnsUpEscape(groupsCount: groups.count) {
                             // The filter bar is the column's top boundary: Up from any filter chip returns to
                             // the nearest semantic action row. (#206)
                             filterBar(groups, total: streamCount)
@@ -2900,7 +2900,7 @@ struct CoreStreamList: View {
                         LazyVStack(spacing: Theme.Space.sm) {
                             ForEach(Array(shownRows.enumerated()), id: \.element.id) { index, row in
                                 let rowView = streamRow(row.addon, row.stream)
-                                if index == 0, groups.count <= 1 {
+                                if TVDetailSourceColumnFocusPolicy.sourceRowOwnsUpEscape(at: index, groupsCount: groups.count) {
                                     // No filter bar: the FIRST row is the column's top boundary, so Up from it
                                     // alone returns to the action row. Up from any deeper row stays native and
                                     // moves one row up in the list (#206).
