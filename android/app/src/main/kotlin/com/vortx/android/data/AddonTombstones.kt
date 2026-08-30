@@ -12,12 +12,11 @@ import org.json.JSONObject
  * one device is never resurrected by a peer device's UNION hydrate or a stale pre-removal cloud blob, nor by
  * the engine re-seeding OFFICIAL_ADDONS on a reset (#137).
  *
- * ANDROID SCOPE TODAY: the owned-add-on hydrate/summary sync legs (checklist ACC-2) are not yet ported, so
- * this store's cross-device PUSH/FOLD have no plumbing to hook into yet. What IS wired here is the on-device
- * anti-resurrection every user sees: a Remove tombstones the transport URL (protected stubs excepted), an
- * explicit re-install forgets it, and the installed-add-on read subtracts the effectively-removed set AND
- * re-uninstalls any that the engine re-seeded. [all], [timestampsForSync], and [merge] are the exact seams the
- * later ACC-2 sync wave binds with no store change, so the store is written to that contract now.
+ * ANDROID SYNC: [VortXSyncManager] folds the app and web account fields into this store on every successful
+ * pull, then publishes [all] plus [timestampsForSync] on its read-merge push without replacing foreign account
+ * fields. The repository enforces the effective set at its installed-add-on read boundary: a Remove tombstones
+ * the transport URL (protected stubs excepted), an explicit re-install forgets it, and engine-seeded add-ons are
+ * re-uninstalled when they remain effectively removed.
  *
  * LAST-WRITER-WINS model. Each transportUrl carries two per-entry timestamps: `removedAt` (stamped by
  * [tombstone]) and `addedAt` (stamped by [forget]). A URL is EFFECTIVELY removed iff `removedAt > addedAt`.

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import com.vortx.android.backup.SettingsBackup
+import com.vortx.android.data.AddonTombstones
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
 import com.vortx.android.metadata.MetadataProviderKeys
@@ -31,6 +32,37 @@ import java.net.URLEncoder
 import java.net.URL
 import java.util.Collections
 import java.util.IdentityHashMap
+
+/**
+ * Publish the app-owned effective add-on removal set and its LWW stamps without replacing any other `vortx`
+ * member. The timestamp map retains `addedAt` entries even when a URL is currently present: that is how a
+ * later explicit reinstall beats an older removal on every peer instead of being re-tombstoned on the next pull.
+ */
+internal fun applyAddonTombstonesToVortx(
+    vortx: JSONObject,
+    tombstones: AddonTombstones,
+): JSONObject {
+    val removed = tombstones.all()
+    if (removed.isNotEmpty()) {
+        vortx.put("deletedAddons", JSONArray(removed.sorted()))
+    } else {
+        vortx.remove("deletedAddons")
+    }
+    val stamps = tombstones.timestampsForSync()
+    if (stamps.isNotEmpty()) {
+        val encoded = JSONObject()
+        for (url in stamps.keys.sorted()) {
+            val entry = JSONObject()
+            stamps[url]?.get("removedAt")?.let { entry.put("removedAt", it) }
+            stamps[url]?.get("addedAt")?.let { entry.put("addedAt", it) }
+            if (entry.length() > 0) encoded.put(url, entry)
+        }
+        vortx.put("deletedAddonsTs", encoded)
+    } else {
+        vortx.remove("deletedAddonsTs")
+    }
+    return vortx
+}
 
 internal const val INITIAL_SESSION_OWNER_EPOCH = 1L
 
@@ -788,6 +820,7 @@ class VortXSyncManager(context: Context) {
     private val debridKeys = DebridKeys(appContext)
     private val metadataKeys = MetadataProviderKeys(appContext)
     private val libraryTombstones = LibraryTombstones(appContext)
+    private val addonTombstones = AddonTombstones(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
     private val sessionState = DurableSessionState(
@@ -1604,6 +1637,14 @@ class VortXSyncManager(context: Context) {
                         libraryTombstones.merge(parsed.deletedLibrary, parsed.deletedLibraryTs)
                         refreshSettingsShadow()
                     }
+                    // Fold app-authored add-on tombstones before publishing this read-merge. The max fold is
+                    // monotone, so a peer deletion remains authoritative over a locally seeded add-on, while
+                    // a newer explicit install's addedAt stamp is retained and wins on every later pull.
+                    // Stamp-less web removals are deliberately minted only in syncDown (the single guarded
+                    // mint chokepoint), never by a push-path read merge.
+                    if (parsed.deletedAddons.isNotEmpty() || parsed.deletedAddonsTs.isNotEmpty()) {
+                        addonTombstones.merge(parsed.deletedAddons, parsed.deletedAddonsTs)
+                    }
                     resolvedRoster.roster?.let {
                         if (it.isNotEmpty()) store.mergeInRoster(it, resolvedRoster.modifiedSeconds)
                     }
@@ -1621,7 +1662,10 @@ class VortXSyncManager(context: Context) {
                     deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
                 )?.let { doc.put("settings", it) }
                 val vortx = VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx"))
-                doc.put("vortx", applyLibraryTombstonesToVortx(vortx))
+                doc.put(
+                    "vortx",
+                    applyAddonTombstonesToVortx(applyLibraryTombstonesToVortx(vortx), addonTombstones),
+                )
                 // gap 2: mirror this device's connected-service (debrid) keys on doc.apiKeys, read-merge +
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
@@ -1756,7 +1800,8 @@ class VortXSyncManager(context: Context) {
         }
         val parsed = VortXSyncDoc.parse(doc)
         var libraryTombstonesChanged = false
-        val foldedLibrary = withContext(Dispatchers.Main) {
+        var addonTombstonesChanged = false
+        val foldedTombstones = withContext(Dispatchers.Main) {
             publishIfSyncLeaseCurrent(lease) {
                 applyingRemote = true
                 try {
@@ -1770,23 +1815,46 @@ class VortXSyncManager(context: Context) {
                             doc.optJSONObject("vortx")?.let(::applyLibraryTombstonesToVortx)
                         }
                     }
+                    // Always fold LWW add-on state from a successfully decrypted doc before the version gate.
+                    // This is safe on stale/equal/forced pulls because every stamp only advances by max, and
+                    // it lets a newer peer reinstall (addedAt) make a previously removed URL present again.
+                    // Fold the persistent, stamp-less web mirror second and only here: merge mints it only
+                    // for an entirely untracked URL, so a known explicit Android install is never re-removed.
+                    if (parsed.deletedAddons.isNotEmpty() || parsed.deletedAddonsTs.isNotEmpty()) {
+                        addonTombstonesChanged = addonTombstones.merge(
+                            parsed.deletedAddons,
+                            parsed.deletedAddonsTs,
+                        )
+                    }
+                    if (parsed.webAddonRemovals.isNotEmpty()) {
+                        addonTombstonesChanged = addonTombstones.merge(
+                            legacyIds = emptyList(),
+                            stamps = emptyMap(),
+                            webIds = parsed.webAddonRemovals,
+                        ) || addonTombstonesChanged
+                    }
+                    if (addonTombstonesChanged) {
+                        doc.optJSONObject("vortx")?.let { applyAddonTombstonesToVortx(it, addonTombstones) }
+                    }
                 } finally {
                     applyingRemote = false
                 }
             }
         }
-        if (!foldedLibrary || !isSyncLeaseCurrent(lease)) return false
-        if (libraryTombstonesChanged) requestSyncSoon()
-        // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Library tombstone
-        // stamps are monotone MAX folds and therefore apply from every successfully decrypted doc.
-        if (!force && version <= lastSyncedVersion(lease)) return libraryTombstonesChanged
+        if (!foldedTombstones || !isSyncLeaseCurrent(lease)) return false
+        if (libraryTombstonesChanged || addonTombstonesChanged) requestSyncSoon()
+        // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Library and add-on
+        // tombstone stamps are monotone MAX folds and therefore apply from every successfully decrypted doc.
+        if (!force && version <= lastSyncedVersion(lease)) {
+            return libraryTombstonesChanged || addonTombstonesChanged
+        }
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
             pulledBlob = doc.opt("settings"),
             fallbackRoster = parsed.roster,
             fallbackModifiedSeconds = parsed.rosterModifiedSeconds,
             fallbackIsLossless = parsed.rosterIsLossless,
         )
-        var restored = libraryTombstonesChanged
+        var restored = libraryTombstonesChanged || addonTombstonesChanged
         val published = withContext(Dispatchers.Main) {
             val store = resolveStore() ?: return@withContext false
             publishIfSyncLeaseCurrent(lease) {

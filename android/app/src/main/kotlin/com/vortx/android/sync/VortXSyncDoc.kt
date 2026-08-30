@@ -58,6 +58,12 @@ object VortXSyncDoc {
         val deletedLibrary: List<String>,
         /** LWW owner-library stamps, keyed by normalized id then removedAt/addedAt. */
         val deletedLibraryTs: Map<String, Map<String, Double>>,
+        /** Back-compatible effective add-on removal set. */
+        val deletedAddons: List<String>,
+        /** LWW add-on stamps, keyed by normalized transport URL then removedAt/addedAt. */
+        val deletedAddonsTs: Map<String, Map<String, Double>>,
+        /** Stamp-less removals authored by the web client; only syncDown may mint these into stamps. */
+        val webAddonRemovals: List<String>,
         /** The remote device's active profile (advisory; selection stays per-device). */
         val activeProfile: String?,
     )
@@ -65,8 +71,21 @@ object VortXSyncDoc {
     // ---- Read: doc.vortx -> local-state view ----
 
     fun parse(doc: JSONObject): Parsed {
+        val webAddonRemovals = doc.optJSONArray("webAddonRemovals")?.toStringList() ?: emptyList()
         val vortx = doc.optJSONObject("vortx")
-            ?: return Parsed(null, null, false, emptyMap(), emptyList(), emptyList(), emptyMap(), null)
+            ?: return Parsed(
+                null,
+                null,
+                false,
+                emptyMap(),
+                emptyList(),
+                emptyList(),
+                emptyMap(),
+                emptyList(),
+                emptyMap(),
+                webAddonRemovals,
+                null,
+            )
 
         // Roster: prefer the FULL lossless carrier (Android-authored); else reconstruct from the dashboard
         // summary (Apple / web-authored) so a cross-surface doc still yields a usable roster.
@@ -106,6 +125,8 @@ object VortXSyncDoc {
         val deleted = vortx.optJSONArray("deletedProfiles")?.toStringList() ?: emptyList()
         val deletedLibrary = vortx.optJSONArray("deletedLibrary")?.toStringList() ?: emptyList()
         val deletedLibraryTs = parseLibraryTimestamps(vortx.optJSONObject("deletedLibraryTs"))
+        val deletedAddons = vortx.optJSONArray("deletedAddons")?.toStringList() ?: emptyList()
+        val deletedAddonsTs = parseLibraryTimestamps(vortx.optJSONObject("deletedAddonsTs"))
         val active = vortx.optStringOrNull("activeProfile")
         return Parsed(
             roster,
@@ -115,6 +136,9 @@ object VortXSyncDoc {
             deleted,
             deletedLibrary,
             deletedLibraryTs,
+            deletedAddons,
+            deletedAddonsTs,
+            webAddonRemovals,
             active,
         )
     }
