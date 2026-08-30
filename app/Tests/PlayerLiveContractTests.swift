@@ -379,6 +379,23 @@ enum PlayerLiveContractTests {
         state.resetAfterStableProgress()
         check("rapid buffering: stable progress renews the one-reload budget",
               !state.hasRecoveredInCurrentProgressBudget)
+
+        let audioChoice = PlayerRecoveryAudioChoice(language: " EN ", title: "Main Mix")
+        let audioCandidates = [
+            PlayerRecoveryAudioChoice.Candidate(id: 7, language: "en", title: "Commentary", selectable: true),
+            PlayerRecoveryAudioChoice.Candidate(id: 8, language: "en", title: "main mix", selectable: true),
+            PlayerRecoveryAudioChoice.Candidate(id: 9, language: "fr", title: "Main Mix", selectable: true),
+        ]
+        check("recovery audio: exact normalized language and title win over a language fallback",
+              PlayerRecoveryAudioChoice.matchingID(for: audioChoice, in: audioCandidates) == 8)
+        check("recovery audio: language fallback survives a changed title",
+              PlayerRecoveryAudioChoice.matchingID(
+                  for: PlayerRecoveryAudioChoice(language: "en", title: "Original"),
+                  in: audioCandidates) == 7)
+        check("recovery audio: no semantic match leaves the existing automatic choice available",
+              PlayerRecoveryAudioChoice.matchingID(
+                  for: PlayerRecoveryAudioChoice(language: "de", title: "Deutsch"),
+                  in: audioCandidates) == nil)
     }
 
     private static func testInitialMountPinsStartupBytes() {
@@ -4151,6 +4168,27 @@ enum PlayerLiveContractTests {
                   "hasStartedPlaying = previousHasStartedPlaying",
                   "firstFrameRenderedAt = previousFirstFrameRenderedAt",
               ]))
+        let autoTrackSelection = sourceSection(
+            tvPlayer,
+            from: "private func autoSelectTracks()",
+            to: "/// Snapshot the viewer's CURRENT explicit subtitle selection")
+        check("wiring: automatic recovery re-applies semantic audio once then falls back to TrackSelector",
+              sourceContainsInOrder(autoTrackSelection, [
+                  "if let pendingAudioReapply",
+                  "PlayerRecoveryAudioChoice.matchingID",
+                  "coordinator.player?.setAudioTrack(id)",
+                  "else if let automaticAudio",
+                  "self.pendingAudioReapply = nil",
+              ]))
+        check("wiring: automatic reload and source hop carry audio, while refusal restores it",
+              sourceContainsInOrder(tvStallReload, [
+                  "let previousPendingAudioReapply = pendingAudioReapply",
+                  "let audioChoice = captureSelectedAudioChoice()",
+                  "pendingAudioReapply = audioChoice",
+                  "pendingAudioReapply = previousPendingAudioReapply",
+              ])
+                  && tvPlayer?.contains("let audioChoice = captureSelectedAudioChoice()") == true
+                  && tvPlayer?.contains("preservingAudioChoice: audioChoice") == true)
         check("wiring: periodic playhead reporting never enters the publication lock",
               playheadReceipt?.contains("playbackClockLock.lock()") == true
                   && sourceSection(

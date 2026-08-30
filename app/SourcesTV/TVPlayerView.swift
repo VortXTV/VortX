@@ -411,6 +411,9 @@ struct TVPlayerView: View {
     // on the new engine's first trackList instead of the preference-derived auto pick. Consumed in
     // autoSelectTracks; only read while userPickedSubtitle is true. Mirror of PlayerScreen.
     @State private var pendingSubtitleReapply: SubtitleChoice?
+    // Automatic same-title recovery is allowed to carry the currently selected audio semantically. Unlike a
+    // preference, this is one mount-to-mount intent and must never leak into a manual title or episode change.
+    @State private var pendingAudioReapply: PlayerRecoveryAudioChoice?
     // A brief, transient note explaining WHY the engine fell back (e.g. AVPlayer cannot demux DV-in-MKV),
     // so the silent demote the owner reported becomes an actionable explanation. Auto-clears after a few s.
     @State private var engineNote: String?
@@ -3698,7 +3701,8 @@ struct TVPlayerView: View {
 
     private func resetRuntimeForIssuedSourceSwitch(
         userInitiated: Bool,
-        preservingSubtitleChoice: SubtitleChoice? = nil
+        preservingSubtitleChoice: SubtitleChoice? = nil,
+        preservingAudioChoice: PlayerRecoveryAudioChoice? = nil
     ) {
         clearCachedAudioOutputTruth()
         avToMPVHandoffTask?.cancel()
@@ -3728,7 +3732,9 @@ struct TVPlayerView: View {
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false
         autoAddonSubTried = false; userPickedSubtitle = preservingSubtitleChoice != nil
         addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""
-        pendingSubtitleReapply = preservingSubtitleChoice; suppressedResumeFloor = nil
+        pendingSubtitleReapply = preservingSubtitleChoice
+        pendingAudioReapply = preservingAudioChoice
+        suppressedResumeFloor = nil
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
         watchedZoneSince = nil
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
@@ -3746,7 +3752,8 @@ struct TVPlayerView: View {
                               resumeOverride: Double? = nil,
                               sourceGenerationAlreadyClaimed: Bool = false,
                               addon: String? = nil,
-                              preservingSubtitleChoice: SubtitleChoice? = nil) -> Bool {
+                              preservingSubtitleChoice: SubtitleChoice? = nil,
+                              preservingAudioChoice: PlayerRecoveryAudioChoice? = nil) -> Bool {
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
@@ -3831,7 +3838,8 @@ struct TVPlayerView: View {
         if debridRef == nil { prepareTorrent(stream) }
         resetRuntimeForIssuedSourceSwitch(
             userInitiated: userInitiated,
-            preservingSubtitleChoice: preservingSubtitleChoice
+            preservingSubtitleChoice: preservingSubtitleChoice,
+            preservingAudioChoice: preservingAudioChoice
         )
         curURL = newURL
         curDebridRef = debridRef
@@ -3989,6 +3997,7 @@ struct TVPlayerView: View {
         // subtitle intent before switchStream resets per-load state; autoSelectTracks re-applies it on the new
         // mount instead of silently returning to language preferences.
         let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
+        let audioChoice = captureSelectedAudioChoice()
         DiagnosticsLog.log(
             "player",
             "source hop \(hops)/\(maxSourceHops) reason=\(safeFailureClass(reason)) next=candidate"
@@ -3996,7 +4005,8 @@ struct TVPlayerView: View {
         guard switchStream(
             to: stream, url: newURL, targetMeta: sourceTargetMeta,
             userInitiated: false, resumeOverride: resume,
-            preservingSubtitleChoice: subtitleChoice
+            preservingSubtitleChoice: subtitleChoice,
+            preservingAudioChoice: audioChoice
         ) else {
             DiagnosticsLog.log(
                 "player",
@@ -4363,7 +4373,22 @@ struct TVPlayerView: View {
         let automaticAudio = TrackSelector.automaticAudioSelection(
             pick.audio,
             remuxOwnsInitialSelection: remuxOwnsInitialAudio)
-        if let automaticAudio { coordinator.player?.setAudioTrack(automaticAudio) }
+        if let pendingAudioReapply {
+            let candidates = audioTracks.map {
+                PlayerRecoveryAudioChoice.Candidate(
+                    id: $0.id, language: $0.lang, title: $0.title, selectable: $0.isSelectable
+                )
+            }
+            if let id = PlayerRecoveryAudioChoice.matchingID(for: pendingAudioReapply, in: candidates) {
+                coordinator.player?.setAudioTrack(id)
+                DiagnosticsLog.log("audio", "re-applied recovery audio choice")
+            } else if let automaticAudio {
+                coordinator.player?.setAudioTrack(automaticAudio)
+            }
+            self.pendingAudioReapply = nil
+        } else if let automaticAudio {
+            coordinator.player?.setAudioTrack(automaticAudio)
+        }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
         // the switch. Re-apply it instead of the preference-derived auto pick, which would otherwise override
         // an explicit Off / language choice on the fresh mount. Only fall back to TrackSelector when there was
@@ -4403,6 +4428,13 @@ struct TVPlayerView: View {
             return .pooled(id: p.id)
         }
         return .embedded(lang: sel.lang, title: sel.title)
+    }
+
+    /// Capture only the semantic attributes shared by unrelated mounts. The raw audio id is intentionally never
+    /// carried across a recovery because each engine rebuild assigns its own id space.
+    private func captureSelectedAudioChoice() -> PlayerRecoveryAudioChoice? {
+        guard let selected = audioTracks.first(where: { $0.selected && $0.isSelectable }) else { return nil }
+        return PlayerRecoveryAudioChoice(language: selected.lang, title: selected.title)
     }
 
     /// Re-apply a captured subtitle choice on the NEW engine after a switch. Track id spaces differ per engine,
@@ -4874,6 +4906,7 @@ struct TVPlayerView: View {
         let previousAddonSubsResolveTried = addonSubsResolveTried
         let previousUserPickedSubtitle = userPickedSubtitle
         let previousPendingSubtitleReapply = pendingSubtitleReapply
+        let previousPendingAudioReapply = pendingAudioReapply
         let previousPendingLibmpvResumeSeek = pendingLibmpvResumeSeek
         let previousBuffering = buffering
         let previousHasStartedPlaying = hasStartedPlaying
@@ -4883,6 +4916,7 @@ struct TVPlayerView: View {
         // fresh mount here (unlike AVPlayer's token reuse), so clearing this flag used to turn an explicit Off
         // or language selection back into the preference-derived automatic selection after every stall.
         let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
+        let audioChoice = captureSelectedAudioChoice()
         resumeSeconds = currentTime
         resumeIsMidPlayRecovery = true   // the live play head of the stalled mount, not a stored offset
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; addonSubsResolveTried = false
@@ -4890,6 +4924,7 @@ struct TVPlayerView: View {
             userPickedSubtitle = subtitleChoice != nil
         }
         pendingSubtitleReapply = subtitleChoice
+        pendingAudioReapply = audioChoice
         pendingLibmpvResumeSeek = nil   // reloading the same source at a fresh mount: drop any deferred resume seek
         buffering = true
         hasStartedPlaying = false
@@ -4913,6 +4948,7 @@ struct TVPlayerView: View {
             addonSubsResolveTried = previousAddonSubsResolveTried
             userPickedSubtitle = previousUserPickedSubtitle
             pendingSubtitleReapply = previousPendingSubtitleReapply
+            pendingAudioReapply = previousPendingAudioReapply
             pendingLibmpvResumeSeek = previousPendingLibmpvResumeSeek
             buffering = previousBuffering
             hasStartedPlaying = previousHasStartedPlaying

@@ -120,3 +120,36 @@ struct PlayerRapidBufferingRecoveryState: Equatable {
         reset()
     }
 }
+
+/// Semantic audio intent carried only across an automatic replacement of the same title. Engine track IDs are
+/// mount-local, so recovery resolves an exact normalized language/title pair first, then a language-only match.
+struct PlayerRecoveryAudioChoice: Equatable {
+    struct Candidate: Equatable {
+        let id: Int
+        let language: String
+        let title: String
+        let selectable: Bool
+    }
+
+    let language: String
+    let title: String
+
+    static func matchingID(for choice: PlayerRecoveryAudioChoice, in candidates: [Candidate]) -> Int? {
+        let language = normalized(choice.language)
+        let title = normalized(choice.title)
+        if let exact = candidates.first(where: {
+            $0.selectable
+                && normalized($0.language) == language
+                && normalized($0.title) == title
+        }) {
+            return exact.id
+        }
+        return candidates.first(where: {
+            $0.selectable && normalized($0.language) == language
+        })?.id
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+}
