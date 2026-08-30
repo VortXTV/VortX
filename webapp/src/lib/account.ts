@@ -15,12 +15,16 @@ import {
   registerAddonsSyncPusher,
   registerCwSyncPusher,
   webProgressEntries,
+  webProgressTombstones,
   installedUrls,
   mergeLibrary,
   mergeContinueWatching,
   mergeLibraryForScope,
   mergeContinueWatchingForScope,
+  mergeContinueWatchingTombstonesForScope,
+  mergeCWTombstones,
   type CWEntry,
+  type CWTombstone,
 } from "./store";
 import {
   mergeSyncedProfiles,
@@ -130,13 +134,13 @@ function cwEntriesFrom(items: unknown): CWEntry[] {
     const t = Number(it.t);
     const d = Number(it.d);
     if (!(t > 0) || !(d > 0) || t / d >= 0.95) return; // not started / already finished
-    // lastWatched may be an ISO string OR an epoch (seconds or ms). When it is missing or unparseable,
-    // fall back to the source ORDER (earlier in the list = more recently watched) so the rail matches the
-    // app's order instead of collapsing every item to updatedAt 0 and scrambling the order.
+    // lastWatched may be an ISO string OR an epoch (seconds or ms). Missing/unparseable clocks retain
+    // source order in the non-positive range. Never synthesize wall-clock freshness: doing that would
+    // make an undated stale account row newer than a real local removal tombstone.
     let updatedAt = NaN;
     if (typeof it.lastWatched === "string") updatedAt = Date.parse(it.lastWatched);
     else if (typeof it.lastWatched === "number") updatedAt = it.lastWatched < 1e12 ? it.lastWatched * 1000 : it.lastWatched;
-    if (!Number.isFinite(updatedAt) || updatedAt <= 0) updatedAt = Date.now() - i * 1000;
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0) updatedAt = -i;
     out.push({
       id: it.id,
       type: it.type,
@@ -263,9 +267,25 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   const libItems = (Array.isArray(vortx.library) ? vortx.library : []) as Array<Record<string, unknown>>;
   mergeLibrary(libItems as unknown as MetaItem[]);
 
+  // Apply bilateral timestamped removals BEFORE any live union so stale account/app rows cannot resurrect
+  // a clear or >=95%-finished title. Older documents simply omit webProgress.removed.
+  const webProg = doc.webProgress && typeof doc.webProgress === "object" ? (doc.webProgress as Record<string, unknown>) : null;
+  const removed = webProg?.removed && typeof webProg.removed === "object"
+    ? (webProg.removed as Record<string, unknown>)
+    : null;
+  let cwChanged = mergeContinueWatchingTombstonesForScope("", tombstonesFrom(removed?.owner));
+  const removedBy = removed?.byProfile && typeof removed.byProfile === "object"
+    ? (removed.byProfile as Record<string, unknown>)
+    : null;
+  if (removedBy) {
+    for (const pid of Object.keys(removedBy)) {
+      if (mergeContinueWatchingTombstonesForScope(pid, tombstonesFrom(removedBy[pid]))) cwChanged = true;
+    }
+  }
+
   // Continue Watching for the OWNER: derive from the synced library items' t/d progress, plus any explicit
   // vortx.continueWatching the app emits. cwEntriesFrom is shared with the per-profile hydration below.
-  let cwChanged = mergeContinueWatching([...cwEntriesFrom(vortx.continueWatching), ...cwEntriesFrom(libItems)]);
+  if (mergeContinueWatching([...cwEntriesFrom(vortx.continueWatching), ...cwEntriesFrom(libItems)])) cwChanged = true;
 
   // Profiles roster + per-profile (byProfile) library/CW. Without this the webapp only ever showed the
   // local "You" profile and never the user's real synced roster, and secondary profiles had empty
@@ -290,7 +310,6 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   // Mirrors the app's "owner top-level, overlays under byProfile" convention so the owner's web progress
   // merges into the base scope (not a phantom scope keyed by the owner's profile id). Merging it back means
   // what you watched on one browser shows on another even before the apps round-trip it into vortx.library.
-  const webProg = doc.webProgress && typeof doc.webProgress === "object" ? (doc.webProgress as Record<string, unknown>) : null;
   if (webProg) {
     if (Array.isArray(webProg.owner) && mergeContinueWatching(cwEntriesFrom(webProg.owner))) cwChanged = true;
     const wpBy = webProg.byProfile && typeof webProg.byProfile === "object" ? (webProg.byProfile as Record<string, unknown>) : null;
@@ -309,6 +328,16 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
     }
     if (rosterChanged) window.dispatchEvent(new Event("vortx:profile-changed"));
   }
+}
+
+function tombstonesFrom(value: unknown): CWTombstone[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is CWTombstone => {
+    if (!entry || typeof entry !== "object") return false;
+    const record = entry as Record<string, unknown>;
+    return Array.isArray(record.keys) && record.keys.every((key) => typeof key === "string") &&
+      typeof record.removedAt === "number" && Number.isFinite(record.removedAt);
+  });
 }
 
 /** After sign-in, pull the account's encrypted sync document and apply it locally, so the user's add-ons,
@@ -693,6 +722,7 @@ registerAddonsSyncPusher((hint) => {
 async function pushWebProgress(session: Session): Promise<void> {
   try {
     const entries = webProgressEntries(); // the active scope's CW, already in the bilateral shape
+    const tombstones = webProgressTombstones();
     const owner = isOwnerProfile(activeProfileId());
     const pid = activeProfileId();
     await mutateSyncDoc(session, (doc) => {
@@ -712,6 +742,19 @@ async function pushWebProgress(session: Session): Promise<void> {
         by[pid] = merged;
         wp.byProfile = by;
       }
+      const removed: Record<string, unknown> =
+        wp.removed && typeof wp.removed === "object" ? (wp.removed as Record<string, unknown>) : {};
+      if (owner) {
+        removed.owner = mergeWebProgressTombstones(removed.owner, tombstones);
+      } else {
+        const by: Record<string, unknown> =
+          removed.byProfile && typeof removed.byProfile === "object"
+            ? (removed.byProfile as Record<string, unknown>)
+            : {};
+        by[pid] = mergeWebProgressTombstones(by[pid], tombstones);
+        removed.byProfile = by;
+      }
+      wp.removed = removed;
       wp.editedAt = Date.now();
       doc.webProgress = wp;
     });
@@ -719,6 +762,12 @@ async function pushWebProgress(session: Session): Promise<void> {
     // fail-soft: progress is already saved locally; the next CW change re-pushes.
   }
 }
+
+function mergeWebProgressTombstones(prior: unknown, mine: CWTombstone[]): CWTombstone[] {
+  return mergeCWTombstones(tombstonesFrom(prior), mine);
+}
+
+export const __continueWatchingSyncTestHooks = { pushWebProgress, mergeWebProgress };
 
 // Union the doc's existing web-progress entries with this device's, keyed by id+played-id, keeping the
 // fresher lastWatched. Without this, a full-array overwrite would let two browsers clobber each other's

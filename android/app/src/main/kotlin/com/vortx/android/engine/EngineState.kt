@@ -280,7 +280,7 @@ internal object EngineState {
                 aliases = listOfNotNull(videoId),
                 freshness = freshness,
                 hasValidProgress = timeOffset.isFinite() && timeOffset > 0 &&
-                    duration.isFinite() && duration >= 0,
+                    duration.isFinite() && duration > 0,
                 removed = removed || finished,
             )
         }

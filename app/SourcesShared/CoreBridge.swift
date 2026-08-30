@@ -2056,7 +2056,7 @@ final class CoreBridge: ObservableObject {
                 type: $0.type,
                 aliases: [$0.state.videoId].compactMap { $0 },
                 hasValidProgress: $0.state.timeOffset.isFinite && $0.state.timeOffset > 0
-                    && $0.state.duration.isFinite && $0.state.duration >= 0,
+                    && $0.state.duration.isFinite && $0.state.duration > 0,
                 removed: $0.removed ?? false
             )
         }

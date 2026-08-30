@@ -48,7 +48,7 @@ class ContinueWatchingDedupeTest {
                     aliases = item.aliases,
                     freshness = item.updatedAt,
                     hasValidProgress = item.position.isFinite() && item.duration.isFinite() &&
-                        item.position > 0 && item.duration >= 0,
+                        item.position > 0 && item.duration > 0,
                     removed = item.removed,
                 )
             }.map(Item::key)

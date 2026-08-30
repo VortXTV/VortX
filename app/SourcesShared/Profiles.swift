@@ -1310,7 +1310,7 @@ final class ProfileStore: ObservableObject {
                 type: $0.item.type,
                 aliases: [$0.item.state.videoId].compactMap { $0 },
                 hasValidProgress: $0.item.state.timeOffset.isFinite && $0.item.state.timeOffset > 0
-                    && $0.item.state.duration.isFinite && $0.item.state.duration >= 0
+                    && $0.item.state.duration.isFinite && $0.item.state.duration > 0
             )
         }
         return unique.prefix(30).map(\.item)

@@ -48,7 +48,14 @@ values.set(
 values.set("vortx.web.activeProfile.v1", "owner");
 
 const { setActiveProfile } = await import("./profiles.ts");
-const { clearProgress, continueWatching, mergeContinueWatching } = await import("./store.ts");
+const {
+  clearProgress,
+  continueWatching,
+  exportBackup,
+  importBackup,
+  mergeContinueWatching,
+  recordProgress,
+} = await import("./store.ts");
 
 const entry = (patch = {}) => ({
   id: "tmdb:1396",
@@ -62,7 +69,47 @@ const entry = (patch = {}) => ({
   ...patch,
 });
 
+const clearCW = () => {
+  for (const key of [...values.keys()]) {
+    if (key.startsWith("vortx.web.cw.")) values.delete(key);
+  }
+  values.set("vortx.web.activeProfile.v1", "owner");
+};
+
+test("web Continue Watching rejects zero duration and tombstones the exact finish boundary", () => {
+  clearCW();
+  recordProgress(entry(), 10, 0);
+  assert.deepEqual(continueWatching(), [], "zero duration is never valid progress");
+
+  recordProgress(entry(), 100, 200);
+  assert.equal(continueWatching().length, 1, "in-progress playback is retained");
+  recordProgress(entry(), 190, 200);
+  assert.deepEqual(continueWatching(), [], "exactly 95% is finished");
+  assert.equal(
+    mergeContinueWatching([entry({ position: 100, duration: 200, updatedAt: 0 })]),
+    false,
+    "stale hydration cannot resurrect a finished row",
+  );
+});
+
+test("backup validates and restores timestamped Continue Watching removals", () => {
+  clearCW();
+  const tombstones = [{ keys: ["id:series:imdb:tt0903747"], removedAt: 1234 }];
+  values.set("vortx.web.cw.removed.v1", JSON.stringify(tombstones));
+  const backup = exportBackup();
+  values.delete("vortx.web.cw.removed.v1");
+  assert.equal(importBackup(backup), true);
+  assert.deepEqual(JSON.parse(values.get("vortx.web.cw.removed.v1")), tombstones);
+
+  const malformed = JSON.parse(backup);
+  malformed.data["vortx.web.cw.removed.v1"] = [{ keys: [7], removedAt: "now" }];
+  values.set("sentinel", "preserved");
+  assert.equal(importBackup(JSON.stringify(malformed)), false, "malformed tombstones reject the whole restore");
+  assert.equal(values.get("sentinel"), "preserved");
+});
+
 test("web Continue Watching keeps alias removal and profile boundaries durable", () => {
+  clearCW();
   values.set(
     "vortx.web.cw.v1",
     JSON.stringify([

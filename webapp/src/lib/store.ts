@@ -265,7 +265,7 @@ export interface CWEntry extends MetaItem {
   updatedAt: number;
 }
 
-interface CWTombstone {
+export interface CWTombstone {
   keys: string[];
   removedAt: number;
 }
@@ -277,7 +277,7 @@ function cwIdentity(entry: CWEntry): ContinueWatchingIdentity {
     aliases: [entry.resumeId],
     freshness: entry.updatedAt,
     hasValidProgress:
-      Number.isFinite(entry.position) && Number.isFinite(entry.duration) && entry.position > 0 && entry.duration >= 0,
+      Number.isFinite(entry.position) && Number.isFinite(entry.duration) && entry.position > 0 && entry.duration > 0,
   };
 }
 
@@ -408,6 +408,39 @@ export function webProgressEntries(): WebProgressEntry[] {
   }));
 }
 
+/** The ACTIVE profile's timestamped removal/finished records for bilateral account sync. */
+export function webProgressTombstones(): CWTombstone[] {
+  return readCWTombstones(scopedKey(CW_TOMBSTONE_KEY));
+}
+
+export function mergeCWTombstones(left: CWTombstone[], right: CWTombstone[]): CWTombstone[] {
+  const merged: CWTombstone[] = [];
+  for (const candidate of [...left, ...right]) {
+    if (!candidate || !Array.isArray(candidate.keys) || !Number.isFinite(candidate.removedAt)) continue;
+    const keys = new Set(candidate.keys.filter((key) => typeof key === "string"));
+    if (!keys.size) continue;
+    let removedAt = candidate.removedAt;
+    for (let i = merged.length - 1; i >= 0; i -= 1) {
+      const existing = merged[i];
+      if (!identityKeysIntersect(keys, new Set(existing.keys))) continue;
+      existing.keys.forEach((key) => keys.add(key));
+      removedAt = Math.max(removedAt, existing.removedAt);
+      merged.splice(i, 1);
+    }
+    merged.push({ keys: [...keys].sort(), removedAt });
+  }
+  return merged.sort((a, b) => b.removedAt - a.removedAt).slice(0, 100);
+}
+
+function writeCWTombstone(key: string, keys: Set<string>, removedAt: number): void {
+  const next = mergeCWTombstones(readCWTombstones(key), [{ keys: [...keys], removedAt }]);
+  try {
+    localStorage.setItem(key, JSON.stringify(next));
+  } catch {
+    /* storage disabled or full: the local live-set removal still applies */
+  }
+}
+
 /** Record playback progress for `item` (its `resumeId` is the played id, defaulting to the display id);
  *  drops that played id once past 95% (finished). */
 export function recordProgress(
@@ -418,9 +451,34 @@ export function recordProgress(
   if (!isFinite(position) || !isFinite(duration) || duration <= 0) return;
   const resumeId = item.resumeId ?? item.id;
   const resumeKey = canonicalPlaybackIdentity(resumeId, item.type);
-  const others = rawCW().filter((entry) => canonicalPlaybackIdentity(entry.resumeId, entry.type) !== resumeKey);
-  if (position / duration > 0.95) {
+  const current = rawCW();
+  const previous = current.find((entry) => canonicalPlaybackIdentity(entry.resumeId, entry.type) === resumeKey);
+  const others = current.filter((entry) => canonicalPlaybackIdentity(entry.resumeId, entry.type) !== resumeKey);
+  if (position / duration >= 0.95) {
     persistCW(others);
+    const seed = previous ?? {
+      id: item.id,
+      type: item.type,
+      name: item.name,
+      poster: item.poster,
+      resumeId,
+      position,
+      duration,
+      updatedAt: Date.now(),
+    };
+    const removalKeys = continueWatchingIdentityKeys(cwIdentity(seed));
+    let expanded = true;
+    while (expanded) {
+      expanded = false;
+      for (const entry of current) {
+        const keys = continueWatchingIdentityKeys(cwIdentity(entry));
+        if (!identityKeysIntersect(removalKeys, keys)) continue;
+        for (const key of keys) {
+          if (!removalKeys.has(key)) { removalKeys.add(key); expanded = true; }
+        }
+      }
+    }
+    writeCWTombstone(scopedKey(CW_TOMBSTONE_KEY), removalKeys, Date.now());
     cwSyncPusher?.(); // finishing a title is a CW change too - push the dropped state up
     return;
   }
@@ -463,17 +521,7 @@ export function clearProgress(id: string): void {
   persistCW(entries.filter((entry) => !identityKeysIntersect(removalKeys, continueWatchingIdentityKeys(cwIdentity(entry)))));
   const tombstoneKey = scopedKey(CW_TOMBSTONE_KEY);
   const removedAt = Date.now();
-  const tombstones = readCWTombstones(tombstoneKey).filter(
-    (entry) => !identityKeysIntersect(removalKeys, new Set(entry.keys)),
-  );
-  try {
-    localStorage.setItem(
-      tombstoneKey,
-      JSON.stringify([{ keys: [...removalKeys].sort(), removedAt }, ...tombstones].slice(0, 100)),
-    );
-  } catch {
-    /* storage disabled or full: the local removal above still applies */
-  }
+  writeCWTombstone(tombstoneKey, removalKeys, removedAt);
   cwSyncPusher?.(); // publish the active live set; this scope's tombstone still blocks stale hydration
 }
 
@@ -583,6 +631,39 @@ export function mergeContinueWatchingForScope(scope: string, entries: CWEntry[])
   return mergeContinueWatchingAt(key, scopedBaseKey(CW_TOMBSTONE_KEY, scope), entries);
 }
 
+/** Merge remote timestamped removals before live hydration, then prune any now-covered local rows. */
+export function mergeContinueWatchingTombstonesForScope(scope: string, incoming: CWTombstone[]): boolean {
+  const key = scopedBaseKey(CW_KEY, scope);
+  const tombstoneKey = scopedBaseKey(CW_TOMBSTONE_KEY, scope);
+  const existing = readCWTombstones(tombstoneKey);
+  const next = mergeCWTombstones(existing, incoming);
+  const tombstonesChanged = JSON.stringify(next) !== JSON.stringify(existing);
+  if (tombstonesChanged) {
+    try {
+      localStorage.setItem(tombstoneKey, JSON.stringify(next));
+    } catch {
+      return false;
+    }
+  }
+  const raw = readCWKey(key, tombstoneKey);
+  let storedCount = 0;
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
+    storedCount = Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    storedCount = 0;
+  }
+  const pruned = raw.length !== storedCount;
+  if (pruned) {
+    try {
+      localStorage.setItem(key, JSON.stringify(raw));
+    } catch {
+      return tombstonesChanged;
+    }
+  }
+  return tombstonesChanged || pruned;
+}
+
 // --- Recent searches ----------------------------------------------------------------------------
 // The last few search queries, newest first, so the Search page can offer one-tap repeats. Local only.
 const RECENT_KEY = "vortx.web.recent.v1";
@@ -686,6 +767,14 @@ function validBackupValue(key: string, val: unknown): boolean {
     case "vortx.web.library.v1":
     case "vortx.web.cw.v1":
       return Array.isArray(val) && val.every((e) => !!e && typeof e === "object" && !Array.isArray(e));
+    case "vortx.web.cw.removed.v1":
+      return Array.isArray(val) && val.every((e) => {
+        if (!e || typeof e !== "object" || Array.isArray(e)) return false;
+        const tombstone = e as Record<string, unknown>;
+        return Array.isArray(tombstone.keys) &&
+          tombstone.keys.every((key) => typeof key === "string") &&
+          typeof tombstone.removedAt === "number" && Number.isFinite(tombstone.removedAt);
+      });
     default:
       return false;
   }

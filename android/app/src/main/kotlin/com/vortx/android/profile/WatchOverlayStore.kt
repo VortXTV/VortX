@@ -91,7 +91,7 @@ class WatchOverlayStore(
                 type = entry.type,
                 aliases = listOfNotNull(entry.videoId),
                 freshness = runCatching { Instant.parse(entry.lastWatched).toEpochMilli().toDouble() }.getOrNull(),
-                hasValidProgress = entry.timeOffsetMs > 0 && entry.durationMs >= 0,
+                hasValidProgress = entry.timeOffsetMs > 0 && entry.durationMs > 0,
             )
         }.take(30).map { it.item }
     }

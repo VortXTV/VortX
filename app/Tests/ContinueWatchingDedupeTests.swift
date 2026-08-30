@@ -23,7 +23,7 @@ private struct Fixture: Decodable {
         let removed: Bool?
 
         var hasValidProgress: Bool {
-            position.isFinite && duration.isFinite && position > 0 && duration >= 0
+            position.isFinite && duration.isFinite && position > 0 && duration > 0
         }
     }
 }
