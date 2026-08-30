@@ -71,7 +71,7 @@ void finalize_mpv_instance(JNIEnv *env, MPVInstance *instance) {
 
 jni_func(jlong, nativeCreate, jobject thiz, jobject appctx) {
     auto instance = new MPVInstance();
-    instance->event_thread_id = 0;
+    instance->event_thread_id.store(0, std::memory_order_relaxed);
     instance->event_thread_request_exit = false;
     instance->teardown_request_complete = false;
     instance->event_thread_start_state = EVENT_THREAD_STARTING;
@@ -121,24 +121,35 @@ jni_func(void, nativeInit, jlong instance) {
     mpv_instance->event_thread_start_state = EVENT_THREAD_STARTING;
     pthread_t created_event_thread;
     if (pthread_create(&created_event_thread, nullptr, event_thread, mpv_instance) != 0) {
-        mpv_instance->event_thread_id = 0;
+        mpv_instance->event_thread_id.store(0, std::memory_order_release);
         die(env, "thread create failed");
         return;
     }
-    mpv_instance->event_thread_id = created_event_thread;
+    // Publish the pthread id before allowing the child to attach or dispatch callbacks. Without this
+    // barrier, a newly scheduled child can reenter Java before nativeInit has finished publishing its
+    // identity and relinquishing MPVInstance access.
+    mpv_instance->event_thread_id.store(created_event_thread, std::memory_order_release);
+    mpv_instance->event_thread_start_state.store(
+        EVENT_THREAD_ID_PUBLISHED,
+        std::memory_order_release);
 
     int start_state;
     while ((start_state = mpv_instance->event_thread_start_state.load(std::memory_order_acquire)) ==
-        EVENT_THREAD_STARTING) {
+        EVENT_THREAD_ID_PUBLISHED) {
         std::this_thread::yield();
     }
     if (start_state == EVENT_THREAD_JNI_ATTACH_FAILED) {
-        pthread_join(mpv_instance->event_thread_id, nullptr);
-        mpv_instance->event_thread_id = 0;
+        pthread_join(created_event_thread, nullptr);
+        mpv_instance->event_thread_id.store(0, std::memory_order_release);
         die(env, "event thread failed to attach to Java VM");
         return;
     }
-    pthread_setname_np(mpv_instance->event_thread_id, "event_thread");
+    pthread_setname_np(created_event_thread, "event_thread");
+    // This is nativeInit's final MPVInstance access. The child cannot enter mpv_wait_event or invoke
+    // Java until it acquires this publication, so callback-driven destroy cannot free startup state.
+    mpv_instance->event_thread_start_state.store(
+        EVENT_THREAD_RUN_ALLOWED,
+        std::memory_order_release);
 }
 
 jni_func(void, nativeDestroy, jlong instance) {
@@ -148,7 +159,8 @@ jni_func(void, nativeDestroy, jlong instance) {
         return;
     }
 
-    const pthread_t event_thread_id = mpv_instance->event_thread_id;
+    const pthread_t event_thread_id =
+        mpv_instance->event_thread_id.load(std::memory_order_acquire);
     if (event_thread_id == 0) {
         finalize_mpv_instance(env, mpv_instance);
         return;
@@ -175,9 +187,9 @@ jni_func(void, nativeDestroy, jlong instance) {
     const int join_result = pthread_join(event_thread_id, nullptr);
     if (join_result != 0) {
         // Cleanup is still owned by the awakened event thread. A join failure must not fall through and
-        // free state that the event loop can still touch.
+        // free state that the event loop can still touch. Do not probe the possibly stale pthread handle
+        // with pthread_detach: modern bionic aborts the process for invalid non-null thread handles.
         ALOGE("event thread join failed (%d); deferred teardown remains event-thread owned", join_result);
-        pthread_detach(event_thread_id);
     }
 }
 

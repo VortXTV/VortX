@@ -10,7 +10,9 @@
 
 enum EventThreadStartState {
     EVENT_THREAD_STARTING = 0,
-    EVENT_THREAD_READY = 1,
+    EVENT_THREAD_ID_PUBLISHED = 1,
+    EVENT_THREAD_JNI_READY = 2,
+    EVENT_THREAD_RUN_ALLOWED = 3,
     EVENT_THREAD_JNI_ATTACH_FAILED = -1,
 };
 
@@ -18,7 +20,7 @@ enum EventThreadStartState {
 struct MPVInstance {
     mpv_handle *mpv;
     JavaVM *vm;
-    pthread_t event_thread_id;
+    std::atomic<pthread_t> event_thread_id;
     std::atomic<bool> event_thread_request_exit;
     std::atomic<bool> teardown_request_complete;
     std::atomic<int> event_thread_start_state;

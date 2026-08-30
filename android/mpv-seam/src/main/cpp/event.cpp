@@ -116,6 +116,14 @@ static void sendLogMessageToJava(JNIEnv *env, MPVInstance* instance, mpv_event_l
 
 void *event_thread(void *arg) {
     auto instance = static_cast<MPVInstance*>(arg);
+
+    // pthread_create may schedule the child before returning to nativeInit. Wait until the parent has
+    // published event_thread_id so neither startup nor a later destroy observes a half-started thread.
+    while (instance->event_thread_start_state.load(std::memory_order_acquire) ==
+        EVENT_THREAD_STARTING) {
+        std::this_thread::yield();
+    }
+
     JNIEnv *env = nullptr;
     acquire_jni_env(instance->vm, &env);
     if (!env) {
@@ -125,7 +133,14 @@ void *event_thread(void *arg) {
             std::memory_order_release);
         return nullptr;
     }
-    instance->event_thread_start_state.store(EVENT_THREAD_READY, std::memory_order_release);
+    instance->event_thread_start_state.store(EVENT_THREAD_JNI_READY, std::memory_order_release);
+
+    // nativeInit still owns startup state after JNI attachment. It publishes RUN_ALLOWED only after its
+    // last instance access, preventing an immediate queued event from reentering destroy too early.
+    while (instance->event_thread_start_state.load(std::memory_order_acquire) ==
+        EVENT_THREAD_JNI_READY) {
+        std::this_thread::yield();
+    }
 
     while (true) {
         mpv_event *mp_event;

@@ -36,8 +36,9 @@ Every intentional difference between upstream tag v1.0.0 and this module is cate
    every JNI call, rejects new leases after destruction starts, waits for existing calls, and destroys
    exactly once. Reentrant destroy calls return without waiting. Listener-requested teardown is moved
    off the JNI callback stack; native code independently transfers final cleanup to the event loop and
-   frees the instance only after `CallVoidMethod` unwinds. This closes both the check-then-free race and
-   the event-thread self-join/use-after-free path.
+   frees the instance only after `CallVoidMethod` unwinds. A startup handshake publishes the pthread id
+   and completes `nativeInit` before the child can dispatch callbacks. This closes the check-then-free,
+   startup-publication, and event-thread self-join/use-after-free paths.
 3. **Single-owner Surface lifetime.** Kotlin serializes attach, detach, and destroy. Native attach
    replaces a GlobalRef without leaking the old one, detach is idempotent, and final destroy owns any
    residual ref. A late SurfaceHolder callback therefore cannot double-delete or use a freed instance.
