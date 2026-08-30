@@ -682,24 +682,33 @@ private func productionWiring() {
     let tvReceiptPasses: (String) -> Bool = { source in
         guard let section = sourceSlice(
             source,
-            after: "let presentationText: String = {",
-            from: "return String(",
-            to: "        }()\n        VXProbe.log("
+            after: "private func maybeLogFrameDropReceipt()",
+            from: "private func maybeLogFrameDropReceipt()",
+            to: "/// Live playback numbers"
         ) else { return false }
-        return section.contains("nextDrawableWaitMs=")
-            && section.contains("presentLatency=unsupported-tvos")
+        return section.contains("rawOutputDelta30s=")
+            && section.contains("settledOutputDelta30s=")
+            && section.contains("outputDropClass=")
+            && section.contains("drawableAcquire=")
+            && section.contains("drawableAcquireWaitMs=")
+            && section.contains("presentCallback=unavailable-tvos")
+            && section.contains("cache-starvation")
+            && !section.contains("delta30s=")
+            && !section.contains("draw=")
+            && !section.contains("nextDrawableWaitMs=")
+            && !section.contains("presentLatency=")
             && !section.contains("presentSample30=")
             && !section.contains("presentSampleMs=")
     }
     let tvSource = sources["TVPlayerView.swift"]!
     check(
-        "frame source contract: tvOS receipt uses unsupported presentation latency",
+        "frame source contract: tvOS receipt reports raw and settled output drops plus drawable acquisition, not a nonexistent present callback",
         tvReceiptPasses(tvSource)
     )
     if let mutated = replacingFirst(
         tvSource,
         after: "let presentationText: String = {",
-        target: "presentLatency=unsupported-tvos",
+        target: "presentCallback=unavailable-tvos",
         with: "presentSample30=%d/%d"
     ) {
         check(
@@ -712,11 +721,11 @@ private func productionWiring() {
     if let mutated = replacingFirst(
         tvSource,
         after: "let presentationText: String = {",
-        target: "nextDrawableWaitMs=",
+        target: "drawableAcquireWaitMs=",
         with: "waitMs="
     ) {
         check(
-            "frame source contract mutation: old drawable wait label is rejected",
+            "frame source contract mutation: drawable-acquire terminology is required",
             !tvReceiptPasses(mutated)
         )
     } else {

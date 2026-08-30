@@ -23,7 +23,7 @@ private enum TrickplayEndToEndCorrectionTests {
         testFetchEpochClaimRejectsABA()
         testCommunityFetchContract()
         testStoreAndUICompletionContract()
-        testProtectedUHDDVCaptureContract()
+        testProtectedUHDHDRCaptureContract()
         testProductionWiringUsesThePolicies()
         print("TrickplayEndToEndCorrectionTests: \(passed)/\(passed) passed")
     }
@@ -515,13 +515,13 @@ private enum TrickplayEndToEndCorrectionTests {
                "fetch completion diagnostics must preserve a fixed unavailable category and remain redacted")
     }
 
-    private static func testProtectedUHDDVCaptureContract() {
+    private static func testProtectedUHDHDRCaptureContract() {
         let tv = source("app/SourcesTV/TVPlayerView.swift")
-        guard let start = tv.range(of: "private func maybeCaptureLocalTrickplay"), let end = tv.range(of: "/// True only for a 4K", range: start.upperBound..<tv.endIndex) else {
-            fatalError("cannot inspect UHD-DV capture guard")
+        guard let start = tv.range(of: "private func maybeCaptureLocalTrickplay"), let end = tv.range(of: "/// UHD Dolby Vision", range: start.upperBound..<tv.endIndex) else {
+            fatalError("cannot inspect UHD-HDR capture guard")
         }
         let captureGate = tv[start.lowerBound..<end.lowerBound]
-        expect(captureGate.contains("shouldSkipTrickplayCaptureForUHDDolbyVision()") && captureGate.contains("captureTrickplayFrame(at: time)") && captureGate.range(of: "shouldSkipTrickplayCaptureForUHDDolbyVision()")!.lowerBound < captureGate.range(of: "captureTrickplayFrame(at: time)")!.lowerBound && !tv.contains("screenshot-raw") && tv.contains("captureFrameJPEGData"), "the existing UHD-DV guard must remain before the only capture path")
+        expect(captureGate.contains("shouldSkipLocalTrickplayCaptureForUHDHDR()") && captureGate.contains("captureTrickplayFrame(at: time)") && captureGate.range(of: "shouldSkipLocalTrickplayCaptureForUHDHDR()")!.lowerBound < captureGate.range(of: "captureTrickplayFrame(at: time)")!.lowerBound && tv.contains("private func shouldSkipLocalTrickplayCaptureForUHDHDR() -> Bool") && tv.contains("isCurrentContentUHDHDR()") && tv.contains("isHDR || player.contentIsDolbyVision || player.hdrAvailable || sourceAdvertisesHDR") && tv.contains("hint.contains(\"hdr\") || hint.contains(\"hlg\")") && tv.contains("isHDR = false") && !tv.contains("screenshot-raw") && tv.contains("captureFrameJPEGData"), "all UHD HDR classes must bypass the only local inline capture path while remote/provider previews remain intact")
     }
 
     private static func testProductionWiringUsesThePolicies() {

@@ -2464,8 +2464,13 @@ struct TVPlayerView: View {
         guard receipt.hasValues else { return }
         lastFrameDropReceiptAt = now
         let count = receipt.frameDropCount ?? 0
-        let fallbackDelta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
-        let delta = receipt.framePresentation?.frameDropsSinceReceipt ?? fallbackDelta
+        // `frameDropCount` is mpv's raw output-drop counter. The presentation receipt intentionally excludes
+        // unsettled renderer/display-switch drops from its scored total, so log both values rather than
+        // relabeling a raw cache-starvation/output delta as a decoder or settled-render failure.
+        let rawOutputDelta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
+        let settledOutputDelta = receipt.framePresentation?.frameDropsSinceReceipt ?? rawOutputDelta
+        let outputDropClass = (receipt.pausedForCache == true || receipt.cacheUnderrun == true)
+            ? "cache-starvation" : "output"
         lastFrameDropCount = count
         func intText(_ value: Int?) -> String { value.map(String.init) ?? "na" }
         func boolText(_ value: Bool?) -> String {
@@ -2488,7 +2493,7 @@ struct TVPlayerView: View {
                 vo = "pending"
             }
             return String(
-                format: " fp=g%llu gate=%@ cscale=%@ priorCscale=%@ draw=%d/%d nextDrawableWaitMs=%.2f/%.2f presentLatency=unsupported-tvos decoderDelta30s=%d sub=%@/%@ cues=%d/%.1fpm vo=%@",
+                format: " fp=g%llu gate=%@ cscale=%@ priorCscale=%@ drawableAcquire=%d/%d drawableAcquireWaitMs=%.2f/%.2f presentCallback=unavailable-tvos decoderDelta30s=%d sub=%@/%@ cues=%d/%.1fpm vo=%@",
                 frame.generation, frame.mitigationGate,
                 frame.activeCscale ?? "na",
                 frame.mitigationPriorCscale ?? "na",
@@ -2502,7 +2507,7 @@ struct TVPlayerView: View {
         }()
         VXProbe.log(
             "perf",
-            "libmpv frameDrop=\(count) delta30s=\(delta) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCaptureInFlight=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureIntervalS=\(Int(Self.trickplayCaptureIntervalSecs)) trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
+            "libmpv outputDrop=\(count) rawOutputDelta30s=\(rawOutputDelta) settledOutputDelta30s=\(settledOutputDelta) outputDropClass=\(outputDropClass) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCaptureInFlight=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureIntervalS=\(Int(Self.trickplayCaptureIntervalSecs)) trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
         )
         trickplayCaptureAttemptsSinceReceipt = 0
         trickplayCaptureCompletionsSinceReceipt = 0
@@ -3761,6 +3766,7 @@ struct TVPlayerView: View {
         resumeIsMidPlayRecovery = false
         bufferedTime = 0
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false
+        isHDR = false
         autoAddonSubTried = false; userPickedSubtitle = preservingSubtitleChoice != nil
         addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""
         pendingSubtitleReapply = preservingSubtitleChoice
@@ -9152,18 +9158,14 @@ struct TVPlayerView: View {
             isScrubbing: scrubbing,
             captureInFlight: localTrickplayCaptureInFlight
         ) else { return }
-        // 4K Dolby Vision aggravator (diag-23): the libmpv frame grab is serviced INLINE on mpv's VO
-        // thread inside MetalLayer.nextDrawable (an MPS scale + cmd.commit), so on a heavy 4K DV frame
-        // it extends the very next drawable wait and can tip the present pipeline into a drop. Skip
-        // local/community capture for exactly that content. The only cost is no community trickplay
-        // contribution on 4K DV titles (a feature cost, zero image risk). Checked here, after the
-        // cadence gate, so mediaSummary() reads only at capture boundaries, not every timePos tick.
-        if shouldSkipTrickplayCaptureForUHDDolbyVision() { return }
-        // Report item 8: withhold capture until first frame + display settle so its GPU work cannot land in
-        // the startup/renegotiation window the diagnosed drop bursts cluster in. UHD HDR/DV content gets the
-        // longer threshold (isCurrentContentUHDHDR). Checked here, after the cadence gate and the DV skip
-        // above, for the same reason those are: mediaSummary() must read only at capture boundaries, not on
-        // every timePos tick.
+        // UHD HDR aggravator (diag-23): a local frame grab is serviced inline on mpv's VO thread inside
+        // MetalLayer.nextDrawable (an MPS scale + cmd.commit). On a heavy UHD HDR frame that extends the
+        // next drawable wait and can tip the output pipeline into a drop. Skip only the local/community
+        // contribution for UHD Dolby Vision, HDR10, and HLG. Remote/provider previews are read separately
+        // by ScrubThumbnailsStore and remain available. This stays after the cadence gate so mediaSummary()
+        // is read at capture boundaries, never on every timePos tick.
+        if shouldSkipLocalTrickplayCaptureForUHDHDR() { return }
+        // Non-UHD SDR remains eligible after the ordinary first-frame/display-settle threshold.
         guard TrickplayPresentationReadinessPolicy.isReady(
             elapsedSinceFirstFrame: firstFrameRenderedAt.map { ProcessInfo.processInfo.systemUptime - $0 },
             displaySwitchSettled: HDRDisplayMode.isSwitchSettled,
@@ -9172,26 +9174,25 @@ struct TVPlayerView: View {
         captureTrickplayFrame(at: time)
     }
 
-    /// True only for a 4K (UHD) Dolby Vision libmpv frame, reusing the chroma mitigation's own UHD
-    /// gate so both read one definition. Fail-open: a non-DV player, or an unknown resolution before
-    /// mpv has probed the stream, returns false so capture stays enabled. Non-4K and non-DV content
-    /// are unaffected.
-    private func shouldSkipTrickplayCaptureForUHDDolbyVision() -> Bool {
-        guard let player = coordinator.player, player.contentIsDolbyVision else { return false }
-        let summary = player.mediaSummary()
-        guard summary.width > 0, summary.height > 0 else { return false }
-        return TVOSFramePresentationPolicy.isUltraHighDefinition(
-            width: summary.width, height: summary.height)
+    /// UHD Dolby Vision, HDR10, and HLG local captures all take the expensive inline drawable path. Keep
+    /// them out of that path entirely. Unknown metadata deliberately fails open, so a stream cannot lose
+    /// local previews forever merely because probing has not completed.
+    private func shouldSkipLocalTrickplayCaptureForUHDHDR() -> Bool {
+        isCurrentContentUHDHDR()
     }
 
-    /// Broader than `shouldSkipTrickplayCaptureForUHDDolbyVision` (DV only, hard skip): this also covers
-    /// plain HDR10/HLG UHD, which has no hard skip today but is still the most expensive frame to scale
-    /// (report item 8: "lower cadence during 4K HDR/DV"). Used only to pick the longer readiness threshold
-    /// above, never to skip capture outright. Fail-open like its DV sibling: unknown/unprobed resolution or
-    /// HDR state keeps the shorter, default threshold rather than withholding capture indefinitely.
+    /// Reuses the frame-presentation UHD definition. `isHDR` receives the active transfer-function result on
+    /// either engine, and the source hint protects HLS before AVFoundation can expose that result. The state is
+    /// reset before a source switch, so a prior HDR title cannot suppress local previews for later SDR media.
+    /// Unknown metadata still fails open for non-UHD SDR media.
     private func isCurrentContentUHDHDR() -> Bool {
         guard let player = coordinator.player else { return false }
-        guard player.contentIsDolbyVision || player.hdrAvailable else { return false }
+        let hint = (curHint ?? sourceHint ?? "").lowercased()
+        let sourceAdvertisesHDR = StreamRanking.isDolbyVision(hint)
+            || hint.contains("hdr") || hint.contains("hlg")
+        guard isHDR || player.contentIsDolbyVision || player.hdrAvailable || sourceAdvertisesHDR else {
+            return false
+        }
         let summary = player.mediaSummary()
         guard summary.width > 0, summary.height > 0 else { return false }
         return TVOSFramePresentationPolicy.isUltraHighDefinition(
