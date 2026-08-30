@@ -15,9 +15,9 @@ if (start < 0 || end < 0 || source.indexOf(startMarker, start + 1) >= 0 || sourc
 }
 
 const moduleSource = `}, function(module, exports, __webpack_require__) {
-    var path = __webpack_require__(5), url = __webpack_require__(6), querystring = __webpack_require__(24), Router = __webpack_require__(100), stream = __webpack_require__(3), http = __webpack_require__(11), https = __webpack_require__(20), fetch = __webpack_require__(34), Headers = fetch.Headers, cfgOpts = {
+    var path = __webpack_require__(5), url = __webpack_require__(6), querystring = __webpack_require__(24), Router = __webpack_require__(100), stream = __webpack_require__(3), http = __webpack_require__(11), https = __webpack_require__(20), net = __webpack_require__(39), dns = __webpack_require__(620), fetch = __webpack_require__(34), Headers = fetch.Headers, cfgOpts = {
         Destination: "d", DestinationHeader: "h", ResponseHeader: "r"
-    }, proxyReqHeaders = [ "accept", "accept-encoding", "accept-language", "range", "if-range", "user-agent" ], proxyResHeaders = [ "accept-ranges", "content-type", "content-length", "content-range", "connection", "transfer-encoding", "last-modified", "etag", "server", "date" ], supportedPlaylists = [ ".m3u", ".m3u8" ], forbiddenAddonHeaders = new Set([ "host", "connection", "content-length", "transfer-encoding", "proxy-connection", "upgrade", "range" ]), sensitiveHeaders = new Set([ "authorization", "cookie", "referer", "origin" ]);
+    }, proxyReqHeaders = [ "accept", "accept-language", "range", "if-range", "user-agent" ], proxyResHeaders = [ "accept-ranges", "content-type", "content-length", "content-range", "connection", "transfer-encoding", "last-modified", "etag", "server", "date" ], supportedPlaylists = [ ".m3u", ".m3u8" ], forbiddenAddonHeaders = new Set([ "host", "connection", "content-length", "transfer-encoding", "proxy-connection", "proxy-authorization", "proxy-authenticate", "upgrade", "range", "te", "trailer", "keep-alive" ]), safeCrossOriginHeaders = new Set([ "accept", "accept-language", "range", "if-range", "user-agent" ]), maximumPlaylistBytes = 2097152, maximumPlaylistLineBytes = 65536;
     function ensureArray(value) { return Array.isArray(value) ? value : value ? [ value ] : []; }
     function validName(name) { return /^[!#$%&'*+.^_\\\`|~0-9A-Za-z-]+$/.test(name); }
     function validValue(value) { return !/[\\r\\n]/.test(value); }
@@ -39,25 +39,66 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
     function sameOrigin(a, b) {
         return a.protocol === b.protocol && a.hostname.toLowerCase() === b.hostname.toLowerCase() && (a.port || (a.protocol === "https:" ? "443" : "80")) === (b.port || (b.protocol === "https:" ? "443" : "80"));
     }
-    function redirectedHeaders(headers, result, from, to) {
+    function redirectedHeaders(headers, from, to) {
         var next = new Headers;
-        headers.forEach((value, name) => { if (sameOrigin(from, to) || !sensitiveHeaders.has(name.toLowerCase())) next.set(name, value); });
+        headers.forEach((value, name) => { if (sameOrigin(from, to) || safeCrossOriginHeaders.has(name.toLowerCase())) next.set(name, value); });
         next.set("host", to.host);
         return next;
     }
-    function fetchOnce(dest, req, headers, agents, controller) {
-        var agent = dest.protocol === "https:" ? agents.https : agents.http;
-        return fetch(url.format(dest), { method: req.method, headers: headers, agent: agent, redirect: "manual", signal: controller.signal });
+    function isPublicAddress(address) {
+        var family = net.isIP(address);
+        if (family === 4) {
+            var p = address.split(".").map(Number);
+            return !(p[0] === 0 || p[0] === 10 || p[0] === 127 || p[0] >= 224
+                || (p[0] === 100 && p[1] >= 64 && p[1] <= 127)
+                || (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31)
+                || (p[0] === 192 && (p[1] === 168 || (p[1] === 0 && (p[2] === 0 || p[2] === 2))))
+                || (p[0] === 198 && (p[1] === 18 || p[1] === 19 || p[1] === 51 && p[2] === 100))
+                || (p[0] === 203 && p[1] === 0 && p[2] === 113));
+        }
+        if (family !== 6) return false;
+        var lower = address.toLowerCase();
+        if (lower.startsWith("::ffff:")) return isPublicAddress(lower.slice(7));
+        var compact = lower.replace(/:/g, "");
+        return !lower.includes(".") && !lower.includes("ffff") && !/^0+$/.test(compact) && !/^0*1$/.test(compact)
+            && !lower.startsWith("fc") && !lower.startsWith("fd")
+            && !/^fe[89ab]/.test(lower) && !lower.startsWith("ff") && !lower.startsWith("2001:db8:")
+            && !/^fe[c-f]/.test(lower);
     }
-    function fetchWithRedirects(dest, req, headers, agents, controller) {
+    function resolvePublic(dest) {
+        if (net.isIP(dest.hostname)) return isPublicAddress(dest.hostname) ? Promise.resolve(dest.hostname) : Promise.reject(new Error("Unsafe destination"));
+        return new Promise((resolve, reject) => dns.lookup(dest.hostname, { all: true, verbatim: true }, (error, answers) => {
+            if (error || !Array.isArray(answers) || !answers.length) return reject(error || new Error("Empty DNS answer"));
+            var addresses = answers.map(answer => typeof answer === "string" ? answer : answer.address);
+            if (!addresses.every(isPublicAddress)) return reject(new Error("Unsafe DNS answer"));
+            resolve(addresses[0]);
+        }));
+    }
+    function pinnedAgent(dest, address) {
+        var Agent = dest.protocol === "https:" ? https.Agent : http.Agent;
+        return new Agent({ lookup: function(_, options, callback) { callback(null, address, net.isIP(address)); } });
+    }
+    function fetchOnce(dest, req, headers, controller) {
+        return resolvePublic(dest).then(address => {
+            var agent = pinnedAgent(dest, address);
+            return fetch(url.format(dest), { method: req.method, headers: headers, agent: agent, redirect: "manual", signal: controller.signal })
+                .then(result => ({ result: result, agent: agent }), error => { agent.destroy(); throw error; });
+        });
+    }
+    function releaseRedirect(result, agent) {
+        if (result.body) { result.body.resume(); result.body.destroy(); }
+        agent.destroy();
+    }
+    function fetchWithRedirects(dest, req, headers, controller) {
         var count = 0;
         function next() {
-            return fetchOnce(dest, req, headers, agents, controller).then(result => {
-                if (!(result.status >= 300 && result.status < 400 && result.headers.has("location"))) return { result: result, dest: dest, headers: headers };
+            return fetchOnce(dest, req, headers, controller).then(({ result, agent }) => {
+                if (!(result.status >= 300 && result.status < 400 && result.headers.has("location"))) return { result: result, dest: dest, headers: headers, agent: agent };
+                releaseRedirect(result, agent);
                 if (++count > 4) throw new Error("Too many redirects");
                 var target = url.parse(url.resolve(url.format(dest), result.headers.get("location")));
                 if (target.protocol !== "https:" && target.protocol !== "http:") throw new Error("Unsafe redirect");
-                headers = redirectedHeaders(headers, result, dest, target);
+                headers = redirectedHeaders(headers, dest, target);
                 dest = target;
                 return next();
             });
@@ -65,8 +106,9 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
         return next();
     }
     module.exports = { getRouter: function() {
-        var router = Router(), agents = { http: new http.Agent, https: new https.Agent };
+        var router = Router();
         return router.all("/:opts/:pathname(*)?", function(req, res, next) {
+            if (req.method !== "GET" && req.method !== "HEAD") return res.sendStatus(405);
             var opts = querystring.parse(req.params.opts);
             opts[cfgOpts.DestinationHeader] = ensureArray(opts[cfgOpts.DestinationHeader]);
             opts[cfgOpts.ResponseHeader] = ensureArray(opts[cfgOpts.ResponseHeader]);
@@ -77,17 +119,18 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
             applyAddonHeaders(headers, opts[cfgOpts.DestinationHeader]);
             if (req.headers.range) headers.set("range", req.headers.range);
             else headers.delete("range");
-            var controller = new AbortController, started = false, settled = false, idle, timer = setTimeout(() => controller.abort(), 15000);
+            var controller = new AbortController, started = false, settled = false, activeAgent, idle, timer = setTimeout(() => controller.abort(), 15000);
             function abort() { controller.abort(); }
             function settle(error) {
                 if (settled) return;
                 settled = true; clearTimeout(timer); clearTimeout(idle);
                 req.removeListener("aborted", abort);
+                if (activeAgent) activeAgent.destroy();
                 if (error) { controller.abort(); if (!res.destroyed) res.destroy(); }
             }
             req.once("aborted", abort); res.once("close", function() { if (!res.writableEnded) { abort(); settle(new Error("downstream closed")); } });
-            fetchWithRedirects(dest, req, headers, agents, controller).then(({ result, dest: finalDest, headers: finalHeaders }) => {
-                clearTimeout(timer); started = true;
+            fetchWithRedirects(dest, req, headers, controller).then(({ result, dest: finalDest, headers: finalHeaders, agent }) => {
+                clearTimeout(timer); started = true; activeAgent = agent;
                 var responseHeaders = makeHeaders(result.headers, proxyResHeaders);
                 opts[cfgOpts.ResponseHeader].forEach(value => { var parsed = parseHeaderString(value); if (parsed) responseHeaders[parsed[0]] = parsed[1]; });
                 var isPlaylist = supportedPlaylists.includes(path.extname(finalDest.pathname)) || (responseHeaders["content-type"] || "").toLowerCase().includes("mpegurl");
@@ -97,14 +140,14 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                 result.body.on("data", armIdle); armIdle();
                 if (!isPlaylist) return stream.pipeline(result.body, res, settle);
                 var rewrite = (function(baseDest) {
-                    var partialLine = "", eol = null;
+                    var partialLine = "", eol = null, totalBytes = 0;
                     function childProxy(lineUrl) {
                         var same = sameOrigin(baseDest, lineUrl), childOpts = {};
                         childOpts[cfgOpts.Destination] = lineUrl.protocol + "//" + lineUrl.host;
                         childOpts[cfgOpts.DestinationHeader] = [];
                         finalHeaders.forEach((value, name) => {
                             var lower = name.toLowerCase();
-                            if (!forbiddenAddonHeaders.has(lower) && (same || !sensitiveHeaders.has(lower))) {
+                            if (!forbiddenAddonHeaders.has(lower) && (same || safeCrossOriginHeaders.has(lower))) {
                                 childOpts[cfgOpts.DestinationHeader].push(name + ":" + value);
                             }
                         });
@@ -122,13 +165,19 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                     }
                     return new stream.Transform({
                         transform: function(chunk, _, done) {
+                            totalBytes += chunk.length;
+                            if (totalBytes > maximumPlaylistBytes) return done(new Error("Playlist too large"));
                             var data = partialLine + chunk.toString();
                             if (!eol) {
                                 var lf = data.indexOf("\\n"), cr = data.indexOf("\\r");
                                 eol = lf < 0 && cr < 0 ? null : lf >= 0 && cr >= 0 ? (cr < lf ? "\\r\\n" : "\\n\\r") : cr < 0 ? "\\n" : "\\r";
                             }
-                            if (!eol) { partialLine = data; return done(); }
+                            if (!eol) {
+                                if (Buffer.byteLength(data) > maximumPlaylistLineBytes) return done(new Error("Playlist line too large"));
+                                partialLine = data; return done();
+                            }
                             var lines = data.split(eol); partialLine = lines.pop();
+                            if (Buffer.byteLength(partialLine) > maximumPlaylistLineBytes || lines.some(line => Buffer.byteLength(line) > maximumPlaylistLineBytes)) return done(new Error("Playlist line too large"));
                             lines.forEach(line => this.push(parseLine(line) + eol)); done();
                         },
                         flush: function(done) { done(null, parseLine(partialLine)); partialLine = ""; eol = null; }

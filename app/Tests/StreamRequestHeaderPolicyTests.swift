@@ -54,6 +54,17 @@ private struct StreamRequestHeaderPolicyTests {
                "IPv6 unique-local routes are local")
         expect(StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "http://[fe80::1]/file")!),
                "IPv6 link-local routes are local")
+        expect(StreamRequestHeaderPolicy.isLocalPlaybackHost("::ffff:127.0.0.1")
+               && StreamRequestHeaderPolicy.isLocalPlaybackHost("::ffff:10.1.2.3"),
+               "IPv4-mapped private and loopback routes are local")
+        expect(StreamRequestHeaderPolicy.isLocalPlaybackHost("::")
+               && StreamRequestHeaderPolicy.isLocalPlaybackHost("ff02::1"),
+               "IPv6 unspecified and multicast routes use the constrained local cache class")
+        expect(StreamRequestHeaderPolicy.isLocalPlaybackHost("100.64.0.1")
+               && StreamRequestHeaderPolicy.isLocalPlaybackHost("0.1.2.3"),
+               "CGNAT and 0/8 routes use the constrained local cache class")
+        expect(!StreamRequestHeaderPolicy.isLocalPlaybackHost("::ffff:8.8.8.8"),
+               "IPv4-mapped public routes remain remote")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackHost("fczz::1"), "malformed IPv6 is remote")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackHost("127.a.0.0.1"), "malformed IPv4 is remote")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "https://foo.strem.io/file")!),
