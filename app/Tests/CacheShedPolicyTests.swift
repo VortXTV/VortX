@@ -290,6 +290,76 @@ check("iOS and macOS baseline selection is unchanged when disk cache is off",
       remoteVODCap(diskCacheEnabled: false, baselineMiB: 512, configuredDiskCacheMiB: 256, reduced: false,
                    enforceTVOSLimit: false) == Int64(512 * mib))
 
+// MARK: - Pinned MPVKit disk-cache capability: preference cannot masquerade as payload offload
+
+check("disk cache: pinned MPVKit payload offload remains explicitly unconfirmed",
+      P.diskCachePayloadOffloadConfirmed == false)
+check("disk cache: a nonzero user preference cannot arm unsupported payload offload",
+      P.shouldArmDiskCache(payloadOffloadRequested: true, muted: false) == false)
+check("disk cache: the muted preview remains unarmed",
+      P.shouldArmDiskCache(payloadOffloadRequested: true, muted: true) == false)
+check("disk cache: a stale armed bit cannot select the metadata cap or ramp for remote VOD",
+      P.shouldUseDiskCacheForLoad(
+        payloadOffloadRequested: true,
+        diskCacheOnDiskArmed: true,
+        live: false,
+        local: false
+      ) == false)
+check("disk cache: ordinary and reduced RAM baselines survive a nonzero preference",
+      remoteVODCap(
+        diskCacheEnabled: P.shouldUseDiskCacheForLoad(
+            payloadOffloadRequested: true,
+            diskCacheOnDiskArmed: true,
+            live: false,
+            local: false
+        ),
+        baselineMiB: 384,
+        configuredDiskCacheMiB: 128,
+        reduced: false
+      ) == Int64(384 * mib)
+        && remoteVODCap(
+            diskCacheEnabled: P.shouldUseDiskCacheForLoad(
+                payloadOffloadRequested: true,
+                diskCacheOnDiskArmed: true,
+                live: false,
+                local: false
+            ),
+            baselineMiB: 96,
+            configuredDiskCacheMiB: 128,
+            reduced: true
+        ) == Int64(96 * mib))
+check("disk cache: live and local loads never use the offload-only path",
+      P.shouldUseDiskCacheForLoad(
+        payloadOffloadRequested: true,
+        diskCacheOnDiskArmed: true,
+        live: true,
+        local: false
+      ) == false
+        && P.shouldUseDiskCacheForLoad(
+            payloadOffloadRequested: true,
+            diskCacheOnDiskArmed: true,
+            live: false,
+            local: true
+        ) == false)
+
+let controllerURL = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent()
+    .deletingLastPathComponent()
+    .appendingPathComponent("Sources/Player/MPVMetalViewController.swift")
+let controllerSource = (try? String(contentsOf: controllerURL, encoding: .utf8)) ?? ""
+check("disk cache wiring: setup uses the authoritative capability gate",
+      controllerSource.contains("VortXCacheShedPolicy.shouldArmDiskCache("))
+check("disk cache wiring: per-load cap and ramp share the confirmed-offload decision",
+      controllerSource.contains("let usesConfirmedDiskOffload = VortXCacheShedPolicy.shouldUseDiskCacheForLoad(")
+        && controllerSource.components(separatedBy: "if usesConfirmedDiskOffload {").count == 3)
+check("disk cache wiring: the saved preference is diagnostic input, not a direct per-load branch",
+      !controllerSource.contains("if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream"))
+check("disk cache diagnostics: requested and confirmed capability are recorded without a cache path",
+      controllerSource.contains("streaming cache requestedMode=")
+        && controllerSource.contains("enabledAfterFleetGate=")
+        && controllerSource.contains("payloadOffloadConfirmed=")
+        && !controllerSource.contains("disk cache armed at "))
+
 // MARK: - Guarded flush-defer on a warning (diag-23 FIX-C), now floor/step-parameterised
 
 func deferFlush(

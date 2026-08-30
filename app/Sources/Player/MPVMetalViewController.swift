@@ -222,8 +222,9 @@ final class MPVMetalViewController: PlatformViewController {
     /// in loadFile with the rest of the per-file cache state.
     private var restoreCyclesThisFile = 0
     #endif
-    /// True once setupMpv armed cache-on-disk against a WRITABLE dir (real payload offload, so `cache-secs` is
-    /// the binding forward lever). Gates the read-ahead ramp: the RAM-fallback path keeps demuxer-max-bytes/300s.
+    /// True only after the pinned engine's payload-offload capability is confirmed and setupMpv successfully
+    /// arms cache-on-disk. The current pinned MPVKit capability gate is false, so ordinary RAM baselines remain
+    /// authoritative even when the user has requested a streaming disk cache.
     private var diskCacheOnDiskArmed = false
     /// Forward read-ahead ramp state (disk-cache-armed remote VOD). See armDiskCacheReadaheadRamp.
     private var cacheReadaheadRampWork: DispatchWorkItem?
@@ -822,45 +823,33 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
-        // Configurable ON-DISK streaming/seek cache (Settings -> "Streaming cache"). When enabled, mpv backs the
-        // FORWARD read-ahead on disk: `add_packet_locked` writes each forward packet's payload to the cache dir
-        // and FREES its RAM, keeping only a file offset (mpv demux/demux.c). So the big seek-ahead buffer lives
-        // on disk, WITHOUT spending the jetsam-bound in-process RAM budget. The hero-preview (#44) is a tiny
-        // silent loop, so it stays on the in-memory cache (this block is skipped for the muted instance).
-        //
-        // THE 0.2.11 CRASH, reconciled. That experiment did two things wrong: (1) it used the REMOVED option name
-        // `cache-dir`, so offload silently did not engage; and (2) it set `demuxer-max-bytes` to the multi-GB disk
-        // budget, which under working cache-on-disk is a GB packet-METADATA budget authorizing hours of runaway
-        // read-ahead -> jetsam. The fix is here and in loadFile: the dir option is now `demuxer-cache-dir`, the
-        // forward depth is bounded in TIME by `cache-secs` (demuxer-max-bytes stops binding once payloads leave
-        // RAM), and loadFile's per-file `demuxer-max-bytes` is a MODEST metadata cap (RemoteConfig
-        // diskCacheMetadataCapMiB), not the disk budget.
-        //
-        // If a future mpv build drops any of these options they no-op (checkError only logs); offload then falls
-        // back to the in-memory cache that loadFile's modest `demuxer-max-bytes` still bounds, so the RAM safety
-        // holds either way. `resolvedMaxBytes` remains the free-disk ceiling shown in Settings and the sweep that
-        // wipes the cache dir on exit; `demuxer-cache-unlink-files=immediate` keeps consumed segments from
-        // accumulating, so the cache file tracks only the [back-buffer, cache-secs forward] window.
-        if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
+        // The Settings value is a REQUEST, not proof that this pinned MPVKit offloads forward payloads. Device
+        // evidence shows its forward buffer remains in process RAM, so the single capability gate in
+        // VortXCacheShedPolicy stays false: do not set disk options, do not claim the cache is armed, and do not
+        // replace the normal RAM baseline with the smaller metadata-only cap. Keeping the dormant setup behind
+        // that gate makes a future, device-proven enablement one explicit capability change instead of another
+        // preference-driven guess. The requested value is logged without a filesystem path for truthful field
+        // diagnosis.
+        let diskCacheRequestedBytes = DiskCacheSetting.storedBytes
+        let diskCacheRequestedMode = diskCacheRequestedBytes == 0
+            ? "off"
+            : (diskCacheRequestedBytes == DiskCacheSetting.unlimitedSentinel ? "unlimited" : "finite")
+        let diskCacheRequested = DiskCacheSetting.diskCacheEnabled
+        diskCacheOnDiskArmed = false
+        if !startMuted {
+            mpvLog.log("streaming cache requestedMode=\(diskCacheRequestedMode, privacy: .public) enabledAfterFleetGate=\(diskCacheRequested, privacy: .public) payloadOffloadConfirmed=\(VortXCacheShedPolicy.diskCachePayloadOffloadConfirmed, privacy: .public)")
+        }
+        if VortXCacheShedPolicy.shouldArmDiskCache(
+            payloadOffloadRequested: diskCacheRequested,
+            muted: startMuted
+        ), let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
             checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
             diskCacheOnDiskArmed = true
-            // FIX: `cache-dir` was removed upstream; the current option is `demuxer-cache-dir`. Point it at the
-            // app-tracked Caches subdir so payload offload actually engages (and the exit sweep can clear it).
             checkError(mpv_set_option_string(mpv, "demuxer-cache-dir", cacheDir))
-            // Unlink consumed cache files immediately (mpv's default, set explicitly) so the on-disk cache never
-            // grows toward the whole title.
             checkError(mpv_set_option_string(mpv, "demuxer-cache-unlink-files", "immediate"))
-            // Bound forward read-ahead in TIME: this is the real lever once payloads live on disk, because
-            // demuxer-max-bytes then caps only metadata. mpv's `cache-secs` default is ~10 hours; hold it to
-            // RemoteConfig `diskCacheReadaheadSecs` (baked 900 s = 15 min). `demuxer-readahead-secs` is mostly
-            // ignored while the cache is on.
             checkError(mpv_set_option_string(mpv, "cache-secs", String(RemoteConfig.snapshot.diskCacheReadaheadSecs)))
-            // DEVICE-TEST CAVEAT: on tvOS `demuxer-cache-dir` may not be writable, in which case mpv silently keeps
-            // payloads in RAM (the modest per-file demuxer-max-bytes is the guardrail there). Log writability so a
-            // soak can tell genuine offload apart from the RAM fallback. Also note: DV-FEL TRUSTED/wrapped packets
-            // bypass offload and stay in RAM regardless.
             let writable = FileManager.default.isWritableFile(atPath: cacheDir)
-            mpvLog.log("disk cache armed at \(cacheDir, privacy: .public) writable=\(writable, privacy: .public) cacheSecs=\(RemoteConfig.snapshot.diskCacheReadaheadSecs, privacy: .public) freeDiskCeiling=\(DiskCacheSetting.resolvedMaxBytes(), privacy: .public) bytes")
+            mpvLog.log("streaming cache armed requested=true payloadOffloadConfirmed=true writable=\(writable, privacy: .public) cacheSecs=\(RemoteConfig.snapshot.diskCacheReadaheadSecs, privacy: .public)")
         }
 
 #if os(tvOS)
@@ -1499,7 +1488,8 @@ final class MPVMetalViewController: PlatformViewController {
             #endif
             #endif
         }
-        // `demuxer-max-bytes` for a REMOTE (debrid/direct CDN) VOD stream, reconciled by cache-on-disk state.
+        // `demuxer-max-bytes` for a REMOTE (debrid/direct CDN) VOD stream, reconciled by CONFIRMED cache-on-disk
+        // capability rather than the user's requested setting.
         //
         // WHAT demuxer-max-bytes MEANS depends on whether the on-disk cache is armed:
         //   - cache-on-disk OFF (default): it is a HARD in-memory forward-PAYLOAD cap. mpv stops reading ahead
@@ -1518,8 +1508,15 @@ final class MPVMetalViewController: PlatformViewController {
         // 96 MiB reduced) so its server and mpv, which share one jetsam-limited process, stay bounded. A LOCAL
         // torrent buffers into the embedded server's own disk cache, and live owns its tight buffers, so both are
         // excluded from the armed branch and retain readAhead.
+        let diskCacheRequestedForFile = DiskCacheSetting.diskCacheEnabled
+        let usesConfirmedDiskOffload = VortXCacheShedPolicy.shouldUseDiskCacheForLoad(
+            payloadOffloadRequested: diskCacheRequestedForFile,
+            diskCacheOnDiskArmed: diskCacheOnDiskArmed,
+            live: live,
+            local: isLocalStream
+        )
         let appliedCap: String
-        if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
+        if usesConfirmedDiskOffload {
             // ON-DISK STREAMING CACHE ARMED. Under cache-on-disk, demuxer-max-bytes bounds packet METADATA, not
             // payload, and the real forward lever is `cache-secs` (set at setup). So set a MODEST, independently
             // tunable metadata budget instead of the RAM read-ahead ceiling or the multi-GB disk budget: the
@@ -1605,7 +1602,7 @@ final class MPVMetalViewController: PlatformViewController {
             // Pace the forward-cache fill for an offload-armed remote VOD: start cache-secs small and ramp to the
             // 900s ceiling so the fill never bursts the present thread (climb-time output drops). Non-armed / live
             // / local sources keep their existing single cap; cancel any stale ramp from a prior in-place source.
-            if diskCacheOnDiskArmed, !live, !isLocalStream {
+            if usesConfirmedDiskOffload {
                 armDiskCacheReadaheadRamp()
             } else {
                 cacheReadaheadRampWork?.cancel(); cacheReadaheadRampWork = nil

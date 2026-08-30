@@ -228,6 +228,37 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
 /// preserved unchanged: the guard only removes the FALSE positives.
 enum VortXCacheShedPolicy {
 
+    /// The pinned MPVKit build does not move the forward demuxer payload out of process RAM when
+    /// `cache-on-disk` is enabled. Keep this as the single capability authority for both setup and per-load
+    /// decisions: a saved user preference expresses intent, but must not be treated as proof of offload.
+    ///
+    /// Flip this only after an on-device diagnostic proves that forward payload bytes leave resident memory
+    /// and the configured byte budget is actually enforced. Until then, the ordinary RAM baselines are the
+    /// only truthful and safe cache budgets.
+    static let diskCachePayloadOffloadConfirmed = false
+
+    /// Whether setup may arm mpv's disk-cache options. Muted preview players never participate even after a
+    /// future capability confirmation.
+    static func shouldArmDiskCache(payloadOffloadRequested: Bool, muted: Bool) -> Bool {
+        diskCachePayloadOffloadConfirmed && payloadOffloadRequested && !muted
+    }
+
+    /// Whether one file may use the disk-offload metadata cap and read-ahead ramp. Requiring the capability
+    /// again here is intentional defense in depth: a stale runtime `armed` bit must not lower the RAM payload
+    /// cap when the pinned build is known not to offload.
+    static func shouldUseDiskCacheForLoad(
+        payloadOffloadRequested: Bool,
+        diskCacheOnDiskArmed: Bool,
+        live: Bool,
+        local: Bool
+    ) -> Bool {
+        diskCachePayloadOffloadConfirmed
+            && payloadOffloadRequested
+            && diskCacheOnDiskArmed
+            && !live
+            && !local
+    }
+
     /// Baked defaults, mirroring `RemoteConfigDefaults`. The controller passes the RemoteConfig-resolved,
     /// device-scaled values at runtime (`shedFloorBytes` / `shedStepBytes`); the tests use these constants.
     ///
