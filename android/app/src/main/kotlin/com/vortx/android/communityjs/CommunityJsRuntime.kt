@@ -88,6 +88,7 @@ class CommunityJsRuntime(
         val token = UUID.randomUUID().toString()
         var broker: ICommunityJsBroker? = null
         val bound = AtomicBoolean(false)
+        val executionAdmission = CommunityJsBrokerExecutionAdmission()
         lateinit var connection: ServiceConnection
         fun cleanup() {
             if (bound.compareAndSet(true, false)) runCatching { appContext.unbindService(connection) }
@@ -107,16 +108,20 @@ class CommunityJsRuntime(
         }
         connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
-                if (!continuation.isActive) {
-                    cleanup()
-                    return
+                val connectedBroker = ICommunityJsBroker.Stub.asInterface(service)
+                val admitted = executionAdmission.executeIfActive(
+                    isActive = { continuation.isActive },
+                ) {
+                    broker = connectedBroker
+                    runCatching {
+                        connectedBroker.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
+                            JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
+                            timeoutMs, MAX_MEMORY_BYTES, callback)
+                    }.onFailure { if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) } }
                 }
-                broker = ICommunityJsBroker.Stub.asInterface(service)
-                runCatching {
-                    broker?.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
-                        JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
-                        timeoutMs, MAX_MEMORY_BYTES, callback)
-                }.onFailure { if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) } }
+                if (!admitted) {
+                    cleanup()
+                }
             }
 
             override fun onServiceDisconnected(name: ComponentName) {
@@ -130,6 +135,7 @@ class CommunityJsRuntime(
         bound.set(appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE))
         if (!bound.get() && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
         continuation.invokeOnCancellation {
+            executionAdmission.cancel()
             host.cancel()
             runCatching { broker?.cancel(token) }
             cleanup()
@@ -248,5 +254,23 @@ class CommunityJsRuntime(
         private fun responseJson(status: Int, statusText: String, body: String, headers: Map<String, String>): String = JSONObject().apply {
             put("status", status); put("statusText", statusText); put("body", body); put("headers", JSONObject(headers))
         }.toString()
+    }
+}
+
+/** Serializes broker execution admission against coroutine cancellation. */
+internal class CommunityJsBrokerExecutionAdmission {
+    private val lock = Any()
+    private var terminal = false
+    private var executionStarted = false
+
+    fun executeIfActive(isActive: () -> Boolean, execute: () -> Unit): Boolean = synchronized(lock) {
+        if (terminal || executionStarted || !isActive()) return@synchronized false
+        executionStarted = true
+        execute()
+        true
+    }
+
+    fun cancel() = synchronized(lock) {
+        terminal = true
     }
 }

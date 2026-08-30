@@ -1,8 +1,8 @@
 package com.vortx.android.communityjs
 
-import java.nio.charset.StandardCharsets
-import java.nio.file.Files
-import java.nio.file.Path
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -79,23 +79,51 @@ class CommunityJsProviderContractTest {
     }
 
     @Test
-    fun `late broker binding cannot execute after cancellation`() {
-        val sourcePath = sequenceOf(
-            Path.of("src/main/kotlin/com/vortx/android/communityjs/CommunityJsRuntime.kt"),
-            Path.of("app/src/main/kotlin/com/vortx/android/communityjs/CommunityJsRuntime.kt"),
-        ).first(Files::exists)
-        val source = String(Files.readAllBytes(sourcePath), StandardCharsets.UTF_8)
-        val connected = source.substringAfter("override fun onServiceConnected")
-            .substringBefore("override fun onServiceDisconnected")
+    fun `cancellation closes broker execution admission before late binding`() {
+        val admission = CommunityJsBrokerExecutionAdmission()
+        admission.cancel()
+        var executed = false
 
-        val inactiveGuard = connected.indexOf("if (!continuation.isActive)")
-        val cleanup = connected.indexOf("cleanup()", startIndex = inactiveGuard)
-        val brokerAssignment = connected.indexOf("broker = ICommunityJsBroker.Stub.asInterface(service)")
-        val execute = connected.indexOf("broker?.execute(")
+        val admitted = admission.executeIfActive(isActive = { true }) {
+            executed = true
+        }
 
-        assertTrue(inactiveGuard >= 0)
-        assertTrue(cleanup > inactiveGuard)
-        assertTrue(brokerAssignment > cleanup)
-        assertTrue(execute > brokerAssignment)
+        assertFalse(admitted)
+        assertFalse(executed)
+    }
+
+    @Test
+    fun `cancellation cannot overtake an admitted broker invocation`() {
+        val admission = CommunityJsBrokerExecutionAdmission()
+        val executeEntered = CountDownLatch(1)
+        val releaseExecute = CountDownLatch(1)
+        val cancelAttempted = CountDownLatch(1)
+        val cancelCompleted = CountDownLatch(1)
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val execution = pool.submit<Boolean> {
+                admission.executeIfActive(isActive = { true }) {
+                    executeEntered.countDown()
+                    assertTrue(releaseExecute.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(executeEntered.await(5, TimeUnit.SECONDS))
+
+            val cancellation = pool.submit {
+                cancelAttempted.countDown()
+                admission.cancel()
+                cancelCompleted.countDown()
+            }
+            assertTrue(cancelAttempted.await(5, TimeUnit.SECONDS))
+            assertFalse(cancelCompleted.await(100, TimeUnit.MILLISECONDS))
+
+            releaseExecute.countDown()
+            assertTrue(execution.get(5, TimeUnit.SECONDS))
+            cancellation.get(5, TimeUnit.SECONDS)
+            assertTrue(cancelCompleted.await(5, TimeUnit.SECONDS))
+        } finally {
+            releaseExecute.countDown()
+            pool.shutdownNow()
+        }
     }
 }
