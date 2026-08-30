@@ -565,6 +565,51 @@ class CollectionsHubLifecycleTest {
     }
 
     @Test
+    fun `first page ignores legacy tmdb enrichment and preserves upstream order`() = runBlocking {
+        val rankedItems = listOf(
+            item("tmdb:202", "Ranked first"),
+            item("tmdb:101", "Ranked second"),
+        )
+        val dependencyCalls = AtomicInteger()
+        val hostileDependencies: List<suspend () -> Boolean> = listOf(
+            {
+                dependencyCalls.incrementAndGet()
+                awaitCancellation()
+            },
+            {
+                dependencyCalls.incrementAndGet()
+                error("legacy TMDB capability lookup must not run")
+            },
+        )
+
+        hostileDependencies.forEach { dependency ->
+            val model = model(
+                preferences = FakeCollectionsPreferences(),
+                source = source(
+                    loadPage = { _, _, _, _, _ ->
+                        CollectionsHubPage(rankedItems, hasMore = false)
+                    },
+                ),
+                tmdbCatalogSupported = dependency,
+            )
+
+            try {
+                withTimeout(5_000) {
+                    model.open(CollectionsHubTarget.Discover(DiscoverList.POPULAR))
+                }
+
+                assertEquals(0, dependencyCalls.get())
+                assertEquals(
+                    listOf("Ranked first", "Ranked second"),
+                    model.browse.value.items.map(MetaItem::name),
+                )
+            } finally {
+                model.close()
+            }
+        }
+    }
+
+    @Test
     fun `perpetually filtered pages stop at the initial scan bound`() = runBlocking {
         val calls = AtomicInteger()
         val model = model(
@@ -647,13 +692,14 @@ class CollectionsHubLifecycleTest {
         preferences: FakeCollectionsPreferences,
         source: CollectionsHubSource,
         deviceRegion: () -> String = { "GB" },
+        tmdbCatalogSupported: suspend () -> Boolean = { true },
         beforePaginationPublication: () -> Unit = {},
     ) = CollectionsHubModel(
         preferences = preferences,
         source = source,
         nowMillis = { 1_000L },
         deviceRegion = deviceRegion,
-        tmdbCatalogSupported = { true },
+        tmdbCatalogSupported = tmdbCatalogSupported,
         beforePaginationPublication = beforePaginationPublication,
     )
 
