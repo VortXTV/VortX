@@ -80,6 +80,12 @@ internal data class EpisodeSwitchSelectionLease(
     }
 }
 
+/** Bounds the fail-soft external-id mapping before a non-IMDb detail becomes terminally unavailable. */
+internal suspend fun <T> boundedDetailRecoveryLookup(
+    timeoutMs: Long,
+    lookup: suspend () -> T?,
+): T? = withTimeoutOrNull(timeoutMs) { lookup() }
+
 internal suspend fun <T> withEpisodeSwitchCancellationRollback(
     rollbackIfOwned: () -> Unit,
     block: suspend () -> T,
@@ -527,7 +533,9 @@ class DetailViewModel(
 
         if (!metaRecoveryAttempted && DetailMetaRecoveryPolicy.isRecoverableNonImdb(metaId)) {
             metaRecoveryAttempted = true
-            val recovered = TMDBPersonClient.imdbId(metaId, type)
+            val recovered = boundedDetailRecoveryLookup(META_RECOVERY_LOOKUP_TIMEOUT_MS) {
+                TMDBPersonClient.imdbId(metaId, type)
+            }
             if (sourceSticky.currentProfileId() != initialProfile) return null
             if (recovered != null && recovered != metaId) {
                 metaId = recovered
@@ -1992,6 +2000,9 @@ class DetailViewModel(
         /// stalled and the recovery / placeholder / terminal ladder takes over, so a hung add-on can never
         /// leave the detail page on a permanent skeleton. Mirrors Apple `metaWatchdogSeconds` (12s).
         const val META_WATCHDOG_MS = 12_000L
+
+        /** Bounded one-shot external-id mapping after an unresolved non-IMDb meta request. */
+        const val META_RECOVERY_LOOKUP_TIMEOUT_MS = 6_000L
 
         /// How many DISTINCT sources the bad-source ladder may burn per play target before it stops
         /// auto-retrying and the shell surfaces manual selection (the CEO's "after 3 failures, ask").

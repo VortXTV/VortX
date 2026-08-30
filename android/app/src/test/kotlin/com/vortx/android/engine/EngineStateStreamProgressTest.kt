@@ -6,6 +6,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -75,6 +77,24 @@ class EngineStateStreamProgressTest {
         val fresh = fence.begin()
         assertFalse(fence.isCurrent(old))
         assertTrue(fence.isCurrent(fresh))
+    }
+
+    @Test
+    fun supersededGenerationRethrowsCancellationInsteadOfReturningFailureResult() = runBlocking {
+        val gate = StreamLoadDispatchGate()
+        val stale = gate.begin()
+        gate.begin()
+        var cancelled = false
+
+        try {
+            runCatchingStreamLoad {
+                gate.dispatchCurrent(stale, listOf("Load")) { }
+            }
+        } catch (_: CancellationException) {
+            cancelled = true
+        }
+
+        assertTrue("supersession must cancel the caller", cancelled)
     }
 
     @Test

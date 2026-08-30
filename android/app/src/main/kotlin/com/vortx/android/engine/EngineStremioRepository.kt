@@ -104,6 +104,15 @@ internal class StreamLoadDispatchGate {
     }
 }
 
+/** Supersession is control flow, not a failed stream result. */
+internal suspend fun <T> runCatchingStreamLoad(block: suspend () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Throwable) {
+    Result.failure(error)
+}
+
 /**
  * Applies the persisted Add-ons-screen priority to raw source groups before the optional "Use add-on
  * order" ranking mode preserves that order. Groups absent from the saved order remain in engine order.
@@ -2061,7 +2070,7 @@ class EngineStremioRepository(
         wantedAddon: String?,
         forceRefresh: Boolean,
     ): Result<List<StreamGroup>> = runLatestStreamLoad { generation ->
-        withContext(Dispatchers.Default) { runCatching {
+        withContext(Dispatchers.Default) { runCatchingStreamLoad {
         // Re-find sources: the engine caches this title's stream groups, so the plain Load below is a
         // no-op with ZERO add-on HTTP once they are resident. Unload the MetaDetails model FIRST so the
         // Load re-queries every stream add-on fresh and expired/dead sources are replaced. Default off:
