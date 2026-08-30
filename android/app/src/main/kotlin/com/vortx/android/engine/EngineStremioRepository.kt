@@ -2193,6 +2193,7 @@ class EngineStremioRepository(
                 headers = source.requestHeaders,
                 externalSubtitles = source.externalSubtitles,
                 externalSubtitleTracks = source.externalSubtitleTracks,
+                communityJsTransport = source.communityJsTransport,
             )
         } else if (source.isTorrent) {
             // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent

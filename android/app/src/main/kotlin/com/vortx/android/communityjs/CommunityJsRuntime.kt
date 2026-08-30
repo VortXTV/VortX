@@ -10,11 +10,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.suspendCancellableCoroutine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 /**
@@ -71,7 +71,8 @@ class CommunityJsRuntime(
     }
 
     private suspend fun evaluate(invocation: Invocation, host: NativeFetchImpl): Result = try {
-        val output = executeInBroker(invocation, host)
+        val output = withTimeoutOrNull(timeoutMs + BROKER_COMPLETION_GRACE_MS) { executeInBroker(invocation, host) }
+            ?: return Result.Failure("Provider execution timed out.")
         val envelope = JSONObject(output)
         if (!envelope.optBoolean("ok")) {
             Result.Failure(envelope.optString("error", "Provider execution failed."))
@@ -84,15 +85,14 @@ class CommunityJsRuntime(
         Result.Failure("Provider execution failed.")
     }
 
-    private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String = suspendCancellableCoroutine { continuation ->
+    private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String {
         val token = UUID.randomUUID().toString()
-        val bound = AtomicBoolean(false)
         val executionAdmission = CommunityJsBrokerExecutionAdmission<ICommunityJsBroker>()
         lateinit var connection: ServiceConnection
-        fun cleanup() {
-            if (bound.compareAndSet(true, false)) runCatching { appContext.unbindService(connection) }
-        }
-        val callback = object : ICommunityJsBrokerCallback.Stub() {
+        val binding = CommunityJsBindingOwner { runCatching { appContext.unbindService(connection) } }
+        return try {
+            suspendCancellableCoroutine { continuation ->
+                val callback = object : ICommunityJsBrokerCallback.Stub() {
             override fun fetch(tokenValue: String, url: String, optionsJson: String, remainingTimeoutMs: Long): String =
                 if (tokenValue == token) host.fetch(url, optionsJson, remainingTimeoutMs) else EMPTY_RESPONSE
 
@@ -100,12 +100,12 @@ class CommunityJsRuntime(
 
             override fun complete(tokenValue: String, envelope: String) {
                 if (tokenValue == token && continuation.isActive) {
-                    cleanup()
-                    continuation.resume(envelope)
+                    binding.terminate()
+                    continuation.resume(communityJsBoundedEnvelope(envelope))
                 }
             }
         }
-        connection = object : ServiceConnection {
+                connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
                 val connectedBroker = ICommunityJsBroker.Stub.asInterface(service)
                 val lease = executionAdmission.reserveIfActive(
@@ -113,31 +113,35 @@ class CommunityJsRuntime(
                     isActive = { continuation.isActive },
                 )
                 if (lease == null || !executionAdmission.claimForCall(lease)) {
-                    cleanup()
+                    binding.terminate()
                     return
                 }
                 runCatching {
                     connectedBroker.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
                         JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
                         timeoutMs, MAX_MEMORY_BYTES, callback)
-                }.onFailure { if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) } }
+                }.onFailure { if (continuation.isActive) { binding.terminate(); continuation.resume(FAILURE_ENVELOPE) } }
             }
 
             override fun onServiceDisconnected(name: ComponentName) {
-                if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) }
+                if (continuation.isActive) { binding.terminate(); continuation.resume(FAILURE_ENVELOPE) }
             }
 
             override fun onBindingDied(name: ComponentName) {
-                if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) }
+                if (continuation.isActive) { binding.terminate(); continuation.resume(FAILURE_ENVELOPE) }
             }
         }
-        bound.set(appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE))
-        if (!bound.get() && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
-        continuation.invokeOnCancellation {
+                val didBind = runCatching {
+                    appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE)
+                }.getOrDefault(false)
+                binding.onBindResult(didBind)
+                if (!didBind && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
+            }
+        } finally {
             val brokerToCancel = executionAdmission.cancel()
             host.cancel()
             runCatching { brokerToCancel?.cancel(token) }
-            cleanup()
+            binding.terminate()
         }
     }
 
@@ -236,6 +240,7 @@ class CommunityJsRuntime(
 
     companion object {
         private const val DEFAULT_TIMEOUT_MS = 25_000L
+        private const val BROKER_COMPLETION_GRACE_MS = 2_000L
         private const val MAX_SOURCE_BYTES = 1_000_000
         private const val MAX_RESPONSE_BYTES = 1_000_000
         private const val MAX_RESULT_COUNT = 100
@@ -253,6 +258,39 @@ class CommunityJsRuntime(
         private fun responseJson(status: Int, statusText: String, body: String, headers: Map<String, String>): String = JSONObject().apply {
             put("status", status); put("statusText", statusText); put("body", body); put("headers", JSONObject(headers))
         }.toString()
+    }
+}
+
+/** Reconciles a terminal callback that races bindService's return without unbinding too early. */
+internal class CommunityJsBindingOwner(private val unbind: () -> Unit) {
+    private enum class State { BINDING, BOUND, TERMINAL }
+    private val lock = Any()
+    private var state = State.BINDING
+
+    fun onBindResult(success: Boolean) {
+        val shouldUnbind = synchronized(lock) {
+            if (!success) {
+                state = State.TERMINAL
+                false
+            } else if (state == State.TERMINAL) {
+                true
+            } else {
+                state = State.BOUND
+                false
+            }
+        }
+        if (shouldUnbind) unbind()
+    }
+
+    fun terminate() {
+        val shouldUnbind = synchronized(lock) {
+            when (state) {
+                State.BINDING -> { state = State.TERMINAL; false }
+                State.BOUND -> { state = State.TERMINAL; true }
+                State.TERMINAL -> false
+            }
+        }
+        if (shouldUnbind) unbind()
     }
 }
 

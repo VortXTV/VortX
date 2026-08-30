@@ -91,6 +91,24 @@ class ExoPlayerSidecarTransportTest {
                 name = subtitle.name,
             ),
         )
+
+        val signedUrl = "https://user:password@subs.example/token/path-secret/en.vtt?token=signed-secret#private"
+        val signedSubtitle = ExternalSubtitle(signedUrl, mapOf("Authorization" to secret), "en", "English")
+        val source = StreamSource(
+            id = "source", addon = "Provider", title = "Signed", url = signedUrl,
+            requestHeaders = mapOf("Authorization" to secret), externalSubtitleTracks = listOf(signedSubtitle),
+        )
+        val playable = Playable(
+            url = signedUrl, title = "Signed", headers = mapOf("Authorization" to secret),
+            externalSubtitleTracks = listOf(signedSubtitle), communityJsTransport = true,
+        )
+        listOf(signedSubtitle.toString(), source.toString(), playable.toString()).forEach { diagnostic ->
+            assertFalse(diagnostic.contains(secret))
+            assertFalse(diagnostic.contains("signed-secret"))
+            assertFalse(diagnostic.contains("password"))
+            assertFalse(diagnostic.contains("path-secret"))
+            assertFalse(diagnostic.contains("#private"))
+        }
     }
 
     @Test
@@ -157,7 +175,8 @@ class ExoPlayerSidecarTransportTest {
     fun `Media3 source construction isolates sidecars and preserves local video support`() {
         val source = readSource("ExoPlayerEngine.kt")
 
-        assertTrue(source.contains("SingleSampleMediaSource.Factory(media3DataSourceFactory(headers))"))
+        assertTrue(source.contains("media3DataSourceFactory(configuration.uri.toString(), headers"))
+        assertTrue(source.contains("CommunityJsMedia3DataSourceFactory(rootUrl, scopedHeaders)"))
         assertTrue(source.contains("createMediaSource(configuration, C.TIME_UNSET)"))
         assertTrue(source.contains("setLanguage(subtitle.language)"))
         assertTrue(source.contains("setLabel(subtitle.name)"))

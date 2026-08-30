@@ -446,6 +446,8 @@ data class StreamSource(
     /// `CoreStream.vortxProvider`. [isMediaServer] remains the ranker's tiering flag; this carries the
     /// provenance id alongside it for the media-server play path.
     val vortxProvider: String? = null,
+    /** Explicit trust provenance for executable Community-JS network output. */
+    val communityJsTransport: Boolean = false,
     /// Per-stream `behaviorHints` (`CoreStreamBehaviorHints`): [bingeGroup] is the auto-advance key (two
     /// streams sharing it are the same source across episodes, so Next keeps the same quality/add-on);
     /// [filename] is the real file name; [notWebReady] flags a stream a plain HTML5 player can't handle.
@@ -462,6 +464,10 @@ data class StreamSource(
     /** Structured sidecars preserve provider-specific request metadata without changing URL-only callers. */
     val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
 ) {
+    override fun toString(): String =
+        "StreamSource(id=$id, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +
+            "requestHeaderCount=${requestHeaders.size}, externalSubtitleCount=${externalSubtitleTracks.size})"
+
     /// A USENET stream: no direct [url] yet, but an `.nzb` link to resolve through a usenet-capable
     /// debrid account. Like a raw torrent, it needs resolution before it is playable. Kept mutually
     /// exclusive from [isTorrent] (which also requires `nzbUrl == null`) so a stream is classified as
@@ -521,7 +527,17 @@ class ExternalSubtitle(
         31 * (31 * (31 * url.hashCode() + language.hashCode()) + name.hashCode()) + transportFingerprint.hashCode()
 
     override fun toString(): String =
-        "ExternalSubtitle(url=$url, language=$language, name=$name, headerCount=${headers.size})"
+        "ExternalSubtitle(url=${redactedTransportUrl(url)}, language=$language, name=$name, headerCount=${headers.size})"
+}
+
+private fun redactedTransportUrl(raw: String?): String? {
+    if (raw == null) return null
+    val parsed = runCatching { java.net.URI(raw) }.getOrNull() ?: return "<redacted-url>"
+    val scheme = parsed.scheme ?: return "<local-path>"
+    if (scheme.equals("file", ignoreCase = true)) return "file://<local>"
+    val host = parsed.host ?: return "$scheme://<redacted>"
+    val port = parsed.port.takeIf { it >= 0 }?.let { ":$it" }.orEmpty()
+    return "$scheme://$host$port/<redacted>"
 }
 
 private fun externalSubtitleTransportFingerprint(headers: Map<String, String>): String {
@@ -583,6 +599,8 @@ data class Playable(
     /// mounts them via `sub-add`; the ExoPlayer path can attach them as side-loaded text tracks.
     val externalSubtitles: List<String> = emptyList(),
     val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
+    /** Selects the public-only, origin-scoped transport for executable Community-JS output. */
+    val communityJsTransport: Boolean = false,
     /// The provider-agnostic content identity for external progress sync (Trakt / SIMKL scrobble). Null
     /// for a source with no resolvable id (a pasted magnet, a kitsu-only catalog) or for the offline
     /// preview, in which case the player simply does not scrobble. Attached by
@@ -648,7 +666,12 @@ data class Playable(
     /// then play downloaded B, and A's row moved. Consumers of local sessions must read THIS, never
     /// ambient engine state; see [PlaybackContext].
     val playbackContext: PlaybackContext? = null,
-)
+) {
+    override fun toString(): String =
+        "Playable(url=${redactedTransportUrl(url)}, title=$title, viaStreamingServer=$viaStreamingServer, " +
+            "isTorrent=$isTorrent, headerCount=${headers.size}, externalSubtitleCount=${externalSubtitleTracks.size}, " +
+            "communityJsTransport=$communityJsTransport)"
+}
 
 /// Provider-agnostic description of the title being scrobbled, resolved ONCE at play time and handed to
 /// every connected external-sync provider (Trakt, SIMKL), each of which maps it to its own id bag.

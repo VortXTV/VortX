@@ -36,6 +36,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import com.vortx.android.model.Playable
+import com.vortx.android.communityjs.CommunityJsMedia3DataSourceFactory
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
 import com.vortx.android.player.tuning.AdaptiveTuning
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -257,14 +258,14 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                 .setUri(playable.url)
                 .build()
             val videoSource = DefaultMediaSourceFactory(appContext)
-                .setDataSourceFactory(media3DataSourceFactory(requestHeaderPlan.videoHeaders(), playable.userAgent))
+                .setDataSourceFactory(media3DataSourceFactory(playable.url, requestHeaderPlan.videoHeaders(), playable.userAgent, playable.communityJsTransport))
                 .createMediaSource(videoItem)
             val audioSource = ProgressiveMediaSource.Factory(trailerHttp)
                 .createMediaSource(MediaItem.fromUri(playable.audioUrl))
             player.setMediaSource(
                 mergeMediaSources(
                     videoSource,
-                    listOf(audioSource) + createExternalSubtitleSources(subtitleConfigs),
+                    listOf(audioSource) + createExternalSubtitleSources(subtitleConfigs, playable.communityJsTransport),
                 ),
             )
             player.playWhenReady = true
@@ -277,7 +278,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // DefaultHttpDataSource factory so both the manifest and media requests carry them. A muxed trailer /
         // worker-fallback trailer (single [url], [userAgent] possibly set) rides this path; fold its UA in.
         val trailerUa = playable.userAgent?.takeIf { it.isNotEmpty() }
-        val videoDataSource = media3DataSourceFactory(requestHeaderPlan.videoHeaders(), trailerUa)
+        val videoDataSource = media3DataSourceFactory(playable.url, requestHeaderPlan.videoHeaders(), trailerUa, playable.communityJsTransport)
         val mediaSourceFactory = DefaultMediaSourceFactory(appContext)
             .setDataSourceFactory(videoDataSource)
 
@@ -290,7 +291,7 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         player.setMediaSource(
             mergeMediaSources(
                 mediaSourceFactory.createMediaSource(item),
-                createExternalSubtitleSources(subtitleConfigs),
+                createExternalSubtitleSources(subtitleConfigs, playable.communityJsTransport),
             ),
         )
         player.playWhenReady = true
@@ -306,8 +307,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
      */
     private fun createExternalSubtitleSources(
         subtitles: List<Pair<MediaItem.SubtitleConfiguration, Map<String, String>>>,
+        communityJsTransport: Boolean,
     ): List<MediaSource> = subtitles.map { (configuration, headers) ->
-        SingleSampleMediaSource.Factory(media3DataSourceFactory(headers))
+        SingleSampleMediaSource.Factory(
+            media3DataSourceFactory(configuration.uri.toString(), headers, communityJsTransport = communityJsTransport),
+        )
             .createMediaSource(configuration, C.TIME_UNSET)
     }
 
@@ -316,9 +320,15 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     /** DefaultDataSource keeps local file/content support while its HTTP leg handles redirecting CDNs. */
     private fun media3DataSourceFactory(
+        rootUrl: String,
         headers: Map<String, String>,
         userAgent: String? = null,
+        communityJsTransport: Boolean = false,
     ): DefaultDataSource.Factory {
+        if (communityJsTransport) {
+            val scopedHeaders = if (userAgent.isNullOrEmpty()) headers else headers + ("User-Agent" to userAgent)
+            return DefaultDataSource.Factory(appContext, CommunityJsMedia3DataSourceFactory(rootUrl, scopedHeaders))
+        }
         val http = DefaultHttpDataSource.Factory().apply {
             if (headers.isNotEmpty()) setDefaultRequestProperties(headers)
             userAgent?.takeIf(String::isNotEmpty)?.let(::setUserAgent)

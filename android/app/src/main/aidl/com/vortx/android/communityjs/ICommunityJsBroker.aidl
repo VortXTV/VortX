@@ -6,5 +6,5 @@ interface ICommunityJsBroker {
     void execute(String token, String code, String tmdbId, String mediaType, String settingsJson,
                  int season, int episode, long timeoutMs, long memoryLimitBytes,
                  ICommunityJsBrokerCallback callback);
-    void cancel(String token);
+    oneway void cancel(String token);
 }

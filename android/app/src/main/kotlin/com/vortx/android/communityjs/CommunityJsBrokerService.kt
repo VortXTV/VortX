@@ -3,13 +3,18 @@ package com.vortx.android.communityjs
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
-import java.util.concurrent.Executors
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Callable
+import java.util.concurrent.FutureTask
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /** Isolated interpreter process. It has no credentials, encrypted store, or direct network client. */
 class CommunityJsBrokerService : Service() {
-    private val executor = Executors.newSingleThreadExecutor { Thread(it, "community-js-broker").apply { isDaemon = true } }
-    private val cancellations = CommunityJsCancellationRegistry()
+    private val controller = CommunityJsBrokerController()
 
     private val binder = object : ICommunityJsBroker.Stub() {
         override fun execute(
@@ -24,9 +29,11 @@ class CommunityJsBrokerService : Service() {
             memoryLimitBytes: Long,
             callback: ICommunityJsBrokerCallback,
         ) {
-            if (token.length > 128 || code.toByteArray().size > MAX_SOURCE_BYTES || settingsJson.toByteArray().size > MAX_SETTINGS_BYTES) return
-            val cancelledFlag = cancellations.begin(token) ?: return
-            executor.execute {
+            if (token.length > 128 || code.toByteArray().size > MAX_SOURCE_BYTES || settingsJson.toByteArray().size > MAX_SETTINGS_BYTES) {
+                completeSafely(callback, token, FAILURE_ENVELOPE)
+                return
+            }
+            val accepted = controller.submit(token) { cancelledFlag ->
                 val host = object : CommunityJsRuntime.NativeFetch {
                     override fun fetch(url: String, optionsJson: String, remainingTimeoutMs: Long): String =
                         runCatching { callback.fetch(token, url, optionsJson, remainingTimeoutMs) }
@@ -37,26 +44,152 @@ class CommunityJsBrokerService : Service() {
                 val envelope = runCatching {
                     CommunityJsNative.evaluate(host, code, tmdbId, mediaType, settingsJson, season, episode, timeoutMs, memoryLimitBytes)
                 }.getOrDefault(FAILURE_ENVELOPE)
-                cancellations.finish(token, cancelledFlag)
-                runCatching { callback.complete(token, envelope) }
+                completeSafely(callback, token, communityJsBoundedEnvelope(envelope))
             }
+            if (!accepted) completeSafely(callback, token, OVERLOADED_ENVELOPE)
         }
 
         override fun cancel(token: String) {
-            cancellations.cancel(token)
+            controller.cancel(token)
         }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
-    override fun onDestroy() { cancellations.cancelAll(); executor.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { controller.shutdownNow(); super.onDestroy() }
+
+    private fun completeSafely(callback: ICommunityJsBrokerCallback, token: String, envelope: String) {
+        runCatching { callback.complete(token, envelope) }
+    }
 
     private companion object {
         const val MAX_SOURCE_BYTES = 1_000_000
         const val MAX_SETTINGS_BYTES = 64 * 1024
         const val EMPTY_RESPONSE = "{\"status\":0,\"statusText\":\"Unavailable\",\"body\":\"\",\"headers\":{}}"
         const val FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
+        const val OVERLOADED_ENVELOPE = "{\"ok\":false,\"error\":\"Provider service busy\"}"
     }
 }
+
+/** Atomically orders tombstone/active admission with the two-slot executor. */
+internal class CommunityJsBrokerController(
+    private val cancellations: CommunityJsCancellationRegistry = CommunityJsCancellationRegistry(),
+    private val executor: CommunityJsBoundedTaskExecutor = CommunityJsBoundedTaskExecutor(),
+) {
+    private val lock = Any()
+
+    fun submit(token: String, onFinished: () -> Unit = {}, work: (AtomicBoolean) -> Unit): Boolean = synchronized(lock) {
+        val flag = cancellations.begin(token) ?: return@synchronized false
+        val accepted = executor.submit(token, work = { if (!flag.get()) work(flag) }) {
+            cancellations.finish(token, flag)
+            onFinished()
+        }
+        if (!accepted) cancellations.finish(token, flag)
+        accepted
+    }
+
+    fun cancel(token: String) = synchronized(lock) {
+        cancellations.cancel(token)
+        executor.cancel(token)
+    }
+
+    fun shutdownNow() = synchronized(lock) {
+        cancellations.cancelAll()
+        executor.shutdownNow()
+    }
+
+    internal fun admittedCountForTesting(): Int = executor.admittedCountForTesting()
+    internal fun queuedCountForTesting(): Int = executor.queuedCountForTesting()
+}
+
+/** One native invocation may run and one may wait. Cancelled queued work releases captures immediately. */
+internal class CommunityJsBoundedTaskExecutor(
+    private val executor: ThreadPoolExecutor = ThreadPoolExecutor(
+        1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(1),
+        { Thread(it, "community-js-broker").apply { isDaemon = true } },
+        ThreadPoolExecutor.AbortPolicy(),
+    ),
+) {
+    private val lock = Any()
+    private val tasks = mutableMapOf<String, TrackedTask>()
+
+    fun submit(token: String, work: () -> Unit, onFinished: () -> Unit): Boolean {
+        val task = TrackedTask(token, work, onFinished)
+        return synchronized(lock) {
+            if (tasks.containsKey(token)) return@synchronized false
+            tasks[token] = task
+            try {
+                executor.execute(task)
+                true
+            } catch (_: RejectedExecutionException) {
+                tasks.remove(token, task)
+                task.clear()
+                false
+            }
+        }
+    }
+
+    fun cancel(token: String): Boolean {
+        val removedQueued = synchronized(lock) {
+            val task = tasks[token] ?: return@synchronized null
+            task.cancel(true)
+            if (!task.started.get() && executor.remove(task)) {
+                tasks.remove(token, task)
+                task
+            } else {
+                return@synchronized null
+            }
+        } ?: return false
+        removedQueued.finishAndClear()
+        return true
+    }
+
+    fun shutdownNow() {
+        val queued = synchronized(lock) {
+            executor.shutdownNow()
+            tasks.values.filter { !it.started.get() }.onEach { tasks.remove(it.token, it) }
+        }
+        queued.forEach(TrackedTask::finishAndClear)
+    }
+
+    internal fun admittedCountForTesting(): Int = synchronized(lock) { tasks.size }
+    internal fun queuedCountForTesting(): Int = executor.queue.size
+    internal fun retainsWorkForTesting(token: String): Boolean = synchronized(lock) { tasks[token]?.retainsWork() == true }
+
+    private inner class TrackedTask(
+        val token: String,
+        work: () -> Unit,
+        onFinished: () -> Unit,
+    ) : Runnable {
+        val started = AtomicBoolean(false)
+        private val work = AtomicReference<(() -> Unit)?>(work)
+        private val onFinished = AtomicReference<(() -> Unit)?>(onFinished)
+        private val future = FutureTask(Callable { this.work.get()?.invoke(); Unit })
+
+        override fun run() {
+            started.set(true)
+            try {
+                future.run()
+            } finally {
+                synchronized(lock) { tasks.remove(token, this) }
+                finishAndClear()
+            }
+        }
+
+        fun finishAndClear() {
+            work.set(null)
+            onFinished.getAndSet(null)?.invoke()
+        }
+
+        fun cancel(mayInterruptIfRunning: Boolean) { future.cancel(mayInterruptIfRunning) }
+        fun clear() { work.set(null); onFinished.set(null) }
+        fun retainsWork(): Boolean = work.get() != null
+    }
+}
+
+internal const val COMMUNITY_JS_MAX_BINDER_RESULT_CHARS = 192 * 1024
+internal const val COMMUNITY_JS_BINDER_FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
+internal fun communityJsBoundedEnvelope(envelope: String): String =
+    if (envelope.length <= COMMUNITY_JS_MAX_BINDER_RESULT_CHARS) envelope else COMMUNITY_JS_BINDER_FAILURE_ENVELOPE
 
 /**
  * Keeps bounded cancel-before-execute tombstones for the maximum expected Binder reordering horizon.

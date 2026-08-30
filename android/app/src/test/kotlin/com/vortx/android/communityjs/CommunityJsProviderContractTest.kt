@@ -10,6 +10,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlinx.coroutines.Job
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
 class CommunityJsProviderContractTest {
     @Test
@@ -42,6 +43,7 @@ class CommunityJsProviderContractTest {
         assertEquals("https://93.184.216.34/media.m3u8", stream.url)
         assertEquals("https://93.184.216.34/", stream.requestHeaders["Referer"])
         assertEquals(listOf("https://93.184.216.34/sub.vtt"), stream.externalSubtitles)
+        assertTrue(stream.communityJsTransport)
     }
 
     @Test
@@ -215,5 +217,129 @@ class CommunityJsProviderContractTest {
 
         assertFalse(registry.toString().contains(secretToken))
         assertTrue(registry.toString().contains("tombstones=1"))
+    }
+
+    @Test
+    fun `origin policy keeps provider headers only on the exact origin`() {
+        val root = "https://media.example/root/master.m3u8".toHttpUrl()
+        val headers = mapOf(
+            "Authorization" to "video-secret",
+            "Cookie" to "session-secret",
+            "X-Provider-Token" to "custom-secret",
+            "Accept" to "application/vnd.apple.mpegurl",
+            "User-Agent" to "provider-agent",
+        )
+
+        assertEquals(headers, CommunityJsHttpPolicy.requestHeaders(root, "https://media.example/root/key.bin".toHttpUrl(), headers))
+        val crossOrigin = CommunityJsHttpPolicy.requestHeaders(root, "https://cdn.example/segment.ts".toHttpUrl(), headers)
+        assertTrue(crossOrigin.isEmpty())
+        assertEquals(
+            setOf("Range", "Accept", "User-Agent"),
+            CommunityJsHttpPolicy.transportHeaders(
+                mapOf("Range" to "bytes=1-", "Accept" to "video/*", "User-Agent" to "Media3", "X-Token" to "secret"),
+            ).keys,
+        )
+    }
+
+    @Test
+    fun `redirect policy denies downgrade and body replay and applies standard methods`() {
+        val root = "https://media.example/start".toHttpUrl()
+        assertNull(CommunityJsHttpPolicy.redirect(root, root, "http://media.example/plain", 302, "GET", null))
+        assertNull(CommunityJsHttpPolicy.redirect(root, root, "https://other.example/upload", 307, "POST", "body".toByteArray()))
+
+        val seeOther = requireNotNull(
+            CommunityJsHttpPolicy.redirect(root, root, "/result", 303, "POST", "body".toByteArray()),
+        )
+        assertEquals("GET", seeOther.method)
+        assertNull(seeOther.body)
+
+        val temporary = requireNotNull(
+            CommunityJsHttpPolicy.redirect(root, root, "/retry", 307, "POST", "body".toByteArray()),
+        )
+        assertEquals("POST", temporary.method)
+        assertEquals("body", temporary.body?.toString(Charsets.UTF_8))
+    }
+
+    @Test
+    fun `binder envelope ceiling is conservative and deterministic`() {
+        val exact = "x".repeat(COMMUNITY_JS_MAX_BINDER_RESULT_CHARS)
+        assertEquals(exact, communityJsBoundedEnvelope(exact))
+        assertEquals(
+            COMMUNITY_JS_BINDER_FAILURE_ENVELOPE,
+            communityJsBoundedEnvelope(exact + "x"),
+        )
+    }
+
+    @Test
+    fun `broker executor rejects saturation and removes cancelled queued work`() {
+        val executor = CommunityJsBoundedTaskExecutor()
+        val running = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val runningFinished = CountDownLatch(1)
+        val queuedRan = CountDownLatch(1)
+        try {
+            assertTrue(executor.submit("running", work = {
+                running.countDown()
+                release.await(5, TimeUnit.SECONDS)
+            }, onFinished = { runningFinished.countDown() }))
+            assertTrue(running.await(5, TimeUnit.SECONDS))
+            assertTrue(executor.submit("queued", work = { queuedRan.countDown() }, onFinished = {}))
+            assertEquals(2, executor.admittedCountForTesting())
+            assertEquals(1, executor.queuedCountForTesting())
+
+            assertFalse(executor.submit("overload", work = {}, onFinished = {}))
+            assertTrue(executor.cancel("queued"))
+            assertEquals(1, executor.admittedCountForTesting())
+            assertEquals(0, executor.queuedCountForTesting())
+            assertFalse(executor.retainsWorkForTesting("queued"))
+
+            release.countDown()
+            assertTrue(runningFinished.await(5, TimeUnit.SECONDS))
+            assertEquals(1L, queuedRan.count)
+            assertEquals(0, executor.admittedCountForTesting())
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `broker controller orders cancel before submit and retains running admission until exit`() {
+        val controller = CommunityJsBrokerController()
+        controller.cancel("cancelled-before-submit")
+        assertFalse(controller.submit("cancelled-before-submit") { error("cancelled work ran") })
+
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val finished = CountDownLatch(1)
+        try {
+            assertTrue(controller.submit("running", onFinished = { finished.countDown() }) { flag ->
+                entered.countDown()
+                while (release.count > 0L) {
+                    try { release.await() } catch (_: InterruptedException) { /* cancellation is also in flag */ }
+                }
+                assertTrue(flag.get())
+            })
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            controller.cancel("running")
+            assertEquals(1, controller.admittedCountForTesting())
+            release.countDown()
+            assertTrue(finished.await(5, TimeUnit.SECONDS))
+            assertEquals(0, controller.admittedCountForTesting())
+        } finally {
+            release.countDown()
+            controller.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `binding owner unbinds exactly once across reentrant completion`() {
+        var unbinds = 0
+        val owner = CommunityJsBindingOwner { unbinds++ }
+        owner.terminate()
+        assertEquals(0, unbinds)
+        owner.onBindResult(success = true)
+        owner.terminate()
+        assertEquals(1, unbinds)
     }
 }

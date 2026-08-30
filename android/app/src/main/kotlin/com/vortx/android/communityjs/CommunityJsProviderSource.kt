@@ -118,6 +118,7 @@ class CommunityJsProviderSource(context: Context) {
                 quality = stream.quality,
                 url = stream.url,
                 vortxProvider = "community-js:${provider.id}",
+                communityJsTransport = true,
                 requestHeaders = stream.headers,
                 externalSubtitles = stream.subtitles.map(CommunityJsRuntime.Subtitle::url),
                 externalSubtitleTracks = stream.subtitles.map { ExternalSubtitle(it.url, it.headers, it.language, it.name) },

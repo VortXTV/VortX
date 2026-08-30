@@ -1,12 +1,9 @@
 package com.vortx.android.communityjs
 
 import com.vortx.android.engine.DeadlinePublicDns
-import com.vortx.android.engine.PublicAddressPolicy
-import okhttp3.HttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import java.io.ByteArrayOutputStream
 import java.net.Proxy
@@ -28,14 +25,17 @@ internal object CommunityJsPublicHttp {
         timeoutMs: Long,
         maxBytes: Int,
     ): ResponseData? {
-        var current = rawUrl.toHttpUrlOrNull()?.takeIf { allowed(it, requireHttps) } ?: return null
+        val root = CommunityJsHttpPolicy.admit(rawUrl)?.takeIf { !requireHttps || it.isHttps } ?: return null
+        var current = root
+        var currentMethod = method.uppercase()
+        var currentBody = body?.toByteArray(Charsets.UTF_8)
         val deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(1))
         repeat(MAX_REDIRECTS + 1) {
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()).coerceAtLeast(1)
             val client = baseClient(remainingMs)
             val request = Request.Builder().url(current).apply {
-                headers.forEach { (name, value) -> header(name, value) }
-                method(method, body?.toRequestBody())
+                CommunityJsHttpPolicy.requestHeaders(root, current, headers).forEach { (name, value) -> header(name, value) }
+                method(currentMethod, currentBody?.toRequestBody())
             }.build()
             val response = runCatching {
                 client.newCall(request).also { call -> call.timeout().timeout(remainingMs, TimeUnit.MILLISECONDS) }.execute()
@@ -43,7 +43,13 @@ internal object CommunityJsPublicHttp {
             response.use { currentResponse ->
                 if (currentResponse.code in REDIRECTS) {
                     val location = currentResponse.header("Location") ?: return null
-                    current = current.resolve(location)?.takeIf { allowed(it, requireHttps) } ?: return null
+                    val transition = CommunityJsHttpPolicy.redirect(
+                        root, current, location, currentResponse.code, currentMethod, currentBody,
+                    ) ?: return null
+                    if (requireHttps && !transition.url.isHttps) return null
+                    current = transition.url
+                    currentMethod = transition.method
+                    currentBody = transition.body
                     return@repeat
                 }
                 return ResponseData(
@@ -56,13 +62,6 @@ internal object CommunityJsPublicHttp {
         }
         return null
     }
-
-    private fun allowed(url: HttpUrl, requireHttps: Boolean): Boolean = runCatching {
-        if ((requireHttps && !url.isHttps) || (!requireHttps && url.scheme !in setOf("http", "https"))) return false
-        if (url.username.isNotEmpty() || url.password.isNotEmpty()) return false
-        PublicAddressPolicy.requireLiteralPublicOrHostname(url.host)
-        true
-    }.getOrDefault(false)
 
     private fun baseClient(timeoutMs: Long): OkHttpClient = OkHttpClient.Builder()
         .proxy(Proxy.NO_PROXY)

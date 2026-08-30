@@ -9,7 +9,9 @@
 
 #define TAG "community-js"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define MAX_RESULT_BYTES (1024 * 1024)
+/* Binder returns a UTF-16 String in a shared ~1 MiB transaction buffer. Keep UTF-8 output
+ * conservatively below 192 KiB so envelope, UTF-16 expansion, and parcel metadata fit safely. */
+#define MAX_RESULT_BYTES (192 * 1024)
 #define MAX_ERROR_BYTES 1024
 
 typedef struct {
