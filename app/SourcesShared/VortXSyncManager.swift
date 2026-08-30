@@ -1607,10 +1607,23 @@ final class VortXSyncManager: ObservableObject {
         // Per-profile library / Continue Watching, so the dashboard shows each profile's titles instead
         // of "no titles yet". Overlay profiles only (the owner profile's history lives in the account
         // library, not a watch overlay). The dashboard derives CW from each item's t/d progress.
-        var byProfile: [String: Any] = [:]
+        // Preserve foreign/per-profile sibling fields from the pulled document. This summary replaces the
+        // whole vortx object at the caller, so rebuilding buckets from only library/removal would erase fields
+        // authored by a newer client. We own only these two keys inside each live profile's bucket.
+        var byProfile = existingVortx?["byProfile"] as? [String: Any] ?? [:]
         for p in store.profiles where !p.isOwner {
-            let cache = store.watchEntriesForSync(for: p.id)
-            guard !cache.isEmpty else { continue }
+            let priorBucket = byProfile[p.id.uuidString] as? [String: Any] ?? [:]
+            let priorRemovals: [OverlayWatchRemoval] = (priorBucket["removed"] as? [[String: Any]] ?? []).compactMap {
+                guard let keys = $0["keys"] as? [String], !keys.isEmpty else { return nil }
+                let stamp = ($0["removedAt"] as? Double) ?? Double(($0["removedAt"] as? Int) ?? 0)
+                return stamp.isFinite && stamp > 0 ? OverlayWatchRemoval(keys: keys, removedAt: stamp) : nil
+            }
+            let resolved = store.watchOverlayForSync(for: p.id, merging: priorRemovals)
+            let snapshot = resolved.entries
+            let cache = snapshot.count <= 120 ? snapshot : Dictionary(uniqueKeysWithValues:
+                snapshot.sorted { $0.value.lastWatched > $1.value.lastWatched }.prefix(120)
+            )
+            let removals = resolved.removals
             let library: [[String: Any]] = cache.map { (metaId, e) in
                 // t/d in seconds for the dashboard; v (resume episode/movie id) + w (watched episode ids)
                 // so syncDown can rebuild the FULL overlay on another device, not just library membership.
@@ -1618,7 +1631,11 @@ final class VortXSyncManager: ObservableObject {
                  "t": e.timeOffsetMs / 1000, "d": e.durationMs / 1000, "lastWatched": e.lastWatched,
                  "v": e.videoId ?? "", "w": e.watchedVideoIds]
             }
-            byProfile[p.id.uuidString] = ["library": library]
+            let removed: [[String: Any]] = removals.map { ["keys": $0.keys, "removedAt": $0.removedAt] }
+            var bucket = priorBucket
+            bucket["library"] = library
+            bucket["removed"] = removed
+            byProfile[p.id.uuidString] = bucket
         }
         // The owner/main profile's library lives in the account (not a watch overlay), so it was absent
         // from the dashboard, which only received the byProfile overlay libraries above. Emit it as
@@ -2446,11 +2463,14 @@ final class VortXSyncManager: ObservableObject {
                 }
             }
         }
-        if let vortx = doc["vortx"] as? [String: Any], let byProfile = vortx["byProfile"] as? [String: Any] {
-            for (idStr, raw) in byProfile {
-                guard let uuid = UUID(uuidString: idStr),
-                      let bucket = raw as? [String: Any],
-                      let lib = bucket["library"] as? [[String: Any]] else { continue }
+        let vortxByProfile = ((doc["vortx"] as? [String: Any])?["byProfile"] as? [String: Any]) ?? [:]
+        let webRemovedByProfile = (((doc["webProgress"] as? [String: Any])?["removed"] as? [String: Any])?["byProfile"] as? [String: Any]) ?? [:]
+        let overlayProfileIDs = Set(vortxByProfile.keys).union(webRemovedByProfile.keys)
+        if !overlayProfileIDs.isEmpty {
+            for idStr in overlayProfileIDs {
+                guard let uuid = UUID(uuidString: idStr) else { continue }
+                let bucket = vortxByProfile[idStr] as? [String: Any] ?? [:]
+                let lib = bucket["library"] as? [[String: Any]] ?? []
                 var entries: [String: WatchEntry] = [:]
                 for item in lib {
                     guard let metaId = item["id"] as? String, !metaId.isEmpty else { continue }
@@ -2465,7 +2485,15 @@ final class VortXSyncManager: ObservableObject {
                     e.watchedVideoIds = item["w"] as? [String] ?? []
                     entries[metaId] = e
                 }
-                ProfileStore.shared.applyRemoteOverlay(profileID: uuid, entries: entries)
+                let appRemovals = bucket["removed"] as? [[String: Any]] ?? []
+                let webRemovals = webRemovedByProfile[idStr] as? [[String: Any]] ?? []
+                let removals: [OverlayWatchRemoval] = (appRemovals + webRemovals).compactMap {
+                    guard let keys = $0["keys"] as? [String], !keys.isEmpty else { return nil }
+                    let stamp = ($0["removedAt"] as? Double) ?? Double(($0["removedAt"] as? Int) ?? 0)
+                    guard stamp.isFinite, stamp > 0 else { return nil }
+                    return OverlayWatchRemoval(keys: keys, removedAt: stamp)
+                }
+                ProfileStore.shared.applyRemoteOverlay(profileID: uuid, entries: entries, removals: removals)
             }
             restored = true
         }

@@ -185,6 +185,7 @@ final class ProfileStore: ObservableObject {
     /// never tombstoned. See [[vortx-2026-06-25-rootcause-investigation]] section 2.
     private static let deletedKey = "stremiox.profiles.deleted"
     private static func watchCacheKey(_ id: UUID) -> String { "stremiox.profiles.watch." + id.uuidString }
+    private static func watchRemovalKey(_ id: UUID) -> String { "stremiox.profiles.watchRemoved." + id.uuidString }
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
     static let primaryTokenAccount = "stremiox.authKey"
 
@@ -377,6 +378,7 @@ final class ProfileStore: ObservableObject {
         profiles.removeAll { $0.id == target.id }
         if target.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: target)) }
         UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(target.id))
+        UserDefaults.standard.removeObject(forKey: Self.watchRemovalKey(target.id))
         tombstone(target.id)   // durable cross-device delete; the union-merge can no longer resurrect it
         persist()
         if activeID == target.id, let first = profiles.first { return select(first) }
@@ -1345,6 +1347,7 @@ final class ProfileStore: ObservableObject {
         entry.name = meta.name
         entry.poster = meta.poster ?? entry.poster
         watch[meta.libraryId] = entry
+        reconcileWatchRemovals(profileID: activeID, entries: &watch)
         scheduleWatchCacheSave()
         schedulePushWatch()
     }
@@ -1420,7 +1423,19 @@ final class ProfileStore: ObservableObject {
     /// The Continue Watching "dismiss" for overlay profiles: drop the whole entry. Zeroing the
     /// offset is not enough, because the rail keeps anything with watched episode ids.
     func removeWatchEntry(metaId: String) {
-        guard watch.removeValue(forKey: metaId) != nil else { return }
+        guard let removed = watch[metaId], let profileID = activeID else { return }
+        let keys = OverlayWatchRemovalPolicy.componentKeys(
+            seedID: metaId, seed: removed, entries: watch, identity: Self.watchIdentity
+        )
+        var tombstones = watchRemovals(for: profileID)
+        tombstones.append(OverlayWatchRemoval(
+            keys: keys.sorted(), removedAt: Date().timeIntervalSince1970 * 1000
+        ))
+        let resolved = OverlayWatchRemovalPolicy.resolve(
+            entries: watch, removals: tombstones, identity: Self.watchIdentity
+        )
+        watch = resolved.entries
+        saveWatchRemovals(resolved.removals, for: profileID)
         saveWatchCache()
         schedulePushWatch()
     }
@@ -1438,13 +1453,7 @@ final class ProfileStore: ObservableObject {
             guard let remote = await ProfileSync.fetchWatch(profileID: id, authKey: key) else { return }
             await MainActor.run {
                 guard let self, self.activeID == id else { return }
-                // Merge by newest lastWatched per title, so a stale device can't roll back progress.
-                var merged = remote
-                for (metaId, local) in self.watch where (merged[metaId]?.lastWatched ?? "") < local.lastWatched {
-                    merged[metaId] = local
-                }
-                self.watch = merged
-                self.saveWatchCache()
+                self.applyRemoteOverlay(profileID: id, entries: remote)
             }
         }
     }
@@ -1505,7 +1514,15 @@ final class ProfileStore: ObservableObject {
         guard let profile = active, !profile.usesEngineHistory else { watch = [:]; return }
         if let data = UserDefaults.standard.data(forKey: Self.watchCacheKey(profile.id)),
            let cached = try? JSONDecoder().decode([String: WatchEntry].self, from: data) {
-            watch = cached
+            let resolved = OverlayWatchRemovalPolicy.resolve(
+                entries: cached, removals: watchRemovals(for: profile.id), identity: Self.watchIdentity
+            )
+            watch = resolved.entries
+            if resolved.entries != cached,
+               let filtered = try? JSONEncoder().encode(resolved.entries) {
+                UserDefaults.standard.set(filtered, forKey: Self.watchCacheKey(profile.id))
+            }
+            saveWatchRemovals(resolved.removals, for: profile.id)
         } else {
             watch = [:]
         }
@@ -1528,7 +1545,15 @@ final class ProfileStore: ObservableObject {
     func watchEntries(for profileID: UUID) -> [String: WatchEntry] {
         guard let data = UserDefaults.standard.data(forKey: Self.watchCacheKey(profileID)),
               let cache = try? JSONDecoder().decode([String: WatchEntry].self, from: data) else { return [:] }
-        return cache
+        let resolved = OverlayWatchRemovalPolicy.resolve(
+            entries: cache, removals: watchRemovals(for: profileID), identity: Self.watchIdentity
+        )
+        if resolved.entries != cache,
+           let filtered = try? JSONEncoder().encode(resolved.entries) {
+            UserDefaults.standard.set(filtered, forKey: Self.watchCacheKey(profileID))
+        }
+        saveWatchRemovals(resolved.removals, for: profileID)
+        return resolved.entries
     }
 
     /// Snapshot used by account sync. The active overlay's in-memory dictionary is newer than its deliberately
@@ -1543,19 +1568,50 @@ final class ProfileStore: ObservableObject {
         )
     }
 
+    func watchRemovalsForSync(for profileID: UUID) -> [OverlayWatchRemoval] {
+        watchRemovals(for: profileID)
+    }
+
+    /// Fold removals already present in the freshly pulled account document into the local snapshot before
+    /// sync-up rewrites that profile bucket. This closes the concurrent read-merge-write window: a stale local
+    /// row cannot erase a peer dismissal, while a strictly newer valid local rewatch clears the old tombstone.
+    func watchOverlayForSync(
+        for profileID: UUID,
+        merging remoteRemovals: [OverlayWatchRemoval]
+    ) -> (entries: [String: WatchEntry], removals: [OverlayWatchRemoval]) {
+        let snapshot = watchEntriesForSync(for: profileID)
+        let previousRemovals = watchRemovals(for: profileID)
+        let resolved = OverlayWatchRemovalPolicy.resolve(
+            entries: snapshot,
+            removals: previousRemovals + Array(remoteRemovals.prefix(120)),
+            identity: Self.watchIdentity
+        )
+        if resolved.entries != snapshot,
+           let data = try? JSONEncoder().encode(resolved.entries) {
+            UserDefaults.standard.set(data, forKey: Self.watchCacheKey(profileID))
+            if active?.id == profileID { watch = resolved.entries }
+        }
+        saveWatchRemovals(resolved.removals, for: profileID)
+        return resolved
+    }
+
     /// Hydrate an OVERLAY profile's local watch overlay from a synced byProfile payload (cloud -> device,
     /// the missing sync-down leg, so a secondary profile's library + CW show in the app on every device,
     /// not just the dashboard). Merges per item last-writer-wins by lastWatched and UNIONs watchedVideoIds
     /// so neither side's progress or watched-episodes are lost. Only ever writes overlay caches; an
     /// engine-backed (owner) profile is skipped so the account library is never touched (the invariant).
-    func applyRemoteOverlay(profileID: UUID, entries: [String: WatchEntry]) {
-        guard !entries.isEmpty else { return }
+    func applyRemoteOverlay(
+        profileID: UUID,
+        entries: [String: WatchEntry],
+        removals incomingRemovals: [OverlayWatchRemoval] = []
+    ) {
+        guard !entries.isEmpty || !incomingRemovals.isEmpty else { return }
         if let p = profiles.first(where: { $0.id == profileID }), p.usesEngineHistory { return }
         // Merge against the same authority the UI is currently mutating. Reading the delayed disk cache for the
         // active profile could replace fresh progress for title A when a remote update for title B landed.
         var current = watchEntriesForSync(for: profileID)
         var changed = false
-        for (metaId, incoming) in entries {
+        for (metaId, incoming) in entries.prefix(120) {
             guard var existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }
             let union = Array(Set(existing.watchedVideoIds).union(incoming.watchedVideoIds))
             if incoming.lastWatched > existing.lastWatched {
@@ -1566,11 +1622,61 @@ final class ProfileStore: ObservableObject {
                 current[metaId] = existing; changed = true
             }
         }
+        let previousRemovals = watchRemovals(for: profileID)
+        let resolved = OverlayWatchRemovalPolicy.resolve(
+            entries: current,
+            removals: previousRemovals + Array(incomingRemovals.prefix(120)),
+            identity: Self.watchIdentity
+        )
+        if resolved.entries != current || resolved.removals != previousRemovals { changed = true }
+        current = resolved.entries
         guard changed else { return }
         if let data = try? JSONEncoder().encode(current) {
             UserDefaults.standard.set(data, forKey: Self.watchCacheKey(profileID))
         }
         if active?.id == profileID { watch = current }   // refresh the live overlay if this is the active profile
+        saveWatchRemovals(resolved.removals, for: profileID)
+    }
+
+    private func watchRemovals(for profileID: UUID) -> [OverlayWatchRemoval] {
+        guard let data = UserDefaults.standard.data(forKey: Self.watchRemovalKey(profileID)),
+              let removals = try? JSONDecoder().decode([OverlayWatchRemoval].self, from: data) else { return [] }
+        return Array(removals.filter { $0.removedAt.isFinite && !$0.keys.isEmpty }.prefix(120))
+    }
+
+    private func saveWatchRemovals(_ removals: [OverlayWatchRemoval], for profileID: UUID) {
+        if removals.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.watchRemovalKey(profileID))
+        } else if let data = try? JSONEncoder().encode(Array(removals.prefix(120))) {
+            UserDefaults.standard.set(data, forKey: Self.watchRemovalKey(profileID))
+        }
+    }
+
+    private func reconcileWatchRemovals(profileID: UUID?, entries: inout [String: WatchEntry]) {
+        guard let profileID else { return }
+        let resolved = OverlayWatchRemovalPolicy.resolve(
+            entries: entries, removals: watchRemovals(for: profileID), identity: Self.watchIdentity
+        )
+        entries = resolved.entries
+        saveWatchRemovals(resolved.removals, for: profileID)
+    }
+
+    private static func watchIdentity(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
+        .init(
+            id: metaId,
+            type: entry.type,
+            aliases: [entry.videoId].compactMap { $0 },
+            freshness: watchFreshness(entry.lastWatched),
+            hasValidProgress: entry.timeOffsetMs > 0 && entry.durationMs > 0
+        )
+    }
+
+    private static func watchFreshness(_ value: String) -> Double? {
+        guard !value.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        return date.map { $0.timeIntervalSince1970 * 1000 }
     }
 
     private static func isoNow() -> String {

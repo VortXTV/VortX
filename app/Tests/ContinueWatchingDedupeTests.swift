@@ -78,6 +78,48 @@ private enum ContinueWatchingDedupeTests {
             requestedID: "inactive", activeID: "active", live: liveWatch, persisted: diskWatch
         ) == diskWatch, "inactive overlay sync reads its persisted cache")
 
+        struct OverlayRow: Equatable {
+            let type: String
+            let alias: String
+            let freshness: Double?
+            let valid: Bool
+        }
+        func overlayIdentity(_ id: String, _ row: OverlayRow) -> ContinueWatchingDedupe.Identity {
+            .init(id: id, type: row.type, aliases: [row.alias], freshness: row.freshness,
+                  hasValidProgress: row.valid)
+        }
+        let deviceA = [
+            "tmdb:1396": OverlayRow(type: "series", alias: "tt0903747:5:16", freshness: 100, valid: true)
+        ]
+        let removedKeys = OverlayWatchRemovalPolicy.componentKeys(
+            seedID: "tmdb:1396", seed: deviceA["tmdb:1396"]!, entries: deviceA, identity: overlayIdentity
+        )
+        let dismissed = OverlayWatchRemovalPolicy.resolve(
+            entries: deviceA,
+            removals: [OverlayWatchRemoval(keys: removedKeys.sorted(), removedAt: 200)],
+            identity: overlayIdentity
+        )
+        expect(dismissed.entries.isEmpty && dismissed.removals.count == 1,
+               "overlay dismiss removes the live alias component and retains its tombstone")
+
+        let stalePeer = [
+            "imdb:tt0903747": OverlayRow(type: "series", alias: "tt0903747:5:15", freshness: 150, valid: true)
+        ]
+        let staleMerge = OverlayWatchRemovalPolicy.resolve(
+            entries: stalePeer, removals: dismissed.removals, identity: overlayIdentity
+        )
+        expect(staleMerge.entries.isEmpty && staleMerge.removals.count == 1,
+               "stale peer alias cannot resurrect a dismissed overlay title")
+
+        let newerPeer = [
+            "imdb:tt0903747": OverlayRow(type: "series", alias: "tt0903747:5:17", freshness: 201, valid: true)
+        ]
+        let newerMerge = OverlayWatchRemovalPolicy.resolve(
+            entries: newerPeer, removals: dismissed.removals, identity: overlayIdentity
+        )
+        expect(newerMerge.entries == newerPeer && newerMerge.removals.isEmpty,
+               "strictly newer valid rewatch restores the overlay and clears its tombstone")
+
         if failures == 0 {
             print("ContinueWatchingDedupeTests: \(checks) checks passed")
         } else {

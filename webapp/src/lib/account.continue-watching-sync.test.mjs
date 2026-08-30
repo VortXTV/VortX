@@ -135,4 +135,29 @@ test("account adapter unions removals, preserves foreign fields, and respects no
     ["imdb:tt0903747"],
     "an explicitly newer rewatch supersedes the tombstone",
   );
+
+  local.set("vortx.web.cw.v1.overlay", JSON.stringify([{
+    id: "imdb:tt0903747",
+    type: "series",
+    name: "Breaking Bad",
+    resumeId: "tt0903747:5:16",
+    position: 900,
+    duration: 2700,
+    updatedAt: browserARemoval.removedAt - 1,
+  }]));
+  applySyncDoc({
+    vortx: {
+      byProfile: {
+        overlay: {
+          library: [remoteEntry({ lastWatched: browserARemoval.removedAt - 1 })],
+          removed: [browserARemoval],
+        },
+      },
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(local.get("vortx.web.cw.v1.overlay") ?? "[]"),
+    [],
+    "Apple byProfile removals are folded before web hydration",
+  );
 });

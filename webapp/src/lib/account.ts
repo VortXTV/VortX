@@ -299,6 +299,9 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
       const bp = byProfile[pid];
       if (!bp || typeof bp !== "object") continue;
       const rec = bp as Record<string, unknown>;
+      // Apple writes the same timestamped canonical-key removals beside this profile's library. Fold them
+      // before its live rows, in addition to webProgress.removed above, so either surface can dismiss safely.
+      if (mergeContinueWatchingTombstonesForScope(pid, tombstonesFrom(rec.removed))) byProfileChanged = true;
       if (mergeLibraryForScope(pid, asObjArr(rec.library) as unknown as MetaItem[])) byProfileChanged = true;
       const cwSrc = Array.isArray(rec.continueWatching) ? rec.continueWatching : rec.library;
       if (mergeContinueWatchingForScope(pid, cwEntriesFrom(cwSrc))) byProfileChanged = true;

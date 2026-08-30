@@ -104,7 +104,7 @@ enum ContinueWatchingDedupe {
         return candidate.sourceIndex < incumbent.sourceIndex
     }
 
-    private static func identityKeys(_ identity: Identity) -> Set<String> {
+    static func identityKeys(_ identity: Identity) -> Set<String> {
         let type = normalizeType(identity.type)
         guard !type.isEmpty else { return [] }
         return Set(([identity.id] + identity.aliases).compactMap {
@@ -154,6 +154,128 @@ enum ContinueWatchingDedupe {
         }
 
         return raw
+    }
+}
+
+/// Timestamped overlay removal carried beside a profile's live library rows. Keys are the canonical,
+/// transitive identity component known at dismissal time; milliseconds keep the JSON readable on every client.
+struct OverlayWatchRemoval: Codable, Equatable {
+    var keys: [String]
+    var removedAt: Double
+}
+
+/// Resolves durable overlay removals against live rows without collapsing the library dictionary itself.
+/// A tombstone suppresses its whole alias component. Only a strictly newer row with valid progress is an
+/// explicit rewatch and clears that component's tombstone; missing/malformed clocks never beat a removal.
+enum OverlayWatchRemovalPolicy {
+    private struct Group {
+        var liveIDs: Set<String>
+        var liveFreshness: [Double]
+        var keys: Set<String>
+        var removals: [OverlayWatchRemoval]
+    }
+
+    static func resolve<Entry>(
+        entries: [String: Entry],
+        removals: [OverlayWatchRemoval],
+        identity: (String, Entry) -> ContinueWatchingDedupe.Identity
+    ) -> (entries: [String: Entry], removals: [OverlayWatchRemoval]) {
+        let boundedRemovals = removals
+            .filter { $0.removedAt.isFinite && !$0.keys.isEmpty }
+            .sorted { $0.removedAt > $1.removedAt }
+            .prefix(120)
+        guard !boundedRemovals.isEmpty else { return (entries, []) }
+
+        // Most libraries have no row related to a removal. Expand only the removal-connected closure before
+        // the component fold: a bridge row can still pull in another alias transitively, while unrelated
+        // library rows never enter the O(n²) grouping pass.
+        var relevantKeys = Set(boundedRemovals.flatMap(\.keys))
+        var relevantLiveIDs = Set<String>()
+        var expanded = true
+        while expanded {
+            expanded = false
+            for (id, entry) in entries where !relevantLiveIDs.contains(id) {
+                let keys = ContinueWatchingDedupe.identityKeys(identity(id, entry))
+                guard !relevantKeys.isDisjoint(with: keys) else { continue }
+                relevantLiveIDs.insert(id)
+                let oldCount = relevantKeys.count
+                relevantKeys.formUnion(keys)
+                if relevantKeys.count != oldCount { expanded = true }
+            }
+        }
+
+        var groups: [Group] = []
+
+        func append(liveID: String?, freshness: Double?, keys: Set<String>, removal: OverlayWatchRemoval?) {
+            guard !keys.isEmpty else { return }
+            let matches = groups.indices.filter { !groups[$0].keys.isDisjoint(with: keys) }
+            guard let target = matches.first else {
+                groups.append(Group(
+                    liveIDs: liveID.map { Set([$0]) } ?? [],
+                    liveFreshness: freshness.map { [$0] } ?? [],
+                    keys: keys,
+                    removals: removal.map { [$0] } ?? []
+                ))
+                return
+            }
+            if let liveID { groups[target].liveIDs.insert(liveID) }
+            if let freshness { groups[target].liveFreshness.append(freshness) }
+            groups[target].keys.formUnion(keys)
+            if let removal { groups[target].removals.append(removal) }
+            for index in matches.dropFirst().reversed() {
+                groups[target].liveIDs.formUnion(groups[index].liveIDs)
+                groups[target].liveFreshness.append(contentsOf: groups[index].liveFreshness)
+                groups[target].keys.formUnion(groups[index].keys)
+                groups[target].removals.append(contentsOf: groups[index].removals)
+                groups.remove(at: index)
+            }
+        }
+
+        for removal in boundedRemovals {
+            append(liveID: nil, freshness: nil, keys: Set(removal.keys), removal: removal)
+        }
+        for (id, entry) in entries where relevantLiveIDs.contains(id) {
+            let value = identity(id, entry)
+            let freshness = value.hasValidProgress ? value.freshness.flatMap { $0.isFinite ? $0 : nil } : nil
+            append(liveID: id, freshness: freshness,
+                   keys: ContinueWatchingDedupe.identityKeys(value), removal: nil)
+        }
+
+        var live = entries
+        var retained: [OverlayWatchRemoval] = []
+        for group in groups where !group.removals.isEmpty {
+            let removedAt = group.removals.map(\.removedAt).max() ?? 0
+            if let replayedAt = group.liveFreshness.max(), replayedAt > removedAt {
+                continue
+            }
+            group.liveIDs.forEach { live.removeValue(forKey: $0) }
+            retained.append(OverlayWatchRemoval(keys: group.keys.sorted(), removedAt: removedAt))
+        }
+        return (
+            live,
+            retained.sorted { $0.removedAt > $1.removedAt }.prefix(120).map { $0 }
+        )
+    }
+
+    static func componentKeys<Entry>(
+        seedID: String,
+        seed: Entry,
+        entries: [String: Entry],
+        identity: (String, Entry) -> ContinueWatchingDedupe.Identity
+    ) -> Set<String> {
+        var keys = ContinueWatchingDedupe.identityKeys(identity(seedID, seed))
+        var expanded = true
+        while expanded {
+            expanded = false
+            for (id, entry) in entries {
+                let candidate = ContinueWatchingDedupe.identityKeys(identity(id, entry))
+                guard !keys.isDisjoint(with: candidate) else { continue }
+                let oldCount = keys.count
+                keys.formUnion(candidate)
+                if keys.count != oldCount { expanded = true }
+            }
+        }
+        return keys
     }
 }
 
