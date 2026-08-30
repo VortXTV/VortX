@@ -517,11 +517,11 @@ private enum TrickplayEndToEndCorrectionTests {
 
     private static func testProtectedUHDHDRCaptureContract() {
         let tv = source("app/SourcesTV/TVPlayerView.swift")
-        guard let start = tv.range(of: "private func maybeCaptureLocalTrickplay"), let end = tv.range(of: "/// UHD Dolby Vision", range: start.upperBound..<tv.endIndex) else {
+        guard let start = tv.range(of: "private func maybeCaptureLocalTrickplay"), let end = tv.range(of: "/// The one place a trickplay frame", range: start.upperBound..<tv.endIndex) else {
             fatalError("cannot inspect UHD-HDR capture guard")
         }
         let captureGate = tv[start.lowerBound..<end.lowerBound]
-        expect(captureGate.contains("shouldSkipLocalTrickplayCaptureForUHDHDR()") && captureGate.contains("captureTrickplayFrame(at: time)") && captureGate.range(of: "shouldSkipLocalTrickplayCaptureForUHDHDR()")!.lowerBound < captureGate.range(of: "captureTrickplayFrame(at: time)")!.lowerBound && tv.contains("private func shouldSkipLocalTrickplayCaptureForUHDHDR() -> Bool") && tv.contains("isCurrentContentUHDHDR()") && tv.contains("isHDR || player.contentIsDolbyVision || player.hdrAvailable || sourceAdvertisesHDR") && tv.contains("hint.contains(\"hdr\") || hint.contains(\"hlg\")") && tv.contains("isHDR = false") && !tv.contains("screenshot-raw") && tv.contains("captureFrameJPEGData"), "all UHD HDR classes must bypass the only local inline capture path while remote/provider previews remain intact")
+        expect(captureGate.contains("currentLocalTrickplayCaptureDecision()") && captureGate.contains("permitsLocalCapture") && captureGate.contains("captureTrickplayFrame(at: time)") && captureGate.range(of: "currentLocalTrickplayCaptureDecision()")!.lowerBound < captureGate.range(of: "captureTrickplayFrame(at: time)")!.lowerBound && tv.contains("TrickplayLocalCaptureEligibilityPolicy.decision") && tv.contains("isHDR = false") && !tv.contains("screenshot-raw") && tv.contains("captureFrameJPEGData"), "the executable UHD-HDR eligibility policy must guard only the local capture path before frame capture")
     }
 
     private static func testProductionWiringUsesThePolicies() {

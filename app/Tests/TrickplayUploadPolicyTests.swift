@@ -7,6 +7,7 @@ private enum TrickplayUploadPolicyTests {
     static func main() {
         testFixedCaptureCadenceContinuesDuringActivePlayback()
         testCaptureCadenceKeepsWorkBounded()
+        testUHDHDRLocalCaptureEligibilityMatrix()
         testBackwardSeekRestartsCaptureCadence()
         testCaptureSessionIdentityBoundaries()
         testCommunityDurationRekeyPreservesSessionFramesWiring()
@@ -185,6 +186,64 @@ private enum TrickplayUploadPolicyTests {
                 captureInFlight: false
             ),
             "interactive scrubbing does not compete with background capture"
+        )
+    }
+
+    private static func testUHDHDRLocalCaptureEligibilityMatrix() {
+        typealias Policy = TrickplayLocalCaptureEligibilityPolicy
+        func decision(uhd: Bool, range: Policy.DynamicRange) -> Policy.Decision {
+            Policy.decision(.init(isUltraHighDefinition: uhd, dynamicRange: range))
+        }
+
+        for (format, range) in [
+            ("Dolby Vision", Policy.DynamicRange.dolbyVision),
+            ("HDR10", Policy.DynamicRange.hdr10),
+            ("HLG", Policy.DynamicRange.hlg),
+        ] {
+            let result = decision(uhd: true, range: range)
+            expect(
+                result.isUltraHighDefinitionHDR && !result.permitsLocalCapture
+                    && result.permitsRemoteProviderPreviews,
+                "UHD \(format) skips only the local capture path"
+            )
+        }
+        expect(
+            !decision(uhd: true, range: .sdr).isUltraHighDefinitionHDR
+                && decision(uhd: true, range: .sdr).permitsLocalCapture,
+            "UHD SDR remains eligible for local capture"
+        )
+        let nonUHDHDR = decision(uhd: false, range: .hdr10)
+        expect(
+            !nonUHDHDR.isUltraHighDefinitionHDR && nonUHDHDR.permitsLocalCapture
+                && TrickplayPresentationReadinessPolicy.isReady(
+                    elapsedSinceFirstFrame: TrickplayPresentationReadinessPolicy.defaultSettleSeconds,
+                    displaySwitchSettled: true,
+                    isUltraHighDefinitionHDR: nonUHDHDR.isUltraHighDefinitionHDR
+                ),
+            "non-UHD HDR remains eligible after the normal readiness gate"
+        )
+        expect(
+            decision(uhd: false, range: .unknown).permitsLocalCapture
+                && decision(uhd: true, range: .unknown).permitsLocalCapture,
+            "unknown or unprobed range data fails open to local capture"
+        )
+        let hdrThenSDR = [
+            decision(uhd: true, range: .hdr10),
+            decision(uhd: true, range: .sdr),
+        ]
+        expect(
+            !hdrThenSDR[0].permitsLocalCapture && hdrThenSDR[1].permitsLocalCapture,
+            "a fresh SDR classification after HDR permits local capture"
+        )
+        expect(
+            [
+                decision(uhd: true, range: .dolbyVision),
+                decision(uhd: true, range: .hdr10),
+                decision(uhd: true, range: .hlg),
+                decision(uhd: true, range: .sdr),
+                nonUHDHDR,
+            ].allSatisfy(\.permitsRemoteProviderPreviews),
+            "local eligibility never suppresses remote or provider previews"
         )
     }
 

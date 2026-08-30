@@ -2465,12 +2465,18 @@ struct TVPlayerView: View {
         lastFrameDropReceiptAt = now
         let count = receipt.frameDropCount ?? 0
         // `frameDropCount` is mpv's raw output-drop counter. The presentation receipt intentionally excludes
-        // unsettled renderer/display-switch drops from its scored total, so log both values rather than
-        // relabeling a raw cache-starvation/output delta as a decoder or settled-render failure.
+        // unsettled renderer/display-switch drops from its scored total, so log both values. Cache state is
+        // sampled only at this receipt and is never used to assign a cause to the preceding interval.
         let rawOutputDelta = count >= lastFrameDropCount ? count - lastFrameDropCount : count
         let settledOutputDelta = receipt.framePresentation?.frameDropsSinceReceipt ?? rawOutputDelta
-        let outputDropClass = (receipt.pausedForCache == true || receipt.cacheUnderrun == true)
-            ? "cache-starvation" : "output"
+        let cacheStateAtReceipt: String
+        if receipt.pausedForCache == true || receipt.cacheUnderrun == true {
+            cacheStateAtReceipt = "starved"
+        } else if receipt.pausedForCache == nil && receipt.cacheUnderrun == nil {
+            cacheStateAtReceipt = "unavailable"
+        } else {
+            cacheStateAtReceipt = "not-starved"
+        }
         lastFrameDropCount = count
         func intText(_ value: Int?) -> String { value.map(String.init) ?? "na" }
         func boolText(_ value: Bool?) -> String {
@@ -2507,7 +2513,7 @@ struct TVPlayerView: View {
         }()
         VXProbe.log(
             "perf",
-            "libmpv outputDrop=\(count) rawOutputDelta30s=\(rawOutputDelta) settledOutputDelta30s=\(settledOutputDelta) outputDropClass=\(outputDropClass) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCaptureInFlight=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureIntervalS=\(Int(Self.trickplayCaptureIntervalSecs)) trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
+            "libmpv outputDrop=\(count) rawOutputDelta30s=\(rawOutputDelta) settledOutputDelta30s=\(settledOutputDelta) cacheStateAtReceipt=\(cacheStateAtReceipt) decoderDrop=\(intText(receipt.decoderFrameDropCount)) mistimed=\(intText(receipt.mistimedFrameCount)) voDelayed=\(intText(receipt.delayedFrameCount)) avsync=\(doubleText(receipt.avSync)) totalAvsyncChange=\(doubleText(receipt.totalAVSyncChange)) pausedForCache=\(boolText(receipt.pausedForCache)) cacheUnderrun=\(boolText(receipt.cacheUnderrun)) cacheIdle=\(boolText(receipt.cacheIdle)) cacheFill=\(intText(receipt.cacheBufferingPercent)) cacheSeconds=\(doubleText(receipt.cacheDuration, decimals: 1)) hwdec=\(receipt.hardwareDecoder ?? "na") vfFps=\(doubleText(receipt.estimatedVideoFPS)) containerFps=\(doubleText(receipt.containerFPS)) displayFps=\(doubleText(receipt.displayFPS)) videoSync=\(receipt.videoSyncMode ?? "na") videoSpeedCorrection=\(doubleText(receipt.videoSpeedCorrection, decimals: 6)) audioSpeedCorrection=\(doubleText(receipt.audioSpeedCorrection, decimals: 6)) ao=\(receipt.audioOutput ?? "na") uiBuffering=\(buffering ? "true" : "false") statsOverlay=\(showStats ? "visible" : "hidden") trickplayCaptureInFlight=\(localTrickplayCaptureInFlight ? "true" : "false") trickplayCaptureIntervalS=\(Int(Self.trickplayCaptureIntervalSecs)) trickplayCaptureAttempts=\(trickplayCaptureAttemptsSinceReceipt) trickplayCaptureCompleted=\(trickplayCaptureCompletionsSinceReceipt) trickplayCaptureNil=\(trickplayCaptureNilSinceReceipt) trickplayContribution=\(scrubThumbnails.isCommunityUploadInFlight ? "active" : "idle") preload=\(preloadTask == nil ? "idle" : "active") warm=\(warmNextTask == nil ? "idle" : "active")\(presentationText)"
         )
         trickplayCaptureAttemptsSinceReceipt = 0
         trickplayCaptureCompletionsSinceReceipt = 0
@@ -9164,39 +9170,47 @@ struct TVPlayerView: View {
         // contribution for UHD Dolby Vision, HDR10, and HLG. Remote/provider previews are read separately
         // by ScrubThumbnailsStore and remain available. This stays after the cadence gate so mediaSummary()
         // is read at capture boundaries, never on every timePos tick.
-        if shouldSkipLocalTrickplayCaptureForUHDHDR() { return }
-        // Non-UHD SDR remains eligible after the ordinary first-frame/display-settle threshold.
+        let captureDecision = currentLocalTrickplayCaptureDecision()
+        guard captureDecision.permitsLocalCapture else { return }
+        // Non-UHD SDR and HDR remain eligible after the ordinary first-frame/display-settle threshold.
         guard TrickplayPresentationReadinessPolicy.isReady(
             elapsedSinceFirstFrame: firstFrameRenderedAt.map { ProcessInfo.processInfo.systemUptime - $0 },
             displaySwitchSettled: HDRDisplayMode.isSwitchSettled,
-            isUltraHighDefinitionHDR: isCurrentContentUHDHDR()
+            isUltraHighDefinitionHDR: captureDecision.isUltraHighDefinitionHDR
         ) else { return }
         captureTrickplayFrame(at: time)
     }
 
-    /// UHD Dolby Vision, HDR10, and HLG local captures all take the expensive inline drawable path. Keep
-    /// them out of that path entirely. Unknown metadata deliberately fails open, so a stream cannot lose
-    /// local previews forever merely because probing has not completed.
-    private func shouldSkipLocalTrickplayCaptureForUHDHDR() -> Bool {
-        isCurrentContentUHDHDR()
-    }
-
-    /// Reuses the frame-presentation UHD definition. `isHDR` receives the active transfer-function result on
-    /// either engine, and the source hint protects HLS before AVFoundation can expose that result. The state is
-    /// reset before a source switch, so a prior HDR title cannot suppress local previews for later SDR media.
-    /// Unknown metadata still fails open for non-UHD SDR media.
-    private func isCurrentContentUHDHDR() -> Bool {
-        guard let player = coordinator.player else { return false }
+    /// Builds a data-only decision before the local capture call. `isHDR` receives the active transfer-function
+    /// result on either engine, and the source hint protects HLS before AVFoundation can expose that result.
+    /// The HDR state is reset before a source switch, so a prior HDR title cannot suppress later SDR media.
+    private func currentLocalTrickplayCaptureDecision() -> TrickplayLocalCaptureEligibilityPolicy.Decision {
+        guard let player = coordinator.player else {
+            return TrickplayLocalCaptureEligibilityPolicy.decision(
+                .init(isUltraHighDefinition: false, dynamicRange: .unknown)
+            )
+        }
         let hint = (curHint ?? sourceHint ?? "").lowercased()
-        let sourceAdvertisesHDR = StreamRanking.isDolbyVision(hint)
-            || hint.contains("hdr") || hint.contains("hlg")
-        guard isHDR || player.contentIsDolbyVision || player.hdrAvailable || sourceAdvertisesHDR else {
-            return false
+        let dynamicRange: TrickplayLocalCaptureEligibilityPolicy.DynamicRange
+        if player.contentIsDolbyVision || StreamRanking.isDolbyVision(hint) {
+            dynamicRange = .dolbyVision
+        } else if hint.contains("hdr10") {
+            dynamicRange = .hdr10
+        } else if hint.contains("hlg") {
+            dynamicRange = .hlg
+        } else if isHDR || player.hdrAvailable || hint.contains("hdr") {
+            dynamicRange = .hdr
+        } else {
+            dynamicRange = .unknown
         }
         let summary = player.mediaSummary()
-        guard summary.width > 0, summary.height > 0 else { return false }
-        return TVOSFramePresentationPolicy.isUltraHighDefinition(
-            width: summary.width, height: summary.height)
+        return TrickplayLocalCaptureEligibilityPolicy.decision(
+            .init(
+                isUltraHighDefinition: TVOSFramePresentationPolicy.isUltraHighDefinition(
+                    width: summary.width, height: summary.height),
+                dynamicRange: dynamicRange
+            )
+        )
     }
 
     /// The one place a trickplay frame is grabbed (from the timePos tick OR the wall-clock timer). Engine-

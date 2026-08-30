@@ -34,6 +34,49 @@ struct TrickplayCaptureCadencePolicy {
     }
 }
 
+/// Separates the local renderer capture decision from remote/provider preview availability. UHD HDR local
+/// grabs can extend the renderer's drawable-acquire work, while a provider sprite sheet has no such cost.
+/// Unknown or unprobed media is deliberately non-UHD here, so it fails open to the ordinary local path.
+struct TrickplayLocalCaptureEligibilityPolicy {
+    enum DynamicRange: Equatable, Sendable {
+        case dolbyVision
+        case hdr10
+        case hlg
+        case hdr
+        case sdr
+        case unknown
+
+        var isHDR: Bool {
+            switch self {
+            case .dolbyVision, .hdr10, .hlg, .hdr:
+                return true
+            case .sdr, .unknown:
+                return false
+            }
+        }
+    }
+
+    struct Input: Equatable, Sendable {
+        let isUltraHighDefinition: Bool
+        let dynamicRange: DynamicRange
+    }
+
+    struct Decision: Equatable, Sendable {
+        let isUltraHighDefinitionHDR: Bool
+        let permitsLocalCapture: Bool
+        let permitsRemoteProviderPreviews: Bool
+    }
+
+    static func decision(_ input: Input) -> Decision {
+        let isUltraHighDefinitionHDR = input.isUltraHighDefinition && input.dynamicRange.isHDR
+        return .init(
+            isUltraHighDefinitionHDR: isUltraHighDefinitionHDR,
+            permitsLocalCapture: !isUltraHighDefinitionHDR,
+            permitsRemoteProviderPreviews: true
+        )
+    }
+}
+
 /// First-frame + display-settle readiness for trickplay capture (report item 8). The libmpv frame grab
 /// scales the drawable INLINE on mpv's VO thread (`MetalLayer.nextDrawable`, right before the very next
 /// present), so a capture request that lands during a display-mode renegotiation or in the first seconds of
