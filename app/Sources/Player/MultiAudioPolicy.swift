@@ -134,6 +134,24 @@ enum PlaybackIntentPolicy {
                                          requestedRate: Float) -> TransportAction {
         playbackRequested ? .play(rate: requestedRate) : .pause
     }
+
+    /// A surface recovery may issue a fresh logical token even though it is replacing the exact item that is
+    /// already playing. Carry intent only while that item is still an active, nonterminal source instance.
+    static func carriesIntentForSameSourceReplacement(requestedLoadHasToken: Bool,
+                                                      hasActiveLoad: Bool,
+                                                      sameSource: Bool,
+                                                      hasCurrentItem: Bool,
+                                                      hasProducedPlayback: Bool,
+                                                      fatalErrorEmitted: Bool,
+                                                      terminalClaimed: Bool) -> Bool {
+        !requestedLoadHasToken
+            && hasActiveLoad
+            && sameSource
+            && hasCurrentItem
+            && hasProducedPlayback
+            && !fatalErrorEmitted
+            && !terminalClaimed
+    }
 }
 
 /// Pure ownership and rollback state for an audio-source replacement mount.

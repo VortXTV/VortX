@@ -293,6 +293,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// A true terminal receipt captured while the viewer is paused. Its exact item generation prevents a
     /// replacement item from replaying the previous item's completion when the viewer presses Play.
     private var deferredTerminal = VortXPlaybackEndNotificationPolicy.DeferredTerminal()
+    /// A healthy growing remux may publish more media after AVPlayer reaches its current playlist tail. If that
+    /// happens while paused, wait for explicit Play before replacing the ended item on the same live mount.
+    private var deferredPublishedTailRecoveryGeneration: UInt64?
     /// One-shot per mount for an explicit HDR-only recovery item. The initial DV item has exactly one video
     /// variant, so AVPlayer cannot jump into a stripped-DV representation inside the same adaptive set. An exact
     /// CoreMedia -12927 rejection on a healthy, base-layer-compatible mount gets one fresh item at
@@ -300,6 +303,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var hdrFallbackRetried = false
     /// True only while the current item is the explicit HDR-only recovery item.
     private var usingHDRFallbackItem = false
+    /// One fresh primary item on the same healthy producer is allowed for a premature published-tail receipt.
+    /// The producer is not restarted and a second receipt without producer completion fails honestly.
+    private var publishedTailItemRecoveryRetried = false
     /// One identity for each source/remux mount. HDR recovery advances the item generation while deliberately
     /// keeping this identity; a source-audio remount or hosted-to-local recovery advances both.
     private var playbackMountIdentity: UInt64 = 0
@@ -809,8 +815,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             isTransitioning: pipState.isTransitioning)
         let preparedCandidate = configuredPreparedRemux
         configuredPreparedRemux = nil
-        let isIntentRemount = loadToken != nil && pendingPlaybackIntent != nil
-        if loadToken == nil {
+        let carriesSameSourceIntent = PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(
+            requestedLoadHasToken: loadToken != nil,
+            hasActiveLoad: activeLoadToken != nil,
+            sameSource: lastLoadURL == url,
+            hasCurrentItem: item != nil,
+            hasProducedPlayback: didStart || videoFrameEverProduced,
+            fatalErrorEmitted: fatalErrorEmitted,
+            terminalClaimed: terminalLatch.hasEmitted)
+        if carriesSameSourceIntent {
+            pendingPlaybackIntent = capturePlaybackIntent(from: item)
+        }
+        let isIntentRemount = pendingPlaybackIntent != nil
+            && (loadToken != nil || carriesSameSourceIntent)
+        if !isIntentRemount {
             let preferences = TrackPreferences.current
             if let normalized = VortXEngineProtocol.normalizedAudioSelectionPreferences(
                 preferredLanguages: preferences.audioLanguages,
@@ -830,7 +848,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             selectedRemuxAudioSourceIndex = configuredAudioSourceIndex
             configuredAudioSourceIndex = nil
             hasConfiguredAudioSourceIndex = false
-        } else if loadToken == nil {
+        } else if !isIntentRemount {
             selectedRemuxAudioSourceIndex = nil
             remuxSourceAudioTracks = []
             remuxSourceSubtitleTracks = []
@@ -840,7 +858,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // reuses the logical request's origin; a fresh unrelated load with no configuration starts at zero.
         if let configured = resumeConfiguration.consumeForNextLoad() {
             currentLoadResumeOrigin = configured
-        } else if loadToken == nil {
+            if isIntentRemount {
+                pendingPlaybackIntent?.updateSourceSeconds(configured)
+            }
+        } else if !isIntentRemount {
             currentLoadResumeOrigin = 0
         }
         let requestedRemuxOrigin = currentLoadResumeOrigin
@@ -848,6 +869,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         itemGeneration &+= 1
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
+        deferredPublishedTailRecoveryGeneration = nil
         playbackMountIdentity &+= 1
         let issuedGeneration = itemGeneration
         audioReplacement?.bind(to: issuedGeneration)
@@ -883,6 +905,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         if !isIntentRemount { playbackRequested = true }
         hdrFallbackRetried = false; usingHDRFallbackItem = false
+        publishedTailItemRecoveryRetried = false
         if !isIntentRemount {
             pendingPlaybackIntent = nil
             remuxSeekRemountTarget = nil
@@ -1647,6 +1670,67 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return true
     }
 
+    /// AVPlayer can report item-end at the current edge of a still-growing HLS playlist. Replace only the item,
+    /// never the healthy producer, and carry the same DV/HDR route, source playhead and media selections. One
+    /// replacement is allowed per mount so an actually stuck playlist cannot loop forever.
+    private func retryFreshItemAtPublishedTail() -> Bool {
+        guard !publishedTailItemRecoveryRetried,
+              let progress = remuxMountProgress,
+              progress.initPublished,
+              !progress.ended,
+              !progress.failed,
+              let currentItem = item,
+              let playlistURL = (currentItem.asset as? AVURLAsset)?.url,
+              let loadToken = activeLoadToken else { return false }
+
+        pendingPlaybackIntent = capturePlaybackIntent(from: currentItem)
+        publishedTailItemRecoveryRetried = true
+        DiagnosticsLog.log(
+            "avplayer",
+            "healthy remux item reached published tail -> one same-mount item replacement "
+                + "sourceTime=\(String(format: "%.3f", playbackPositionSeconds))s "
+                + "segments=\(progress.segmentCount) bytes=\(progress.producedBytes)")
+
+        invalidateSeekRequests()
+        teardownObservers()
+        player.pause()
+        isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
+        videoFrameEverProduced = false; preferredPeakBitRatePinned = false
+        audioOverBlackSince = 0; audioOverBlackFired = false
+        stallEpisode.reset()
+        audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
+        selectionTopologyGeneration = nil
+        selectionRefreshState.reset()
+        disableExternalSubtitle(discardingCues: false)
+
+        let freshItem = AVPlayerItem(asset: AVURLAsset(url: playlistURL))
+        itemGeneration &+= 1
+        terminalLatch.reset(generation: itemGeneration)
+        deferredTerminal.reset(generation: itemGeneration)
+        deferredPublishedTailRecoveryGeneration = nil
+        if remuxRemoteMount != nil {
+            remuxRemoteItemGeneration = itemGeneration
+        }
+        audioReplacement?.bind(to: itemGeneration)
+        pendingPlaybackIntent?.bind(
+            generation: itemGeneration,
+            mountIdentity: playbackMountIdentity)
+        item = freshItem
+        freshItem.preferredForwardBufferDuration =
+            VortXRemuxForwardBufferPolicy.preferredDuration(
+                mount: forwardBufferMount,
+                hasProducedFirstFrame: false)
+        let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+        ])
+        freshItem.add(output)
+        videoOutput = output
+        player.replaceCurrentItem(with: freshItem)
+        observe(freshItem, loadToken: loadToken)
+        if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
+        return true
+    }
+
     private func refreshPendingIntentTransport() {
         guard var intent = pendingPlaybackIntent else { return }
         intent.updateTransport(
@@ -1707,6 +1791,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     func play() {
         playbackRequested = true
         refreshPendingIntentTransport()
+        if deferredPublishedTailRecoveryGeneration == itemGeneration,
+           let loadToken = activeLoadToken {
+            deferredPublishedTailRecoveryGeneration = nil
+            if retryFreshItemAtPublishedTail() {
+                logTransport("play -> resumed deferred published-tail recovery")
+                return
+            }
+            deliverTerminal(
+                .error(VortXRemuxItemEndPolicy.prematureEndReason),
+                loadToken: loadToken,
+                generation: itemGeneration)
+            logTransport("play -> published-tail recovery unavailable")
+            return
+        }
         if let loadToken = activeLoadToken,
            let deferred = deferredTerminal.consume(generation: itemGeneration) {
             // A paused item has already reached its terminal state. Deliver the exact receipt now rather than
@@ -2061,6 +2159,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         itemGeneration &+= 1
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
+        deferredPublishedTailRecoveryGeneration = nil
         pendingRemuxGeneration = nil
         #if os(tvOS)
         nativePreAttachTask?.cancel()
@@ -3697,6 +3796,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         ) {
         case .contentEOF:
             terminal = .eof
+        case .recoverablePublishedTail:
+            guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
+            if !playbackRequested {
+                guard deferredPublishedTailRecoveryGeneration != itemGeneration else { return }
+                deferredPublishedTailRecoveryGeneration = itemGeneration
+                DiagnosticsLog.log(
+                    "avplayer",
+                    "deferred healthy published-tail recovery while committed transport intent is paused generation=\(itemGeneration)")
+                return
+            }
+            if retryFreshItemAtPublishedTail() { return }
+            terminal = .error(VortXRemuxItemEndPolicy.prematureEndReason)
         case .remuxFailure(let reason):
             guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
             if playbackRequested, recoverAudioReplacementIfNeeded(

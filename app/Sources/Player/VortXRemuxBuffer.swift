@@ -232,6 +232,7 @@ enum VortXPlaybackEndNotificationPolicy {
 enum VortXRemuxItemEndPolicy {
     enum Decision: Equatable, Sendable {
         case contentEOF
+        case recoverablePublishedTail
         case remuxFailure(String)
     }
 
@@ -252,7 +253,7 @@ enum VortXRemuxItemEndPolicy {
         let concrete = producerFailureReason?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let concrete, !concrete.isEmpty { return .remuxFailure(concrete) }
         guard !producerEnded else { return .contentEOF }
-        return .remuxFailure(prematureEndReason)
+        return .recoverablePublishedTail
     }
 }
 
