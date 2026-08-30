@@ -24,4 +24,14 @@ class AudioRouteRefreshGateTest {
         assertFalse(gate.schedule())
         assertFalse(gate.stop())
     }
+
+    @Test fun `restart schedules a fresh current route delivery`() {
+        val gate = AudioRouteRefreshGate()
+        gate.start()
+        assertTrue(gate.consume())
+        gate.stop()
+        assertTrue(gate.start())
+        assertTrue(gate.consume())
+        assertFalse(gate.consume())
+    }
 }

@@ -264,6 +264,36 @@ internal fun PlayerState.requestEngineFallback(reason: EngineFallbackReason): Pl
 internal fun shouldDemoteEngine(reason: EngineFallbackReason?, alreadyDemoted: Boolean): Boolean =
     reason != null && !alreadyDemoted
 
+internal enum class EngineFailureAction { NONE, DEMOTE }
+
+/** Gives same-source engine fallback atomic precedence over an old engine's terminal error. */
+internal class EngineFailurePrecedence {
+    private var fallbackConsumed = false
+    private var terminalPending = false
+
+    @Synchronized
+    fun observe(state: PlayerState): EngineFailureAction {
+        if (state.engineFallbackReason != null) {
+            terminalPending = false
+            if (!fallbackConsumed) {
+                fallbackConsumed = true
+                return EngineFailureAction.DEMOTE
+            }
+            return EngineFailureAction.NONE
+        }
+        if (!fallbackConsumed && state.hasError) terminalPending = true
+        return EngineFailureAction.NONE
+    }
+
+    @Synchronized
+    fun commitTerminal(): Boolean {
+        if (fallbackConsumed) return false
+        val commit = terminalPending
+        terminalPending = false
+        return commit
+    }
+}
+
 /** Fresh per-item state. No terminal, timing, buffering, or track data may leak across [PlayerEngine.load]. */
 internal fun freshPlayerStateForLoad(): PlayerState = PlayerState(isBuffering = true)
 

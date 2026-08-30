@@ -64,6 +64,22 @@ class PlaybackIntentControllerTest {
         assertFalse(subject.snapshot().shouldPlay)
     }
 
+    @Test fun `toggle follows displayed pause while focus blocker hides user intent`() {
+        val subject = PlaybackIntentController()
+        subject.setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)
+        subject.userToggle(currentlyPaused = true)
+        assertTrue(subject.snapshot().userWantsPlay)
+        assertFalse(subject.snapshot().shouldPlay)
+    }
+
+    @Test fun `toggle follows displayed pause while still watching blocks playback`() {
+        val subject = PlaybackIntentController(PlaybackIntentState(userWantsPlay = false))
+        subject.setBlocked(PlaybackBlocker.STILL_WATCHING, true)
+        subject.userToggle(currentlyPaused = true)
+        assertTrue(subject.snapshot().userWantsPlay)
+        assertFalse(subject.snapshot().shouldPlay)
+    }
+
     @Test fun `multiple blockers clear independently`() {
         val subject = PlaybackIntentController()
         subject.setBlocked(PlaybackBlocker.CAST, true)
@@ -80,7 +96,8 @@ class PlaybackIntentControllerTest {
         prepareAndLoadEngine(
             engine = engine,
             playable = com.vortx.android.model.Playable("https://example.invalid/video.mkv", "Video"),
-            lifecycleStarted = false,
+            lifecycleStarted = { false },
+            pausePlaybackInBackground = { true },
             playbackIntent = subject,
             refreshAudioRoute = { engine.actions += "route" },
         )
@@ -88,6 +105,59 @@ class PlaybackIntentControllerTest {
         assertEquals("pause", engine.actions.last())
         subject.setBlocked(PlaybackBlocker.BACKGROUND, false)
         assertEquals("play", engine.actions.last())
+    }
+
+    @Test fun `background playback preference avoids transport blocker but keeps resource hook`() {
+        val engine = RecordingEngine()
+        val subject = PlaybackIntentController()
+        prepareAndLoadEngine(
+            engine,
+            com.vortx.android.model.Playable("https://example.invalid/video.mkv", "Video"),
+            lifecycleStarted = { false },
+            pausePlaybackInBackground = { false },
+            playbackIntent = subject,
+        )
+        assertTrue("resource hook must still run", "background" in engine.actions)
+        assertTrue(subject.snapshot().shouldPlay)
+        assertEquals("play", engine.actions.last())
+    }
+
+    @Test fun `stopped transition during async load wins before publication`() {
+        val engine = RecordingEngine()
+        val subject = PlaybackIntentController()
+        var sample = 0
+        prepareAndLoadEngine(
+            engine,
+            com.vortx.android.model.Playable("https://example.invalid/video.mkv", "Video"),
+            lifecycleStarted = { sample++ == 0 },
+            pausePlaybackInBackground = { true },
+            playbackIntent = subject,
+        )
+        assertFalse(subject.snapshot().shouldPlay)
+        assertEquals("pause", engine.actions.last())
+        assertTrue(engine.actions.lastIndexOf("background") > engine.actions.indexOf("load"))
+    }
+
+    @Test fun `audio focus blocks before request and denial or abandon never clears it`() {
+        val subject = PlaybackIntentController()
+        subject.onAudioFocusEvent(AudioFocusIntentEvent.REQUESTED)
+        assertFalse(subject.snapshot().shouldPlay)
+        subject.onAudioFocusEvent(AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST)
+        subject.onAudioFocusEvent(AudioFocusIntentEvent.ABANDONED)
+        assertFalse(subject.snapshot().shouldPlay)
+    }
+
+    @Test fun `only focus grant or gain clears blocker and replacement inherits it`() {
+        val subject = PlaybackIntentController()
+        subject.onAudioFocusEvent(AudioFocusIntentEvent.REQUESTED)
+        subject.bind(RecordingEngine())
+        val replacement = RecordingEngine()
+        subject.bind(replacement)
+        assertEquals("pause", replacement.actions.last())
+        subject.onAudioFocusEvent(AudioFocusIntentEvent.GRANTED_OR_GAINED)
+        assertEquals("play", replacement.actions.last())
+        subject.onAudioFocusEvent(AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST)
+        assertEquals("pause", replacement.actions.last())
     }
 
     private class RecordingEngine : PlayerEngine {

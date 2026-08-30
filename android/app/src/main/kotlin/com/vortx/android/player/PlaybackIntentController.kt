@@ -9,6 +9,19 @@ internal enum class PlaybackBlocker {
     SYSTEM,
 }
 
+internal enum class AudioFocusIntentEvent { REQUESTED, GRANTED_OR_GAINED, DENIED_DELAYED_OR_LOST, ABANDONED }
+
+internal fun PlaybackIntentController.onAudioFocusEvent(event: AudioFocusIntentEvent) {
+    when (event) {
+        AudioFocusIntentEvent.REQUESTED,
+        AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST,
+        -> setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)
+        AudioFocusIntentEvent.GRANTED_OR_GAINED -> setBlocked(PlaybackBlocker.AUDIO_FOCUS, false)
+        // Abandoning an old engine's request must not clear ownership for a replacement or delayed grant.
+        AudioFocusIntentEvent.ABANDONED -> Unit
+    }
+}
+
 internal data class PlaybackIntentState(
     val userWantsPlay: Boolean = true,
     val blockers: Set<PlaybackBlocker> = emptySet(),
@@ -41,7 +54,7 @@ internal class PlaybackIntentController(
     fun userPause() = update(state.copy(userWantsPlay = false))
 
     @Synchronized
-    fun userToggle() = update(state.copy(userWantsPlay = !state.userWantsPlay))
+    fun userToggle(currentlyPaused: Boolean) = update(state.copy(userWantsPlay = currentlyPaused))
 
     @Synchronized
     fun setBlocked(blocker: PlaybackBlocker, blocked: Boolean) {
@@ -70,15 +83,44 @@ internal class PlaybackIntentController(
 internal fun prepareAndLoadEngine(
     engine: PlayerEngine,
     playable: com.vortx.android.model.Playable,
-    lifecycleStarted: Boolean,
+    lifecycleStarted: () -> Boolean,
+    pausePlaybackInBackground: () -> Boolean,
     playbackIntent: PlaybackIntentController,
     refreshAudioRoute: () -> Unit = {},
 ) {
-    playbackIntent.setBlocked(PlaybackBlocker.BACKGROUND, !lifecycleStarted)
-    playbackIntent.bind(engine)
-    if (!lifecycleStarted) engine.onEnterBackground()
-    refreshAudioRoute()
+    reconcileEngineLifecycle(
+        engine,
+        lifecycleStarted(),
+        pausePlaybackInBackground(),
+        playbackIntent,
+        refreshAudioRoute,
+    )
     engine.load(playable)
-    refreshAudioRoute()
+    // Async/non-cancellable construction can cross START/STOP. The post-load sample is authoritative.
+    reconcileEngineLifecycle(
+        engine,
+        lifecycleStarted(),
+        pausePlaybackInBackground(),
+        playbackIntent,
+        refreshAudioRoute,
+    )
+}
+
+internal fun reconcileEngineLifecycle(
+    engine: PlayerEngine,
+    lifecycleStarted: Boolean,
+    pausePlaybackInBackground: Boolean,
+    playbackIntent: PlaybackIntentController,
+    refreshAudioRoute: () -> Unit = {},
+) {
+    val blockForBackground = !lifecycleStarted && pausePlaybackInBackground
+    playbackIntent.setBlocked(PlaybackBlocker.BACKGROUND, blockForBackground)
+    playbackIntent.bind(engine)
+    if (lifecycleStarted) {
+        refreshAudioRoute()
+        engine.onEnterForeground()
+    } else {
+        engine.onEnterBackground()
+    }
     playbackIntent.bind(engine)
 }

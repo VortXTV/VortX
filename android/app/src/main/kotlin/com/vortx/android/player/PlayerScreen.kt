@@ -72,6 +72,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.audio.AudioRouteMonitor
+import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
 import com.vortx.android.skip.AutoSkipPolicy
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
@@ -236,9 +237,14 @@ fun PlayerScreen(
     val playbackSessionKey = sourceSwitchState.sessionKey
     val playbackIntent = remember(playbackSessionKey) {
         val background = !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        val pauseInBackground = !KeepPlayingBackgroundSetting.isEnabled(context)
         PlaybackIntentController(
             PlaybackIntentState(
-                blockers = if (background) setOf(PlaybackBlocker.BACKGROUND) else emptySet(),
+                blockers = if (background && pauseInBackground) {
+                    setOf(PlaybackBlocker.BACKGROUND)
+                } else {
+                    emptySet()
+                },
             ),
         )
     }
@@ -393,8 +399,6 @@ fun PlayerScreen(
             if (resumeAt >= 0L) currentPlayable.copy(startPositionMs = resumeAt) else currentPlayable
         val wantsMpv = !forceExoPlayer &&
             PlayerEngineRouter.choose(currentPlayable, enginePreference) == PlayerEngineRouter.Engine.MPV
-        val lifecycleStarted = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-        playbackIntent.setBlocked(PlaybackBlocker.BACKGROUND, !lifecycleStarted)
         val engine: PlayerEngine = if (wantsMpv) {
             // NonCancellable: a half-initialized native mpv context must never be abandoned mid-build
             // (cancellation would leak it un-releasable); the block always completes, and the isActive
@@ -402,19 +406,43 @@ fun PlayerScreen(
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
                     engineHolder.set(it)
-                    prepareAndLoadEngine(it, playableForEngine, lifecycleStarted, playbackIntent) {
+                    prepareAndLoadEngine(
+                        it,
+                        playableForEngine,
+                        lifecycleStarted = {
+                            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                        },
+                        pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
+                        playbackIntent = playbackIntent,
+                    ) {
                         if (it.audioOutputModeAvailable) it.setAudioOutputMode(audioOutputMode)
                     }
                 }
             } ?: ExoPlayerEngine(context).also {
                 // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
                 engineHolder.set(it)
-                prepareAndLoadEngine(it, playableForEngine, lifecycleStarted, playbackIntent)
+                prepareAndLoadEngine(
+                    it,
+                    playableForEngine,
+                    lifecycleStarted = {
+                        lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                    },
+                    pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
+                    playbackIntent = playbackIntent,
+                )
             }
         } else {
             ExoPlayerEngine(context).also {
                 engineHolder.set(it)
-                prepareAndLoadEngine(it, playableForEngine, lifecycleStarted, playbackIntent)
+                prepareAndLoadEngine(
+                    it,
+                    playableForEngine,
+                    lifecycleStarted = {
+                        lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                    },
+                    pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
+                    playbackIntent = playbackIntent,
+                )
             }
         }
         if (!isActive) {
@@ -490,7 +518,10 @@ fun PlayerScreen(
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_STOP -> {
-                    playbackIntent.setBlocked(PlaybackBlocker.BACKGROUND, true)
+                    playbackIntent.setBlocked(
+                        PlaybackBlocker.BACKGROUND,
+                        !KeepPlayingBackgroundSetting.isEnabled(context),
+                    )
                     engine.onEnterBackground()
                 }
                 Lifecycle.Event.ON_START -> {
@@ -820,9 +851,33 @@ fun PlayerScreen(
         if (runtimeMismatch) playbackIntent.setSourceTerminal(true)
     }
 
-    // The one error verdict everything downstream renders and gates on: the engine's own hasError OR
-    // the watchdog's stall verdict OR the runtime-mismatch verdict.
-    val effectiveError = playerState.hasError || stallError || runtimeMismatch
+    // Engine fallback wins atomically over the old engine's terminal error. A terminal is held briefly;
+    // a fallback arriving in that interval cancels the pending source verdict and preserves the position.
+    val failurePrecedence = remember(engine) { EngineFailurePrecedence() }
+    var committedEngineError by remember(engine) { mutableStateOf(false) }
+    LaunchedEffect(
+        engine,
+        playerState.hasError,
+        playerState.engineFallbackReason,
+        stallError,
+        runtimeMismatch,
+    ) {
+        if (failurePrecedence.observe(playerState) == EngineFailureAction.DEMOTE) {
+            committedEngineError = false
+            playbackIntent.setSourceTerminal(false)
+            engineSwitchResumeMs[0] = playerState.positionMs.coerceAtLeast(0L)
+            forceExoPlayer = true
+            return@LaunchedEffect
+        }
+        if (playerState.hasError) {
+            delay(ENGINE_FALLBACK_PRECEDENCE_MS)
+            committedEngineError = failurePrecedence.commitTerminal()
+        } else {
+            committedEngineError = false
+        }
+    }
+    // The one committed error verdict everything downstream renders and gates on.
+    val effectiveError = committedEngineError || stallError || runtimeMismatch
     LaunchedEffect(playerState.hasEnded, effectiveError) {
         playbackIntent.setSourceTerminal(playerState.hasEnded || effectiveError)
     }
@@ -862,7 +917,11 @@ fun PlayerScreen(
     // player renders exactly as before.
     val pip = rememberPlayerPip(
         engine = engine,
-        onToggleUserPlayback = playbackIntent::userToggle,
+        onToggleUserPlayback = {
+            playbackIntent.userToggle(
+                currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
+            )
+        },
         isActivelyPlaying = !playerState.isPaused && !playerState.hasEnded && !effectiveError,
         isPaused = playerState.isPaused,
         durationKnown = playerState.durationMs > 0L,
@@ -1163,15 +1222,6 @@ fun PlayerScreen(
         currentOnEnded()
     }
 
-    // A libmpv runtime failure demotes the SAME source to Media3 once. It is intentionally separate from
-    // hasError, so the host's ranked-source ladder does not discard a healthy URL because one engine failed.
-    LaunchedEffect(playerState.engineFallbackReason) {
-        if (shouldDemoteEngine(playerState.engineFallbackReason, forceExoPlayer)) {
-            engineSwitchResumeMs[0] = latestState.positionMs.coerceAtLeast(0L)
-            forceExoPlayer = true
-        }
-    }
-
     // Periodic progress writeback while playing, so Continue Watching updates live. The engine's state
     // position advances ~1s on both engines (mpv's time-pos observer, ExoPlayer's position ticker), so a
     // throttled read here is accurate; the host debounces the engine dispatch.
@@ -1267,10 +1317,15 @@ fun PlayerScreen(
     // auto-RESUMES playback the policy itself paused, so a GAIN can no longer un-pause a film the
     // viewer had paused deliberately before the interruption.
     DisposableEffect(engine) {
+        // Own focus before asking. A denied or delayed request must not let the replacement engine play.
+        playbackIntent.onAudioFocusEvent(AudioFocusIntentEvent.REQUESTED)
         val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-            playbackIntent.setBlocked(
-                PlaybackBlocker.AUDIO_FOCUS,
-                change != AudioManager.AUDIOFOCUS_GAIN,
+            playbackIntent.onAudioFocusEvent(
+                if (change == AudioManager.AUDIOFOCUS_GAIN) {
+                    AudioFocusIntentEvent.GRANTED_OR_GAINED
+                } else {
+                    AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST
+                },
             )
         }
         val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -1283,9 +1338,12 @@ fun PlayerScreen(
             .setOnAudioFocusChangeListener(focusListener)
             .build()
         if (audioManager?.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-            playbackIntent.setBlocked(PlaybackBlocker.AUDIO_FOCUS, false)
+            playbackIntent.onAudioFocusEvent(AudioFocusIntentEvent.GRANTED_OR_GAINED)
         }
-        onDispose { audioManager?.abandonAudioFocusRequest(request) }
+        onDispose {
+            audioManager?.abandonAudioFocusRequest(request)
+            playbackIntent.onAudioFocusEvent(AudioFocusIntentEvent.ABANDONED)
+        }
     }
 
     // TV re-reveal path: when the chrome hides, its focusable buttons leave composition and D-pad input
@@ -1312,7 +1370,9 @@ fun PlayerScreen(
                 when (event.key) {
                     Key.MediaPlayPause -> {
                         showControls()
-                        playbackIntent.userToggle()
+                        playbackIntent.userToggle(
+                            currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
+                        )
                         return@onKeyEvent true
                     }
                     Key.MediaPlay -> {
@@ -1547,7 +1607,9 @@ fun PlayerScreen(
             onBack = ::exitPlayer,
             onTogglePause = {
                 showControls()
-                playbackIntent.userToggle()
+                playbackIntent.userToggle(
+                    currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
+                )
             },
             onSeek = { showControls(); engine.seekTo(it) },
             onSeekBy = { showControls(); engine.seekBy(it) },
@@ -2020,6 +2082,9 @@ private const val WATCHDOG_START_TIMEOUT_MS = 30_000L
 /// stalled. Tighter than the start bound: mid-stream the pipeline is proven, so a long freeze is a
 /// dead connection, and the verdict self-clears if the stream recovers.
 private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
+
+/// Small arbitration window in which a same-engine fallback outranks its trailing terminal callback.
+private const val ENGINE_FALLBACK_PRECEDENCE_MS = 250L
 
 /// Whether the FILE's demuxed duration is implausibly short for the title being played, i.e. the
 /// source resolved to the WRONG file (a removed episode's ~10s debrid junk/sample). With a known

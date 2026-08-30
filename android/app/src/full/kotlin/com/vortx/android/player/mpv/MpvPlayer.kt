@@ -942,12 +942,9 @@ class MpvPlayer private constructor(
                     keepScreenOn = true
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            runCatching { mpv.attachSurface(holder.surface) }
-                                .onFailure {
-                                    _state.update {
-                                        it.requestEngineFallback(EngineFallbackReason.SURFACE_ATTACH_FAILED)
-                                    }
-                                }
+                            attachMpvSurfaceOrFallback { mpv.attachSurface(holder.surface) }?.let { reason ->
+                                _state.update { it.requestEngineFallback(reason) }
+                            }
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -1101,6 +1098,15 @@ class MpvPlayer private constructor(
             }
         }
     }
+}
+
+/** Fatal-aware surface attach seam: expected runtime failures demote; process-fatal failures propagate. */
+internal fun attachMpvSurfaceOrFallback(attach: () -> Unit): EngineFallbackReason? {
+    val attached = recoverNativeFailure("mpv-init") {
+        attach()
+        true
+    } ?: false
+    return if (attached) null else EngineFallbackReason.SURFACE_ATTACH_FAILED
 }
 
 internal fun requireMpvSecurityOption(name: String, result: Int) {
