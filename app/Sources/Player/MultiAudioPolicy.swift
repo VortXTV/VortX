@@ -137,16 +137,14 @@ enum PlaybackIntentPolicy {
 
     /// A surface recovery may issue a fresh logical token even though it is replacing the exact item that is
     /// already playing. Carry intent only while that item is still an active, nonterminal source instance.
-    static func carriesIntentForSameSourceReplacement(requestedLoadHasToken: Bool,
-                                                      hasActiveLoad: Bool,
-                                                      sameSource: Bool,
-                                                      hasCurrentItem: Bool,
-                                                      hasProducedPlayback: Bool,
-                                                      fatalErrorEmitted: Bool,
-                                                      terminalClaimed: Bool) -> Bool {
-        !requestedLoadHasToken
-            && hasActiveLoad
-            && sameSource
+    static func carriesIntentForOwnedRecovery(recoveryTokenMatchesActiveLoad: Bool,
+                                               sameRequestMetadata: Bool,
+                                               hasCurrentItem: Bool,
+                                               hasProducedPlayback: Bool,
+                                               fatalErrorEmitted: Bool,
+                                               terminalClaimed: Bool) -> Bool {
+        recoveryTokenMatchesActiveLoad
+            && sameRequestMetadata
             && hasCurrentItem
             && hasProducedPlayback
             && !fatalErrorEmitted

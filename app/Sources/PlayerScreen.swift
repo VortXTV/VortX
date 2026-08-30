@@ -3565,6 +3565,8 @@ struct PlayerScreen: View {
     }
 
     private func recoverFromStall() {
+        let recoveryToken = coordinator.player is AVPlayerEngineController
+            ? coordinator.player?.activeLoadToken : nil
         srcProbe("recoverFromStall ENTER (mid-play freeze) stallRecoveries=\(stallRecoveries)/3 at pos=\(String(format: "%.1f", currentTime))s")
         guard stallRecoveries < 3 else {
             // Repeated stalls on one source: hop to another at the current position, falling back to
@@ -3591,7 +3593,8 @@ struct PlayerScreen: View {
         postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(
-            curURL ?? url, headers: curHeaders, live: isLive, resumeOrigin: resume
+            curURL ?? url, headers: curHeaders, live: isLive,
+            reusing: recoveryToken, resumeOrigin: resume
         )
         if issuedToken != nil { startLoadTimeout() }
         if issuedToken != nil, resume > 5 {

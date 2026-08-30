@@ -122,30 +122,48 @@ enum RemuxItemEndPolicyTests {
 
         check(
             "same-source replacement carries intent only from an active playable nonterminal item",
-            PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(
-                requestedLoadHasToken: false,
-                hasActiveLoad: true,
-                sameSource: true,
+            PlaybackIntentPolicy.carriesIntentForOwnedRecovery(
+                recoveryTokenMatchesActiveLoad: true,
+                sameRequestMetadata: true,
                 hasCurrentItem: true,
                 hasProducedPlayback: true,
                 fatalErrorEmitted: false,
                 terminalClaimed: false)
-                && !PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(
-                    requestedLoadHasToken: false,
-                    hasActiveLoad: true,
-                    sameSource: false,
+                && !PlaybackIntentPolicy.carriesIntentForOwnedRecovery(
+                    recoveryTokenMatchesActiveLoad: false,
+                    sameRequestMetadata: true,
                     hasCurrentItem: true,
                     hasProducedPlayback: true,
                     fatalErrorEmitted: false,
                     terminalClaimed: false)
-                && !PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(
-                    requestedLoadHasToken: false,
-                    hasActiveLoad: true,
-                    sameSource: true,
+                && !PlaybackIntentPolicy.carriesIntentForOwnedRecovery(
+                    recoveryTokenMatchesActiveLoad: true,
+                    sameRequestMetadata: false,
                     hasCurrentItem: true,
                     hasProducedPlayback: true,
                     fatalErrorEmitted: true,
                     terminalClaimed: false))
+
+        check(
+            "paused published tail is reclassified from active to clean EOF on Play",
+            VortXRemuxItemEndPolicy.classify(
+                isRemux: true,
+                producerEnded: false,
+                producerFailureReason: nil) == .recoverablePublishedTail
+                && VortXRemuxItemEndPolicy.classify(
+                    isRemux: true,
+                    producerEnded: true,
+                    producerFailureReason: nil) == .contentEOF)
+        check(
+            "paused published tail is reclassified from active to exact producer failure on Play",
+            VortXRemuxItemEndPolicy.classify(
+                isRemux: true,
+                producerEnded: false,
+                producerFailureReason: nil) == .recoverablePublishedTail
+                && VortXRemuxItemEndPolicy.classify(
+                    isRemux: true,
+                    producerEnded: false,
+                    producerFailureReason: "socket read failed") == .remuxFailure("socket read failed"))
 
         var replacementIntent = PlaybackIntentPolicy.Intent(
             sourceSeconds: 232.375,
@@ -266,6 +284,12 @@ enum RemuxItemEndPolicyTests {
         let stream = try? String(
             contentsOf: appRoot.appendingPathComponent("Sources/Player/VortXMKVRemuxStream.swift"),
             encoding: .utf8)
+        let iosSurface = try? String(
+            contentsOf: appRoot.appendingPathComponent("Sources/PlayerScreen.swift"),
+            encoding: .utf8)
+        let tvSurface = try? String(
+            contentsOf: appRoot.appendingPathComponent("SourcesTV/TVPlayerView.swift"),
+            encoding: .utf8)
         let endHandler = sourceSection(
             engine,
             from: "@objc private func didPlayToEnd",
@@ -273,7 +297,7 @@ enum RemuxItemEndPolicyTests {
         check(
             "wiring: paused item-end evidence is classified then deferred before terminal-latch claim",
             containsInOrder(endHandler, [
-                "VortXRemuxItemEndPolicy.classify(",
+                "currentRemuxItemEndDecision()",
                 "if !playbackRequested {",
                 "deferredTerminal.capture(terminal, generation: itemGeneration)",
             ]) && endHandler?.contains("terminalLatch.claim(generation: itemGeneration)") == false)
@@ -286,17 +310,27 @@ enum RemuxItemEndPolicyTests {
                 "player.rate = requestedRate",
             ]))
         check(
+            "wiring: explicit Play during recovery updates intent but cannot start before restoration",
+            containsInOrder(engine, [
+                "func play() {",
+                "refreshPendingIntentTransport()",
+                "if pendingPlaybackIntent != nil {",
+                "play -> deferred until recovery restoration",
+                "return",
+                "player.rate = requestedRate",
+            ]))
+        check(
             "wiring: healthy remux tail replaces only the item and concrete failure remains terminal",
             server?.contains("stream.hlsSnapshot().ended") == true
                 && containsInOrder(endHandler, [
-                    "VortXRemuxItemEndPolicy.classify(",
+                    "currentRemuxItemEndDecision()",
                     "case .recoverablePublishedTail:",
                     "retryFreshItemOnHealthyMount(",
                     "case .remuxFailure(let reason):",
                     "guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }",
-                    "fatalErrorEmitted = true",
-                    "emit(MPVProperty.endFileError, reason",
-                ]))
+                ])
+                && engine?.contains("return VortXRemuxItemEndPolicy.classify(") == true
+                && engine?.contains("emit(MPVProperty.endFileError, reason") == true)
         check(
             "wiring: the legacy progressive remux loader contributes its producer-ended receipt",
             engine?.contains("else if let loader = remuxLoader") == true
@@ -324,7 +358,7 @@ enum RemuxItemEndPolicyTests {
         check(
             "wiring: surface same-source replacement captures intent before teardown and keeps exact resume origin",
             containsInOrder(loadFile, [
-                "PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(",
+                "PlaybackIntentPolicy.carriesIntentForOwnedRecovery(",
                 "pendingPlaybackIntent = capturePlaybackIntent(from: item)",
                 "pendingPlaybackIntent?.updateSourceSeconds(configured)",
                 "retryFreshItemOnHealthyMount(",
@@ -332,6 +366,35 @@ enum RemuxItemEndPolicyTests {
                 "teardownRemux()",
                 "disableExternalSubtitle(discardingCues: !isIntentRemount)",
             ]))
+        check(
+            "wiring: both Apple stall surfaces pass the active AVPlayer recovery token explicitly",
+            containsInOrder(iosSurface, [
+                "private func recoverFromStall()",
+                "let recoveryToken = coordinator.player is AVPlayerEngineController",
+                "reusing: recoveryToken, resumeOrigin: resume",
+            ])
+                && containsInOrder(tvSurface, [
+                    "private func reloadAtPlayhead()",
+                    "let recoveryToken = coordinator.player is AVPlayerEngineController",
+                    "reusing: recoveryToken, resumeOrigin: currentTime",
+                ]))
+        let readyHandler = sourceSection(
+            engine,
+            from: "private func handleStatus(_ item: AVPlayerItem",
+            to: "@objc private func didPlayToEnd")
+        check(
+            "wiring: recovery ready cannot apply transport before async selection restoration",
+            containsInOrder(readyHandler, [
+                "loadSelectionGroups()",
+                "if pendingPlaybackIntent == nil {",
+                "applyCommittedTransport()",
+                "readyToPlay deferred transport until recovery selection and playhead restoration",
+            ])
+                && containsInOrder(engine, [
+                    "private func loadSelectionGroups()",
+                    "switch restore.subtitle",
+                    "applyCommittedTransport()",
+                ]))
         check(
             "wiring: same-mount tail recovery captures selection intent and restores it before transport",
             containsInOrder(tailRecovery, [
@@ -360,6 +423,12 @@ enum RemuxItemEndPolicyTests {
                     "func play() {",
                     "deferredPublishedTailRecoveryGeneration == itemGeneration",
                     "retryFreshItemOnHealthyMount(",
+                ])
+                && containsInOrder(engine, [
+                    "func play() {",
+                    "deferredTerminal.consume(generation: itemGeneration)",
+                    "deferredPublishedTailRecoveryGeneration == itemGeneration",
+                    "currentRemuxItemEndDecision()",
                 ]))
         check(
             "wiring: deferred and immediate EOF/error delivery share the exact-generation terminal latch",

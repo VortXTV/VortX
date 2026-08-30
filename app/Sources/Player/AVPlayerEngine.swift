@@ -815,19 +815,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             isTransitioning: pipState.isTransitioning)
         let preparedCandidate = configuredPreparedRemux
         configuredPreparedRemux = nil
-        let carriesSameSourceIntent = PlaybackIntentPolicy.carriesIntentForSameSourceReplacement(
-            requestedLoadHasToken: loadToken != nil,
-            hasActiveLoad: activeLoadToken != nil,
-            sameSource: lastLoadURL == url,
+        let carriesOwnedRecoveryIntent = PlaybackIntentPolicy.carriesIntentForOwnedRecovery(
+            recoveryTokenMatchesActiveLoad: loadToken != nil && loadToken == activeLoadToken,
+            sameRequestMetadata: lastLoadURL == url
+                && lastLoadHeaders == headers
+                && lastLoadLive == live,
             hasCurrentItem: item != nil,
             hasProducedPlayback: didStart || videoFrameEverProduced,
             fatalErrorEmitted: fatalErrorEmitted,
             terminalClaimed: terminalLatch.hasEmitted)
-        if carriesSameSourceIntent {
+        if carriesOwnedRecoveryIntent {
             pendingPlaybackIntent = capturePlaybackIntent(from: item)
         }
         let isIntentRemount = pendingPlaybackIntent != nil
-            && (loadToken != nil || carriesSameSourceIntent)
+            && (loadToken != nil || carriesOwnedRecoveryIntent)
         if !isIntentRemount {
             let preferences = TrackPreferences.current
             if let normalized = VortXEngineProtocol.normalizedAudioSelectionPreferences(
@@ -865,7 +866,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             currentLoadResumeOrigin = 0
         }
         let requestedRemuxOrigin = currentLoadResumeOrigin
-        if carriesSameSourceIntent,
+        if carriesOwnedRecoveryIntent,
            let existingToken = activeLoadToken,
            retryFreshItemOnHealthyMount(
                reason: "surface same-source stall recovery",
@@ -1800,28 +1801,42 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     func play() {
         playbackRequested = true
         refreshPendingIntentTransport()
-        if deferredPublishedTailRecoveryGeneration == itemGeneration,
-           let loadToken = activeLoadToken {
-            deferredPublishedTailRecoveryGeneration = nil
-            if retryFreshItemOnHealthyMount(
-                reason: "deferred published-tail recovery",
-                claimsPublishedTailRetry: true) {
-                logTransport("play -> resumed deferred published-tail recovery")
-                return
-            }
-            deliverTerminal(
-                .error(VortXRemuxItemEndPolicy.prematureEndReason),
-                loadToken: loadToken,
-                generation: itemGeneration)
-            logTransport("play -> published-tail recovery unavailable")
-            return
-        }
         if let loadToken = activeLoadToken,
            let deferred = deferredTerminal.consume(generation: itemGeneration) {
             // A paused item has already reached its terminal state. Deliver the exact receipt now rather than
             // issuing play() against an ended AVPlayerItem, which can restart or race the episode transition.
             deliverTerminal(deferred, loadToken: loadToken, generation: itemGeneration)
             logTransport("play -> delivered deferred terminal")
+            return
+        }
+        if deferredPublishedTailRecoveryGeneration == itemGeneration,
+           let loadToken = activeLoadToken {
+            deferredPublishedTailRecoveryGeneration = nil
+            switch currentRemuxItemEndDecision() {
+            case .contentEOF:
+                deliverTerminal(.eof, loadToken: loadToken, generation: itemGeneration)
+                logTransport("play -> published tail completed while paused")
+            case .remuxFailure(let reason):
+                deliverTerminal(.error(reason), loadToken: loadToken, generation: itemGeneration)
+                logTransport("play -> published tail failed while paused")
+            case .recoverablePublishedTail:
+                if retryFreshItemOnHealthyMount(
+                    reason: "deferred published-tail recovery",
+                    claimsPublishedTailRetry: true) {
+                    logTransport("play -> resumed deferred published-tail recovery")
+                    return
+                }
+                deliverTerminal(
+                    .error(VortXRemuxItemEndPolicy.prematureEndReason),
+                    loadToken: loadToken,
+                    generation: itemGeneration)
+                logTransport("play -> published-tail recovery unavailable")
+            }
+            return
+        }
+        if pendingPlaybackIntent != nil {
+            logTransport("play -> deferred until recovery restoration")
+            emit(MPVProperty.pause, false)
             return
         }
         player.rate = requestedRate
@@ -3422,10 +3437,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             }
             if !didStart {
                 didStart = true
-                applyCommittedTransport()
+                if pendingPlaybackIntent == nil {
+                    applyCommittedTransport()
+                } else {
+                    DiagnosticsLog.log(
+                        "avplayer",
+                        "readyToPlay deferred transport until recovery selection and playhead restoration")
+                }
                 DiagnosticsLog.log(
                     "avplayer",
-                    "readyToPlay -> committed transport playbackRequested=\(playbackRequested) requestedRate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+                    "readyToPlay transport playbackRequested=\(playbackRequested) requestedRate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
                 // Variant-pick observability: each item has exactly one video variant. The path identifies
                 // whether this is the primary DV item or the explicit HDR-only recovery item.
                 let indicatedBitrate = item.accessLog()?.events.last?.indicatedBitrate ?? -1
@@ -3783,28 +3804,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let endedItem = note.object as? AVPlayerItem,
               let loadToken = activeLoadToken,
               owns(endedItem, loadToken: loadToken) else { return }
-        let remuxTerminal: (ended: Bool, failureReason: String?)?
-        if let server = remuxHLSServer {
-            remuxTerminal = (server.hasReachedEndOfStream, server.terminalFailureReason)
-        } else if let remote = remuxRemoteMount {
-            let progress = remote.mountProgress
-            remuxTerminal = (
-                progress.ended,
-                progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil)
-        } else if let loader = remuxLoader {
-            let progress = loader.mountProgress
-            remuxTerminal = (
-                progress.ended,
-                progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil)
-        } else {
-            remuxTerminal = nil
-        }
         let terminal: VortXPlaybackEndNotificationPolicy.Terminal
-        switch VortXRemuxItemEndPolicy.classify(
-            isRemux: remuxTerminal != nil,
-            producerEnded: remuxTerminal?.ended ?? true,
-            producerFailureReason: remuxTerminal?.failureReason
-        ) {
+        switch currentRemuxItemEndDecision() {
         case .contentEOF:
             terminal = .eof
         case .recoverablePublishedTail:
@@ -3838,6 +3839,30 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             return
         }
         deliverTerminal(terminal, loadToken: loadToken, generation: itemGeneration)
+    }
+
+    private func currentRemuxItemEndDecision() -> VortXRemuxItemEndPolicy.Decision {
+        let remuxTerminal: (ended: Bool, failureReason: String?)?
+        if let server = remuxHLSServer {
+            remuxTerminal = (server.hasReachedEndOfStream, server.terminalFailureReason)
+        } else if let remote = remuxRemoteMount {
+            let progress = remote.mountProgress
+            remuxTerminal = (
+                progress.ended,
+                progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil)
+        } else if let loader = remuxLoader {
+            let progress = loader.mountProgress
+            remuxTerminal = (
+                progress.ended,
+                progress.failed ? VortXRemuxItemEndPolicy.producerFailedReason : nil)
+        } else {
+            remuxTerminal = nil
+        }
+        return VortXRemuxItemEndPolicy.classify(
+            isRemux: remuxTerminal != nil,
+            producerEnded: remuxTerminal?.ended ?? true,
+            producerFailureReason: remuxTerminal?.failureReason
+        )
     }
 
     /// Emits one terminal chrome event only while the exact item generation is still current. A paused

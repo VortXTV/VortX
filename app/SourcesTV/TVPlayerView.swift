@@ -4763,9 +4763,11 @@ struct TVPlayerView: View {
     /// The shared mid-play same-engine reload: replays the current mount at the live play head. Used by
     /// the stall ladder and by the buffered-retirement gate ahead of an AVPlayer-to-libmpv demote (B3).
     private func reloadAtPlayhead() {
+        let recoveryToken = coordinator.player is AVPlayerEngineController
+            ? coordinator.player?.activeLoadToken : nil
         resumeSeconds = currentTime
         resumeIsMidPlayRecovery = true   // the live play head of the stalled mount, not a stored offset
-        appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false
+        appliedResume = false; autoAddonSubTried = false; addonSubsResolveTried = false
         pendingLibmpvResumeSeek = nil   // reloading the same source at a fresh mount: drop any deferred resume seek
         buffering = true
         hasStartedPlaying = false
@@ -4776,7 +4778,7 @@ struct TVPlayerView: View {
         firstFrameRenderedAt = nil
         curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
-                       resumeOrigin: currentTime)
+                       reusing: recoveryToken, resumeOrigin: currentTime)
         startLoadTimeout()
     }
 

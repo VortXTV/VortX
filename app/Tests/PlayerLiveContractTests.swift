@@ -3711,8 +3711,9 @@ enum PlayerLiveContractTests {
               ])
                   && sourceContainsInOrder(remuxDurationMapping, [
                       "if !didStart",
+                      "if pendingPlaybackIntent == nil",
                       "applyCommittedTransport()",
-                      "readyToPlay -> committed transport",
+                      "readyToPlay deferred transport until recovery selection and playhead restoration",
                   ])
                   && sourceContainsInOrder(selectionRestore, [
                       "switch restore.subtitle",
