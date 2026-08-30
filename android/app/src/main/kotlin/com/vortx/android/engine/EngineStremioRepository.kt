@@ -85,17 +85,40 @@ internal data class DebridResolveTarget(
     val fileIdx: Int?,
 )
 
-internal class StreamLoadGenerationFence {
+internal class StreamLoadDispatchGate {
+    private val lock = Any()
     private var generation = 0L
 
-    @Synchronized
-    fun begin(): Long {
+    fun begin(): Long = synchronized(lock) {
         generation += 1L
-        return generation
+        generation
     }
 
-    @Synchronized
-    fun isCurrent(candidate: Long): Boolean = candidate == generation
+    fun isCurrent(candidate: Long): Boolean = synchronized(lock) { candidate == generation }
+
+    /** Runs a native action sequence with one uninterrupted generation owner. */
+    fun dispatchCurrent(generation: Long, actions: List<String>, dispatch: (String) -> Unit) = synchronized(lock) {
+        if (this.generation != generation) throw CancellationException("Superseded by a newer stream target")
+        actions.forEach(dispatch)
+        if (this.generation != generation) throw CancellationException("Superseded by a newer stream target")
+    }
+}
+
+/**
+ * Applies the persisted Add-ons-screen priority to raw source groups before the optional "Use add-on
+ * order" ranking mode preserves that order. Groups absent from the saved order remain in engine order.
+ */
+internal fun orderStreamGroupsByAppliedAddonOrder(
+    groups: List<StreamGroup>,
+    appliedAddonOrder: List<String>,
+): List<StreamGroup> {
+    if (groups.size < 2 || appliedAddonOrder.isEmpty()) return groups
+    val rank = HashMap<String, Int>(appliedAddonOrder.size)
+    appliedAddonOrder.forEachIndexed { index, base -> rank[AddonOrder.normalize(base)] = index }
+    return groups.withIndex()
+        .sortedWith(compareBy<IndexedValue<StreamGroup>> { rank[AddonOrder.normalize(it.value.base)] ?: Int.MAX_VALUE }
+            .thenBy { it.index })
+        .map { it.value }
 }
 
 internal fun StreamSource.debridResolveTarget(
@@ -685,7 +708,7 @@ class EngineStremioRepository(
     /// failure (e.g. a malformed ctx JSON on a single event) can't cancel the whole scope.
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val streamLoadLock = Any()
-    private val streamLoadFence = StreamLoadGenerationFence()
+    private val streamLoadGate = StreamLoadDispatchGate()
     private var streamLoadJob: Job? = null
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.SignedOut)
@@ -1096,7 +1119,7 @@ class EngineStremioRepository(
                 CancellationException("Superseded by a newer stream target"),
             )
             streamLoadJob = ownerJob
-            streamLoadFence.begin()
+            streamLoadGate.begin()
         }
         return try {
             block(generation)
@@ -1108,20 +1131,32 @@ class EngineStremioRepository(
     }
 
     private fun requireCurrentStreamLoad(generation: Long) {
-        if (!streamLoadFence.isCurrent(generation)) {
+        if (!streamLoadGate.isCurrent(generation)) {
             throw CancellationException("Superseded by a newer stream target")
         }
     }
+
+    /**
+     * The native engine has one resident MetaDetails model. A Re-find's Unload + Load pair must remain
+     * indivisible: a newer generation can begin only before or after both actions, never between them.
+     */
+    private fun dispatchCurrentStreamLoad(generation: Long, vararg actionJson: String) =
+        streamLoadGate.dispatchCurrent(generation, actionJson.toList(), StremioCoreNative::dispatch)
 
     private suspend fun loadStreamFieldUntil(
         generation: Long,
         actionJson: String,
         streamId: String?,
+        forceRefresh: Boolean = false,
     ): String {
         val field = EngineActions.FIELD_META_DETAILS
         val settled = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
             requireCurrentStreamLoad(generation)
-            StremioCoreNative.dispatch(actionJson)
+            if (forceRefresh) {
+                dispatchCurrentStreamLoad(generation, EngineActions.unloadMeta(), actionJson)
+            } else {
+                dispatchCurrentStreamLoad(generation, actionJson)
+            }
             val immediate = StremioCoreNative.getState("\"$field\"")
             requireCurrentStreamLoad(generation)
             if (EngineState.parseStreamGroups(immediate, streamId).isNotEmpty()) return@withTimeoutOrNull immediate
@@ -1149,10 +1184,15 @@ class EngineStremioRepository(
         rememberedQuality: String,
         wantedAddon: String,
         generation: Long,
+        forceRefresh: Boolean = false,
     ): String {
         val settled = withTimeoutOrNull<String>(loadTimeoutSeconds.seconds) {
             requireCurrentStreamLoad(generation)
-            StremioCoreNative.dispatch(actionJson)
+            if (forceRefresh) {
+                dispatchCurrentStreamLoad(generation, EngineActions.unloadMeta(), actionJson)
+            } else {
+                dispatchCurrentStreamLoad(generation, actionJson)
+            }
             var firstPlayableAtMs: Long? = null
             var answer: String? = null
             while (answer == null) {
@@ -2028,9 +2068,6 @@ class EngineStremioRepository(
         // an ordinary detail load never pays this cost. The loadStreamFieldUntil / loadStreamsUntilWanted
         // wait below still holds -- post-Unload the immediate field read is empty, so it correctly waits
         // for the real re-fetch to settle instead of returning the just-cleared state.
-        if (forceRefresh) {
-            StremioCoreNative.dispatch(EngineActions.unloadMeta())
-        }
         // Meta + a guessed stream were already requested by meta(); re-pull meta_details for its
         // stream groups. If meta() was not called first, this Load brings both in.
         //
@@ -2045,9 +2082,9 @@ class EngineStremioRepository(
         // Ready = at least one add-on's stream group settled; later groups keep landing in engine
         // state and S05's reactive detail work will surface them incrementally.
         val state = if (episodeId != null && !wantedAddon.isNullOrBlank() && !rememberedQuality.isNullOrBlank()) {
-            loadStreamsUntilWanted(action, episodeId, rememberedQuality, wantedAddon, generation)
+            loadStreamsUntilWanted(action, episodeId, rememberedQuality, wantedAddon, generation, forceRefresh)
         } else {
-            loadStreamFieldUntil(generation, action, episodeId)
+            loadStreamFieldUntil(generation, action, episodeId, forceRefresh)
         }
         requireCurrentStreamLoad(generation)
         // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
@@ -2071,9 +2108,12 @@ class EngineStremioRepository(
         // CoreBridge.swift:984): a disabled add-on's sources never reach ranking or the picker for
         // this profile. Groups with no base (a malformed request) are kept, never dropped.
         val disabledAddons = addonPrefs.disabledBases()
-        val groups = EngineState.parseStreamGroups(state, episodeId).filter { group ->
-            group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
-        }
+        val groups = orderStreamGroupsByAppliedAddonOrder(
+            EngineState.parseStreamGroups(state, episodeId).filter { group ->
+                group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
+            },
+            addonPrefs.appliedOrder(),
+        )
         // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
         // kernel fire-and-forget and log the agreement (a diff count). It never touches the ranked
         // list returned below; with the flag at its default OFF this line is one volatile read.

@@ -586,8 +586,14 @@ class DetailViewModel(
     }
 
     private fun startSourceLoad(episodeId: String?, forceRefresh: Boolean = false) {
+        val profileId = sourceSticky.currentProfileId()
+        val token = if (forceRefresh) {
+            sourceRequestFence.beginRefresh(profileId, episodeId) ?: return
+        } else {
+            sourceRequestFence.begin(profileId, episodeId)
+        }
         sourceLoadJob?.cancel()
-        val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), episodeId)
+        if (forceRefresh) torbox.reset(token.generation, clearCache = true)
         sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token, forceRefresh) }
     }
 
@@ -603,8 +609,6 @@ class DetailViewModel(
     /// warmed next-episode lane mid-binge.
     fun refreshSources() {
         val episodeId = _selectedEpisodeId.value
-        val gen = sourceRequestFence.currentToken()?.generation ?: 0L
-        torbox.reset(gen, clearCache = true)
         startSourceLoad(episodeId, forceRefresh = true)
     }
 
@@ -659,6 +663,7 @@ class DetailViewModel(
     /// stream in behind the hero" shape. Fail-soft: an add-on-load failure surfaces as [UiState.Error] and
     /// leaves any still-arriving contributor lane to be handled on the next load.
     private suspend fun loadSources(episodeId: String?, request: SourceRequestFence.Token, forceRefresh: Boolean = false) {
+        try {
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         // Reset per-target state so a superseded episode's rows / cache badges can never leak into the new one.
         sourcesReady = false
@@ -791,6 +796,9 @@ class DetailViewModel(
                 }
             },
         )
+        } finally {
+            if (forceRefresh) sourceRequestFence.finishRefresh(request)
+        }
     }
 
     /// The frozen ranking context [sourceModel] assembles against: the real user preference snapshot + the

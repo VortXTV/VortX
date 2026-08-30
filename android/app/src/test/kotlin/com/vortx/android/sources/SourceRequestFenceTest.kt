@@ -34,4 +34,31 @@ class SourceRequestFenceTest {
         assertTrue(fence.accepts(current, "profile-a"))
         assertEquals("show:1:1", current.targetId)
     }
+
+    @Test
+    fun repeatedRefreshKeepsTheFirstGenerationAuthoritativeUntilItFinishes() {
+        val fence = SourceRequestFence("profile-a")
+        val initial = fence.begin("profile-a", "show:1:1")
+
+        val refresh = requireNotNull(fence.beginRefresh("profile-a", "show:1:1"))
+        assertFalse(fence.accepts(initial, "profile-a"))
+        assertEquals(refresh, fence.currentToken())
+        assertEquals(null, fence.beginRefresh("profile-a", "show:1:1"))
+        assertEquals(refresh, fence.currentToken())
+
+        fence.finishRefresh(refresh)
+        val next = requireNotNull(fence.beginRefresh("profile-a", "show:1:1"))
+        assertTrue(next.generation > refresh.generation)
+    }
+
+    @Test
+    fun ordinaryTargetChangeReleasesCanceledRefreshSlot() {
+        val fence = SourceRequestFence("profile-a")
+        fence.beginRefresh("profile-a", "show:1:1")
+
+        val selected = fence.begin("profile-a", "show:1:2")
+
+        assertEquals("show:1:2", selected.targetId)
+        assertTrue(fence.beginRefresh("profile-a", "show:1:2") != null)
+    }
 }

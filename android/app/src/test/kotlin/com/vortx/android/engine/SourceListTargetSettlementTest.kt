@@ -209,6 +209,34 @@ class SourceListTargetSettlementTest {
         singularity.close()
     }
 
+    @Test
+    fun directHttpAddonRowsSurviveDirectLinksOnlyDisplayFiltering() {
+        val http = StreamSource(
+            id = "http-row",
+            addon = "HTTP Add-on",
+            title = "HTTP stream",
+            url = "http://stream.example/live.m3u8",
+        )
+        val rawTorrent = StreamSource(
+            id = "torrent-row",
+            addon = "Torrent Add-on",
+            title = "Torrent stream",
+            isTorrent = true,
+            infoHash = "a".repeat(40),
+        )
+
+        val displayed = SourceListModel.directLinkDisplayGroups(
+            listOf(
+                StreamGroup("HTTP Add-on", listOf(http)),
+                StreamGroup("Torrent Add-on", listOf(rawTorrent)),
+            ),
+            enabled = true,
+        )
+
+        assertEquals(listOf("HTTP Add-on"), displayed.map { it.addon })
+        assertEquals("http://stream.example/live.m3u8", displayed.single().streams.single().url)
+    }
+
     private fun direct(id: String, addon: String) = StreamSource(
         id = id,
         addon = addon,

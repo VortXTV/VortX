@@ -15,8 +15,28 @@ internal class SourceRequestFence(initialProfileId: String) {
     private var generation = 0L
     private var profileId = initialProfileId
     private var current: Token? = null
+    private var refresh: Token? = null
 
     fun begin(profileId: String, targetId: String?): Token = synchronized(lock) {
+        refresh = null
+        next(profileId, targetId)
+    }
+
+    /**
+     * Claims the one in-flight force-refresh slot. Repeated taps must not repeatedly unload the shared
+     * engine model: the current refresh already asks every add-on again and owns its eventual publication.
+     */
+    fun beginRefresh(profileId: String, targetId: String?): Token? = synchronized(lock) {
+        if (refresh != null) return null
+        next(profileId, targetId).also { refresh = it }
+    }
+
+    /** Releases a completed refresh only if it still owns the slot. */
+    fun finishRefresh(token: Token) = synchronized(lock) {
+        if (refresh === token) refresh = null
+    }
+
+    private fun next(profileId: String, targetId: String?): Token {
         generation += 1L
         this.profileId = profileId
         Token(generation, profileId, targetId).also { current = it }
@@ -26,6 +46,7 @@ internal class SourceRequestFence(initialProfileId: String) {
         generation += 1L
         this.profileId = profileId
         current = null
+        refresh = null
         generation
     }
 
