@@ -86,9 +86,8 @@ class CommunityJsRuntime(
 
     private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String = suspendCancellableCoroutine { continuation ->
         val token = UUID.randomUUID().toString()
-        var broker: ICommunityJsBroker? = null
         val bound = AtomicBoolean(false)
-        val executionAdmission = CommunityJsBrokerExecutionAdmission()
+        val executionAdmission = CommunityJsBrokerExecutionAdmission<ICommunityJsBroker>()
         lateinit var connection: ServiceConnection
         fun cleanup() {
             if (bound.compareAndSet(true, false)) runCatching { appContext.unbindService(connection) }
@@ -109,19 +108,19 @@ class CommunityJsRuntime(
         connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, service: IBinder) {
                 val connectedBroker = ICommunityJsBroker.Stub.asInterface(service)
-                val admitted = executionAdmission.executeIfActive(
+                val lease = executionAdmission.reserveIfActive(
+                    broker = connectedBroker,
                     isActive = { continuation.isActive },
-                ) {
-                    broker = connectedBroker
-                    runCatching {
-                        connectedBroker.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
-                            JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
-                            timeoutMs, MAX_MEMORY_BYTES, callback)
-                    }.onFailure { if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) } }
-                }
-                if (!admitted) {
+                )
+                if (lease == null || !executionAdmission.claimForCall(lease)) {
                     cleanup()
+                    return
                 }
+                runCatching {
+                    connectedBroker.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
+                        JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
+                        timeoutMs, MAX_MEMORY_BYTES, callback)
+                }.onFailure { if (continuation.isActive) { cleanup(); continuation.resume(FAILURE_ENVELOPE) } }
             }
 
             override fun onServiceDisconnected(name: ComponentName) {
@@ -135,9 +134,9 @@ class CommunityJsRuntime(
         bound.set(appContext.bindService(Intent(appContext, CommunityJsBrokerService::class.java), connection, Context.BIND_AUTO_CREATE))
         if (!bound.get() && continuation.isActive) continuation.resume(FAILURE_ENVELOPE)
         continuation.invokeOnCancellation {
-            executionAdmission.cancel()
+            val brokerToCancel = executionAdmission.cancel()
             host.cancel()
-            runCatching { broker?.cancel(token) }
+            runCatching { brokerToCancel?.cancel(token) }
             cleanup()
         }
     }
@@ -257,20 +256,38 @@ class CommunityJsRuntime(
     }
 }
 
-/** Serializes broker execution admission against coroutine cancellation. */
-internal class CommunityJsBrokerExecutionAdmission {
-    private val lock = Any()
-    private var terminal = false
-    private var executionStarted = false
+/** Orders broker execution admission against cancellation without holding a lock across Binder IPC. */
+internal class CommunityJsBrokerExecutionAdmission<T : Any> {
+    internal class Lease<T : Any> internal constructor(
+        internal val generation: Long,
+        internal val broker: T,
+    )
 
-    fun executeIfActive(isActive: () -> Boolean, execute: () -> Unit): Boolean = synchronized(lock) {
-        if (terminal || executionStarted || !isActive()) return@synchronized false
-        executionStarted = true
-        execute()
+    private enum class State { OPEN, LEASED, IN_FLIGHT, TERMINAL }
+
+    private val lock = Any()
+    private var state = State.OPEN
+    private var generation = 0L
+    private var broker: T? = null
+
+    fun reserveIfActive(broker: T, isActive: () -> Boolean): Lease<T>? = synchronized(lock) {
+        if (state != State.OPEN || !isActive()) return@synchronized null
+        generation += 1
+        this.broker = broker
+        state = State.LEASED
+        Lease(generation, broker)
+    }
+
+    fun claimForCall(lease: Lease<T>): Boolean = synchronized(lock) {
+        if (state != State.LEASED || lease.generation != generation || broker !== lease.broker) {
+            return@synchronized false
+        }
+        state = State.IN_FLIGHT
         true
     }
 
-    fun cancel() = synchronized(lock) {
-        terminal = true
+    fun cancel(): T? = synchronized(lock) {
+        state = State.TERMINAL
+        broker
     }
 }

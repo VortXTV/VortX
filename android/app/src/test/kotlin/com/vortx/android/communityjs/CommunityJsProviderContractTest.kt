@@ -6,6 +6,7 @@ import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlinx.coroutines.Job
@@ -80,50 +81,81 @@ class CommunityJsProviderContractTest {
 
     @Test
     fun `cancellation closes broker execution admission before late binding`() {
-        val admission = CommunityJsBrokerExecutionAdmission()
+        val admission = CommunityJsBrokerExecutionAdmission<String>()
         admission.cancel()
-        var executed = false
 
-        val admitted = admission.executeIfActive(isActive = { true }) {
-            executed = true
-        }
-
-        assertFalse(admitted)
-        assertFalse(executed)
+        assertNull(admission.reserveIfActive(broker = "late-broker", isActive = { true }))
     }
 
     @Test
-    fun `cancellation cannot overtake an admitted broker invocation`() {
-        val admission = CommunityJsBrokerExecutionAdmission()
+    fun `cancellation between reservation and call denies the late execute`() {
+        val admission = CommunityJsBrokerExecutionAdmission<String>()
+        val lease = requireNotNull(admission.reserveIfActive(broker = "broker", isActive = { true }))
+
+        assertEquals("broker", admission.cancel())
+        assertFalse(admission.claimForCall(lease))
+    }
+
+    @Test
+    fun `cancellation returns promptly while admitted binder call is blocked`() {
+        class BlockingBroker {
+            val executeEntered = CountDownLatch(1)
+            val releaseExecute = CountDownLatch(1)
+            val cancelCalled = CountDownLatch(1)
+
+            fun execute() {
+                executeEntered.countDown()
+                assertTrue(releaseExecute.await(5, TimeUnit.SECONDS))
+            }
+
+            fun cancel() {
+                cancelCalled.countDown()
+            }
+        }
+
+        val admission = CommunityJsBrokerExecutionAdmission<BlockingBroker>()
+        val broker = BlockingBroker()
+        val lease = requireNotNull(admission.reserveIfActive(broker, isActive = { true }))
+        assertTrue(admission.claimForCall(lease))
         val executeEntered = CountDownLatch(1)
-        val releaseExecute = CountDownLatch(1)
-        val cancelAttempted = CountDownLatch(1)
         val cancelCompleted = CountDownLatch(1)
         val pool = Executors.newFixedThreadPool(2)
         try {
-            val execution = pool.submit<Boolean> {
-                admission.executeIfActive(isActive = { true }) {
-                    executeEntered.countDown()
-                    assertTrue(releaseExecute.await(5, TimeUnit.SECONDS))
-                }
+            val execution = pool.submit {
+                executeEntered.countDown()
+                broker.execute()
             }
             assertTrue(executeEntered.await(5, TimeUnit.SECONDS))
+            assertTrue(broker.executeEntered.await(5, TimeUnit.SECONDS))
 
             val cancellation = pool.submit {
-                cancelAttempted.countDown()
-                admission.cancel()
+                admission.cancel()?.cancel()
                 cancelCompleted.countDown()
             }
-            assertTrue(cancelAttempted.await(5, TimeUnit.SECONDS))
-            assertFalse(cancelCompleted.await(100, TimeUnit.MILLISECONDS))
+            assertTrue(cancelCompleted.await(1, TimeUnit.SECONDS))
+            assertTrue(broker.cancelCalled.await(1, TimeUnit.SECONDS))
+            assertEquals(1L, broker.releaseExecute.count)
 
-            releaseExecute.countDown()
-            assertTrue(execution.get(5, TimeUnit.SECONDS))
+            broker.releaseExecute.countDown()
+            execution.get(5, TimeUnit.SECONDS)
             cancellation.get(5, TimeUnit.SECONDS)
-            assertTrue(cancelCompleted.await(5, TimeUnit.SECONDS))
         } finally {
-            releaseExecute.countDown()
+            broker.releaseExecute.countDown()
             pool.shutdownNow()
         }
+    }
+
+    @Test
+    fun `broker service tombstone rejects cancel before execute ordering`() {
+        val registry = CommunityJsCancellationRegistry()
+
+        registry.cancel("late-token")
+
+        assertNull(registry.begin("late-token"))
+
+        val running = requireNotNull(registry.begin("running-token"))
+        registry.cancel("running-token")
+        assertTrue(running.get())
+        registry.finish("running-token", running)
     }
 }

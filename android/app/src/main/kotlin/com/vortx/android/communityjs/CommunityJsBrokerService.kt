@@ -3,14 +3,13 @@ package com.vortx.android.communityjs
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Isolated interpreter process. It has no credentials, encrypted store, or direct network client. */
 class CommunityJsBrokerService : Service() {
     private val executor = Executors.newSingleThreadExecutor { Thread(it, "community-js-broker").apply { isDaemon = true } }
-    private val cancelled = ConcurrentHashMap<String, AtomicBoolean>()
+    private val cancellations = CommunityJsCancellationRegistry()
 
     private val binder = object : ICommunityJsBroker.Stub() {
         override fun execute(
@@ -26,8 +25,7 @@ class CommunityJsBrokerService : Service() {
             callback: ICommunityJsBrokerCallback,
         ) {
             if (token.length > 128 || code.toByteArray().size > MAX_SOURCE_BYTES || settingsJson.toByteArray().size > MAX_SETTINGS_BYTES) return
-            val cancelledFlag = AtomicBoolean(false)
-            cancelled[token] = cancelledFlag
+            val cancelledFlag = cancellations.begin(token) ?: return
             executor.execute {
                 val host = object : CommunityJsRuntime.NativeFetch {
                     override fun fetch(url: String, optionsJson: String, remainingTimeoutMs: Long): String =
@@ -39,23 +37,49 @@ class CommunityJsBrokerService : Service() {
                 val envelope = runCatching {
                     CommunityJsNative.evaluate(host, code, tmdbId, mediaType, settingsJson, season, episode, timeoutMs, memoryLimitBytes)
                 }.getOrDefault(FAILURE_ENVELOPE)
-                cancelled.remove(token)
+                cancellations.finish(token, cancelledFlag)
                 runCatching { callback.complete(token, envelope) }
             }
         }
 
         override fun cancel(token: String) {
-            cancelled[token]?.set(true)
+            cancellations.cancel(token)
         }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
-    override fun onDestroy() { cancelled.values.forEach { it.set(true) }; executor.shutdownNow(); super.onDestroy() }
+    override fun onDestroy() { cancellations.cancelAll(); executor.shutdownNow(); super.onDestroy() }
 
     private companion object {
         const val MAX_SOURCE_BYTES = 1_000_000
         const val MAX_SETTINGS_BYTES = 64 * 1024
         const val EMPTY_RESPONSE = "{\"status\":0,\"statusText\":\"Unavailable\",\"body\":\"\",\"headers\":{}}"
         const val FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
+    }
+}
+
+/** Keeps cancellation tombstones so cancel-before-execute Binder ordering cannot resurrect a token. */
+internal class CommunityJsCancellationRegistry {
+    private val flags = java.util.concurrent.ConcurrentHashMap<String, AtomicBoolean>()
+
+    fun begin(token: String): AtomicBoolean? {
+        val flag = flags.computeIfAbsent(token) { AtomicBoolean(false) }
+        if (!flag.get()) return flag
+        flags.remove(token, flag)
+        return null
+    }
+
+    fun cancel(token: String) {
+        flags.compute(token) { _, existing ->
+            (existing ?: AtomicBoolean()).apply { set(true) }
+        }
+    }
+
+    fun finish(token: String, flag: AtomicBoolean) {
+        flags.remove(token, flag)
+    }
+
+    fun cancelAll() {
+        flags.values.forEach { it.set(true) }
     }
 }
