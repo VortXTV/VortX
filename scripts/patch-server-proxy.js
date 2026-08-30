@@ -62,7 +62,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
         var compact = lower.replace(/:/g, "");
         // Only globally routed unicast is accepted. This deliberately excludes the well-known and
         // local-use NAT64 prefixes, which could otherwise synthesize a private IPv4 destination.
-        return /^[23]/.test(lower) && !lower.includes(".") && !lower.includes("ffff")
+        return /^[23]/.test(lower) && !lower.includes(".")
             && !/^2001:0*db8:/.test(lower) && !/^fe[c-f]/.test(lower) && !/^0+$/.test(compact) && !/^0*1$/.test(compact);
     }
     function abortError() { var error = new Error("Destination resolution timed out"); error.name = "AbortError"; return error; }

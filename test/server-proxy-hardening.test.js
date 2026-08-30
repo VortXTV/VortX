@@ -59,7 +59,7 @@ try {
     assert.notStrictEqual(ambiguousResult.status, 0, "a duplicate end anchor must fail closed");
     assert(ambiguousResult.stderr.includes("unique proxy module anchors not found"), "duplicate end reports the explicit anchor-integrity error");
     fs.unlinkSync(ambiguous);
-    executeRedirectedPlaylistFixture(output).then(({ rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, methodResult, oversizedResult }) => {
+    executeRedirectedPlaylistFixture(output).then(({ rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, publicIPv6DNSResult, publicIPv6LiteralResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, methodResult, oversizedResult }) => {
         const childURL = new URL(rewritten.trim(), "http://127.0.0.1");
         const encoded = childURL.pathname.slice("/proxy/".length).split("/")[0];
         const childOpts = querystring.parse(encoded);
@@ -74,7 +74,7 @@ try {
         const redirected = calls.find(call => new URL(call.target).hostname === "b.example" && new URL(call.target).pathname === "/list.m3u8");
         assert(!redirected.headers.has("proxy-authorization") && !redirected.headers.has("x-api-key"),
             "Proxy-Authorization and custom auth-like headers are stripped across origin");
-        assert(calls.every(call => call.pinnedAddress === "8.8.8.8"), "each executed fetch uses only its vetted pinned address");
+        assert(calls.every(call => call.pinnedAddress === "8.8.8.8" || call.pinnedAddress === "2606:4700:ffff::1" || call.pinnedAddress === "2606:4700::ffff"), "each executed fetch uses only its vetted pinned address");
         assert.strictEqual(privateResult.status, 502, "private literal destinations fail before fetch");
         assert.strictEqual(privateIPv6Result.status, 502, "private IPv6 literals fail before fetch");
         assert.strictEqual(nat64WellKnownResult.status, 502, "well-known NAT64 literals cannot synthesize loopback destinations");
@@ -82,6 +82,8 @@ try {
         assert.strictEqual(hostileDNSResult.status, 502, "private DNS answers fail before fetch");
         assert.strictEqual(nat64DNSResult.status, 502, "NAT64 DNS answers fail before fetch");
         assert.strictEqual(nat64LocalDNSResult.status, 502, "local-use NAT64 DNS answers fail before fetch");
+        assert.strictEqual(publicIPv6DNSResult.status, 200, "globally routed IPv6 remains valid when ffff is an interior hextet");
+        assert.strictEqual(publicIPv6LiteralResult.status, 200, "globally routed IPv6 remains valid when ffff is the final hextet");
         assert.strictEqual(mixedDNSResult.status, 502, "mixed public/private DNS snapshots fail closed against rebinding");
         assert.strictEqual(redirectDNSResult.status, 502, "a redirect hop resolving private fails before its fetch");
         assert(neverDNSResult.status === 504 && neverDNSResult.elapsed < 250 && neverDNSResult.abortListeners === 0,
@@ -91,7 +93,7 @@ try {
         assert.strictEqual(methodResult.status, 405, "non-GET/HEAD methods are rejected");
         assert(oversizedResult.closed && oversizedResult.status === 200, "unterminated over-limit playlist is terminated after headers");
         assert(redirectBodies.length === 2 && redirectBodies.every(body => body.destroyed), "redirect response bodies are destroyed before the next hop");
-        console.log("Embedded server proxy hardening: PASS (47 checks)");
+        console.log("Embedded server proxy hardening: PASS (49 checks)");
     }).catch(error => { process.nextTick(() => { throw error; }); });
 } finally {
     // The behavior promise has already loaded the generated module source into memory.
@@ -120,6 +122,9 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
         if (parsed.hostname === "big.example") {
             return { status: 200, headers: new HeadersImpl({ "content-type": "application/vnd.apple.mpegurl" }), body: stream.Readable.from(["x".repeat(70_000)]) };
         }
+        if (parsed.hostname === "public-v6.example" || parsed.hostname === "[2606:4700::ffff]") {
+            return { status: 200, headers: new HeadersImpl({ "content-type": "video/mp2t" }), body: stream.Readable.from(["OK"]) };
+        }
         assert.strictEqual(parsed.hostname, "b.example");
         if (parsed.pathname === "/list.m3u8") {
             return { status: 200, headers: new HeadersImpl({ "content-type": "application/vnd.apple.mpegurl" }), body: stream.Readable.from(["segment.ts\n"]) };
@@ -135,6 +140,7 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
         "private.example": [ { address: "127.0.0.1", family: 4 } ],
         "nat64.example": [ { address: "64:ff9b::7f00:1", family: 6 } ],
         "nat64-local.example": [ { address: "64:ff9b:1::a00:1", family: 6 } ],
+        "public-v6.example": [ { address: "2606:4700:ffff::1", family: 6 } ],
         "mixed.example": [ { address: "8.8.8.8", family: 4 }, { address: "127.0.0.1", family: 4 } ]
     };
     let lateDNSCallbackCount = 0;
@@ -186,6 +192,8 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
     assert.strictEqual(calls.length, beforeHostile, "unsafe destinations never reach fetch");
     const redirectDNSResult = await request(querystring.stringify({ d: "https://redirect-private.example" }), "start");
     assert.strictEqual(calls.length, beforeHostile + 1, "private redirect target is rejected before its own fetch");
+    const publicIPv6DNSResult = await request(querystring.stringify({ d: "https://public-v6.example" }), "video.ts");
+    const publicIPv6LiteralResult = await request(querystring.stringify({ d: "http://[2606:4700::ffff]" }), "video.ts");
     const beforeResolverTimeouts = calls.length;
     const neverDNSResult = await request(querystring.stringify({ d: "https://never.example" }), "secret");
     const lateDNSResult = await request(querystring.stringify({ d: "https://late.example" }), "secret");
@@ -193,5 +201,5 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
     assert.strictEqual(calls.length, beforeResolverTimeouts, "timed-out and late DNS resolutions never create an agent or fetch");
     const methodResult = await request(querystring.stringify({ d: "https://b.example" }), "segment.ts", "POST");
     const oversizedResult = await request(querystring.stringify({ d: "https://big.example" }), "list.m3u8");
-    return { rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, methodResult, oversizedResult };
+    return { rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, publicIPv6DNSResult, publicIPv6LiteralResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, methodResult, oversizedResult };
 }
