@@ -1,6 +1,9 @@
 package com.vortx.android.player
 
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -138,26 +141,74 @@ class PlaybackIntentControllerTest {
         assertTrue(engine.actions.lastIndexOf("background") > engine.actions.indexOf("load"))
     }
 
-    @Test fun `audio focus blocks before request and denial or abandon never clears it`() {
+    @Test fun `audio focus authority blocks initial engine before request completes`() {
         val subject = PlaybackIntentController()
-        subject.onAudioFocusEvent(AudioFocusIntentEvent.REQUESTED)
-        assertFalse(subject.snapshot().shouldPlay)
-        subject.onAudioFocusEvent(AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST)
-        subject.onAudioFocusEvent(AudioFocusIntentEvent.ABANDONED)
+        val focus = AudioFocusIntentAuthority(subject)
+        val generation = focus.beginRequest()
+        val engine = RecordingEngine()
+        subject.bind(engine)
+        assertEquals("pause", engine.actions.last())
+        focus.onDeniedDelayedOrLost(generation)
+        focus.abandon(generation)
         assertFalse(subject.snapshot().shouldPlay)
     }
 
-    @Test fun `only focus grant or gain clears blocker and replacement inherits it`() {
+    @Test fun `replacement gap retains focus blocker until current generation gains`() {
         val subject = PlaybackIntentController()
-        subject.onAudioFocusEvent(AudioFocusIntentEvent.REQUESTED)
+        val focus = AudioFocusIntentAuthority(subject)
+        val generation = focus.beginRequest()
         subject.bind(RecordingEngine())
         val replacement = RecordingEngine()
         subject.bind(replacement)
         assertEquals("pause", replacement.actions.last())
-        subject.onAudioFocusEvent(AudioFocusIntentEvent.GRANTED_OR_GAINED)
+        focus.onGrantedOrGained(generation)
         assertEquals("play", replacement.actions.last())
-        subject.onAudioFocusEvent(AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST)
+        focus.onDeniedDelayedOrLost(generation)
         assertEquals("pause", replacement.actions.last())
+    }
+
+    @Test fun `stale focus callbacks cannot mutate successor generation`() {
+        val subject = PlaybackIntentController()
+        val focus = AudioFocusIntentAuthority(subject)
+        val stale = focus.beginRequest()
+        val current = focus.beginRequest()
+        focus.onGrantedOrGained(stale)
+        assertFalse(subject.snapshot().shouldPlay)
+        focus.onDeniedDelayedOrLost(stale)
+        focus.abandon(stale)
+        assertFalse(subject.snapshot().shouldPlay)
+        focus.onGrantedOrGained(current)
+        assertTrue(subject.snapshot().shouldPlay)
+    }
+
+    @Test fun `stop at explicit publication suspension is reconciled before exposure`() = runBlocking {
+        val engine = RecordingEngine()
+        val subject = PlaybackIntentController()
+        val atBoundary = CompletableDeferred<Unit>()
+        val releaseBoundary = CompletableDeferred<Unit>()
+        var started = true
+        var published = false
+        val job = launch {
+            reconcileAndPublishEngine(
+                engine = engine,
+                lifecycleStarted = { started },
+                pausePlaybackInBackground = { true },
+                playbackIntent = subject,
+                beforePublication = {
+                    atBoundary.complete(Unit)
+                    releaseBoundary.await()
+                },
+                publish = { published = true },
+            )
+        }
+        atBoundary.await()
+        started = false
+        releaseBoundary.complete(Unit)
+        job.join()
+        assertTrue(published)
+        assertFalse(subject.snapshot().shouldPlay)
+        assertEquals("pause", engine.actions.last())
+        assertTrue("resource hook precedes publication", "background" in engine.actions)
     }
 
     private class RecordingEngine : PlayerEngine {

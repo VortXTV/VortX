@@ -248,6 +248,41 @@ fun PlayerScreen(
             ),
         )
     }
+    // Focus ownership exists before any engine construction, load, or bind. It is source-session scoped,
+    // so an mpv -> Media3 replacement inherits the same blocker and never opens an unowned playback gap.
+    val audioFocusAuthority = remember(playbackSessionKey, playbackIntent) {
+        AudioFocusIntentAuthority(playbackIntent)
+    }
+    val audioFocusGeneration = remember(audioFocusAuthority) {
+        audioFocusAuthority.beginRequest()
+    }
+    DisposableEffect(audioFocusAuthority, audioFocusGeneration, audioManager) {
+        val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+            if (change == AudioManager.AUDIOFOCUS_GAIN) {
+                audioFocusAuthority.onGrantedOrGained(audioFocusGeneration)
+            } else {
+                audioFocusAuthority.onDeniedDelayedOrLost(audioFocusGeneration)
+            }
+        }
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build(),
+            )
+            .setOnAudioFocusChangeListener(focusListener)
+            .build()
+        if (audioManager == null) {
+            audioFocusAuthority.onGrantedOrGained(audioFocusGeneration)
+        } else if (audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            audioFocusAuthority.onGrantedOrGained(audioFocusGeneration)
+        }
+        onDispose {
+            audioManager?.abandonAudioFocusRequest(request)
+            audioFocusAuthority.abandon(audioFocusGeneration)
+        }
+    }
     val subtitleContentKey = remember(playbackSessionKey) {
         subtitleOffsetContentKey(currentPlayable.mediaRef)
     }
@@ -451,7 +486,20 @@ fun PlayerScreen(
             engineHolder.getAndSet(null)?.release()
             return@LaunchedEffect
         }
-        builtEngine = engine
+        // withContext above may have returned after ON_STOP. This is the final main-thread publication
+        // gate: re-sample lifecycle now, apply resources + transport intent, then expose the engine.
+        reconcileAndPublishEngine(
+            engine = engine,
+            lifecycleStarted = {
+                lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+            },
+            pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
+            playbackIntent = playbackIntent,
+            refreshAudioRoute = {
+                if (engine.audioOutputModeAvailable) engine.setAudioOutputMode(audioOutputMode)
+            },
+            publish = { builtEngine = it },
+        )
     }
     DisposableEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         onDispose { engineHolder.getAndSet(null)?.release() }
@@ -851,33 +899,21 @@ fun PlayerScreen(
         if (runtimeMismatch) playbackIntent.setSourceTerminal(true)
     }
 
-    // Engine fallback wins atomically over the old engine's terminal error. A terminal is held briefly;
-    // a fallback arriving in that interval cancels the pending source verdict and preserves the position.
-    val failurePrecedence = remember(engine) { EngineFailurePrecedence() }
-    var committedEngineError by remember(engine) { mutableStateOf(false) }
+    // mpv publishes a terminal only after its synchronized demotion opportunities resolve. Therefore the
+    // UI consumes a definitive engine verdict with no timer and never starts the source ladder for an
+    // old engine that requested same-source Media3 fallback.
     LaunchedEffect(
         engine,
-        playerState.hasError,
         playerState.engineFallbackReason,
-        stallError,
-        runtimeMismatch,
     ) {
-        if (failurePrecedence.observe(playerState) == EngineFailureAction.DEMOTE) {
-            committedEngineError = false
+        if (shouldDemoteEngine(playerState.engineFallbackReason, alreadyDemoted = forceExoPlayer)) {
             playbackIntent.setSourceTerminal(false)
             engineSwitchResumeMs[0] = playerState.positionMs.coerceAtLeast(0L)
             forceExoPlayer = true
-            return@LaunchedEffect
-        }
-        if (playerState.hasError) {
-            delay(ENGINE_FALLBACK_PRECEDENCE_MS)
-            committedEngineError = failurePrecedence.commitTerminal()
-        } else {
-            committedEngineError = false
         }
     }
     // The one committed error verdict everything downstream renders and gates on.
-    val effectiveError = committedEngineError || stallError || runtimeMismatch
+    val effectiveError = playerState.hasError || stallError || runtimeMismatch
     LaunchedEffect(playerState.hasEnded, effectiveError) {
         playbackIntent.setSourceTerminal(playerState.hasEnded || effectiveError)
     }
@@ -1307,42 +1343,6 @@ fun PlayerScreen(
                 // Stop records the watch server-side (Trakt at >= 80%, plus a SIMKL history write).
                 ScrobbleService.stop(ref, progress)
             }
-        }
-    }
-
-    // AudioFocus: pause when another app takes audio (a call, another player) so VortX never talks over
-    // it, and resume on gain. Standard AudioManager focus request (minSdk 26 carries AudioFocusRequest).
-    // The pause/resume DECISION is [AudioFocusPolicy] (pure, unit-tested): it pauses on every loss
-    // class (transient included; ducking film dialog is worse than pausing it) but only ever
-    // auto-RESUMES playback the policy itself paused, so a GAIN can no longer un-pause a film the
-    // viewer had paused deliberately before the interruption.
-    DisposableEffect(engine) {
-        // Own focus before asking. A denied or delayed request must not let the replacement engine play.
-        playbackIntent.onAudioFocusEvent(AudioFocusIntentEvent.REQUESTED)
-        val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
-            playbackIntent.onAudioFocusEvent(
-                if (change == AudioManager.AUDIOFOCUS_GAIN) {
-                    AudioFocusIntentEvent.GRANTED_OR_GAINED
-                } else {
-                    AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST
-                },
-            )
-        }
-        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                    .build(),
-            )
-            .setOnAudioFocusChangeListener(focusListener)
-            .build()
-        if (audioManager?.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-            playbackIntent.onAudioFocusEvent(AudioFocusIntentEvent.GRANTED_OR_GAINED)
-        }
-        onDispose {
-            audioManager?.abandonAudioFocusRequest(request)
-            playbackIntent.onAudioFocusEvent(AudioFocusIntentEvent.ABANDONED)
         }
     }
 
@@ -2082,9 +2082,6 @@ private const val WATCHDOG_START_TIMEOUT_MS = 30_000L
 /// stalled. Tighter than the start bound: mid-stream the pipeline is proven, so a long freeze is a
 /// dead connection, and the verdict self-clears if the stream recovers.
 private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
-
-/// Small arbitration window in which a same-engine fallback outranks its trailing terminal callback.
-private const val ENGINE_FALLBACK_PRECEDENCE_MS = 250L
 
 /// Whether the FILE's demuxed duration is implausibly short for the title being played, i.e. the
 /// source resolved to the WRONG file (a removed episode's ~10s debrid junk/sample). With a known

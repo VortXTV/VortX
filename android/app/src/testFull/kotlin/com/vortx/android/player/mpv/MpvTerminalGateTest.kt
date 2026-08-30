@@ -20,7 +20,7 @@ class MpvTerminalGateTest {
 
     private fun gate(): Pair<MpvTerminalGate, MutableList<Published>> {
         val publications = mutableListOf<Published>()
-        val gate = MpvTerminalGate { hasEnded, hasError, isBuffering ->
+        val gate = MpvTerminalGate { hasEnded, hasError, isBuffering, _ ->
             publications += Published().apply {
                 this.hasEnded = hasEnded
                 this.hasError = hasError

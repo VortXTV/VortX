@@ -259,38 +259,83 @@ enum class EngineFallbackReason {
 }
 
 internal fun PlayerState.requestEngineFallback(reason: EngineFallbackReason): PlayerState =
-    copy(engineFallbackReason = reason)
+    copy(
+        hasEnded = false,
+        hasError = false,
+        isBuffering = false,
+        engineFallbackReason = reason,
+    )
 
 internal fun shouldDemoteEngine(reason: EngineFallbackReason?, alreadyDemoted: Boolean): Boolean =
     reason != null && !alreadyDemoted
 
-internal enum class EngineFailureAction { NONE, DEMOTE }
+internal sealed interface EngineFailureResolution<out T> {
+    data object None : EngineFailureResolution<Nothing>
+    data class CommitTerminal<T>(val terminal: T) : EngineFailureResolution<T>
+    data class Demote(val reason: EngineFallbackReason) : EngineFailureResolution<Nothing>
+}
 
-/** Gives same-source engine fallback atomic precedence over an old engine's terminal error. */
-internal class EngineFailurePrecedence {
+/**
+ * Engine-owned arbitration for terminal callbacks that overlap a concrete demotion opportunity.
+ * There is no elapsed-time assumption: terminal publication waits until every active opportunity has
+ * completed, and a fallback completion permanently suppresses the old engine's pending terminal.
+ */
+internal class EngineFailureCoordinator<T> {
+    private var nextOpportunity = 0L
+    private val activeOpportunities = mutableSetOf<Long>()
+    private var pendingTerminal: T? = null
+    private var terminalCommitted = false
     private var fallbackConsumed = false
-    private var terminalPending = false
 
     @Synchronized
-    fun observe(state: PlayerState): EngineFailureAction {
-        if (state.engineFallbackReason != null) {
-            terminalPending = false
-            if (!fallbackConsumed) {
-                fallbackConsumed = true
-                return EngineFailureAction.DEMOTE
-            }
-            return EngineFailureAction.NONE
-        }
-        if (!fallbackConsumed && state.hasError) terminalPending = true
-        return EngineFailureAction.NONE
+    fun reset() {
+        activeOpportunities.clear()
+        pendingTerminal = null
+        terminalCommitted = false
+        fallbackConsumed = false
     }
 
     @Synchronized
-    fun commitTerminal(): Boolean {
-        if (fallbackConsumed) return false
-        val commit = terminalPending
-        terminalPending = false
-        return commit
+    fun beginOpportunity(): Long {
+        nextOpportunity += 1L
+        activeOpportunities += nextOpportunity
+        return nextOpportunity
+    }
+
+    @Synchronized
+    fun hasPendingTerminal(): Boolean = pendingTerminal != null
+
+    @Synchronized
+    fun onTerminal(terminal: T): EngineFailureResolution<T> {
+        if (fallbackConsumed || terminalCommitted) return EngineFailureResolution.None
+        if (activeOpportunities.isNotEmpty()) {
+            pendingTerminal = terminal
+            return EngineFailureResolution.None
+        }
+        terminalCommitted = true
+        return EngineFailureResolution.CommitTerminal(terminal)
+    }
+
+    @Synchronized
+    fun completeOpportunity(
+        opportunity: Long,
+        fallbackReason: EngineFallbackReason? = null,
+    ): EngineFailureResolution<T> {
+        if (!activeOpportunities.remove(opportunity)) return EngineFailureResolution.None
+        if (fallbackReason != null) {
+            pendingTerminal = null
+            activeOpportunities.clear()
+            if (fallbackConsumed || terminalCommitted) return EngineFailureResolution.None
+            fallbackConsumed = true
+            return EngineFailureResolution.Demote(fallbackReason)
+        }
+        if (fallbackConsumed || terminalCommitted || activeOpportunities.isNotEmpty()) {
+            return EngineFailureResolution.None
+        }
+        val terminal = pendingTerminal ?: return EngineFailureResolution.None
+        pendingTerminal = null
+        terminalCommitted = true
+        return EngineFailureResolution.CommitTerminal(terminal)
     }
 }
 

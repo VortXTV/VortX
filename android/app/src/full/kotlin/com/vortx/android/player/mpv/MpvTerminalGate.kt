@@ -16,7 +16,12 @@ package com.vortx.android.player.mpv
 ///     old file's END_FILE is queued before the new file's START_FILE on the SAME client queue, and
 ///     this window is exactly that span observed from our side of the seam.
 internal class MpvTerminalGate(
-    private val publish: (hasEnded: Boolean, hasError: Boolean, isBuffering: Boolean) -> Unit,
+    private val publish: (
+        hasEnded: Boolean,
+        hasError: Boolean,
+        isBuffering: Boolean,
+        terminal: Boolean,
+    ) -> Unit,
 ) {
     private val lock = Any()
 
@@ -29,7 +34,7 @@ internal class MpvTerminalGate(
     fun beginFirstLoad() {
         synchronized(lock) {
             state = MpvTerminalState.initialSource()
-            publish(false, false, true)
+            publish(false, false, true, false)
         }
     }
 
@@ -39,7 +44,7 @@ internal class MpvTerminalGate(
     fun beginReplacementLoad() {
         synchronized(lock) {
             state = state.onSourceReplacement()
-            publish(false, false, true)
+            publish(false, false, true, false)
         }
     }
 
@@ -61,7 +66,7 @@ internal class MpvTerminalGate(
             val next = state.onTerminal(event)
             if (next == state) return null
             state = next
-            publish(next.hasEnded, next.hasError, false)
+            publish(next.hasEnded, next.hasError, false, true)
             return next
         }
     }

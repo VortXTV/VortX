@@ -14,6 +14,8 @@ import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
 import com.vortx.android.player.EngineFallbackReason
+import com.vortx.android.player.EngineFailureCoordinator
+import com.vortx.android.player.EngineFailureResolution
 import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.PlayerChapter
@@ -97,9 +99,35 @@ class MpvPlayer private constructor(
     /// reachable only for reason codes a future libmpv might add, and fails safe (error, no advance).
     /// The former eof-reached flag heuristic is GONE: it was a global, non-source-scoped property that
     /// could stale-race across source generations; with real reasons there is nothing left to infer.
-    private val terminalGate = MpvTerminalGate { hasEnded, hasError, isBuffering ->
-        _state.update {
-            it.copy(hasEnded = hasEnded, hasError = hasError, isBuffering = isBuffering)
+    private val failureCoordinator = EngineFailureCoordinator<EngineTerminalVerdict>()
+    private val terminalGate = MpvTerminalGate { hasEnded, hasError, isBuffering, terminal ->
+        val verdict = EngineTerminalVerdict(hasEnded, hasError, isBuffering)
+        if (terminal) {
+            applyFailureResolution(failureCoordinator.onTerminal(verdict))
+        } else {
+            // Source reset runs under the terminal gate's lock, preserving one global lock order:
+            // terminal gate -> failure coordinator. Old async opportunity completions then become no-ops.
+            failureCoordinator.reset()
+            _state.update {
+                it.copy(hasEnded = hasEnded, hasError = hasError, isBuffering = isBuffering)
+            }
+        }
+    }
+
+    private fun applyFailureResolution(resolution: EngineFailureResolution<EngineTerminalVerdict>) {
+        when (resolution) {
+            EngineFailureResolution.None -> Unit
+            is EngineFailureResolution.CommitTerminal -> _state.update {
+                it.copy(
+                    hasEnded = resolution.terminal.hasEnded,
+                    hasError = resolution.terminal.hasError,
+                    isBuffering = resolution.terminal.isBuffering,
+                )
+            }
+            is EngineFailureResolution.Demote -> {
+                _state.update { it.requestEngineFallback(resolution.reason) }
+                Log.e(TAG, "libmpv ${resolution.reason}; requesting Media3 fallback")
+            }
         }
     }
 
@@ -289,21 +317,23 @@ class MpvPlayer private constructor(
     override fun load(playable: Playable) {
         if (released.get()) return
         val loadGeneration = subtitleLoadGeneration.incrementAndGet()
+        // Reset terminal classification and invalidate the previous source's opportunity tokens before
+        // cancelling its jobs. Their finally blocks may run immediately; completion must be a no-op for
+        // this new source generation.
+        if (hasLoadedSource) {
+            terminalGate.beginReplacementLoad()
+        } else {
+            terminalGate.beginFirstLoad()
+        }
         synchronized(audioHealthLock) {
             audioHealthJob?.cancel()
             audioHealthJob = null
             audioRecoveryAttempted = false
             audioFileLoadedGeneration = 0L
         }
-        // Fresh terminal flags for the new file, and isBuffering=true as the connecting state. For a
-        // replacement, the gate arms its suppression window: mpv queues the OLD source's END_FILE
-        // before the NEW source's START_FILE on this client's event queue, so exactly that span is
-        // where a stale old-source terminal must be dropped. START_FILE closes the window.
-        if (hasLoadedSource) {
-            terminalGate.beginReplacementLoad()
-        } else {
-            terminalGate.beginFirstLoad()
-        }
+        // For a replacement the gate above armed its suppression window: mpv queues the OLD source's
+        // END_FILE before the NEW source's START_FILE on this client's event queue, so exactly that span
+        // is where a stale old-source terminal must be dropped. START_FILE closes the window.
         hasLoadedSource = true
         playbackStarted = false
 
@@ -823,61 +853,68 @@ class MpvPlayer private constructor(
             if (released.get() || audioFileLoadedGeneration != generation) return
             if (audioHealthJob?.isActive == true) {
                 if (!replaceExisting) return
-                audioHealthJob?.cancel()
             }
+            // Begin the successor opportunity before cancelling its predecessor. A terminal racing the
+            // handoff therefore remains held continuously until one explicit health verdict wins.
+            val opportunity = failureCoordinator.beginOpportunity()
+            audioHealthJob?.cancel()
             audioHealthJob = runtimePolicyScope.launch {
-                verifyAudioOutput(generation)
+                verifyAudioOutput(generation, opportunity)
             }
         }
     }
 
-    private suspend fun verifyAudioOutput(generation: Long) {
-        delay(AUDIO_OUTPUT_SETTLE_MS)
-        if (!audioOutputCheckActive(generation)) return
-
-        val initialAction = mpvAudioOutputHealthAction(
-            hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
-            currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
-            outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
-            recoveryAttempted = audioRecoveryAttempted,
-        )
-        if (initialAction == MpvAudioOutputHealthAction.NONE) return
-        if (initialAction == MpvAudioOutputHealthAction.FAIL_SOURCE) {
-            failSilentAudioSource()
-            return
-        }
-
-        synchronized(audioHealthLock) {
-            if (!audioOutputCheckActive(generation) || audioRecoveryAttempted) return
-            audioRecoveryAttempted = true
-        }
-        Log.w(TAG, "libmpv opened no audio output; retrying decoded stereo")
-        for ((name, value) in safeMpvAudioRecoveryProperties()) {
+    private suspend fun verifyAudioOutput(generation: Long, opportunity: Long) {
+        var fallbackReason: EngineFallbackReason? = null
+        try {
+            delay(AUDIO_OUTPUT_SETTLE_MS)
             if (!audioOutputCheckActive(generation)) return
-            mpv.setPropertyString(name, value)
-        }
 
-        delay(AUDIO_OUTPUT_RECOVERY_MS)
-        if (!audioOutputCheckActive(generation)) return
-        val recoveredAction = mpvAudioOutputHealthAction(
-            hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
-            currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
-            outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
-            recoveryAttempted = true,
-        )
-        if (recoveredAction == MpvAudioOutputHealthAction.FAIL_SOURCE) failSilentAudioSource()
+            val initialAction = mpvAudioOutputHealthAction(
+                hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
+                currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
+                outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
+                recoveryAttempted = audioRecoveryAttempted,
+            )
+            if (initialAction == MpvAudioOutputHealthAction.NONE) return
+            if (initialAction == MpvAudioOutputHealthAction.FAIL_SOURCE) {
+                fallbackReason = EngineFallbackReason.AUDIO_OUTPUT_FAILED
+                return
+            }
+
+            synchronized(audioHealthLock) {
+                if (!audioOutputCheckActive(generation) || audioRecoveryAttempted) return
+                audioRecoveryAttempted = true
+            }
+            Log.w(TAG, "libmpv opened no audio output; retrying decoded stereo")
+            for ((name, value) in safeMpvAudioRecoveryProperties()) {
+                if (!audioOutputCheckActive(generation)) return
+                mpv.setPropertyString(name, value)
+            }
+
+            delay(AUDIO_OUTPUT_RECOVERY_MS)
+            if (!audioOutputCheckActive(generation)) return
+            val recoveredAction = mpvAudioOutputHealthAction(
+                hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
+                currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
+                outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
+                recoveryAttempted = true,
+            )
+            if (recoveredAction == MpvAudioOutputHealthAction.FAIL_SOURCE) {
+                fallbackReason = EngineFallbackReason.AUDIO_OUTPUT_FAILED
+            }
+        } finally {
+            applyFailureResolution(
+                failureCoordinator.completeOpportunity(opportunity, fallbackReason),
+            )
+        }
     }
 
     private fun audioOutputCheckActive(generation: Long): Boolean {
         val state = _state.value
         return !released.get() && subtitleLoadGeneration.get() == generation &&
             audioFileLoadedGeneration == generation &&
-            !state.hasError && !state.hasEnded
-    }
-
-    private fun failSilentAudioSource() {
-        _state.update { it.requestEngineFallback(EngineFallbackReason.AUDIO_OUTPUT_FAILED) }
-        Log.e(TAG, "libmpv audio output failed after decoded-stereo retry; requesting Media3 fallback")
+            !state.hasError && !state.hasEnded && !failureCoordinator.hasPendingTerminal()
     }
 
     override fun release() {
@@ -885,6 +922,7 @@ class MpvPlayer private constructor(
         // Close the terminal gate before unregistering so an already-dispatched native callback racing
         // teardown cannot publish EOF and trigger watched/auto-advance.
         terminalGate.release()
+        failureCoordinator.reset()
         runtimePolicyScope.cancel()
         mpv.removeObserver(observer)
         // Native destruction owns final cleanup of any still-attached surface. SurfaceHolder may deliver
@@ -942,9 +980,11 @@ class MpvPlayer private constructor(
                     keepScreenOn = true
                     holder.addCallback(object : SurfaceHolder.Callback {
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            attachMpvSurfaceOrFallback { mpv.attachSurface(holder.surface) }?.let { reason ->
-                                _state.update { it.requestEngineFallback(reason) }
-                            }
+                            val opportunity = failureCoordinator.beginOpportunity()
+                            val reason = attachMpvSurfaceOrFallback { mpv.attachSurface(holder.surface) }
+                            applyFailureResolution(
+                                failureCoordinator.completeOpportunity(opportunity, reason),
+                            )
                         }
 
                         override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -1099,6 +1139,12 @@ class MpvPlayer private constructor(
         }
     }
 }
+
+private data class EngineTerminalVerdict(
+    val hasEnded: Boolean,
+    val hasError: Boolean,
+    val isBuffering: Boolean,
+)
 
 /** Fatal-aware surface attach seam: expected runtime failures demote; process-fatal failures propagate. */
 internal fun attachMpvSurfaceOrFallback(attach: () -> Unit): EngineFallbackReason? {

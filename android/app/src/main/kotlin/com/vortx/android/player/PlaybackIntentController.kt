@@ -9,16 +9,39 @@ internal enum class PlaybackBlocker {
     SYSTEM,
 }
 
-internal enum class AudioFocusIntentEvent { REQUESTED, GRANTED_OR_GAINED, DENIED_DELAYED_OR_LOST, ABANDONED }
+/** Session-owned audio-focus authority. Stale callbacks cannot mutate a successor request. */
+internal class AudioFocusIntentAuthority(
+    private val playbackIntent: PlaybackIntentController,
+) {
+    private var generation = 0L
 
-internal fun PlaybackIntentController.onAudioFocusEvent(event: AudioFocusIntentEvent) {
-    when (event) {
-        AudioFocusIntentEvent.REQUESTED,
-        AudioFocusIntentEvent.DENIED_DELAYED_OR_LOST,
-        -> setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)
-        AudioFocusIntentEvent.GRANTED_OR_GAINED -> setBlocked(PlaybackBlocker.AUDIO_FOCUS, false)
-        // Abandoning an old engine's request must not clear ownership for a replacement or delayed grant.
-        AudioFocusIntentEvent.ABANDONED -> Unit
+    @Synchronized
+    fun beginRequest(): Long {
+        generation += 1L
+        playbackIntent.setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)
+        return generation
+    }
+
+    @Synchronized
+    fun onGrantedOrGained(requestGeneration: Long) {
+        if (requestGeneration == generation) {
+            playbackIntent.setBlocked(PlaybackBlocker.AUDIO_FOCUS, false)
+        }
+    }
+
+    @Synchronized
+    fun onDeniedDelayedOrLost(requestGeneration: Long) {
+        if (requestGeneration == generation) {
+            playbackIntent.setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)
+        }
+    }
+
+    @Synchronized
+    fun abandon(requestGeneration: Long) {
+        if (requestGeneration == generation) {
+            playbackIntent.setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)
+            generation += 1L
+        }
     }
 }
 
@@ -123,4 +146,28 @@ internal fun reconcileEngineLifecycle(
         engine.onEnterBackground()
     }
     playbackIntent.bind(engine)
+}
+
+/**
+ * Final publication gate for an asynchronously prepared engine. The caller invokes this on main;
+ * lifecycle is sampled only after [beforePublication] returns, so a STOP during construction wins.
+ */
+internal suspend fun reconcileAndPublishEngine(
+    engine: PlayerEngine,
+    lifecycleStarted: () -> Boolean,
+    pausePlaybackInBackground: () -> Boolean,
+    playbackIntent: PlaybackIntentController,
+    refreshAudioRoute: () -> Unit = {},
+    beforePublication: suspend () -> Unit = {},
+    publish: (PlayerEngine) -> Unit,
+) {
+    beforePublication()
+    reconcileEngineLifecycle(
+        engine = engine,
+        lifecycleStarted = lifecycleStarted(),
+        pausePlaybackInBackground = pausePlaybackInBackground(),
+        playbackIntent = playbackIntent,
+        refreshAudioRoute = refreshAudioRoute,
+    )
+    publish(engine)
 }
