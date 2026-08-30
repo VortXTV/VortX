@@ -1583,7 +1583,7 @@ final class ProfileStore: ObservableObject {
         let previousRemovals = watchRemovals(for: profileID)
         let resolved = OverlayWatchRemovalPolicy.resolve(
             entries: snapshot,
-            removals: previousRemovals + Array(remoteRemovals.prefix(120)),
+            removals: previousRemovals + remoteRemovals,
             identity: Self.watchIdentity
         )
         if resolved.entries != snapshot,
@@ -1607,11 +1607,16 @@ final class ProfileStore: ObservableObject {
     ) {
         guard !entries.isEmpty || !incomingRemovals.isEmpty else { return }
         if let p = profiles.first(where: { $0.id == profileID }), p.usesEngineHistory { return }
+        guard let inbound = OverlayWatchInboundPolicy.select(
+            rows: entries.map { .init(id: $0.key, entry: $0.value) },
+            removals: incomingRemovals,
+            identity: Self.watchIdentity
+        ) else { return }
         // Merge against the same authority the UI is currently mutating. Reading the delayed disk cache for the
         // active profile could replace fresh progress for title A when a remote update for title B landed.
         var current = watchEntriesForSync(for: profileID)
         var changed = false
-        for (metaId, incoming) in entries.prefix(120) {
+        for (metaId, incoming) in inbound.entries {
             guard var existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }
             let union = Array(Set(existing.watchedVideoIds).union(incoming.watchedVideoIds))
             if incoming.lastWatched > existing.lastWatched {
@@ -1625,7 +1630,7 @@ final class ProfileStore: ObservableObject {
         let previousRemovals = watchRemovals(for: profileID)
         let resolved = OverlayWatchRemovalPolicy.resolve(
             entries: current,
-            removals: previousRemovals + Array(incomingRemovals.prefix(120)),
+            removals: previousRemovals + inbound.removals,
             identity: Self.watchIdentity
         )
         if resolved.entries != current || resolved.removals != previousRemovals { changed = true }
@@ -1669,6 +1674,10 @@ final class ProfileStore: ObservableObject {
             freshness: watchFreshness(entry.lastWatched),
             hasValidProgress: entry.timeOffsetMs > 0 && entry.durationMs > 0
         )
+    }
+
+    static func watchIdentityForSync(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
+        watchIdentity(metaId: metaId, entry: entry)
     }
 
     private static func watchFreshness(_ value: String) -> Double? {

@@ -2471,7 +2471,11 @@ final class VortXSyncManager: ObservableObject {
                 guard let uuid = UUID(uuidString: idStr) else { continue }
                 let bucket = vortxByProfile[idStr] as? [String: Any] ?? [:]
                 let lib = bucket["library"] as? [[String: Any]] ?? []
-                var entries: [String: WatchEntry] = [:]
+                let appRemovals = bucket["removed"] as? [[String: Any]] ?? []
+                let webRemovals = webRemovedByProfile[idStr] as? [[String: Any]] ?? []
+                guard lib.count <= OverlayWatchInboundPolicy.parseLimit,
+                      appRemovals.count + webRemovals.count <= OverlayWatchInboundPolicy.parseLimit else { continue }
+                var rows: [OverlayWatchInboundPolicy.Row<WatchEntry>] = []
                 for item in lib {
                     guard let metaId = item["id"] as? String, !metaId.isEmpty else { continue }
                     let tSec = (item["t"] as? Int) ?? Int((item["t"] as? Double) ?? 0)
@@ -2483,17 +2487,20 @@ final class VortXSyncManager: ObservableObject {
                                        type: item["type"] as? String ?? "movie",
                                        poster: (item["poster"] as? String).flatMap { $0.isEmpty ? nil : $0 })
                     e.watchedVideoIds = item["w"] as? [String] ?? []
-                    entries[metaId] = e
+                    rows.append(.init(id: metaId, entry: e))
                 }
-                let appRemovals = bucket["removed"] as? [[String: Any]] ?? []
-                let webRemovals = webRemovedByProfile[idStr] as? [[String: Any]] ?? []
                 let removals: [OverlayWatchRemoval] = (appRemovals + webRemovals).compactMap {
                     guard let keys = $0["keys"] as? [String], !keys.isEmpty else { return nil }
                     let stamp = ($0["removedAt"] as? Double) ?? Double(($0["removedAt"] as? Int) ?? 0)
                     guard stamp.isFinite, stamp > 0 else { return nil }
                     return OverlayWatchRemoval(keys: keys, removedAt: stamp)
                 }
-                ProfileStore.shared.applyRemoteOverlay(profileID: uuid, entries: entries, removals: removals)
+                guard let inbound = OverlayWatchInboundPolicy.select(
+                    rows: rows, removals: removals, identity: { ProfileStore.watchIdentityForSync(metaId: $0, entry: $1) }
+                ) else { continue }
+                ProfileStore.shared.applyRemoteOverlay(
+                    profileID: uuid, entries: inbound.entries, removals: inbound.removals
+                )
             }
             restored = true
         }

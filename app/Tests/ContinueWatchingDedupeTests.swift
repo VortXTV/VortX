@@ -120,6 +120,53 @@ private enum ContinueWatchingDedupeTests {
         expect(newerMerge.entries == newerPeer && newerMerge.removals.isEmpty,
                "strictly newer valid rewatch restores the overlay and clears its tombstone")
 
+        let largeRemoval = OverlayWatchRemoval(keys: removedKeys.sorted(), removedAt: 1_000)
+        let decoys = (0..<130).map { index in
+            OverlayWatchInboundPolicy.Row(
+                id: "tmdb:movie:\(10_000 + index)",
+                entry: OverlayRow(type: "movie", alias: "", freshness: 800 - Double(index), valid: true)
+            )
+        }
+        let oldBridge = OverlayWatchInboundPolicy.Row(
+            id: "tmdb:1396",
+            entry: OverlayRow(type: "series", alias: "tt0903747:5:1", freshness: 1, valid: true)
+        )
+        let newestRewatch = OverlayWatchInboundPolicy.Row(
+            id: "imdb:tt0903747",
+            entry: OverlayRow(type: "series", alias: "tt0903747:5:17", freshness: 1_100, valid: true)
+        )
+        let orderedRows = decoys + [newestRewatch, oldBridge]
+        let forward = OverlayWatchInboundPolicy.select(
+            rows: orderedRows, removals: [largeRemoval], identity: overlayIdentity
+        )
+        let reversed = OverlayWatchInboundPolicy.select(
+            rows: orderedRows.reversed(), removals: [largeRemoval], identity: overlayIdentity
+        )
+        expect(forward?.entries["imdb:tt0903747"] == newestRewatch.entry && forward?.removals.isEmpty == true,
+               "newest rewatch survives a shuffled oversized payload through an old alias bridge")
+        let forwardKeys = Set(forward?.entries.keys.map { $0 } ?? [])
+        let reversedKeys = Set(reversed?.entries.keys.map { $0 } ?? [])
+        expect(forwardKeys == reversedKeys && forward?.entries == reversed?.entries &&
+               forward?.removals == reversed?.removals,
+               "oversized inbound selection is deterministic across insertion orders")
+        expect(forward?.entries.count == OverlayWatchInboundPolicy.liveLimit,
+               "inbound live output remains bounded after alias closure")
+
+        let staleRewatch = OverlayWatchInboundPolicy.Row(
+            id: "imdb:tt0903747",
+            entry: OverlayRow(type: "series", alias: "tt0903747:5:15", freshness: 900, valid: true)
+        )
+        let staleLarge = OverlayWatchInboundPolicy.select(
+            rows: decoys + [staleRewatch, oldBridge], removals: [largeRemoval], identity: overlayIdentity
+        )
+        expect(staleLarge?.entries["imdb:tt0903747"] == nil && staleLarge?.removals.count == 1 &&
+               staleLarge?.removals.first?.removedAt == largeRemoval.removedAt,
+               "old bridge carries a tombstone to suppress stale progress below the live cap")
+        expect(OverlayWatchInboundPolicy.select(
+            rows: Array(repeating: oldBridge, count: OverlayWatchInboundPolicy.parseLimit + 1),
+            removals: [], identity: overlayIdentity
+        ) == nil, "hostile oversized inbound arrays are rejected before candidate folding")
+
         if failures == 0 {
             print("ContinueWatchingDedupeTests: \(checks) checks passed")
         } else {

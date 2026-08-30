@@ -182,68 +182,83 @@ enum OverlayWatchRemovalPolicy {
     ) -> (entries: [String: Entry], removals: [OverlayWatchRemoval]) {
         let boundedRemovals = removals
             .filter { $0.removedAt.isFinite && !$0.keys.isEmpty }
-            .sorted { $0.removedAt > $1.removedAt }
+            .sorted {
+                if $0.removedAt != $1.removedAt { return $0.removedAt > $1.removedAt }
+                return $0.keys.sorted().joined(separator: "\u{1e}") <
+                    $1.keys.sorted().joined(separator: "\u{1e}")
+            }
             .prefix(120)
         guard !boundedRemovals.isEmpty else { return (entries, []) }
 
-        // Most libraries have no row related to a removal. Expand only the removal-connected closure before
-        // the component fold: a bridge row can still pull in another alias transitively, while unrelated
-        // library rows never enter the O(n²) grouping pass.
+        // Build one adjacency index, then walk only the removal-connected closure. A bridge row can pull in
+        // another alias transitively without repeatedly scanning the whole library.
+        var keysByLiveID: [String: Set<String>] = [:]
+        var liveIDsByKey: [String: [String]] = [:]
+        for (id, entry) in entries {
+            let keys = ContinueWatchingDedupe.identityKeys(identity(id, entry))
+            keysByLiveID[id] = keys
+            for key in keys { liveIDsByKey[key, default: []].append(id) }
+        }
         var relevantKeys = Set(boundedRemovals.flatMap(\.keys))
         var relevantLiveIDs = Set<String>()
-        var expanded = true
-        while expanded {
-            expanded = false
-            for (id, entry) in entries where !relevantLiveIDs.contains(id) {
-                let keys = ContinueWatchingDedupe.identityKeys(identity(id, entry))
-                guard !relevantKeys.isDisjoint(with: keys) else { continue }
-                relevantLiveIDs.insert(id)
-                let oldCount = relevantKeys.count
-                relevantKeys.formUnion(keys)
-                if relevantKeys.count != oldCount { expanded = true }
+        var pendingKeys = Array(relevantKeys)
+        var cursor = 0
+        while cursor < pendingKeys.count {
+            let key = pendingKeys[cursor]
+            cursor += 1
+            for id in liveIDsByKey[key] ?? [] where relevantLiveIDs.insert(id).inserted {
+                for aliasKey in keysByLiveID[id] ?? [] where relevantKeys.insert(aliasKey).inserted {
+                    pendingKeys.append(aliasKey)
+                }
             }
         }
 
-        var groups: [Group] = []
-
-        func append(liveID: String?, freshness: Double?, keys: Set<String>, removal: OverlayWatchRemoval?) {
-            guard !keys.isEmpty else { return }
-            let matches = groups.indices.filter { !groups[$0].keys.isDisjoint(with: keys) }
-            guard let target = matches.first else {
-                groups.append(Group(
-                    liveIDs: liveID.map { Set([$0]) } ?? [],
-                    liveFreshness: freshness.map { [$0] } ?? [],
-                    keys: keys,
-                    removals: removal.map { [$0] } ?? []
-                ))
-                return
-            }
-            if let liveID { groups[target].liveIDs.insert(liveID) }
-            if let freshness { groups[target].liveFreshness.append(freshness) }
-            groups[target].keys.formUnion(keys)
-            if let removal { groups[target].removals.append(removal) }
-            for index in matches.dropFirst().reversed() {
-                groups[target].liveIDs.formUnion(groups[index].liveIDs)
-                groups[target].liveFreshness.append(contentsOf: groups[index].liveFreshness)
-                groups[target].keys.formUnion(groups[index].keys)
-                groups[target].removals.append(contentsOf: groups[index].removals)
-                groups.remove(at: index)
-            }
+        var nodes: [Group] = boundedRemovals.map {
+            Group(liveIDs: [], liveFreshness: [], keys: Set($0.keys), removals: [$0])
         }
-
-        for removal in boundedRemovals {
-            append(liveID: nil, freshness: nil, keys: Set(removal.keys), removal: removal)
-        }
-        for (id, entry) in entries where relevantLiveIDs.contains(id) {
+        for id in relevantLiveIDs.sorted() {
+            guard let entry = entries[id] else { continue }
             let value = identity(id, entry)
             let freshness = value.hasValidProgress ? value.freshness.flatMap { $0.isFinite ? $0 : nil } : nil
-            append(liveID: id, freshness: freshness,
-                   keys: ContinueWatchingDedupe.identityKeys(value), removal: nil)
+            nodes.append(Group(
+                liveIDs: [id], liveFreshness: freshness.map { [$0] } ?? [],
+                keys: keysByLiveID[id] ?? [], removals: []
+            ))
+        }
+
+        var parents = Array(nodes.indices)
+        func root(_ value: Int) -> Int {
+            var current = value
+            while parents[current] != current { current = parents[current] }
+            return current
+        }
+        func unite(_ lhs: Int, _ rhs: Int) {
+            let left = root(lhs)
+            let right = root(rhs)
+            if left != right { parents[right] = left }
+        }
+        var ownerByKey: [String: Int] = [:]
+        for index in nodes.indices {
+            for key in nodes[index].keys.sorted() {
+                if let owner = ownerByKey[key] { unite(index, owner) }
+                else { ownerByKey[key] = index }
+            }
+        }
+        var groupsByRoot: [Int: Group] = [:]
+        for index in nodes.indices {
+            let node = nodes[index]
+            let nodeRoot = root(index)
+            var group = groupsByRoot[nodeRoot] ?? Group(liveIDs: [], liveFreshness: [], keys: [], removals: [])
+            group.liveIDs.formUnion(node.liveIDs)
+            group.liveFreshness.append(contentsOf: node.liveFreshness)
+            group.keys.formUnion(node.keys)
+            group.removals.append(contentsOf: node.removals)
+            groupsByRoot[nodeRoot] = group
         }
 
         var live = entries
         var retained: [OverlayWatchRemoval] = []
-        for group in groups where !group.removals.isEmpty {
+        for group in groupsByRoot.values where !group.removals.isEmpty {
             let removedAt = group.removals.map(\.removedAt).max() ?? 0
             if let replayedAt = group.liveFreshness.max(), replayedAt > removedAt {
                 continue
@@ -253,7 +268,10 @@ enum OverlayWatchRemovalPolicy {
         }
         return (
             live,
-            retained.sorted { $0.removedAt > $1.removedAt }.prefix(120).map { $0 }
+            retained.sorted {
+                if $0.removedAt != $1.removedAt { return $0.removedAt > $1.removedAt }
+                return $0.keys.joined(separator: "\u{1e}") < $1.keys.joined(separator: "\u{1e}")
+            }.prefix(120).map { $0 }
         )
     }
 
@@ -264,18 +282,83 @@ enum OverlayWatchRemovalPolicy {
         identity: (String, Entry) -> ContinueWatchingDedupe.Identity
     ) -> Set<String> {
         var keys = ContinueWatchingDedupe.identityKeys(identity(seedID, seed))
-        var expanded = true
-        while expanded {
-            expanded = false
-            for (id, entry) in entries {
-                let candidate = ContinueWatchingDedupe.identityKeys(identity(id, entry))
-                guard !keys.isDisjoint(with: candidate) else { continue }
-                let oldCount = keys.count
-                keys.formUnion(candidate)
-                if keys.count != oldCount { expanded = true }
+        var keysByID: [String: Set<String>] = [:]
+        var idsByKey: [String: [String]] = [:]
+        for (id, entry) in entries {
+            let candidate = ContinueWatchingDedupe.identityKeys(identity(id, entry))
+            keysByID[id] = candidate
+            for key in candidate { idsByKey[key, default: []].append(id) }
+        }
+        var visitedIDs = Set<String>()
+        var pendingKeys = Array(keys)
+        var cursor = 0
+        while cursor < pendingKeys.count {
+            let key = pendingKeys[cursor]
+            cursor += 1
+            for id in idsByKey[key] ?? [] where visitedIDs.insert(id).inserted {
+                for aliasKey in keysByID[id] ?? [] where keys.insert(aliasKey).inserted {
+                    pendingKeys.append(aliasKey)
+                }
             }
         }
         return keys
+    }
+}
+
+/// Deterministic trust-boundary selection for remote overlay arrays. The relay document is untrusted: reject
+/// hostile bulk before materializing it, resolve every accepted alias and clock against tombstones, then retain
+/// at most 120 surviving live rows ranked by valid clocked progress. A bridge below the live cutoff therefore
+/// still participates in the transitive component without consuming a final output slot.
+enum OverlayWatchInboundPolicy {
+    static let liveLimit = 120
+    static let parseLimit = 2_000
+
+    struct Row<Entry> {
+        let id: String
+        let entry: Entry
+    }
+
+    static func select<Entry>(
+        rows: [Row<Entry>],
+        removals: [OverlayWatchRemoval],
+        identity: (String, Entry) -> ContinueWatchingDedupe.Identity
+    ) -> (entries: [String: Entry], removals: [OverlayWatchRemoval])? {
+        guard rows.count <= parseLimit, removals.count <= parseLimit else { return nil }
+        let ordered = rows.sorted { lhs, rhs in
+            preferred(lhs, over: rhs, identity: identity)
+        }
+        var unique: [Row<Entry>] = []
+        var seenIDs = Set<String>()
+        for row in ordered where seenIDs.insert(row.id).inserted { unique.append(row) }
+
+        let allEntries = Dictionary(uniqueKeysWithValues: unique.map { ($0.id, $0.entry) })
+        let resolved = OverlayWatchRemovalPolicy.resolve(
+            entries: allEntries, removals: removals, identity: identity
+        )
+        let live = Dictionary(uniqueKeysWithValues: unique.compactMap { row in
+            resolved.entries[row.id].map { (row.id, $0) }
+        }.prefix(liveLimit))
+        return (live, resolved.removals)
+    }
+
+    private static func preferred<Entry>(
+        _ lhs: Row<Entry>,
+        over rhs: Row<Entry>,
+        identity: (String, Entry) -> ContinueWatchingDedupe.Identity
+    ) -> Bool {
+        let left = identity(lhs.id, lhs.entry)
+        let right = identity(rhs.id, rhs.entry)
+        let leftClock = left.hasValidProgress ? left.freshness.flatMap { $0.isFinite ? $0 : nil } : nil
+        let rightClock = right.hasValidProgress ? right.freshness.flatMap { $0.isFinite ? $0 : nil } : nil
+        if let leftClock, let rightClock, leftClock != rightClock { return leftClock > rightClock }
+        if leftClock != nil, rightClock == nil { return true }
+        if leftClock == nil, rightClock != nil { return false }
+        let leftKey = ContinueWatchingDedupe.identityKeys(left).sorted().joined(separator: "\u{1e}")
+        let rightKey = ContinueWatchingDedupe.identityKeys(right).sorted().joined(separator: "\u{1e}")
+        if leftKey != rightKey { return leftKey < rightKey }
+        let leftID = lhs.id.lowercased()
+        let rightID = rhs.id.lowercased()
+        return leftID == rightID ? lhs.id < rhs.id : leftID < rightID
     }
 }
 
