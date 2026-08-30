@@ -10,6 +10,7 @@ import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.SystemClock
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -78,6 +79,7 @@ import com.vortx.android.skip.SkipTimestampService
 import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
@@ -185,6 +187,30 @@ fun PlayerScreen(
     val currentOnWarmNext by rememberUpdatedState(onWarmNext)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
+    // Every exit surface, including system Back while the engine is still connecting, funnels through
+    // this one idempotent route. The outer shell still owns navigation state, but it must not receive a
+    // second Back while the first callback is waiting for composition to remove this player.
+    var playerExitRequested by remember(outerPlaybackSessionId) { mutableStateOf(false) }
+    var playerPreviousOrientation by remember(outerPlaybackSessionId) { mutableStateOf<Int?>(null) }
+    fun restorePlayerWindow() {
+        val activity = hostActivity ?: return
+        activity.window?.let { window ->
+            WindowInsetsControllerCompat(window, window.decorView)
+                .show(WindowInsetsCompat.Type.systemBars())
+        }
+        activity.requestedOrientation = playerPreviousOrientation
+            ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        clearWindowBrightness(activity)
+    }
+    fun exitPlayer() {
+        if (playerExitRequested) return
+        playerExitRequested = true
+        // Restore synchronously as well as from DisposableEffect. This prevents the browse shell from
+        // drawing one or more frames in player landscape while navigation is committing.
+        restorePlayerWindow()
+        currentOnBack()
+    }
+    BackHandler(enabled = !playerExitRequested) { exitPlayer() }
     DisposableEffect(sourceSwitchCoordinator, outerPlaybackSessionId) {
         onDispose { sourceSwitchCoordinator.invalidateIfCurrent(outerPlaybackSessionId) }
     }
@@ -396,9 +422,10 @@ fun PlayerScreen(
     // fullscreen frame, restored on exit. On Android TV both calls are harmless no-ops (the panel is
     // already landscape and TVs show no bars). Keyed on Unit: enter/exit of the player, not per engine.
     DisposableEffect(Unit) {
-        val activity = context.findActivity()
+        val activity = hostActivity
         val previousOrientation = activity?.requestedOrientation
             ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        playerPreviousOrientation = previousOrientation
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         val insetsController = activity?.window?.let { w ->
             WindowInsetsControllerCompat(w, w.decorView).apply {
@@ -408,10 +435,7 @@ fun PlayerScreen(
         }
         onDispose {
             insetsController?.show(WindowInsetsCompat.Type.systemBars())
-            activity?.requestedOrientation = previousOrientation
-            // The brightness gesture only ever overrides the WINDOW level; hand the window back to
-            // the system setting so the browse shell never inherits a mid-film dimming.
-            clearWindowBrightness(activity)
+            restorePlayerWindow()
         }
     }
 
@@ -500,25 +524,6 @@ fun PlayerScreen(
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(routeMonitor)
             routeMonitor.stop()
-        }
-    }
-
-    // AUTO-ROTATE TO LANDSCAPE (Apple `stremiox.autoLandscapeInPlayer`, default on). On a phone, opening a
-    // non-trailer stream turns the device to landscape to match the video (following the sensor between the
-    // two landscape orientations), and restores the previous orientation on exit. A no-op on TV, which is
-    // always landscape, and for trailers, exactly like Apple's `forceLandscape` gate.
-    DisposableEffect(currentPlayable.isTrailer) {
-        val activity = activityOf(context)
-        val isTv = context.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK)
-        if (
-            activity != null && !isTv && !currentPlayable.isTrailer &&
-            com.vortx.android.player.extras.AutoLandscapeSetting.isEnabled(context)
-        ) {
-            val previous = activity.requestedOrientation
-            activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            onDispose { activity.requestedOrientation = previous }
-        } else {
-            onDispose { }
         }
     }
 
@@ -1049,7 +1054,11 @@ fun PlayerScreen(
     // frame is a duplicate at best, an unrendered black frame at worst), and never before a real duration
     // (the session is not keyed yet, so the frame would be buffered against no title and thrown away).
     // A null return is the normal, expected outcome on the ExoPlayer engine, which cannot read back a
-    // SurfaceView without breaking Dolby Vision -- see [PlayerEngine.captureFrameJpeg].
+    // SurfaceView without breaking Dolby Vision -- see [PlayerEngine.captureFrameJpeg]. It is also a
+    // terminal signal for this scheduler: a native renderer that declined or threw once must never be
+    // re-entered every ten seconds. The mpv lane owns its direct-surface guard; this is the caller-side
+    // circuit breaker that guarantees the guard is not repeatedly stressed after an adverse response.
+    val trickplayCapture = remember(engine, playbackSessionKey) { TrickplayCaptureCircuitBreaker() }
     LaunchedEffect(engine, playbackSessionKey) {
         while (true) {
             delay((TrickplaySession.CAPTURE_INTERVAL_S * 1000).toLong())
@@ -1060,7 +1069,9 @@ fun PlayerScreen(
             if (s.isPaused || s.isBuffering || s.durationMs <= 0L || runtimeMismatch ||
                 afrHolder.get()?.isSettling() == true || !CommunityTrickplay.isEnabled(context)
             ) continue
-            val jpeg = engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH) ?: continue
+            val jpeg = trickplayCapture.attempt {
+                engine.captureFrameJpeg(TRICKPLAY_TILE_MAX_WIDTH)
+            } ?: continue
             // Read the source height HERE, while the engine is demonstrably alive and rendering, and bank
             // it with the frame. Doing it at teardown instead would mean a JNI property read against an
             // engine that may already be released, which is a native crash, not a catchable one.
@@ -1105,7 +1116,7 @@ fun PlayerScreen(
         // than auto-advancing to the next episode. Mirrors the Apple sleepAtEpisodeEnd branch.
         if (sleepAtEpisodeEnd) {
             sleepAtEpisodeEnd = false
-            currentOnBack()
+            exitPlayer()
             return@LaunchedEffect
         }
         // A LOCAL session's end is a plain exit, never [currentOnEnded]: the host's ended handler asks
@@ -1114,7 +1125,7 @@ fun PlayerScreen(
         // A's successor (AND-DL-01). Exiting matches the TV shell, whose player has always closed on
         // end; a future legitimate local Up Next needs an identity-carrying callback of its own.
         if (isLocalSession) {
-            currentOnBack()
+            exitPlayer()
             return@LaunchedEffect
         }
         currentOnEnded()
@@ -1502,7 +1513,7 @@ fun PlayerScreen(
             // Continuous interactions the chrome owns internally (scrubber drags, sheet opens) re-arm
             // the auto-hide timer through this seam; the discrete actions below re-arm via [showControls].
             onInteraction = { showControls() },
-            onBack = currentOnBack,
+            onBack = ::exitPlayer,
             onTogglePause = {
                 showControls()
                 markMpvUserPausedIntent(engine, !latestState.isPaused)
@@ -1734,7 +1745,7 @@ fun PlayerScreen(
                 },
                 onStop = {
                     stillWatchingPrompt = false
-                    currentOnBack()
+                    exitPlayer()
                 },
             )
         }
@@ -1784,7 +1795,7 @@ fun PlayerScreen(
                 CastOverlay(
                     state = castState,
                     emberAccent = emberAccent,
-                    onBack = currentOnBack,
+                    onBack = ::exitPlayer,
                     onTogglePlay = { castManager.togglePause() },
                     onSeekBy = { castManager.seekBy(it) },
                     onSeekTo = { castManager.seekTo(it) },
@@ -1895,6 +1906,30 @@ private fun videoHeightOf(engine: PlayerEngine): Int {
     return resolution.substringAfter('x', "").toIntOrNull() ?: 0
 }
 
+/// Session-local circuit breaker for optional trickplay screenshot capture. A capture is not part of video
+/// playback's correctness contract, so the first absent frame or ordinary failure closes this lane while the
+/// engine continues playing. Cancellation is propagated so leaving the player still cancels promptly.
+internal class TrickplayCaptureCircuitBreaker {
+    private var disabled = false
+
+    suspend fun attempt(capture: suspend () -> ByteArray?): ByteArray? {
+        if (disabled) return null
+        return try {
+            capture() ?: run {
+                disabled = true
+                null
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            disabled = true
+            null
+        }
+    }
+
+    internal fun isDisabled(): Boolean = disabled
+}
+
 /**
  * True when this playable opens a device-LOCAL file (an offline download). Only the download screens
  * produce `file://` playables today; every streamed / torrent / debrid / trailer source resolves to an
@@ -1989,17 +2024,6 @@ private const val WATCHDOG_STALL_TIMEOUT_MS = 20_000L
 /// The scrubber band colour for a skippable segment kind. Cool cyan for the intro, amber for a recap,
 /// violet for the credits, and orange for a next-episode preview, so a glance at the bar reads what each
 /// coloured stretch is. Kept next to the player because [PlayerChrome]'s scrubber is colour-agnostic.
-/// Unwrap the hosting [android.app.Activity] from a Compose [android.content.Context] (which may be a
-/// ContextWrapper chain), or null when none is found. Used to drive the window's requested orientation.
-private fun activityOf(context: android.content.Context): android.app.Activity? {
-    var ctx: android.content.Context = context
-    while (ctx is android.content.ContextWrapper) {
-        if (ctx is android.app.Activity) return ctx
-        ctx = ctx.baseContext
-    }
-    return null
-}
-
 private fun skipBandColor(kind: SkipSegment.Kind): Color = when (kind) {
     SkipSegment.Kind.INTRO -> Color(0xFF3FC7E0)
     SkipSegment.Kind.RECAP -> Color(0xFFE0B23F)

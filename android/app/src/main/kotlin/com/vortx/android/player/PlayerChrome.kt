@@ -288,6 +288,15 @@ fun PlayerChrome(
     val qualityDescription = stringResource(R.string.player_quality_action_description)
     val switchingSource = stringResource(R.string.player_switching_source)
     val switchFailed = stringResource(R.string.player_source_switch_failed)
+    // The player opens above a previously focused detail screen. Explicitly park the TV remote on the
+    // Back affordance rather than depending on Compose focus search to discover this newly composed layer.
+    val tvChromeFocus = remember { FocusRequester() }
+    LaunchedEffect(isTvPlayer, controlsVisible, openSheet) {
+        if (isTvPlayer && controlsVisible && openSheet == ControlSheet.NONE) {
+            withFrameNanos { }
+            runCatching { tvChromeFocus.requestFocus() }
+        }
+    }
     val chaptersTitle = stringResource(R.string.player_chapters)
     val chaptersDescription = stringResource(R.string.player_chapters_action_description)
     val subtitleSettingsTitle = stringResource(R.string.player_subtitle_settings)
@@ -413,7 +422,7 @@ fun PlayerChrome(
                 .padding(horizontal = 8.dp, vertical = 8.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) {
+                IconButton(onClick = onBack, modifier = Modifier.focusRequester(tvChromeFocus)) {
                     Icon(
                         Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Back",
@@ -1852,6 +1861,11 @@ private fun VolumeSheet(
 /// ranked source list, plus a plain back. Shown when [PlayerState.hasError] is set.
 @Composable
 private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: () -> Unit) {
+    val recoveryFocus = remember { FocusRequester() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { recoveryFocus.requestFocus() }
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1878,6 +1892,7 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                     // Primary recovery action as ember glass (was a solid accent slab).
                     modifier = Modifier
                         .vortxGlassProminent(shape = RoundedCornerShape(8.dp), tint = emberAccent)
+                        .focusRequester(recoveryFocus)
                         .clickable(onClick = onRetry)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )

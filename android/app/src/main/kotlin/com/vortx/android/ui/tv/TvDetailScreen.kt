@@ -184,6 +184,7 @@ private fun TvDetailContent(
     val colors = VortXTheme.colors
     val playFocus = remember { FocusRequester() }
     val secondaryFocus = remember { FocusRequester() }
+    val sourcesFocus = remember { FocusRequester() }
     val initialFocus = remember(detail.id) { TvDetailInitialFocus() }
     val hasSources = (streamsState as? UiState.Success)?.data?.any { it.streams.isNotEmpty() } == true
     val watchEnabled = hasSources && playback !is Playback.Resolving
@@ -339,6 +340,15 @@ private fun TvDetailContent(
                         onClick = { beginPlayback { viewModel.playBest() } },
                         focusRequester = playFocus,
                     )
+                    Spacer(Modifier.width(VortXTheme.spacing.sm))
+                    // Sources is an explicit peer of Watch, not a distant right-pane discovery task.
+                    // It parks the remote on the source pane's stable Re-find control, from which the
+                    // ranked Watch Now row and filters are one deterministic D-pad step away.
+                    TvFilterChip(
+                        label = "Sources",
+                        selected = false,
+                        onClick = { runCatching { sourcesFocus.requestFocus() } },
+                    )
                     if (resolving) {
                         Spacer(Modifier.width(VortXTheme.spacing.md))
                         CircularProgressIndicator(
@@ -435,6 +445,7 @@ private fun TvDetailContent(
                         label = "Re-find",
                         selected = false,
                         onClick = viewModel::refreshSources,
+                        modifier = Modifier.focusRequester(sourcesFocus),
                     )
                 }
                 TvSourceList(
