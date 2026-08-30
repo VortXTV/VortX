@@ -3,7 +3,6 @@ package com.vortx.android.home
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
-import com.vortx.android.trickplay.TmdbImdbResolution
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -101,43 +100,20 @@ class CollectionsHubProviderPolicyTest {
     }
 
     @Test
-    fun `typed resolver failures preserve a valid tmdb item only when downstream supports it`() {
-        val item = MetaItem("tmdb:movie:123", MediaType.MOVIE, "Title")
-        val failures = listOf(
-            TmdbImdbResolution.NoImdbId,
-            TmdbImdbResolution.TransportFailure,
-            TmdbImdbResolution.HttpFailure(429),
-            TmdbImdbResolution.ParseFailure,
-        )
-
-        failures.forEach { resolution ->
-            assertEquals(
-                "tmdb:123",
-                CollectionsHubItemPolicy.resolvedItem(item, resolution, tmdbCatalogSupported = true)?.id,
-            )
-            assertNull(CollectionsHubItemPolicy.resolvedItem(item, resolution, tmdbCatalogSupported = false))
-        }
+    fun `catalog routing preserves upstream order instead of rotating it`() {
+        assertEquals(0, CuratedFreshness.rotation("curated.acclaimed", 30))
     }
 
     @Test
-    fun `typed resolver prefers imdb and rejects invalid input`() {
-        val item = MetaItem("tmdb:tv:456", MediaType.SERIES, "Series")
+    fun `catalog routing canonicalizes a valid tmdb item without enrichment`() {
+        val item = MetaItem("tmdb:movie:123", MediaType.MOVIE, "Title")
 
+        assertEquals("tmdb:123", CollectionsHubItemPolicy.routeItem(item)?.id)
         assertEquals(
             "tt1234567",
-            CollectionsHubItemPolicy.resolvedItem(
-                item,
-                TmdbImdbResolution.Resolved("tt1234567"),
-                tmdbCatalogSupported = true,
-            )?.id,
+            CollectionsHubItemPolicy.routeItem(item.copy(id = "tt1234567:1:2"))?.id,
         )
-        assertNull(
-            CollectionsHubItemPolicy.resolvedItem(
-                item.copy(id = "not-tmdb"),
-                TmdbImdbResolution.InvalidId,
-                tmdbCatalogSupported = true,
-            ),
-        )
+        assertNull(CollectionsHubItemPolicy.routeItem(item.copy(id = "not-tmdb")))
     }
 
     private fun addon(providesMeta: Boolean, raw: String) = InstalledAddon(

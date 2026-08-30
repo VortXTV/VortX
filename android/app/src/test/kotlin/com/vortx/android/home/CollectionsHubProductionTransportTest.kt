@@ -1,6 +1,5 @@
 package com.vortx.android.home
 
-import com.vortx.android.trickplay.TmdbImdbResolution
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -80,8 +79,30 @@ class CollectionsHubProductionTransportTest {
         assertNotNull(connection.getRequestProperty("X-VX-Sig"))
     }
 
+    @Test
+    fun `ranked page publishes canonical cards without per-card enrichment or shuffle`() = runBlocking {
+        val connection = FakeHttpURLConnection(
+            body = """{"results":[{"id":123,"title":"Ranked first"},{"id":456,"title":"Ranked second"}]}""",
+        )
+        val source = source(ArrayDeque(listOf(connection)))
+
+        val page = source.page(
+            CollectionsHubTarget.Genre(
+                GenreSpec("action", com.vortx.android.R.string.collections_genre_action, 28, null),
+            ),
+            movies(),
+            "GB",
+            1,
+            false,
+        )
+
+        assertEquals(listOf("tmdb:123", "tmdb:456"), page.items.map { it.id })
+        assertEquals(listOf("Ranked first", "Ranked second"), page.items.map { it.name })
+        assertTrue(connection.requestedUrl.query.contains("page=1"))
+        assertFalse(connection.requestedUrl.query.contains("vxday="))
+    }
+
     private fun source(connections: ArrayDeque<FakeHttpURLConnection>) = EdgeCollectionsHubSource(
-        resolveExternalId = { _, _ -> TmdbImdbResolution.NoImdbId },
         transport = CollectionsHubHttpTransport(
             openConnection = { url -> connections.removeFirst().also { it.requestedUrl = url } },
         ),

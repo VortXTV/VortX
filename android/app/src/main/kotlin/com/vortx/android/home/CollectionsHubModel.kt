@@ -10,7 +10,6 @@ import com.vortx.android.model.InstalledAddon
 import com.vortx.android.config.RemoteConfig
 import com.vortx.android.net.VortXEdgeAuth
 import com.vortx.android.profile.ProfileStore
-import com.vortx.android.trickplay.TmdbImdbResolution
 import com.vortx.android.trickplay.TmdbImdbResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -334,12 +333,13 @@ internal class CollectionsHubModel internal constructor(
     private val source: CollectionsHubSource,
     private val nowMillis: () -> Long = System::currentTimeMillis,
     private val deviceRegion: () -> String = ::defaultCollectionsRegion,
-    private val tmdbCatalogSupported: suspend () -> Boolean = { false },
+    @Suppress("UNUSED_PARAMETER")
+    tmdbCatalogSupported: suspend () -> Boolean = { false },
     private val beforePaginationPublication: () -> Unit = {},
 ) {
     constructor(
         context: Context,
-        source: CollectionsHubSource = EdgeCollectionsHubSource(context.applicationContext),
+        source: CollectionsHubSource = EdgeCollectionsHubSource(),
         nowMillis: () -> Long = System::currentTimeMillis,
         tmdbCatalogSupported: suspend () -> Boolean = { false },
     ) : this(
@@ -649,14 +649,10 @@ internal class CollectionsHubModel internal constructor(
         category: CollectionsHubCategory,
         page: Int,
     ): Result<CollectionsHubPage> = try {
-        val supportsTmdb = try {
-            tmdbCatalogSupported()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Throwable) {
-            false
-        }
-        Result.success(source.page(target, category, resolvedRegion(), page, supportsTmdb))
+        // Collection cards publish with a canonical tmdb route. DetailViewModel owns the one-title
+        // tmdb -> IMDb recovery when an installed meta add-on cannot open that route directly, so the
+        // collection's first paint must not wait on an add-on capability read or per-card enrichment.
+        Result.success(source.page(target, category, resolvedRegion(), page, tmdbCatalogSupported = true))
     } catch (cancelled: CancellationException) {
         throw cancelled
     } catch (error: Throwable) {
@@ -1006,15 +1002,10 @@ internal object CollectionsHubProviderPolicy {
 }
 
 internal object CollectionsHubItemPolicy {
-    fun resolvedItem(
-        item: MetaItem,
-        resolution: TmdbImdbResolution,
-        tmdbCatalogSupported: Boolean,
-    ): MetaItem? {
-        val imdbId = (resolution as? TmdbImdbResolution.Resolved)?.imdbId
-            ?.let(TmdbImdbResolver::ttPrefix)
+    /** Stable detail-route identity. One tapped title is enriched by DetailViewModel only when needed. */
+    fun routeItem(item: MetaItem): MetaItem? {
+        val imdbId = TmdbImdbResolver.ttPrefix(item.id)
         if (imdbId != null) return item.copy(id = imdbId)
-        if (resolution == TmdbImdbResolution.InvalidId || !tmdbCatalogSupported) return null
         val tmdbId = canonicalTmdbId(item.id) ?: return null
         return item.copy(id = tmdbId)
     }
@@ -1029,47 +1020,10 @@ internal object CollectionsHubItemPolicy {
     }
 }
 
-/**
- * Freshness for the VortX-curated catalogs: the hub's popularity windows (the genre / service / decade
- * "Movies", "Shows" and "Trending" pills, page-rotated here). Mirrors Apple `CuratedFreshness`
- * (CollectionsHubModel.swift) so the same static ordering does not read as the identical list every open.
- * The seed is drawn ONCE per process, so the rotation is STABLE within a viewing session (scrolling,
- * paginating and returning never reorder under the user) and changes on the next app open. Deterministic
- * per catalog: the offset hashes the catalog's own query, so "1990s Movies" and "1990s Shows" rotate
- * independently. Complements (not replaces) the server-side `vxday=1` daily shuffle opt-in.
- */
+/** Preserve the declared upstream ranking. Fresh data changes naturally without reordering a known page. */
 internal object CuratedFreshness {
-    /** One draw per process launch: fresh rotation each open, stable for the whole session. */
-    private val sessionSeed: Long = java.security.SecureRandom().nextLong()
-
-    /**
-     * Pages 1..span rotate; span 4 keeps every rotated first page inside the top ~80 titles of the window,
-     * so a curated row still reads as "the good stuff", just a different slice of it per open.
-     */
-    private const val SPAN = 4L
-
-    /** Deterministic 0..<span page offset for a curated window (FNV-1a over the query, mixed with the seed). */
-    fun pageOffset(key: String): Int = (Math.floorMod(mix(key), SPAN)).toInt()
-
-    /**
-     * Deterministic 0..<count rotation start for an already-fetched curated pool (the editorial Home rails):
-     * the same seeded mix, scaled to the pool size instead of the page span. 0 on an empty pool. Mirrors
-     * Apple `CuratedFreshness.rotation`.
-     */
-    fun rotation(key: String, count: Int): Int =
-        if (count <= 0) 0 else Math.floorMod(mix(key), count.toLong()).toInt()
-
-    /** FNV-1a over the key, mixed with the per-open session seed. */
-    private fun mix(key: String): Long {
-        var h = -0x340d631b7bdddcdbL // 0xcbf29ce484222325 (FNV-1a 64-bit offset basis)
-        for (byte in key.toByteArray(Charsets.UTF_8)) {
-            h = h xor (byte.toLong() and 0xFF)
-            h *= 0x100000001b3L
-        }
-        h = h xor sessionSeed
-        h *= 0x100000001b3L
-        return h
-    }
+    @Suppress("UNUSED_PARAMETER")
+    fun rotation(key: String, count: Int): Int = 0
 }
 
 internal sealed class CollectionsHubTransportFailure(message: String, cause: Throwable? = null) : IOException(message, cause) {
@@ -1115,15 +1069,8 @@ internal class CollectionsHubHttpTransport(
 
 /** Keyless, signed catalog-edge implementation. No TMDB credential is present on the device. */
 internal class EdgeCollectionsHubSource internal constructor(
-    private val resolveExternalId: suspend (String, Boolean) -> TmdbImdbResolution,
-    private val transport: CollectionsHubHttpTransport,
+    private val transport: CollectionsHubHttpTransport = CollectionsHubHttpTransport(),
 ) : CollectionsHubSource {
-    constructor(context: Context) : this(
-        resolveExternalId = { rawId, seriesHint ->
-            TmdbImdbResolver.resolveImdbIdTyped(context, rawId, seriesHint)
-        },
-        transport = CollectionsHubHttpTransport(),
-    )
 
     private val providerRegionsMutex = Mutex()
     private val providerRegions = mutableMapOf<Int, List<String>>()
@@ -1164,6 +1111,7 @@ internal class EdgeCollectionsHubSource internal constructor(
             }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     override suspend fun page(
         target: CollectionsHubTarget,
         category: CollectionsHubCategory,
@@ -1187,7 +1135,7 @@ internal class EdgeCollectionsHubSource internal constructor(
             is CollectionsHubTarget.Decade -> decadePage(target.spec, category, region, page)
         }
         return CollectionsHubPage(
-            items = resolvePlayable(raw, tmdbCatalogSupported),
+            items = raw.take(MAX_PAGE_ITEMS).mapNotNull(CollectionsHubItemPolicy::routeItem),
             hasMore = raw.isNotEmpty(),
         )
     }
@@ -1313,20 +1261,7 @@ internal class EdgeCollectionsHubSource internal constructor(
                 append(tvScope, "sort_by=popularity.desc&first_air_date.gte=${today.minusDays(365)}&first_air_date.lte=$today&vote_count.gte=10")
             else -> append(movieScope, "sort_by=popularity.desc") to append(tvScope, "sort_by=popularity.desc")
         }
-        // `fresh` opts a POPULARITY window (Movies / Shows / Trending) into the per-app-open seeded page
-        // rotation (CuratedFreshness). Date-sorted and Top-This-* rows keep their semantic order. When a
-        // rotated first page comes back empty (a sparse window shorter than the rotation span), fall back to
-        // the unrotated page 1 so rotation never blanks a working row. Mirrors Apple scopedSubs.
-        val offset = if (category.id in FRESH_CATEGORY_IDS) {
-            CuratedFreshness.pageOffset("${movie.orEmpty()}|${tv.orEmpty()}")
-        } else {
-            0
-        }
-        val rotated = mergedDiscover(movie, tv, region, page + offset)
-        if (offset > 0 && page == 1 && rotated.isEmpty()) {
-            return mergedDiscover(movie, tv, region, 1)
-        }
-        return rotated
+        return mergedDiscover(movie, tv, region, page)
     }
 
     /**
@@ -1349,16 +1284,7 @@ internal class EdgeCollectionsHubSource internal constructor(
             "newshows" -> null to "$tvWindow&sort_by=first_air_date.desc&vote_count.gte=5"
             else -> "$movieWindow&sort_by=popularity.desc" to "$tvWindow&sort_by=popularity.desc"
         }
-        val offset = if (category.id in FRESH_CATEGORY_IDS) {
-            CuratedFreshness.pageOffset("${movie.orEmpty()}|${tv.orEmpty()}")
-        } else {
-            0
-        }
-        val rotated = mergedDiscover(movie, tv, region, page + offset)
-        if (offset > 0 && page == 1 && rotated.isEmpty()) {
-            return mergedDiscover(movie, tv, region, 1)
-        }
-        return rotated
+        return mergedDiscover(movie, tv, region, page)
     }
 
     override suspend fun artwork(
@@ -1442,10 +1368,7 @@ internal class EdgeCollectionsHubSource internal constructor(
     }
 
     private suspend fun discover(media: String, type: MediaType, extra: String, region: String, page: Int): List<MetaItem> {
-        // vxday=1: opt these curated discover rows into the catalogs worker's daily shuffle (#6). An unknown,
-        // harmless no-op until the worker ships the shuffle, then it reorders the SAME window once per day so a
-        // static curated row does not read identically forever. Mirrors Apple CollectionsHubModel.mergeBuckets.
-        val root = transport.getJson("/discover/$media?$extra&vxday=1&watch_region=$region&page=$page")
+        val root = transport.getJson("/discover/$media?$extra&watch_region=$region&page=$page")
         return parseResults(root.resultsArray(), type)
     }
 
@@ -1470,24 +1393,6 @@ internal class EdgeCollectionsHubSource internal constructor(
                 )
             }
         }
-    }
-
-    private suspend fun resolvePlayable(
-        items: List<MetaItem>,
-        tmdbCatalogSupported: Boolean,
-    ): List<MetaItem> = coroutineScope {
-        val slots = Semaphore(6)
-        items.take(40).mapIndexed { index, item ->
-            async {
-                index to slots.withPermit {
-                    CollectionsHubItemPolicy.resolvedItem(
-                        item = item,
-                        resolution = resolveExternalId(item.id, item.type == MediaType.SERIES),
-                        tmdbCatalogSupported = tmdbCatalogSupported,
-                    )
-                }
-            }
-        }.awaitAll().sortedBy { it.first }.mapNotNull { it.second }
     }
 
     private fun interleave(first: List<MetaItem>, second: List<MetaItem>): List<MetaItem> {
@@ -1519,10 +1424,7 @@ internal class EdgeCollectionsHubSource internal constructor(
     private companion object {
         const val IMAGE_BASE = "https://image.tmdb.org/t/p"
         const val MAX_PROVIDER_TILES = 50
-
-        // The popularity windows that opt into the per-app-open seeded page rotation (CuratedFreshness). The
-        // date-sorted ("newmovies"/"newshows") and rolling Top-This-* rows keep their semantic order.
-        val FRESH_CATEGORY_IDS = setOf("movies", "shows", "trending")
+        const val MAX_PAGE_ITEMS = 40
 
         val featuredProviderRank = mapOf(
             8 to 0,
