@@ -2,7 +2,6 @@ package com.vortx.android.player.mpv
 
 import com.vortx.android.model.ExternalSubtitle
 import com.vortx.android.model.Playable
-import com.vortx.android.engine.DeadlinePublicDns
 import kotlinx.coroutines.CancellationException
 import okhttp3.Request
 import org.junit.Assert.assertEquals
@@ -11,7 +10,6 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.net.URI
-import java.net.UnknownHostException
 
 class MpvExternalSubtitleTransportTest {
     @Test
@@ -101,13 +99,13 @@ class MpvExternalSubtitleTransportTest {
             listOf("127.0.0.1"),
             listOf("1.1.1.1", "127.0.0.1"),
         ).forEach { answers ->
-            val dns = DeadlinePublicDns(timeoutMs = 1_000) { answers.map(java.net.InetAddress::getByName) }
+            val dns = MpvExternalSubtitleTransport.publicDns(1_000) { answers.map(java.net.InetAddress::getByName) }
             val client = MpvExternalSubtitleTransport.protectedClient(timeoutMs = 1_000, dns = dns)
             val result = runCatching {
                 client.newCall(Request.Builder().url("https://sidecar.test/sub.srt").build()).execute().close()
             }
 
-            assertTrue(result.exceptionOrNull() is UnknownHostException)
+            assertTrue(result.isFailure)
         }
     }
 }

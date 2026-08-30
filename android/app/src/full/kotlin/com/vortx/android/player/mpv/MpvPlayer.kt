@@ -13,6 +13,7 @@ import com.vortx.android.model.Playable
 import com.vortx.android.model.ExternalSubtitle
 import com.vortx.android.communityjs.CommunityJsUrlPolicy
 import com.vortx.android.engine.DeadlinePublicDns
+import com.vortx.android.engine.PublicAddressPolicy
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.AudioOutputMode
 import com.vortx.android.player.DiskCacheSetting
@@ -53,6 +54,8 @@ import java.io.File
 import java.io.IOException
 import java.net.Proxy
 import java.net.URI
+import java.net.InetAddress
+import java.net.UnknownHostException
 import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -1204,7 +1207,7 @@ internal object MpvExternalSubtitleTransport {
         normalizedExternalSubtitles(playable).distinct()
 
     /** The public DNS result supplied to OkHttp is also the only address it may connect to. */
-    fun protectedClient(timeoutMs: Long, dns: Dns = DeadlinePublicDns(timeoutMs)): OkHttpClient =
+    fun protectedClient(timeoutMs: Long, dns: Dns = publicDns(timeoutMs)): OkHttpClient =
         OkHttpClient.Builder()
             .proxy(Proxy.NO_PROXY)
             .dns(dns)
@@ -1215,10 +1218,21 @@ internal object MpvExternalSubtitleTransport {
             .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
             .build()
 
+    /** Validate injected resolver answers too, so tests and future callers cannot bypass the DNS policy. */
+    fun publicDns(
+        timeoutMs: Long,
+        resolver: (String) -> List<InetAddress> = PublicAddressPolicy::requirePublic,
+    ): Dns = DeadlinePublicDns(timeoutMs) { host ->
+        val addresses = resolver(host)
+        if (addresses.isEmpty() || addresses.any(PublicAddressPolicy::isBlocked)) {
+            throw UnknownHostException("Sidecar DNS returned a non-public address")
+        }
+        addresses
+    }
+
     fun requestFor(subtitle: ExternalSubtitle): Request? {
         val uri = runCatching { URI(subtitle.url) }.getOrNull() ?: return null
         if (!CommunityJsUrlPolicy.isPublicHttpsUrl(subtitle.url) || uri.host.isNullOrBlank()) return null
-        if (runCatching { PublicAddressPolicy.requirePublic(uri.host) }.isFailure) return null
         return Request(uri = uri, headers = sanitizeHeaders(subtitle.headers))
     }
 
@@ -1260,7 +1274,6 @@ internal object MpvExternalSubtitleTransport {
         if (hop >= MAX_REDIRECTS || location.isNullOrBlank() || location.any(::isControl)) return null
         val next = runCatching { current.uri.resolve(location) }.getOrNull() ?: return null
         if (!CommunityJsUrlPolicy.isPublicHttpsUrl(next.toString()) || next.host.isNullOrBlank()) return null
-        if (runCatching { PublicAddressPolicy.requirePublic(next.host) }.isFailure) return null
         return Request(
             uri = next,
             headers = if (sameOrigin(current.uri, next)) current.headers else emptyMap(),
