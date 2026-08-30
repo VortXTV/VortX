@@ -146,16 +146,74 @@ class CommunityJsProviderContractTest {
     }
 
     @Test
-    fun `broker service tombstone rejects cancel before execute ordering`() {
-        val registry = CommunityJsCancellationRegistry()
+    fun `broker tombstone rejects late execute within horizon then expires`() {
+        var now = 1_000L
+        val registry = CommunityJsCancellationRegistry(
+            clockMs = { now },
+            tombstoneHorizonMs = 100L,
+            maxTombstones = 4,
+        )
 
         registry.cancel("late-token")
-
+        now = 1_099L
         assertNull(registry.begin("late-token"))
 
+        now = 1_100L
+        val afterExpiry = requireNotNull(registry.begin("late-token"))
+        registry.finish("late-token", afterExpiry)
+    }
+
+    @Test
+    fun `broker tombstone capacity evicts oldest first`() {
+        var now = 0L
+        val registry = CommunityJsCancellationRegistry(
+            clockMs = { now },
+            tombstoneHorizonMs = 10_000L,
+            maxTombstones = 2,
+        )
+
+        registry.cancel("oldest")
+        now += 1
+        registry.cancel("middle")
+        now += 1
+        registry.cancel("newest")
+
+        assertEquals(2, registry.tombstoneCountForTesting())
+        val evicted = requireNotNull(registry.begin("oldest"))
+        assertNull(registry.begin("middle"))
+        assertNull(registry.begin("newest"))
+        registry.finish("oldest", evicted)
+    }
+
+    @Test
+    fun `tombstone pruning never evicts active cancellation flags`() {
+        var now = 0L
+        val registry = CommunityJsCancellationRegistry(
+            clockMs = { now },
+            tombstoneHorizonMs = 10_000L,
+            maxTombstones = 1,
+        )
         val running = requireNotNull(registry.begin("running-token"))
+
         registry.cancel("running-token")
+        registry.cancel("tombstone-one")
+        now += 1
+        registry.cancel("tombstone-two")
+
         assertTrue(running.get())
+        assertEquals(1, registry.activeCountForTesting())
+        assertEquals(1, registry.tombstoneCountForTesting())
         registry.finish("running-token", running)
+        assertEquals(0, registry.activeCountForTesting())
+    }
+
+    @Test
+    fun `cancellation registry diagnostics never render tokens`() {
+        val secretToken = "secret-provider-token"
+        val registry = CommunityJsCancellationRegistry()
+        registry.cancel(secretToken)
+
+        assertFalse(registry.toString().contains(secretToken))
+        assertTrue(registry.toString().contains("tombstones=1"))
     }
 }

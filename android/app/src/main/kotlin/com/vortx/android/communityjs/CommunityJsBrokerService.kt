@@ -58,28 +58,92 @@ class CommunityJsBrokerService : Service() {
     }
 }
 
-/** Keeps cancellation tombstones so cancel-before-execute Binder ordering cannot resurrect a token. */
-internal class CommunityJsCancellationRegistry {
-    private val flags = java.util.concurrent.ConcurrentHashMap<String, AtomicBoolean>()
-
-    fun begin(token: String): AtomicBoolean? {
-        val flag = flags.computeIfAbsent(token) { AtomicBoolean(false) }
-        if (!flag.get()) return flag
-        flags.remove(token, flag)
-        return null
+/**
+ * Keeps bounded cancel-before-execute tombstones for the maximum expected Binder reordering horizon.
+ * Active invocation flags are a distinct entry type and are never removed by tombstone pruning.
+ */
+internal class CommunityJsCancellationRegistry(
+    private val clockMs: () -> Long = { System.nanoTime() / 1_000_000L },
+    private val tombstoneHorizonMs: Long = DEFAULT_TOMBSTONE_HORIZON_MS,
+    private val maxTombstones: Int = DEFAULT_MAX_TOMBSTONES,
+) {
+    private sealed interface Entry {
+        data class Active(val flag: AtomicBoolean) : Entry
+        data class Tombstone(val createdAtMs: Long, val order: Long) : Entry
     }
 
-    fun cancel(token: String) {
-        flags.compute(token) { _, existing ->
-            (existing ?: AtomicBoolean()).apply { set(true) }
+    private val lock = Any()
+    private val entries = mutableMapOf<String, Entry>()
+    private var nextOrder = 0L
+
+    init {
+        require(tombstoneHorizonMs >= 0L)
+        require(maxTombstones >= 0)
+    }
+
+    fun begin(token: String): AtomicBoolean? = synchronized(lock) {
+        pruneTombstones(clockMs())
+        when (entries[token]) {
+            null -> AtomicBoolean(false).also { entries[token] = Entry.Active(it) }
+            is Entry.Active, is Entry.Tombstone -> null
         }
     }
 
-    fun finish(token: String, flag: AtomicBoolean) {
-        flags.remove(token, flag)
+    fun cancel(token: String) = synchronized(lock) {
+        val now = clockMs()
+        pruneTombstones(now)
+        when (val entry = entries[token]) {
+            is Entry.Active -> entry.flag.set(true)
+            is Entry.Tombstone, null -> {
+                entries[token] = Entry.Tombstone(now, nextOrder++)
+                enforceTombstoneCapacity()
+            }
+        }
     }
 
-    fun cancelAll() {
-        flags.values.forEach { it.set(true) }
+    fun finish(token: String, flag: AtomicBoolean) = synchronized(lock) {
+        val entry = entries[token]
+        if (entry is Entry.Active && entry.flag === flag) entries.remove(token)
+    }
+
+    fun cancelAll() = synchronized(lock) {
+        entries.values.forEach { entry -> if (entry is Entry.Active) entry.flag.set(true) }
+    }
+
+    internal fun activeCountForTesting(): Int = synchronized(lock) {
+        entries.values.count { it is Entry.Active }
+    }
+
+    internal fun tombstoneCountForTesting(): Int = synchronized(lock) {
+        entries.values.count { it is Entry.Tombstone }
+    }
+
+    override fun toString(): String = synchronized(lock) {
+        "CommunityJsCancellationRegistry(active=${entries.values.count { it is Entry.Active }}, " +
+            "tombstones=${entries.values.count { it is Entry.Tombstone }})"
+    }
+
+    private fun pruneTombstones(now: Long) {
+        entries.entries.removeAll { (_, entry) ->
+            entry is Entry.Tombstone && now >= entry.createdAtMs &&
+                now - entry.createdAtMs >= tombstoneHorizonMs
+        }
+    }
+
+    private fun enforceTombstoneCapacity() {
+        val overflow = entries.values.count { it is Entry.Tombstone } - maxTombstones
+        if (overflow <= 0) return
+        entries.entries.asSequence()
+            .mapNotNull { (token, entry) -> (entry as? Entry.Tombstone)?.let { token to it } }
+            .sortedWith(compareBy({ it.second.createdAtMs }, { it.second.order }))
+            .take(overflow)
+            .map { it.first }
+            .toList()
+            .forEach(entries::remove)
+    }
+
+    private companion object {
+        const val DEFAULT_TOMBSTONE_HORIZON_MS = 120_000L
+        const val DEFAULT_MAX_TOMBSTONES = 1_024
     }
 }
