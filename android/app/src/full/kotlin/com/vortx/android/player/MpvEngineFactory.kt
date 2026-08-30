@@ -11,5 +11,12 @@ import com.vortx.android.player.mpv.MpvPlayer
 object MpvEngineFactory {
     const val isBundled: Boolean = true
 
-    fun create(context: Context): PlayerEngine? = MpvPlayer.create(context)
+    fun create(context: Context): PlayerEngine? = createSafely { MpvPlayer.create(context) }
+
+    /** Native linkage and class initialization failures are Errors, not Exceptions. */
+    internal fun createSafely(createMpv: () -> PlayerEngine?): PlayerEngine? = try {
+        createMpv()
+    } catch (_: Throwable) {
+        null
+    }
 }

@@ -1100,7 +1100,11 @@ class MpvPlayer private constructor(
             val appContext = context.applicationContext
             if (!MpvConfig.ensureSystemTrustStoreObserver(appContext)) return null
             val caBundlePath = MpvConfig.provisionSystemCaBundle(appContext) ?: return null
-            val lib = MPVLib.create(appContext) ?: return null
+            val lib = try {
+                MPVLib.create(appContext)
+            } catch (_: Throwable) {
+                null
+            } ?: return null
             return runCatching { MpvPlayer(lib, appContext, caBundlePath) }.getOrElse {
                 runCatching { lib.destroy() }
                 null

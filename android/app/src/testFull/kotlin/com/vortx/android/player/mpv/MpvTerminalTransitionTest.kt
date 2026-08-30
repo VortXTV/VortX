@@ -82,6 +82,22 @@ class MpvTerminalTransitionTest {
         assertEquals(MpvTerminalReason.REDIRECT, redirected.reason)
         assertFalse(redirected.hasEnded)
         assertFalse(redirected.hasError)
+
+        val ended = redirected.onSourceStarted().onTerminal(MpvTerminalEvent(MpvTerminalReason.EOF))
+        assertTrue(ended.hasEnded)
+    }
+
+    @Test
+    fun `multiple redirect hops remain open until a real terminal`() {
+        val active = MpvTerminalState.initialSource()
+            .onTerminal(MpvTerminalEvent(MpvTerminalReason.REDIRECT))
+            .onSourceStarted()
+            .onTerminal(MpvTerminalEvent(MpvTerminalReason.REDIRECT))
+            .onSourceStarted()
+
+        val failed = active.onTerminal(MpvTerminalEvent(MpvTerminalReason.ERROR, nativeError = -5))
+        assertTrue(failed.hasError)
+        assertEquals(-5, failed.nativeError)
     }
 
     @Test

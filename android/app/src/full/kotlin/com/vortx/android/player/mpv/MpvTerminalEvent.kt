@@ -102,13 +102,23 @@ internal data class MpvTerminalState(
             )
             MpvTerminalReason.STOP,
             MpvTerminalReason.QUIT,
-            MpvTerminalReason.REDIRECT,
             -> copy(
                 reason = event.reason,
                 nativeError = event.nativeError,
                 hasEnded = false,
                 hasError = false,
                 terminalConsumed = true,
+                suppressReplacementTerminal = false,
+            )
+            // mpv emits END_FILE(REDIRECT) while continuing into the redirected resource. It is a
+            // boundary inside one source session, not a terminal verdict, so a later real EOF/error
+            // must still be accepted (including after another START_FILE for a redirect hop).
+            MpvTerminalReason.REDIRECT -> copy(
+                reason = event.reason,
+                nativeError = event.nativeError,
+                hasEnded = false,
+                hasError = false,
+                terminalConsumed = false,
                 suppressReplacementTerminal = false,
             )
         }
