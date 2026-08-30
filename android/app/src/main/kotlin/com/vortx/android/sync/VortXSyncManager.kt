@@ -65,12 +65,14 @@ internal fun applyAddonTombstonesToVortx(
 }
 
 /**
- * The version-independent add-on portion of `syncDown`: a successfully decrypted account doc always advances
- * its monotone LWW tombstone state before `syncDown` decides whether profile/settings payload is old enough to
- * skip. Keeping this as a production seam makes the equal-version convergence rule directly testable.
+ * The add-on portion of `syncDown`: a successfully authenticated and decrypted account doc always advances its
+ * monotone LWW tombstone state before `syncDown` decides whether its versioned payload is safe to apply. An
+ * older document is deliberately scoped to this fold alone, preserving the H-2 rollback barrier for every other
+ * account field. Keeping this as a production seam makes that boundary directly testable.
  */
 internal data class AddonTombstoneSyncDownFold(
     val changed: Boolean,
+    val shouldFoldLibraryTombstones: Boolean,
     val shouldApplyVersionedPayload: Boolean,
 )
 
@@ -97,7 +99,9 @@ internal fun foldAddonTombstonesForSyncDown(
     }
     return AddonTombstoneSyncDownFold(
         changed = appChanged || webChanged,
-        shouldApplyVersionedPayload = force || pulledVersion > lastSyncedVersion,
+        shouldFoldLibraryTombstones = pulledVersion >= lastSyncedVersion,
+        shouldApplyVersionedPayload =
+            pulledVersion > lastSyncedVersion || (force && pulledVersion == lastSyncedVersion),
     )
 }
 
@@ -1458,7 +1462,18 @@ class VortXSyncManager(context: Context) {
      * version older than this account's high-water mark (H-2 rollback replay) is a FAILURE. A DECRYPT-MISS
      * throws no exception and yields Failed, never an empty `{}` that would wipe state.
      */
-    private suspend fun pullSyncDocResult(lease: SyncSessionLease): SyncDocPull {
+    private suspend fun pullSyncDocResult(lease: SyncSessionLease): SyncDocPull =
+        pullSyncDocResult(lease, allowOlderAddonTombstones = false)
+
+    /**
+     * [syncDown] is the sole caller permitted to inspect a replayed envelope after cryptographic authentication.
+     * It uses this strictly to max-fold add-on tombstones, then rejects all other payload paths. Every normal
+     * pull remains H-2 protected before decryption, so it cannot merge, seed, or report stale account data.
+     */
+    private suspend fun pullSyncDocResult(
+        lease: SyncSessionLease,
+        allowOlderAddonTombstones: Boolean,
+    ): SyncDocPull {
         if (!isSyncLeaseCurrent(lease)) return SyncDocPull.Failed
         val callPermit = acquireSyncCallPermit(lease) ?: return SyncDocPull.Failed
         val (code, json) = request(
@@ -1475,9 +1490,10 @@ class VortXSyncManager(context: Context) {
         val docStr = body.optString("document", "").takeUnless { it.isEmpty() } ?: return SyncDocPull.Empty
         // Version is a 64-bit epoch-ms value: read as LONG (optLong), NEVER optInt (which truncates it).
         val pulledVersion = body.optLong("version", 0L)
-        // H-2: refuse an honest-label replay of a doc OLDER than what this account already applied. A real
-        // server only returns a version >= our high-water mark, so this fires only on a rollback/replay.
-        if (pulledVersion < lastSyncedVersion(lease)) return SyncDocPull.Failed
+        // H-2: normal pulls refuse an honest-label replay of a doc OLDER than what this account already applied.
+        // syncDown may authenticate and decrypt that envelope solely to max-fold add-on tombstones; it never
+        // applies any other stale account data. A real server only returns a version >= our high-water mark.
+        if (pulledVersion < lastSyncedVersion(lease) && !allowOlderAddonTombstones) return SyncDocPull.Failed
         val plaintext = openSyncDocument(lease, docStr, pulledVersion) ?: return SyncDocPull.Failed
         val obj = runCatching { JSONObject(String(plaintext, Charsets.UTF_8)) }.getOrNull()
             ?: return SyncDocPull.Failed                          // undecodable plaintext: do not clobber
@@ -1826,7 +1842,7 @@ class VortXSyncManager(context: Context) {
         // PENDING-EDIT GUARD: restore a durable process-death marker and retry its push before any
         // foreground pull. Even a forced pull must not overwrite a fresh local edit.
         if (retryPendingPushBeforePull(lease)) return false
-        val pull = pullSyncDocResult(lease)
+        val pull = pullSyncDocResult(lease, allowOlderAddonTombstones = true)
         if (!isSyncLeaseCurrent(lease)) return false
         if (retryPendingPushBeforePull(lease)) return false
         val doc: JSONObject
@@ -1844,16 +1860,6 @@ class VortXSyncManager(context: Context) {
             publishIfSyncLeaseCurrent(lease) {
                 applyingRemote = true
                 try {
-                    if (parsed.deletedLibrary.isNotEmpty() || parsed.deletedLibraryTs.isNotEmpty()) {
-                        libraryTombstonesChanged = libraryTombstones.merge(
-                            parsed.deletedLibrary,
-                            parsed.deletedLibraryTs,
-                        )
-                        refreshSettingsShadow()
-                        if (libraryTombstonesChanged) {
-                            doc.optJSONObject("vortx")?.let(::applyLibraryTombstonesToVortx)
-                        }
-                    }
                     // Always fold LWW add-on state from a successfully decrypted doc before the version gate.
                     // This is safe on stale/equal/forced pulls because every stamp only advances by max, and
                     // it lets a newer peer reinstall (addedAt) make a previously removed URL present again.
@@ -1871,6 +1877,21 @@ class VortXSyncManager(context: Context) {
                     if (addonTombstonesChanged) {
                         doc.optJSONObject("vortx")?.let { applyAddonTombstonesToVortx(it, addonTombstones) }
                     }
+                    // An older authenticated document is permitted only to contribute the add-on MAX fold above.
+                    // Its library tombstones and every versioned account field remain behind the H-2 barrier.
+                    if (
+                        addonFold.shouldFoldLibraryTombstones &&
+                            (parsed.deletedLibrary.isNotEmpty() || parsed.deletedLibraryTs.isNotEmpty())
+                    ) {
+                        libraryTombstonesChanged = libraryTombstones.merge(
+                            parsed.deletedLibrary,
+                            parsed.deletedLibraryTs,
+                        )
+                        refreshSettingsShadow()
+                        if (libraryTombstonesChanged) {
+                            doc.optJSONObject("vortx")?.let(::applyLibraryTombstonesToVortx)
+                        }
+                    }
                 } finally {
                     applyingRemote = false
                 }
@@ -1878,8 +1899,8 @@ class VortXSyncManager(context: Context) {
         }
         if (!foldedTombstones || !isSyncLeaseCurrent(lease)) return false
         if (libraryTombstonesChanged || addonTombstonesChanged) requestSyncSoon()
-        // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Library and add-on
-        // tombstone stamps are monotone MAX folds and therefore apply from every successfully decrypted doc.
+        // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Equal docs may run a
+        // forced explicit restore, while an older authenticated doc contributes only add-on tombstone stamps.
         if (!shouldApplyVersionedPayload) {
             return libraryTombstonesChanged || addonTombstonesChanged
         }

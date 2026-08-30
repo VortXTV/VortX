@@ -51,6 +51,7 @@ class AddonTombstoneSyncTest {
             force = false,
         )
         assertTrue(equalVersionFold.changed)
+        assertTrue(equalVersionFold.shouldFoldLibraryTombstones)
         assertFalse(equalVersionFold.shouldApplyVersionedPayload)
         assertTrue(url in tombstones.all())
 
@@ -58,6 +59,49 @@ class AddonTombstoneSyncTest {
         now = 300.0
         assertTrue(tombstones.forget(url))
         assertFalse(url in tombstones.all())
+    }
+
+    @Test
+    fun `older authenticated sync down doc folds only add-on tombstones`() {
+        var now = 100.0
+        val tombstones = AddonTombstones(MemoryAddonTombstonePersistence()) { now }
+        val peerRemoval = "https://peer.example/manifest.json"
+        val olderDoc = JSONObject()
+            .put("settings", JSONObject().put("shouldNotApply", true))
+            .put("foreignAccountField", "preserve")
+            .put(
+                "vortx",
+                JSONObject()
+                    .put("profiles", JSONArray().put(JSONObject().put("id", "peer-profile")))
+                    .put("deletedLibrary", JSONArray().put("library-entry"))
+                    .put("futureSurfaceField", JSONObject().put("keep", true))
+                    .put(
+                        "deletedAddonsTs",
+                        JSONObject().put(peerRemoval, JSONObject().put("removedAt", 200.0)),
+                    ),
+            )
+
+        // syncDown reaches this production fold only after the replayed envelope has authenticated and decrypted.
+        val staleFold = foldAddonTombstonesForSyncDown(
+            tombstones = tombstones,
+            parsed = VortXSyncDoc.parse(olderDoc),
+            pulledVersion = 9L,
+            lastSyncedVersion = 10L,
+            force = true,
+        )
+
+        assertTrue(staleFold.changed)
+        assertFalse(staleFold.shouldFoldLibraryTombstones)
+        assertFalse(staleFold.shouldApplyVersionedPayload)
+        assertTrue(peerRemoval in tombstones.all())
+        // The seam returns guards only and does not publish profile/settings/foreign data from a replayed doc.
+        assertTrue(olderDoc.getJSONObject("settings").getBoolean("shouldNotApply"))
+        assertEquals("preserve", olderDoc.getString("foreignAccountField"))
+        assertTrue(olderDoc.getJSONObject("vortx").getJSONObject("futureSurfaceField").getBoolean("keep"))
+
+        now = 300.0
+        assertTrue(tombstones.forget(peerRemoval))
+        assertFalse(peerRemoval in tombstones.all())
     }
 
     @Test
