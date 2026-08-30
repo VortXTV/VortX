@@ -37,6 +37,13 @@ class MpvEngineFactoryTest {
         assertSame(failure, thrownBy { MpvEngineFactory.createSafely { throw failure } })
     }
 
+    @Test fun `fatal cleanup failure propagates`() {
+        val failure = OutOfMemoryError("cleanup fatal")
+        assertSame(failure, thrownBy {
+            recoverNativeFailure<Unit>("mpv-init") { throw failure }
+        })
+    }
+
     private fun thrownBy(block: () -> Unit): Throwable = try {
         block()
         throw AssertionError("expected failure")

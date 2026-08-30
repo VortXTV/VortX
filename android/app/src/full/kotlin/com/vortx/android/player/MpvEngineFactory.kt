@@ -6,9 +6,8 @@ import kotlinx.coroutines.CancellationException
 
 /// `full` flavor factory: builds the real libmpv [PlayerEngine]. This is the flavor-specific half of the
 /// seam declared (contract-only) in [PlayerEngine]. Returns null when libmpv cannot start on this device
-/// (missing native `.so` for the running ABI, OOM), so [PlayerEngineRouter.engine] falls back to
-/// ExoPlayer instead of crashing. [MpvPlayer.create] itself never throws: it wraps native failure and
-/// returns null.
+/// (missing native `.so` for the running ABI, recoverable init failure), so [PlayerEngineRouter.engine]
+/// falls back to ExoPlayer instead of crashing. Process-fatal failures and cancellation propagate.
 object MpvEngineFactory {
     const val isBundled: Boolean = true
 

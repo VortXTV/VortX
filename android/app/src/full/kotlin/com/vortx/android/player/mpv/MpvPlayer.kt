@@ -1094,9 +1094,9 @@ class MpvPlayer private constructor(
             }
         }
 
-        /// Build an [MpvPlayer], applying config + init. Returns null if [MPVLib.create] fails (missing
-        /// native `.so` for the running ABI / OOM), so [com.vortx.android.player.MpvEngineFactory]
-        /// can fall back to ExoPlayer. Never throws.
+        /// Build an [MpvPlayer], applying config + init. Returns null if [MPVLib.create] has a recoverable
+        /// native linkage or initialization failure, so [com.vortx.android.player.MpvEngineFactory]
+        /// can fall back to ExoPlayer. Process-fatal failures and cancellation propagate.
         fun create(context: Context): MpvPlayer? {
             val appContext = context.applicationContext
             if (!MpvConfig.ensureSystemTrustStoreObserver(appContext)) return null
@@ -1107,7 +1107,10 @@ class MpvPlayer private constructor(
             return recoverNativeFailure("mpv-init") {
                 MpvPlayer(lib, appContext, caBundlePath)
             } ?: run {
-                runCatching { lib.destroy() }
+                recoverNativeFailure("mpv-init") {
+                    lib.destroy()
+                    Unit
+                }
                 null
             }
         }
