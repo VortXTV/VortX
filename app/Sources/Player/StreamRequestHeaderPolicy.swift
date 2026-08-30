@@ -26,6 +26,8 @@ enum StreamRequestHeaderPolicy {
         guard let rawHost = url.host?.lowercased() else { return false }
         let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
         if host == "localhost" || host == "::1" { return true }
+        if host.contains(":"), host.hasPrefix("fc") || host.hasPrefix("fd")
+            || ["fe8", "fe9", "fea", "feb"].contains(where: { host.hasPrefix($0) }) { return true }
         let octets = host.split(separator: ".", omittingEmptySubsequences: false).compactMap { UInt8($0) }
         guard octets.count == 4 else { return false }
         if octets[0] == 127 || octets[0] == 10 { return true }

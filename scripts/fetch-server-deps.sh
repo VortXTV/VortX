@@ -104,12 +104,13 @@ if [ -n "$found" ]; then
 else
     echo "No local Stremio.app found; downloading server.js v$SERVER_VERSION from dl.strem.io..."
     curl -sfL "https://dl.strem.io/server/v$SERVER_VERSION/desktop/server.js" -o "$SERVER_DEST"
-    if [ "$SERVER_VERSION" = "4.21.0" ]; then
-        verify_sha256 "$SERVER_DEST" "$SERVER_JS_4_21_0_SHA256" "server.js v$SERVER_VERSION"
-    else
-        echo "WARNING: no pinned checksum for server.js v$SERVER_VERSION; skipping verification." >&2
-    fi
 fi
+if [ "$SERVER_VERSION" != "4.21.0" ]; then
+    echo "ERROR: no reviewed proxy hardening patch exists for server.js v$SERVER_VERSION" >&2
+    exit 1
+fi
+# Verify every acquisition path, including local application bundles, before applying byte-anchored patches.
+verify_sha256 "$SERVER_DEST" "$SERVER_JS_4_21_0_SHA256" "server.js v$SERVER_VERSION"
 
 # 3) Subtitle fallback fonts (Noto Sans family, OFL 1.1) so mpv renders
 #    non-Latin subtitles. Too big for git, hosted on the same vendor release.

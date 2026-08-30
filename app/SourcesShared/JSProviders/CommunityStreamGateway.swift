@@ -5,6 +5,12 @@ import Network
 /// opaque local URL rather than a provider URL, so every initial request, range retry, subtitle request, and
 /// playlist child request crosses `PinnedHTTPClient` instead of letting a media framework resolve a hostname.
 final class CommunityStreamGateway: @unchecked Sendable {
+    typealias StreamOperation = @Sendable (
+        PinnedHTTPClient.Request,
+        @escaping @Sendable (PinnedHTTPClient.ResponseHead) async throws -> Void,
+        @escaping @Sendable (Data) async throws -> Void
+    ) async throws -> Void
+
     static let shared = CommunityStreamGateway()
 
     enum Failure: Error, Equatable {
@@ -33,8 +39,15 @@ final class CommunityStreamGateway: @unchecked Sendable {
     private let maximumRoutes = 256
     private let maximumPlaylistBytes = 2 * 1024 * 1024
     private let maximumClientHeaderBytes = 32 * 1024
+    private let streamOperation: StreamOperation
 
-    private init() {}
+    private convenience init() {
+        self.init(streamOperation: { request, onHead, onBody in
+            try await PinnedHTTPClient.stream(request, onHead: onHead, onBody: onBody)
+        })
+    }
+
+    init(streamOperation: @escaping StreamOperation) { self.streamOperation = streamOperation }
 
     /// Starts a listener bound to 127.0.0.1 only. It is intentionally never exposed on LAN interfaces.
     func start() async throws {
@@ -75,6 +88,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
     }
 
     private enum StartDecision { case alreadyReady, waiting, start }
+
     private func beginStart() -> StartDecision {
         lock.lock(); defer { lock.unlock() }
         if listener != nil { return .alreadyReady }
@@ -158,6 +172,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
+        guard Self.isLoopbackPeer(connection.endpoint) else { connection.cancel(); return }
         let lifetime = GatewayClientLifetime()
         connection.stateUpdateHandler = { state in
             switch state {
@@ -167,6 +182,16 @@ final class CommunityStreamGateway: @unchecked Sendable {
         }
         connection.start(queue: queue)
         receiveRequest(connection, buffer: Data(), lifetime: lifetime)
+    }
+
+    private static func isLoopbackPeer(_ endpoint: NWEndpoint) -> Bool {
+        guard case let .hostPort(host, _) = endpoint else { return false }
+        switch host {
+        case .ipv4(let address): return address == IPv4Address("127.0.0.1")
+        case .ipv6(let address): return address == IPv6Address("::1")
+        case .name(let name, _): return name.lowercased() == "localhost"
+        @unknown default: return false
+        }
     }
 
     private func receiveRequest(_ connection: NWConnection, buffer: Data, lifetime: GatewayClientLifetime) {
@@ -245,16 +270,16 @@ final class CommunityStreamGateway: @unchecked Sendable {
             let state = ForwardState(method: request.method, upstream: currentURL, headers: currentHeaders,
                                      maximumPlaylistBytes: maximumPlaylistBytes)
             do {
-                try await PinnedHTTPClient.stream(
+                try await streamOperation(
                     .init(url: currentURL, method: request.method, headers: currentHeaders),
-                    onHead: { head in
+                    { head in
                         if (300...399).contains(head.statusCode) { throw RedirectReceived(head: head) }
                         try await state.accept(head: head, send: { [weak self] status, responseHeaders in
                             guard let self else { throw Failure.unavailable }
                             try await self.sendHead(connection, status: status, headers: responseHeaders)
                         })
                     },
-                    onBody: { [weak self] bytes in
+                    { [weak self] bytes in
                         guard let self else { throw Failure.unavailable }
                         try await state.accept(bytes: bytes, send: { body in
                             try await self.sendBody(connection, body: body)
@@ -281,8 +306,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
                       JSProviderURLPolicy.default.isAllowed(next) else {
                     throw PinnedHTTPClient.Failure.redirect(redirect.head.statusCode)
                 }
-                currentHeaders = redirectedHeaders(currentHeaders, response: redirect.head,
-                                                   from: currentURL, to: next)
+                currentHeaders = childHeaders(currentHeaders, parent: currentURL, child: next)
                 currentURL = next
             } catch {
                 if state.hasSentHead { throw GatewayForwardFailure.downstreamStarted }
@@ -354,30 +378,10 @@ final class CommunityStreamGateway: @unchecked Sendable {
         return headers.filter { !sensitive.contains($0.key.lowercased()) }
     }
 
-    private func redirectedHeaders(_ headers: [String: String], response: PinnedHTTPClient.ResponseHead,
-                                   from: URL, to: URL) -> [String: String] {
-        guard sameOrigin(from, to) else { return childHeaders(headers, parent: from, child: to) }
-        guard let setCookie = response.headers["set-cookie"],
-              let cookie = Self.safeRedirectCookie(setCookie) else { return headers }
-        var result = headers.filter { $0.key.caseInsensitiveCompare("cookie") != .orderedSame }
-        let existing = headers.first { $0.key.caseInsensitiveCompare("cookie") == .orderedSame }?.value
-        result["Cookie"] = [existing, cookie].compactMap { $0 }.joined(separator: "; ")
-        return result
-    }
-
     private func sameOrigin(_ first: URL, _ second: URL) -> Bool {
         first.scheme?.lowercased() == second.scheme?.lowercased()
             && first.host?.lowercased() == second.host?.lowercased()
             && (first.port ?? 443) == (second.port ?? 443)
-    }
-
-    static func safeRedirectCookie(_ setCookie: String) -> String? {
-        let pair = setCookie.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true).first?
-            .trimmingCharacters(in: .whitespaces)
-        guard let pair, let equals = pair.firstIndex(of: "="), equals != pair.startIndex,
-              PinnedHTTPClient.isHTTPToken(String(pair[..<equals])),
-              PinnedHTTPClient.isValidFieldValue(String(pair[pair.index(after: equals)...])) else { return nil }
-        return String(pair)
     }
 
     private func filteredHeaders(_ input: [String: String], bodyLength: Int, preserveLength: Bool) -> [String: String] {

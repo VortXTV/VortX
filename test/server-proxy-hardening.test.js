@@ -18,18 +18,27 @@ try {
     child.execFileSync(process.execPath, [patcher, fixture], { stdio: "pipe" });
     child.execFileSync(process.execPath, ["--check", fixture], { stdio: "pipe" });
     const output = fs.readFileSync(fixture, "utf8");
-    assert(output.includes("new https.Agent;"), "normal TLS verification must use the default HTTPS agent");
+    assert(output.includes("https: new https.Agent") && output.includes("http: new http.Agent"), "HTTP and verified HTTPS use scheme-appropriate agents");
     assert(!output.includes("rejectUnauthorized: !1"), "the proxy module must not disable certificate checks");
     assert(output.includes("forbiddenAddonHeaders") && output.includes("\"range\""), "addon Range is forbidden");
     assert(output.includes("if (req.headers.range) headers.set(\"range\", req.headers.range)"), "downstream Range wins");
     assert(output.includes("sensitiveHeaders") && output.includes("sameOrigin(from, to)"), "redirect credentials are origin-bound");
-    assert(output.includes("safeCookie") && output.includes("result.headers.has(\"set-cookie\")"), "same-origin redirect cookies are retained narrowly");
+    assert(!output.includes("set-cookie") && !output.includes("safeCookie"), "unscoped response cookies are never propagated");
     assert(output.includes("new AbortController") && output.includes("req.once(\"aborted\", abort)"), "timeouts and disconnect abort upstream");
     assert(output.includes("setTimeout(() => controller.abort(), 15000)") && output.includes("setTimeout(abort, 10000)"), "head and idle deadlines are bounded");
+    assert((output.match(/stream\.pipeline\(/g) || []).length === 2 && output.includes("function settle(error)"), "progressive and HLS bodies have exactly-once pipeline ownership");
+    assert(output.includes("clearTimeout(timer); clearTimeout(idle)") && output.includes("controller.abort(); if (!res.destroyed) res.destroy()"), "body failures clear deadlines and tear down both sides");
     assert(output.includes("res.sendStatus(error && error.name === \"AbortError\" ? 504 : 502)"), "pre-head timeout is a bounded 504");
     assert(output.includes("fetchOnce(dest") && !output.includes("rejectUnauthorized: false"), "each redirect/final response uses one verified fetch");
     assert(patchSource.includes("childProxy") && patchSource.includes("parseLine"), "playlist children remain routed through the proxy");
-    console.log("Embedded server proxy hardening: PASS (11 checks)");
+    assert(output.includes("headers: finalHeaders") && output.includes("finalHeaders.forEach")
+        && !output.includes("ensureArray(opts[cfgOpts.DestinationHeader]).forEach"),
+        "playlist children inherit only the credential scope that reached the final origin");
+    const fetchScript = fs.readFileSync(path.join(root, "scripts/fetch-server-deps.sh"), "utf8");
+    assert(fetchScript.includes('if [ "$SERVER_VERSION" != "4.21.0" ]')
+        && fetchScript.indexOf('verify_sha256 "$SERVER_DEST"') < fetchScript.indexOf('node scripts/patch-server-proxy.js'),
+        "only the checksum-pinned 4.21 bundle may be patched");
+    console.log("Embedded server proxy hardening: PASS (15 checks)");
 } finally {
     try { fs.unlinkSync(fixture); } catch (_) {}
 }

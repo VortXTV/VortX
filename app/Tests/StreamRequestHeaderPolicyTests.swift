@@ -44,6 +44,10 @@ private struct StreamRequestHeaderPolicyTests {
                "IPv4 loopback is local")
         expect(StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "http://192.168.1.5/file")!),
                "private embedded routes are local")
+        expect(StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "http://[fd12:3456::1]/file")!),
+               "IPv6 unique-local routes are local")
+        expect(StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "http://[fe80::1]/file")!),
+               "IPv6 link-local routes are local")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "https://foo.strem.io/file")!),
                "a strem.io subdomain is remote")
         expect(!StreamRequestHeaderPolicy.isLocalPlaybackURL(URL(string: "https://evilstrem.io/file")!),
