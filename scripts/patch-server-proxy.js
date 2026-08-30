@@ -17,7 +17,7 @@ if (start < 0 || end < 0 || source.indexOf(startMarker, start + 1) >= 0 || sourc
 const moduleSource = `}, function(module, exports, __webpack_require__) {
     var path = __webpack_require__(5), url = __webpack_require__(6), querystring = __webpack_require__(24), Router = __webpack_require__(100), stream = __webpack_require__(3), http = __webpack_require__(11), https = __webpack_require__(20), net = __webpack_require__(39), dns = __webpack_require__(620), fetch = __webpack_require__(34), Headers = fetch.Headers, cfgOpts = {
         Destination: "d", DestinationHeader: "h", ResponseHeader: "r"
-    }, proxyReqHeaders = [ "accept", "accept-language", "range", "if-range", "user-agent" ], proxyResHeaders = [ "accept-ranges", "content-type", "content-length", "content-range", "connection", "transfer-encoding", "last-modified", "etag", "server", "date" ], supportedPlaylists = [ ".m3u", ".m3u8" ], forbiddenAddonHeaders = new Set([ "host", "connection", "content-length", "transfer-encoding", "proxy-connection", "proxy-authorization", "proxy-authenticate", "upgrade", "range", "te", "trailer", "keep-alive" ]), safeCrossOriginHeaders = new Set([ "accept", "accept-language", "range", "if-range", "user-agent" ]), maximumPlaylistBytes = 2097152, maximumPlaylistLineBytes = 65536;
+    }, proxyReqHeaders = [ "accept", "accept-language", "range", "if-range", "user-agent" ], proxyResHeaders = [ "accept-ranges", "content-type", "content-length", "content-range", "connection", "transfer-encoding", "last-modified", "etag", "server", "date" ], supportedPlaylists = [ ".m3u", ".m3u8" ], forbiddenAddonHeaders = new Set([ "host", "connection", "content-length", "transfer-encoding", "proxy-connection", "proxy-authorization", "proxy-authenticate", "upgrade", "range", "te", "trailer", "keep-alive" ]), safeCrossOriginHeaders = new Set([ "accept", "accept-language", "range", "if-range", "user-agent" ]), maximumPlaylistBytes = 2097152, maximumPlaylistLineBytes = 65536, headTimeoutMilliseconds = 15000;
     function ensureArray(value) { return Array.isArray(value) ? value : value ? [ value ] : []; }
     function validName(name) { return /^[!#$%&'*+.^_\\\`|~0-9A-Za-z-]+$/.test(name); }
     function validValue(value) { return !/[\\r\\n]/.test(value); }
@@ -60,26 +60,37 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
         var lower = address.toLowerCase();
         if (lower.startsWith("::ffff:")) return isPublicAddress(lower.slice(7));
         var compact = lower.replace(/:/g, "");
-        return !lower.includes(".") && !lower.includes("ffff") && !/^0+$/.test(compact) && !/^0*1$/.test(compact)
-            && !lower.startsWith("fc") && !lower.startsWith("fd")
-            && !/^fe[89ab]/.test(lower) && !lower.startsWith("ff") && !lower.startsWith("2001:db8:")
-            && !/^fe[c-f]/.test(lower);
+        // Only globally routed unicast is accepted. This deliberately excludes the well-known and
+        // local-use NAT64 prefixes, which could otherwise synthesize a private IPv4 destination.
+        return /^[23]/.test(lower) && !lower.includes(".") && !lower.includes("ffff")
+            && !/^2001:0*db8:/.test(lower) && !/^fe[c-f]/.test(lower) && !/^0+$/.test(compact) && !/^0*1$/.test(compact);
     }
-    function resolvePublic(dest) {
+    function abortError() { var error = new Error("Destination resolution timed out"); error.name = "AbortError"; return error; }
+    function resolvePublic(dest, signal) {
         if (net.isIP(dest.hostname)) return isPublicAddress(dest.hostname) ? Promise.resolve(dest.hostname) : Promise.reject(new Error("Unsafe destination"));
-        return new Promise((resolve, reject) => dns.lookup(dest.hostname, { all: true, verbatim: true }, (error, answers) => {
-            if (error || !Array.isArray(answers) || !answers.length) return reject(error || new Error("Empty DNS answer"));
-            var addresses = answers.map(answer => typeof answer === "string" ? answer : answer.address);
-            if (!addresses.every(isPublicAddress)) return reject(new Error("Unsafe DNS answer"));
-            resolve(addresses[0]);
-        }));
+        return new Promise((resolve, reject) => {
+            var settled = false, timer;
+            function aborted() { if (!settled) { finish(); reject(abortError()); } }
+            function finish() { settled = true; clearTimeout(timer); signal.removeEventListener("abort", aborted); }
+            signal.addEventListener("abort", aborted, { once: true });
+            if (signal.aborted) return aborted();
+            timer = setTimeout(aborted, headTimeoutMilliseconds);
+            dns.lookup(dest.hostname, { all: true, verbatim: true }, (error, answers) => {
+                if (settled) return;
+                finish();
+                if (error || !Array.isArray(answers) || !answers.length) return reject(error || new Error("Empty DNS answer"));
+                var addresses = answers.map(answer => typeof answer === "string" ? answer : answer.address);
+                if (!addresses.every(isPublicAddress)) return reject(new Error("Unsafe DNS answer"));
+                resolve(addresses[0]);
+            });
+        });
     }
     function pinnedAgent(dest, address) {
         var Agent = dest.protocol === "https:" ? https.Agent : http.Agent;
         return new Agent({ lookup: function(_, options, callback) { callback(null, address, net.isIP(address)); } });
     }
     function fetchOnce(dest, req, headers, controller) {
-        return resolvePublic(dest).then(address => {
+        return resolvePublic(dest, controller.signal).then(address => {
             var agent = pinnedAgent(dest, address);
             return fetch(url.format(dest), { method: req.method, headers: headers, agent: agent, redirect: "manual", signal: controller.signal })
                 .then(result => ({ result: result, agent: agent }), error => { agent.destroy(); throw error; });
@@ -119,7 +130,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
             applyAddonHeaders(headers, opts[cfgOpts.DestinationHeader]);
             if (req.headers.range) headers.set("range", req.headers.range);
             else headers.delete("range");
-            var controller = new AbortController, started = false, settled = false, activeAgent, idle, timer = setTimeout(() => controller.abort(), 15000);
+            var controller = new AbortController, started = false, settled = false, activeAgent, idle, timer = setTimeout(() => controller.abort(), headTimeoutMilliseconds);
             function abort() { controller.abort(); }
             function settle(error) {
                 if (settled) return;
@@ -127,6 +138,11 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                 req.removeListener("aborted", abort);
                 if (activeAgent) activeAgent.destroy();
                 if (error) { controller.abort(); if (!res.destroyed) res.destroy(); }
+            }
+            function failBeforeHead(error) {
+                if (settled) return;
+                settled = true; clearTimeout(timer); clearTimeout(idle); req.removeListener("aborted", abort); controller.abort();
+                res.sendStatus(error && error.name === "AbortError" ? 504 : 502);
             }
             req.once("aborted", abort); res.once("close", function() { if (!res.writableEnded) { abort(); settle(new Error("downstream closed")); } });
             fetchWithRedirects(dest, req, headers, controller).then(({ result, dest: finalDest, headers: finalHeaders, agent }) => {
@@ -186,7 +202,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
                 stream.pipeline(result.body, rewrite, res, settle);
             }).catch(error => {
                 clearTimeout(timer); clearTimeout(idle);
-                if (!started && !res.headersSent) res.sendStatus(error && error.name === "AbortError" ? 504 : 502);
+                if (!started && !res.headersSent) failBeforeHead(error);
                 else settle(error);
             });
         }), router;
