@@ -1324,7 +1324,10 @@ private suspend fun OkHttpClient.awaitResponse(request: Request, timeoutMs: Long
 
             override fun onResponse(call: Call, response: Response) {
                 if (completed.compareAndSet(false, true)) {
-                    continuation.resumeWith(Result.success(response))
+                    // A cancellation may win after this callback receives ownership but before the
+                    // suspended caller can enter its response.use block. Bind cleanup to resume itself
+                    // so that race closes this exact response rather than leaking its socket/body.
+                    continuation.resume(response) { _, delivered, _ -> delivered.close() }
                 } else {
                     response.close()
                 }
