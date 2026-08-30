@@ -66,8 +66,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
             && !/^2001:0*db8:/.test(lower) && !/^fe[c-f]/.test(lower) && !/^0+$/.test(compact) && !/^0*1$/.test(compact);
     }
     function abortError() { var error = new Error("Destination resolution timed out"); error.name = "AbortError"; return error; }
-    function resolvePublic(dest, signal) {
-        if (net.isIP(dest.hostname)) return isPublicAddress(dest.hostname) ? Promise.resolve(dest.hostname) : Promise.reject(new Error("Unsafe destination"));
+    function lookupAddresses(hostname, signal) {
         return new Promise((resolve, reject) => {
             var settled = false, timer;
             function aborted() { if (!settled) { finish(); reject(abortError()); } }
@@ -75,14 +74,71 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
             signal.addEventListener("abort", aborted, { once: true });
             if (signal.aborted) return aborted();
             timer = setTimeout(aborted, headTimeoutMilliseconds);
-            dns.lookup(dest.hostname, { all: true, verbatim: true }, (error, answers) => {
+            dns.lookup(hostname, { all: true, verbatim: true }, (error, answers) => {
                 if (settled) return;
                 finish();
                 if (error || !Array.isArray(answers) || !answers.length) return reject(error || new Error("Empty DNS answer"));
-                var addresses = answers.map(answer => typeof answer === "string" ? answer : answer.address);
-                if (!addresses.every(isPublicAddress)) return reject(new Error("Unsafe DNS answer"));
-                resolve(addresses[0]);
+                resolve(answers.map(answer => typeof answer === "string" ? answer : answer.address));
             });
+        });
+    }
+    function ipv6Bytes(address) {
+        if (net.isIP(address) !== 6 || address.includes(".")) return null;
+        var sides = address.toLowerCase().split("::");
+        if (sides.length > 2) return null;
+        var left = sides[0] ? sides[0].split(":") : [], right = sides.length === 2 && sides[1] ? sides[1].split(":") : [];
+        var missing = 8 - left.length - right.length;
+        if (missing < 0 || (sides.length === 1 && missing !== 0)) return null;
+        var words = left.concat(Array(missing).fill("0"), right).map(word => parseInt(word, 16));
+        if (words.length !== 8 || words.some(word => !Number.isInteger(word) || word < 0 || word > 65535)) return null;
+        return words.reduce((bytes, word) => bytes.concat([ word >> 8, word & 255 ]), []);
+    }
+    function bit(bytes, index) { return bytes[index >> 3] >> (7 - (index & 7)) & 1; }
+    function embeddedIPv4(bytes, prefixLength) {
+        if (prefixLength !== 96 && bytes[8] !== 0) return null;
+        var beforeU = prefixLength === 96 ? 32 : 64 - prefixLength, value = 0;
+        for (var index = 0; index < 32; index++) value = value * 2 + bit(bytes, index < beforeU ? prefixLength + index : 72 + index - beforeU);
+        var suffixStart = prefixLength === 96 ? 128 : 72 + 32 - beforeU;
+        for (var suffix = suffixStart; suffix < 128; suffix++) if (bit(bytes, suffix)) return null;
+        return [ value >>> 24, value >>> 16 & 255, value >>> 8 & 255, value & 255 ];
+    }
+    function samePrefix(bytes, prefix) {
+        for (var index = 0; index < prefix.length; index++) if (bit(bytes, index) !== prefix.bits[index]) return false;
+        return true;
+    }
+    function discoverPref64(signal) {
+        // Do not cache across requests: a network transition can change PREF64 without changing process state.
+        return lookupAddresses("ipv4only.arpa", signal).then(addresses => {
+            var prefixes = [];
+            addresses.forEach(address => {
+                var bytes = ipv6Bytes(address);
+                if (!bytes) return;
+                [ 32, 40, 48, 56, 64, 96 ].forEach(length => {
+                    var embedded = embeddedIPv4(bytes, length);
+                    if (embedded && embedded[0] === 192 && embedded[1] === 0 && embedded[2] === 0 && (embedded[3] === 170 || embedded[3] === 171)) {
+                        prefixes.push({ length: length, bits: Array.from({ length: length }, (_, index) => bit(bytes, index)) });
+                    }
+                });
+            });
+            if (!prefixes.length) throw new Error("PREF64 unavailable");
+            return prefixes;
+        });
+    }
+    function rejectActivePref64(addresses, signal) {
+        var ipv6 = addresses.filter(address => net.isIP(address) === 6);
+        if (!ipv6.length) return Promise.resolve();
+        return discoverPref64(signal).then(prefixes => {
+            if (ipv6.some(address => { var bytes = ipv6Bytes(address); return !bytes || prefixes.some(prefix => samePrefix(bytes, prefix)); })) throw new Error("Unsafe PREF64 destination");
+        });
+    }
+    function resolvePublic(dest, signal) {
+        if (net.isIP(dest.hostname)) {
+            if (!isPublicAddress(dest.hostname)) return Promise.reject(new Error("Unsafe destination"));
+            return rejectActivePref64([ dest.hostname ], signal).then(() => dest.hostname);
+        }
+        return lookupAddresses(dest.hostname, signal).then(addresses => {
+            if (!addresses.every(isPublicAddress)) throw new Error("Unsafe DNS answer");
+            return rejectActivePref64(addresses, signal).then(() => addresses[0]);
         });
     }
     function pinnedAgent(dest, address) {

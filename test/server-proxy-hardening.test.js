@@ -39,6 +39,7 @@ try {
     assert(output.includes("req.method !== \"GET\" && req.method !== \"HEAD\""), "the proxy refuses non-playback HTTP methods");
     assert(output.includes("resolvePublic(dest, controller.signal)") && output.includes("addresses.every(isPublicAddress)"), "every hop requires a cancellable wholly public DNS snapshot");
     assert(output.includes("headTimeoutMilliseconds") && output.includes("signal.addEventListener(\"abort\", aborted"), "DNS resolution shares the advertised head deadline and downstream cancellation");
+    assert(output.includes("ipv4only.arpa") && output.includes("[ 32, 40, 48, 56, 64, 96 ]"), "active PREF64 discovery recognizes every RFC6052 layout");
     assert(output.includes("maximumPlaylistBytes") && output.includes("maximumPlaylistLineBytes"), "playlist bytes and partial lines have hard caps");
     assert(output.includes("result.body.resume(); result.body.destroy()"), "redirect response bodies are drained and cancelled before recursion");
     assert(output.includes("fetchOnce(dest") && !output.includes("rejectUnauthorized: false"), "each redirect/final response uses one verified fetch");
@@ -59,7 +60,7 @@ try {
     assert.notStrictEqual(ambiguousResult.status, 0, "a duplicate end anchor must fail closed");
     assert(ambiguousResult.stderr.includes("unique proxy module anchors not found"), "duplicate end reports the explicit anchor-integrity error");
     fs.unlinkSync(ambiguous);
-    executeRedirectedPlaylistFixture(output).then(({ rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, publicIPv6DNSResult, publicIPv6LiteralResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, methodResult, oversizedResult }) => {
+    executeRedirectedPlaylistFixture(output).then(({ rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, activePref64Results, publicIPv6DNSResult, publicIPv6LiteralResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, discoveryNeverResult, discoveryLateResult, lateDiscoveryCallbackCount, methodResult, oversizedResult }) => {
         const childURL = new URL(rewritten.trim(), "http://127.0.0.1");
         const encoded = childURL.pathname.slice("/proxy/".length).split("/")[0];
         const childOpts = querystring.parse(encoded);
@@ -82,6 +83,8 @@ try {
         assert.strictEqual(hostileDNSResult.status, 502, "private DNS answers fail before fetch");
         assert.strictEqual(nat64DNSResult.status, 502, "NAT64 DNS answers fail before fetch");
         assert.strictEqual(nat64LocalDNSResult.status, 502, "local-use NAT64 DNS answers fail before fetch");
+        assert(activePref64Results.length === 6 && activePref64Results.every(result => result.status === 502),
+            "active global /96, /64, and /40 PREF64 targets are rejected as both literals and DNS answers");
         assert.strictEqual(publicIPv6DNSResult.status, 200, "globally routed IPv6 remains valid when ffff is an interior hextet");
         assert.strictEqual(publicIPv6LiteralResult.status, 200, "globally routed IPv6 remains valid when ffff is the final hextet");
         assert.strictEqual(mixedDNSResult.status, 502, "mixed public/private DNS snapshots fail closed against rebinding");
@@ -90,10 +93,12 @@ try {
             "a non-returning resolver gets a prompt 504 and releases its downstream listener");
         assert(lateDNSResult.status === 504 && lateDNSCallbackCount === 1,
             "a late resolver callback is ignored after timeout cleanup");
+        assert(discoveryNeverResult.status === 504 && discoveryLateResult.status === 504 && lateDiscoveryCallbackCount === 1,
+            "unavailable and late PREF64 discovery fail IPv6 closed without accepting a late prefix");
         assert.strictEqual(methodResult.status, 405, "non-GET/HEAD methods are rejected");
         assert(oversizedResult.closed && oversizedResult.status === 200, "unterminated over-limit playlist is terminated after headers");
         assert(redirectBodies.length === 2 && redirectBodies.every(body => body.destroyed), "redirect response bodies are destroyed before the next hop");
-        console.log("Embedded server proxy hardening: PASS (49 checks)");
+        console.log("Embedded server proxy hardening: PASS (53 checks)");
     }).catch(error => { process.nextTick(() => { throw error; }); });
 } finally {
     // The behavior promise has already loaded the generated module source into memory.
@@ -141,10 +146,18 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
         "nat64.example": [ { address: "64:ff9b::7f00:1", family: 6 } ],
         "nat64-local.example": [ { address: "64:ff9b:1::a00:1", family: 6 } ],
         "public-v6.example": [ { address: "2606:4700:ffff::1", family: 6 } ],
+        "pref64-96.example": [ { address: "2001:4860:64::a00:1", family: 6 } ],
+        "pref64-64.example": [ { address: "2001:4860:abcd:1234:a:0:100:0", family: 6 } ],
+        "pref64-40.example": [ { address: "2001:4860:ab0a:0:1::", family: 6 } ],
         "mixed.example": [ { address: "8.8.8.8", family: 4 }, { address: "127.0.0.1", family: 4 } ]
     };
-    let lateDNSCallbackCount = 0;
+    let lateDNSCallbackCount = 0, lateDiscoveryCallbackCount = 0, pref64Mode = "normal", pref64Answers = [ { address: "2001:4860:64::c000:aa", family: 6 } ];
     const dnsFixture = { lookup(host, options, callback) {
+        if (host === "ipv4only.arpa") {
+            if (pref64Mode === "never") return;
+            if (pref64Mode === "late") return setTimeout(() => { lateDiscoveryCallbackCount += 1; callback(null, pref64Answers); }, 60);
+            return callback(null, pref64Answers);
+        }
         if (host === "never.example") return;
         if (host === "late.example") return setTimeout(() => { lateDNSCallbackCount += 1; callback(null, [ { address: "8.8.8.8", family: 4 } ]); }, 60);
         callback(null, dnsAnswers[host] || []);
@@ -192,6 +205,18 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
     assert.strictEqual(calls.length, beforeHostile, "unsafe destinations never reach fetch");
     const redirectDNSResult = await request(querystring.stringify({ d: "https://redirect-private.example" }), "start");
     assert.strictEqual(calls.length, beforeHostile + 1, "private redirect target is rejected before its own fetch");
+    const activePref64Results = [];
+    pref64Answers = [ { address: "2001:4860:64::c000:aa", family: 6 } ];
+    activePref64Results.push(await request(querystring.stringify({ d: "http://[2001:4860:64::a00:1]" }), "secret"));
+    activePref64Results.push(await request(querystring.stringify({ d: "https://pref64-96.example" }), "secret"));
+    pref64Answers = [ { address: "2001:4860:abcd:1234:c0:0:aa00:0", family: 6 } ];
+    activePref64Results.push(await request(querystring.stringify({ d: "http://[2001:4860:abcd:1234:a:0:100:0]" }), "secret"));
+    activePref64Results.push(await request(querystring.stringify({ d: "https://pref64-64.example" }), "secret"));
+    pref64Answers = [ { address: "2001:4860:abc0:0:aa::", family: 6 } ];
+    activePref64Results.push(await request(querystring.stringify({ d: "http://[2001:4860:ab0a:0:1::]" }), "secret"));
+    activePref64Results.push(await request(querystring.stringify({ d: "https://pref64-40.example" }), "secret"));
+    assert.strictEqual(calls.length, beforeHostile + 1, "active PREF64 destinations never reach fetch");
+    pref64Answers = [ { address: "2001:4860:64::c000:aa", family: 6 } ];
     const publicIPv6DNSResult = await request(querystring.stringify({ d: "https://public-v6.example" }), "video.ts");
     const publicIPv6LiteralResult = await request(querystring.stringify({ d: "http://[2606:4700::ffff]" }), "video.ts");
     const beforeResolverTimeouts = calls.length;
@@ -199,7 +224,13 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
     const lateDNSResult = await request(querystring.stringify({ d: "https://late.example" }), "secret");
     await new Promise(resolve => setTimeout(resolve, 80));
     assert.strictEqual(calls.length, beforeResolverTimeouts, "timed-out and late DNS resolutions never create an agent or fetch");
+    pref64Mode = "never";
+    const discoveryNeverResult = await request(querystring.stringify({ d: "https://public-v6.example" }), "video.ts");
+    pref64Mode = "late";
+    const discoveryLateResult = await request(querystring.stringify({ d: "https://public-v6.example" }), "video.ts");
+    await new Promise(resolve => setTimeout(resolve, 80)); pref64Mode = "normal";
+    assert.strictEqual(calls.length, beforeResolverTimeouts, "timed-out and late PREF64 discovery never create an agent or fetch");
     const methodResult = await request(querystring.stringify({ d: "https://b.example" }), "segment.ts", "POST");
     const oversizedResult = await request(querystring.stringify({ d: "https://big.example" }), "list.m3u8");
-    return { rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, publicIPv6DNSResult, publicIPv6LiteralResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, methodResult, oversizedResult };
+    return { rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, activePref64Results, publicIPv6DNSResult, publicIPv6LiteralResult, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, discoveryNeverResult, discoveryLateResult, lateDiscoveryCallbackCount, methodResult, oversizedResult };
 }
