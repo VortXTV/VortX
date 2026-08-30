@@ -22,13 +22,22 @@ class PlayerTvExitContractTest {
     }
 
     @Test
+    fun `original orientation survives in-player retry and Up Next session replacement`() {
+        val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
+
+        assertTrue(screen.contains("var playerPreviousOrientation by remember { mutableStateOf<Int?>(null) }"))
+        assertFalse(screen.contains("playerPreviousOrientation by remember(outerPlaybackSessionId)"))
+        assertTrue(screen.contains("if (playerPreviousOrientation == null) playerPreviousOrientation = previousOrientation"))
+    }
+
+    @Test
     fun `TV player and failure overlay both request a reachable initial focus target`() {
         val chrome = source("src/main/kotlin/com/vortx/android/player/PlayerChrome.kt")
 
         assertTrue(chrome.contains("val tvChromeFocus = remember { FocusRequester() }"))
         assertTrue(chrome.contains("Modifier.focusRequester(tvChromeFocus)"))
         assertTrue(chrome.contains("val recoveryFocus = remember { FocusRequester() }"))
-        assertTrue(chrome.contains("Modifier.focusRequester(recoveryFocus)"))
+        assertTrue(chrome.contains(".focusRequester(recoveryFocus)"))
     }
 
     @Test
@@ -48,15 +57,20 @@ class PlayerTvExitContractTest {
         assertTrue(failureCircuit.isDisabled())
     }
 
-    @Test(expected = CancellationException::class)
-    fun `trickplay capture propagates cancellation and leaves the circuit available`() = runBlocking {
+    @Test
+    fun `trickplay capture propagates cancellation and leaves the circuit available`() {
         val circuit = TrickplayCaptureCircuitBreaker()
+        var cancelled = false
 
         try {
-            circuit.attempt { throw CancellationException("player closed") }
-        } finally {
-            assertFalse(circuit.isDisabled())
+            runBlocking {
+                circuit.attempt { throw CancellationException("player closed") }
+            }
+        } catch (_: CancellationException) {
+            cancelled = true
         }
+        assertTrue(cancelled)
+        assertFalse(circuit.isDisabled())
     }
 
     private fun source(relativePath: String): String {

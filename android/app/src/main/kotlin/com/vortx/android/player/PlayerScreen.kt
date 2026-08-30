@@ -191,7 +191,11 @@ fun PlayerScreen(
     // this one idempotent route. The outer shell still owns navigation state, but it must not receive a
     // second Back while the first callback is waiting for composition to remove this player.
     var playerExitRequested by remember(outerPlaybackSessionId) { mutableStateOf(false) }
-    var playerPreviousOrientation by remember(outerPlaybackSessionId) { mutableStateOf<Int?>(null) }
+    // Orientation belongs to this PLAYER MOUNT, not a source retry or an Up Next replacement. Those
+    // operations change [outerPlaybackSessionId] while the same fullscreen composition remains active.
+    // Re-keying this value would erase the pre-player orientation and make a later exit restore the
+    // generic UNSPECIFIED fallback instead of the host's actual prior request.
+    var playerPreviousOrientation by remember { mutableStateOf<Int?>(null) }
     fun restorePlayerWindow() {
         val activity = hostActivity ?: return
         activity.window?.let { window ->
@@ -425,7 +429,7 @@ fun PlayerScreen(
         val activity = hostActivity
         val previousOrientation = activity?.requestedOrientation
             ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        playerPreviousOrientation = previousOrientation
+        if (playerPreviousOrientation == null) playerPreviousOrientation = previousOrientation
         activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         val insetsController = activity?.window?.let { w ->
             WindowInsetsControllerCompat(w, w.decorView).apply {
