@@ -27,6 +27,23 @@ class MpvEngineFactoryTest {
         assertSame(expected, MpvEngineFactory.createSafely { expected })
     }
 
+    @Test fun `out of memory remains fatal`() {
+        val failure = OutOfMemoryError("fatal")
+        assertSame(failure, thrownBy { MpvEngineFactory.createSafely { throw failure } })
+    }
+
+    @Test fun `thread death remains fatal`() {
+        val failure = ThreadDeath()
+        assertSame(failure, thrownBy { MpvEngineFactory.createSafely { throw failure } })
+    }
+
+    private fun thrownBy(block: () -> Unit): Throwable = try {
+        block()
+        throw AssertionError("expected failure")
+    } catch (failure: Throwable) {
+        failure
+    }
+
     private class StubEngine : PlayerEngine {
         override val state = MutableStateFlow(PlayerState())
         override fun load(playable: com.vortx.android.model.Playable) = Unit

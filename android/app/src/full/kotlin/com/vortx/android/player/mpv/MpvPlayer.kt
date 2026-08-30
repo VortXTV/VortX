@@ -21,6 +21,7 @@ import com.vortx.android.player.PlayerState
 import com.vortx.android.player.PlayerTrack
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.VideoScaleMode
+import com.vortx.android.player.recoverNativeFailure
 import com.vortx.android.player.tuning.AdaptiveTuning
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -1100,12 +1101,12 @@ class MpvPlayer private constructor(
             val appContext = context.applicationContext
             if (!MpvConfig.ensureSystemTrustStoreObserver(appContext)) return null
             val caBundlePath = MpvConfig.provisionSystemCaBundle(appContext) ?: return null
-            val lib = try {
+            val lib = recoverNativeFailure("native-create") {
                 MPVLib.create(appContext)
-            } catch (_: Throwable) {
-                null
             } ?: return null
-            return runCatching { MpvPlayer(lib, appContext, caBundlePath) }.getOrElse {
+            return recoverNativeFailure("mpv-init") {
+                MpvPlayer(lib, appContext, caBundlePath)
+            } ?: run {
                 runCatching { lib.destroy() }
                 null
             }

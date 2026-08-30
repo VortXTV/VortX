@@ -2,6 +2,7 @@ package com.vortx.android.player
 
 import android.content.Context
 import com.vortx.android.player.mpv.MpvPlayer
+import kotlinx.coroutines.CancellationException
 
 /// `full` flavor factory: builds the real libmpv [PlayerEngine]. This is the flavor-specific half of the
 /// seam declared (contract-only) in [PlayerEngine]. Returns null when libmpv cannot start on this device
@@ -11,12 +12,32 @@ import com.vortx.android.player.mpv.MpvPlayer
 object MpvEngineFactory {
     const val isBundled: Boolean = true
 
-    fun create(context: Context): PlayerEngine? = createSafely { MpvPlayer.create(context) }
+    fun create(context: Context): PlayerEngine? = recoverNativeFailure("native-linkage") {
+        MpvPlayer.create(context)
+    }
 
     /** Native linkage and class initialization failures are Errors, not Exceptions. */
-    internal fun createSafely(createMpv: () -> PlayerEngine?): PlayerEngine? = try {
-        createMpv()
-    } catch (_: Throwable) {
-        null
+    internal fun createSafely(createMpv: () -> PlayerEngine?): PlayerEngine? =
+        recoverNativeFailure("native-linkage", createMpv)
+}
+
+/** Converts expected optional-native failures to null without hiding process-fatal conditions. */
+internal inline fun <T> recoverNativeFailure(stage: String, action: () -> T?): T? = try {
+    action()
+} catch (failure: Throwable) {
+    when (failure) {
+        is VirtualMachineError,
+        is ThreadDeath,
+        is CancellationException,
+        -> throw failure
+        is LinkageError,
+        is Exception,
+        -> {
+            val message = "VortX optional native fallback stage=$stage failure=${failure.javaClass.name}"
+            runCatching { android.util.Log.w("MpvEngineFactory", message) }
+                .onFailure { System.err.println(message) }
+            null
+        }
+        else -> throw failure
     }
 }
