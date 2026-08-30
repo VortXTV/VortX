@@ -184,7 +184,9 @@ internal fun StreamSource.directPlaybackUrl(fallbackHandle: String): String? =
     url?.takeIf(::isHttpPlaybackUrl) ?: fallbackHandle.takeIf(::isHttpPlaybackUrl)
 
 private fun isHttpPlaybackUrl(value: String): Boolean =
-    value.startsWith("http://", ignoreCase = true) || value.startsWith("https://", ignoreCase = true)
+    runCatching { URI(value.trim()) }.getOrNull()?.let { uri ->
+        (uri.scheme.equals("http", true) || uri.scheme.equals("https", true)) && !uri.host.isNullOrBlank()
+    } == true
 
 internal fun usenetPlaybackFailure(error: Throwable): Throwable = when (error) {
     DebridResolver.DebridException.NoKey ->
@@ -2190,6 +2192,7 @@ class EngineStremioRepository(
                 isAtmos = isAtmos,
                 headers = source.requestHeaders,
                 externalSubtitles = source.externalSubtitles,
+                externalSubtitleTracks = source.externalSubtitleTracks,
             )
         } else if (source.isTorrent) {
             // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent

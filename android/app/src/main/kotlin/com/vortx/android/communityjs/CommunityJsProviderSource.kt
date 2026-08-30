@@ -4,6 +4,7 @@ import android.content.Context
 import com.vortx.android.catalog.CatalogTmdbEdge
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.ExternalSubtitle
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -119,6 +120,7 @@ class CommunityJsProviderSource(context: Context) {
                 vortxProvider = "community-js:${provider.id}",
                 requestHeaders = stream.headers,
                 externalSubtitles = stream.subtitles.map(CommunityJsRuntime.Subtitle::url),
+                externalSubtitleTracks = stream.subtitles.map { ExternalSubtitle(it.url, it.headers, it.language, it.name) },
             )
         }
         return mapped.takeIf { it.isNotEmpty() }?.let { StreamGroup(addon = provider.name, streams = it, base = "community-js:${provider.id}") }

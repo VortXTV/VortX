@@ -459,6 +459,8 @@ data class StreamSource(
     val requestHeaders: Map<String, String> = emptyMap(),
     /** External sidecar subtitle URLs returned by a source provider. */
     val externalSubtitles: List<String> = emptyList(),
+    /** Structured sidecars preserve provider-specific request metadata without changing URL-only callers. */
+    val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
 ) {
     /// A USENET stream: no direct [url] yet, but an `.nzb` link to resolve through a usenet-capable
     /// debrid account. Like a raw torrent, it needs resolution before it is playable. Kept mutually
@@ -498,6 +500,13 @@ data class StreamSource(
         const val TRAILER_RESOLVER_BASE: String = "https://trailer.vortx.tv"
     }
 }
+
+data class ExternalSubtitle(
+    val url: String,
+    val headers: Map<String, String> = emptyMap(),
+    val language: String? = null,
+    val name: String? = null,
+)
 
 /// Sources grouped by the add-on that returned them, mirroring `CoreStreamSourceGroup`. The detail
 /// page renders one labeled block per group, best source first.
@@ -545,6 +554,7 @@ data class Playable(
     /// External sidecar subtitle URLs to mount alongside the video (add-on resolved subtitles). mpv
     /// mounts them via `sub-add`; the ExoPlayer path can attach them as side-loaded text tracks.
     val externalSubtitles: List<String> = emptyList(),
+    val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
     /// The provider-agnostic content identity for external progress sync (Trakt / SIMKL scrobble). Null
     /// for a source with no resolvable id (a pasted magnet, a kitsu-only catalog) or for the offline
     /// preview, in which case the player simply does not scrobble. Attached by

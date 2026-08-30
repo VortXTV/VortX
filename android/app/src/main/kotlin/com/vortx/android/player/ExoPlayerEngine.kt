@@ -222,7 +222,13 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // External sidecars need a concrete Media3 MIME. Admit recognized path extensions and explicit
         // format metadata carried by extensionless URLs. Opaque extensionless URLs are rejected with a
         // reason instead of guessed as a parser type or synchronously fetched on the playback thread.
-        val subtitleConfigs = playable.externalSubtitles.mapNotNull { subUrl ->
+        val subtitleTracks = if (playable.externalSubtitleTracks.isEmpty()) {
+            playable.externalSubtitles.map { com.vortx.android.model.ExternalSubtitle(it) }
+        } else {
+            playable.externalSubtitleTracks
+        }
+        val subtitleConfigs = subtitleTracks.mapNotNull { subtitle ->
+            val subUrl = subtitle.url
             val decision = externalSubtitleMimeDecision(subUrl)
             val mime = decision.mimeType ?: run {
                 Log.w(TAG, "Skipping external subtitle: ${decision.rejectionReason}")
