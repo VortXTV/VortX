@@ -4189,6 +4189,64 @@ enum PlayerLiveContractTests {
               ])
                   && tvPlayer?.contains("let audioChoice = captureSelectedAudioChoice()") == true
                   && tvPlayer?.contains("preservingAudioChoice: audioChoice") == true)
+        let tvDemote = sourceSection(
+            tvPlayer,
+            from: "private func demoteAVPlayerToMPV() -> Bool",
+            to: "/// SwiftUI construction has no synchronous completion callback")
+        let tvEngineSwitch = sourceSection(
+            tvPlayer,
+            from: "private func switchPlayerEngine(toAVPlayer: Bool)",
+            to: "/// Show a brief player toast")
+        check("wiring: paused AV demotion and both manual engine directions carry a token-fenced transport intent",
+              sourceContainsInOrder(tvDemote, [
+                "let desiredPaused = isPaused",
+                "captureRecoverySelections()",
+                "queueIncomingTransportIntent(paused: desiredPaused)",
+              ])
+                  && sourceContainsInOrder(tvEngineSwitch, [
+                    "let desiredPaused = isPaused",
+                    "captureRecoverySelections()",
+                    "queueIncomingTransportIntent(paused: desiredPaused)",
+                  ])
+                  && tvPlayer?.contains("bindIncomingTransportIntent(to: issuedToken)") == true
+                  && tvPlayer?.contains("applyIncomingTransportIntentIfOwned(by: event.loadToken)") == true)
+        let issuedEpisodeReset = sourceSection(
+            tvPlayer,
+            from: "private func resetRuntimeForIssuedEpisode()",
+            to: "/// Device-local resume for an already-prepared episode")
+        check("wiring: accepted episode issue clears recovery budgets and stale semantic selections",
+              sourceContainsInOrder(issuedEpisodeReset, [
+                "midPlayRecoveryCount = 0",
+                "stallRecoveries = 0",
+                "resetRapidBufferingRecovery(reason: \"accepted episode issue\")",
+                "pendingAudioReapply = nil",
+                "pendingTransportIntent = nil",
+              ]))
+        let rapidWatchdog = sourceSection(
+            tvPlayer,
+            from: "private func startStallWatchdog()",
+            to: "/// Arm the bounded terminal")
+        check("wiring: stable progress renews rapid recovery even with no ordinary stall recovery",
+              sourceContainsInOrder(rapidWatchdog, [
+                "stallStableProgressTicks += 1",
+                "rapidBufferingRecovery.resetAfterStableProgress()",
+                "PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget",
+              ]))
+        check("wiring: ordinary same-source reload clears rapid edges but preserves its spent budget",
+              tvStallReload?.contains("reason: \"ordinary same-source reload\"") == true
+                  && tvStallReload?.contains("preservingProgressBudget: true") == true)
+        let eofHandler = sourceSection(
+            tvPlayer,
+            from: "case MPVProperty.endFileEof:",
+            to: "default: break")
+        check("wiring: EOF while paused persists completion but parks the boundary until play",
+              sourceContainsInOrder(eofHandler, [
+                "if isPaused",
+                "pendingBoundaryAdvanceAfterPlay = true",
+                "EOF completion parked until explicit play",
+              ])
+                  && tvPlayer?.contains("else if pendingBoundaryAdvanceAfterPlay") == true
+                  && tvPlayer?.contains("queueIncomingTransportIntent(paused: true)") == true)
         check("wiring: periodic playhead reporting never enters the publication lock",
               playheadReceipt?.contains("playbackClockLock.lock()") == true
                   && sourceSection(

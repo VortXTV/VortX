@@ -414,6 +414,16 @@ struct TVPlayerView: View {
     // Automatic same-title recovery is allowed to carry the currently selected audio semantically. Unlike a
     // preference, this is one mount-to-mount intent and must never leak into a manual title or episode change.
     @State private var pendingAudioReapply: PlayerRecoveryAudioChoice?
+    /// Transport intent belongs to a replacement mount, not to a particular engine.  A surface hand-off can
+    /// construct a new controller that defaults to playing before its first property callback, so bind the
+    /// intent to the accepted load token and apply it only when that exact load has rendered.
+    private struct PendingTransportIntent {
+        let paused: Bool
+        let episodeGeneration: Int
+        let sourceGeneration: Int
+        var loadToken: PlayerLoadToken?
+    }
+    @State private var pendingTransportIntent: PendingTransportIntent?
     // A brief, transient note explaining WHY the engine fell back (e.g. AVPlayer cannot demux DV-in-MKV),
     // so the silent demote the owner reported becomes an actionable explanation. Auto-clears after a few s.
     @State private var engineNote: String?
@@ -686,6 +696,9 @@ struct TVPlayerView: View {
     @State private var eofFrozenAtTerminal = false
     @State private var terminalAdvanceDeadlineTask: Task<Void, Never>?
     private static let terminalAdvanceDeadlineSeconds: Double = 20
+    /// EOF while the viewer has paused is a completion, not permission to begin the next episode.  The
+    /// completion still persists immediately; an explicit later Play releases this one-shot boundary advance.
+    @State private var pendingBoundaryAdvanceAfterPlay = false
     @State private var uncommittedIdentityBlocked = false
     @State private var persistenceBlockedForExit = false
     private var hasUncommittedIssuedMedia: Bool {
@@ -1592,7 +1605,15 @@ struct TVPlayerView: View {
             // real change is correct.
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
-                if b { resetRapidBufferingRecovery(reason: "user pause") }
+                if b {
+                    resetRapidBufferingRecovery(reason: "user pause")
+                    // EOF may have already admitted the next episode. Carry this late user pause into that
+                    // replacement rather than letting its default-playing controller restart the series.
+                    if let pending = pendingAdvance {
+                        queueIncomingTransportIntent(paused: true)
+                        if let token = pending.loadToken { bindIncomingTransportIntent(to: token) }
+                    }
+                }
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
                 // #157: reflect play/pause on the system card AT ONCE. The play head stops ticking while
                 // paused, so without this the published rate would stay at "playing" and the Control Center
@@ -1621,6 +1642,9 @@ struct TVPlayerView: View {
                        suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
                         core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)
                     }
+                } else if pendingBoundaryAdvanceAfterPlay {
+                    pendingBoundaryAdvanceAfterPlay = false
+                    autoAdvance()
                 }
             }
         case MPVProperty.timePos:
@@ -1677,6 +1701,7 @@ struct TVPlayerView: View {
                         )
                     )
                     hasStartedPlaying = true
+                    applyIncomingTransportIntentIfOwned(by: event.loadToken)
                     // A real frame from the same-source fallback completes its recovery obligation. Clearing
                     // this before any later callbacks makes a retired watchdog inert for this source.
                     directAVNoFrameRecovery = nil
@@ -2163,6 +2188,11 @@ struct TVPlayerView: View {
                 // bounded fallback instead of trusting that resolve to land (diag-22: a dead TorBox hung this
                 // ~15 min). If the next source resolves in time, its load clears the flag and cancels this.
                 if armsTerminalDeadline { armTerminalAdvanceDeadline(reason: "persist-completion, next target resolving") }
+                return
+            }
+            if isPaused {
+                pendingBoundaryAdvanceAfterPlay = true
+                DiagnosticsLog.log("player", "EOF completion parked until explicit play")
                 return
             }
             autoAdvance()                                // episode finished → play next, else exit
@@ -3631,6 +3661,7 @@ struct TVPlayerView: View {
                 loadToken: issuedToken,
                 requestedResumeOrigin: requestedResumeOrigin
             )
+            bindIncomingTransportIntent(to: issuedToken)
         }
         if pendingAdvance != nil {
             pendingAdvance?.loadToken = issuedToken
@@ -4437,6 +4468,42 @@ struct TVPlayerView: View {
         return PlayerRecoveryAudioChoice(language: selected.lang, title: selected.title)
     }
 
+    /// Same-title automatic replacements recreate both engines' track id spaces.  Preserve semantic choices
+    /// before the old controller disappears, then consume them once on the replacement track list.
+    private func captureRecoverySelections() {
+        pendingAudioReapply = captureSelectedAudioChoice()
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+    }
+
+    private func queueIncomingTransportIntent(paused: Bool) {
+        pendingTransportIntent = PendingTransportIntent(
+            paused: paused,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            loadToken: nil
+        )
+    }
+
+    private func bindIncomingTransportIntent(to loadToken: PlayerLoadToken) {
+        guard var intent = pendingTransportIntent,
+              intent.episodeGeneration == episodeSwitchGeneration,
+              intent.sourceGeneration == sourceSwitchGeneration else { return }
+        intent.loadToken = loadToken
+        pendingTransportIntent = intent
+    }
+
+    private func applyIncomingTransportIntentIfOwned(by loadToken: PlayerLoadToken) {
+        guard let intent = pendingTransportIntent,
+              intent.episodeGeneration == episodeSwitchGeneration,
+              intent.sourceGeneration == sourceSwitchGeneration,
+              intent.loadToken == loadToken,
+              coordinator.player?.activeLoadToken == loadToken else { return }
+        pendingTransportIntent = nil
+        if intent.paused { coordinator.player?.pause() }
+        else { coordinator.player?.play() }
+        DiagnosticsLog.log("player", "applied replacement transport intent paused=\(intent.paused)")
+    }
+
     /// Re-apply a captured subtitle choice on the NEW engine after a switch. Track id spaces differ per engine,
     /// so an embedded pick matches by lang/title (Off if it can't be found, never a different auto pick), and
     /// an external / pooled pick is re-added by URL / pool id (both engines auto-select the added track).
@@ -4658,6 +4725,12 @@ struct TVPlayerView: View {
                 } else {
                     stalledTicks = 0
                     stallStableProgressTicks += 1
+                    if stallStableProgressTicks >= PlayerMidPlaybackStallPolicy.stableProgressTicksToResetRecoveryBudget {
+                        // Rapid starvation owns a separate one-reload budget.  It must renew after the same
+                        // stable window even when the ordinary freeze lane never spent a recovery.
+                        rapidBufferingRecovery.resetAfterStableProgress()
+                        DiagnosticsLog.log("player", "rapid-buffer reset after stable progress")
+                    }
                     if PlayerMidPlaybackStallPolicy.shouldResetRecoveryBudget(
                         recoveries: stallRecoveries,
                         stableProgressTicks: stallStableProgressTicks
@@ -4666,8 +4739,9 @@ struct TVPlayerView: View {
                         stallStableProgressTicks = 0
                         stallNudgesIssued = 0
                         midPlayBufferedReloadUsed = false
-                        rapidBufferingRecovery.resetAfterStableProgress()
-                        DiagnosticsLog.log("player", "rapid-buffer reset after stable progress")
+                    }
+                    if stallStableProgressTicks >= PlayerMidPlaybackStallPolicy.stableProgressTicksToResetRecoveryBudget {
+                        stallStableProgressTicks = 0
                     }
                 }
                 lastObservedTime = currentTime
@@ -4925,6 +4999,13 @@ struct TVPlayerView: View {
         }
         pendingSubtitleReapply = subtitleChoice
         pendingAudioReapply = audioChoice
+        // An ordinary reload must not inherit stale edges, but it must retain whether the rapid lane already
+        // spent its one same-source reload so a fresh burst still escalates instead of looping.
+        resetRapidBufferingRecovery(
+            reason: "ordinary same-source reload",
+            preservingProgressBudget: true,
+            clearingSuppression: false
+        )
         pendingLibmpvResumeSeek = nil   // reloading the same source at a fresh mount: drop any deferred resume seek
         buffering = true
         hasStartedPlaying = false
@@ -5141,6 +5222,9 @@ struct TVPlayerView: View {
         demoteFollowedDeadInput = false
         guard useAVPlayerEngine,
               let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return false }
+        let desiredPaused = isPaused
+        captureRecoverySelections()
+        queueIncomingTransportIntent(paused: desiredPaused)
         resetRapidBufferingRecovery(reason: "engine demote")
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
@@ -5346,6 +5430,9 @@ struct TVPlayerView: View {
             withAnimation { showOptions = false }; return
         }
         resetRapidBufferingRecovery(reason: "user engine switch")
+        let desiredPaused = isPaused
+        captureRecoverySelections()
+        queueIncomingTransportIntent(paused: desiredPaused)
         DiagnosticsLog.log("player", "user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
         resumeRetryGeneration &+= 1
         let reissueEpisodeGeneration = episodeSwitchGeneration
@@ -5365,9 +5452,6 @@ struct TVPlayerView: View {
         let reconcileResume: Double? = hasStartedPlaying ? carried : (resumeSeconds ?? suppressedResumeFloor)
         // Provenance of that value, captured before the reset below clears `hasStartedPlaying` (see switchStream).
         let carriedPlayHead = hasStartedPlaying || resumeIsMidPlayRecovery
-        // Preserve an explicit in-session subtitle pick across the switch (mandated check 8): capture it NOW,
-        // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
-        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         // Engine of origin for the grace window below (W2-A item 3a). Captured before stop() clears it, and for
         // WHICHEVER engine is outgoing here: leaving a stale token from an earlier demote in place would make the
         // grace treat this switch's own stale error as "from the incoming engine" and stop swallowing it.
@@ -5976,6 +6060,7 @@ struct TVPlayerView: View {
         let targetVideoID = retryMeta?.videoId
         let retryURL = curURL
         let retrySource = curSourceStream
+        captureRecoverySelections()
         resumeSourceReresolved = true
         coordinator.player?.invalidateLoadToken()
         // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
@@ -6160,6 +6245,7 @@ struct TVPlayerView: View {
     private func retryLoad(resetAutoRetries: Bool = true) {
         if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; recoveryDeadline?.cancel(); recoveryDeadline = nil }
         autoRetryTask?.cancel()
+        captureRecoverySelections()
         let resume = hasStartedPlaying ? currentTime : (resumeSeconds ?? 0)
         avToMPVHandoffBlocked = false
         withAnimation { loadFailed = false }
@@ -7411,6 +7497,13 @@ struct TVPlayerView: View {
         upNextSuppressed = false; upNextWantsCredits = false
         sourceHops = 0; exhaustedURLs = []
         recoveryDeadline?.cancel(); recoveryDeadline = nil
+        midPlayRecoveryCount = 0; midPlayFailureOwner = nil
+        stallRecoveries = 0; stallStableProgressTicks = 0; stalledTicks = 0; stallNudgesIssued = 0
+        midPlayBufferedReloadUsed = false; lastObservedTime = -1
+        resetRapidBufferingRecovery(reason: "accepted episode issue")
+        pendingAudioReapply = nil; pendingSubtitleReapply = nil
+        pendingTransportIntent = nil
+        pendingBoundaryAdvanceAfterPlay = false
     }
 
     /// Device-local resume for an already-prepared episode. The optional Stremio
