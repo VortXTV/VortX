@@ -17,7 +17,7 @@ if (start < 0 || end < 0 || source.indexOf(startMarker, start + 1) >= 0 || sourc
 const moduleSource = `}, function(module, exports, __webpack_require__) {
     var path = __webpack_require__(5), url = __webpack_require__(6), querystring = __webpack_require__(24), Router = __webpack_require__(100), stream = __webpack_require__(3), http = __webpack_require__(11), https = __webpack_require__(20), net = __webpack_require__(39), dns = __webpack_require__(620), fetch = __webpack_require__(34), Headers = fetch.Headers, cfgOpts = {
         Destination: "d", DestinationHeader: "h", ResponseHeader: "r"
-    }, proxyReqHeaders = [ "accept", "accept-language", "range", "if-range", "user-agent" ], proxyResHeaders = [ "accept-ranges", "content-type", "content-length", "content-range", "connection", "transfer-encoding", "last-modified", "etag", "server", "date" ], supportedPlaylists = [ ".m3u", ".m3u8" ], forbiddenAddonHeaders = new Set([ "host", "connection", "content-length", "transfer-encoding", "proxy-connection", "proxy-authorization", "proxy-authenticate", "upgrade", "range", "te", "trailer", "keep-alive" ]), safeCrossOriginHeaders = new Set([ "accept", "accept-language", "range", "if-range", "user-agent" ]), maximumPlaylistBytes = 2097152, maximumPlaylistLineBytes = 65536, headTimeoutMilliseconds = 15000;
+    }, proxyReqHeaders = [ "accept", "accept-language", "range", "if-range", "user-agent" ], proxyResHeaders = [ "accept-ranges", "content-type", "content-length", "content-range", "connection", "transfer-encoding", "last-modified", "etag", "server", "date" ], supportedPlaylists = [ ".m3u", ".m3u8" ], forbiddenAddonHeaders = new Set([ "host", "connection", "content-length", "transfer-encoding", "proxy-connection", "proxy-authorization", "proxy-authenticate", "upgrade", "range", "te", "trailer", "keep-alive" ]), safeCrossOriginHeaders = new Set([ "accept", "accept-language", "range", "if-range", "user-agent" ]), maximumPlaylistBytes = 2097152, maximumPlaylistLineBytes = 65536, headTimeoutMilliseconds = 15000, pref64TimeoutMilliseconds = 3000;
     function ensureArray(value) { return Array.isArray(value) ? value : value ? [ value ] : []; }
     function validName(name) { return /^[!#$%&'*+.^_\\\`|~0-9A-Za-z-]+$/.test(name); }
     function validValue(value) { return !/[\\r\\n]/.test(value); }
@@ -66,18 +66,18 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
             && !/^2001:0*db8:/.test(lower) && !/^fe[c-f]/.test(lower) && !/^0+$/.test(compact) && !/^0*1$/.test(compact);
     }
     function abortError() { var error = new Error("Destination resolution timed out"); error.name = "AbortError"; return error; }
-    function lookupAddresses(hostname, signal) {
+    function lookupAddresses(hostname, signal, timeoutMilliseconds, allowEmpty) {
         return new Promise((resolve, reject) => {
             var settled = false, timer;
             function aborted() { if (!settled) { finish(); reject(abortError()); } }
             function finish() { settled = true; clearTimeout(timer); signal.removeEventListener("abort", aborted); }
             signal.addEventListener("abort", aborted, { once: true });
             if (signal.aborted) return aborted();
-            timer = setTimeout(aborted, headTimeoutMilliseconds);
+            timer = setTimeout(aborted, timeoutMilliseconds || headTimeoutMilliseconds);
             dns.lookup(hostname, { all: true, verbatim: true }, (error, answers) => {
                 if (settled) return;
                 finish();
-                if (error || !Array.isArray(answers) || !answers.length) return reject(error || new Error("Empty DNS answer"));
+                if (error || !Array.isArray(answers) || (!allowEmpty && !answers.length)) return reject(error || new Error("Empty DNS answer"));
                 resolve(answers.map(answer => typeof answer === "string" ? answer : answer.address));
             });
         });
@@ -95,7 +95,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
     }
     function bit(bytes, index) { return bytes[index >> 3] >> (7 - (index & 7)) & 1; }
     function embeddedIPv4(bytes, prefixLength) {
-        if (prefixLength !== 96 && bytes[8] !== 0) return null;
+        if (bytes[8] !== 0) return null;
         var beforeU = prefixLength === 96 ? 32 : 64 - prefixLength, value = 0;
         for (var index = 0; index < 32; index++) value = value * 2 + bit(bytes, index < beforeU ? prefixLength + index : 72 + index - beforeU);
         var suffixStart = prefixLength === 96 ? 128 : 72 + 32 - beforeU;
@@ -108,37 +108,48 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
     }
     function discoverPref64(signal) {
         // Do not cache across requests: a network transition can change PREF64 without changing process state.
-        return lookupAddresses("ipv4only.arpa", signal).then(addresses => {
+        return lookupAddresses("ipv4only.arpa", signal, pref64TimeoutMilliseconds, true).then(addresses => {
             var prefixes = [];
-            addresses.forEach(address => {
+            var ipv6Answers = addresses.filter(address => net.isIP(address) === 6);
+            if (!ipv6Answers.length) return prefixes;
+            ipv6Answers.forEach(address => {
                 var bytes = ipv6Bytes(address);
-                if (!bytes) return;
+                var found = false;
+                if (!bytes) throw new Error("Malformed PREF64 answer");
                 [ 32, 40, 48, 56, 64, 96 ].forEach(length => {
                     var embedded = embeddedIPv4(bytes, length);
                     if (embedded && embedded[0] === 192 && embedded[1] === 0 && embedded[2] === 0 && (embedded[3] === 170 || embedded[3] === 171)) {
+                        found = true;
                         prefixes.push({ length: length, bits: Array.from({ length: length }, (_, index) => bit(bytes, index)) });
                     }
                 });
+                if (!found) throw new Error("Malformed PREF64 answer");
             });
-            if (!prefixes.length) throw new Error("PREF64 unavailable");
             return prefixes;
         });
     }
-    function rejectActivePref64(addresses, signal) {
+    function selectSafeAddress(addresses, signal) {
+        if (!addresses.every(isPublicAddress)) return Promise.reject(new Error("Unsafe DNS answer"));
+        var ipv4 = addresses.filter(address => net.isIP(address) === 4);
         var ipv6 = addresses.filter(address => net.isIP(address) === 6);
-        if (!ipv6.length) return Promise.resolve();
+        if (!ipv6.length) return Promise.resolve(ipv4[0]);
         return discoverPref64(signal).then(prefixes => {
-            if (ipv6.some(address => { var bytes = ipv6Bytes(address); return !bytes || prefixes.some(prefix => samePrefix(bytes, prefix)); })) throw new Error("Unsafe PREF64 destination");
+            var safeIPv6 = ipv6.filter(address => { var bytes = ipv6Bytes(address); return bytes && !prefixes.some(prefix => samePrefix(bytes, prefix)); });
+            var safe = addresses.filter(address => net.isIP(address) === 4 || safeIPv6.includes(address));
+            if (!safe.length) throw new Error("Unsafe PREF64 destination");
+            return safe[0];
+        }, error => {
+            if (ipv4.length) return ipv4[0];
+            throw error;
         });
     }
     function resolvePublic(dest, signal) {
         if (net.isIP(dest.hostname)) {
             if (!isPublicAddress(dest.hostname)) return Promise.reject(new Error("Unsafe destination"));
-            return rejectActivePref64([ dest.hostname ], signal).then(() => dest.hostname);
+            return selectSafeAddress([ dest.hostname ], signal);
         }
         return lookupAddresses(dest.hostname, signal).then(addresses => {
-            if (!addresses.every(isPublicAddress)) throw new Error("Unsafe DNS answer");
-            return rejectActivePref64(addresses, signal).then(() => addresses[0]);
+            return selectSafeAddress(addresses, signal);
         });
     }
     function pinnedAgent(dest, address) {
