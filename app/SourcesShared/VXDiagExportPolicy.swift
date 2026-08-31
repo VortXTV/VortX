@@ -203,14 +203,52 @@ enum VXDiagExportPolicy {
     /// the device passes the current rules regardless of which build wrote it, and it means a future rule
     /// improvement retroactively covers old bytes instead of only new ones.
     ///
-    /// Every line, ours and the bundled server's alike, goes through `VXProbeRedaction.scrub`, so the
-    /// per-line byte cap, the control-character neutralisation and the identifier rules apply uniformly.
+    /// The maximum always-on log tail included in one export. `diagnostics.log` is independently capped on
+    /// disk, and this line cap stops an unusually dense retained file from crowding out the probe/server
+    /// evidence. Every retained line is still redacted and byte-capped below.
+    static let diagnosticsTailLineLimit = 400
+
+    /// Legacy shape retained for callers and focused policy tests that intentionally exercise the probe and
+    /// server channels alone. The live export uses the overload below and supplies the always-on snapshot.
     static func exportBody(logContents: String, serverStatus: String?, serverTailLines: [String]) -> Data {
-        var out = logContents
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { VXProbeRedaction.scrub(String($0)) }
+        exportBody(
+            logContents: logContents,
+            diagnosticsLogContents: nil,
+            serverStatus: serverStatus,
+            serverTailLines: serverTailLines
+        )
+    }
+
+    /// Every line, from the opt-in probe, the always-on application breadcrumb, and the bundled server,
+    /// goes through `VXProbeRedaction.scrub` at export time. The diagnostics channel is deliberately
+    /// non-consuming: a successful phone download must retain it just as devicectl retrieval does.
+    static func exportBody(
+        logContents: String,
+        diagnosticsLogContents: String?,
+        serverStatus: String?,
+        serverTailLines: [String]
+    ) -> Data {
+        let probeLines = lines(in: logContents)
+        var out = probeLines
+            .map { VXProbeRedaction.scrub($0) }
             .joined(separator: "\n")
         if out.isEmpty { out = "(diagnostic log is empty)\n" }
+
+        if let diagnosticsLogContents {
+            let probeLineSet = Set(probeLines)
+            let diagnosticsTail = Array(lines(in: diagnosticsLogContents).suffix(diagnosticsTailLineLimit))
+                .filter { !probeLineSet.contains($0) }
+            var section = "\n\n===== always-on application diagnostics =====\n"
+            if diagnosticsTail.isEmpty {
+                section += "(always-on diagnostics log is empty or duplicates the probe log)\n"
+            } else {
+                section += "--- diagnostics.log (last \(diagnosticsTail.count) distinct lines; never consumed) ---\n"
+                section += diagnosticsTail.map { VXProbeRedaction.scrub($0) }.joined(separator: "\n")
+                section += "\n"
+            }
+            out += section
+        }
+
         guard let serverStatus else { return Data(out.utf8) }
         var section = "\n\n===== streaming server =====\nstatus: \(VXProbeRedaction.scrub(serverStatus))\n"
         if serverTailLines.isEmpty {
@@ -221,5 +259,11 @@ enum VXDiagExportPolicy {
             section += "\n"
         }
         return Data((out + section).utf8)
+    }
+
+    private static func lines(in contents: String) -> [String] {
+        contents
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map(String.init)
     }
 }

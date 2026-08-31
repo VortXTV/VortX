@@ -422,10 +422,12 @@ final class VXDiagExport: @unchecked Sendable {
     /// and the server section is omitted. Never throws.
     private static func exportPayload() -> ExportPayload {
         let snapshot = VXProbe.logSnapshot()
+        let diagnosticsSnapshot = DiagnosticsLog.snapshot()
         let status = ServerDiagnostics.status()
         let tail = status == nil ? [] : ServerDiagnostics.logTail(400)
         let body = VXDiagExportPolicy.exportBody(
             logContents: snapshot.contents,
+            diagnosticsLogContents: diagnosticsSnapshot.contents,
             serverStatus: status,
             serverTailLines: tail
         )

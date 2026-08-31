@@ -11,7 +11,8 @@
 // WHY THIS EXISTS. Enumerating by ARTIFACT rather than by call site gives three channels, and they do not
 // share a posture:
 //   - `vortx-diag.log`      OPT-IN. Exported by the LAN QR path, the macOS Finder copy, and the iOS ShareLink.
-//   - `diagnostics.log`     ALWAYS ON for every user, ~512 KiB durable, 152 call sites across 25 files.
+//   - `diagnostics.log`     ALWAYS ON for every user, ~512 KiB durable, hundreds of call sites;
+//                           exported as a bounded, non-consuming, separately labelled tail.
 //   - `stremio-server.log`  Written by bundled JavaScript we do not own, retained ACROSS BOOTS, and appended
 //                           to two of the three exports, so it DOES leave the device. It logs raw torrent
 //                           hashes on engine created/destroyed/idle/inactive/error/invalid-piece.
@@ -287,6 +288,62 @@ let rules: [Rule] = [
             DiagnosticsLog.log("cw-resume", "\\(outcome) id=\\(libraryId) profile=\\(pid)")
             """
         ]
+    ),
+
+    // G6. An opt-in probe-off export used to start with "diagnostic log is empty" even though the always-on
+    // channel contained the actual playback trail. The export must take the queue-barrier snapshot and pass
+    // it to the distinct, bounded, non-consuming section; otherwise a correct pure formatter is never fed.
+    Rule(
+        name: "G6 exports a bounded non-consuming always-on diagnostics snapshot",
+        files: [
+            "app/SourcesShared/DiagnosticsLog.swift",
+            "app/SourcesShared/VXDiagExport.swift",
+            "app/SourcesShared/VXDiagExportPolicy.swift"
+        ],
+        check: { files in
+            var found: [String] = []
+            if let diagnostics = files["app/SourcesShared/DiagnosticsLog.swift"] {
+                found += requiring(diagnostics, "static func snapshot() -> DiagnosticsLogSnapshot",
+                                   why: "must expose the always-on queue-barrier snapshot")
+                found += requiring(diagnostics, "queue.sync {",
+                                   why: "must flush queued writes before reading the always-on file")
+            }
+            if let export = files["app/SourcesShared/VXDiagExport.swift"] {
+                found += requiring(export, "let diagnosticsSnapshot = DiagnosticsLog.snapshot()",
+                                   why: "must snapshot the always-on channel for every export")
+                found += requiring(export, "diagnosticsLogContents: diagnosticsSnapshot.contents",
+                                   why: "must pass the always-on snapshot to the export formatter")
+                found += forbidding(export, "DiagnosticsLog.clear()",
+                                    why: "must never consume the always-on log after an export")
+            }
+            if let policy = files["app/SourcesShared/VXDiagExportPolicy.swift"] {
+                found += requiring(policy, "static let diagnosticsTailLineLimit = 400",
+                                   why: "must bound the always-on tail")
+                found += requiring(policy, "===== always-on application diagnostics =====",
+                                   why: "must label the always-on channel distinctly")
+            }
+            return found
+        },
+        revertedFixture: [
+            "app/SourcesShared/DiagnosticsLog.swift": """
+            enum DiagnosticsLog {
+                static func log(_ category: String, _ message: String) {}
+            }
+            """,
+            "app/SourcesShared/VXDiagExport.swift": """
+            final class VXDiagExport {
+                private static func exportPayload() {
+                    let snapshot = VXProbe.logSnapshot()
+                    _ = snapshot
+                }
+            }
+            """,
+            "app/SourcesShared/VXDiagExportPolicy.swift": """
+            enum VXDiagExportPolicy {
+                static func exportBody(logContents: String) -> Data { Data() }
+            }
+            """
+        ]
     )
 ]
 
@@ -426,6 +483,58 @@ struct DiagnosticsChannelGate {
                                                               serverTailLines: []), as: UTF8.self)
                 .contains("(diagnostic log is empty)"),
                "G-EXP10: an empty log exports a placeholder rather than a zero-byte file")
+
+        let alwaysOnLegacy = """
+        2026-01-01 00:00:02.000 [route] open https://cdn.example/movie.mkv?token=VERY-SECRET-TOKEN
+        2026-01-01 00:00:03.000 [meta] id=tt0903747 fallback=ready
+        """
+        let probeOff = String(decoding: VXDiagExportPolicy.exportBody(
+            logContents: "",
+            diagnosticsLogContents: alwaysOnLegacy,
+            serverStatus: nil,
+            serverTailLines: []
+        ), as: UTF8.self)
+        expect(probeOff.contains("===== always-on application diagnostics =====")
+                   && probeOff.contains("fallback=ready"),
+               "G-EXP11: a probe-off export includes the labelled always-on diagnostics tail")
+        expect(!probeOff.contains("VERY-SECRET-TOKEN") && !probeOff.contains("tt0903747"),
+               "G-EXP12: legacy always-on URL credentials and identifiers are scrubbed at export time")
+
+        let manyDiagnostics = (0...VXDiagExportPolicy.diagnosticsTailLineLimit)
+            .map { "diagnostics-tail-line-\($0)" }
+            .joined(separator: "\n")
+        let bounded = String(decoding: VXDiagExportPolicy.exportBody(
+            logContents: "",
+            diagnosticsLogContents: manyDiagnostics,
+            serverStatus: nil,
+            serverTailLines: []
+        ), as: UTF8.self)
+        expect(!bounded.contains("diagnostics-tail-line-0")
+                   && bounded.contains("diagnostics-tail-line-\(VXDiagExportPolicy.diagnosticsTailLineLimit)"),
+               "G-EXP13: the always-on export is a bounded tail, not the complete retained file")
+
+        let noDiagnostics = String(decoding: VXDiagExportPolicy.exportBody(
+            logContents: "",
+            diagnosticsLogContents: "",
+            serverStatus: nil,
+            serverTailLines: []
+        ), as: UTF8.self)
+        expect(noDiagnostics.contains("always-on diagnostics log is empty or duplicates the probe log"),
+               "G-EXP14: an unavailable always-on log states its absence clearly")
+
+        let duplicate = String(decoding: VXDiagExportPolicy.exportBody(
+            logContents: "same retained line",
+            diagnosticsLogContents: "same retained line",
+            serverStatus: "running",
+            serverTailLines: []
+        ), as: UTF8.self)
+        let alwaysOnBeforeServer = (duplicate.range(of: "===== always-on application diagnostics =====")
+            .map { alwaysOn in
+                duplicate.range(of: "===== streaming server =====").map { server in alwaysOn.lowerBound < server.lowerBound } ?? false
+            }) ?? false
+        expect(duplicate.components(separatedBy: "same retained line").count - 1 == 1
+                   && alwaysOnBeforeServer,
+               "G-EXP15: exact cross-channel duplicates are omitted and the server remains last")
     }
 
     // MARK: Part 2 - the production wiring

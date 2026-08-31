@@ -1,6 +1,6 @@
 import Foundation
 
-/// Mirrors important log lines into Documents/diagnostics.log so they can be
+/// Mirrors important log lines into Caches/diagnostics.log so they can be
 /// pulled off a real device over the pairing tunnel (devicectl) without Console
 /// access. The unified log is unreachable from a network-only Apple TV via CLI,
 /// which made remote debugging of device-only bugs (the HDR display switch)
@@ -39,9 +39,21 @@ enum DiagnosticsLog {
         mirrorToProbe(category, message)
     }
 
+    /// Flush every queued durable write and return a coherent point-in-time image for a user-requested
+    /// diagnostic export. Export runs away from the playback/render path, so this synchronous queue barrier
+    /// cannot stall playback, while an export opened immediately after an event includes that event rather
+    /// than an arbitrarily older on-disk prefix. Unlike `VXProbe.logSnapshot()`, this snapshot is never
+    /// consumed: the always-on breadcrumb remains available for device-pairing retrieval and later exports.
+    static func snapshot() -> DiagnosticsLogSnapshot {
+        queue.sync {
+            let bytes = (try? Data(contentsOf: fileURL)) ?? Data()
+            return DiagnosticsLogSnapshot(contents: String(decoding: bytes, as: UTF8.self))
+        }
+    }
+
     /// This channel is ALWAYS ON. Unlike `VXProbe` there is no launch flag and no Settings toggle in front
-    /// of it: `log`/`logSync` append for every user of every build, ~512 KiB durable in Caches, from 152
-    /// call sites across 25 files carrying library ids, catalog ids, video ids, stream names, URL
+    /// of it: `log`/`logSync` append for every user of every build, ~512 KiB durable in Caches, from 409
+    /// important call sites carrying library ids, catalog ids, video ids, stream names, URL
     /// components, imported list titles and localized errors. Only the `mirrorToProbe` hop below is gated.
     ///
     /// So BOTH fields go through the shared bounded formatter before this file's own disk append, rather
@@ -54,12 +66,11 @@ enum DiagnosticsLog {
         VXProbeRedaction.durableLine(timestamp: stamp.string(from: Date()), category: category, message: message)
     }
 
-    /// Mirror into the EXPORTABLE probe log (Caches/vortx-diag.log). The in-app log export serves ONLY
-    /// VXProbe's file (VXDiagExport), while this diagnostics.log is a devicectl-pull escape hatch users
-    /// never send, so every DV/HDR/demote breadcrumb written only here was invisible in user reports
-    /// (#76: the exported trail misleadingly ended at "remux classify"). Gated on VXProbe.enabled so
-    /// probe-off runs pay nothing; VXProbeFileLog.record is async on its own utility queue and swallows
-    /// all errors, and it never calls back into DiagnosticsLog, so there is no recursion.
+    /// Mirror into the EXPORTABLE probe log (Caches/vortx-diag.log) when the owner has opted in. The normal
+    /// in-app export also includes a bounded, clearly labelled, non-consuming tail of this always-on file,
+    /// so a probe-off customer export is still actionable. Gated on VXProbe.enabled so probe-off playback
+    /// pays nothing; VXProbeFileLog.record is async on its own utility queue and never calls back into
+    /// DiagnosticsLog, so there is no recursion.
     private static func mirrorToProbe(_ category: String, _ message: String) {
         guard VXProbe.enabled else { return }
         VXProbeFileLog.shared.record(category: category, message: message)
@@ -79,4 +90,10 @@ enum DiagnosticsLog {
         }
         try? handle.write(contentsOf: data)
     }
+}
+
+/// The always-on log has no delivery acknowledgement or consume lifecycle. It is intentionally a contents-
+/// only snapshot, keeping that distinction explicit at the type boundary from `VXProbeLogSnapshot`.
+struct DiagnosticsLogSnapshot: Sendable {
+    let contents: String
 }
