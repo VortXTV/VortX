@@ -2,6 +2,9 @@ import SwiftUI
 import UserNotifications
 import UniformTypeIdentifiers
 import CoreTransferable
+#if os(iOS)
+import UIKit
+#endif
 
 /// A lazy share-sheet payload for the rolling diagnostic log. `ShareLink` asks this representation for
 /// the file only after the owner taps it, so rebuilding Settings never rereads and rewrites the entire log.
@@ -394,6 +397,7 @@ struct iOSSettingsView: View {
             }
             .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
             .onChange(of: updates.manualOutcome) { outcome in
+                announceManualUpdateOutcome(outcome)
                 if case .updateAvailable = outcome {
                     // Keep one sheet owner in the root shell. An explicit Settings request may use it from this
                     // tab, but unattended automatic checks retain the root's Home/player presentation gates.
@@ -2012,7 +2016,7 @@ struct iOSSettingsView: View {
                     Label("Update available: \(update.name)", systemImage: "arrow.down.circle.fill")
                         .font(.body.weight(.semibold))
                         .foregroundStyle(Theme.Palette.accent)
-                    Text("Install the new build from the GitHub releases page; your sign-in and settings carry over.")
+                    Text("Install the new build from the release page; your sign-in and settings carry over.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -2023,7 +2027,8 @@ struct iOSSettingsView: View {
             }
             .disabled(updates.isManualCheckInProgress)
             .accessibilityLabel("Check for Updates")
-            .accessibilityHint("Checks GitHub now and shows the available update or a retry message.")
+            .accessibilityValue(updates.manualOutcome.accessibilityText)
+            .accessibilityHint("Checks for published updates now and shows the result.")
             manualUpdateResult
             LabeledContent("Version", value: appVersion)
             LabeledContent("Player", value: String(localized: "libmpv · MPVKit"))
@@ -2038,6 +2043,13 @@ struct iOSSettingsView: View {
                 Label("Watch Stats", systemImage: "chart.bar.xaxis")
             }
         }
+    }
+
+    private func announceManualUpdateOutcome(_ outcome: UpdateChecker.ManualCheckOutcome) {
+        guard !outcome.accessibilityText.isEmpty else { return }
+        #if os(iOS)
+        UIAccessibility.post(notification: .announcement, argument: outcome.accessibilityText)
+        #endif
     }
 
     @ViewBuilder private var manualUpdateResult: some View {

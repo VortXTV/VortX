@@ -20,6 +20,14 @@ let iOSSettingsRoot = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent().deletingLastPathComponent()
     .appendingPathComponent("SourcesiOS/iOSSettingsView.swift")
 let iOSSettingsSource = (try? String(contentsOf: iOSSettingsRoot, encoding: .utf8)) ?? ""
+let iOSRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent().deletingLastPathComponent()
+    .appendingPathComponent("SourcesiOS/iOSRootView.swift")
+let iOSRootSource = (try? String(contentsOf: iOSRoot, encoding: .utf8)) ?? ""
+let promptRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent().deletingLastPathComponent()
+    .appendingPathComponent("SourcesShared/UpdatePromptView.swift")
+let promptSource = (try? String(contentsOf: promptRoot, encoding: .utf8)) ?? ""
 let checks = [
     (source.contains("@Environment(\\.scenePhase) private var scenePhase"), "tvOS observes lifecycle phase"),
     (source.contains("if phase == .active { updates.startMonitoring() }"), "foreground retries monitoring"),
@@ -33,7 +41,16 @@ let checks = [
     (tvSettingsSource.contains("updates.checkNow()") && iOSSettingsSource.contains("updates.checkNow()"), "Apple Settings expose an explicit update check"),
     (tvSettingsSource.contains("updates.presentAvailableIfNeeded(force: true)") && iOSSettingsSource.contains("updates.presentAvailableIfNeeded(force: true)"), "Settings use the root-owned update sheet without competing bindings"),
     (tvSettingsSource.contains(".accessibilityLabel(\"Check for Updates\")") && iOSSettingsSource.contains(".accessibilityLabel(\"Check for Updates\")"), "manual checks have native accessibility labels"),
-    (tvSettingsSource.contains("Unable to check. Try again.") && iOSSettingsSource.contains("You’re up to date"), "Settings visibly report manual check outcomes")
+    (tvSettingsSource.contains("Unable to check. Try again.") && iOSSettingsSource.contains("You’re up to date"), "Settings visibly report manual check outcomes"),
+    (tvSettingsSource.contains("accessibilityValue(updates.manualOutcome.accessibilityText)") && iOSSettingsSource.contains("accessibilityValue(updates.manualOutcome.accessibilityText)"), "manual check state has a dynamic VoiceOver value"),
+    (tvSettingsSource.contains("UIAccessibility.post(notification: .announcement") && iOSSettingsSource.contains("UIAccessibility.post(notification: .announcement"), "manual check results announce to assistive technology"),
+    (tvSettingsSource.contains(".focused($updateCheckFocused)") && tvSettingsSource.contains("updateCheckFocused = true"), "tvOS returns focus to the update check after completion"),
+    (source.contains("!showSeedingNag") && source.contains("presentUpdateIfReady()\n        }) { MoveSeedingNagTV() }"), "tvOS defers update presentation until the seeding sheet closes"),
+    (iOSRootSource.contains("!showSeedingNag") && iOSRootSource.contains("presentUpdateIfReady()\n        }) { MoveSeedingNagView() }"), "iOS and macOS defer update presentation until the seeding sheet closes"),
+    (iOSRootSource.contains("UpdateCheckFeedback") && iOSRootSource.contains(".alert(item: $updateCheckFeedback)"), "macOS menu checks have visible current and failure feedback"),
+    (promptSource.contains(".accessibilityHidden(true)") && promptSource.contains(".accessibilityAddTraits(.isHeader)"), "update prompt exposes a clean accessibility hierarchy"),
+    (promptSource.contains("Open release page") && promptSource.contains("Apple TV cannot install an IPA from inside VortX"), "tvOS prompt does not claim that opening a page installs an IPA"),
+    (!tvSettingsSource.contains("GitHub releases page") && !iOSSettingsSource.contains("GitHub releases page"), "Settings hint copy does not name an implementation host")
 ]
 var failures = 0
 for (condition, message) in checks {

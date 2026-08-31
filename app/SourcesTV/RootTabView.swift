@@ -423,6 +423,7 @@ struct RootTabView: View {
             // Persist the receipt at the sheet boundary so no dismissal path can make it return on
             // every launch of this build. Settings still keys only on the first real sync.
             MoveSeeding.recordLaunchNagDismissal()
+            presentUpdateIfReady()
         }) { MoveSeedingNagTV() }
         .task { await armSeedingNag() }
         .onAppear {
@@ -546,7 +547,7 @@ struct RootTabView: View {
 
     /// Present only after the real Home shell is visible, never behind the splash, picker, or player.
     private func presentUpdateIfReady(force: Bool = false) {
-        guard launchReady, selection == 0 else { return }
+        guard launchReady, selection == 0, !showSeedingNag else { return }
         updates.presentAvailableIfNeeded(force: force)
     }
 

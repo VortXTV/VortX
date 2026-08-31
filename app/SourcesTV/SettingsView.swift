@@ -1,5 +1,8 @@
 import SwiftUI
 import UserNotifications
+#if os(tvOS)
+import UIKit
+#endif
 
 /// Settings: who you're signed in as, the embedded streaming-server status, subtitles, and app info.
 /// Mirrors the official tvOS app's Settings sections, on the StremioX design system.
@@ -12,6 +15,7 @@ struct SettingsView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
+    @FocusState private var updateCheckFocused: Bool
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
@@ -1492,7 +1496,7 @@ struct SettingsView: View {
                     Label("Update available: \(update.name)", systemImage: "arrow.down.circle.fill")
                         .font(Theme.Typography.body.weight(.semibold))
                         .foregroundStyle(Theme.Palette.accent)
-                    Text("Sideload the new IPA from the GitHub releases page, your sign-in and settings carry over.")
+                    Text("Sideload the new IPA from the release page, your sign-in and settings carry over.")
                         .font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textSecondary)
                 }
@@ -1504,8 +1508,10 @@ struct SettingsView: View {
             }
             .buttonStyle(ChipButtonStyle(selected: false))
             .disabled(updates.isManualCheckInProgress)
+            .focused($updateCheckFocused)
             .accessibilityLabel("Check for Updates")
-            .accessibilityHint("Checks GitHub now and shows the available update or a retry message.")
+            .accessibilityValue(updates.manualOutcome.accessibilityText)
+            .accessibilityHint("Checks for published updates now and shows the result.")
             manualUpdateResult
             infoRow(String(localized: "Version"), appVersion)
             infoRow(String(localized: "Player"), String(localized: "libmpv · MPVKit"))
@@ -1517,12 +1523,19 @@ struct SettingsView: View {
         }
         .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
         .onChange(of: updates.manualOutcome) { _, outcome in
+            announceManualUpdateOutcome(outcome)
+            if !outcome.isChecking { updateCheckFocused = true }
             if case .updateAvailable = outcome {
                 // The shell owns the only update sheet. A Settings-initiated check may present it on this tab,
                 // while unattended automatic checks continue to wait for the existing Home/player safety gates.
                 updates.presentAvailableIfNeeded(force: true)
             }
         }
+    }
+
+    private func announceManualUpdateOutcome(_ outcome: UpdateChecker.ManualCheckOutcome) {
+        guard !outcome.accessibilityText.isEmpty else { return }
+        UIAccessibility.post(notification: .announcement, argument: outcome.accessibilityText)
     }
 
     @ViewBuilder private var manualUpdateResult: some View {

@@ -95,6 +95,9 @@ struct iOSRootView: View {
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
     /// when a still-newer build ships.
     @ObservedObject private var updates = UpdateChecker.shared
+    #if os(macOS)
+    @State private var updateCheckFeedback: UpdateCheckFeedback?
+    #endif
     #if !os(tvOS)
     /// Offline downloads (#30), observed so the Library tab can carry a live count badge of in-flight
     /// downloads, the persistent "downloads are running, find them here" signal away from the detail page.
@@ -156,9 +159,9 @@ struct iOSRootView: View {
     /// soon as its launch splash and profile picker are out of the way.
     private func presentUpdateIfReady(force: Bool = false) {
         #if os(macOS)
-        guard launchReady, shellVisible, !playbackGate.playerActive else { return }
+        guard launchReady, shellVisible, !playbackGate.playerActive, !showSeedingNag else { return }
         #else
-        guard launchReady, shellVisible, !playbackGate.playerActive, tab == .home else { return }
+        guard launchReady, shellVisible, !playbackGate.playerActive, tab == .home, !showSeedingNag else { return }
         #endif
         updates.presentAvailableIfNeeded(force: force)
     }
@@ -249,7 +252,23 @@ struct iOSRootView: View {
             // Swipe-down, successful setup, Done, and Not now all close the same launch reminder.
             // Persist at the sheet boundary so every dismissal stays quiet for this build.
             MoveSeeding.recordLaunchNagDismissal()
+            presentUpdateIfReady()
         }) { MoveSeedingNagView() }
+        #if os(macOS)
+        .onChange(of: updates.manualOutcome) { outcome in
+            switch outcome {
+            case .upToDate:
+                updateCheckFeedback = UpdateCheckFeedback(title: "You’re up to date", message: "This Mac already has the latest VortX build.")
+            case .failure:
+                updateCheckFeedback = UpdateCheckFeedback(title: "Unable to check for updates", message: "Try again in a moment.")
+            default:
+                break
+            }
+        }
+        .alert(item: $updateCheckFeedback) { feedback in
+            Alert(title: Text(feedback.title), message: Text(feedback.message), dismissButton: .default(Text("OK")))
+        }
+        #endif
         .task { await armSeedingNag() }
         .onChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
@@ -394,6 +413,14 @@ struct iOSRootView: View {
     private func armSeedingNag() async {
         await MoveSeeding.armLaunchNag { showSeedingNag = true }
     }
+
+    #if os(macOS)
+    private struct UpdateCheckFeedback: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+    }
+    #endif
 
     #if os(macOS)
     /// Where a search request lands (#117 rule: never route to a hidden tab, fall back to Home).

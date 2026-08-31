@@ -22,7 +22,7 @@ final class UpdateChecker: ObservableObject {
         let notes: String
         let ipa: String?
         let altstore: String?
-        /// Integrity metadata from the verified appcast. GitHub fallback releases do not carry these fields.
+        /// Published appcast metadata. It is not a claim that a downloaded artifact was locally verified.
         let size: Int?
         let sha256: String?
 
@@ -49,6 +49,16 @@ final class UpdateChecker: ObservableObject {
         var isChecking: Bool {
             if case .checking = self { return true }
             return false
+        }
+
+        var accessibilityText: String {
+            switch self {
+            case .idle: return ""
+            case .checking: return "Checking for updates"
+            case .upToDate: return "You’re up to date"
+            case .updateAvailable(let release): return "Update available: \(release.name)"
+            case .failure: return "Unable to check for updates. Try again."
+            }
         }
     }
 
@@ -88,12 +98,18 @@ final class UpdateChecker: ObservableObject {
     private let sleeper: Sleeper
     private let buildOverride: Int?
     private let versionOverride: String?
+    private let liteOverride: Bool?
 
     private static let lastCheckedKey = "stremiox.update.lastChecked"
     private static let dismissedKey = "stremiox.update.dismissedVersion"
     private static let cachedReleaseKey = "stremiox.update.cachedRelease"
     private static let appcastURL = "https://vortx.tv/appcast.json"
-    private static let releasesURL = "https://api.github.com/repos/VortXTV/VortX/releases?per_page=100"
+    private static let releasesURL = "https://api.github.com/repos/VortXTV/VortX/releases?per_page=20"
+    private static let maxResponseBytes = 512 * 1024
+    private static let maxReleaseCount = 20
+    private static let maxAssetCount = 100
+    private static let maxNameLength = 240
+    private static let maxNotesLength = 50_000
     /// A fresh automatic request is allowed on launch and once per hour while the app remains alive.
     /// This is deliberately much shorter than a day because sideloaded installs have no store daemon to
     /// surface a release on our behalf.
@@ -110,7 +126,8 @@ final class UpdateChecker: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
         },
         currentBuild: Int? = nil,
-        currentVersion: String? = nil
+        currentVersion: String? = nil,
+        isLite: Bool? = nil
     ) {
         self.defaults = defaults
         self.now = now
@@ -118,6 +135,7 @@ final class UpdateChecker: ObservableObject {
         self.sleeper = sleeper
         self.buildOverride = currentBuild
         self.versionOverride = currentVersion
+        self.liteOverride = isLite
     }
 
     private var currentBuild: Int {
@@ -210,9 +228,15 @@ final class UpdateChecker: ObservableObject {
 
         let currentTime = now().timeIntervalSince1970
         let last = defaults.double(forKey: Self.lastCheckedKey)
+        if isChecking {
+            // A scheduler tick that lands while a manual request owns discovery must transfer its next-deadline
+            // responsibility to that request. Calling onFinish here can re-arm at zero delay and hot-loop.
+            if isMonitoring { pendingMonitoringGeneration = monitoringGeneration }
+            return
+        }
         // A timestamp from a previous process is not a successful result for this one. Once this session has
         // failed its forced cold-launch request, its short retry loop must bypass that inherited timestamp.
-        guard (automaticCheckFailedThisSession || currentTime - last >= Self.automaticInterval), !isChecking else {
+        guard automaticCheckFailedThisSession || currentTime - last >= Self.automaticInterval else {
             onFinish?()
             return
         }
@@ -229,7 +253,7 @@ final class UpdateChecker: ObservableObject {
                 self.finishCheck(success: succeeded, forcePrompt: forcePrompt, isManual: isManual,
                                  manualOutcome: outcome, onFinish: onFinish)
             }
-            let discovery = await self.discoverLatestRelease()
+            let discovery = await self.discoverLatestRelease(cached: self.validatedRelease(self.available))
             guard case let .release(latest) = discovery else {
                 if case .current = discovery {
                     self.recordSuccessfulCheck()
@@ -247,6 +271,9 @@ final class UpdateChecker: ObservableObject {
             self.recordSuccessfulCheck()
             succeeded = true
 
+            // Never regress a cached/newer candidate because a successful but older endpoint replied later.
+            let selected = self.newerRelease(latest, than: self.validatedRelease(self.available))
+            guard let latest = selected else { return }
             if let encoded = try? JSONEncoder().encode(latest) {
                 self.defaults.set(encoded, forKey: Self.cachedReleaseKey)
             }
@@ -258,6 +285,7 @@ final class UpdateChecker: ObservableObject {
                 return
             }
             self.available = latest
+            if !isManual, case .upToDate = self.manualOutcome { self.manualOutcome = .idle }
             outcome = .updateAvailable(latest)
             if forcePrompt { self.forcePresentationNonce &+= 1 }
         }
@@ -273,18 +301,34 @@ final class UpdateChecker: ObservableObject {
     /// authoritative whenever it passes the client-side schema and artifact checks. GitHub is only a fallback
     /// for transport, HTTP, decoding, schema, or selected-entry validation failure, never a second source to
     /// merge or rank against it.
-    private func discoverLatestRelease() async -> DiscoveryResult {
-        switch await appcastDiscovery() {
-        case .release(let release):
+    private func discoverLatestRelease(cached: Release?) async -> DiscoveryResult {
+        let appcast = await appcastDiscovery()
+        if case .release(let release) = appcast,
+           isNewer(release), newerRelease(release, than: cached) == release {
+            // A valid, actually newer appcast is the authoritative source. Do not merge it with GitHub.
             return .release(release)
-        case .current:
-            return .current
-        case .failure:
-            return await gitHubDiscovery()
         }
+
+        // A current or stale appcast is not sufficient evidence to suppress an already-known newer release or a
+        // newer GitHub fallback. This also repairs a stale edge cache without trusting it over a validated cache.
+        let github = await gitHubDiscovery()
+        let appcastCandidate: Release?
+        if case .release(let release) = appcast { appcastCandidate = release }
+        else { appcastCandidate = nil }
+        let githubCandidate: Release?
+        if case .release(let release) = github { githubCandidate = release }
+        else { githubCandidate = nil }
+        if let newest = newestRelease(in: [cached, appcastCandidate, githubCandidate]) {
+            return .release(newest)
+        }
+        if case .failure = github { return .failure }
+        return .current
     }
 
     private func appcastDiscovery() async -> DiscoveryResult {
+        // appcast's tvOS entry is the Full target. Lite has a distinct bundle identifier and exact IPA, so it
+        // deliberately uses the strictly bound GitHub asset path below instead of ever being offered Full.
+        guard !isLiteBuild else { return .current }
         guard let url = URL(string: Self.appcastURL),
               let (data, response) = try? await request(url, githubAPI: false),
               (response as? HTTPURLResponse)?.statusCode == 200,
@@ -301,11 +345,12 @@ final class UpdateChecker: ObservableObject {
         guard let url = URL(string: Self.releasesURL),
               let (data, response) = try? await request(url, githubAPI: true),
               (response as? HTTPURLResponse)?.statusCode == 200,
-              let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
+              let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data),
+              releases.count <= Self.maxReleaseCount else {
             return .failure
         }
         guard let latest = releases
-            .filter({ !$0.draft && $0.publishedAt != nil })
+            .filter({ !$0.draft && $0.publishedAt != nil && $0.assets.count <= Self.maxAssetCount })
             .compactMap({ release(from: $0) })
             .max(by: { compare($0, $1) == .orderedAscending }) else {
             return .current
@@ -321,7 +366,13 @@ final class UpdateChecker: ObservableObject {
         request.setValue(githubAPI ? "application/vnd.github+json" : "application/json", forHTTPHeaderField: "Accept")
         request.setValue("VortX-UpdateChecker", forHTTPHeaderField: "User-Agent")
         if githubAPI { request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version") }
-        return try await requestLoader(request)
+        let (data, response) = try await requestLoader(request)
+        guard data.count <= Self.maxResponseBytes,
+              let finalURL = response.url,
+              isExpectedFinalResponseURL(finalURL, githubAPI: githubAPI) else {
+            throw URLError(.badServerResponse)
+        }
+        return (data, response)
     }
 
     private func finishCheck(success: Bool, forcePrompt: Bool, isManual: Bool,
@@ -330,13 +381,26 @@ final class UpdateChecker: ObservableObject {
         if !forcePrompt { automaticCheckFailedThisSession = !success }
         if isManual { self.manualOutcome = manualOutcome }
         onFinish?()
-        guard manualCheckPending else { return }
+        guard manualCheckPending else {
+            completePendingMonitoringIfNeeded()
+            return
+        }
         manualCheckPending = false
         let pendingHandlers = pendingManualFinishHandlers
         pendingManualFinishHandlers.removeAll()
         check(forcePrompt: true, isManual: true) {
             pendingHandlers.forEach { $0() }
         }
+    }
+
+    /// A manual request can be in flight when monitoring first starts, or when an hourly timer becomes due.
+    /// Its completion takes over the pending generation exactly once, after any queued manual check has settled.
+    private func completePendingMonitoringIfNeeded() {
+        guard !isChecking, isMonitoring,
+              let generation = pendingMonitoringGeneration,
+              generation == monitoringGeneration else { return }
+        pendingMonitoringGeneration = nil
+        completeMonitoringCheck(generation)
     }
 
     /// Arms one one-shot task. The next deadline is always computed after the prior request finished,
@@ -379,6 +443,7 @@ final class UpdateChecker: ObservableObject {
         restoredCache = true
         guard let data = defaults.data(forKey: Self.cachedReleaseKey),
               let release = try? JSONDecoder().decode(Release.self, from: data),
+              let release = validatedRelease(release),
               isNewer(release) else {
             defaults.removeObject(forKey: Self.cachedReleaseKey)
             return
@@ -389,7 +454,11 @@ final class UpdateChecker: ObservableObject {
     /// Platform shells call this only after their launch surface is visible. Keeping presentation separate from
     /// discovery prevents a fast response from putting the sheet behind a splash, profile picker, or player.
     func presentAvailableIfNeeded(force: Bool = false) {
-        guard let release = available else { return }
+        guard let release = validatedRelease(available), isNewer(release) else {
+            available = nil
+            prompt = nil
+            return
+        }
         guard force || !promptedKeys.contains(release.key) else { return }
         promptedKeys.insert(release.key)
         prompt = release
@@ -412,32 +481,11 @@ final class UpdateChecker: ObservableObject {
     }
 
     private func release(from entry: AppcastEntry) -> Release? {
-        let expectedType: String
-        let expectedExtension: String
-        #if os(macOS)
-        expectedType = "dmg"
-        expectedExtension = ".dmg"
-        #else
-        expectedType = "ipa"
-        expectedExtension = ".ipa"
-        #endif
-
-        guard entry.build > 0,
-              !numericVersion(entry.version).isEmpty,
-              entry.artifactType.lowercased() == expectedType,
-              entry.size > 0,
-              isLowercaseSHA256(entry.sha256),
-              let rawURL = entry.url ?? entry.ipa,
-              let artifactURL = URL(string: rawURL),
-              artifactURL.scheme == "https",
-              artifactURL.host == "github.com",
-              artifactURL.path.hasPrefix("/VortXTV/VortX/releases/download/"),
-              artifactURL.path.lowercased().hasSuffix(expectedExtension) else {
-            return nil
-        }
-        let altstore = entry.altstore.flatMap { URL(string: $0)?.scheme == "https" ? $0 : nil }
-        return Release(version: entry.version, build: entry.build, name: entry.name, notes: entry.notes,
-                       ipa: artifactURL.absoluteString, altstore: altstore, size: entry.size, sha256: entry.sha256)
+        guard entry.artifactType == expectedArtifactType else { return nil }
+        let release = Release(version: entry.version, build: entry.build, name: entry.name, notes: entry.notes,
+                              ipa: entry.url ?? entry.ipa, altstore: entry.altstore,
+                              size: entry.size, sha256: entry.sha256)
+        return validatedRelease(release, requiresIntegrity: true)
     }
 
     private func isLowercaseSHA256(_ value: String) -> Bool {
@@ -446,53 +494,152 @@ final class UpdateChecker: ObservableObject {
         }
     }
 
+    /// Final sink validation for network releases and persisted cache alike. Discovery adapters may parse their
+    /// own schemas, but nothing reaches `available`, `prompt`, or `openURL` without this exact platform binding.
+    private func validatedRelease(_ release: Release?, requiresIntegrity: Bool = false) -> Release? {
+        guard let release,
+              let version = numericVersion(release.version),
+              release.build > 0,
+              release.name.count > 0, release.name.count <= Self.maxNameLength,
+              release.notes.count <= Self.maxNotesLength,
+              release.name.localizedCaseInsensitiveContains(release.version),
+              let artifact = exactArtifactURL(release.ipa, version: release.version),
+              release.ipa == artifact.absoluteString else {
+            return nil
+        }
+        let hasIntegrity = release.size != nil || release.sha256 != nil
+        guard !hasIntegrity || (release.size ?? 0) > 0 && isLowercaseSHA256(release.sha256 ?? ""),
+              !requiresIntegrity || hasIntegrity,
+              release.altstore == nil || exactAltstoreURL(release.altstore) != nil else {
+            return nil
+        }
+        // Bind the fully parsed numeric version, so a string that merely contains a valid numeric fragment cannot
+        // reach the install URL sink.
+        guard !version.isEmpty else { return nil }
+        return release
+    }
+
+    private func exactArtifactURL(_ rawURL: String?, version: String) -> URL? {
+        guard let rawURL, let url = URL(string: rawURL),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == "https", components.host == "github.com",
+              components.user == nil, components.password == nil, components.port == nil,
+              components.query == nil, components.fragment == nil,
+              components.path == "/VortXTV/VortX/releases/download/v\(version)/\(expectedArtifactFilename(version))" else {
+            return nil
+        }
+        return url
+    }
+
+    private func exactAltstoreURL(_ rawURL: String?) -> URL? {
+        guard let rawURL, let url = URL(string: rawURL),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == "https", components.host == "vortx.tv",
+              components.user == nil, components.password == nil, components.port == nil,
+              components.query == nil, components.fragment == nil,
+              components.path == "/altstore.json" else {
+            return nil
+        }
+        return url
+    }
+
+    private func isExpectedFinalResponseURL(_ url: URL, githubAPI: Bool) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme == "https", components.user == nil, components.password == nil,
+              components.port == nil, components.fragment == nil else { return false }
+        if githubAPI {
+            return components.host == "api.github.com" &&
+                components.path == "/repos/VortXTV/VortX/releases" &&
+                components.queryItems == [URLQueryItem(name: "per_page", value: "20")]
+        }
+        return components.host == "vortx.tv" && components.path == "/appcast.json" && components.query == nil
+    }
+
+    private var expectedArtifactType: String {
+        if isLiteBuild { return "ipa" }
+        #if os(macOS)
+        return "dmg"
+        #else
+        return "ipa"
+        #endif
+    }
+
+    private func expectedArtifactFilename(_ version: String) -> String {
+        #if os(tvOS)
+        return isLiteBuild ? "VortX-tvOS-Lite-v\(version)-ci.ipa" : "VortX-tvOS-v\(version)-ci.ipa"
+        #elseif os(macOS)
+        return isLiteBuild ? "VortX-tvOS-Lite-v\(version)-ci.ipa" : "VortX-macOS-v\(version)-ci.dmg"
+        #else
+        return isLiteBuild ? "VortX-tvOS-Lite-v\(version)-ci.ipa" : "VortX-iOS-v\(version)-ci.ipa"
+        #endif
+    }
+
+    private var isLiteBuild: Bool {
+        if let liteOverride { return liteOverride }
+        #if os(tvOS)
+        return Bundle.main.bundleIdentifier == "com.stremiox.tv.lite"
+        #else
+        return false
+        #endif
+    }
+
+    private func newerRelease(_ candidate: Release, than existing: Release?) -> Release? {
+        guard let candidate = validatedRelease(candidate) else { return existing }
+        guard let existing = validatedRelease(existing) else { return candidate }
+        return compare(candidate, existing) == .orderedAscending ? existing : candidate
+    }
+
+    private func newestRelease(in candidates: [Release?]) -> Release? {
+        candidates.compactMap { validatedRelease($0) }
+            .max(by: { compare($0, $1) == .orderedAscending })
+    }
+
     private func release(from github: GitHubRelease) -> Release? {
-        guard let version = marketingVersion(in: github.tagName),
+        guard let version = version(fromTag: github.tagName),
               // The public release title is canonical. Release-note bodies carry older beta history, so their
               // first "Build" marker is not necessarily the build of this release.
               let build = buildNumber(in: github.name ?? "") ?? highestBuildNumber(in: github.body ?? ""),
               build > 0,
-              let asset = github.assets.first(where: platformAsset) else {
+              let asset = github.assets.first(where: { $0.name == expectedArtifactFilename(version) }) else {
             return nil
         }
-        return Release(version: version, build: build,
-                       name: github.name ?? github.tagName,
-                       notes: github.body ?? "",
-                       ipa: asset.browserDownloadURL,
-                       altstore: nil,
-                       size: nil,
-                       sha256: nil)
-    }
-
-    private func platformAsset(_ asset: GitHubAsset) -> Bool {
-        let name = asset.name.lowercased()
-        #if os(tvOS)
-        return name.contains("tvos") && !name.contains("lite") && name.hasSuffix(".ipa")
-        #elseif os(macOS)
-        return name.contains("macos") && (name.hasSuffix(".dmg") || name.hasSuffix(".pkg"))
-        #else
-        return name.contains("ios") && name.hasSuffix(".ipa")
-        #endif
+        let release = Release(version: version, build: build,
+                              name: github.name ?? github.tagName,
+                              notes: github.body ?? "",
+                              ipa: asset.browserDownloadURL,
+                              altstore: nil,
+                              size: nil,
+                              sha256: nil)
+        return validatedRelease(release)
     }
 
     private func isNewer(_ release: Release) -> Bool {
-        let remote = numericVersion(release.version)
-        let installed = numericVersion(currentVersion)
-        guard !remote.isEmpty, !installed.isEmpty else { return false }
+        guard let remote = numericVersion(release.version),
+              let installed = numericVersion(currentVersion) else { return false }
         let versionOrder = compareComponents(remote, installed)
         return versionOrder == .orderedDescending ||
             (versionOrder == .orderedSame && release.build > currentBuild)
     }
 
     private func compare(_ lhs: Release, _ rhs: Release) -> ComparisonResult {
-        let versionOrder = compareComponents(numericVersion(lhs.version), numericVersion(rhs.version))
+        guard let left = numericVersion(lhs.version), let right = numericVersion(rhs.version) else {
+            return .orderedSame
+        }
+        let versionOrder = compareComponents(left, right)
         guard versionOrder == .orderedSame else { return versionOrder }
         if lhs.build == rhs.build { return .orderedSame }
         return lhs.build < rhs.build ? .orderedAscending : .orderedDescending
     }
 
-    private func marketingVersion(in text: String) -> String? {
-        firstMatch(in: text, pattern: #"(?i)(?:^|[^0-9])(\d+(?:\.\d+)+)"#)
+    private func version(fromTag tag: String) -> String? {
+        guard tag.first == "v" else { return nil }
+        let body = String(tag.dropFirst())
+        let parts = body.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let version = parts.first.map(String.init), numericVersion(version) != nil,
+              parts.count == 1 || (!parts[1].isEmpty && parts[1].allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == ".") }) else {
+            return nil
+        }
+        return version
     }
 
     private func buildNumber(in text: String) -> Int? {
@@ -523,9 +670,13 @@ final class UpdateChecker: ObservableObject {
         return String(text[range])
     }
 
-    private func numericVersion(_ version: String) -> [Int] {
-        let numeric = marketingVersion(in: version) ?? version
-        return numeric.split(separator: ".").compactMap { Int($0) }
+    private func numericVersion(_ version: String) -> [Int]? {
+        let components = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard components.count >= 2, components.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else {
+            return nil
+        }
+        let values = components.compactMap { Int($0) }
+        return values.count == components.count ? values : nil
     }
 
     private func compareComponents(_ lhs: [Int], _ rhs: [Int]) -> ComparisonResult {

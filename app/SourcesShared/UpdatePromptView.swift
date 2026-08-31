@@ -15,6 +15,7 @@ struct UpdatePromptView: View {
 
     @Environment(\.openURL) private var openURL
     @Environment(\.dismiss) private var dismiss
+    @State private var openFailed = false
 
     private var versionLine: String {
         let v = release.version.isEmpty ? "" : "Version \(release.version)"
@@ -28,11 +29,13 @@ struct UpdatePromptView: View {
                 .font(.system(size: iconSize, weight: .semibold))
                 .foregroundStyle(Theme.Palette.accent)
                 .padding(.top, Theme.Space.lg)
+                .accessibilityHidden(true)
 
             VStack(spacing: Theme.Space.xs) {
                 Text("Update available")
                     .font(titleFont).fontWeight(.bold)
                     .foregroundStyle(Theme.Palette.textPrimary)
+                    .accessibilityAddTraits(.isHeader)
                 Text(release.name.isEmpty ? versionLine : "\(release.name) · \(versionLine)")
                     .font(.subheadline)
                     .foregroundStyle(Theme.Palette.textSecondary)
@@ -55,18 +58,32 @@ struct UpdatePromptView: View {
                 .vortxSettingsCard()
             }
 
+            #if os(tvOS)
+            Text("Apple TV updates are installed from another device. Open the release page there, then sideload the IPA.")
+                .font(.footnote)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .multilineTextAlignment(.center)
+            #endif
+
             VStack(spacing: Theme.Space.sm) {
                 Button {
-                    if let url = release.installURL { openURL(url) }
-                    finish()
+                    openInstallDestination()
                 } label: {
-                    Label("Get the update", systemImage: "arrow.down.circle.fill")
+                    Label(installActionTitle, systemImage: "arrow.down.circle.fill")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 4)
                 }
                 // PrimaryActionStyle uses Theme.Palette.onAccent for the label; the old `.borderedProminent`
                 // + `.tint(accent)` auto-picked white text that vanished on the gold accent (invisible-text).
                 .buttonStyle(PrimaryActionStyle())
+
+                if openFailed {
+                    Text(openFailureMessage)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .accessibilityLabel(openFailureMessage)
+                }
 
                 // A `.bordered` button paints its label in the tint color; `textSecondary` (mid-grey) on
                 // the dark canvas was too low-contrast to read on tvOS, especially unfocused (same class as
@@ -97,6 +114,42 @@ struct UpdatePromptView: View {
     private func finish() {
         onDismiss()
         dismiss()
+    }
+
+    private var installActionTitle: String {
+        #if os(tvOS)
+        return "Open release page"
+        #else
+        return "Get the update"
+        #endif
+    }
+
+    private var installDestination: URL? {
+        #if os(tvOS)
+        return URL(string: "https://github.com/VortXTV/VortX/releases/latest")
+        #else
+        return release.installURL
+        #endif
+    }
+
+    private var openFailureMessage: String {
+        #if os(tvOS)
+        return "Apple TV cannot install an IPA from inside VortX. Open the release page on another device, then sideload the update."
+        #else
+        return "Unable to open the update destination. Try again."
+        #endif
+    }
+
+    private func openInstallDestination() {
+        guard let url = installDestination else { openFailed = true; return }
+        openURL(url) { accepted in
+            if accepted {
+                // On tvOS this only confirms that the release page opened. The copy never claims an IPA installed.
+                finish()
+            } else {
+                openFailed = true
+            }
+        }
     }
 
     // Platform sizing: a roomy 10-foot dialog on tvOS, a compact centered card on phone/iPad/Mac.

@@ -96,31 +96,36 @@ actor GateLoader {
 actor RoutedLoader {
     private let appcast: Result<(Data, URLResponse), Error>
     private let github: Result<(Data, URLResponse), Error>
+    private let preserveResponseURL: Bool
     private(set) var requestedHosts: [String] = []
 
-    init(appcast: Result<(Data, URLResponse), Error>, github: Result<(Data, URLResponse), Error>) {
+    init(appcast: Result<(Data, URLResponse), Error>, github: Result<(Data, URLResponse), Error>,
+         preserveResponseURL: Bool = false) {
         self.appcast = appcast
         self.github = github
+        self.preserveResponseURL = preserveResponseURL
     }
 
     func load(_ request: URLRequest) throws -> (Data, URLResponse) {
         let host = request.url?.host ?? ""
         requestedHosts.append(host)
-        return try (host == "vortx.tv" ? appcast : github).get()
+        let (data, originalResponse) = try (host == "vortx.tv" ? appcast : github).get()
+        let status = (originalResponse as? HTTPURLResponse)?.statusCode ?? 200
+        return (data, preserveResponseURL ? originalResponse : response(status, url: request.url!))
     }
 
     var appcastCalls: Int { requestedHosts.filter { $0 == "vortx.tv" }.count }
     var githubCalls: Int { requestedHosts.filter { $0 == "api.github.com" }.count }
 }
 
-func response(_ status: Int) -> URLResponse {
-    HTTPURLResponse(url: URL(string: "https://api.github.com")!, statusCode: status,
+func response(_ status: Int, url: URL = URL(string: "https://api.github.com/repos/VortXTV/VortX/releases?per_page=20")!) -> URLResponse {
+    HTTPURLResponse(url: url, statusCode: status,
                     httpVersion: nil, headerFields: nil)!
 }
 
-func release(build: Int, body: String = "") -> Data {
+func release(build: Int, body: String = "", assetName: String = "VortX-macOS-v0.3.15-ci.dmg") -> Data {
     let fixture = """
-    [{"tag_name":"v0.3.15","name":"VortX 0.3.15 (Build \(build))","body":"\(body)","draft":false,"prerelease":false,"published_at":"2026-08-30T00:00:00Z","assets":[{"name":"VortX-macOS.dmg","browser_download_url":"https://example.invalid/VortX-macOS.dmg"}]}]
+    [{"tag_name":"v0.3.15","name":"VortX 0.3.15 (Build \(build))","body":"\(body)","draft":false,"prerelease":false,"published_at":"2026-08-30T00:00:00Z","assets":[{"name":"\(assetName)","browser_download_url":"https://github.com/VortXTV/VortX/releases/download/v0.3.15/\(assetName)"}]}]
     """
     return Data(fixture.utf8)
 }
@@ -508,8 +513,8 @@ struct UpdateCheckerTests {
         check(appcastNewerAppcastCalls == 1 && appcastNewerGitHubCalls == 0,
               "valid appcast is authoritative and does not merge GitHub")
 
-        // A valid appcast that exactly matches the installed build is still authoritative and must report current
-        // instead of falling through to a potentially different GitHub result.
+        // A valid but current appcast cannot suppress a newer GitHub candidate. The appcast remains authoritative
+        // only when it itself proves a newer build, which avoids a stale edge response hiding a live release.
         let appcastCurrentDefaults = UserDefaults(suiteName: "\(suiteName).appcast-current")!
         defer { appcastCurrentDefaults.removePersistentDomain(forName: "\(suiteName).appcast-current") }
         let appcastCurrentLoader = RoutedLoader(
@@ -523,11 +528,15 @@ struct UpdateCheckerTests {
         }
         await MainActor.run { appcastCurrent.checkNow() }
         await waitForManualCheckToFinish(appcastCurrent)
-        check(await manualOutcome(appcastCurrent) == .upToDate, "valid current appcast reports current")
+        let appcastCurrentOutcome = await manualOutcome(appcastCurrent)
+        let appcastCurrentBuild: Int?
+        if case .updateAvailable(let release) = appcastCurrentOutcome { appcastCurrentBuild = release.build }
+        else { appcastCurrentBuild = nil }
+        check(appcastCurrentBuild == 234, "valid current appcast falls through to a newer GitHub release")
         let appcastCurrentAppcastCalls = await appcastCurrentLoader.appcastCalls
         let appcastCurrentGitHubCalls = await appcastCurrentLoader.githubCalls
-        check(appcastCurrentAppcastCalls == 1 && appcastCurrentGitHubCalls == 0,
-              "valid current appcast avoids the GitHub fallback")
+        check(appcastCurrentAppcastCalls == 1 && appcastCurrentGitHubCalls == 1,
+              "valid current appcast performs one GitHub comparison")
 
         // Primary status or schema failure falls back to the existing GitHub parser. Both transport chains
         // failing still surface the manual retry state instead of quietly recording the request.
@@ -595,6 +604,195 @@ struct UpdateCheckerTests {
         let bothFailedGitHubCalls = await bothFailedLoader.githubCalls
         check(bothFailedAppcastCalls == 1 && bothFailedGitHubCalls == 1,
               "both-source failure attempts the fallback once")
+
+        // Monitoring can first be requested while a user-initiated check owns discovery. The manual completion
+        // must inherit exactly one scheduler deadline rather than leaving monitoring stranded.
+        let manualFirstDefaults = UserDefaults(suiteName: "\(suiteName).manual-first-monitoring")!
+        defer { manualFirstDefaults.removePersistentDomain(forName: "\(suiteName).manual-first-monitoring") }
+        let manualFirstLoader = GateLoader((release(build: 233), response(200)))
+        let manualFirstSleeper = ControlledSleeper()
+        let manualFirst = await MainActor.run {
+            UpdateChecker(defaults: manualFirstDefaults, now: { Date(timeIntervalSince1970: 1_900_000) },
+                          requestLoader: { request in await manualFirstLoader.load(request) },
+                          sleeper: { seconds in await manualFirstSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { manualFirst.checkNow() }
+        await waitForCalls(manualFirstLoader, 1)
+        await MainActor.run { manualFirst.startMonitoring() }
+        await manualFirstLoader.resumeFirst()
+        await waitForManualCheckToFinish(manualFirst)
+        await waitForSleeper(manualFirstSleeper, 1)
+        check(await manualFirstSleeper.waitingCount == 1,
+              "monitoring started during a manual check inherits one scheduler deadline")
+        await MainActor.run { manualFirst.stopMonitoring() }
+        await manualFirstSleeper.resumeNext()
+
+        // If the hourly task wakes while a manual fetch is in flight, it transfers scheduler ownership to that
+        // request. It must not synchronously re-arm a zero-delay loop while the manual request is still gated.
+        let timerDuringManualDefaults = UserDefaults(suiteName: "\(suiteName).timer-during-manual")!
+        defer { timerDuringManualDefaults.removePersistentDomain(forName: "\(suiteName).timer-during-manual") }
+        let timerDuringManualLoader = GateLoader((release(build: 233), response(200)), gatedCall: 2)
+        let timerDuringManualSleeper = ControlledSleeper()
+        let timerClock = TestClock(2_000_000)
+        let timerDuringManual = await MainActor.run {
+            UpdateChecker(defaults: timerDuringManualDefaults, now: { timerClock.date() },
+                          requestLoader: { request in await timerDuringManualLoader.load(request) },
+                          sleeper: { seconds in await timerDuringManualSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { timerDuringManual.startMonitoring() }
+        await waitForCalls(timerDuringManualLoader, 1)
+        await waitForSleeper(timerDuringManualSleeper, 1)
+        await MainActor.run { timerDuringManual.checkNow() }
+        await waitForCalls(timerDuringManualLoader, 2)
+        timerClock.seconds += 3_600
+        await timerDuringManualSleeper.resumeNext()
+        try? await Task.sleep(for: .milliseconds(20))
+        let callsDuringManual = await timerDuringManualLoader.calls
+        let sleepersDuringManual = await timerDuringManualSleeper.waitingCount
+        check(callsDuringManual == 2 && sleepersDuringManual == 0,
+              "hourly tick during manual discovery does not hot-loop a zero-delay scheduler")
+        await timerDuringManualLoader.resumeFirst()
+        await waitForManualCheckToFinish(timerDuringManual)
+        await waitForSleeper(timerDuringManualSleeper, 1)
+        check(await timerDuringManualSleeper.waitingCount == 1,
+              "manual completion re-arms the deferred hourly scheduler once")
+        await MainActor.run { timerDuringManual.stopMonitoring() }
+        await timerDuringManualSleeper.resumeNext()
+
+        // A URL that looks close to an artifact is still rejected at the final sink. This protects both a
+        // malformed appcast and any persisted release from selecting a query-bearing or redirected destination.
+        let poisonedAppcastString = String(data: appcast(version: "0.3.16", build: 234), encoding: .utf8)!
+            .replacingOccurrences(of: "VortX-macOS-v0.3.16-ci.dmg\",\"size", with: "VortX-macOS-v0.3.16-ci.dmg?download=1\",\"size")
+        let poisonedAppcast = Data(poisonedAppcastString.utf8)
+        let poisonedDefaults = UserDefaults(suiteName: "\(suiteName).poisoned-appcast")!
+        defer { poisonedDefaults.removePersistentDomain(forName: "\(suiteName).poisoned-appcast") }
+        let poisonedLoader = RoutedLoader(appcast: .success((poisonedAppcast, response(200))),
+                                          github: .success((release(build: 234), response(200))))
+        let poisoned = await MainActor.run {
+            UpdateChecker(defaults: poisonedDefaults, now: { Date(timeIntervalSince1970: 2_100_000) },
+                          requestLoader: { request in try await poisonedLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { poisoned.checkNow() }
+        await waitForManualCheckToFinish(poisoned)
+        let poisonedBuild = await MainActor.run { poisoned.available?.build }
+        let poisonedGitHubCalls = await poisonedLoader.githubCalls
+        check(poisonedBuild == 234 && poisonedGitHubCalls == 1,
+              "query-bearing appcast artifact is rejected and falls back safely")
+
+        let oversizedDefaults = UserDefaults(suiteName: "\(suiteName).oversized-appcast")!
+        defer { oversizedDefaults.removePersistentDomain(forName: "\(suiteName).oversized-appcast") }
+        let oversizedLoader = RoutedLoader(
+            appcast: .success((Data(repeating: 0, count: 512 * 1024 + 1), response(200))),
+            github: .success((release(build: 234), response(200)))
+        )
+        let oversized = await MainActor.run {
+            UpdateChecker(defaults: oversizedDefaults, now: { Date(timeIntervalSince1970: 2_150_000) },
+                          requestLoader: { request in try await oversizedLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { oversized.checkNow() }
+        await waitForManualCheckToFinish(oversized)
+        let oversizedBuild = await MainActor.run { oversized.available?.build }
+        let oversizedGitHubCalls = await oversizedLoader.githubCalls
+        check(oversizedBuild == 234 && oversizedGitHubCalls == 1,
+              "oversized primary response is bounded and falls back safely")
+
+        let redirectDefaults = UserDefaults(suiteName: "\(suiteName).redirect")!
+        defer { redirectDefaults.removePersistentDomain(forName: "\(suiteName).redirect") }
+        let redirectLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.16", build: 234), response(200, url: URL(string: "https://evil.example/appcast.json")!))),
+            github: .success((release(build: 234), response(200))), preserveResponseURL: true)
+        let redirect = await MainActor.run {
+            UpdateChecker(defaults: redirectDefaults, now: { Date(timeIntervalSince1970: 2_200_000) },
+                          requestLoader: { request in try await redirectLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { redirect.checkNow() }
+        await waitForManualCheckToFinish(redirect)
+        let redirectBuild = await MainActor.run { redirect.available?.build }
+        let redirectOutcome = await manualOutcome(redirect)
+        let redirectGitHubCalls = await redirectLoader.githubCalls
+        check(redirectBuild == 234 && redirectOutcome != .failure && redirectGitHubCalls == 1,
+              "unexpected appcast redirect is rejected before the safe fallback is used")
+
+        let githubRedirectDefaults = UserDefaults(suiteName: "\(suiteName).github-redirect")!
+        defer { githubRedirectDefaults.removePersistentDomain(forName: "\(suiteName).github-redirect") }
+        let githubRedirectLoader = RoutedLoader(
+            appcast: .success((Data("{}".utf8), response(503, url: URL(string: "https://vortx.tv/appcast.json")!))),
+            github: .success((release(build: 234), response(200, url: URL(string: "https://evil.example/releases")!))),
+            preserveResponseURL: true)
+        let githubRedirect = await MainActor.run {
+            UpdateChecker(defaults: githubRedirectDefaults, now: { Date(timeIntervalSince1970: 2_250_000) },
+                          requestLoader: { request in try await githubRedirectLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { githubRedirect.checkNow() }
+        await waitForManualCheckToFinish(githubRedirect)
+        check(await manualOutcome(githubRedirect) == .failure,
+              "unexpected GitHub final response origin is rejected visibly")
+
+        let liteDefaults = UserDefaults(suiteName: "\(suiteName).lite")!
+        defer { liteDefaults.removePersistentDomain(forName: "\(suiteName).lite") }
+        let liteLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.16", build: 234), response(200))),
+            github: .success((release(build: 234, assetName: "VortX-tvOS-Lite-v0.3.15-ci.ipa"), response(200))))
+        let lite = await MainActor.run {
+            UpdateChecker(defaults: liteDefaults, now: { Date(timeIntervalSince1970: 2_300_000) },
+                          requestLoader: { request in try await liteLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15", isLite: true)
+        }
+        await MainActor.run { lite.checkNow() }
+        await waitForManualCheckToFinish(lite)
+        check(await MainActor.run { lite.available?.ipa?.hasSuffix("VortX-tvOS-Lite-v0.3.15-ci.ipa") == true },
+              "Lite selects only its exact IPA asset")
+        let liteAppcastCalls = await liteLoader.appcastCalls
+        let liteGitHubCalls = await liteLoader.githubCalls
+        check(liteAppcastCalls == 0 && liteGitHubCalls == 1,
+              "Lite bypasses the Full-only appcast entry while remaining update-eligible")
+
+        let cachedRelease = UpdateChecker.Release(
+            version: "0.3.16", build: 234, name: "VortX 0.3.16 (Build 234)", notes: "Release notes",
+            ipa: "https://github.com/VortXTV/VortX/releases/download/v0.3.16/VortX-macOS-v0.3.16-ci.dmg",
+            altstore: nil, size: nil, sha256: nil
+        )
+        let cachedDefaults = UserDefaults(suiteName: "\(suiteName).cached-highest")!
+        defer { cachedDefaults.removePersistentDomain(forName: "\(suiteName).cached-highest") }
+        cachedDefaults.set(try! JSONEncoder().encode(cachedRelease), forKey: "stremiox.update.cachedRelease")
+        let cachedLoader = ScriptedLoader([.success((release(build: 233), response(200)))])
+        let cached = await MainActor.run {
+            UpdateChecker(defaults: cachedDefaults, now: { Date(timeIntervalSince1970: 2_400_000) },
+                          requestLoader: { request in try await cachedLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { cached.checkNow() }
+        await waitForManualCheckToFinish(cached)
+        check(await MainActor.run { cached.available?.build } == 234,
+              "older valid network data cannot overwrite a newer cached release")
+
+        let invalidCachedDefaults = UserDefaults(suiteName: "\(suiteName).cached-invalid")!
+        defer { invalidCachedDefaults.removePersistentDomain(forName: "\(suiteName).cached-invalid") }
+        var invalidCachedRelease = cachedRelease
+        invalidCachedRelease = UpdateChecker.Release(
+            version: invalidCachedRelease.version, build: invalidCachedRelease.build,
+            name: invalidCachedRelease.name, notes: invalidCachedRelease.notes,
+            ipa: invalidCachedRelease.ipa! + "?download=1", altstore: nil, size: nil, sha256: nil
+        )
+        invalidCachedDefaults.set(try! JSONEncoder().encode(invalidCachedRelease), forKey: "stremiox.update.cachedRelease")
+        let invalidCachedLoader = GateLoader((release(build: 233), response(200)))
+        let invalidCached = await MainActor.run {
+            UpdateChecker(defaults: invalidCachedDefaults, now: { Date(timeIntervalSince1970: 2_500_000) },
+                          requestLoader: { request in await invalidCachedLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { invalidCached.checkNow() }
+        check(await MainActor.run { invalidCached.available == nil },
+              "invalid cached release is rejected before it can be shown")
+        await waitForCalls(invalidCachedLoader, 1)
+        await invalidCachedLoader.resumeFirst()
+        await waitForManualCheckToFinish(invalidCached)
 
         exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE)
     }
