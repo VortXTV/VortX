@@ -1632,23 +1632,19 @@ final class CoreBridge: ObservableObject {
     /// Mark the whole title (all episodes of a series, or a movie) watched/unwatched.
     func markWatched(_ isWatched: Bool) {
         if overlayMarkWatched(isWatched, videoIds: { meta in (meta.videos ?? []).map(\.id) }) { return }
-        // MarkAsWatched(false) did not clear the per-video watched state the episode
-        // ticks read from, so "Mark Whole Series Unwatched" left every tick in place.
-        // Clear each video explicitly (the same path single-episode unwatch uses) so
-        // the ticks actually drop; watched stays the efficient aggregate action.
-        if isWatched {
-            dispatchMetaDetails(["action": "MarkAsWatched", "args": true])
-            return
-        }
-        guard let videos = metaDetails?.meta?.videos, !videos.isEmpty else {
-            dispatchMetaDetails(["action": "MarkAsWatched", "args": false]); return
-        }
-        for v in videos {
+        // `MarkAsWatched` changes only the library item's aggregate watched state. Episode ticks
+        // come from the separate per-video watched bitfield, so BOTH directions must visit every
+        // known video. The old true branch sent only the aggregate action, making a whole-series
+        // mark look like a silent no-op on the detail page.
+        for v in metaDetails?.meta?.videos ?? [] {
             var payload: [String: Any] = ["id": v.id]
             if let season = v.season { payload["season"] = season }
             if let episode = v.episode { payload["episode"] = episode }
-            dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, false]])
+            dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, isWatched]])
         }
+        // Keep the title-level library state in sync as well. This also covers movies and sparse
+        // details that have not supplied a videos array yet.
+        dispatchMetaDetails(["action": "MarkAsWatched", "args": isWatched])
     }
 
     /// Mark every episode of a season watched/unwatched.
@@ -2121,26 +2117,40 @@ final class CoreBridge: ObservableObject {
             }
             return
         }
-        guard let data = stateData("meta_details"),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let metaItems = object["metaItems"] as? [[String: Any]] else { return }
-        for entry in metaItems {
-            // Loadable serializes adjacently tagged: {"type":"Ready","content":{...meta...}}.
-            // (Looking for a lowercase "ready" key here made this function a silent no-op,
-            // which is why the Library button never saved from a detail page.)
-            if let loadable = entry["content"] as? [String: Any],
-               loadable["type"] as? String == "Ready",
-               let meta = loadable["content"] as? [String: Any] {
-                // An explicit add supersedes any prior removal tombstone for this id, so the freshly-added
-                // title is not later suppressed by the recovery skip / union subtract and the next push stops
-                // carrying the stale removal. Mirrors installAddon's AddonTombstones.forget on a fresh install.
-                if let addedId = meta["id"] as? String { LibraryTombstones.forget(addedId) }
-                dispatchCtx(["action": "AddToLibrary", "args": meta])
-                NSLog("[CoreBridge] AddToLibrary dispatched for %@", (meta["id"] as? String) ?? "?")
-                return
+        guard let meta = detailMetaPreview() else {
+            NSLog("[CoreBridge] AddToLibrary found no usable detail meta")
+            return
+        }
+        // An explicit add supersedes any prior removal tombstone for this id, so the freshly-added
+        // title is not later suppressed by the recovery skip / union subtract and the next push stops
+        // carrying the stale removal. Mirrors installAddon's AddonTombstones.forget on a fresh install.
+        if let addedId = meta["id"] as? String { LibraryTombstones.forget(addedId) }
+        dispatchCtx(["action": "AddToLibrary", "args": meta])
+        NSLog("[CoreBridge] AddToLibrary dispatched for %@", (meta["id"] as? String) ?? "?")
+    }
+
+    /// Return the exact ready engine meta for the open detail page when it is still resident. A
+    /// `meta_details` event and the SwiftUI detail update are asynchronous, however, so that state
+    /// can briefly be unavailable even while `metaDetails` has already rendered the title. The engine's
+    /// `MetaItemPreview` accepts id/type/name (optional poster), therefore the decoded detail is a safe
+    /// final fallback rather than making a deliberate Library button tap a silent no-op.
+    private func detailMetaPreview() -> [String: Any]? {
+        let selectedID = metaDetails?.meta?.id
+        if let data = stateData("meta_details"),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let metaItems = object["metaItems"] as? [[String: Any]] {
+            for entry in metaItems {
+                guard let loadable = entry["content"] as? [String: Any],
+                      loadable["type"] as? String == "Ready",
+                      let meta = loadable["content"] as? [String: Any] else { continue }
+                if selectedID == nil || meta["id"] as? String == selectedID { return meta }
             }
         }
-        NSLog("[CoreBridge] AddToLibrary found no ready meta in meta_details")
+        if let selectedID, let catalog = rawMetaPreview(forId: selectedID) { return catalog }
+        guard let detail = metaDetails?.meta else { return nil }
+        var preview: [String: Any] = ["id": detail.id, "type": detail.type, "name": detail.name]
+        if let poster = detail.poster { preview["poster"] = poster }
+        return preview
     }
 
     /// Remove the open detail-page title from the library, mirroring the removal to each connected external
@@ -2732,7 +2742,10 @@ final class CoreBridge: ObservableObject {
                 let changed = current.libraryItem?.id != details?.libraryItem?.id
                     || current.libraryItem?.removed != details?.libraryItem?.removed
                     || current.libraryItem?.temp != details?.libraryItem?.temp
-                    || (current.watchedVideoIds?.count ?? 0) != (details?.watchedVideoIds?.count ?? 0)
+                    // An account/sync refresh can exchange one episode id for another while
+                    // preserving the count. Comparing the count made the open detail page retain
+                    // its old tick set until a reload, falsely appearing to undo a successful mark.
+                    || WatchedMembershipPolicy.changed(current.watchedVideoIds, details?.watchedVideoIds)
                 if changed { self.metaDetails = details }
             }
         }
