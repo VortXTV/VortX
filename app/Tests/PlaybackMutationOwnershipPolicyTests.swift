@@ -83,6 +83,9 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "pending B proof suppresses resident A publishing and hydration")
         check(Policy.blocksEnginePublication(hasPendingBinding: true, credentialRejected: true),
               "rejected B blocks both launch and repair timers from indirect retry")
+        check(Policy.blocksEnginePublication(hasPendingBinding: false, credentialRejected: false,
+                                             signedOutRepairPending: true),
+              "pending explicit logout blocks stale resident publication until signed-out control receipt")
         check(!Policy.blocksEnginePublication(hasPendingBinding: false, credentialRejected: false),
               "settled or signed-out engine may publish normally")
         check(!Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: false),

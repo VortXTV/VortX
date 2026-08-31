@@ -72,8 +72,9 @@ enum PlaybackMutationOwnershipPolicy {
             && !authMigration && activeProfileIsOwner && activeUsesEngineHistory && credentialCurrent
     }
 
-    static func blocksEnginePublication(hasPendingBinding: Bool, credentialRejected: Bool) -> Bool {
-        hasPendingBinding || credentialRejected
+    static func blocksEnginePublication(hasPendingBinding: Bool, credentialRejected: Bool,
+                                        signedOutRepairPending: Bool = false) -> Bool {
+        hasPendingBinding || credentialRejected || signedOutRepairPending
     }
 
     static func allowsRepairHydration(engineSignedIn: Bool, hasSettledBinding: Bool) -> Bool {

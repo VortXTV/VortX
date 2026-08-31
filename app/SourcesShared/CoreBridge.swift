@@ -141,9 +141,28 @@ final class CoreBridge: ObservableObject {
     private struct SignedOutRepairRequest: Equatable {
         let generation: UInt64
         let publicationToken: PublicationToken
+        /// Imported-away recovery has its own fenced path, but still needs the logout
+        /// publication gate until the engine positively acknowledges signed-out state.
+        let rearmSessionRepair: Bool
     }
     private var signedOutRepairGeneration: UInt64 = 0
     private var signedOutRepairRequest: SignedOutRepairRequest?
+    /// Imported-away logout runs through awaits, so it retains the exact profile/token identity
+    /// that authorized it rather than re-reading the active profile after suspension.
+    private struct ImportedAwayBootstrapContext {
+        let profileID: UUID
+        let keychainAccount: String
+        let credentialFingerprint: String
+        let authGeneration: UInt64
+        let publicationToken: PublicationToken
+        let importedAway: Bool
+    }
+    private struct ImportedAwayLocalRecoveryContext {
+        let profileID: UUID
+        let keychainAccount: String
+        let authGeneration: UInt64
+        let publicationToken: PublicationToken
+    }
 
     // MARK: Player-active gating (playback lag fix)
     //
@@ -719,6 +738,7 @@ final class CoreBridge: ObservableObject {
         if isLoggedIn() {
             if importedAway {
                 cancelAccountBindingVerification()
+                guard let importedAwayContext = captureImportedAwayBootstrapContext() else { return }
                 // Wave 4 (Finding 2): this account is migrated to VortX and NOT opted into two-way sync, yet the
                 // engine still holds a live Stremio session from its own persisted storage. stremio-core
                 // auto-persists library / progress mutations to api.strem.io whenever a session is loaded (the
@@ -733,26 +753,42 @@ final class CoreBridge: ObservableObject {
                 // session repair. Next launch has no token, so isLoggedIn() is false and this runs at most once;
                 // on an unreachable launch we keep the session and retry next launch (never an empty UI).
                 Task { @MainActor in
+                    guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }
                     if await VortXSyncManager.shared.accountDocReachable() {
+                        guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }
                         NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
                         self.logOut(rearmSignedOutRepair: false)   // imported-away owns deterministic local recovery below
                         // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
                         // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
                         // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
-                        Keychain.set(nil, for: self.activeTokenAccount)
+                        Keychain.set(nil, for: importedAwayContext.keychainAccount)
+                        let localRecovery = self.captureImportedAwayLocalRecoveryContext(
+                            profileID: importedAwayContext.profileID,
+                            keychainAccount: importedAwayContext.keychainAccount
+                        )
+                        guard let localRecovery else { return }
                         // Logout invalidated the launch timer with the old Stremio context.  The now
                         // signed-out local context gets one fresh, token-fenced repair opportunity.
+                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
                         self.scheduleSessionRepair()
                         // Deterministic post-logout recovery: wait for the engine to actually process the Logout
                         // (isLoggedIn flips false and the library resets), then load that empty library and recover
                         // the owner library from doc.vortx at launch, not after the 14s repair.
-                        for _ in 0 ..< 30 where self.isLoggedIn() { try? await Task.sleep(nanoseconds: 100_000_000) }
+                        for _ in 0 ..< 30 where self.isLoggedIn() {
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                            guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
+                        }
+                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
                         await self.loadLibraryAndAwait()
+                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
                         await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
+                        self.loadBoard()
                     } else {
                         NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
+                        guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }
+                        self.loadBoard()
                     }
-                    self.loadBoard()
                 }
                 loadBoard()
                 return
@@ -952,42 +988,28 @@ final class CoreBridge: ObservableObject {
     /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
     func logOut(rearmSignedOutRepair: Bool = true) {
         invalidateAuthenticationGeneration()
-        let signedOutRepairRequest: SignedOutRepairRequest?
-        if rearmSignedOutRepair {
-            signedOutRepairGeneration &+= 1
-            let request = SignedOutRepairRequest(
-                generation: signedOutRepairGeneration,
-                publicationToken: capturePublicationToken()
-            )
-            self.signedOutRepairRequest = request
-            signedOutRepairRequest = request
-        } else {
-            signedOutRepairRequest = nil
-        }
+        signedOutRepairGeneration &+= 1
+        let signedOutRepairRequest = SignedOutRepairRequest(
+            generation: signedOutRepairGeneration,
+            publicationToken: capturePublicationToken(),
+            rearmSessionRepair: rearmSignedOutRepair
+        )
+        self.signedOutRepairRequest = signedOutRepairRequest
         dispatchCtx(["action": "Logout"])
         clearUserState()
-        if let signedOutRepairRequest {
-            DispatchQueue.main.async { [weak self] in
-                self?.rearmSignedOutRepairWhenSafe(signedOutRepairRequest)
-            }
-        }
     }
 
-    /// Do not schedule local recovery at logout dispatch time: the engine may still have the old
-    /// authenticated ctx.  A short bounded poll is backed by the ctx receipt path below, and the
-    /// one-shot flag makes both paths converge on exactly one repair timer.
-    private func rearmSignedOutRepairWhenSafe(_ request: SignedOutRepairRequest, attempt: Int = 0) {
-        guard signedOutRepairRequest == request,
-              publicationStillCurrent(request.publicationToken) else { return }
-        guard !isLoggedIn() else {
-            guard attempt < 30 else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.rearmSignedOutRepairWhenSafe(request, attempt: attempt + 1)
-            }
-            return
-        }
+    /// A matching signed-out `ctx` is the only receipt allowed to release the logout publication
+    /// gate.  Polling `isLoggedIn()` is not enough: it can observe a transitional engine state
+    /// while old board/library events are still queued behind it.
+    private func rearmSignedOutRepairWhenSafe(_ request: SignedOutRepairRequest) {
+        guard signedOutRepairRequestStillCurrent(request) else { return }
+        guard !isLoggedIn() else { return }
+        guard signedOutRepairRequestStillCurrent(request) else { return }
         signedOutRepairRequest = nil
-        scheduleSessionRepair()
+        if request.rearmSessionRepair {
+            scheduleSessionRepair()
+        }
     }
 
     /// Clear the published per-account UI state (rails, library, details).
@@ -2773,6 +2795,69 @@ final class CoreBridge: ObservableObject {
         SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    private func captureImportedAwayBootstrapContext() -> ImportedAwayBootstrapContext? {
+        guard importedAwayFromStremio,
+              let profile = ProfileStore.shared.active,
+              profile.usesEngineHistory,
+              let token = Keychain.string(ProfileStore.shared.activeKeychainAccount), !token.isEmpty else { return nil }
+        return ImportedAwayBootstrapContext(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            credentialFingerprint: Self.credentialFingerprint(token),
+            authGeneration: authBindingGeneration,
+            publicationToken: capturePublicationToken(),
+            importedAway: importedAwayFromStremio
+        )
+    }
+
+    private func importedAwayBootstrapStillCurrent(_ context: ImportedAwayBootstrapContext) -> Bool {
+        guard let profile = ProfileStore.shared.active,
+              profile.id == context.profileID,
+              profile.usesEngineHistory,
+              ProfileStore.shared.activeKeychainAccount == context.keychainAccount,
+              authBindingGeneration == context.authGeneration,
+              publicationEpochMatches(context.publicationToken),
+              context.importedAway,
+              importedAwayFromStremio,
+              let token = Keychain.string(context.keychainAccount), !token.isEmpty,
+              Self.credentialFingerprint(token) == context.credentialFingerprint else { return false }
+        return true
+    }
+
+    private func captureImportedAwayLocalRecoveryContext(profileID: UUID,
+                                                         keychainAccount: String) -> ImportedAwayLocalRecoveryContext? {
+        guard let profile = ProfileStore.shared.active,
+              profile.id == profileID,
+              profile.usesEngineHistory,
+              ProfileStore.shared.activeKeychainAccount == keychainAccount,
+              Keychain.string(keychainAccount) == nil,
+              !awaitingAuthMigration,
+              !switchInFlight,
+              pendingAccountBinding == nil,
+              !importedAwayFromStremio else { return nil }
+        return ImportedAwayLocalRecoveryContext(
+            profileID: profileID,
+            keychainAccount: keychainAccount,
+            authGeneration: authBindingGeneration,
+            publicationToken: capturePublicationToken()
+        )
+    }
+
+    private func importedAwayLocalRecoveryStillCurrent(_ context: ImportedAwayLocalRecoveryContext) -> Bool {
+        guard let profile = ProfileStore.shared.active,
+              profile.id == context.profileID,
+              profile.usesEngineHistory,
+              ProfileStore.shared.activeKeychainAccount == context.keychainAccount,
+              authBindingGeneration == context.authGeneration,
+              publicationEpochMatches(context.publicationToken),
+              Keychain.string(context.keychainAccount) == nil,
+              !awaitingAuthMigration,
+              !switchInFlight,
+              pendingAccountBinding == nil,
+              !importedAwayFromStremio else { return false }
+        return true
+    }
+
     /// Clear the old binding before dispatching authentication. A missing active engine profile
     /// fails closed rather than borrowing whichever account happened to be resident.
     private func beginAccountBinding(for token: String) {
@@ -2828,7 +2913,8 @@ final class CoreBridge: ObservableObject {
     private var enginePublicationBlocked: Bool {
         PlaybackMutationOwnershipPolicy.blocksEnginePublication(
             hasPendingBinding: pendingAccountBinding != nil,
-            credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration)
+            credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration,
+            signedOutRepairPending: signedOutRepairRequest != nil)
     }
 
     private func capturePublicationToken() -> PublicationToken {
@@ -2843,10 +2929,21 @@ final class CoreBridge: ObservableObject {
     /// publishing resident engine state even when no epoch has changed.
     private func publicationStillCurrent(_ token: PublicationToken) -> Bool {
         dispatchPrecondition(condition: .onQueue(.main))
+        return publicationEpochMatches(token) && !enginePublicationBlocked
+    }
+
+    /// Control-plane receipts cannot use `publicationStillCurrent`: a matching signed-out ctx is
+    /// what clears the logout publication gate.  This raw epoch comparison is intentionally kept
+    /// separate and is only paired with an exact request identity below.
+    private func publicationEpochMatches(_ token: PublicationToken) -> Bool {
         publicationEpochLock.lock()
         let current = token.epoch == publicationEpoch
         publicationEpochLock.unlock()
-        return current && !enginePublicationBlocked
+        return current
+    }
+
+    private func signedOutRepairRequestStillCurrent(_ request: SignedOutRepairRequest) -> Bool {
+        signedOutRepairRequest == request && publicationEpochMatches(request.publicationToken)
     }
 
     /// Invalidate every captured engine snapshot at the profile/auth boundary.  Coalesced work is
