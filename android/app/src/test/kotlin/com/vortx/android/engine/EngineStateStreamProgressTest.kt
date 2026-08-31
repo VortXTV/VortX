@@ -1,12 +1,19 @@
 package com.vortx.android.engine
 
+import com.vortx.android.data.StreamLoadUpdate
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -151,6 +158,132 @@ class EngineStateStreamProgressTest {
         )
 
         assertEquals(listOf("First", "Second", "Third"), ordered.map { it.addon })
+    }
+
+    @Test
+    fun fastLowPriorityThenSlowHighPriorityPublishesOrderedTerminalSnapshot() = runBlocking {
+        val changes = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+        val state = AtomicReference(streamState(high = "Loading", low = "Loading"))
+        val dispatched = CountDownLatch(1)
+        val partialRead = CountDownLatch(1)
+        val updates = async(Dispatchers.Default) {
+            streamLoadStateUpdates(
+                changes = changes,
+                dispatch = { dispatched.countDown() },
+                readState = state::get,
+                snapshot = { json ->
+                    streamUpdate(json).also { update ->
+                        if (update.groups.map(StreamGroup::addon) == listOf("low.invalid")) {
+                            partialRead.countDown()
+                        }
+                    }
+                },
+                isCurrent = { true },
+                timeoutMs = 2_000L,
+            ).toList()
+        }
+
+        assertTrue(dispatched.await(2, TimeUnit.SECONDS))
+        state.set(streamState(high = "Loading", low = "Ready"))
+        changes.tryEmit(Unit)
+        assertTrue(partialRead.await(2, TimeUnit.SECONDS))
+        state.set(streamState(high = "Ready", low = "Ready"))
+        changes.tryEmit(Unit)
+
+        val snapshots = updates.await()
+        assertTrue(snapshots.any { it.groups.map(StreamGroup::addon) == listOf("low.invalid") && !it.terminal })
+        assertEquals(listOf("high.invalid", "low.invalid"), snapshots.last().groups.map(StreamGroup::addon))
+        assertTrue(snapshots.last().terminal)
+    }
+
+    @Test
+    fun allEmptyAnswersPublishAnImmediateTerminalSnapshot() = runBlocking {
+        val state = AtomicReference(streamState(high = "Ready", low = "Err", empty = true))
+        val update = streamLoadStateUpdates(
+            changes = MutableSharedFlow(),
+            dispatch = { },
+            readState = state::get,
+            snapshot = ::streamUpdate,
+            isCurrent = { true },
+            timeoutMs = 2_000L,
+        ).toList().single()
+
+        assertTrue(update.groups.isEmpty())
+        assertEquals(2, update.loaded)
+        assertEquals(2, update.total)
+        assertTrue(update.terminal)
+    }
+
+    @Test
+    fun stalePreviousGenerationCannotPublishAfterSupersession() = runBlocking {
+        val changes = MutableSharedFlow<Unit>(extraBufferCapacity = 2)
+        val current = AtomicBoolean(true)
+        val dispatched = CountDownLatch(1)
+        val old = async(Dispatchers.Default) {
+            runCatching {
+                streamLoadStateUpdates(
+                    changes = changes,
+                    dispatch = { dispatched.countDown() },
+                    readState = { streamState(high = "Loading", low = "Loading") },
+                    snapshot = ::streamUpdate,
+                    isCurrent = current::get,
+                    timeoutMs = 2_000L,
+                ).toList()
+            }.exceptionOrNull()
+        }
+
+        assertTrue(dispatched.await(2, TimeUnit.SECONDS))
+        current.set(false)
+        changes.tryEmit(Unit)
+        assertTrue(old.await() is CancellationException)
+    }
+
+    @Test
+    fun repeatedRefindCollectorsReturnOnlyTheirOwnTerminalState() = runBlocking {
+        suspend fun load(id: String): List<StreamLoadUpdate> {
+            val json = streamState(high = "Ready", low = "Err", sourceId = id)
+            return streamLoadStateUpdates(
+                changes = MutableSharedFlow(),
+                dispatch = { },
+                readState = { json },
+                snapshot = ::streamUpdate,
+                isCurrent = { true },
+                timeoutMs = 2_000L,
+            ).toList()
+        }
+
+        assertTrue(load("first").single().groups.single().streams.single().id.contains("/first#first"))
+        assertTrue(load("second").single().groups.single().streams.single().id.contains("/second#second"))
+    }
+
+    private fun streamUpdate(json: String): StreamLoadUpdate {
+        val progress = EngineState.parseStreamLoadProgress(json)
+        return StreamLoadUpdate(
+            groups = EngineState.parseStreamGroups(json),
+            loaded = progress.loaded,
+            total = progress.total,
+            terminal = progress.total > 0 && progress.loaded == progress.total,
+        )
+    }
+
+    private fun streamState(
+        high: String,
+        low: String,
+        empty: Boolean = false,
+        sourceId: String = "source",
+    ): String {
+        fun entry(base: String, type: String, id: String): String {
+            val content = when (type) {
+                "Ready" -> if (empty) "[]" else """[{"url":"https://cdn.invalid/$id","name":"$id"}]"""
+                else -> "null"
+            }
+            return if (type == "Ready") {
+                """{"request":{"base":"https://$base.invalid"},"content":{"type":"Ready","content":$content}}"""
+            } else {
+                """{"request":{"base":"https://$base.invalid"},"content":{"type":"$type"}}"""
+            }
+        }
+        return """{"streams":[${entry("high", high, sourceId)},${entry("low", low, "low")}] }"""
     }
 
     private fun group(addon: String, base: String) = StreamGroup(

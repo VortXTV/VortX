@@ -85,6 +85,14 @@ data class HomeUpdate(
     val owner: ContinueWatchingOwner = LOCAL_CONTINUE_WATCHING_OWNER,
 )
 
+/** One target-scoped stream fan-out snapshot. Empty [groups] is authoritative only when [terminal] is true. */
+data class StreamLoadUpdate(
+    val groups: List<StreamGroup>,
+    val loaded: Int,
+    val total: Int,
+    val terminal: Boolean,
+)
+
 /// The seam between the UI and the engine. The Compose screens depend only on this interface, so the
 /// real stremio-core-kotlin engine (Rust core over JNI, the same engine the iOS/tvOS apps use) lands
 /// behind it in a later iteration with no UI churn. Functions are suspend/Result-shaped to match the
@@ -313,6 +321,22 @@ interface CatalogRepository {
         wantedAddon: String? = null,
         forceRefresh: Boolean = false,
     ): Result<List<StreamGroup>>
+
+    /**
+     * Incremental stream fan-out. Implementations emit partial snapshots and one terminal snapshot after
+     * every requested add-on has answered, including the authoritative all-empty result.
+     */
+    fun streamUpdates(
+        type: MediaType,
+        id: String,
+        episodeId: String? = null,
+        rememberedQuality: String? = null,
+        wantedAddon: String? = null,
+        forceRefresh: Boolean = false,
+    ): Flow<StreamLoadUpdate> = flow {
+        val groups = streams(type, id, episodeId, rememberedQuality, wantedAddon, forceRefresh).getOrThrow()
+        emit(StreamLoadUpdate(groups, loaded = 1, total = 1, terminal = true))
+    }
 
     /// Resolve a chosen [StreamSource] into a directly-playable [Playable] for the player. The engine
     /// does whatever the source requires: hand a magnet to the in-process streaming server and return

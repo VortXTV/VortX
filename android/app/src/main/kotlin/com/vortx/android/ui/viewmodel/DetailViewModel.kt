@@ -722,15 +722,16 @@ class DetailViewModel(
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         sourceModel.setMediaServerGroups(serverGroups)
 
-        repo.streams(
-            type = type,
-            id = metaId,
-            episodeId = episodeId,
-            rememberedQuality = advanceHint?.first,
-            wantedAddon = advanceHint?.let { sourceSticky.preference(id)?.addon },
-            forceRefresh = forceRefresh,
-        ).fold(
-            onSuccess = { raw ->
+        try {
+            repo.streamUpdates(
+                type = type,
+                id = metaId,
+                episodeId = episodeId,
+                rememberedQuality = advanceHint?.first,
+                wantedAddon = advanceHint?.let { sourceSticky.preference(id)?.addon },
+                forceRefresh = forceRefresh,
+            ).collect { update ->
+                val raw = update.groups
                 // Immediate paint of the ranked add-on groups (already ranked by the engine repo), then feed
                 // the model so the fuller assembled + re-ranked list refines it a beat later.
                 if (
@@ -743,10 +744,14 @@ class DetailViewModel(
                     // model/capture/cache lanes: their display assembly filters before ranking, while capture
                     // intentionally sees eligible torrent descriptors before the viewer-only display filter.
                     val displayRaw = SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly)
-                    sourcesReady = true
-                    _streams.value = UiState.Success(displayRaw)
+                    if (displayRaw.isNotEmpty() || update.terminal) {
+                        sourcesReady = true
+                        _streams.value = UiState.Success(displayRaw)
+                    }
                     sourceModel.setRawGroups(raw)
-                    runCacheCheck(raw, episodeId, season, episodeNum, request, ctx.contentId)
+                    if (raw.isNotEmpty()) {
+                        runCacheCheck(raw, episodeId, season, episodeNum, request, ctx.contentId)
+                    }
                     // Smart Source Selection auto-pick (viewer opt-in, once per episode tap): play the
                     // best-ranked source of the FRESH raw groups straight away. Ranked directly (not via
                     // [bestSource]) because the assembly coalescer may still hold the previous episode's
@@ -757,7 +762,7 @@ class DetailViewModel(
                     // signature + bingeGroup so the ranking's next-episode bonuses keep the binge on the
                     // same release family; it also reports a no-source dead end through [_playback] so
                     // the shell's Up Next overlay can bail instead of sitting on "Starting…" forever.
-                    if (pendingAutoPick) {
+                    if (pendingAutoPick && (displayRaw.isNotEmpty() || update.terminal)) {
                         pendingAutoPick = false
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
@@ -769,7 +774,7 @@ class DetailViewModel(
                                 streamId = episodeId,
                                 deadlineMs = AUTO_NEXT_ASSEMBLY_DEADLINE_MS,
                             )
-                            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@fold
+                            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@collect
                             assembled?.best
                         } else {
                             StreamRanking.best(
@@ -787,8 +792,10 @@ class DetailViewModel(
                         }
                     }
                 }
-            },
-            onFailure = {
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
                 if (
                     episodeId == _selectedEpisodeId.value &&
                     sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
@@ -796,14 +803,13 @@ class DetailViewModel(
                     // An auto-advance load failure must reach the shell's Up Next overlay (it observes
                     // [playback], not [streams]); a Smart-Source tap keeps today's streams-Error surface.
                     if (pendingAutoPick && pendingAdvanceHint != null) {
-                        _playback.value = Playback.Failed(it.message ?: "Couldn't load the next episode's sources.")
+                        _playback.value = Playback.Failed(error.message ?: "Couldn't load the next episode's sources.")
                     }
                     pendingAutoPick = false
                     pendingAdvanceHint = null
-                    _streams.value = UiState.Error(it.message ?: "Something went wrong loading your add-ons.")
+                    _streams.value = UiState.Error(error.message ?: "Something went wrong loading your add-ons.")
                 }
-            },
-        )
+        }
         } finally {
             if (forceRefresh) sourceRequestFence.finishRefresh(request)
         }

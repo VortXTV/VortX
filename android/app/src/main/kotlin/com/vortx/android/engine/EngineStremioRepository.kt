@@ -14,6 +14,7 @@ import com.vortx.android.data.ContinueWatchingSnapshot
 import com.vortx.android.data.HomeSnapshot
 import com.vortx.android.data.HomeUpdate
 import com.vortx.android.data.PlaybackSessionToken
+import com.vortx.android.data.StreamLoadUpdate
 import com.vortx.android.model.AddonOrder
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
@@ -52,6 +53,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -67,6 +69,7 @@ import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.last
 import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -114,6 +117,58 @@ internal suspend fun <T> runCatchingStreamLoad(block: suspend () -> T): Result<T
     throw cancelled
 } catch (error: Throwable) {
     Result.failure(error)
+}
+
+/**
+ * Subscribe to field ticks before dispatch, then serialize every state pull through one reader. A conflated
+ * tick is sufficient because engine state is cumulative; a missed intermediate notification is recovered by
+ * the next pull. The final read on timeout preserves the freshest bounded best-effort snapshot.
+ */
+internal fun streamLoadStateUpdates(
+    changes: Flow<Unit>,
+    dispatch: () -> Unit,
+    readState: () -> String,
+    snapshot: (String) -> StreamLoadUpdate,
+    isCurrent: () -> Boolean,
+    timeoutMs: Long,
+): Flow<StreamLoadUpdate> = channelFlow {
+    fun requireCurrent() {
+        if (!isCurrent()) throw CancellationException("Superseded by a newer stream target")
+    }
+
+    val ticks = Channel<Unit>(Channel.CONFLATED)
+    val subscription = launch(start = CoroutineStart.UNDISPATCHED) {
+        changes.collect { ticks.trySend(Unit) }
+    }
+    var last: StreamLoadUpdate? = null
+    suspend fun publishCurrent(): Boolean {
+        requireCurrent()
+        val current = snapshot(readState())
+        requireCurrent()
+        if (current != last) {
+            send(current)
+            last = current
+        }
+        return current.terminal
+    }
+
+    try {
+        requireCurrent()
+        dispatch()
+        val terminal = withTimeoutOrNull(timeoutMs) {
+            if (publishCurrent()) return@withTimeoutOrNull true
+            while (true) {
+                ticks.receive()
+                if (publishCurrent()) return@withTimeoutOrNull true
+            }
+            @Suppress("UNREACHABLE_CODE")
+            false
+        } ?: false
+        if (!terminal) publishCurrent()
+    } finally {
+        subscription.cancel()
+        ticks.close()
+    }
 }
 
 /**
@@ -1167,101 +1222,12 @@ class EngineStremioRepository(
         }
     }
 
-    private fun requireCurrentStreamLoad(generation: Long) {
-        if (!streamLoadGate.isCurrent(generation)) {
-            throw CancellationException("Superseded by a newer stream target")
-        }
-    }
-
     /**
      * The native engine has one resident MetaDetails model. A Re-find's Unload + Load pair must remain
      * indivisible: a newer generation can begin only before or after both actions, never between them.
      */
     private fun dispatchCurrentStreamLoad(generation: Long, vararg actionJson: String) =
         streamLoadGate.dispatchCurrent(generation, actionJson.toList(), StremioCoreNative::dispatch)
-
-    private suspend fun loadStreamFieldUntil(
-        generation: Long,
-        actionJson: String,
-        streamId: String?,
-        forceRefresh: Boolean = false,
-    ): String {
-        val field = EngineActions.FIELD_META_DETAILS
-        val settled = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
-            requireCurrentStreamLoad(generation)
-            if (forceRefresh) {
-                dispatchCurrentStreamLoad(generation, EngineActions.unloadMeta(), actionJson)
-            } else {
-                dispatchCurrentStreamLoad(generation, actionJson)
-            }
-            val immediate = StremioCoreNative.getState("\"$field\"")
-            requireCurrentStreamLoad(generation)
-            if (EngineState.parseStreamGroups(immediate, streamId).isNotEmpty()) return@withTimeoutOrNull immediate
-            changedFields
-                .filter { field in it }
-                .map {
-                    requireCurrentStreamLoad(generation)
-                    StremioCoreNative.getState("\"$field\"")
-                }
-                .first { EngineState.parseStreamGroups(it, streamId).isNotEmpty() }
-        }
-        requireCurrentStreamLoad(generation)
-        return settled ?: StremioCoreNative.getState("\"$field\"")
-    }
-
-    /**
-     * Wait for a series' remembered source provider after the first playable answer arrives. With no
-     * playable source the normal field timeout still applies; once playback is possible, the remembered
-     * provider gets at most [StreamRanking.WANTED_SOURCE_DEADLINE_SECONDS] to settle. Polling the resident
-     * state also survives a dropped NewState notification and mirrors the Apple wait policy.
-     */
-    private suspend fun loadStreamsUntilWanted(
-        actionJson: String,
-        streamId: String,
-        rememberedQuality: String,
-        wantedAddon: String,
-        generation: Long,
-        forceRefresh: Boolean = false,
-    ): String {
-        val settled = withTimeoutOrNull<String>(loadTimeoutSeconds.seconds) {
-            requireCurrentStreamLoad(generation)
-            if (forceRefresh) {
-                dispatchCurrentStreamLoad(generation, EngineActions.unloadMeta(), actionJson)
-            } else {
-                dispatchCurrentStreamLoad(generation, actionJson)
-            }
-            var firstPlayableAtMs: Long? = null
-            var answer: String? = null
-            while (answer == null) {
-                requireCurrentStreamLoad(generation)
-                val state = StremioCoreNative.getState("\"${EngineActions.FIELD_META_DETAILS}\"")
-                val groups = EngineState.parseStreamGroups(state, streamId)
-                val nowMs = monotonicMs()
-                if (groups.isNotEmpty() && firstPlayableAtMs == null) firstPlayableAtMs = nowMs
-
-                val firstAt = firstPlayableAtMs
-                if (firstAt != null) {
-                    val progress = EngineState.parseStreamLoadProgress(state, streamId)
-                    if (
-                        StreamRanking.resolveSettled(
-                            groups = groups,
-                            loaded = progress.loaded,
-                            total = progress.total,
-                            secondsSinceFirstPlayable = (nowMs - firstAt) / 1_000.0,
-                            rememberedQuality = rememberedQuality,
-                            wantedAddon = wantedAddon,
-                        )
-                    ) {
-                        answer = state
-                    }
-                }
-                if (answer == null) delay(STREAM_SETTLEMENT_POLL_MS)
-            }
-            answer
-        }
-        requireCurrentStreamLoad(generation)
-        return settled ?: StremioCoreNative.getState("\"${EngineActions.FIELD_META_DETAILS}\"")
-    }
 
     /// One-shot Home (kept for the [CatalogRepository] contract; the Home screen itself collects
     /// [homeUpdates]): waits until at least one board row has content, then snapshots.
@@ -2098,16 +2064,17 @@ class EngineStremioRepository(
         }
     } }
 
-    override suspend fun streams(
+    override fun streamUpdates(
         type: MediaType,
         id: String,
         episodeId: String?,
         rememberedQuality: String?,
         wantedAddon: String?,
         forceRefresh: Boolean,
-    ): Result<List<StreamGroup>> = runLatestStreamLoad { generation ->
-        withContext(Dispatchers.Default) { runCatchingStreamLoad {
-        metaDetailsGate.exclusive {
+    ): Flow<StreamLoadUpdate> = channelFlow {
+        runLatestStreamLoad { generation ->
+            withContext(Dispatchers.Default) {
+                metaDetailsGate.exclusive {
         // Re-find sources: the engine caches this title's stream groups, so the plain Load below is a
         // no-op with ZERO add-on HTTP once they are resident. Unload the MetaDetails model FIRST so the
         // Load re-queries every stream add-on fresh and expired/dead sources are replaced. Default off:
@@ -2125,14 +2092,6 @@ class EngineStremioRepository(
         } else {
             EngineActions.loadMeta(type.id, id)
         }
-        // Ready = at least one add-on's stream group settled; later groups keep landing in engine
-        // state and S05's reactive detail work will surface them incrementally.
-        val state = if (episodeId != null && !wantedAddon.isNullOrBlank() && !rememberedQuality.isNullOrBlank()) {
-            loadStreamsUntilWanted(action, episodeId, rememberedQuality, wantedAddon, generation, forceRefresh)
-        } else {
-            loadStreamFieldUntil(generation, action, episodeId, forceRefresh)
-        }
-        requireCurrentStreamLoad(generation)
         // Rank before the UI ever sees them: strongest source (debrid-cached > resolution > source ladder)
         // first within each add-on block, and the strongest add-on block first. This is what makes the
         // hero "Watch" auto-pick and the source picker meaningful, mirroring Apple's ranked source list.
@@ -2154,19 +2113,55 @@ class EngineStremioRepository(
         // CoreBridge.swift:984): a disabled add-on's sources never reach ranking or the picker for
         // this profile. Groups with no base (a malformed request) are kept, never dropped.
         val disabledAddons = addonPrefs.disabledBases()
-        val groups = orderStreamGroupsByAppliedAddonOrder(
-            EngineState.parseStreamGroups(state, episodeId).filter { group ->
-                group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
+        val appliedOrder = addonPrefs.appliedOrder()
+        val field = EngineActions.FIELD_META_DETAILS
+        streamLoadStateUpdates(
+            changes = changedFields.filter { field in it }.map { Unit },
+            dispatch = {
+                if (forceRefresh) {
+                    dispatchCurrentStreamLoad(generation, EngineActions.unloadMeta(), action)
+                } else {
+                    dispatchCurrentStreamLoad(generation, action)
+                }
             },
-            addonPrefs.appliedOrder(),
-        )
-        // vortx-core SHADOW lane: with the flag ON, rank the SAME inputs through the own engine
-        // kernel fire-and-forget and log the agreement (a diff count). It never touches the ranked
-        // list returned below; with the flag at its default OFF this line is one volatile read.
-        if (shadowRankingConfigured && VortxRankingShadow.enabled) VortxRankingShadow.compareAsync(groups, snapshot)
-        StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
+            readState = { StremioCoreNative.getState("\"$field\"") },
+            snapshot = { state ->
+                val progress = EngineState.parseStreamLoadProgress(state, episodeId)
+                val ordered = orderStreamGroupsByAppliedAddonOrder(
+                    EngineState.parseStreamGroups(state, episodeId).filter { group ->
+                        group.base.isEmpty() || AddonOrder.normalize(group.base) !in disabledAddons
+                    },
+                    appliedOrder,
+                )
+                if (shadowRankingConfigured && VortxRankingShadow.enabled) {
+                    VortxRankingShadow.compareAsync(ordered, snapshot)
+                }
+                StreamLoadUpdate(
+                    groups = StreamRanking.rankedGroups(ordered, prefs = snapshot, pin = pin),
+                    loaded = progress.loaded,
+                    total = progress.total,
+                    terminal = progress.total > 0 && progress.loaded == progress.total,
+                )
+            },
+            isCurrent = { streamLoadGate.isCurrent(generation) },
+            timeoutMs = loadTimeoutSeconds.seconds.inWholeMilliseconds,
+        ).collect { send(it) }
+                }
+            }
         }
-        } }
+    }.distinctUntilChanged()
+
+    override suspend fun streams(
+        type: MediaType,
+        id: String,
+        episodeId: String?,
+        rememberedQuality: String?,
+        wantedAddon: String?,
+        forceRefresh: Boolean,
+    ): Result<List<StreamGroup>> = withContext(Dispatchers.Default) {
+        runCatchingStreamLoad {
+            streamUpdates(type, id, episodeId, rememberedQuality, wantedAddon, forceRefresh).last().groups
+        }
     }
 
     override suspend fun resolve(
