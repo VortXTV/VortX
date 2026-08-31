@@ -128,6 +128,45 @@ struct PlaybackMeta: Hashable {
     }
 }
 
+/// Immutable ownership captured when a player session is mounted. Long-lived callbacks must use this
+/// rather than asking which profile happens to be selected when the callback finally fires.
+typealias PlaybackMutationTarget = PlaybackMutationOwnershipPolicy.Target
+
+extension PlaybackMutationTarget {
+
+    static func capture(core: CoreBridge) -> PlaybackMutationTarget {
+        let profiles = ProfileStore.shared
+        if profiles.activeUsesEngineHistory {
+            return .engine(profileID: profiles.activeID,
+                           keychainAccount: profiles.activeKeychainAccount,
+                           uid: core.currentUID())
+        }
+        guard let profileID = profiles.activeID else {
+            // A missing active id means no profile can own a local write. The engine route is
+            // deliberately fail-closed below when the active context no longer matches.
+            return .engine(profileID: nil, keychainAccount: profiles.activeKeychainAccount, uid: core.currentUID())
+        }
+        return .overlay(profileID: profileID)
+    }
+
+    func stillOwnsCurrentContext(core: CoreBridge) -> Bool {
+        let profiles = ProfileStore.shared
+        let context = PlaybackMutationOwnershipPolicy.Context(
+            activeProfileID: profiles.activeID,
+            activeUsesEngineHistory: profiles.activeUsesEngineHistory,
+            activeKeychainAccount: profiles.activeKeychainAccount,
+            activeUID: core.currentUID(),
+            extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
+        )
+        return PlaybackMutationOwnershipPolicy.allows(self, in: context)
+    }
+
+    var overlayProfileID: UUID? {
+        if case .overlay(let id) = self { return id }
+        return nil
+    }
+}
+
 /// Manages the signed-in Stremio session: auth token (persisted), installed addons, and the
 /// chosen stream addon. The token + addon URLs (which carry debrid keys) stay on-device only.
 @MainActor
@@ -310,10 +349,13 @@ final class StremioAccount: ObservableObject {
     /// was watched on Apple TV. Fetches the existing item and mutates only the progress fields so no
     /// other client's data is clobbered; creates a minimal item only if it's new to the library.
     /// Overlay profiles write to their own private synced history and never touch the account library.
-    func saveProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double) async {
-        if !ProfileStore.shared.activeUsesEngineHistory {
+    func saveProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double,
+                      target: PlaybackMutationTarget? = nil) async {
+        let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)
+        guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
+        if let profileID = target.overlayProfileID {
             ProfileStore.shared.recordProgress(meta: meta, positionSeconds: positionSeconds,
-                                               durationSeconds: durationSeconds)
+                                               durationSeconds: durationSeconds, profileID: profileID)
             return
         }
         // Wave 4: VortX owns the MAIN profile's Continue Watching + resume. The position is already persisted to
@@ -335,6 +377,7 @@ final class StremioAccount: ObservableObject {
         item["removed"] = false
         if item["name"] == nil { item["name"] = meta.name }
         if item["type"] == nil { item["type"] = meta.type }
+        guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
         await datastorePut(authKey: key, change: item)
     }
 

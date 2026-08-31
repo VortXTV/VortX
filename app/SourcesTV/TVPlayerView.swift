@@ -683,6 +683,9 @@ struct TVPlayerView: View {
     @State private var curHeaders: [String: String]?   // the playing stream's required HTTP headers
     @State private var curTitle: String = ""
     @State private var curMeta: PlaybackMeta?
+    /// Session ownership is fixed at presentation. Player callbacks must not re-route writes through
+    /// whichever profile is selected after the player has already started.
+    @State private var playbackMutationTarget = PlaybackMutationTarget.capture(core: CoreBridge.shared)
     // The episode id the engine Player is ACTUALLY loaded for. Progress attribution (the engine's TimeChanged)
     // keys on the engine Player's own stream request, so writing progress while this disagrees with `curMeta`
     // lands it on the wrong episode. Seeded at launch to the launch episode (the detail page loaded the engine
@@ -1176,7 +1179,8 @@ struct TVPlayerView: View {
                assetSanityAccepted, !isCurrentLiveStream,
                enginePlayerVideoId == curMeta?.videoId,
                suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
-                core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position (never for live)
+                core.reportProgress(timeSeconds: currentTime, durationSeconds: duration,
+                                    target: playbackMutationTarget)   // flush final position (never for live)
             }
             exitAcceptedLoadToken = nil
             // The engine is NOT torn down here: RootView presents the player with `.id(req.id)`, so any
@@ -1704,7 +1708,8 @@ struct TVPlayerView: View {
                     if assetSanityAttempt.isAccepted(owner: loadToken),
                        !isCurrentLiveStream, enginePlayerVideoId == curMeta?.videoId,
                        suppressedResumeFloor == nil || currentTime >= (suppressedResumeFloor ?? 0) {
-                        core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)
+                        core.reportProgress(timeSeconds: currentTime, durationSeconds: duration,
+                                            target: playbackMutationTarget)
                     }
                 } else if pendingBoundaryAdvanceAfterPlay {
                     pendingBoundaryAdvanceAfterPlay = false
@@ -1918,7 +1923,8 @@ struct TVPlayerView: View {
                     // not regress the ENGINE library's resume point either, until playback passes it.
                     if enginePlayerVideoId == curMeta?.videoId,
                        suppressedResumeFloor == nil || d >= (suppressedResumeFloor ?? 0) {
-                        core.reportProgress(timeSeconds: d, durationSeconds: duration)   // engine progress
+                        core.reportProgress(timeSeconds: d, durationSeconds: duration,
+                                            target: playbackMutationTarget)   // engine progress
                     }
                 }
                 // ~90% in → flip the watched marker live. DWELL-GATED: a single tick past 90% is not
@@ -1937,7 +1943,7 @@ struct TVPlayerView: View {
                         if now - since >= 5, let m = curMeta {
                             markedWatched = true
                             core.markPlaybackWatched(
-                                m, allowEngineWrite: EpisodePlaybackIdentity.engineWritesAllowed(
+                                m, target: playbackMutationTarget, allowEngineWrite: EpisodePlaybackIdentity.engineWritesAllowed(
                                     boundVideoID: isEpisodePlaybackContext ? enginePlayerVideoId : m.videoId,
                                     displayedVideoID: m.videoId
                                 )
@@ -1955,7 +1961,8 @@ struct TVPlayerView: View {
                 if assetSanityAccepted, !autoAddedThisPlayback,
                    !isCurrentLiveStream, d >= 60, let m = curMeta {
                     autoAddedThisPlayback = true
-                    LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary)
+                    LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary,
+                                               target: playbackMutationTarget)
                     // Resolve a tmdb:… hub/catalog id to its tt identity first (fire-and-forget on a cache
                     // miss) so those plays feed the pool too; a tt id still pings inline. Never blocks.
                     WatchSignalClient.pingResolvingTMDB(contentId: m.libraryId, type: m.type, seriesHint: m.season != nil)
@@ -2242,7 +2249,7 @@ struct TVPlayerView: View {
             if !markedWatched, let m = curMeta {
                 markedWatched = true
                 core.markPlaybackWatched(
-                    m, allowEngineWrite: EpisodePlaybackIdentity.engineWritesAllowed(
+                    m, target: playbackMutationTarget, allowEngineWrite: EpisodePlaybackIdentity.engineWritesAllowed(
                         boundVideoID: isEpisodePlaybackContext ? enginePlayerVideoId : m.videoId,
                         displayedVideoID: m.videoId
                     )
@@ -7424,7 +7431,7 @@ struct TVPlayerView: View {
                 return
             }
         } else if terminalRewindGate.issueTerminalRewind() {
-            core.finishedWatching(libraryId: m.libraryId)
+            core.finishedWatching(libraryId: m.libraryId, target: playbackMutationTarget)
         }
         // A movie/explicit owner rewind owns the final state. Do not write a stale end-position
         // TimeChanged/progress flush after it; series no-successor state remains engine/account-owned.
@@ -9122,7 +9129,8 @@ struct TVPlayerView: View {
         }
         let dur = duration
         Task {
-            await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur)
+            await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur,
+                                       target: playbackMutationTarget)
             if thenSyncEngine { await MainActor.run { core.syncLibraryNow() } }
         }
     }
@@ -9231,7 +9239,8 @@ struct TVPlayerView: View {
         if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
            !isCurrentLiveStream, duration > 0, enginePlayerVideoId == curMeta?.videoId,
            suppressedResumeFloor == nil || scrubTarget >= (suppressedResumeFloor ?? 0) {
-            core.reportProgress(timeSeconds: scrubTarget, durationSeconds: duration)
+            core.reportProgress(timeSeconds: scrubTarget, durationSeconds: duration,
+                                target: playbackMutationTarget)
         }
         scrubThumbnails.clear()
         flashControls()

@@ -25,19 +25,19 @@ enum LibraryAutoAdd {
     private static let cap = 2000   // bound the remembered-ids set so it can't grow without limit
 
     /// The per-profile storage key. Falls back to a shared key when there is no active profile id.
-    private static func storageKey() -> String {
-        if let id = ProfileStore.shared.activeID { return "\(keyPrefix).\(id.uuidString)" }
+    private static func storageKey(profileID: UUID? = ProfileStore.shared.activeID) -> String {
+        if let id = profileID { return "\(keyPrefix).\(id.uuidString)" }
         return keyPrefix
     }
 
     /// Whether this (active-profile, id) has already been auto-added once. Public so the caller can cheaply
     /// short-circuit the ~60s tick without building any meta.
-    static func hasAutoAdded(_ id: String) -> Bool {
-        (UserDefaults.standard.stringArray(forKey: storageKey()) ?? []).contains(id)
+    static func hasAutoAdded(_ id: String, profileID: UUID? = ProfileStore.shared.activeID) -> Bool {
+        (UserDefaults.standard.stringArray(forKey: storageKey(profileID: profileID)) ?? []).contains(id)
     }
 
-    private static func rememberAutoAdded(_ id: String) {
-        let key = storageKey()
+    private static func rememberAutoAdded(_ id: String, profileID: UUID?) {
+        let key = storageKey(profileID: profileID)
         var ids = UserDefaults.standard.stringArray(forKey: key) ?? []
         guard !ids.contains(id) else { return }
         ids.append(id)
@@ -53,37 +53,48 @@ enum LibraryAutoAdd {
     ///   - enabled: the "Auto-add watched to Library" setting (default ON); a `false` skips entirely.
     /// Idempotent: after the first successful auto-add for (profile, id) this is a no-op, so a manual removal
     /// afterwards is honored (the title is not re-added on the next play).
-    static func addIfNeeded(meta: PlaybackMeta, core: CoreBridge, enabled: Bool) {
+    static func addIfNeeded(meta: PlaybackMeta, core: CoreBridge, enabled: Bool,
+                            target: PlaybackMutationTarget? = nil) {
         guard enabled else { return }
+        let target = target ?? PlaybackMutationTarget.capture(core: core)
+        guard target.stillOwnsCurrentContext(core: core) else { return }
         let id = meta.libraryId
         // Only real catalog ids belong in the account library. A synthetic magnet / ad-hoc paste-a-link id
         // must never be written (it poisons official-client account sync). tt… and tmdb… are the safe shapes.
         guard id.hasPrefix("tt") || id.hasPrefix("tmdb") else { return }
-        guard !hasAutoAdded(id) else { return }   // already auto-added once for this profile -> respect removal
+        let profileID: UUID? = {
+            switch target {
+            case .overlay(let id): return id
+            case .engine(let id, _, _): return id
+            }
+        }()
+        guard !hasAutoAdded(id, profileID: profileID) else { return }   // already auto-added once for this profile -> respect removal
 
-        if ProfileStore.shared.activeUsesEngineHistory {
+        if target.overlayProfileID == nil {
             // MAIN profile: go through the engine. Prefer the loaded meta_details (exact engine shape); if that
             // is not this title (a hub/CW launch may have replaced it), resolve the full meta from Cinemeta and
             // dispatch AddToLibrary. Both routes are the account-syncing engine path, never an app libraryItem.
             if let loaded = core.metaDetails?.meta, loaded.id == id {
                 core.addToLibrary(metaId: id)
-                rememberAutoAdded(id)
+                rememberAutoAdded(id, profileID: profileID)
                 NSLog("[autolib] auto-added %@ to account library (engine, loaded meta)", id)
             } else {
                 let type = meta.usesSeriesLifecycle ? "series" : "movie"
                 Task { @MainActor in
                     // Only remember the auto-add once the account write actually succeeded; a failed resolve
                     // must retry on the next play, not be silently pinned as "already added".
-                    if await core.addCatalogItemToAccount(id: id, type: type) {
-                        rememberAutoAdded(id)
+                    if await core.addCatalogItemToAccount(id: id, type: type, target: target) {
+                        rememberAutoAdded(id, profileID: profileID)
                         NSLog("[autolib] auto-added %@ to account library (engine, resolved meta)", id)
                     }
                 }
             }
         } else {
             // OVERLAY profile: local overlay ONLY, never the account library.
-            ProfileStore.shared.addLibraryEntry(metaId: id, name: meta.name, type: meta.type, poster: meta.poster)
-            rememberAutoAdded(id)
+            guard let profileID = target.overlayProfileID else { return }
+            ProfileStore.shared.addLibraryEntry(metaId: id, name: meta.name, type: meta.type,
+                                                poster: meta.poster, profileID: profileID)
+            rememberAutoAdded(id, profileID: profileID)
             NSLog("[autolib] auto-added %@ to overlay-profile library (local overlay)", id)
         }
     }

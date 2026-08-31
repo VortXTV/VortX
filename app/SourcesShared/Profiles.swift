@@ -1352,6 +1352,47 @@ final class ProfileStore: ObservableObject {
         schedulePushWatch()
     }
 
+    /// Apply a player callback to the profile that started playback. The normal public methods below
+    /// intentionally use the active in-memory overlay; player callbacks cannot, because a profile switch
+    /// may happen while an AV/mpv callback or account request is still in flight.
+    private func mutateOverlayWatch(profileID: UUID, _ body: (inout [String: WatchEntry]) -> Void) {
+        guard let profile = profiles.first(where: { $0.id == profileID }), !profile.usesEngineHistory else { return }
+        if activeID == profileID {
+            body(&watch)
+            reconcileWatchRemovals(profileID: profileID, entries: &watch)
+            saveWatchCache()
+            schedulePushWatch()
+            return
+        }
+        let initialEntries = PlaybackMutationOwnershipPolicy.overlayEntries(
+            from: UserDefaults.standard.data(forKey: Self.watchCacheKey(profileID)), as: WatchEntry.self)
+        var entries = initialEntries
+        body(&entries)
+        reconcileWatchRemovals(profileID: profileID, entries: &entries)
+        guard let encoded = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.standard.set(encoded, forKey: Self.watchCacheKey(profileID))
+        // `VortXSyncManager` serializes the complete per-profile envelope, including inactive
+        // cache keys. Scheduling it now is durable; waiting for this profile to be selected again
+        // could strand a callback if the user never returns to it.
+        VortXSyncManager.shared.requestSyncSoon()
+    }
+
+    func recordProgress(meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double, profileID: UUID) {
+        guard durationSeconds > 0 else { return }
+        mutateOverlayWatch(profileID: profileID) { entries in
+            var entry = entries[meta.libraryId] ?? WatchEntry(
+                videoId: meta.videoId, timeOffsetMs: 0, durationMs: 0, lastWatched: "",
+                name: meta.name, type: meta.type, poster: meta.poster)
+            entry.videoId = meta.videoId
+            entry.timeOffsetMs = Int((positionSeconds * 1000).rounded())
+            entry.durationMs = Int((durationSeconds * 1000).rounded())
+            entry.lastWatched = Self.isoNow()
+            entry.name = meta.name
+            entry.poster = meta.poster ?? entry.poster
+            entries[meta.libraryId] = entry
+        }
+    }
+
     /// Saved resume position in seconds (0 = start fresh); series only resume the same episode.
     func resumeOffset(for meta: PlaybackMeta) -> Double {
         guard let entry = watch[meta.libraryId] else { return 0 }
@@ -1399,6 +1440,16 @@ final class ProfileStore: ObservableObject {
         schedulePushWatch()
     }
 
+    func markWatched(meta: PlaybackMeta, profileID: UUID) {
+        mutateOverlayWatch(profileID: profileID) { entries in
+            var entry = entries[meta.libraryId] ?? WatchEntry(
+                videoId: meta.videoId, timeOffsetMs: 0, durationMs: 0, lastWatched: Self.isoNow(),
+                name: meta.name, type: meta.type, poster: meta.poster)
+            if !entry.watchedVideoIds.contains(meta.videoId) { entry.watchedVideoIds.append(meta.videoId) }
+            entries[meta.libraryId] = entry
+        }
+    }
+
     /// Save a title to the overlay profile's Library without marking it watched (the "Add to
     /// Library" button). Writes a zero-offset, zero-watched entry so libraryItems shows it while
     /// cwItems correctly skips it (no progress, no watched episodes) until it is actually played.
@@ -1411,6 +1462,14 @@ final class ProfileStore: ObservableObject {
         schedulePushWatch()
     }
 
+    func addLibraryEntry(metaId: String, name: String, type: String, poster: String?, profileID: UUID) {
+        mutateOverlayWatch(profileID: profileID) { entries in
+            guard entries[metaId] == nil else { return }
+            entries[metaId] = WatchEntry(videoId: nil, timeOffsetMs: 0, durationMs: 0,
+                                         lastWatched: Self.isoNow(), name: name, type: type, poster: poster)
+        }
+    }
+
     /// A title finished (movie, or a series' last episode): zero the offset so it leaves the rail.
     func finishedWatching(metaId: String) {
         guard var entry = watch[metaId] else { return }
@@ -1418,6 +1477,14 @@ final class ProfileStore: ObservableObject {
         watch[metaId] = entry
         saveWatchCache()
         schedulePushWatch()
+    }
+
+    func finishedWatching(metaId: String, profileID: UUID) {
+        mutateOverlayWatch(profileID: profileID) { entries in
+            guard var entry = entries[metaId] else { return }
+            entry.timeOffsetMs = 0
+            entries[metaId] = entry
+        }
     }
 
     /// The Continue Watching "dismiss" for overlay profiles: drop the whole entry. Zeroing the

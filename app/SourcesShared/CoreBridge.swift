@@ -1631,15 +1631,18 @@ final class CoreBridge: ObservableObject {
 
     /// Mark the whole title (all episodes of a series, or a movie) watched/unwatched.
     func markWatched(_ isWatched: Bool) {
+        // Snapshot one resident detail identity before constructing actions. A stale menu closure may
+        // outlive a detail replacement; never let it dispatch through whichever meta_details happens
+        // to be resident now.
+        guard let residentMeta = metaDetails?.meta else { return }
         switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
         case .profileOverlay:
             // Keep this local to the active overlay. Missing detail context must remain a no-op,
             // never a fallthrough write into the account library.
-            guard let meta = metaDetails?.meta else { return }
-            let ids = (meta.videos ?? []).map(\.id)
-            ProfileStore.shared.setWatched(isWatched, metaId: meta.id,
-                                           videoIds: ids.isEmpty ? [meta.id] : ids,
-                                           name: meta.name, type: meta.type, poster: meta.poster)
+            let ids = (residentMeta.videos ?? []).map(\.id)
+            ProfileStore.shared.setWatched(isWatched, metaId: residentMeta.id,
+                                           videoIds: ids.isEmpty ? [residentMeta.id] : ids,
+                                           name: residentMeta.name, type: residentMeta.type, poster: residentMeta.poster)
             return
         case .engineAccount:
             break
@@ -1648,7 +1651,7 @@ final class CoreBridge: ObservableObject {
         // come from the separate per-video watched bitfield, so BOTH directions must visit every
         // known video. The old true branch sent only the aggregate action, making a whole-series
         // mark look like a silent no-op on the detail page.
-        let videos = (metaDetails?.meta?.videos ?? []).map {
+        let videos = (residentMeta.videos ?? []).map {
             LibraryWatchedMutationPolicy.Video(id: $0.id, season: $0.season, episode: $0.episode)
         }
         for action in LibraryWatchedMutationPolicy.wholeTitleActions(videos: videos, isWatched: isWatched) {
@@ -1666,6 +1669,8 @@ final class CoreBridge: ObservableObject {
 
     /// Mark every episode of a season watched/unwatched.
     func markSeasonWatched(_ season: Int, _ isWatched: Bool) {
+        guard let residentMeta = metaDetails?.meta,
+              residentMeta.videos?.contains(where: { $0.season == season }) == true else { return }
         if overlayMarkWatched(isWatched, videoIds: { meta in
             (meta.videos ?? []).filter { $0.season == season }.map(\.id)
         }) { return }
@@ -1674,6 +1679,8 @@ final class CoreBridge: ObservableObject {
 
     /// Mark a single episode watched/unwatched. The engine's `Video` only needs `id`.
     func markVideoWatched(_ video: CoreVideo, _ isWatched: Bool) {
+        guard let residentMeta = metaDetails?.meta,
+              residentMeta.videos?.contains(where: { $0.id == video.id }) == true else { return }
         if overlayMarkWatched(isWatched, videoIds: { _ in [video.id] }) { return }
         var payload: [String: Any] = ["id": video.id]
         if let season = video.season { payload["season"] = season }
@@ -1730,14 +1737,22 @@ final class CoreBridge: ObservableObject {
     /// Called by the player when a title is effectively watched (~end of playback) so the marker
     /// flips live instead of waiting for a library sync. Relies on meta_details being loaded (it is,
     /// since playback is launched from the detail screen).
-    func markPlaybackWatched(_ meta: PlaybackMeta, allowEngineWrite: Bool = true) {
+    func markPlaybackWatched(_ meta: PlaybackMeta, target: PlaybackMutationTarget? = nil,
+                             allowEngineWrite: Bool = true) {
+        let target = target ?? PlaybackMutationTarget.capture(core: self)
+        guard target.stillOwnsCurrentContext(core: self) else {
+            NSLog("[playback] dropped watched callback after profile/account ownership changed")
+            return
+        }
         // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
         // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
         // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
         // never touches an engine libraryItem field, honoring the poison invariant.
-        ScrobbleCoordinator.shared.watched(meta)
-        guard ProfileStore.shared.activeUsesEngineHistory else {
-            ProfileStore.shared.markWatched(meta: meta)   // overlay profile: private history only
+        // Scrobbling is account-owned. An inactive overlay callback may still update that overlay's
+        // private cache below, but it must never fan out through a newly active owner account.
+        if target.overlayProfileID == nil { ScrobbleCoordinator.shared.watched(meta) }
+        if let profileID = target.overlayProfileID {
+            ProfileStore.shared.markWatched(meta: meta, profileID: profileID)
             return
         }
         // Scrobble and overlay-profile state above are keyed by the explicit PlaybackMeta and remain safe even
@@ -1745,6 +1760,10 @@ final class CoreBridge: ObservableObject {
         // attribution; callers close this leg rather than suppressing the correct external watched signal.
         guard allowEngineWrite else { return }
         if meta.usesSeriesLifecycle {
+            guard metaDetails?.meta?.id == meta.libraryId else {
+                NSLog("[playback] dropped stale series watched callback id=%@", meta.libraryId)
+                return
+            }
             var payload: [String: Any] = ["id": meta.videoId]
             if let season = meta.season { payload["season"] = season }
             if let episode = meta.episode { payload["episode"] = episode }
@@ -2080,9 +2099,14 @@ final class CoreBridge: ObservableObject {
     /// `CoreMetaDetails` has no completeness marker; engine/account state owns genuine final-series removal.
     /// `is_in_continue_watching()` is just `time_offset > 0`, so a movie at its end position would otherwise
     /// linger forever. Rewind keeps the library entry and its new-episode notifications, unlike full removal.
-    func finishedWatching(libraryId: String) {
-        guard ProfileStore.shared.activeUsesEngineHistory else {
-            ProfileStore.shared.finishedWatching(metaId: libraryId)   // overlay profile
+    func finishedWatching(libraryId: String, target: PlaybackMutationTarget? = nil) {
+        let target = target ?? PlaybackMutationTarget.capture(core: self)
+        guard target.stillOwnsCurrentContext(core: self) else {
+            NSLog("[playback] dropped finish callback after profile/account ownership changed")
+            return
+        }
+        if let profileID = target.overlayProfileID {
+            ProfileStore.shared.finishedWatching(metaId: libraryId, profileID: profileID)
             return
         }
         // Stamp the LOCAL rewind before the dispatch. This is the app's single `RewindLibraryItem` site, and a
@@ -2242,13 +2266,17 @@ final class CoreBridge: ObservableObject {
     /// on the next play. `@discardableResult` keeps fire-and-forget callers unchanged.
     @MainActor
     @discardableResult
-    func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true) async -> Bool {
+    func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true,
+                                 target: PlaybackMutationTarget? = nil) async -> Bool {
+        let target = target ?? PlaybackMutationTarget.capture(core: self)
+        guard target.stillOwnsCurrentContext(core: self) else { return false }
         let safeType = (type == "series") ? "series" : "movie"
         let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
               let (data, _) = try? await URLSession.shared.data(from: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return false }
+              let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false,
+              target.stillOwnsCurrentContext(core: self) else { return false }
         // An explicit user/dashboard add-to-library targeting the owner stamps the add so it supersedes a prior
         // removal on every device (stampIntent: true, the default). The cold-device library recovery passes
         // stampIntent: false: recovery is a machine re-add of account-owned titles, and stamping an addedAt
@@ -2491,10 +2519,13 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Report the playback position to the engine Player (in ms), so Continue Watching reflects it live.
-    func reportProgress(timeSeconds: Double, durationSeconds: Double) {
+    func reportProgress(timeSeconds: Double, durationSeconds: Double,
+                        target: PlaybackMutationTarget? = nil) {
+        let target = target ?? PlaybackMutationTarget.capture(core: self)
+        guard target.stillOwnsCurrentContext(core: self) else { return }
         // Overlay profiles never feed the engine Player: it would write their progress into the
         // ACCOUNT library bucket and sync it, which is exactly what profile separation prevents.
-        guard ProfileStore.shared.activeUsesEngineHistory else { return }
+        guard target.overlayProfileID == nil else { return }
         guard durationSeconds.isFinite, timeSeconds.isFinite, durationSeconds > 0, timeSeconds >= 0 else { return }
         #if os(tvOS)
         let device = "tvOS"

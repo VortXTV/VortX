@@ -521,6 +521,9 @@ struct PlayerScreen: View {
     // every Next/Prev/list switch so progress, the watched marker, Continue-Watching, skip timestamps,
     // and add-on subtitles all key off the episode ACTUALLY playing (not the one first opened).
     @State private var curMetaState: PlaybackMeta? = nil
+    /// Captured once for this presented player. Do not derive callback ownership from the profile
+    /// selected later, because AV/mpv callbacks and datastore writes outlive profile transitions.
+    @State private var playbackMutationTarget = PlaybackMutationTarget.capture(core: CoreBridge.shared)
     @State private var curTitleState: String? = nil
     @State private var enginePlayerVideoId: String? = nil
     @State private var engineAttributionInitialized = false
@@ -1902,7 +1905,8 @@ struct PlayerScreen: View {
                     if assetSanityAccepted, !autoAddedThisPlayback,
                        !effectivelyLive, d >= 60, let m = curMeta {
                         autoAddedThisPlayback = true
-                        LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary)
+                        LibraryAutoAdd.addIfNeeded(meta: m, core: core, enabled: autoAddLibrary,
+                                                   target: playbackMutationTarget)
                         // Resolve a tmdb:… hub/catalog id to its tt identity first (fire-and-forget on a cache
                         // miss) so those plays feed the pool too; a tt id still pings inline. Never blocks.
                         WatchSignalClient.pingResolvingTMDB(contentId: m.libraryId, type: m.type, seriesHint: m.season != nil)
@@ -1924,7 +1928,8 @@ struct PlayerScreen: View {
                        !effectivelyLive, duration > 0, d / duration >= 0.9,
                        let m = curMeta {
                         markedWatched = true
-                        core.markPlaybackWatched(m, allowEngineWrite: engineWritesOpen)
+                        core.markPlaybackWatched(m, target: playbackMutationTarget,
+                                                 allowEngineWrite: engineWritesOpen)
                     }
                 }
             }
@@ -2185,7 +2190,8 @@ struct PlayerScreen: View {
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
             if !markedWatched, !effectivelyLive, let m = curMeta {
                 markedWatched = true
-                core.markPlaybackWatched(m, allowEngineWrite: engineWritesOpen)
+                core.markPlaybackWatched(m, target: playbackMutationTarget,
+                                         allowEngineWrite: engineWritesOpen)
             }
             // External sync (Trakt/SIMKL): scrobble STOP at end-of-file (a completion). Additive + fail-soft +
             // gated + once-latched inside the coordinator (dedupes against the watched record above), no-op
@@ -2231,7 +2237,7 @@ struct PlayerScreen: View {
                         return
                     }
                 } else if let m = curMeta, terminalRewindGate.issueTerminalRewind() {
-                    core.finishedWatching(libraryId: m.libraryId)
+                    core.finishedWatching(libraryId: m.libraryId, target: playbackMutationTarget)
                 }
                 if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
@@ -7696,7 +7702,7 @@ struct PlayerScreen: View {
         if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive, duration > 0,
            currentTime / duration >= 0.9, let m = curMeta {
             if !m.usesSeriesLifecycle, terminalRewindGate.issueTerminalRewind() {
-                core.finishedWatching(libraryId: m.libraryId)
+                core.finishedWatching(libraryId: m.libraryId, target: playbackMutationTarget)
             }
         }
         invalidateLocalTrickplayCapture()
@@ -7967,7 +7973,8 @@ struct PlayerScreen: View {
         guard !hasUncommittedIssuedMedia, !persistenceBlockedForExit else { return }
         guard let m = curMeta else { return }
         let dur = duration
-        Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur) }
+        Task { await account.saveProgress(for: m, positionSeconds: position, durationSeconds: dur,
+                                          target: playbackMutationTarget) }
     }
 
     /// Snapshot the viewer's CURRENT explicit subtitle selection so a following engine switch can re-apply it
