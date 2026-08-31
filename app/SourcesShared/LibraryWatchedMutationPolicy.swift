@@ -57,7 +57,47 @@ enum LibraryWatchedMutationPolicy {
     }
 
     static func canDispatchCatalogAdd(metaID: String, expectedType: String?, previewID: String?, previewType: String?) -> Bool {
-        metaID == previewID && (expectedType == nil || expectedType == previewType)
+        guard isCanonicalCatalogID(metaID), metaID == previewID,
+              let previewType = previewType.flatMap(normalizedCatalogType) else { return false }
+        guard let expectedType else { return true }
+        return normalizedCatalogType(expectedType) == previewType
+    }
+
+    /// Account-library resolver input is deliberately narrower than arbitrary Stremio ids. It
+    /// accepts only title ids that Cinemeta exposes as catalog roots, never video ids or path-like
+    /// input which could change the resolver route.
+    static func isCanonicalCatalogID(_ id: String) -> Bool {
+        guard !id.isEmpty,
+              id.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              id.rangeOfCharacter(from: .controlCharacters) == nil,
+              !id.contains("/"), !id.contains("\\"), !id.contains("..") else { return false }
+        if id.hasPrefix("tt") {
+            let suffix = id.dropFirst(2)
+            return isASCIIDigits(suffix)
+        }
+        let pieces = id.split(separator: ":", omittingEmptySubsequences: false)
+        guard pieces.first == "tmdb" else { return false }
+        switch pieces.count {
+        case 2:
+            return isASCIIDigits(pieces[1])
+        case 3:
+            return (pieces[1] == "movie" || pieces[1] == "tv")
+                && isASCIIDigits(pieces[2])
+        default:
+            return false
+        }
+    }
+
+    static func normalizedCatalogType(_ type: String) -> String? {
+        switch type.lowercased() {
+        case "movie": return "movie"
+        case "series", "tv": return "series"
+        default: return nil
+        }
+    }
+
+    private static func isASCIIDigits<S: StringProtocol>(_ value: S) -> Bool {
+        !value.isEmpty && value.unicodeScalars.allSatisfy { (48...57).contains($0.value) }
     }
 
     /// Prefer only a ready meta for the open title. A ready response for a previous detail page

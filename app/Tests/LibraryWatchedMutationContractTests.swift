@@ -20,9 +20,9 @@ private func check(_ condition: Bool, _ name: String) {
 @main
 private struct LibraryWatchedMutationContractTests {
     static func main() {
-        let movie = Policy.MetaPreview(id: "ttmovie", type: "movie", name: "Movie", poster: nil)
-        let series = Policy.MetaPreview(id: "ttseries", type: "series", name: "Series", poster: "poster")
-        let stale = Policy.MetaPreview(id: "ttstale", type: "movie", name: "Stale", poster: nil)
+        let movie = Policy.MetaPreview(id: "tt0000001", type: "movie", name: "Movie", poster: nil)
+        let series = Policy.MetaPreview(id: "tt0000002", type: "series", name: "Series", poster: "poster")
+        let stale = Policy.MetaPreview(id: "tt0000003", type: "movie", name: "Stale", poster: nil)
         let episodes = [
             Policy.Video(id: "ttseries:1:1", season: 1, episode: 1),
             Policy.Video(id: "ttseries:1:2", season: 1, episode: 2),
@@ -54,6 +54,21 @@ private struct LibraryWatchedMutationContractTests {
         check(!Policy.canDispatchCatalogAdd(metaID: series.id, expectedType: series.type,
                                             previewID: nil, previewType: nil),
               "auto add does not claim dispatch without a catalog preview")
+        check(Policy.isCanonicalCatalogID("tt0137523"), "IMDb catalog title id is accepted")
+        check(Policy.isCanonicalCatalogID("tmdb:movie:550"), "typed TMDB catalog title id is accepted")
+        check(Policy.isCanonicalCatalogID("tmdb:1399"), "legacy TMDB catalog title id is accepted")
+        for unsafe in ["tt../1", "tmdb:../1", "tmdb:movie:55/extra", "tmdb:movie:55\\extra", "tt 123", "tt123\\n", "kitsu:123", "tt١٢٣"] {
+            check(!Policy.isCanonicalCatalogID(unsafe), "unsafe catalog id is rejected: \(unsafe.debugDescription)")
+        }
+        check(!Policy.canDispatchCatalogAdd(metaID: series.id, expectedType: "series",
+                                            previewID: stale.id, previewType: "series"),
+              "resolver response id must exactly match the requested catalog id")
+        check(!Policy.canDispatchCatalogAdd(metaID: series.id, expectedType: "series",
+                                            previewID: series.id, previewType: "movie"),
+              "resolver response type must normalize to the requested type")
+        check(Policy.canDispatchCatalogAdd(metaID: "tmdb:tv:1399", expectedType: "series",
+                                           previewID: "tmdb:tv:1399", previewType: "tv"),
+              "exact resolver response dispatches only after normalized type validation")
 
         // Movie and series, watched and unwatched, produce deterministic engine action sequences.
         for watched in [false, true] {

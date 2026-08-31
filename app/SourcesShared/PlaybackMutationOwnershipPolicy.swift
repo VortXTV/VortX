@@ -16,6 +16,17 @@ enum PlaybackMutationOwnershipPolicy {
         let extantOverlayProfileIDs: Set<UUID>
     }
 
+    /// A credential may be used for an account write only after the engine has emitted an
+    /// authenticated context for the exact profile/account/token tuple that initiated auth.
+    /// This is intentionally stronger than looking at the currently selected profile and UID:
+    /// during A -> B, those can briefly describe B while the engine still contains A.
+    struct SettledAccountBinding: Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let credentialFingerprint: String
+        let uid: String
+    }
+
     static func allows(_ target: Target, in context: Context) -> Bool {
         switch target {
         case .overlay(let profileID):
@@ -37,12 +48,11 @@ enum PlaybackMutationOwnershipPolicy {
     }
 
     static func allowsQueuedAccountReplay(profileID: UUID, account: String, credentialFingerprint: String,
-                                          activeProfileID: UUID?, activeAccount: String,
-                                          activeCredentialFingerprint: String?, activeUID: String?) -> Bool {
-        profileID == activeProfileID
-            && account == activeAccount
-            && credentialFingerprint == activeCredentialFingerprint
-            && activeUID != nil
+                                          binding: SettledAccountBinding?) -> Bool {
+        guard let binding else { return false }
+        return profileID == binding.profileID
+            && account == binding.keychainAccount
+            && credentialFingerprint == binding.credentialFingerprint
     }
 
     /// An inactive overlay may not have been played before, hence no cache file exists yet. Its

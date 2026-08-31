@@ -33,6 +33,11 @@ private struct PlaybackMutationOwnershipPolicyTests {
                                                 extantOverlayProfileIDs: [overlay, replacement])
         let ownerTarget = Policy.Target.engine(profileID: owner, keychainAccount: account, uid: "owner-uid")
         let overlayTarget = Policy.Target.overlay(profileID: overlay)
+        let settledOwner = Policy.SettledAccountBinding(profileID: owner, keychainAccount: account,
+                                                        credentialFingerprint: "fp", uid: "owner-uid")
+        let staleEngineAForSelectedB = Policy.SettledAccountBinding(profileID: replacement,
+                                                                      keychainAccount: account,
+                                                                      credentialFingerprint: "fp-b", uid: "owner-uid")
 
         check(Policy.allows(ownerTarget, in: ownerContext), "owner callback writes while its account remains active")
         check(!Policy.allows(ownerTarget, in: overlayContext), "owner to overlay switch rejects account callback")
@@ -51,16 +56,16 @@ private struct PlaybackMutationOwnershipPolicyTests {
         check(!Policy.allowsAccountMutation(overlayTarget, in: ownerContext),
               "overlay target may never dispatch an account mutation")
         check(Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
-                                                activeProfileID: owner, activeAccount: account,
-                                                activeCredentialFingerprint: "fp", activeUID: "owner-uid"),
+                                                binding: settledOwner),
               "queued owner add replays only in its original account context")
         check(!Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
-                                                 activeProfileID: overlay, activeAccount: account,
-                                                 activeCredentialFingerprint: "fp", activeUID: "owner-uid"),
-              "queued owner add rejects an overlay context")
+                                                 binding: nil),
+              "signed-out owner intent cannot replay without a settled binding")
         check(!Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
-                                                 activeProfileID: owner, activeAccount: account,
-                                                 activeCredentialFingerprint: "other", activeUID: "owner-uid"),
+                                                 binding: staleEngineAForSelectedB),
+              "selected B with stale engine uid A cannot manufacture a B replay target")
+        check(!Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "old-fp",
+                                                 binding: settledOwner),
               "queued owner add rejects a replaced credential")
         check(Policy.overlayEntries(from: nil, as: CacheEntry.self).isEmpty,
               "first inactive-overlay callback starts from an empty cache")

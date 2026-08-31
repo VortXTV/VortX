@@ -170,7 +170,10 @@ final class ProfileStore: ObservableObject {
     private struct PendingAccountLibraryAdd: Codable, Equatable {
         let profileID: UUID
         let keychainAccount: String
-        let credentialFingerprint: String
+        /// nil means the dashboard intent arrived while this profile was signed out. It remains
+        /// bound to the profile/account slot and gains a fingerprint only after that exact slot
+        /// has a proven engine binding; it must never borrow the active profile's token.
+        let credentialFingerprint: String?
         let metaID: String
         let type: String
     }
@@ -333,12 +336,13 @@ final class ProfileStore: ObservableObject {
     /// intentionally irrelevant here: a shared/overlay profile must never be used as a fallback.
     private func enqueueAccountLibraryAdd(profile: UserProfile, metaID: String, type: String) {
         guard profile.usesEngineHistory,
-              let fingerprint = Self.accountFingerprint(keychainAccount(for: profile)) else { return }
+              LibraryWatchedMutationPolicy.isCanonicalCatalogID(metaID),
+              let safeType = LibraryWatchedMutationPolicy.normalizedCatalogType(type) else { return }
         let entry = PendingAccountLibraryAdd(profileID: profile.id,
                                              keychainAccount: keychainAccount(for: profile),
-                                             credentialFingerprint: fingerprint,
+                                             credentialFingerprint: Self.accountFingerprint(keychainAccount(for: profile)),
                                              metaID: metaID,
-                                             type: type == "series" ? "series" : "movie")
+                                             type: safeType)
         var entries = pendingAccountLibraryAdds()
         guard !entries.contains(entry) else { return }
         entries.append(entry)
@@ -349,17 +353,37 @@ final class ProfileStore: ObservableObject {
     /// matched against profile, keychain slot, credential fingerprint, and current uid before its
     /// async account mutation begins; failed attempts remain queued for the next valid ctx event.
     func replayPendingAccountLibraryAdds(core: CoreBridge) {
-        guard let profile = active, profile.usesEngineHistory,
-              let uid = core.currentUID() else { return }
-        let account = keychainAccount(for: profile)
-        guard account == activeKeychainAccount,
-              let fingerprint = Self.accountFingerprint(account) else { return }
-        let target = PlaybackMutationTarget.engine(profileID: profile.id, keychainAccount: account, uid: uid)
-        for entry in pendingAccountLibraryAdds() where PlaybackMutationOwnershipPolicy.allowsQueuedAccountReplay(
+        guard let binding = core.settledActiveAccountBinding() else { return }
+        var entries = pendingAccountLibraryAdds()
+        var entriesChanged = false
+        for index in entries.indices.reversed() {
+            let entry = entries[index]
+            guard entry.profileID == binding.profileID,
+                  entry.keychainAccount == binding.keychainAccount else { continue }
+            if entry.credentialFingerprint == nil {
+                // A signed-out owner intent is retained and becomes attributable only once this
+                // exact profile/account/token/uid relation has been proven.
+                entries[index] = PendingAccountLibraryAdd(profileID: entry.profileID,
+                                                          keychainAccount: entry.keychainAccount,
+                                                          credentialFingerprint: binding.credentialFingerprint,
+                                                          metaID: entry.metaID, type: entry.type)
+                entriesChanged = true
+            } else if entry.credentialFingerprint != binding.credentialFingerprint {
+                // Credential rotation is an account boundary. Once a new binding is proven, do
+                // not replay an old-token intent into it. Retire it rather than silently migrate.
+                NSLog("[profiles] retiring stale owner-library intent after credential rotation")
+                entries.remove(at: index)
+                entriesChanged = true
+            }
+        }
+        if entriesChanged { savePendingAccountLibraryAdds(entries) }
+        for entry in entries where PlaybackMutationOwnershipPolicy.allowsQueuedAccountReplay(
             profileID: entry.profileID, account: entry.keychainAccount,
-            credentialFingerprint: entry.credentialFingerprint, activeProfileID: profile.id,
-            activeAccount: account, activeCredentialFingerprint: fingerprint, activeUID: uid) {
-            let replayID = "\(entry.profileID.uuidString):\(entry.metaID):\(entry.type)"
+            credentialFingerprint: entry.credentialFingerprint ?? "", binding: binding) {
+            let target = PlaybackMutationTarget.engine(profileID: binding.profileID,
+                                                        keychainAccount: binding.keychainAccount,
+                                                        uid: binding.uid)
+            let replayID = "\(entry.profileID.uuidString):\(entry.credentialFingerprint ?? "unbound"):\(entry.metaID):\(entry.type)"
             guard !pendingAccountLibraryReplayIDs.contains(replayID) else { continue }
             pendingAccountLibraryReplayIDs.insert(replayID)
             Task { @MainActor [weak self] in
@@ -1890,7 +1914,10 @@ extension ProfileStore {
             // Only real catalog ids are engine-safe; a synthetic / add-on-specific id (kitsu:, etc.)
             // would be rejected or poison official-client sync, so it is skipped and reported, never
             // silently dropped.
-            let accepted = items.filter { $0.metaId.hasPrefix("tt") || $0.metaId.hasPrefix("tmdb") }
+            let accepted = items.filter {
+                LibraryWatchedMutationPolicy.isCanonicalCatalogID($0.metaId)
+                    && LibraryWatchedMutationPolicy.normalizedCatalogType($0.type) != nil
+            }
             for item in accepted {
                 await CoreBridge.shared.addCatalogItemToAccount(id: item.metaId, type: item.type)
             }

@@ -68,7 +68,8 @@ enum LibraryAutoAdd {
             case .engine(let id, _, _): return id
             }
         }()
-        guard !hasAutoAdded(id, profileID: profileID) else { return }   // already auto-added once for this profile -> respect removal
+        guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
+              !hasAutoAdded(id, profileID: profileID) else { return }   // already auto-added once for this profile -> respect removal
 
         if target.overlayProfileID == nil {
             let type = meta.usesSeriesLifecycle ? "series" : "movie"
