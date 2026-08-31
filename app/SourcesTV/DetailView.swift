@@ -918,9 +918,11 @@ struct DetailView: View {
                         CoreSeasonedEpisodes(meta: meta, videos: videos,
                                              orderedEpisodes: ordered,
                                              watched: watched,
-                                             initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season)
+                                             initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season,
+                                             onEpisodeMove: { direction in
+                                                 handleDetailMove(direction, from: .lower, using: proxy)
+                                             })
                             .id("detailContent")
-                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         castSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         whereToWatchSection
@@ -1696,6 +1698,9 @@ struct CoreSeasonedEpisodes: View {
     var orderedEpisodes: [CoreVideo] = []
     var watched: Set<String> = []
     var initialSeason: Int?
+    /// Optional bridge to the mounting detail page's hero focus graph. It is invoked only for the first
+    /// episode row's Up boundary; all deeper episode rows keep native tvOS list navigation.
+    var onEpisodeMove: ((MoveCommandDirection) -> Void)?
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // observed so a Settings toggle redraws; effective value via SpoilerBlurSetting (user wins over the RemoteConfig fleet default)
     // Spoiler-safe mode (SourcePreferences.spoilerSafeKey): veil an UNWATCHED episode's art + synopsis until it
     // is revealed. On tvOS the reveal is FOCUS: the focused row (focusedEpisode == v.id) un-blurs + shows its
@@ -1806,8 +1811,15 @@ struct CoreSeasonedEpisodes: View {
             // added so a programmatic focus request can scroll its row into existence first.
             ScrollViewReader { rows in
                 LazyVStack(spacing: Theme.Space.sm) {
-                    ForEach(episodes) { v in
-                        episodeRow(v).focused($focusedEpisode, equals: v.id).id(v.id)
+                    ForEach(Array(episodes.enumerated()), id: \.element.id) { index, v in
+                        let row = episodeRow(v).focused($focusedEpisode, equals: v.id).id(v.id)
+                        if TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index) {
+                            // The first row is the list's sole upward boundary. Every deeper row has no
+                            // move-command owner, so Up remains tvOS's native previous-episode movement.
+                            row.modifier(DetailMoveCommandHandler(action: episodeMoveHandler(at: index)))
+                        } else {
+                            row
+                        }
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
@@ -1933,6 +1945,17 @@ struct CoreSeasonedEpisodes: View {
     /// per-profile watch invariant. tvOS reveals by FOCUS, so the focused row is always un-veiled.
     private func spoilerVeiled(_ v: CoreVideo, isWatched: Bool) -> Bool {
         spoilerSafe && !isWatched && focusedEpisode != v.id
+    }
+
+    /// SwiftUI delivers all directional commands to a registered handler. Keep that handler at the first
+    /// row only and forward exactly Up; returning for every other direction leaves the local focus graph
+    /// untouched, matching the action/source boundary handlers elsewhere in this file.
+    private func episodeMoveHandler(at index: Int) -> ((MoveCommandDirection) -> Void)? {
+        guard let onEpisodeMove else { return nil }
+        return { direction in
+            guard TVDetailEpisodeListFocusPolicy.owns(direction: direction, at: index) else { return }
+            onEpisodeMove(direction)
+        }
     }
 
     private func episodeRow(_ v: CoreVideo) -> some View {
