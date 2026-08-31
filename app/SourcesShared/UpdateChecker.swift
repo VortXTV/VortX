@@ -407,7 +407,7 @@ final class UpdateChecker: ObservableObject {
             // Persist a check only after transport, status, and payload decoding all succeeded. Recording
             // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
             if networkSucceeded { self.recordSuccessfulCheck() }
-            if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
+            if isManual && networkSucceeded { self.replaceMonitoringDeadlineAfterManualSuccess() }
             if networkSucceeded, !isManual, !self.manualCheckPending { self.manualOutcome = .idle }
             succeeded = networkSucceeded
 

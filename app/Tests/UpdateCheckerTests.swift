@@ -775,6 +775,34 @@ struct UpdateCheckerTests {
         check(await MainActor.run { cachedFallback.available?.build } == 234,
               "newer validated cache survives current appcast and failed GitHub")
 
+        // Retaining a newer cache does not turn a failed manual refresh into a network recovery. The automatic
+        // failure's existing 60-second deadline must remain intact instead of being replaced with an hour.
+        let cachedManualFailureDefaults = UserDefaults(suiteName: "\(suiteName).cached-manual-failure")!
+        defer { cachedManualFailureDefaults.removePersistentDomain(forName: "\(suiteName).cached-manual-failure") }
+        cachedManualFailureDefaults.set(try! JSONEncoder().encode(cachedFallbackRelease), forKey: "stremiox.update.cachedRelease")
+        let cachedManualFailureSleeper = ControlledSleeper()
+        let cachedManualFailureLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.15", build: 233), response(200))),
+            github: .success((Data("[]".utf8), response(503)))
+        )
+        let cachedManualFailure = await MainActor.run {
+            UpdateChecker(defaults: cachedManualFailureDefaults, now: { Date(timeIntervalSince1970: 1_865_000) },
+                          requestLoader: { request in try await cachedManualFailureLoader.load(request) },
+                          sleeper: { seconds in await cachedManualFailureSleeper.sleep(seconds) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { cachedManualFailure.startMonitoring() }
+        await waitForSleeper(cachedManualFailureSleeper, 1)
+        check(await cachedManualFailureSleeper.duration(at: 0) == 60,
+              "cached network failure first arms the 60-second retry")
+        await MainActor.run { cachedManualFailure.checkNow() }
+        await waitForManualCheckToFinish(cachedManualFailure)
+        try? await Task.sleep(for: .milliseconds(20))
+        check(await cachedManualFailureSleeper.waitingCount == 1,
+              "failed manual refresh with a cached update retains the 60-second retry")
+        await MainActor.run { cachedManualFailure.stopMonitoring() }
+        await cachedManualFailureSleeper.resumeNext()
+
         // Monitoring can first be requested while a user-initiated check owns discovery. The manual completion
         // must inherit exactly one scheduler deadline rather than leaving monitoring stranded.
         let manualFirstDefaults = UserDefaults(suiteName: "\(suiteName).manual-first-monitoring")!
@@ -820,6 +848,30 @@ struct UpdateCheckerTests {
               "manual-first total failure arms the monitoring short retry")
         await MainActor.run { manualFirstFailure.stopMonitoring() }
         await manualFirstFailureSleeper.resumeNext()
+
+        // The same manual-first ownership path must retain the short retry when a validated cached update is
+        // available but the manual network refresh fails. Cache preservation is not transport success.
+        let manualFirstCachedFailureDefaults = UserDefaults(suiteName: "\(suiteName).manual-first-cached-failure")!
+        defer { manualFirstCachedFailureDefaults.removePersistentDomain(forName: "\(suiteName).manual-first-cached-failure") }
+        manualFirstCachedFailureDefaults.set(try! JSONEncoder().encode(cachedFallbackRelease), forKey: "stremiox.update.cachedRelease")
+        let manualFirstCachedFailureLoader = GateLoader((Data("[]".utf8), response(503)))
+        let manualFirstCachedFailureSleeper = ControlledSleeper()
+        let manualFirstCachedFailure = await MainActor.run {
+            UpdateChecker(defaults: manualFirstCachedFailureDefaults, now: { Date(timeIntervalSince1970: 1_960_000) },
+                          requestLoader: { request in await manualFirstCachedFailureLoader.load(request) },
+                          sleeper: { seconds in await manualFirstCachedFailureSleeper.sleep(seconds) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { manualFirstCachedFailure.checkNow() }
+        await waitForCalls(manualFirstCachedFailureLoader, 1)
+        await MainActor.run { manualFirstCachedFailure.startMonitoring() }
+        await manualFirstCachedFailureLoader.resumeFirst()
+        await waitForManualCheckToFinish(manualFirstCachedFailure)
+        await waitForSleeper(manualFirstCachedFailureSleeper, 1)
+        check(await manualFirstCachedFailureSleeper.duration(at: 0) == 60,
+              "manual-first cached refresh failure arms the 60-second monitoring retry")
+        await MainActor.run { manualFirstCachedFailure.stopMonitoring() }
+        await manualFirstCachedFailureSleeper.resumeNext()
 
         // If the hourly task wakes while a manual fetch is in flight, it transfers scheduler ownership to that
         // request. It must not synchronously re-arm a zero-delay loop while the manual request is still gated.
