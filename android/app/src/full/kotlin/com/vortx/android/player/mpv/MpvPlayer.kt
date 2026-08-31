@@ -1461,7 +1461,10 @@ internal suspend fun copyBoundedContentSubtitle(
     val worker = CONTENT_COPY_WORKER.submit {
         var success = false
         try {
-            val opened = openInput() ?: return@submit complete(Result.success(false))
+            val opened = openInput() ?: run {
+                complete(Result.success(false))
+                return@submit
+            }
             val output = synchronized(ioLock) {
                 if (aborted.get()) {
                     runCatching { opened.close() }
@@ -1470,7 +1473,10 @@ internal suspend fun copyBoundedContentSubtitle(
                     input.set(opened)
                     target.outputStream()
                 }
-            } ?: return@submit complete(Result.success(false))
+            } ?: run {
+                complete(Result.success(false))
+                return@submit
+            }
             opened.use { stream ->
                 output.use outputUse@{ output ->
                     val buffer = ByteArray(16 * 1024)
