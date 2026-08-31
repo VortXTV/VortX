@@ -107,6 +107,12 @@ private struct PlaybackMutationOwnershipPolicyTests {
         check(!Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: false,
                                                                   topLevelAction: "Player"),
               "settled logout state releases account mutation gate")
+        check(!Policy.allowsAddonMutationEffects(contextCurrent: true, logoutPending: true),
+              "pending logout leaves add-on tombstones, sync pushes, and hydration counts unchanged")
+        check(!Policy.allowsAddonMutationEffects(contextCurrent: false, logoutPending: false),
+              "stale profile context cannot create add-on side effects")
+        check(Policy.allowsAddonMutationEffects(contextCurrent: true, logoutPending: false),
+              "settled current context permits normal add-on mutation effects")
         check(!Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: false),
               "14-second repair cannot hydrate selected B into an unverified resident A session")
         check(Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: true),

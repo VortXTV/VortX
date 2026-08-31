@@ -97,6 +97,12 @@ enum PlaybackMutationOwnershipPolicy {
         }
     }
 
+    /// Add-on install/remove carries durable local side effects.  The caller must prove both its
+    /// captured context and the absence of a pending logout before touching tombstones or counts.
+    static func allowsAddonMutationEffects(contextCurrent: Bool, logoutPending: Bool) -> Bool {
+        contextCurrent && !logoutPending
+    }
+
     static func allowsRepairHydration(engineSignedIn: Bool, hasSettledBinding: Bool) -> Bool {
         !engineSignedIn || hasSettledBinding
     }

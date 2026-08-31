@@ -66,6 +66,9 @@ let importedCapture = section(bridge, from: "private func captureImportedAwayBoo
 let publicationGate = section(bridge, from: "private var enginePublicationBlocked", until: "/// Invalidate every captured")
 let localRecovery = section(bridge, from: "private func captureImportedAwayLocalRecoveryContext", until: "/// Clear the old binding")
 let dispatch = section(bridge, from: "func dispatch(action:", until: "/// Compact human name")
+let uninstallAddon = section(bridge, from: "func uninstallAddon(_ descriptor:", until: "/// Normalize a pasted")
+let installAddon = section(bridge, from: "func installAddonConfirmed", until: "struct AddonManifestPreview")
+let hydrateAddons = section(bridge, from: "func hydrateAddonsFromAccount", until: "/// stremio-core")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
@@ -147,8 +150,24 @@ check(localRecovery.contains("signedOutRequest: SignedOutRepairRequest")
                 && localRecovery.contains("!isLoggedIn(), currentUID() == nil"),
               "imported-away recovery times out unless the exact logout receipt is cleared and engine identity is blank")
 check(dispatch.contains("blocksAccountMutationDuringSignedOutRepair")
-                && dispatch.contains("dropped account mutation pending signed-out receipt"),
+                && dispatch.contains("dropped account mutation pending signed-out receipt")
+                && dispatch.contains("beforeDispatch?()")
+                && dispatch.contains("return false")
+                && dispatch.contains("return true"),
               "central engine dispatch gate rejects pending-logout account mutations while leaving overlay state local")
+check(uninstallAddon.contains("guard !logoutAccountMutationPending else { return }")
+                && appearsBefore("guard !logoutAccountMutationPending else { return }", "AddonTombstones.tombstone", in: uninstallAddon),
+              "pending logout cannot create an add-on tombstone or sync push before uninstall dispatch")
+check(installAddon.contains("let mutationToken = capturePublicationToken()")
+                && installAddon.components(separatedBy: "addonMutationStillAllowed(mutationToken)").count >= 5
+                && installAddon.contains("dispatchCtx([\"action\": \"UninstallAddon\", \"args\": existing])")
+                && installAddon.contains("beforeDispatch: {")
+                && installAddon.contains("AddonTombstones.forget(identityURL.absoluteString)"),
+              "installer rechecks after awaits and mutates tombstones only on an accepted install dispatch")
+check(hydrateAddons.contains("guard !owned.isEmpty, addonMutationStillAllowed(mutationToken) else { return }")
+                && hydrateAddons.contains("if dispatchCtx([\"action\": \"InstallAddon\", \"args\": addon.installDescriptor])")
+                && hydrateAddons.contains("installedCount += 1"),
+              "account hydration reports only install actions accepted by the dispatch gate")
 check(seed.contains("capturePublicationToken()")
                 && seed.contains("publicationStillCurrent(publicationToken)")
                 && seed.contains("rebuildContinueWatching(capturedPublicationToken: publicationToken)")

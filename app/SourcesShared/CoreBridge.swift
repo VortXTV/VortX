@@ -50,6 +50,7 @@ final class CoreBridge: ObservableObject {
     private var manifestPreviewCache: [String: (manifest: [String: Any], canonicalURL: String, fetchedAt: Date)] = [:]
     private static let manifestCacheTTL: TimeInterval = 60
     private static let manifestCacheCap = 64
+    private static let accountTransitionMessage = String(localized: "Your account is switching or signing out. Try again in a moment.")
     private var started = false
     /// Coalesces the Home-board rebuild. The engine emits a BURST of `board` events during launch and while a
     /// catalog page lands (one per catalog settling), and each event used to trigger a full `buildBoardRows()`
@@ -372,6 +373,9 @@ final class CoreBridge: ObservableObject {
     /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
     /// URL must stay re-addable on every device.
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
+        // A pending logout still belongs to the previous account.  Do not create a durable
+        // deletion intent or its sync push when the engine mutation itself is fenced.
+        guard !logoutAccountMutationPending else { return }
         // Record the durable removal FIRST, before touching rawAddonsByUrl. A synced add-on can be visible
         // in the published `addons` list yet be MISSING from `rawAddonsByUrl` (its raw engine descriptor
         // never landed, e.g. a roster the sync layer added without an engine InstallAddon). The old
@@ -442,6 +446,10 @@ final class CoreBridge: ObservableObject {
     /// intact when the new manifest never confirms.
     @MainActor
     func installAddonConfirmed(urlString: String, replacingExisting: Bool = false) async -> AddonInstallOutcome {
+        let mutationToken = capturePublicationToken()
+        guard addonMutationStillAllowed(mutationToken) else {
+            return .failed(retryable: true, message: Self.accountTransitionMessage)
+        }
         // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
         // debrid key). Normalizing it to /configure/manifest.json fetches a valid-shaped but DEAD default from
         // the add-on SDK router, so the install would "succeed" yet return no sources. Refuse it here at the
@@ -463,7 +471,11 @@ final class CoreBridge: ObservableObject {
             manifest = cached.manifest
             identity = cached.canonicalURL
         } else {
-            switch await AddonURLGuard.fetch(url) {
+            let fetchResult = await AddonURLGuard.fetch(url)
+            guard addonMutationStillAllowed(mutationToken) else {
+                return .failed(retryable: true, message: Self.accountTransitionMessage)
+            }
+            switch fetchResult {
             case .failure(let rejection):
                 return .failed(retryable: Self.isRetryable(rejection), message: rejection.message)
             case .success(let (data, finalURL)):
@@ -491,7 +503,10 @@ final class CoreBridge: ObservableObject {
         let previousManifest: [String: Any]? = replacing
             ? (rawAddonsByUrl[identity]?["manifest"] as? [String: Any]) : nil
         if replacing, let existing = rawAddonsByUrl[identity] {
-            dispatchCtx(["action": "UninstallAddon", "args": existing])
+            guard addonMutationStillAllowed(mutationToken),
+                  dispatchCtx(["action": "UninstallAddon", "args": existing]) else {
+                return .failed(retryable: true, message: Self.accountTransitionMessage)
+            }
         }
 
         // The descriptor is installed under the guarded final identity, never the unvalidated redirect source.
@@ -508,10 +523,19 @@ final class CoreBridge: ObservableObject {
         // URL failed with "Install did not confirm". An explicit user install is intent to have the
         // add-on, the same authority the Library add path uses to supersede LibraryTombstones. If the
         // install itself fails, the user can remove the add-on again, which re-tombstones it.
-        AddonTombstones.forget(identityURL.absoluteString)
-        dispatchCtx(["action": "InstallAddon", "args": descriptor])
+        guard addonMutationStillAllowed(mutationToken),
+              dispatchCtx(["action": "InstallAddon", "args": descriptor], beforeDispatch: {
+                  AddonTombstones.forget(identityURL.absoluteString)
+              }) else {
+            return .failed(retryable: true, message: Self.accountTransitionMessage)
+        }
 
-        guard await awaitAddonInstalled(identity, replacingManifest: previousManifest, expectedManifest: manifest) else {
+        let installConfirmed = await awaitAddonInstalled(identity, replacingManifest: previousManifest,
+                                                         expectedManifest: manifest)
+        guard addonMutationStillAllowed(mutationToken) else {
+            return .failed(retryable: true, message: Self.accountTransitionMessage)
+        }
+        guard installConfirmed else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
         }
         return .installed
@@ -708,12 +732,15 @@ final class CoreBridge: ObservableObject {
     /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
     /// touches a per-profile overlay and never `disabledAddons` (which stays a render-layer filter).
     func hydrateAddonsFromAccount(_ owned: [VortXOwnedAddon]) {
-        guard !owned.isEmpty else { return }
+        let mutationToken = capturePublicationToken()
+        guard !owned.isEmpty, addonMutationStillAllowed(mutationToken) else { return }
         let installed = Set(addons.map(\.transportUrl)) .union(rawAddonsByUrl.keys)
         var installedCount = 0
         for addon in owned where !installed.contains(addon.transportUrl) {
-            dispatchCtx(["action": "InstallAddon", "args": addon.installDescriptor])
-            installedCount += 1
+            guard addonMutationStillAllowed(mutationToken) else { return }
+            if dispatchCtx(["action": "InstallAddon", "args": addon.installDescriptor]) {
+                installedCount += 1
+            }
         }
         if installedCount > 0 {
             NSLog("%@", "[CoreBridge] hydrated \(installedCount) account-owned add-on(s) into the engine (no Stremio session needed)")
@@ -2960,6 +2987,14 @@ final class CoreBridge: ObservableObject {
         signedOutRepairRequest != nil
     }
 
+    /// Add-on operations have local tombstone side effects, so they require the same immutable
+    /// publication context as their eventual Ctx write, not only the central dispatch gate.
+    private func addonMutationStillAllowed(_ token: PublicationToken) -> Bool {
+        PlaybackMutationOwnershipPolicy.allowsAddonMutationEffects(
+            contextCurrent: publicationStillCurrent(token),
+            logoutPending: logoutAccountMutationPending)
+    }
+
     private func capturePublicationToken() -> PublicationToken {
         publicationEpochLock.lock()
         let token = PublicationToken(epoch: publicationEpoch)
@@ -3140,8 +3175,9 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Dispatch an `Action::Ctx(...)` to the whole model (field = nil).
-    private func dispatchCtx(_ ctxAction: [String: Any]) {
-        dispatch(action: ["action": "Ctx", "args": ctxAction])
+    @discardableResult
+    private func dispatchCtx(_ ctxAction: [String: Any], beforeDispatch: (() -> Void)? = nil) -> Bool {
+        dispatch(action: ["action": "Ctx", "args": ctxAction], beforeDispatch: beforeDispatch)
     }
 
     // MARK: Dispatch
@@ -3149,7 +3185,8 @@ final class CoreBridge: ObservableObject {
     /// Dispatch an action. `field` targets one model field (nil broadcasts to the whole model).
     /// `action` is the engine's `Action` JSON, e.g.
     /// `["action": "Load", "args": ["model": "CatalogsWithExtra", "args": ["type": NSNull(), "extra": []]]]`.
-    func dispatch(action: [String: Any], field: String? = nil) {
+    @discardableResult
+    func dispatch(action: [String: Any], field: String? = nil, beforeDispatch: (() -> Void)? = nil) -> Bool {
         let topLevelAction = action["action"] as? String
         let contextAction = (action["args"] as? [String: Any])?["action"] as? String
         guard !PlaybackMutationOwnershipPolicy.blocksAccountMutationDuringSignedOutRepair(
@@ -3157,15 +3194,17 @@ final class CoreBridge: ObservableObject {
             topLevelAction: topLevelAction,
             contextAction: contextAction) else {
             VXProbe.log("engine", "dropped account mutation pending signed-out receipt: \(Self.actionName(action))")
-            return
+            return false
         }
         let payload: [String: Any] = ["field": field ?? NSNull(), "action": action]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: data, encoding: .utf8) else { return }
+              let json = String(data: data, encoding: .utf8) else { return false }
+        beforeDispatch?()
         // [engine] narrate every dispatched action (its name + the field it targets) so the log shows
         // what we asked the engine to do. Gated + autoclosure: shipping builds build no string.
         VXProbe.log("engine", "dispatch \(Self.actionName(action))\(field.map { " -> \($0)" } ?? "")")
         json.withCString { stremiox_core_dispatch($0) }
+        return true
     }
 
     /// Compact human name for a dispatched action, for the [engine] probe. Reports the top-level
