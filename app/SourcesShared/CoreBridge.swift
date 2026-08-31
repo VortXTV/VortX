@@ -127,6 +127,13 @@ final class CoreBridge: ObservableObject {
     private var accountBindingVerificationTask: Task<Void, Never>?
     private var rejectedAccountBindingGeneration: UInt64?
 
+    /// Rust delivers NewState on its own worker.  Auth/profile state belongs to main, so workers must
+    /// never read it directly.  They capture this lock-backed, immutable epoch and main validates it
+    /// immediately before a decoded snapshot is published or used for a deferred engine mutation.
+    private struct PublicationToken: Equatable { let epoch: UInt64 }
+    private let publicationEpochLock = NSLock()
+    private var publicationEpoch: UInt64 = 0
+
     // MARK: Player-active gating (playback lag fix)
     //
     // A high-source title (e.g. GoT S2E1: 1757 streams across 17 groups) makes source search re-emit
@@ -202,17 +209,18 @@ final class CoreBridge: ObservableObject {
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
     /// hydrated library), it emits no `NewState`, so capture it once after init; events keep it fresh.
     private func seedInitialState() {
-        guard !enginePublicationBlocked else { return }
+        let publicationToken = capturePublicationToken()
         let rows = buildBoardRows()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            guard self.publicationStillCurrent(publicationToken) else { return }
             if !rows.isEmpty { self.boardRows = rows }
         }
         // Seed Continue Watching through the SAME union path events use, so a cold / migrated device that
         // re-added its owner library at time 0 still paints the rail from OwnerResumeStore instead of blank
         // (#149), rather than only reflecting the engine's own (empty) continue_watching_preview here.
-        rebuildContinueWatching()
-        refreshAddons()
+        rebuildContinueWatching(capturedPublicationToken: publicationToken)
+        refreshAddons(capturedPublicationToken: publicationToken)
     }
 
     /// Refresh the installed-addons list (and the raw descriptors for uninstall) from ctx.profile.
@@ -234,7 +242,10 @@ final class CoreBridge: ObservableObject {
     /// NOT suppressed here. The same holds for an explicit Stremio reconnect (`signedInWithLegacyAuthKey`
     /// clears the removal set before the account import).
     private func refreshAddons() {
-        guard !enginePublicationBlocked else { return }
+        refreshAddons(capturedPublicationToken: capturePublicationToken())
+    }
+
+    private func refreshAddons(capturedPublicationToken publicationToken: PublicationToken) {
         let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
         // A synced order can arrive before OR after the final add-on hydrate. Keep the full-range intent
         // alive across both sequences: if an explicit order already exists when ctx grows, widen only when
@@ -243,7 +254,8 @@ final class CoreBridge: ObservableObject {
         if !CatalogPrefsStore.order().isEmpty {
             let installedCatalogTotal = typed.reduce(0) { $0 + $1.manifest.catalogs.count }
             DispatchQueue.main.async { [weak self] in
-                self?.ensureCatalogOrderRangeLoaded(installedCatalogTotal: installedCatalogTotal)
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                self.ensureCatalogOrderRangeLoaded(installedCatalogTotal: installedCatalogTotal)
             }
         }
         var raw: [String: [String: Any]] = [:]
@@ -286,24 +298,28 @@ final class CoreBridge: ObservableObject {
             let pushDeletionsToStremio = (MirrorSettings.mirrorAddons && isLoggedIn()) || !isLoggedIn()
             if !toUninstall.isEmpty, pushDeletionsToStremio {
                 Task { @MainActor [weak self] in
+                    guard let self, self.publicationStillCurrent(publicationToken) else { return }
                     for rawDescriptor in toUninstall {
-                        self?.dispatchCtx(["action": "UninstallAddon", "args": rawDescriptor])
+                        guard self.publicationStillCurrent(publicationToken) else { return }
+                        self.dispatchCtx(["action": "UninstallAddon", "args": rawDescriptor])
                     }
                 }
             }
-            // Publish the tmdb:-meta gate from the FINAL surviving set (thread-safe UserDefaults write, no
-            // self needed) so the off-main catalog resolvers gate the tmdb: fallback on real installed state.
-            AddonMetaGate.publish(survivingTyped.contains { $0.providesTMDBMeta })
             DispatchQueue.main.async { [weak self] in
-                self?.addons = survivingTyped
-                self?.rawAddonsByUrl = publishedRaw
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                // Keep this gate and the published descriptor snapshot atomic from the active profile's
+                // perspective.  A stale ctx callback must not enable a resolver for the next account.
+                AddonMetaGate.publish(survivingTyped.contains { $0.providesTMDBMeta })
+                self.addons = survivingTyped
+                self.rawAddonsByUrl = publishedRaw
             }
             return
         }
-        AddonMetaGate.publish(typed.contains { $0.providesTMDBMeta })
         DispatchQueue.main.async { [weak self] in
-            self?.addons = typed
-            self?.rawAddonsByUrl = raw
+            guard let self, self.publicationStillCurrent(publicationToken) else { return }
+            AddonMetaGate.publish(typed.contains { $0.providesTMDBMeta })
+            self.addons = typed
+            self.rawAddonsByUrl = raw
         }
     }
 
@@ -793,8 +809,9 @@ final class CoreBridge: ObservableObject {
     /// data OR no stream add-on, re-establish the session from the token; the engine then pulls
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
+        let publicationToken = capturePublicationToken()
         DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-            guard let self, !self.switchInFlight, !self.awaitingAuthMigration,
+            guard let self, self.publicationStillCurrent(publicationToken), !self.switchInFlight, !self.awaitingAuthMigration,
                   !self.enginePublicationBlocked else { return }
             let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
             let noAccountData = self.continueWatching.isEmpty && cwItems.isEmpty && (self.library?.catalog.isEmpty ?? true)
@@ -810,7 +827,9 @@ final class CoreBridge: ObservableObject {
             // never make things worse. This is what fixes "post-update: 0 sources / 0 add-ons" on a
             // genuinely-logged-out or degraded device.
             Task { @MainActor in
+                guard self.publicationStillCurrent(publicationToken) else { return }
                 await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                guard self.publicationStillCurrent(publicationToken) else { return }
                 // Re-establish a live Stremio session to reconcile on top of the hydrated floor ONLY when a
                 // usable token exists AND this device is NOT migrated-and-opted-out. Wave 4 (Finding 2): an
                 // importedAway device must NEVER re-auth Stremio here, or it would defeat the import with a
@@ -878,6 +897,7 @@ final class CoreBridge: ObservableObject {
     /// token identity agrees with the engine ctx.
     func switchAccount(token: String) {
         beginAccountBinding(for: token)
+        let publicationToken = capturePublicationToken()
         switchInFlight = true
         switchFromUID = currentUID()
         clearUserState()
@@ -886,7 +906,7 @@ final class CoreBridge: ObservableObject {
         // This is a UI refresh backstop only. It is not credential proof and deliberately cannot
         // settle `pendingAccountBinding` or permit a queued account mutation.
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
-            guard let self, self.switchInFlight else { return }
+            guard let self, self.publicationStillCurrent(publicationToken), self.switchInFlight else { return }
             self.switchInFlight = false
             self.switchFromUID = nil
             // Never refresh the pre-switch account merely because time elapsed. A verified
@@ -2043,7 +2063,10 @@ final class CoreBridge: ObservableObject {
     /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
     /// synthesizes + publishes on main.
     func rebuildContinueWatching() {
-        guard !enginePublicationBlocked else { return }
+        rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())
+    }
+
+    private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken) {
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         let generation = continueWatchingRebuildGeneration
@@ -2061,7 +2084,7 @@ final class CoreBridge: ObservableObject {
             self.continueWatchingRebuildLock.lock()
             let isLatest = generation == self.continueWatchingRebuildGeneration
             self.continueWatchingRebuildLock.unlock()
-            guard isLatest else { return }
+            guard isLatest, self.publicationStillCurrent(publicationToken) else { return }
             // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
             // profile rides `profiles.cwItems` and ignores this published value entirely.
             let ownerProfile = ProfileStore.shared.activeUsesEngineHistory
@@ -2692,6 +2715,7 @@ final class CoreBridge: ObservableObject {
     /// fails closed rather than borrowing whichever account happened to be resident.
     private func beginAccountBinding(for token: String) {
         cancelAccountBindingVerification()
+        invalidatePublicationEpoch()
         settledAccountBinding = nil
         authBindingGeneration &+= 1
         rejectedAccountBindingGeneration = nil
@@ -2719,6 +2743,7 @@ final class CoreBridge: ObservableObject {
 
     private func invalidateAuthenticationGeneration() {
         cancelAccountBindingVerification()
+        invalidatePublicationEpoch()
         authBindingGeneration &+= 1
         pendingAccountBinding = nil
         settledAccountBinding = nil
@@ -2731,10 +2756,37 @@ final class CoreBridge: ObservableObject {
             credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration)
     }
 
-    private func publicationStillCurrent(_ capturedGeneration: UInt64) -> Bool {
-        PlaybackMutationOwnershipPolicy.mayPublish(capturedGeneration: capturedGeneration,
-                                                   currentGeneration: authBindingGeneration,
-                                                   blocked: enginePublicationBlocked)
+    private func capturePublicationToken() -> PublicationToken {
+        publicationEpochLock.lock()
+        let token = PublicationToken(epoch: publicationEpoch)
+        publicationEpochLock.unlock()
+        return token
+    }
+
+    /// Main-only validation for a worker-captured publication.  The lock provides the epoch race
+    /// fence; the main-owned binding check prevents an unresolved or rejected credential from
+    /// publishing resident engine state even when no epoch has changed.
+    private func publicationStillCurrent(_ token: PublicationToken) -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        publicationEpochLock.lock()
+        let current = token.epoch == publicationEpoch
+        publicationEpochLock.unlock()
+        return current && !enginePublicationBlocked
+    }
+
+    /// Invalidate every captured engine snapshot at the profile/auth boundary.  Coalesced work is
+    /// cancelled as a latency optimisation, but the epoch guard remains the correctness fence for a
+    /// closure already executing when cancellation arrives.
+    private func invalidatePublicationEpoch() {
+        publicationEpochLock.lock()
+        publicationEpoch &+= 1
+        publicationEpochLock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.boardRebuildWork?.cancel()
+            self?.boardRebuildWork = nil
+            self?.metaDetailsWork?.cancel()
+            self?.metaDetailsWork = nil
+        }
     }
 
     /// ProfileStore calls this in the same turn as selection. It invalidates any completion for
@@ -2925,7 +2977,9 @@ final class CoreBridge: ObservableObject {
         // friends) as changed on every library tick for free, so an idle device woke every `revision` observer
         // several times a minute to re-render identical state. Bump only when something was really published.
         var published = false
-        let publicationGeneration = authBindingGeneration
+        // This callback is on Rust's worker thread.  Capture only the lock-backed publication
+        // epoch here; all main-owned auth/profile checks happen in the eventual main closure.
+        let publicationToken = capturePublicationToken()
 
         // Legacy authKey migration + account-switch completion both depend on `ctx` landing while logged in.
         // Their state (awaitingAuthMigration, switchInFlight, switchFromUID) is ALSO written on the MAIN thread
@@ -2934,7 +2988,7 @@ final class CoreBridge: ObservableObject {
         // stuck-true (the switched account never reloads) through an unsynchronized cross-thread write.
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
                 let bindingSettled = self.settleAccountBindingIfProven()
                 if self.awaitingAuthMigration, self.isLoggedIn() {
                     self.awaitingAuthMigration = false
@@ -2953,20 +3007,23 @@ final class CoreBridge: ObservableObject {
         if fields.contains("continue_watching_preview") {
             // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
             // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
-            rebuildContinueWatching()
+            rebuildContinueWatching(capturedPublicationToken: publicationToken)
             published = true
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
         // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
         // full decodes + republishes (the on-open lag). The rebuild itself still decodes off-main.
         if fields.contains("board") || fields.contains("ctx") {
-            scheduleBoardRebuild()   // [engine] board row count is logged there (coalesced, one per burst)
+            scheduleBoardRebuild(capturedPublicationToken: publicationToken)   // [engine] board row count is logged there (coalesced, one per burst)
             published = true
         }
         if fields.contains("ctx") {
             VXProbe.log("engine", "ctx/settings changed addons=\(decode(CoreCtx.self, field: "ctx")?.profile.addons.count ?? 0)")
-            DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
-            refreshAddons()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                self.addonNamesCache = nil
+            }   // addon set changed → rebuild name map
+            refreshAddons(capturedPublicationToken: publicationToken)
             published = true
             // MID-SEARCH RE-PLAN. A profile/addon change mid-search runs `Internal::ProfileChanged`, which
             // in `catalogs_with_extra.rs` calls `catalogs_update(..., range: None, ...)`: every planned
@@ -2984,7 +3041,7 @@ final class CoreBridge: ObservableObject {
             // Coalesce a source-search burst into one trailing decode+diff (see metaDetailsWork). The heavy
             // 1757-stream decode used to run on this worker thread on every re-emit; now it runs once per
             // burst, and the diff drops the republish when nothing the UI / streamGroups needs has changed.
-            scheduleMetaDetailsRepublish()
+            scheduleMetaDetailsRepublish(capturedPublicationToken: publicationToken)
             published = true
         }
         if fields.contains("discover") {
@@ -3021,7 +3078,7 @@ final class CoreBridge: ObservableObject {
                     VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
-                        guard self.publicationStillCurrent(publicationGeneration) else { return }
+                        guard self.publicationStillCurrent(publicationToken) else { return }
                         // End-stop (#95): a next-page load that has FULLY settled (no page still loading)
                         // without growing the list means there are no more pages, whether the catalog was
                         // cursorless or its cursor went nil mid-catalog. Gate on !isLoadingPage so the
@@ -3040,7 +3097,10 @@ final class CoreBridge: ObservableObject {
                     if let value, value.items.isEmpty,
                        !value.selectable.types.contains(where: { $0.selected }),
                        let first = value.selectable.types.first {
-                        selectDiscover(first.request)
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                            self.selectDiscover(first.request)
+                        }
                     }
                 }
             }
@@ -3049,7 +3109,7 @@ final class CoreBridge: ObservableObject {
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationGeneration) else { return }
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
                 self.library = value
             }
             published = true
@@ -3059,7 +3119,7 @@ final class CoreBridge: ObservableObject {
             // UNION OwnerResumeStore. Skipped during playback: the rail is not visible then, and a real
             // progress save emits its own continue_watching_preview event (which rebuilds), so nothing is lost
             // while sparing the ~20s progress-save churn (#147).
-            if !playerActive { rebuildContinueWatching() }
+            if !playerActive { rebuildContinueWatching(capturedPublicationToken: publicationToken) }
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.
@@ -3079,7 +3139,7 @@ final class CoreBridge: ObservableObject {
             guard !playerActive else { return }
             let details = decode(CoreMetaDetails.self, field: "meta_details")
             DispatchQueue.main.async { [weak self] in
-                guard let self, let current = self.metaDetails else { return }
+                guard let self, self.publicationStillCurrent(publicationToken), let current = self.metaDetails else { return }
                 let changed = current.libraryItem?.id != details?.libraryItem?.id
                     || current.libraryItem?.removed != details?.libraryItem?.removed
                     || current.libraryItem?.temp != details?.libraryItem?.temp
@@ -3135,15 +3195,19 @@ final class CoreBridge: ObservableObject {
             VXProbe.log("engine", "search changed results=\(unique.count) loading=\(hasLoadingPages)")
             published = true
             DispatchQueue.main.async { [weak self] in
-                self?.searchIsLoading = hasLoadingPages
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                self.searchIsLoading = hasLoadingPages
                 if !hasLoadingPages || !unique.isEmpty {
-                    self?.searchResults = unique
+                    self.searchResults = unique
                 }
             }
         }
         if fields.contains("local_search") {
             let value = decode(CoreLocalSearchState.self, field: "local_search")
-            DispatchQueue.main.async { [weak self] in self?.searchSuggestions = value?.searchResults ?? [] }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                self.searchSuggestions = value?.searchResults ?? []
+            }
             published = true
         }
 
@@ -3152,7 +3216,7 @@ final class CoreBridge: ObservableObject {
         // reaction to the bump, so the two stay consistent: a suppressed event published nothing for anyone
         // to read. WatchedIndex's fields (ctx / library / continue_watching_preview) all mark published.
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.publicationStillCurrent(publicationToken) else { return }
             self.changedFields = Set(fields)
             if published { self.revision &+= 1 }
         }
@@ -3169,8 +3233,12 @@ final class CoreBridge: ObservableObject {
     /// episode switch or a fresh Load changes the meta id / stream set, so its republish always lands
     /// within one debounce window, keeping in-player next-episode / binge auto-advance intact.
     private func scheduleMetaDetailsRepublish() {
+        scheduleMetaDetailsRepublish(capturedPublicationToken: capturePublicationToken())
+    }
+
+    private func scheduleMetaDetailsRepublish(capturedPublicationToken publicationToken: PublicationToken) {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.publicationStillCurrent(publicationToken) else { return }
             self.metaDetailsWork?.cancel()
             let refreshGenerationAtSchedule = self.appleCWMetaRefreshRequest?.generation
             let work = DispatchWorkItem { [weak self] in
@@ -3187,7 +3255,7 @@ final class CoreBridge: ObservableObject {
                         if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
                     }
                     DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
+                        guard let self, self.publicationStillCurrent(publicationToken) else { return }
                         // The decoded payload belongs to the request generation that was active when this
                         // debounce work was scheduled. If teardown cancelled that generation, or a
                         // replacement player installed another one, discard the stale work before it can
@@ -3354,9 +3422,12 @@ final class CoreBridge: ObservableObject {
     /// (`buildBoardRows`) runs off the main thread; only the `boardRows` assignment lands on main. Net effect:
     /// the launch/page-land storm that used to fire N full decodes + N republishes now fires exactly one.
     private func scheduleBoardRebuild() {
-        guard !enginePublicationBlocked else { return }
+        scheduleBoardRebuild(capturedPublicationToken: capturePublicationToken())
+    }
+
+    private func scheduleBoardRebuild(capturedPublicationToken publicationToken: PublicationToken) {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            guard let self, self.publicationStillCurrent(publicationToken) else { return }
             self.boardRebuildWork?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
@@ -3368,7 +3439,7 @@ final class CoreBridge: ObservableObject {
                     // [engine] one board line per coalesced rebuild (catalogs the engine holds -> visible rows).
                     VXProbe.log("engine", "board changed catalogs=\(boardState?.catalogs.count ?? 0) rows=\(rows.count)")
                     DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
+                        guard let self, self.publicationStillCurrent(publicationToken) else { return }
                         self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
                         self.boardCatalogTotal = boardState?.catalogs.count ?? 0
                         self.boardRows = rows
@@ -3479,8 +3550,12 @@ final class CoreBridge: ObservableObject {
 
     /// Rebuild the board (e.g. after a catalog-preference change) and republish on the main queue.
     func rebuildBoardRows() {
+        let publicationToken = capturePublicationToken()
         let rows = buildBoardRows()
-        DispatchQueue.main.async { [weak self] in self?.boardRows = rows }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.publicationStillCurrent(publicationToken) else { return }
+            self.boardRows = rows
+        }
     }
 
     /// The Home board rows whose content type is Live TV (tv / channel / events), for the Live
