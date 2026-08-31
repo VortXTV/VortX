@@ -60,6 +60,9 @@ enum VortXRemuxProducerLeadPolicyTests {
         extremeBitrateRespectsTheViableFloor()
         coupledTargetPlusMarginNeverReachesTheCeilingAcrossFieldBitrates()
         completedCouplingIsInertUntilTheItemGenerationChanges()
+        elapsedEvidencePhaseSamplesOnRealTimeAndReplacesFallback()
+        elapsedEvidencePhaseRejectsInvalidAndRegressingTime()
+        elapsedEvidencePhaseResetsForReplacementGeneration()
         fieldLoopSimulationOldTargetStarvesNewTargetDoesNot()
 
         print("===== FAILURES: \(failures) =====")
@@ -327,6 +330,106 @@ enum VortXRemuxProducerLeadPolicyTests {
         check("a replacement item starts a fresh coupling schedule",
               VortXRemuxForwardBufferCoupling.isAttemptDue(
                   state: completed, currentGeneration: 42))
+    }
+
+    static func elapsedEvidencePhaseSamplesOnRealTimeAndReplacesFallback() {
+        let generation: UInt64 = 41
+        let base = VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds
+        var state = VortXRemuxForwardBufferCoupling.AttemptState()
+
+        func tick(_ elapsed: TimeInterval, observed: Double? = nil, indicated: Double? = nil)
+            -> (applyDuration: TimeInterval?, finished: Bool) {
+            let decision = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+                state: state,
+                currentGeneration: generation,
+                elapsedSinceFirstFrame: elapsed,
+                observedBitsPerSecond: observed,
+                indicatedBitsPerSecond: indicated,
+                aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                baseDuration: base)
+            state = decision.state
+            return (decision.applyDuration, decision.finished)
+        }
+
+        let firstFrame = tick(0)
+        check("first-frame tick does not spend a remux evidence sample",
+              firstFrame.applyDuration == nil && state.samplesTaken == 0 && !firstFrame.finished)
+        let quarterSecond = tick(0.25)
+        check("quarter-second observer tick is not due before two seconds",
+              quarterSecond.applyDuration == nil && state.samplesTaken == 0)
+        let onePointNine = tick(1.9)
+        check("no sample is due before the two-second boundary",
+              onePointNine.applyDuration == nil && state.samplesTaken == 0)
+        for elapsed in [2.0, 4.0, 6.0] {
+            let decision = tick(elapsed)
+            check("missing-evidence sample at t=\(Int(elapsed))s stays live",
+                  decision.applyDuration == nil && !decision.finished)
+        }
+        check("two-second cadence records exactly three samples by t=6",
+              state.samplesTaken == 3 && state.lastSampleElapsedSeconds == 6)
+        let fallback = tick(8)
+        check("t=8 missing evidence applies active eight-second fallback without finishing",
+              fallback.applyDuration == VortXRemuxForwardBufferCoupling.conservativeFallbackSeconds
+                && !fallback.finished && state.fallbackApplied && state.samplesTaken == 4)
+        let repeated = tick(8.25)
+        check("repeated observer ticks cannot reapply fallback or spend a sample",
+              repeated.applyDuration == nil && !repeated.finished && state.samplesTaken == 4)
+        let estimated = tick(10, observed: fieldBitsPerSecond)
+        let expected = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+            observedBitsPerSecond: fieldBitsPerSecond,
+            unconstrainedDuration: base)
+        check("t=10 byte-backed estimate replaces fallback with the coupled target and finishes",
+              estimated.applyDuration == expected && estimated.finished && state.finished)
+        let inert = tick(12, observed: 200_000_000)
+        check("completed evidence phase is inert even if a later observer estimate changes",
+              inert.applyDuration == nil && inert.finished && state.bestBitsPerSecond == fieldBitsPerSecond)
+    }
+
+    static func elapsedEvidencePhaseRejectsInvalidAndRegressingTime() {
+        let generation: UInt64 = 92
+        let base = VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds
+        var state = VortXRemuxForwardBufferCoupling.AttemptState()
+        let first = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: state, currentGeneration: generation, elapsedSinceFirstFrame: 2,
+            observedBitsPerSecond: nil, indicatedBitsPerSecond: nil,
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
+        state = first.state
+        let invalid = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: state, currentGeneration: generation, elapsedSinceFirstFrame: .nan,
+            observedBitsPerSecond: fieldBitsPerSecond, indicatedBitsPerSecond: nil,
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
+        check("non-finite elapsed time leaves the active evidence phase untouched",
+              invalid.state == state && invalid.applyDuration == nil && !invalid.finished)
+        let regressed = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: state, currentGeneration: generation, elapsedSinceFirstFrame: 1,
+            observedBitsPerSecond: fieldBitsPerSecond, indicatedBitsPerSecond: nil,
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
+        check("regressing elapsed time cannot consume or complete an evidence sample",
+              regressed.state == state && regressed.applyDuration == nil && !regressed.finished)
+    }
+
+    static func elapsedEvidencePhaseResetsForReplacementGeneration() {
+        let base = VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds
+        var state = VortXRemuxForwardBufferCoupling.AttemptState(generation: 11, attemptsUsed: 4,
+                                                                  bestBitsPerSecond: fieldBitsPerSecond)
+        state.finished = true
+        let newItemAtFirstFrame = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: state, currentGeneration: 12, elapsedSinceFirstFrame: 0,
+            observedBitsPerSecond: nil, indicatedBitsPerSecond: nil,
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
+        check("replacement generation resets stale completed evidence at first frame",
+              newItemAtFirstFrame.state.generation == 12
+                && newItemAtFirstFrame.state.samplesTaken == 0
+                && newItemAtFirstFrame.state.bestBitsPerSecond == nil
+                && !newItemAtFirstFrame.state.finished
+                && newItemAtFirstFrame.applyDuration == nil)
+        let newItemSample = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+            state: newItemAtFirstFrame.state, currentGeneration: 12, elapsedSinceFirstFrame: 2,
+            observedBitsPerSecond: nil, indicatedBitsPerSecond: nil,
+            aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
+        check("replacement generation starts its own two-second cadence",
+              newItemSample.state.samplesTaken == 1 && !newItemSample.finished)
     }
 
     /// State-machine replay of the diag-6 loop (branch review finding 3: the configured target must CHANGE

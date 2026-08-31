@@ -117,28 +117,51 @@ enum VortXRemuxForwardBufferCoupling {
         return max(minimumSteadyStateSeconds, capped)
     }
 
-    // MARK: Generation-owned retry (branch review finding 2)
+    // MARK: Generation-owned evidence phase (branch review finding 2)
 
     /// The first rendered frame can beat the remux server's minimum sampling window (10 s of produced
     /// media), and the HLS `signaling.bandwidth` may not be parsed yet either. A ONE-SHOT coupling at the
     /// first-frame latch therefore missed permanently on fast starts and left the uncoupled 30 s ask in
-    /// place for the whole item. These constants bound the retry schedule that follows the latch instead.
-    static let maximumSampleAttempts = 5
+    /// place for the whole item. The periodic observer runs much faster than the server's evidence window, so
+    /// this must be elapsed-time driven rather than callback-count driven. A 0.25 s observer must never spend
+    /// eight seconds of evidence time in one second of wall-clock playback.
     static let sampleRetryIntervalSeconds: TimeInterval = 2
+    /// At this point the item still needs a survivable local-remux target even if no byte-backed estimate has
+    /// arrived. The fallback deliberately matches the proven viable floor, but is NOT a terminal decision:
+    /// sampling continues until real evidence can replace it.
+    static let conservativeFallbackSeconds: TimeInterval = minimumSteadyStateSeconds
+    static let fallbackElapsedSeconds: TimeInterval = 8
+    /// Local-remux bitrate accounting needs approximately ten seconds of produced media before it becomes a
+    /// trustworthy coupling input. Earlier declared values are retained as evidence but cannot finish the
+    /// phase by themselves.
+    static let minimumEvidenceElapsedSeconds: TimeInterval = 10
 
     /// Coupling ownership for exactly one player-item generation. A replaced mount/item resets the attempt
-    /// budget and the estimate; stale callbacks from the old generation can never retune the new item.
-    /// `finished` latches the end of the schedule so steady-state ticks pay nothing.
+    /// timing anchor and the estimate; stale callbacks from the old generation can never retune the new item.
+    /// `finished` latches the end of the evidence phase so steady-state ticks pay nothing. `lastSampleElapsed`
+    /// makes the two-second rate limit explicit and generation-owned instead of coupling it to observer tick
+    /// frequency.
     struct AttemptState: Equatable {
         let generation: UInt64
-        var attemptsUsed: Int
+        var lastSampleElapsedSeconds: TimeInterval?
+        var samplesTaken: Int
         var bestBitsPerSecond: Double?
+        var fallbackApplied: Bool
         var finished: Bool = false
 
         init(generation: UInt64 = 0, attemptsUsed: Int = 0, bestBitsPerSecond: Double? = nil) {
             self.generation = generation
-            self.attemptsUsed = attemptsUsed
+            self.lastSampleElapsedSeconds = nil
+            self.samplesTaken = attemptsUsed
             self.bestBitsPerSecond = bestBitsPerSecond
+            self.fallbackApplied = false
+        }
+
+        /// Kept as a source-compatible diagnostic count while callers migrate to the elapsed-time API. It is
+        /// observability only, never an evidence budget.
+        var attemptsUsed: Int {
+            get { samplesTaken }
+            set { samplesTaken = newValue }
         }
     }
 
@@ -158,9 +181,83 @@ enum VortXRemuxForwardBufferCoupling {
         state.generation != currentGeneration || !state.finished
     }
 
-    /// One step of the bounded retry. Returns the duration to apply NOW (nil = leave the item alone this
-    /// tick) and whether the schedule has finished for this generation. Fails OPEN: exhausting the attempts
-    /// without any usable estimate leaves today's base duration untouched.
+    /// Returns whether a real evidence sample may run now. Invalid or regressing elapsed time fails safely:
+    /// it leaves the current generation's state untouched and cannot consume a sample. A newly observed
+    /// generation begins at elapsed zero, so its first actual sample is due no earlier than two seconds.
+    static func isAttemptDue(state: AttemptState,
+                             currentGeneration: UInt64,
+                             elapsedSinceFirstFrame: TimeInterval) -> Bool {
+        guard elapsedSinceFirstFrame.isFinite, elapsedSinceFirstFrame >= 0 else { return false }
+        guard state.generation == currentGeneration else {
+            return elapsedSinceFirstFrame >= sampleRetryIntervalSeconds
+        }
+        guard !state.finished else { return false }
+        guard let lastSampleElapsedSeconds = state.lastSampleElapsedSeconds else {
+            return elapsedSinceFirstFrame >= sampleRetryIntervalSeconds
+        }
+        guard elapsedSinceFirstFrame >= lastSampleElapsedSeconds else { return false }
+        return elapsedSinceFirstFrame - lastSampleElapsedSeconds >= sampleRetryIntervalSeconds
+    }
+
+    /// Elapsed-time evidence phase for exactly one local-remux item generation. It samples at most once every
+    /// two seconds; after eight seconds of missing evidence it actively applies an eight-second fallback but
+    /// stays live; at ten seconds or later a valid observed/indicated estimate replaces that fallback with the
+    /// byte-budget-coupled target and finishes the phase. Direct and remote mounts remain outside this policy
+    /// because their callers never invoke it.
+    static func nextCouplingAttempt(state: AttemptState,
+                                    currentGeneration: UInt64,
+                                    elapsedSinceFirstFrame: TimeInterval,
+                                    observedBitsPerSecond: Double?,
+                                    indicatedBitsPerSecond: Double?,
+                                    aheadByteBudget: Int,
+                                    baseDuration: TimeInterval)
+        -> (state: AttemptState, applyDuration: TimeInterval?, finished: Bool) {
+        guard elapsedSinceFirstFrame.isFinite, elapsedSinceFirstFrame >= 0 else {
+            return (state, nil, state.finished)
+        }
+        var next = state.generation == currentGeneration
+            ? state
+            : AttemptState(generation: currentGeneration)
+        guard !next.finished else { return (next, nil, true) }
+        guard isAttemptDue(
+            state: next,
+            currentGeneration: currentGeneration,
+            elapsedSinceFirstFrame: elapsedSinceFirstFrame
+        ) else {
+            return (next, nil, false)
+        }
+
+        next.lastSampleElapsedSeconds = elapsedSinceFirstFrame
+        next.samplesTaken += 1
+        next.bestBitsPerSecond = effectiveEstimate(
+            observed: observedBitsPerSecond,
+            indicated: indicatedBitsPerSecond,
+            best: next.bestBitsPerSecond)
+
+        // Wait until the remux has had enough media time to produce an evidence-backed coupling. The fallback
+        // exists only for the no-evidence case, and applying it does not stop this state machine.
+        if elapsedSinceFirstFrame >= minimumEvidenceElapsedSeconds,
+           let bps = next.bestBitsPerSecond {
+            next.finished = true
+            let duration = steadyStateDuration(
+                aheadByteBudget: aheadByteBudget,
+                observedBitsPerSecond: bps,
+                unconstrainedDuration: baseDuration)
+            return (next, duration, true)
+        }
+        if elapsedSinceFirstFrame >= fallbackElapsedSeconds,
+           next.bestBitsPerSecond == nil,
+           !next.fallbackApplied {
+            next.fallbackApplied = true
+            return (next, conservativeFallbackSeconds, false)
+        }
+        return (next, nil, false)
+    }
+
+    /// Compatibility entry point for callers that have not yet supplied an item-relative elapsed clock. It
+    /// preserves the pre-existing bounded behaviour so this policy can land before the engine wiring changes.
+    /// Local-remux production must use the elapsed-time overload above; this wrapper intentionally cannot
+    /// promise observer-rate independence because it has no clock input.
     static func nextCouplingAttempt(state: AttemptState,
                                     currentGeneration: UInt64,
                                     observedBitsPerSecond: Double?,
@@ -185,11 +282,11 @@ enum VortXRemuxForwardBufferCoupling {
                 unconstrainedDuration: baseDuration)
             return (next, duration, true)
         }
-        if next.attemptsUsed + 1 >= maximumSampleAttempts {
+        if next.samplesTaken + 1 >= 5 {
             next.finished = true
             return (next, nil, true)
         }
-        next.attemptsUsed += 1
+        next.samplesTaken += 1
         return (next, nil, false)
     }
 }
