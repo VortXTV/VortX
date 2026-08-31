@@ -381,6 +381,10 @@ struct iOSDetailView: View {
     // the plain system nav-bar back on iOS). On Mac the existing .macBackAffordance() still supplies Esc / Cmd-[.
     @Environment(\.dismiss) private var dismiss
 
+    private var detailTarget: LibraryWatchedMutationPolicy.DetailTarget {
+        .init(id: id, type: type)
+    }
+
     /// A remote Continue Watching offer remains readable only while its exact Trakt credential session is
     /// current. Detail views can stay mounted across sign-out, so this check belongs at every use site.
     private var validInitialResumeSeconds: Double? {
@@ -3503,16 +3507,16 @@ struct iOSDetailView: View {
     /// Per-season + whole-series Mark Watched / Unwatched, wired to the same CoreBridge methods the
     /// tvOS season-chip context menu uses.
     @ViewBuilder private func seasonWatchedMenu(_ s: Int) -> some View {
-        Button { core.markSeasonWatched(s, true) } label: {
+        Button { core.markSeasonWatched(s, true, expected: detailTarget) } label: {
             Label("Mark \(seasonLabel(s)) Watched", systemImage: "checkmark.circle")
         }
-        Button { core.markSeasonWatched(s, false) } label: {
+        Button { core.markSeasonWatched(s, false, expected: detailTarget) } label: {
             Label("Mark \(seasonLabel(s)) Unwatched", systemImage: "arrow.uturn.backward")
         }
-        Button { core.markWatched(true) } label: {
+        Button { core.markWatched(true, expected: detailTarget) } label: {
             Label("Mark Whole Series Watched", systemImage: "checkmark.circle.fill")
         }
-        Button { core.markWatched(false) } label: {
+        Button { core.markWatched(false, expected: detailTarget) } label: {
             Label("Mark Whole Series Unwatched", systemImage: "circle")
         }
     }
@@ -3583,7 +3587,7 @@ struct iOSDetailView: View {
             .accessibilityValue(isWatched ? "Watched" : "")
             .contextMenu {
                 Button(isWatched ? "Mark as Unwatched" : "Mark as Watched") {
-                    core.markVideoWatched(v, !isWatched)
+                    core.markVideoWatched(v, !isWatched, expected: detailTarget)
                 }
                 #if !os(tvOS)
                 // #119: one-episode auto-pick download from the list (best source via the same

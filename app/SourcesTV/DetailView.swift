@@ -1722,6 +1722,9 @@ struct CoreSeasonedEpisodes: View {
     // `videos`; episodes additionally on `season`.
     @State private var seasons: [Int] = []
     @State private var episodes: [CoreVideo] = []
+    private var detailTarget: LibraryWatchedMutationPolicy.DetailTarget {
+        .init(id: meta.id, type: meta.type)
+    }
 
     /// The engine's CURRENT resume episode id for this series (advances as continuous-play moves through
     /// episodes), read from the same source as resumeSeasonHint: the engine library for the main profile,
@@ -1762,16 +1765,16 @@ struct CoreSeasonedEpisodes: View {
                             Button { season = s } label: { Text(seasonLabel(s)) }
                                 .buttonStyle(ChipButtonStyle(selected: season == s))
                                 .contextMenu {
-                                    Button { core.markSeasonWatched(s, true) } label: {
+                                    Button { core.markSeasonWatched(s, true, expected: detailTarget) } label: {
                                         Label("Mark \(seasonLabel(s)) Watched", systemImage: "checkmark.circle")
                                     }
-                                    Button { core.markSeasonWatched(s, false) } label: {
+                                    Button { core.markSeasonWatched(s, false, expected: detailTarget) } label: {
                                         Label("Mark \(seasonLabel(s)) Unwatched", systemImage: "arrow.uturn.backward")
                                     }
-                                    Button { core.markWatched(true) } label: {
+                                    Button { core.markWatched(true, expected: detailTarget) } label: {
                                         Label("Mark Whole Series Watched", systemImage: "checkmark.circle.fill")
                                     }
-                                    Button { core.markWatched(false) } label: {
+                                    Button { core.markWatched(false, expected: detailTarget) } label: {
                                         Label("Mark Whole Series Unwatched", systemImage: "circle")
                                     }
                                 }
@@ -1783,10 +1786,10 @@ struct CoreSeasonedEpisodes: View {
                         }
                         .buttonStyle(ChipButtonStyle())
                         .confirmationDialog("Mark watched", isPresented: $showBulkMenu, titleVisibility: .visible) {
-                            Button("\(seasonLabel(season)) watched") { core.markSeasonWatched(season, true) }
-                            Button("\(seasonLabel(season)) unwatched") { core.markSeasonWatched(season, false) }
-                            Button("Whole series watched") { core.markWatched(true) }
-                            Button("Whole series unwatched") { core.markWatched(false) }
+                            Button("\(seasonLabel(season)) watched") { core.markSeasonWatched(season, true, expected: detailTarget) }
+                            Button("\(seasonLabel(season)) unwatched") { core.markSeasonWatched(season, false, expected: detailTarget) }
+                            Button("Whole series watched") { core.markWatched(true, expected: detailTarget) }
+                            Button("Whole series unwatched") { core.markWatched(false, expected: detailTarget) }
                             Button("Cancel", role: .cancel) {}
                         }
                     }
@@ -1973,7 +1976,7 @@ struct CoreSeasonedEpisodes: View {
         .buttonStyle(RowFocusStyle())
         .contextMenu {
             Button(isWatched ? "Mark as Unwatched" : "Mark as Watched") {
-                core.markVideoWatched(v, !isWatched)
+                core.markVideoWatched(v, !isWatched, expected: detailTarget)
             }
         }
     }

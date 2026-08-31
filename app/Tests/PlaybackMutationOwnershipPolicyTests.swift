@@ -46,6 +46,10 @@ private struct PlaybackMutationOwnershipPolicyTests {
                              in: ownerContext), "account uid replacement rejects async engine completion")
         check(!Policy.allows(Policy.Target.engine(profileID: owner, keychainAccount: account, uid: nil),
                              in: ownerContext), "unhydrated launch identity is not a wildcard")
+        check(Policy.allowsAccountMutation(ownerTarget, in: ownerContext),
+              "owner target may dispatch an account mutation")
+        check(!Policy.allowsAccountMutation(overlayTarget, in: ownerContext),
+              "overlay target may never dispatch an account mutation")
         check(Policy.overlayEntries(from: nil, as: CacheEntry.self).isEmpty,
               "first inactive-overlay callback starts from an empty cache")
         let encoded = try! JSONEncoder().encode(["tt1": CacheEntry(value: 1)])

@@ -31,6 +31,11 @@ enum PlaybackMutationOwnershipPolicy {
         }
     }
 
+    static func allowsAccountMutation(_ target: Target, in context: Context) -> Bool {
+        guard case .engine = target else { return false }
+        return allows(target, in: context)
+    }
+
     /// An inactive overlay may not have been played before, hence no cache file exists yet. Its
     /// first callback must start from an empty dictionary rather than being silently discarded.
     static func overlayEntries<Entry: Decodable>(from data: Data?, as: Entry.Type) -> [String: Entry] {

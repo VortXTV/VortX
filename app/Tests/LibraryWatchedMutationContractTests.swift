@@ -32,6 +32,14 @@ private struct LibraryWatchedMutationContractTests {
         check(Policy.route(usesEngineHistory: true) == .engineAccount, "owner mutations route to the engine account")
         check(Policy.route(usesEngineHistory: false) == .profileOverlay, "overlay mutations remain private profile state")
 
+        let expectedSeries = Policy.DetailTarget(id: series.id, type: series.type)
+        check(Policy.residentMatches(expectedSeries, residentID: series.id, residentType: series.type),
+              "rendered detail target matches its resident meta")
+        check(!Policy.residentMatches(expectedSeries, residentID: stale.id, residentType: stale.type),
+              "stale detail closure rejects a replacement resident meta")
+        check(!Policy.residentMatches(expectedSeries, residentID: series.id, residentType: "movie"),
+              "detail target requires matching type as well as id")
+
         // Movie and series, watched and unwatched, produce deterministic engine action sequences.
         for watched in [false, true] {
             check(Policy.wholeTitleActions(videos: [], isWatched: watched) == [.title(watched)],

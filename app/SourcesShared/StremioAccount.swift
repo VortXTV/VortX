@@ -161,6 +161,18 @@ extension PlaybackMutationTarget {
         return PlaybackMutationOwnershipPolicy.allows(self, in: context)
     }
 
+    func stillOwnsAccountContext(core: CoreBridge) -> Bool {
+        let profiles = ProfileStore.shared
+        let context = PlaybackMutationOwnershipPolicy.Context(
+            activeProfileID: profiles.activeID,
+            activeUsesEngineHistory: profiles.activeUsesEngineHistory,
+            activeKeychainAccount: profiles.activeKeychainAccount,
+            activeUID: core.currentUID(),
+            extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
+        )
+        return PlaybackMutationOwnershipPolicy.allowsAccountMutation(self, in: context)
+    }
+
     var overlayProfileID: UUID? {
         if case .overlay(let id) = self { return id }
         return nil

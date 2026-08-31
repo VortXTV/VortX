@@ -1630,11 +1630,13 @@ final class CoreBridge: ObservableObject {
     // MARK: Mark watched / unwatched (updates the library + syncs; markers refresh live)
 
     /// Mark the whole title (all episodes of a series, or a movie) watched/unwatched.
-    func markWatched(_ isWatched: Bool) {
+    func markWatched(_ isWatched: Bool, expected: LibraryWatchedMutationPolicy.DetailTarget) {
         // Snapshot one resident detail identity before constructing actions. A stale menu closure may
         // outlive a detail replacement; never let it dispatch through whichever meta_details happens
         // to be resident now.
-        guard let residentMeta = metaDetails?.meta else { return }
+        guard let residentMeta = metaDetails?.meta,
+              LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
+                                                           residentType: residentMeta.type) else { return }
         switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
         case .profileOverlay:
             // Keep this local to the active overlay. Missing detail context must remain a no-op,
@@ -1668,8 +1670,11 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Mark every episode of a season watched/unwatched.
-    func markSeasonWatched(_ season: Int, _ isWatched: Bool) {
+    func markSeasonWatched(_ season: Int, _ isWatched: Bool,
+                           expected: LibraryWatchedMutationPolicy.DetailTarget) {
         guard let residentMeta = metaDetails?.meta,
+              LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
+                                                           residentType: residentMeta.type),
               residentMeta.videos?.contains(where: { $0.season == season }) == true else { return }
         if overlayMarkWatched(isWatched, videoIds: { meta in
             (meta.videos ?? []).filter { $0.season == season }.map(\.id)
@@ -1678,8 +1683,11 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Mark a single episode watched/unwatched. The engine's `Video` only needs `id`.
-    func markVideoWatched(_ video: CoreVideo, _ isWatched: Bool) {
+    func markVideoWatched(_ video: CoreVideo, _ isWatched: Bool,
+                          expected: LibraryWatchedMutationPolicy.DetailTarget) {
         guard let residentMeta = metaDetails?.meta,
+              LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
+                                                           residentType: residentMeta.type),
               residentMeta.videos?.contains(where: { $0.id == video.id }) == true else { return }
         if overlayMarkWatched(isWatched, videoIds: { _ in [video.id] }) { return }
         var payload: [String: Any] = ["id": video.id]
@@ -1759,8 +1767,11 @@ final class CoreBridge: ObservableObject {
         // when an episodic engine re-point failed. Only the owner-engine dispatch depends on confirmed Player
         // attribution; callers close this leg rather than suppressing the correct external watched signal.
         guard allowEngineWrite else { return }
+        let expected = LibraryWatchedMutationPolicy.DetailTarget(id: meta.libraryId, type: meta.type)
+        let residentMatchesPlayback = LibraryWatchedMutationPolicy.residentMatches(
+            expected, residentID: metaDetails?.meta?.id, residentType: metaDetails?.meta?.type)
         if meta.usesSeriesLifecycle {
-            guard metaDetails?.meta?.id == meta.libraryId else {
+            guard residentMatchesPlayback else {
                 NSLog("[playback] dropped stale series watched callback id=%@", meta.libraryId)
                 return
             }
@@ -1769,7 +1780,13 @@ final class CoreBridge: ObservableObject {
             if let episode = meta.episode { payload["episode"] = episode }
             dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]])
         } else {
-            dispatchMetaDetails(["action": "MarkAsWatched", "args": true])
+            // The MetaDetails action is id-less and would mutate whichever movie is resident after
+            // navigation. The Ctx action below remains safely keyed by the captured library id.
+            if residentMatchesPlayback {
+                dispatchMetaDetails(["action": "MarkAsWatched", "args": true])
+            } else {
+                NSLog("[playback] dropped stale movie detail watched callback id=%@", meta.libraryId)
+            }
             // Belt-and-suspenders: MarkAsWatched routes through the meta_details model, which is a silent
             // no-op if meta_details isn't currently loaded for this movie (CW direct-resume from Home, or
             // after the user navigated away mid-playback). Also mark the library item directly via Ctx (by
@@ -2269,14 +2286,14 @@ final class CoreBridge: ObservableObject {
     func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true,
                                  target: PlaybackMutationTarget? = nil) async -> Bool {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
-        guard target.stillOwnsCurrentContext(core: self) else { return false }
+        guard target.stillOwnsAccountContext(core: self) else { return false }
         let safeType = (type == "series") ? "series" : "movie"
         let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
               let (data, _) = try? await URLSession.shared.data(from: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false,
-              target.stillOwnsCurrentContext(core: self) else { return false }
+              target.stillOwnsAccountContext(core: self) else { return false }
         // An explicit user/dashboard add-to-library targeting the owner stamps the add so it supersedes a prior
         // removal on every device (stampIntent: true, the default). The cold-device library recovery passes
         // stampIntent: false: recovery is a machine re-add of account-owned titles, and stamping an addedAt

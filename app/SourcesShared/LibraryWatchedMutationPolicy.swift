@@ -27,6 +27,13 @@ enum LibraryWatchedMutationPolicy {
         let episode: Int?
     }
 
+    /// Identity captured by a rendered detail action. The bridge must compare both fields before
+    /// it dispatches, because an id alone is not a sufficient model identity across catalog types.
+    struct DetailTarget: Equatable {
+        let id: String
+        let type: String
+    }
+
     enum WatchedAction: Equatable {
         case video(Video, Bool)
         case title(Bool)
@@ -34,6 +41,10 @@ enum LibraryWatchedMutationPolicy {
 
     static func route(usesEngineHistory: Bool) -> Route {
         usesEngineHistory ? .engineAccount : .profileOverlay
+    }
+
+    static func residentMatches(_ expected: DetailTarget, residentID: String?, residentType: String?) -> Bool {
+        expected.id == residentID && expected.type == residentType
     }
 
     /// Prefer only a ready meta for the open title. A ready response for a previous detail page
