@@ -1478,7 +1478,9 @@ final class ProfileStore: ObservableObject {
         // `VortXSyncManager` serializes the complete per-profile envelope, including inactive
         // cache keys. Scheduling it now is durable; waiting for this profile to be selected again
         // could strand a callback if the user never returns to it.
-        VortXSyncManager.shared.requestSyncSoon()
+        Task { @MainActor in
+            VortXSyncManager.shared.requestSyncSoon()
+        }
     }
 
     func recordProgress(meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double, profileID: UUID) {
