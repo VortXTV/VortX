@@ -4903,11 +4903,11 @@ struct TVPlayerView: View {
         let resume = max(currentTime, suppressedResumeFloor ?? 0)   // R9 floor: never re-mount below where the viewer was
         resumeSeconds = resume
         resumeIsMidPlayRecovery = true   // a live play head carried across the re-mount, not a stored offset
-        // Preserve an explicit in-session subtitle pick across the re-mount, exactly as switchPlayerEngine does
-        // for an engine switch: snapshot it BEFORE the reset and leave `userPickedSubtitle` SET, so
-        // autoSelectTracks re-applies the viewer's choice on the fresh mount. Clearing the flag here traded a
-        // manual Off / language pick for the preference-derived auto pick on every port-move re-mount, which the
-        // viewer never asked for and could not tell from the app losing their subtitles.
+        // Preserve explicit in-session audio and subtitle picks across the same-source re-mount, exactly as an
+        // engine switch does. Track IDs are mount-local, so audio carries its semantic language/title identity;
+        // the subtitle snapshot carries its explicit Off/language/external choice. Without these snapshots the
+        // fresh mount silently replaces manual choices with preference-derived automatic selection.
+        pendingAudioReapply = captureSelectedAudioChoice()
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false
         addonSubsResolveTried = false; pendingLibmpvResumeSeek = nil
@@ -4929,6 +4929,7 @@ struct TVPlayerView: View {
             appliedResume = true
             // The OLD mount is still live and still carries the viewer's pick, so drop the snapshot: re-applying
             // it would re-add an external subtitle that was never removed (a duplicate row in the picker).
+            pendingAudioReapply = nil
             pendingSubtitleReapply = nil
             return
         }

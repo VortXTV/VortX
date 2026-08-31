@@ -2,6 +2,86 @@ import Foundation
 import Darwin   // sockets (waitForPortFree) + rlimit (RLIMIT_NOFILE raise) before node boots
 import NodeMobile
 
+/// Pure state machine mirrored by the Node preload's listener-rebind guard below. A relisten can succeed and
+/// then lose its listener again before the next HTTP response, which is a fresh failure episode rather than a
+/// duplicate signal for the previous one. The attempt budget belongs to the wake/healthy-response window, so a
+/// relisten alone never erases evidence of repeated failure.
+enum NodeListenerRebindPolicy {
+    static let maximumAttempts = 3
+
+    enum Probe: Equatable {
+        case refused
+        case response
+        case timeoutOrOther
+    }
+
+    enum Decision: Equatable {
+        case ignore
+        case suppressInFlight
+        case suppressDuplicate
+        case start(epoch: UInt64, attempt: Int)
+        case exhausted(epoch: UInt64)
+    }
+
+    struct State: Equatable {
+        private(set) var attempts = 0
+        private(set) var epoch: UInt64 = 0
+        private var rebindInFlight = false
+        private var relistenConfirmedSinceRefusal = false
+        private var lastAttemptEpoch: UInt64?
+        private var lastAttemptTime: TimeInterval?
+
+        mutating func observe(_ probe: Probe, now: TimeInterval, cooldown: TimeInterval) -> Decision {
+            switch probe {
+            case .response:
+                // Only a real HTTP response resets the failure budget. A listener's `listening` callback means
+                // it bound, not that a client can complete a request through it.
+                attempts = 0
+                lastAttemptEpoch = nil
+                lastAttemptTime = nil
+                relistenConfirmedSinceRefusal = true
+                return .ignore
+            case .timeoutOrOther:
+                return .ignore
+            case .refused:
+                if relistenConfirmedSinceRefusal {
+                    epoch &+= 1
+                    relistenConfirmedSinceRefusal = false
+                    lastAttemptEpoch = nil
+                    lastAttemptTime = nil
+                }
+                if rebindInFlight { return .suppressInFlight }
+                if lastAttemptEpoch == epoch,
+                   let lastAttemptTime,
+                   now - lastAttemptTime < cooldown {
+                    return .suppressDuplicate
+                }
+                guard attempts < NodeListenerRebindPolicy.maximumAttempts else { return .exhausted(epoch: epoch) }
+                attempts += 1
+                rebindInFlight = true
+                lastAttemptEpoch = epoch
+                lastAttemptTime = now
+                return .start(epoch: epoch, attempt: attempts)
+            }
+        }
+
+        mutating func finishRebind(relistened: Bool) {
+            rebindInFlight = false
+            if relistened { relistenConfirmedSinceRefusal = true }
+        }
+
+        mutating func beginNewWake() {
+            attempts = 0
+            epoch &+= 1
+            rebindInFlight = false
+            relistenConfirmedSinceRefusal = false
+            lastAttemptEpoch = nil
+            lastAttemptTime = nil
+        }
+    }
+}
+// END Node listener rebind policy
+
 /// Runs Stremio's streaming server (server.js) inside the app via nodejs-mobile,
 /// listening on http://127.0.0.1:11470. This enables torrent / uncached streams
 /// (debrid/direct streams play without it). node_start() blocks, so it runs on a
@@ -307,23 +387,36 @@ enum NodeServer {
             __servers.push(s); return s;
           };
         })();
-        var __rb={busy:false,last:0,attempts:0};
+        // A confirmed `listening` callback ends one failure episode. A later refused connect is a new outage,
+        // even inside sixty seconds, and must be allowed to heal. Failed attempts retain their per-wake budget;
+        // only an HTTP response or a fresh wake resets it. This mirrors NodeListenerRebindPolicy above.
+        var __rb={busy:false,lastAttemptAt:0,lastAttemptEpoch:-1,attempts:0,epoch:0,relistenConfirmed:false};
+        function __beginFreshFailureAfterRelisten(){
+          if(!__rb.relistenConfirmed) return;
+          __rb.epoch++; __rb.relistenConfirmed=false;
+          __rb.lastAttemptEpoch=-1; __rb.lastAttemptAt=0;
+        }
+        function __beginNewWake(){
+          __rb.attempts=0; __rb.epoch++; __rb.busy=false; __rb.relistenConfirmed=false;
+          __rb.lastAttemptEpoch=-1; __rb.lastAttemptAt=0;
+        }
         function __doRebind(reason){
           if(__rb.busy){ w('[rebind]',['skip (rebind busy)']); return; }
           var now=Date.now();
-          if(now-__rb.last<60000){ w('[rebind]',['skip (60s cooldown) '+reason]); return; }
+          __beginFreshFailureAfterRelisten();
+          if(__rb.lastAttemptEpoch===__rb.epoch && now-__rb.lastAttemptAt<60000){ w('[rebind]',['skip (same failure episode cooldown) '+reason]); return; }
           if(__rb.attempts>=3){ try{fs.writeFileSync(STUCKF,String(now))}catch(e){}; w('[rebind]',['gave up after 3 attempts this resume; wrote stuck marker']); return; }
           if(__servers.length===0){ w('[rebind]',['no captured listeners to rebind']); return; }
-          __rb.busy=true; __rb.last=now; __rb.attempts++;
+          __rb.busy=true; __rb.lastAttemptAt=now; __rb.lastAttemptEpoch=__rb.epoch; __rb.attempts++;
           // Belt-and-suspenders: if neither a 'listening' nor an 'error' event ever fires (listen wedged),
           // never leave busy latched or every later __doRebind short-circuits forever. Clear it after 15s so
           // the next trigger can retry.
           setTimeout(function(){ if(__rb.busy){ __rb.busy=false; w('[rebind]',['busy watchdog cleared']); } },15000);
           w('[rebind]',['rebinding '+__servers.length+' listener(s) attempt '+__rb.attempts+' ('+reason+')']);
-          var pending=__servers.length;
+          var pending=__servers.length, relistened=false;
           __servers.forEach(function(s){
             var a=s.__args||[];
-            var settle=function(){ if(--pending<=0) __rb.busy=false; };
+            var settle=function(){ if(--pending<=0){ __rb.busy=false; if(relistened) __rb.relistenConfirmed=true; } };
             // listen() reports failure ASYNC as an 'error' event (EADDRINUSE, the 11471 lesson) and success as
             // a 'listening' event; a try/catch alone would miss both. Bind BOTH before listen so the port-latch
             // rewrite + stuck-marker clear happen ONLY on a CONFIRMED bind, never optimistically (a failed
@@ -332,6 +425,7 @@ enum NodeServer {
             var onListen=function(){
               s.removeListener('error',onErr);   // drop the paired error handler so it cannot accumulate per cycle
               w('[rebind]',['relistened on '+JSON.stringify(a)]);
+              relistened=true;
               try{ if(boundPort) fs.writeFileSync(PORTF,String(boundPort)); }catch(e){}
               try{ fs.unlinkSync(STUCKF); }catch(e){}
               settle();
@@ -352,7 +446,7 @@ enum NodeServer {
           var req=http.get({host:'127.0.0.1',port:boundPort||11470,path:'/settings',timeout:4000},function(res){
             // Got an HTTP response: listener is alive (busy-but-alive included). Never rebind; reset attempts
             // and clear any stale stuck marker so the status string stops claiming recovery failed.
-            __rb.attempts=0; try{fs.unlinkSync(STUCKF)}catch(e){}; res.resume();
+            __rb.attempts=0; __rb.lastAttemptEpoch=-1; __rb.lastAttemptAt=0; __rb.relistenConfirmed=true; try{fs.unlinkSync(STUCKF)}catch(e){}; res.resume();
           });
           req.on('error',function(e){
             // Our own timeout handler below calls req.destroy(), and node synthesizes a follow-up 'error' with
@@ -407,7 +501,7 @@ enum NodeServer {
               }
               // A lag spike past 30s means the process was frozen (suspended) and just thawed: this is a
               // fresh resume, so reset the per-resume attempt budget and, after a short settle, self-check.
-              if(lag>30000){ __rb.attempts=0; setTimeout(function(){ __selfCheck('wake-lag='+lag+'ms'); },2000); }
+              if(lag>30000){ __beginNewWake(); setTimeout(function(){ __selfCheck('wake-lag='+lag+'ms'); },2000); }
               // Consume the Swift one-shot rebind signal (its foreground refused-probe path drops it).
               try{ if(fs.existsSync(REBINDF)){ fs.unlinkSync(REBINDF); __selfCheck('swift-signal'); } }catch(e){}
             } catch(e){}
