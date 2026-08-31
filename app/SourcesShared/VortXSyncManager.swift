@@ -1620,8 +1620,9 @@ final class VortXSyncManager: ObservableObject {
             }
             let resolved = store.watchOverlayForSync(for: p.id, merging: priorRemovals)
             let snapshot = resolved.entries
-            let cache = snapshot.count <= 120 ? snapshot : Dictionary(uniqueKeysWithValues:
-                snapshot.sorted { $0.value.lastWatched > $1.value.lastWatched }.prefix(120)
+            let cache: [String: WatchEntry] = snapshot.count <= 120 ? snapshot : Dictionary(uniqueKeysWithValues:
+                snapshot.sorted { $0.value.lastWatched > $1.value.lastWatched }
+                    .prefix(120).map { ($0.key, $0.value) }
             )
             let removals = resolved.removals
             let library: [[String: Any]] = cache.map { (metaId, e) in

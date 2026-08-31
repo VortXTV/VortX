@@ -696,8 +696,8 @@ struct iOSSettingsView: View {
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel(String(localized: "Streaming cache unavailable"))
-                .accessibilityValue(String(localized: VortXCacheShedPolicy.unavailableDiskCacheState))
-                .accessibilityHint(String(localized: VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint))
+                .accessibilityValue(VortXCacheShedPolicy.unavailableDiskCacheState)
+                .accessibilityHint(VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint)
             }
             #if os(iOS) || os(macOS)
             Picker("Player engine", selection: $playerEngine) {
@@ -945,7 +945,7 @@ struct iOSSettingsView: View {
     /// intentionally preserved but not shown as active until payload offload has been confirmed.
     private var diskCacheFooter: String {
         guard VortXCacheShedPolicy.diskCacheSizeSelectionAvailable else {
-            return String(localized: VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint)
+            return VortXCacheShedPolicy.unavailableDiskCacheAccessibilityHint
         }
         let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free space and the cache clears when a title finishes, so it never fills your device.")
         guard diskCacheBytes != 0 else { return base }
