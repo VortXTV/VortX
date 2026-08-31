@@ -215,6 +215,57 @@ class EngineStateStreamProgressTest {
     }
 
     @Test
+    fun zeroRequestTimeoutPublishesTerminalEmptySnapshot() = runBlocking {
+        val update = streamLoadStateUpdates(
+            changes = MutableSharedFlow(),
+            dispatch = { },
+            readState = { "{}" },
+            snapshot = ::streamUpdate,
+            isCurrent = { true },
+            timeoutMs = 0L,
+        ).toList().last()
+
+        assertTrue(update.groups.isEmpty())
+        assertEquals(0, update.total)
+        assertTrue(update.terminal)
+        assertTrue(update.timedOut)
+        assertTrue(update.selectionReady)
+    }
+
+    @Test
+    fun autoNextWaitsForLateRememberedProviderButNotForTheWholeFanout() {
+        val low = listOf(group("Low", "https://low.example/manifest.json"))
+        val withWanted = low + group("Wanted", "https://wanted.example/manifest.json")
+
+        assertFalse(
+            streamSelectionReady(
+                groups = low,
+                loaded = 1,
+                total = 2,
+                terminal = false,
+                episodeId = "show:1:2",
+                rememberedQuality = "1080p",
+                wantedAddon = "Wanted",
+                firstPlayableAtMs = 1_000L,
+                nowMs = 2_000L,
+            ),
+        )
+        assertTrue(
+            streamSelectionReady(
+                groups = withWanted,
+                loaded = 1,
+                total = 2,
+                terminal = false,
+                episodeId = "show:1:2",
+                rememberedQuality = "1080p",
+                wantedAddon = "Wanted",
+                firstPlayableAtMs = 1_000L,
+                nowMs = 2_000L,
+            ),
+        )
+    }
+
+    @Test
     fun stalePreviousGenerationCannotPublishAfterSupersession() = runBlocking {
         val changes = MutableSharedFlow<Unit>(extraBufferCapacity = 2)
         val current = AtomicBoolean(true)

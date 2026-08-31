@@ -91,6 +91,10 @@ data class StreamLoadUpdate(
     val loaded: Int,
     val total: Int,
     val terminal: Boolean,
+    /** The engine did not settle before the bounded wait elapsed. [groups] remains the freshest snapshot. */
+    val timedOut: Boolean = false,
+    /** True when automatic next-episode selection may consume this snapshot without skipping its continuity hint. */
+    val selectionReady: Boolean = terminal || groups.isNotEmpty(),
 )
 
 /// The seam between the UI and the engine. The Compose screens depend only on this interface, so the

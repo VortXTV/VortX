@@ -291,6 +291,8 @@ class DetailViewModel(
     private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
     private val sourceSwitchCommitGate = PlayerSourceSwitchCommitGate()
     private var sourceLoadJob: Job? = null
+    private var cacheCheckJob: Job? = null
+    private val cacheCheckGate = CacheCheckGenerationGate()
     private var playbackResolveJob: Job? = null
     private var profileReloadJob: Job? = null
     private val watchlistStore = WatchlistStore.shared(app)
@@ -762,7 +764,7 @@ class DetailViewModel(
                     // signature + bingeGroup so the ranking's next-episode bonuses keep the binge on the
                     // same release family; it also reports a no-source dead end through [_playback] so
                     // the shell's Up Next overlay can bail instead of sitting on "Starting…" forever.
-                    if (pendingAutoPick && (displayRaw.isNotEmpty() || update.terminal)) {
+                    if (pendingAutoPick && update.selectionReady) {
                         pendingAutoPick = false
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
@@ -859,7 +861,9 @@ class DetailViewModel(
         if (!debrid.hasAnyResolver && !debrid.hasUsenetResolver) return
         val owner = debridKeys.ownerToken() ?: return
         val credentialRevision = debridKeys.currentCredentialRevision()
-        viewModelScope.launch {
+        val cacheGeneration = cacheCheckGate.begin()
+        cacheCheckJob?.cancel()
+        cacheCheckJob = viewModelScope.launch {
             // Gather over the CURRENT lanes for this title (raw add-on groups + whatever the TorBox / Singularity
             // contributors have already published), never a possibly-stale prior assembly. Late-arriving TorBox
             // torrents self-badge from the index's own check_cache tag, so they need no account round trip here.
@@ -872,6 +876,7 @@ class DetailViewModel(
             if (
                 episodeId != _selectedEpisodeId.value ||
                 !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
+                !cacheCheckGate.isCurrent(cacheGeneration) ||
                 !debridKeys.isCurrent(owner) ||
                 debridKeys.currentCredentialRevision() != credentialRevision
             ) {
@@ -896,6 +901,7 @@ class DetailViewModel(
                 decorated !== raw &&
                 episodeId == _selectedEpisodeId.value &&
                 sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
+                cacheCheckGate.isCurrent(cacheGeneration) &&
                 debridKeys.isCurrent(owner) &&
                 debridKeys.currentCredentialRevision() == credentialRevision
             ) {

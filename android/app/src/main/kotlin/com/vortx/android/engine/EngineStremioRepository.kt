@@ -164,11 +164,42 @@ internal fun streamLoadStateUpdates(
             @Suppress("UNREACHABLE_CODE")
             false
         } ?: false
-        if (!terminal) publishCurrent()
+        if (!terminal) {
+            requireCurrent()
+            val timedOut = snapshot(readState()).copy(terminal = true, timedOut = true, selectionReady = true)
+            requireCurrent()
+            if (timedOut != last) send(timedOut)
+        }
     } finally {
         subscription.cancel()
         ticks.close()
     }
+}
+
+/** Keeps the source list reactive while preserving a bounded provider/quality hold for auto-next. */
+internal fun streamSelectionReady(
+    groups: List<StreamGroup>,
+    loaded: Int,
+    total: Int,
+    terminal: Boolean,
+    episodeId: String?,
+    rememberedQuality: String?,
+    wantedAddon: String?,
+    firstPlayableAtMs: Long?,
+    nowMs: Long,
+): Boolean {
+    if (episodeId == null || rememberedQuality.isNullOrBlank() || wantedAddon.isNullOrBlank()) {
+        return groups.isNotEmpty() || terminal
+    }
+    val firstPlayableAt = firstPlayableAtMs ?: return terminal
+    return StreamRanking.resolveSettled(
+        groups = groups,
+        loaded = loaded,
+        total = total,
+        secondsSinceFirstPlayable = (nowMs - firstPlayableAt) / 1_000.0,
+        rememberedQuality = rememberedQuality,
+        wantedAddon = wantedAddon,
+    ) || terminal
 }
 
 /**
@@ -2115,6 +2146,7 @@ class EngineStremioRepository(
         val disabledAddons = addonPrefs.disabledBases()
         val appliedOrder = addonPrefs.appliedOrder()
         val field = EngineActions.FIELD_META_DETAILS
+        var firstPlayableAtMs: Long? = null
         streamLoadStateUpdates(
             changes = changedFields.filter { field in it }.map { Unit },
             dispatch = {
@@ -2136,11 +2168,29 @@ class EngineStremioRepository(
                 if (shadowRankingConfigured && VortxRankingShadow.enabled) {
                     VortxRankingShadow.compareAsync(ordered, snapshot)
                 }
+                val terminal = progress.total > 0 && progress.loaded == progress.total
+                val firstPlayableAt = if (ordered.isNotEmpty()) {
+                    firstPlayableAtMs ?: monotonicMs().also { firstPlayableAtMs = it }
+                } else {
+                    firstPlayableAtMs
+                }
+                val selectionReady = streamSelectionReady(
+                    groups = ordered,
+                    loaded = progress.loaded,
+                    total = progress.total,
+                    terminal = terminal,
+                    episodeId = episodeId,
+                    rememberedQuality = rememberedQuality,
+                    wantedAddon = wantedAddon,
+                    firstPlayableAtMs = firstPlayableAt,
+                    nowMs = monotonicMs(),
+                )
                 StreamLoadUpdate(
                     groups = StreamRanking.rankedGroups(ordered, prefs = snapshot, pin = pin),
                     loaded = progress.loaded,
                     total = progress.total,
-                    terminal = progress.total > 0 && progress.loaded == progress.total,
+                    terminal = terminal,
+                    selectionReady = selectionReady,
                 )
             },
             isCurrent = { streamLoadGate.isCurrent(generation) },
