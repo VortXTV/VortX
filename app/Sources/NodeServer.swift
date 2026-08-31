@@ -19,15 +19,16 @@ enum NodeListenerRebindPolicy {
         case ignore
         case suppressInFlight
         case suppressDuplicate
-        case start(epoch: UInt64, attempt: Int)
+        case start(epoch: UInt64, attempt: Int, attemptID: UInt64)
         case exhausted(epoch: UInt64)
     }
 
     struct State: Equatable {
         private(set) var attempts = 0
         private(set) var epoch: UInt64 = 0
-        private var rebindInFlight = false
-        private var relistenConfirmedSinceRefusal = false
+        private(set) var activeAttemptID: UInt64?
+        private(set) var relistenConfirmedSinceRefusal = false
+        private var nextAttemptID: UInt64 = 0
         private var lastAttemptEpoch: UInt64?
         private var lastAttemptTime: TimeInterval?
 
@@ -50,7 +51,7 @@ enum NodeListenerRebindPolicy {
                     lastAttemptEpoch = nil
                     lastAttemptTime = nil
                 }
-                if rebindInFlight { return .suppressInFlight }
+                if activeAttemptID != nil { return .suppressInFlight }
                 if lastAttemptEpoch == epoch,
                    let lastAttemptTime,
                    now - lastAttemptTime < cooldown {
@@ -58,22 +59,29 @@ enum NodeListenerRebindPolicy {
                 }
                 guard attempts < NodeListenerRebindPolicy.maximumAttempts else { return .exhausted(epoch: epoch) }
                 attempts += 1
-                rebindInFlight = true
+                nextAttemptID &+= 1
+                activeAttemptID = nextAttemptID
                 lastAttemptEpoch = epoch
                 lastAttemptTime = now
-                return .start(epoch: epoch, attempt: attempts)
+                return .start(epoch: epoch, attempt: attempts, attemptID: nextAttemptID)
             }
         }
 
-        mutating func finishRebind(relistened: Bool) {
-            rebindInFlight = false
+        mutating func finishRebind(_ attemptID: UInt64, relistened: Bool) {
+            guard activeAttemptID == attemptID else { return }
+            activeAttemptID = nil
             if relistened { relistenConfirmedSinceRefusal = true }
+        }
+
+        mutating func watchdogExpired(_ attemptID: UInt64) {
+            guard activeAttemptID == attemptID else { return }
+            activeAttemptID = nil
         }
 
         mutating func beginNewWake() {
             attempts = 0
             epoch &+= 1
-            rebindInFlight = false
+            activeAttemptID = nil
             relistenConfirmedSinceRefusal = false
             lastAttemptEpoch = nil
             lastAttemptTime = nil
@@ -390,14 +398,21 @@ enum NodeServer {
         // A confirmed `listening` callback ends one failure episode. A later refused connect is a new outage,
         // even inside sixty seconds, and must be allowed to heal. Failed attempts retain their per-wake budget;
         // only an HTTP response or a fresh wake resets it. This mirrors NodeListenerRebindPolicy above.
-        var __rb={busy:false,lastAttemptAt:0,lastAttemptEpoch:-1,attempts:0,epoch:0,relistenConfirmed:false};
+        var __rb={busy:false,lastAttemptAt:0,lastAttemptEpoch:-1,attempts:0,epoch:0,relistenConfirmed:false,nextAttemptID:0,activeAttemptID:0};
+        function __ownsAttempt(attemptID){ return __rb.activeAttemptID===attemptID; }
+        function __retireAttempt(attemptID){
+          if(!__ownsAttempt(attemptID)) return false;
+          __rb.busy=false; __rb.activeAttemptID=0; return true;
+        }
         function __beginFreshFailureAfterRelisten(){
           if(!__rb.relistenConfirmed) return;
           __rb.epoch++; __rb.relistenConfirmed=false;
           __rb.lastAttemptEpoch=-1; __rb.lastAttemptAt=0;
         }
         function __beginNewWake(){
-          __rb.attempts=0; __rb.epoch++; __rb.busy=false; __rb.relistenConfirmed=false;
+          // Invalidate rather than complete the previous attempt: its watchdog/listener callbacks may still
+          // arrive later, but their captured attempt ID can no longer mutate this wake's state.
+          __rb.attempts=0; __rb.epoch++; __rb.busy=false; __rb.activeAttemptID=0; __rb.relistenConfirmed=false;
           __rb.lastAttemptEpoch=-1; __rb.lastAttemptAt=0;
         }
         function __doRebind(reason){
@@ -407,28 +422,43 @@ enum NodeServer {
           if(__rb.lastAttemptEpoch===__rb.epoch && now-__rb.lastAttemptAt<60000){ w('[rebind]',['skip (same failure episode cooldown) '+reason]); return; }
           if(__rb.attempts>=3){ try{fs.writeFileSync(STUCKF,String(now))}catch(e){}; w('[rebind]',['gave up after 3 attempts this resume; wrote stuck marker']); return; }
           if(__servers.length===0){ w('[rebind]',['no captured listeners to rebind']); return; }
-          __rb.busy=true; __rb.lastAttemptAt=now; __rb.lastAttemptEpoch=__rb.epoch; __rb.attempts++;
+          var attemptID=++__rb.nextAttemptID;
+          __rb.busy=true; __rb.activeAttemptID=attemptID; __rb.lastAttemptAt=now; __rb.lastAttemptEpoch=__rb.epoch; __rb.attempts++;
           // Belt-and-suspenders: if neither a 'listening' nor an 'error' event ever fires (listen wedged),
           // never leave busy latched or every later __doRebind short-circuits forever. Clear it after 15s so
           // the next trigger can retry.
-          setTimeout(function(){ if(__rb.busy){ __rb.busy=false; w('[rebind]',['busy watchdog cleared']); } },15000);
+          setTimeout(function(){ if(__retireAttempt(attemptID)){ w('[rebind]',['busy watchdog cleared']); } },15000);
           w('[rebind]',['rebinding '+__servers.length+' listener(s) attempt '+__rb.attempts+' ('+reason+')']);
           var pending=__servers.length, relistened=false;
           __servers.forEach(function(s){
             var a=s.__args||[];
-            var settle=function(){ if(--pending<=0){ __rb.busy=false; if(relistened) __rb.relistenConfirmed=true; } };
+            var settled=false;
+            var onErr, onListen;
+            var removeTerminalListeners=function(){
+              if(onErr) s.removeListener('error',onErr);
+              if(onListen) s.removeListener('listening',onListen);
+            };
+            var settle=function(didRelisten){
+              if(settled) return;
+              settled=true; removeTerminalListeners();
+              if(!__ownsAttempt(attemptID)) return;
+              if(didRelisten) relistened=true;
+              if(--pending<=0 && __retireAttempt(attemptID) && relistened) __rb.relistenConfirmed=true;
+            };
             // listen() reports failure ASYNC as an 'error' event (EADDRINUSE, the 11471 lesson) and success as
             // a 'listening' event; a try/catch alone would miss both. Bind BOTH before listen so the port-latch
             // rewrite + stuck-marker clear happen ONLY on a CONFIRMED bind, never optimistically (a failed
             // re-listen must not delete the honest stuck marker).
-            var onErr=function(e){ w('[rebind-err]',['relisten '+JSON.stringify(a)+': '+(e&&e.message||e)]); settle(); };
-            var onListen=function(){
-              s.removeListener('error',onErr);   // drop the paired error handler so it cannot accumulate per cycle
+            onErr=function(e){
+              if(__ownsAttempt(attemptID)) w('[rebind-err]',['relisten '+JSON.stringify(a)+': '+(e&&e.message||e)]);
+              settle(false);
+            };
+            onListen=function(){
+              if(!__ownsAttempt(attemptID)){ settle(false); return; }
               w('[rebind]',['relistened on '+JSON.stringify(a)]);
-              relistened=true;
               try{ if(boundPort) fs.writeFileSync(PORTF,String(boundPort)); }catch(e){}
               try{ fs.unlinkSync(STUCKF); }catch(e){}
-              settle();
+              settle(true);
             };
             try{
               // Drain bookkeeping ONLY: node fires close(cb) after ALL open connections drain, so re-listening
@@ -438,7 +468,7 @@ enum NodeServer {
               s.once('error',onErr);
               s.once('listening',onListen);
               s.listen.apply(s,a);
-            }catch(e){ w('[rebind-err]',[String(e)]); settle(); }
+            }catch(e){ if(__ownsAttempt(attemptID)) w('[rebind-err]',[String(e)]); settle(false); }
           });
         }
         function __selfCheck(reason){

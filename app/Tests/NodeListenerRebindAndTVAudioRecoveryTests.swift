@@ -3,9 +3,12 @@
 //
 //   { printf '%s\n' 'import Foundation'; \
 //     sed -n '/^enum NodeListenerRebindPolicy {/,/^\/\/ END Node listener rebind policy$/p' \
-//       app/Sources/NodeServer.swift | sed '$d'; } > /tmp/node-listener-rebind-policy.swift && \
+//       app/Sources/NodeServer.swift | sed '$d'; \
+//     sed -n '/^enum TVTrackRecoveryPolicy {/,/^\/\/ END tvOS track recovery policy$/p' \
+//       app/SourcesTV/TVPlayerView.swift | sed '$d'; } > /tmp/node-listener-rebind-policy.swift && \
 //   xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
 //     /tmp/node-listener-rebind-policy.swift \
+//     app/Sources/Player/MPVTrack.swift \
 //     app/Sources/Player/PlayerStallPolicy.swift \
 //     app/Tests/NodeListenerRebindAndTVAudioRecoveryTests.swift \
 //     -o /tmp/node-listener-rebind-and-tv-audio-recovery-test && \
@@ -41,17 +44,41 @@ private enum NodeListenerRebindAndTVAudioRecoveryTests {
         let cooldown = 60.0
         var state = NodeListenerRebindPolicy.State()
 
-        check("first refusal starts recovery", state.observe(.refused, now: 0, cooldown: cooldown) == .start(epoch: 0, attempt: 1))
+        guard case let .start(epoch: firstEpoch, attempt: firstAttempt, attemptID: attemptA) = state.observe(.refused, now: 0, cooldown: cooldown) else {
+            check("first refusal starts recovery", false)
+            finish()
+            return
+        }
+        check("first refusal starts recovery", firstEpoch == 0 && firstAttempt == 1)
         check("concurrent duplicate is suppressed in flight", state.observe(.refused, now: 1, cooldown: cooldown) == .suppressInFlight)
-        state.finishRebind(relistened: false)
+        state.finishRebind(attemptA, relistened: false)
         check("failed same-episode duplicate is cooldown-suppressed", state.observe(.refused, now: 2, cooldown: cooldown) == .suppressDuplicate)
 
-        state.finishRebind(relistened: true)
-        check("confirmed relisten creates a fresh refusal epoch inside cooldown", state.observe(.refused, now: 22, cooldown: cooldown) == .start(epoch: 1, attempt: 2))
-        state.finishRebind(relistened: false)
-        check("second failed attempt starts after same-episode cooldown", state.observe(.refused, now: 83, cooldown: cooldown) == .start(epoch: 1, attempt: 3))
-        state.finishRebind(relistened: false)
-        check("failed attempts cap truthfully", state.observe(.refused, now: 144, cooldown: cooldown) == .exhausted(epoch: 1))
+        var successfulState = NodeListenerRebindPolicy.State()
+        guard case let .start(_, _, successfulAttemptA) = successfulState.observe(.refused, now: 0, cooldown: cooldown) else {
+            check("confirmed relisten starts an owned attempt", false)
+            finish()
+            return
+        }
+        successfulState.finishRebind(successfulAttemptA, relistened: true)
+        guard case let .start(epoch: freshEpoch, attempt: freshAttempt, attemptID: attemptB) = successfulState.observe(.refused, now: 22, cooldown: cooldown) else {
+            check("confirmed relisten creates a fresh refusal epoch inside cooldown", false)
+            finish()
+            return
+        }
+        check("confirmed relisten creates a fresh refusal epoch inside cooldown", freshEpoch == 1 && freshAttempt == 2)
+        successfulState.watchdogExpired(successfulAttemptA)
+        successfulState.finishRebind(successfulAttemptA, relistened: false)
+        check("late A watchdog and settle cannot retire B", successfulState.activeAttemptID == attemptB)
+        successfulState.finishRebind(attemptB, relistened: false)
+        guard case .start(epoch: 1, attempt: 3, attemptID: _) = successfulState.observe(.refused, now: 83, cooldown: cooldown) else {
+            check("second failed attempt starts after same-episode cooldown", false)
+            finish()
+            return
+        }
+        check("second failed attempt starts after same-episode cooldown", true)
+        successfulState.finishRebind(successfulState.activeAttemptID ?? 0, relistened: false)
+        check("failed attempts cap truthfully", successfulState.observe(.refused, now: 144, cooldown: cooldown) == .exhausted(epoch: 1))
 
         var responseState = NodeListenerRebindPolicy.State()
         check("timeout never rebinds", responseState.observe(.timeoutOrOther, now: 0, cooldown: cooldown) == .ignore)
@@ -60,11 +87,26 @@ private enum NodeListenerRebindAndTVAudioRecoveryTests {
         check("response resets the attempt budget", responseState.attempts == 0)
         check("new wake resets a consumed failure budget", {
             var exhausted = NodeListenerRebindPolicy.State()
-            _ = exhausted.observe(.refused, now: 0, cooldown: cooldown); exhausted.finishRebind(relistened: false)
-            _ = exhausted.observe(.refused, now: 61, cooldown: cooldown); exhausted.finishRebind(relistened: false)
-            _ = exhausted.observe(.refused, now: 122, cooldown: cooldown); exhausted.finishRebind(relistened: false)
+            if case let .start(_, _, id) = exhausted.observe(.refused, now: 0, cooldown: cooldown) { exhausted.finishRebind(id, relistened: false) }
+            if case let .start(_, _, id) = exhausted.observe(.refused, now: 61, cooldown: cooldown) { exhausted.finishRebind(id, relistened: false) }
+            if case let .start(_, _, id) = exhausted.observe(.refused, now: 122, cooldown: cooldown) { exhausted.finishRebind(id, relistened: false) }
             exhausted.beginNewWake()
-            return exhausted.attempts == 0 && exhausted.observe(.refused, now: 123, cooldown: cooldown) == .start(epoch: 1, attempt: 1)
+            guard case .start(epoch: 1, attempt: 1, attemptID: _) = exhausted.observe(.refused, now: 123, cooldown: cooldown) else { return false }
+            return exhausted.attempts == 1
+        }())
+        check("new wake invalidates old listener completion", {
+            var wake = NodeListenerRebindPolicy.State()
+            guard case let .start(_, _, oldAttempt) = wake.observe(.refused, now: 0, cooldown: cooldown) else { return false }
+            wake.beginNewWake()
+            wake.finishRebind(oldAttempt, relistened: true)
+            return wake.activeAttemptID == nil && !wake.relistenConfirmedSinceRefusal
+        }())
+        check("stale onListen after terminal error cannot mark relisten", {
+            var stale = NodeListenerRebindPolicy.State()
+            guard case let .start(_, _, attempt) = stale.observe(.refused, now: 0, cooldown: cooldown) else { return false }
+            stale.finishRebind(attempt, relistened: false)
+            stale.finishRebind(attempt, relistened: true)
+            return !stale.relistenConfirmedSinceRefusal
         }())
 
         let nodeSourcePath = "app/Sources/NodeServer.swift"
@@ -80,6 +122,8 @@ private enum NodeListenerRebindAndTVAudioRecoveryTests {
         check(
             "Node preload opens a new refusal epoch only after confirmed relisten",
             sourceContainsInOrder(preload, [
+                "function __ownsAttempt(attemptID)",
+                "function __retireAttempt(attemptID)",
                 "function __beginFreshFailureAfterRelisten()",
                 "if(!__rb.relistenConfirmed) return;",
                 "__beginFreshFailureAfterRelisten();",
@@ -88,13 +132,24 @@ private enum NodeListenerRebindAndTVAudioRecoveryTests {
             ]))
 
         let manualAudio = PlayerRecoveryAudioChoice(language: " EN ", title: "Main Mix")
-        let newTrackID = PlayerRecoveryAudioChoice.matchingID(
-            for: manualAudio,
-            in: [
-                .init(id: 8, language: "en", title: "main mix", selectable: true),
-                .init(id: 9, language: "en", title: "commentary", selectable: true)
-            ])
-        check("manual audio is re-identified semantically on a new mount", newTrackID == 8)
+        let audioTracks = [MPVTrack(id: 8, type: "audio", title: "main mix", lang: "en", selected: false)]
+        let subtitleTracks = [MPVTrack(id: 17, type: "sub", title: "English", lang: "en", selected: false)]
+        check("audio-first staged arrival retains pending embedded subtitle", TVTrackRecoveryPolicy.subtitleAction(
+            choice: .embedded(lang: "en", title: "English"), tracks: [], pooledChoiceAvailable: false) == .retain)
+        check("audio-first staged arrival restores manual audio", TVTrackRecoveryPolicy.audioAction(
+            choice: manualAudio, tracks: audioTracks, automaticID: nil) == .reapply(8))
+        check("later subtitle arrival restores exact embedded selection", TVTrackRecoveryPolicy.subtitleAction(
+            choice: .embedded(lang: "en", title: "English"), tracks: subtitleTracks, pooledChoiceAvailable: false) == .selectEmbedded(17))
+        check("subtitle-first staged arrival retains pending manual audio", TVTrackRecoveryPolicy.audioAction(
+            choice: manualAudio, tracks: [], automaticID: nil) == .retain)
+        check("subtitle-first staged arrival restores subtitle", TVTrackRecoveryPolicy.subtitleAction(
+            choice: .embedded(lang: "en", title: "English"), tracks: subtitleTracks, pooledChoiceAvailable: false) == .selectEmbedded(17))
+        check("later audio arrival restores exact manual audio", TVTrackRecoveryPolicy.audioAction(
+            choice: manualAudio, tracks: audioTracks, automaticID: nil) == .reapply(8))
+        check("manual subtitle Off is actionable before track discovery", TVTrackRecoveryPolicy.subtitleAction(
+            choice: .off, tracks: [], pooledChoiceAvailable: false) == .applyImmediately)
+        check("manual external subtitle is actionable before track discovery", TVTrackRecoveryPolicy.subtitleAction(
+            choice: .external(url: "https://example.invalid/sub.vtt", title: "English", lang: "en"), tracks: [], pooledChoiceAvailable: false) == .applyImmediately)
 
         let tvSourcePath = "app/SourcesTV/TVPlayerView.swift"
         guard let tvSource = try? String(contentsOfFile: tvSourcePath, encoding: .utf8),

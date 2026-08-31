@@ -87,6 +87,70 @@ enum TVLibMPVStartupNudgePolicy {
     }
 }
 
+/// Recovery choices arrive before either track list is guaranteed complete. Keep each semantic choice pending
+/// until its own media type can perform a real action; an early empty subtitle list must never turn a manual
+/// language pick into Off just because audio happened to arrive first.
+enum TVTrackRecoveryPolicy {
+    enum AudioAction: Equatable {
+        case retain
+        case reapply(Int)
+        case automatic(Int)
+    }
+
+    enum SubtitleAction: Equatable {
+        case retain
+        case selectEmbedded(Int)
+        case applyImmediately
+    }
+
+    static func audioAction(
+        choice: PlayerRecoveryAudioChoice,
+        tracks: [MPVTrack],
+        automaticID: Int?
+    ) -> AudioAction {
+        let candidates = tracks.map {
+            PlayerRecoveryAudioChoice.Candidate(
+                id: $0.id, language: $0.lang, title: $0.title, selectable: $0.isSelectable
+            )
+        }
+        guard candidates.contains(where: \.selectable) else { return .retain }
+        if let id = PlayerRecoveryAudioChoice.matchingID(for: choice, in: candidates) {
+            return .reapply(id)
+        }
+        return automaticID.map(AudioAction.automatic) ?? .retain
+    }
+
+    static func subtitleAction(
+        choice: SubtitleChoice,
+        tracks: [MPVTrack],
+        pooledChoiceAvailable: Bool
+    ) -> SubtitleAction {
+        switch choice {
+        case .off, .external:
+            return .applyImmediately
+        case .pooled:
+            return pooledChoiceAvailable ? .applyImmediately : .retain
+        case let .embedded(lang, title):
+            let normalizedLanguage = lang.lowercased()
+            let normalizedTitle = title.lowercased()
+            if let exact = tracks.first(where: {
+                $0.isSelectable
+                    && $0.lang.lowercased() == normalizedLanguage
+                    && $0.title.lowercased() == normalizedTitle
+            }) {
+                return .selectEmbedded(exact.id)
+            }
+            if let language = tracks.first(where: {
+                $0.isSelectable && $0.lang.lowercased() == normalizedLanguage
+            }) {
+                return .selectEmbedded(language.id)
+            }
+            return .retain
+        }
+    }
+}
+// END tvOS track recovery policy
+
 /// Pure ownership and first-frame gates shared by the 30-second source-hop timer and the event surface.
 /// Position zero is a valid rendered first frame for AVPlayer, while every timer must still prove it belongs
 /// to the exact episode, source, retry generation and logical player load that armed it.
@@ -1955,11 +2019,17 @@ struct TVPlayerView: View {
             // re-emits trackList once they resolve, so re-pull skip candidates + scrubber chapter marks here.
             // On libmpv chapters() is already synchronous at duration, so this is a cheap no-op re-run there.
             refreshSkipSegments()
-            if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
+            let firstAutomaticTrackPass = !appliedAutoTracks
+            if firstAutomaticTrackPass, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
                 appliedAutoTracks = true
                 let langs = subtitleTracks.map { langName($0.lang) }.joined(separator: ",")
                 VXProbe.log("subs", "subs available n=\(subtitleTracks.count) langs=\(langs)")
-                autoSelectTracks()
+            }
+            // AVPlayer and mpv may publish audio and subtitle topology in separate events. Defaults remain
+            // one-shot, while recovery choices are retried on every owned track-list publication until the
+            // matching media type can act; this prevents audio-first delivery from consuming a subtitle pick.
+            if firstAutomaticTrackPass || pendingAudioReapply != nil || pendingSubtitleReapply != nil {
+                autoSelectTracks(applyAutomaticSelections: firstAutomaticTrackPass)
             }
             applyCurrentSubtitleDelayIfReady(force: false)
             if let loadToken,
@@ -4408,8 +4478,8 @@ struct TVPlayerView: View {
         if showOptions { panelRows = optionRows }
     }
 
-    /// Auto-pick the audio + subtitle track from the user's language preferences, once tracks are known.
-    private func autoSelectTracks() {
+    /// Auto-pick defaults once per load, while retaining explicit recovery intent across staged track-list events.
+    private func autoSelectTracks(applyAutomaticSelections: Bool = true) {
         let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
         let remuxOwnsInitialAudio =
             (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
@@ -4417,19 +4487,23 @@ struct TVPlayerView: View {
             pick.audio,
             remuxOwnsInitialSelection: remuxOwnsInitialAudio)
         if let pendingAudioReapply {
-            let candidates = audioTracks.map {
-                PlayerRecoveryAudioChoice.Candidate(
-                    id: $0.id, language: $0.lang, title: $0.title, selectable: $0.isSelectable
-                )
-            }
-            if let id = PlayerRecoveryAudioChoice.matchingID(for: pendingAudioReapply, in: candidates) {
+            switch TVTrackRecoveryPolicy.audioAction(
+                choice: pendingAudioReapply,
+                tracks: audioTracks,
+                automaticID: automaticAudio
+            ) {
+            case .retain:
+                break
+            case let .reapply(id):
                 coordinator.player?.setAudioTrack(id)
                 DiagnosticsLog.log("audio", "re-applied recovery audio choice")
-            } else if let automaticAudio {
-                coordinator.player?.setAudioTrack(automaticAudio)
+                self.pendingAudioReapply = nil
+            case let .automatic(id):
+                coordinator.player?.setAudioTrack(id)
+                DiagnosticsLog.log("audio", "recovery audio unavailable; applied automatic fallback")
+                self.pendingAudioReapply = nil
             }
-            self.pendingAudioReapply = nil
-        } else if let automaticAudio {
+        } else if applyAutomaticSelections, let automaticAudio {
             coordinator.player?.setAudioTrack(automaticAudio)
         }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
@@ -4437,9 +4511,35 @@ struct TVPlayerView: View {
         // an explicit Off / language choice on the fresh mount. Only fall back to TrackSelector when there was
         // no explicit pick.
         if userPickedSubtitle {
-            if let choice = pendingSubtitleReapply { reapplySubtitleChoice(choice); pendingSubtitleReapply = nil }
+            if let choice = pendingSubtitleReapply {
+                let pooledChoiceAvailable: Bool
+                if case let .pooled(id) = choice,
+                   let pooled = pooledSubs.first(where: { $0.id == id }) {
+                    pooledChoiceAvailable = subtitleLoadingURL == nil
+                        && communityContentKey == pooled.contentKey
+                        && MoatConsent.contributeAndConsume
+                        && VortXSyncManager.shared.isSignedIn
+                } else {
+                    pooledChoiceAvailable = false
+                }
+                switch TVTrackRecoveryPolicy.subtitleAction(
+                    choice: choice,
+                    tracks: subtitleTracks,
+                    pooledChoiceAvailable: pooledChoiceAvailable
+                ) {
+                case .retain:
+                    break
+                case let .selectEmbedded(id):
+                    coordinator.player?.setSubtitleTrack(id)
+                    DiagnosticsLog.log("subs", "re-applied explicit embedded pick across engine switch")
+                    pendingSubtitleReapply = nil
+                case .applyImmediately:
+                    reapplySubtitleChoice(choice)
+                    pendingSubtitleReapply = nil
+                }
+            }
             // else: an explicit pick with no snapshot to restore; leave the engine's current selection.
-        } else if let s = pick.subtitle {
+        } else if applyAutomaticSelections, let s = pick.subtitle {
             coordinator.player?.setSubtitleTrack(s)   // -1 = off
             let lang = s < 0 ? "off" : (subtitleTracks.first { $0.id == s }.map { langName($0.lang) } ?? "\(s)")
             VXProbe.event("subs", "subs selected \(lang) (auto)")
@@ -6566,6 +6666,9 @@ struct TVPlayerView: View {
             guard subtitlePoolRequests.finishFetch(requestID, published: true) else { return }
             pooledSubs = result.subs
             VXProbe.log("subs", "subs pooled n=\(result.subs.count)")
+            if pendingSubtitleReapply != nil {
+                autoSelectTracks(applyAutomaticSelections: false)
+            }
             // The pooled list can land AFTER autoSelectTracks already ran (and after an empty add-on list): give
             // the language-chain auto-select its turn on these candidates too (guards above keep it safe).
             autoSelectAddonSubtitleIfNeeded()
