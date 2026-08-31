@@ -1631,7 +1631,19 @@ final class CoreBridge: ObservableObject {
 
     /// Mark the whole title (all episodes of a series, or a movie) watched/unwatched.
     func markWatched(_ isWatched: Bool) {
-        if overlayMarkWatched(isWatched, videoIds: { meta in (meta.videos ?? []).map(\.id) }) { return }
+        switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
+        case .profileOverlay:
+            // Keep this local to the active overlay. Missing detail context must remain a no-op,
+            // never a fallthrough write into the account library.
+            guard let meta = metaDetails?.meta else { return }
+            let ids = (meta.videos ?? []).map(\.id)
+            ProfileStore.shared.setWatched(isWatched, metaId: meta.id,
+                                           videoIds: ids.isEmpty ? [meta.id] : ids,
+                                           name: meta.name, type: meta.type, poster: meta.poster)
+            return
+        case .engineAccount:
+            break
+        }
         // `MarkAsWatched` changes only the library item's aggregate watched state. Episode ticks
         // come from the separate per-video watched bitfield, so BOTH directions must visit every
         // known video. The old true branch sent only the aggregate action, making a whole-series
@@ -2114,13 +2126,16 @@ final class CoreBridge: ObservableObject {
                 PlaybackMeta(libraryId: meta.id, videoId: meta.id, type: meta.type,
                              name: meta.name, poster: meta.poster, season: nil, episode: nil))
         }
-        guard ProfileStore.shared.activeUsesEngineHistory else {
+        switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
+        case .profileOverlay:
             // Overlay profile: save to the profile's private overlay, never the account library.
             if let meta = metaDetails?.meta {
                 ProfileStore.shared.addLibraryEntry(metaId: meta.id, name: meta.name,
                                                     type: meta.type, poster: meta.poster)
             }
             return
+        case .engineAccount:
+            break
         }
         guard let meta = detailMetaPreview() else {
             NSLog("[CoreBridge] AddToLibrary found no usable detail meta")
