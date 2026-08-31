@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.Forward30
 import androidx.compose.material.icons.filled.Replay30
 import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.PlayArrow
@@ -282,6 +283,15 @@ fun PlayerChrome(
     val episodeChoices = remember(episodeOptions, playable.mediaRef) {
         playerEpisodeChoices(episodeOptions, playable.mediaRef)
     }
+    val overflowPlacement = playerChromeActionPlacement(
+        hasQualityChoices = qualityChoices.size > 1,
+        hasEpisodes = episodeChoices.size > 1,
+        hasChapters = chapters.isNotEmpty(),
+        canShare = PlayerHandoff.canRouteExternally(playable),
+        hasPip = onEnterPip != null,
+        hasLock = onLock != null,
+        hasCastSlot = castButton != null,
+    )
     val sourcesTitle = stringResource(R.string.player_sources)
     val sourcesDescription = stringResource(R.string.player_sources_action_description)
     val qualityTitle = stringResource(R.string.player_quality)
@@ -291,10 +301,21 @@ fun PlayerChrome(
     // The player opens above a previously focused detail screen. Explicitly park the TV remote on the
     // Back affordance rather than depending on Compose focus search to discover this newly composed layer.
     val tvChromeFocus = remember { FocusRequester() }
-    LaunchedEffect(isTvPlayer, controlsVisible, openSheet) {
+    val tvMoreFocus = remember { FocusRequester() }
+    var restoreMoreFocus by remember { mutableStateOf(false) }
+    // A secondary sheet is reached from More, so returning to the compact chrome must land back on
+    // More instead of making the remote start over at Back. This also keeps nested dismissals from
+    // depending on Compose's spatial focus search.
+    fun openMoreSubsheet(sheet: ControlSheet) {
+        restoreMoreFocus = true
+        openSheet = sheet
+    }
+    LaunchedEffect(isTvPlayer, controlsVisible, openSheet, restoreMoreFocus) {
         if (isTvPlayer && controlsVisible && openSheet == ControlSheet.NONE) {
             withFrameNanos { }
-            runCatching { tvChromeFocus.requestFocus() }
+            runCatching {
+                if (restoreMoreFocus) tvMoreFocus.requestFocus() else tvChromeFocus.requestFocus()
+            }
         }
     }
     val chaptersTitle = stringResource(R.string.player_chapters)
@@ -439,64 +460,20 @@ fun PlayerChrome(
                         .weight(1f)
                         .padding(start = 4.dp),
                 )
-                // Control cluster: source/quality switching, audio/output, subtitles, speed, and aspect.
-                // Opening a sheet counts as interaction so the host's auto-hide timer re-arms.
-                if (sourceChoices.size > 1) {
-                    ChromeIcon(Icons.Filled.Tune, sourcesDescription) { onInteraction(); openSheet = ControlSheet.SOURCES }
-                }
-                if (qualityChoices.size > 1) {
-                    ChromeIcon(Icons.Filled.HighQuality, qualityDescription) { onInteraction(); openSheet = ControlSheet.QUALITY }
-                }
-                // In-player episode picker (series only): the season's episodes, current one highlighted.
-                if (episodeChoices.size > 1) {
-                    ChromeIcon(Icons.AutoMirrored.Filled.List, "Episodes") { onInteraction(); openSheet = ControlSheet.EPISODES }
-                }
+                // Keep the frequent source / track controls reachable in one remote move. Everything else
+                // lives behind More so the title does not collapse into an unclickable icon strip on narrow
+                // landscape phones or TV overscan layouts.
+                ChromeIcon(Icons.Filled.Tune, sourcesDescription) { onInteraction(); openSheet = ControlSheet.SOURCES }
                 ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
-                // Volume + mute (Apple `stremiox.playerVolume`): the speaker glyph reflects the mute / level
-                // state; opening it shows the slider + mute toggle.
-                ChromeIcon(
-                    icon = if (playerMuted || playerVolume <= 0.0) {
-                        Icons.AutoMirrored.Filled.VolumeOff
-                    } else {
-                        Icons.AutoMirrored.Filled.VolumeUp
-                    },
-                    description = "Volume",
-                    tint = if (playerMuted || playerVolume <= 0.0) emberAccent else Color.White,
-                ) { onInteraction(); openSheet = ControlSheet.VOLUME }
                 ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
-                ChromeIcon(Icons.Filled.Speed, "Playback speed") { onInteraction(); openSheet = ControlSheet.SPEED }
-                if (chapters.isNotEmpty()) {
-                    ChromeIcon(Icons.AutoMirrored.Filled.List, chaptersDescription) { onInteraction(); openSheet = ControlSheet.CHAPTERS }
-                }
-                // Aspect ratio: opens the Fit / Fill / Stretch sheet. Ember-tinted when not on the default Fit.
                 ChromeIcon(
-                    Icons.Filled.AspectRatio,
-                    "Aspect ratio",
-                    tint = if (scaleMode != VideoScaleMode.FIT) emberAccent else Color.White,
-                ) { onInteraction(); openSheet = ControlSheet.VIDEO }
-                // Player settings overflow: sleep timer, decoder, playback info, and the engine switch.
-                // Share / hand-off: only for a stream that can actually leave the app (a real remote link,
-                // never a loopback torrent or a trailer). Opens a small sheet with Share link + Open in
-                // another player. Mirrors the Apple player's share sheet + external-player hand-off.
-                if (PlayerHandoff.canRouteExternally(playable)) {
-                    ChromeIcon(Icons.Filled.Share, "Share or open in another app") {
-                        onInteraction(); openSheet = ControlSheet.SHARE
-                    }
-                }
-                ChromeIcon(Icons.Filled.Settings, "Player settings") { onInteraction(); openSheet = ControlSheet.PLAYER_SETTINGS }
-                // Google Cast (the CAST lane), when the host supplies it for a castable stream. Drawn as a
-                // host slot so ALL cast logic stays in com.vortx.android.cast; the slot itself self-hides
-                // when no receivers are reachable. Placed before PiP/lock in the cluster.
-                castButton?.invoke()
-                // Picture-in-Picture, before the lock so the lock stays the cluster's last (and
-                // therefore most protected-from-fat-finger) position.
-                onEnterPip?.let { pip ->
-                    ChromeIcon(Icons.Filled.PictureInPictureAlt, "Picture in picture") { pip() }
-                }
-                // Player Lock: hides the chrome and freezes touch input so nothing mid-film seeks or
-                // pauses by accident; the host draws the unlock affordance while locked.
-                onLock?.let { lock ->
-                    ChromeIcon(Icons.Filled.Lock, "Lock player controls") { lock() }
+                    Icons.Filled.MoreHoriz,
+                    "More player controls",
+                    modifier = Modifier.focusRequester(tvMoreFocus),
+                ) {
+                    onInteraction()
+                    restoreMoreFocus = false
+                    openSheet = ControlSheet.MORE
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(start = 8.dp, top = 2.dp)) {
@@ -918,6 +895,61 @@ fun PlayerChrome(
                 emberAccent = emberAccent,
                 onDismiss = { openSheet = ControlSheet.NONE },
             )
+            ControlSheet.MORE -> ControlSelectionSheet(
+                title = "More player controls",
+                options = buildList {
+                    if (PlayerChromeOverflowAction.QUALITY in overflowPlacement.overflow) {
+                        add(SheetOption(qualityTitle, false, detail = "${qualityChoices.size} options ›", onPick = {
+                            openMoreSubsheet(ControlSheet.QUALITY)
+                        }, dismissOnPick = false))
+                    }
+                    if (PlayerChromeOverflowAction.EPISODES in overflowPlacement.overflow) {
+                        add(SheetOption("Episodes", false, detail = "${episodeChoices.size} episodes ›", onPick = {
+                            openMoreSubsheet(ControlSheet.EPISODES)
+                        }, dismissOnPick = false))
+                    }
+                    add(
+                        SheetOption(
+                            label = "Volume",
+                            selected = false,
+                            detail = if (playerMuted || playerVolume <= 0.0) "Muted" else "${playerVolume.roundToInt()}%",
+                            onPick = { openMoreSubsheet(ControlSheet.VOLUME) },
+                            dismissOnPick = false,
+                        ),
+                    )
+                    add(SheetOption("Playback speed", false, detail = "${trimSpeed(speed)}x", onPick = {
+                        openMoreSubsheet(ControlSheet.SPEED)
+                    }, dismissOnPick = false))
+                    if (PlayerChromeOverflowAction.CHAPTERS in overflowPlacement.overflow) {
+                        add(SheetOption(chaptersTitle, false, detail = "${chapters.size} chapters ›", onPick = {
+                            openMoreSubsheet(ControlSheet.CHAPTERS)
+                        }, dismissOnPick = false))
+                    }
+                    add(SheetOption("Aspect ratio", false, detail = videoScaleModeLabel(scaleMode), onPick = {
+                        openMoreSubsheet(ControlSheet.VIDEO)
+                    }, dismissOnPick = false))
+                    if (PlayerChromeOverflowAction.SHARE in overflowPlacement.overflow) {
+                        add(SheetOption("Share or open in another app", false, detail = "›", onPick = {
+                            openMoreSubsheet(ControlSheet.SHARE)
+                        }, dismissOnPick = false))
+                    }
+                    onEnterPip?.takeIf { PlayerChromeOverflowAction.PIP in overflowPlacement.overflow }?.let { pip ->
+                        add(SheetOption("Picture in picture", false, onPick = { pip() }))
+                    }
+                    onLock?.takeIf { PlayerChromeOverflowAction.LOCK in overflowPlacement.overflow }?.let { lock ->
+                        add(SheetOption("Lock player controls", false, onPick = { lock() }))
+                    }
+                    add(SheetOption("Player settings", false, detail = "›", onPick = {
+                        openMoreSubsheet(ControlSheet.PLAYER_SETTINGS)
+                    }, dismissOnPick = false))
+                },
+                emberAccent = emberAccent,
+                accessory = castButton,
+                onDismiss = {
+                    restoreMoreFocus = true
+                    openSheet = ControlSheet.NONE
+                },
+            )
             ControlSheet.PLAYER_SETTINGS -> ControlSelectionSheet(
                 title = "Player Settings",
                 options = buildList {
@@ -1304,6 +1336,7 @@ private enum class ControlSheet {
     AUDIO_SETTINGS,
     SPEED,
     CHAPTERS,
+    MORE,
     PLAYER_SETTINGS,
     SLEEP,
     SEEK_BAR_STYLE,
@@ -1315,6 +1348,62 @@ private enum class ControlSheet {
     AUDIO_LANGUAGE,
     SUBTITLE_LANGUAGE,
     SHARE_QR,
+}
+
+/**
+ * The compact chrome contract deliberately does not vary with available width: the same four controls
+ * fit a narrow landscape phone and an overscanned TV, and every optional control remains in [overflow].
+ */
+internal enum class PlayerChromeHeaderAction { SOURCES, AUDIO, SUBTITLES, MORE }
+
+internal enum class PlayerChromeOverflowAction {
+    QUALITY,
+    EPISODES,
+    VOLUME,
+    SPEED,
+    CHAPTERS,
+    ASPECT_RATIO,
+    SHARE,
+    PIP,
+    LOCK,
+    SETTINGS,
+    CAST,
+}
+
+internal data class PlayerChromeActionPlacement(
+    val header: List<PlayerChromeHeaderAction>,
+    val overflow: List<PlayerChromeOverflowAction>,
+)
+
+internal fun playerChromeActionPlacement(
+    hasQualityChoices: Boolean,
+    hasEpisodes: Boolean,
+    hasChapters: Boolean,
+    canShare: Boolean,
+    hasPip: Boolean,
+    hasLock: Boolean,
+    hasCastSlot: Boolean,
+): PlayerChromeActionPlacement = PlayerChromeActionPlacement(
+    header = PlayerChromeHeaderAction.entries,
+    overflow = buildList {
+        if (hasQualityChoices) add(PlayerChromeOverflowAction.QUALITY)
+        if (hasEpisodes) add(PlayerChromeOverflowAction.EPISODES)
+        add(PlayerChromeOverflowAction.VOLUME)
+        add(PlayerChromeOverflowAction.SPEED)
+        if (hasChapters) add(PlayerChromeOverflowAction.CHAPTERS)
+        add(PlayerChromeOverflowAction.ASPECT_RATIO)
+        if (canShare) add(PlayerChromeOverflowAction.SHARE)
+        if (hasPip) add(PlayerChromeOverflowAction.PIP)
+        if (hasLock) add(PlayerChromeOverflowAction.LOCK)
+        add(PlayerChromeOverflowAction.SETTINGS)
+        if (hasCastSlot) add(PlayerChromeOverflowAction.CAST)
+    },
+)
+
+internal fun videoScaleModeLabel(mode: VideoScaleMode): String = when (mode) {
+    VideoScaleMode.FIT -> "Fit"
+    VideoScaleMode.ZOOM -> "Fill"
+    VideoScaleMode.STRETCH -> "Stretch"
 }
 
 /// Aspect-ratio choices for the VIDEO sheet, mirroring the Apple Aspect Ratio panel
@@ -1657,6 +1746,7 @@ private fun ControlSelectionSheet(
     title: String,
     options: List<SheetOption>,
     emberAccent: Color,
+    accessory: (@Composable () -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
     val firstEnabledIndex = options.indexOfFirst(SheetOption::enabled)
@@ -1760,6 +1850,12 @@ private fun ControlSelectionSheet(
                         )
                     }
                 }
+            }
+            // Cast is supplied as a host-owned composable because it owns discovery and connection state.
+            // Keeping that slot in More preserves its self-hiding availability contract without returning it
+            // to the constrained top row.
+            accessory?.let { content ->
+                Box(modifier = Modifier.fillMaxWidth()) { content() }
             }
         }
     }
@@ -2103,8 +2199,14 @@ private fun TransportBar(
 
 /// One control-cluster icon button (white, or [tint]-highlighted when its state is active).
 @Composable
-private fun ChromeIcon(icon: ImageVector, description: String, tint: Color = Color.White, onClick: () -> Unit) {
-    IconButton(onClick = onClick) {
+private fun ChromeIcon(
+    icon: ImageVector,
+    description: String,
+    tint: Color = Color.White,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    IconButton(onClick = onClick, modifier = modifier) {
         Icon(imageVector = icon, contentDescription = description, tint = tint)
     }
 }
