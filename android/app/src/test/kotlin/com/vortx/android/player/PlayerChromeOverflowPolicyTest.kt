@@ -59,12 +59,18 @@ class PlayerChromeOverflowPolicyTest {
     }
 
     @Test
-    fun `dismissing a More drill-in restores TV focus to More`() {
+    fun `sheet dismissal restores the actual invoking TV control without stale More focus`() {
         val chrome = source("src/main/kotlin/com/vortx/android/player/PlayerChrome.kt")
 
+        assertTrue(chrome.contains("var focusReturnTarget by remember { mutableStateOf<FocusRequester?>(null) }"))
+        assertTrue(chrome.contains("fun openSheetFromControl(sheet: ControlSheet, invoker: FocusRequester)"))
+        assertTrue(chrome.contains("val focusTarget = focusReturnTarget ?: tvChromeFocus"))
+        assertTrue(chrome.contains("focusReturnTarget = null"))
         assertTrue(chrome.contains("fun openMoreSubsheet(sheet: ControlSheet)"))
-        assertTrue(chrome.contains("restoreMoreFocus = true\n        openSheet = sheet"))
-        assertTrue(chrome.contains("if (restoreMoreFocus) tvMoreFocus.requestFocus()"))
+        assertTrue(chrome.contains("openSheetFromControl(sheet, tvMoreFocus)"))
+        assertTrue(chrome.contains("openSheetFromControl(ControlSheet.SOURCES, tvSourcesFocus)"))
+        assertTrue(chrome.contains("openSheetFromControl(ControlSheet.AUDIO, tvAudioFocus)"))
+        assertTrue(chrome.contains("openSheetFromControl(ControlSheet.SUBTITLE, tvSubtitleFocus)"))
         val more = chrome.substringAfter("ControlSheet.MORE ->").substringBefore("ControlSheet.PLAYER_SETTINGS ->")
         assertTrue(more.contains("openMoreSubsheet(ControlSheet.VOLUME)"))
         assertTrue(more.contains("openMoreSubsheet(ControlSheet.PLAYER_SETTINGS)"))
@@ -93,6 +99,7 @@ class PlayerChromeOverflowPolicyTest {
 
         assertTrue(selection.contains("BackHandler { onDismiss() }"))
         assertTrue(volume.contains("BackHandler { onDismiss() }"))
+        assertTrue(selection.contains(".heightIn(min = 48.dp)"))
     }
 
     @Test

@@ -301,21 +301,24 @@ fun PlayerChrome(
     // The player opens above a previously focused detail screen. Explicitly park the TV remote on the
     // Back affordance rather than depending on Compose focus search to discover this newly composed layer.
     val tvChromeFocus = remember { FocusRequester() }
+    val tvSourcesFocus = remember { FocusRequester() }
+    val tvAudioFocus = remember { FocusRequester() }
+    val tvSubtitleFocus = remember { FocusRequester() }
     val tvMoreFocus = remember { FocusRequester() }
-    var restoreMoreFocus by remember { mutableStateOf(false) }
-    // A secondary sheet is reached from More, so returning to the compact chrome must land back on
-    // More instead of making the remote start over at Back. This also keeps nested dismissals from
-    // depending on Compose's spatial focus search.
-    fun openMoreSubsheet(sheet: ControlSheet) {
-        restoreMoreFocus = true
+    // A sheet returns to the control that opened it. This must be per-open rather than a sticky boolean:
+    // after a More drill-in closes, a later Sources sheet must return to Sources, not stale More.
+    var focusReturnTarget by remember { mutableStateOf<FocusRequester?>(null) }
+    fun openSheetFromControl(sheet: ControlSheet, invoker: FocusRequester) {
+        focusReturnTarget = invoker
         openSheet = sheet
     }
-    LaunchedEffect(isTvPlayer, controlsVisible, openSheet, restoreMoreFocus) {
+    fun openMoreSubsheet(sheet: ControlSheet) = openSheetFromControl(sheet, tvMoreFocus)
+    LaunchedEffect(isTvPlayer, controlsVisible, openSheet) {
         if (isTvPlayer && controlsVisible && openSheet == ControlSheet.NONE) {
+            val focusTarget = focusReturnTarget ?: tvChromeFocus
+            focusReturnTarget = null
             withFrameNanos { }
-            runCatching {
-                if (restoreMoreFocus) tvMoreFocus.requestFocus() else tvChromeFocus.requestFocus()
-            }
+            runCatching { focusTarget.requestFocus() }
         }
     }
     val chaptersTitle = stringResource(R.string.player_chapters)
@@ -463,17 +466,25 @@ fun PlayerChrome(
                 // Keep the frequent source / track controls reachable in one remote move. Everything else
                 // lives behind More so the title does not collapse into an unclickable icon strip on narrow
                 // landscape phones or TV overscan layouts.
-                ChromeIcon(Icons.Filled.Tune, sourcesDescription) { onInteraction(); openSheet = ControlSheet.SOURCES }
-                ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings") { onInteraction(); openSheet = ControlSheet.AUDIO }
-                ChromeIcon(Icons.Filled.Subtitles, "Subtitles") { onInteraction(); openSheet = ControlSheet.SUBTITLE }
+                ChromeIcon(Icons.Filled.Tune, sourcesDescription, modifier = Modifier.focusRequester(tvSourcesFocus)) {
+                    onInteraction()
+                    openSheetFromControl(ControlSheet.SOURCES, tvSourcesFocus)
+                }
+                ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings", modifier = Modifier.focusRequester(tvAudioFocus)) {
+                    onInteraction()
+                    openSheetFromControl(ControlSheet.AUDIO, tvAudioFocus)
+                }
+                ChromeIcon(Icons.Filled.Subtitles, "Subtitles", modifier = Modifier.focusRequester(tvSubtitleFocus)) {
+                    onInteraction()
+                    openSheetFromControl(ControlSheet.SUBTITLE, tvSubtitleFocus)
+                }
                 ChromeIcon(
                     Icons.Filled.MoreHoriz,
                     "More player controls",
                     modifier = Modifier.focusRequester(tvMoreFocus),
                 ) {
                     onInteraction()
-                    restoreMoreFocus = false
-                    openSheet = ControlSheet.MORE
+                    openSheetFromControl(ControlSheet.MORE, tvMoreFocus)
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(start = 8.dp, top = 2.dp)) {
@@ -1814,6 +1825,7 @@ private fun ControlSelectionSheet(
                                 Modifier
                             },
                         )
+                        .heightIn(min = 48.dp)
                         .padding(vertical = 10.dp, horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
