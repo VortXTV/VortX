@@ -75,7 +75,11 @@ class CommunityJsProviderStore(context: Context) {
             val file = entry.optString("filename").trim()
             if (!VALID_ID.matches(id) || file.isEmpty()) continue
             val providerUrl = CommunityJsUrlPolicy.providerUrl(manifestUrl, file) ?: continue
-            val code = fetchText(providerUrl)?.takeIf { it.isNotBlank() && it.toByteArray().size <= MAX_SOURCE_BYTES } ?: continue
+            val code = fetchText(providerUrl)?.takeIf {
+                it.isNotBlank() &&
+                    it.toByteArray().size <= MAX_SOURCE_BYTES &&
+                    it.length <= CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS
+            } ?: continue
             totalSourceBytes += code.toByteArray(Charsets.UTF_8).size
             if (totalSourceBytes > MAX_TOTAL_SOURCE_BYTES) break
             val types = entry.optJSONArray("supportedTypes")
@@ -121,7 +125,10 @@ class CommunityJsProviderStore(context: Context) {
                 val item = array.optJSONObject(i) ?: continue
                 val id = item.optString("id").trim()
                 val code = item.optString("code")
-                if (!VALID_ID.matches(id) || code.isBlank() || code.toByteArray().size > MAX_SOURCE_BYTES) continue
+                if (!VALID_ID.matches(id) || code.isBlank() ||
+                    code.toByteArray().size > MAX_SOURCE_BYTES ||
+                    code.length > CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS
+                ) continue
                 val types = item.optJSONArray("types")?.let { typesArray ->
                     buildSet { for (j in 0 until typesArray.length()) add(typesArray.optString(j).lowercase()) }
                 }?.intersect(SUPPORTED_MEDIA_TYPES)?.ifEmpty { SUPPORTED_MEDIA_TYPES } ?: SUPPORTED_MEDIA_TYPES

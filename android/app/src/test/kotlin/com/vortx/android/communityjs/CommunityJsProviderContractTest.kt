@@ -271,6 +271,69 @@ class CommunityJsProviderContractTest {
     }
 
     @Test
+    fun `execute Binder budget accepts exact ceilings and rejects overages before IPC`() {
+        val exact = CommunityJsBinderPayloads.isExecuteRequestSafe(
+            token = "t".repeat(CommunityJsBinderPayloads.MAX_TOKEN_CHARS),
+            code = "c".repeat(CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS),
+            tmdbId = "1".repeat(CommunityJsBinderPayloads.MAX_MEDIA_ID_CHARS),
+            mediaType = "m".repeat(CommunityJsBinderPayloads.MAX_MEDIA_TYPE_CHARS),
+            settingsJson = "s".repeat(CommunityJsBinderPayloads.MAX_EXECUTE_SETTINGS_CHARS),
+        )
+        assertTrue(exact)
+        assertFalse(CommunityJsBinderPayloads.isExecuteRequestSafe(
+            token = "token",
+            code = "c".repeat(CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS + 1),
+            tmdbId = "1",
+            mediaType = "movie",
+            settingsJson = "{}",
+        ))
+
+        var brokerCalls = 0
+        assertFalse(communityJsExecuteOverBinder(
+            token = "token",
+            code = "c".repeat(CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS + 1),
+            tmdbId = "1",
+            mediaType = "movie",
+            settingsJson = "{}",
+        ) { brokerCalls += 1 })
+        assertEquals(0, brokerCalls)
+    }
+
+    @Test
+    fun `oversized fetch payload is rejected without calling the Binder callback`() {
+        var callbackCalls = 0
+        val result = communityJsFetchOverBinder(
+            token = "token",
+            url = "https://example.test/" + "x".repeat(CommunityJsBinderPayloads.MAX_FETCH_URL_CHARS),
+            optionsJson = "{}",
+            remainingTimeoutMs = 1_000L,
+        ) { _, _, _, _ ->
+            callbackCalls += 1
+            "unexpected"
+        }
+
+        assertEquals(COMMUNITY_JS_EMPTY_FETCH_RESPONSE, result)
+        assertEquals(0, callbackCalls)
+    }
+
+    @Test
+    fun `fetch Binder response budget accepts exact ceiling and replaces oversized body before return IPC`() {
+        var callbackCalls = 0
+        val exact = communityJsFetchOverBinder("token", "https://example.test", "{}", 1_000L) { _, _, _, _ ->
+            callbackCalls += 1
+            "r".repeat(CommunityJsBinderPayloads.MAX_FETCH_RESPONSE_CHARS)
+        }
+        assertEquals(CommunityJsBinderPayloads.MAX_FETCH_RESPONSE_CHARS, exact.length)
+
+        val tooLarge = communityJsFetchOverBinder("token", "https://example.test", "{}", 1_000L) { _, _, _, _ ->
+            callbackCalls += 1
+            "r".repeat(CommunityJsBinderPayloads.MAX_FETCH_RESPONSE_CHARS + 1)
+        }
+        assertEquals(COMMUNITY_JS_EMPTY_FETCH_RESPONSE, tooLarge)
+        assertEquals(2, callbackCalls)
+    }
+
+    @Test
     fun `broker executor rejects saturation and removes cancelled queued work`() {
         val executor = CommunityJsBoundedTaskExecutor()
         val running = CountDownLatch(1)

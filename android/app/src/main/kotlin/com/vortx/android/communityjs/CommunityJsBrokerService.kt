@@ -29,15 +29,18 @@ class CommunityJsBrokerService : Service() {
             memoryLimitBytes: Long,
             callback: ICommunityJsBrokerCallback,
         ) {
-            if (token.length > 128 || code.toByteArray().size > MAX_SOURCE_BYTES || settingsJson.toByteArray().size > MAX_SETTINGS_BYTES) {
+            if (!CommunityJsBinderPayloads.isExecuteRequestSafe(token, code, tmdbId, mediaType, settingsJson) ||
+                code.toByteArray().size > MAX_SOURCE_BYTES || settingsJson.toByteArray().size > MAX_SETTINGS_BYTES
+            ) {
                 completeSafely(callback, token, FAILURE_ENVELOPE)
                 return
             }
             val accepted = controller.submit(token) { cancelledFlag ->
                 val host = object : CommunityJsRuntime.NativeFetch {
                     override fun fetch(url: String, optionsJson: String, remainingTimeoutMs: Long): String =
-                        runCatching { callback.fetch(token, url, optionsJson, remainingTimeoutMs) }
-                            .getOrDefault(EMPTY_RESPONSE)
+                        communityJsFetchOverBinder(token, url, optionsJson, remainingTimeoutMs) { safeToken, safeUrl, safeOptions, safeTimeout ->
+                            callback.fetch(safeToken, safeUrl, safeOptions, safeTimeout)
+                        }
 
                     override fun isCancelled(): Boolean = cancelledFlag.get() || runCatching { callback.isCancelled(token) }.getOrDefault(true)
                 }
@@ -64,7 +67,6 @@ class CommunityJsBrokerService : Service() {
     private companion object {
         const val MAX_SOURCE_BYTES = 1_000_000
         const val MAX_SETTINGS_BYTES = 64 * 1024
-        const val EMPTY_RESPONSE = "{\"status\":0,\"statusText\":\"Unavailable\",\"body\":\"\",\"headers\":{}}"
         const val FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
         const val OVERLOADED_ENVELOPE = "{\"ok\":false,\"error\":\"Provider service busy\"}"
     }

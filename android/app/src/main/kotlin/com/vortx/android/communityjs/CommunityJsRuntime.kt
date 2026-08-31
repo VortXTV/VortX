@@ -57,7 +57,9 @@ class CommunityJsRuntime(
     }
 
     suspend fun execute(invocation: Invocation): Result {
-        if (invocation.provider.code.toByteArray().size > MAX_SOURCE_BYTES) return Result.Failure("Provider source exceeds the limit.")
+        if (invocation.provider.code.toByteArray().size > MAX_SOURCE_BYTES ||
+            invocation.provider.code.length > CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS
+        ) return Result.Failure("Provider source exceeds the limit.")
         if (invocation.mediaType !in setOf("movie", "tv") || invocation.tmdbId.toIntOrNull() == null) return Result.Failure("Invalid media identity.")
         val host = NativeFetchImpl(timeoutMs)
         val cancellation = currentCoroutineContext()[Job]?.invokeOnCompletion { cause ->
@@ -87,6 +89,11 @@ class CommunityJsRuntime(
 
     private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String {
         val token = UUID.randomUUID().toString()
+        val settingsJson = JSONObject(invocation.settingsJson).toString()
+        if (!CommunityJsBinderPayloads.isExecuteRequestSafe(
+                token, invocation.provider.code, invocation.tmdbId, invocation.mediaType, settingsJson,
+            )
+        ) return FAILURE_ENVELOPE
         val executionAdmission = CommunityJsBrokerExecutionAdmission<ICommunityJsBroker>()
         lateinit var connection: ServiceConnection
         val binding = CommunityJsBindingOwner { runCatching { appContext.unbindService(connection) } }
@@ -94,7 +101,11 @@ class CommunityJsRuntime(
             suspendCancellableCoroutine { continuation ->
                 val callback = object : ICommunityJsBrokerCallback.Stub() {
             override fun fetch(tokenValue: String, url: String, optionsJson: String, remainingTimeoutMs: Long): String =
-                if (tokenValue == token) host.fetch(url, optionsJson, remainingTimeoutMs) else EMPTY_RESPONSE
+                if (tokenValue == token && CommunityJsBinderPayloads.isFetchRequestSafe(tokenValue, url, optionsJson)) {
+                    CommunityJsBinderPayloads.boundedFetchResponse(host.fetch(url, optionsJson, remainingTimeoutMs))
+                } else {
+                    EMPTY_RESPONSE
+                }
 
             override fun isCancelled(tokenValue: String): Boolean = tokenValue != token || host.isCancelled() || !continuation.isActive
 
@@ -117,9 +128,15 @@ class CommunityJsRuntime(
                     return
                 }
                 runCatching {
-                    connectedBroker.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
-                        JSONObject(invocation.settingsJson).toString(), invocation.season ?: 0, invocation.episode ?: 0,
-                        timeoutMs, MAX_MEMORY_BYTES, callback)
+                    communityJsExecuteOverBinder(
+                        token, invocation.provider.code, invocation.tmdbId, invocation.mediaType, settingsJson,
+                    ) {
+                        connectedBroker.execute(token, invocation.provider.code, invocation.tmdbId, invocation.mediaType,
+                            settingsJson, invocation.season ?: 0, invocation.episode ?: 0,
+                            timeoutMs, MAX_MEMORY_BYTES, callback)
+                    }
+                }.onSuccess { invoked ->
+                    if (!invoked && continuation.isActive) { binding.terminate(); continuation.resume(FAILURE_ENVELOPE) }
                 }.onFailure { if (continuation.isActive) { binding.terminate(); continuation.resume(FAILURE_ENVELOPE) } }
             }
 
@@ -242,7 +259,7 @@ class CommunityJsRuntime(
         private const val DEFAULT_TIMEOUT_MS = 25_000L
         private const val BROKER_COMPLETION_GRACE_MS = 2_000L
         private const val MAX_SOURCE_BYTES = 1_000_000
-        private const val MAX_RESPONSE_BYTES = 1_000_000
+        private const val MAX_RESPONSE_BYTES = 128 * 1024
         private const val MAX_RESULT_COUNT = 100
         private const val MAX_SUBTITLE_COUNT = 20
         private const val MAX_REQUEST_COUNT = 20
@@ -251,7 +268,7 @@ class CommunityJsRuntime(
         private const val MAX_REQUEST_BODY_BYTES = 256 * 1024
         private const val MAX_MEMORY_BYTES = 16L * 1024 * 1024
         private const val USER_AGENT = "Mozilla/5.0 (Android) AppleWebKit/537.36 Chrome/125 Safari/537.36"
-        private const val EMPTY_RESPONSE = "{\"status\":0,\"statusText\":\"Unavailable\",\"body\":\"\",\"headers\":{}}"
+        private const val EMPTY_RESPONSE = COMMUNITY_JS_EMPTY_FETCH_RESPONSE
         private const val FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
         private val ALLOWED_METHODS = setOf("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE")
         private val BODY_METHODS = setOf("POST", "PUT", "PATCH", "DELETE")
