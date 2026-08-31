@@ -111,6 +111,13 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "pending logout leaves add-on tombstones, sync pushes, and hydration counts unchanged")
         check(!Policy.allowsAddonMutationEffects(contextCurrent: false, logoutPending: false),
               "stale profile context cannot create add-on side effects")
+        for blockedBinding in [
+            Policy.blocksEnginePublication(hasPendingBinding: true, credentialRejected: false),
+            Policy.blocksEnginePublication(hasPendingBinding: false, credentialRejected: true),
+        ] {
+            check(!Policy.allowsAddonMutationEffects(contextCurrent: !blockedBinding, logoutPending: false),
+                  "pending or rejected binding leaves uninstall tombstones and sync effects unchanged")
+        }
         check(Policy.allowsAddonMutationEffects(contextCurrent: true, logoutPending: false),
               "settled current context permits normal add-on mutation effects")
         check(!Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: false),

@@ -155,9 +155,11 @@ check(dispatch.contains("blocksAccountMutationDuringSignedOutRepair")
                 && dispatch.contains("return false")
                 && dispatch.contains("return true"),
               "central engine dispatch gate rejects pending-logout account mutations while leaving overlay state local")
-check(uninstallAddon.contains("guard !logoutAccountMutationPending else { return }")
-                && appearsBefore("guard !logoutAccountMutationPending else { return }", "AddonTombstones.tombstone", in: uninstallAddon),
-              "pending logout cannot create an add-on tombstone or sync push before uninstall dispatch")
+check(uninstallAddon.contains("let mutationToken = capturePublicationToken()")
+                && uninstallAddon.contains("guard addonMutationStillAllowed(mutationToken) else { return }")
+                && appearsBefore("guard addonMutationStillAllowed(mutationToken) else { return }", "AddonTombstones.tombstone", in: uninstallAddon)
+                && appearsBefore("guard addonMutationStillAllowed(mutationToken) else { return }", "rawAddonsByUrl", in: uninstallAddon),
+              "pending logout or unresolved binding cannot create an add-on tombstone, sync push, raw lookup, or uninstall")
 check(installAddon.contains("let mutationToken = capturePublicationToken()")
                 && installAddon.components(separatedBy: "addonMutationStillAllowed(mutationToken)").count >= 5
                 && installAddon.contains("dispatchCtx([\"action\": \"UninstallAddon\", \"args\": existing])")

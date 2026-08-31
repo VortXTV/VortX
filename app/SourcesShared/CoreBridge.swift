@@ -373,9 +373,10 @@ final class CoreBridge: ObservableObject {
     /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
     /// URL must stay re-addable on every device.
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
-        // A pending logout still belongs to the previous account.  Do not create a durable
-        // deletion intent or its sync push when the engine mutation itself is fenced.
-        guard !logoutAccountMutationPending else { return }
+        let mutationToken = capturePublicationToken()
+        // A logout, unresolved binding, or rejected credential still belongs to the previous
+        // account. Do not create a durable deletion intent or inspect engine state while fenced.
+        guard addonMutationStillAllowed(mutationToken) else { return }
         // Record the durable removal FIRST, before touching rawAddonsByUrl. A synced add-on can be visible
         // in the published `addons` list yet be MISSING from `rawAddonsByUrl` (its raw engine descriptor
         // never landed, e.g. a roster the sync layer added without an engine InstallAddon). The old
