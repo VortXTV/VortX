@@ -34,6 +34,12 @@ struct NextEpisodePreloadPolicy: Equatable {
 
     static let halfwayFraction = 0.4
     static let durationlessStartSeconds = 90.0
+    /// Transport warming is deliberately later than source preparation. The source pipeline can begin at
+    /// forty percent and retry safely, while the resolved playback transport is refreshed only once the
+    /// viewer is plausibly close enough to use it before its link/cache state expires.
+    static let transportWarmFraction = 0.75
+    static let transportWarmRemainingSeconds = 180.0
+    static let durationlessTransportWarmSeconds = 240.0
     static let nearCreditsRemainingSeconds = 100.0
     static let durationlessNearCreditsSeconds = 300.0
     static let maxRegularAttempts = 3
@@ -172,6 +178,21 @@ struct NextEpisodePreloadPolicy: Equatable {
 
     func isReady(for requestedTarget: Target) -> Bool {
         target == requestedTarget && ready
+    }
+
+    /// Whether a prepared next episode should start its bounded transport warm-up now.
+    ///
+    /// This has no scheduling side effects. Callers must still verify that their prepared target is current
+    /// before claiming a warm identity or starting I/O, because a title/season change can race a time tick.
+    static func isTransportWarmEligible(position: Double, duration: Double) -> Bool {
+        guard position.isFinite, duration.isFinite, position >= 0, duration >= 0 else {
+            return false
+        }
+        if duration > 0 {
+            return position / duration >= transportWarmFraction
+                || duration - position <= transportWarmRemainingSeconds
+        }
+        return position >= durationlessTransportWarmSeconds
     }
 
     mutating func invalidate() {

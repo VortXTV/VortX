@@ -20,6 +20,7 @@ struct NextEpisodePreloadPolicyTests {
         successLatches()
         generationRejectsStaleCompletion()
         warmFailureGetsOneRefresh()
+        transportWarmEligibilityBoundaries()
         creditsPreemptAnInFlightAttempt()
         timedOutAttemptCannotOwnThePolicyForever()
         requestTimeoutMatchesThePoolLease()
@@ -145,6 +146,67 @@ struct NextEpisodePreloadPolicyTests {
         expect(refresh?.kind == .nearCredits, "an expired ready URL is refreshed in the credits window")
         if let refresh { _ = policy.complete(refresh, success: false, now: 1) }
         expect(!policy.warmFailed(for: target()), "the refresh path is one-shot")
+    }
+
+    private static func transportWarmEligibilityBoundaries() {
+        expect(
+            !NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 749, duration: 1_000
+            ),
+            "transport warm waits below the seventy-five percent boundary"
+        )
+        expect(
+            NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 750, duration: 1_000
+            ),
+            "transport warm starts at the seventy-five percent boundary"
+        )
+        expect(
+            !NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 419.999, duration: 600
+            ),
+            "transport warm waits just outside the one-hundred-eighty-second window"
+        )
+        expect(
+            NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 420, duration: 600
+            ),
+            "transport warm starts at exactly one hundred eighty seconds remaining"
+        )
+        expect(
+            NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 0, duration: 180
+            ),
+            "short episodes warm immediately because their whole runtime is within the warm window"
+        )
+        expect(
+            !NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 239.999, duration: 0
+            ),
+            "durationless playback waits just below the bounded warm threshold"
+        )
+        expect(
+            NextEpisodePreloadPolicy.isTransportWarmEligible(
+                position: 240, duration: 0
+            ),
+            "durationless playback warms at the bounded fallback threshold"
+        )
+        let invalidPairs: [(position: Double, duration: Double)] = [
+            (-0.001, 1_000),
+            (100, -0.001),
+            (.nan, 1_000),
+            (100, .nan),
+            (.infinity, 1_000),
+            (100, .infinity)
+        ]
+        expect(
+            invalidPairs.allSatisfy {
+                !NextEpisodePreloadPolicy.isTransportWarmEligible(
+                    position: $0.position, duration: $0.duration
+                )
+            },
+            "invalid positions and durations cannot start a transport warm-up"
+        )
     }
 
     private static func creditsPreemptAnInFlightAttempt() {
