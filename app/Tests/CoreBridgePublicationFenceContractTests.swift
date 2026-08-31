@@ -20,11 +20,11 @@ private func check(_ condition: Bool, _ name: String) {
     else { Contract.failures += 1; print("FAIL  \(name)") }
 }
 
-private func source() -> String {
+private func source(_ relativePath: String) -> String {
     let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     let candidates = [
-        cwd.appendingPathComponent("app/SourcesShared/CoreBridge.swift"),
-        cwd.appendingPathComponent("SourcesShared/CoreBridge.swift"),
+        cwd.appendingPathComponent("app").appendingPathComponent(relativePath),
+        cwd.appendingPathComponent(relativePath),
     ]
     for url in candidates where FileManager.default.fileExists(atPath: url.path) {
         if let text = try? String(contentsOf: url, encoding: .utf8) { return text }
@@ -43,7 +43,8 @@ private func appearsBefore(_ needle: String, _ other: String, in source: String)
     return left.lowerBound < right.lowerBound
 }
 
-let bridge = source()
+let bridge = source("SourcesShared/CoreBridge.swift")
+let stremioCard = source("SourcesShared/StremioConnectCard.swift")
 let seed = section(bridge, from: "private func seedInitialState()", until: "/// Refresh the installed-addons")
 let refresh = section(bridge, from: "private func refreshAddons()", until: "/// Remove an installed addon")
 let continueWatching = section(bridge, from: "func rebuildContinueWatching()", until: "/// FLOOR each engine")
@@ -57,6 +58,7 @@ let finishSettlement = section(bridge, from: "private func finishSettledAccountB
 let invalidation = section(bridge, from: "private func invalidatePublicationEpoch()", until: "/// ProfileStore calls")
 let profileChange = section(bridge, from: "func activeProfileDidChange()", until: "private func verifyAccountBinding")
 let bootstrap = section(bridge, from: "private func bootstrapAuth()", until: "/// Self-heal a stale")
+let logout = section(bridge, from: "func logOut(rearmSignedOutRepair", until: "/// Clear the published")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
@@ -87,6 +89,18 @@ check(finishSettlement.contains("scheduleSessionRepair()")
                 && bootstrap.contains("Keychain.set(nil, for: self.activeTokenAccount)")
                 && bootstrap.contains("self.scheduleSessionRepair()"),
               "settled, no-token, and imported-away logout contexts each rearm one valid repair timer")
+check(finishSettlement.contains("if switchInFlight {")
+                && finishSettlement.contains("switchInFlight = false")
+                && finishSettlement.contains("switchFromUID = nil")
+                && appearsBefore("switchInFlight = false", "scheduleSessionRepair()", in: finishSettlement),
+              "proof-first legacy switch retires its gate before binding replay or repair")
+check(logout.contains("signedOutRepairAfterLogout = rearmSignedOutRepair")
+                && logout.contains("rearmSignedOutRepairWhenSafe()")
+                && logout.contains("guard !isLoggedIn()")
+                && logout.contains("signedOutRepairAfterLogout = false")
+                && stremioCard.contains("account.signOut()")
+                && stremioCard.contains("core.logOut()"),
+              "explicit Stremio disconnect rearms exactly one local repair after safe engine logout")
 check(seed.contains("capturePublicationToken()")
                 && seed.contains("publicationStillCurrent(publicationToken)")
                 && seed.contains("rebuildContinueWatching(capturedPublicationToken: publicationToken)")

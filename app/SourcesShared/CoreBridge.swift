@@ -130,6 +130,9 @@ final class CoreBridge: ObservableObject {
     private var authBindingGeneration: UInt64 = 0
     private var accountBindingVerificationTask: Task<Void, Never>?
     private var rejectedAccountBindingGeneration: UInt64?
+    /// Explicit disconnect waits for the engine's signed-out ctx before arming local recovery.
+    /// Imported-away logout owns its deterministic recovery separately and sets this false.
+    private var signedOutRepairAfterLogout = false
 
     /// Rust delivers NewState on its own worker.  Auth/profile state belongs to main, so workers must
     /// never read it directly.  They capture this lock-backed, immutable epoch and main validates it
@@ -728,7 +731,7 @@ final class CoreBridge: ObservableObject {
                 Task { @MainActor in
                     if await VortXSyncManager.shared.accountDocReachable() {
                         NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
-                        self.logOut()   // Ctx Logout: kills the Stremio session server-side + resets the engine
+                        self.logOut(rearmSignedOutRepair: false)   // imported-away owns deterministic local recovery below
                         // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
                         // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
                         // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
@@ -943,10 +946,30 @@ final class CoreBridge: ObservableObject {
 
     /// Log out of the engine (clears the persisted profile + library, and kills the session
     /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
-    func logOut() {
+    func logOut(rearmSignedOutRepair: Bool = true) {
         invalidateAuthenticationGeneration()
+        signedOutRepairAfterLogout = rearmSignedOutRepair
         dispatchCtx(["action": "Logout"])
         clearUserState()
+        if rearmSignedOutRepair {
+            DispatchQueue.main.async { [weak self] in self?.rearmSignedOutRepairWhenSafe() }
+        }
+    }
+
+    /// Do not schedule local recovery at logout dispatch time: the engine may still have the old
+    /// authenticated ctx.  A short bounded poll is backed by the ctx receipt path below, and the
+    /// one-shot flag makes both paths converge on exactly one repair timer.
+    private func rearmSignedOutRepairWhenSafe(attempt: Int = 0) {
+        guard signedOutRepairAfterLogout else { return }
+        guard !isLoggedIn() else {
+            guard attempt < 30 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.rearmSignedOutRepairWhenSafe(attempt: attempt + 1)
+            }
+            return
+        }
+        signedOutRepairAfterLogout = false
+        scheduleSessionRepair()
     }
 
     /// Clear the published per-account UI state (rails, library, details).
@@ -2769,6 +2792,7 @@ final class CoreBridge: ObservableObject {
         pendingAccountBinding = nil
         settledAccountBinding = nil
         rejectedAccountBindingGeneration = nil
+        signedOutRepairAfterLogout = false
     }
 
     private var enginePublicationBlocked: Bool {
@@ -2920,6 +2944,13 @@ final class CoreBridge: ObservableObject {
             // the same engine uid, finish the migration here instead of relying on another ctx
             // event that may never come.
             awaitingAuthMigration = false
+            // Proof-first migration may have needed LoginWithToken to replace a restored engine
+            // account.  The same proof+ctx settlement is now authoritative, so retire that
+            // switch gate before binding-dependent replay and the rearmed repair inspect it.
+            if switchInFlight {
+                switchInFlight = false
+                switchFromUID = nil
+            }
             NSLog("[CoreBridge] authKey migration identity verified -> pulling addons + syncing library")
             refreshFromAPI()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
@@ -3036,6 +3067,12 @@ final class CoreBridge: ObservableObject {
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                // Explicit disconnect reaches local recovery only after this signed-out ctx is
+                // visible.  Do not let the default-profile receipt flow into stale account work.
+                if self.signedOutRepairAfterLogout, !self.isLoggedIn() {
+                    self.rearmSignedOutRepairWhenSafe()
+                    return
+                }
                 // `ctx` is control-plane evidence: while B is pending it is the ONLY engine receipt
                 // that can prove the authenticated B token is now resident.  Never apply the data
                 // publication gate before this settlement attempt.
