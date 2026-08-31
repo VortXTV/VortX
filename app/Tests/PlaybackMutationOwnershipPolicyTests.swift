@@ -34,10 +34,14 @@ private struct PlaybackMutationOwnershipPolicyTests {
         let ownerTarget = Policy.Target.engine(profileID: owner, keychainAccount: account, uid: "owner-uid")
         let overlayTarget = Policy.Target.overlay(profileID: overlay)
         let settledOwner = Policy.SettledAccountBinding(profileID: owner, keychainAccount: account,
-                                                        credentialFingerprint: "fp", uid: "owner-uid")
+                                                        credentialFingerprint: "fp", uid: "owner-uid", generation: 1)
         let staleEngineAForSelectedB = Policy.SettledAccountBinding(profileID: replacement,
                                                                       keychainAccount: account,
-                                                                      credentialFingerprint: "fp-b", uid: "owner-uid")
+                                                                      credentialFingerprint: "fp-b", uid: "owner-uid", generation: 2)
+        let restoredProof = Policy.AuthenticatedAccountProof(profileID: owner, keychainAccount: account,
+                                                             credentialFingerprint: "fp", uid: "owner-uid", generation: 1)
+        let rotatedBinding = Policy.SettledAccountBinding(profileID: owner, keychainAccount: account,
+                                                          credentialFingerprint: "rotated", uid: "owner-uid", generation: 2)
 
         check(Policy.allows(ownerTarget, in: ownerContext), "owner callback writes while its account remains active")
         check(!Policy.allows(ownerTarget, in: overlayContext), "owner to overlay switch rejects account callback")
@@ -55,6 +59,26 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "owner target may dispatch an account mutation")
         check(!Policy.allowsAccountMutation(overlayTarget, in: ownerContext),
               "overlay target may never dispatch an account mutation")
+        check(Policy.settle(restoredProof, activeProfileID: owner, activeUsesEngineHistory: true,
+                            activeKeychainAccount: account, activeCredentialFingerprint: "fp",
+                            engineUID: "owner-uid") == settledOwner,
+              "restored logged-in engine requires and accepts independently authenticated token identity")
+        check(Policy.settle(restoredProof, activeProfileID: owner, activeUsesEngineHistory: true,
+                            activeKeychainAccount: account, activeCredentialFingerprint: "fp",
+                            engineUID: "owner-uid") != nil,
+              "same-UID reauthentication settles from authenticated proof rather than uid change")
+        let selectedBProof = Policy.AuthenticatedAccountProof(profileID: replacement, keychainAccount: account,
+                                                              credentialFingerprint: "fp-b", uid: "b-uid", generation: 2)
+        check(Policy.settle(selectedBProof, activeProfileID: replacement, activeUsesEngineHistory: true,
+                            activeKeychainAccount: account, activeCredentialFingerprint: "fp-b",
+                            engineUID: "owner-uid") == nil,
+              "selected B remains unresolved while engine ctx still reports A")
+        check(!Policy.bindingIsCurrent(settledOwner, current: rotatedBinding),
+              "same-slot token rotation invalidates a suspended resolver binding")
+        check(!Policy.allowsResolverDispatch(target: nil, binding: nil),
+              "default resolver caller fails closed without a settled credential binding")
+        check(Policy.allowsResolverDispatch(target: ownerTarget, binding: settledOwner),
+              "resolver dispatch requires the captured target and settled credential binding")
         check(Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
                                                 binding: settledOwner),
               "queued owner add replays only in its original account context")

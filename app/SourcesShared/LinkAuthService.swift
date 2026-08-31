@@ -67,16 +67,15 @@ enum LinkAuthService {
         return .pending
     }
 
-    /// Validates a freshly-linked auth key against the main account API and returns the account email.
-    ///
-    /// This is the gate that stops a REJECTED/expired link token from masquerading as a signed-in
-    /// session: `link.stremio.com` can return a key that `api.strem.io` no longer recognises, in
-    /// which case `getUser` answers `{"error":{"code":1,...}}` ("Session does not exist"). Throwing
-    /// here keeps the caller from flipping the account to signed-in with an empty add-on list. The
-    /// returned email is informational only (it may be `nil` for accounts without one); a non-throw
-    /// is the success signal.
-    @discardableResult
-    static func validate(authKey: String) async throws -> String? {
+    struct AuthenticatedIdentity: Equatable {
+        let uid: String
+        let email: String?
+    }
+
+    /// Validates a Stremio auth key against the main account API and returns the authenticated user
+    /// identity. This is the only token-to-user proof used by CoreBridge; it never parses a token
+    /// locally or infers identity from an active profile.
+    static func authenticatedIdentity(authKey: String) async throws -> AuthenticatedIdentity {
         struct Req: Encodable { let authKey: String }
         guard let url = URL(string: "\(accountAPI)/getUser") else { throw LinkAuthError.badURL }
         var request = URLRequest(url: url)
@@ -91,13 +90,26 @@ enum LinkAuthService {
         }
         let decoded = try JSONDecoder().decode(APIResponse<UserDTO>.self, from: data)
         if let error = decoded.error {
-            // A rejected/expired key surfaces here as a real error rather than being swallowed.
             throw LinkAuthError.server(error.message ?? "This sign-in code is no longer valid.")
         }
-        guard decoded.result != nil else {
-            throw LinkAuthError.server("This sign-in code is no longer valid.")
+        guard let result = decoded.result,
+              let uid = result.uid, !uid.isEmpty else {
+            throw LinkAuthError.server("Account service did not return an authenticated user.")
         }
-        return decoded.result?.email
+        return AuthenticatedIdentity(uid: uid, email: result.email)
+    }
+
+    /// Validates a freshly-linked auth key against the main account API and returns the account email.
+    ///
+    /// This is the gate that stops a REJECTED/expired link token from masquerading as a signed-in
+    /// session: `link.stremio.com` can return a key that `api.strem.io` no longer recognises, in
+    /// which case `getUser` answers `{"error":{"code":1,...}}` ("Session does not exist"). Throwing
+    /// here keeps the caller from flipping the account to signed-in with an empty add-on list. The
+    /// returned email is informational only (it may be `nil` for accounts without one); a non-throw
+    /// is the success signal.
+    @discardableResult
+    static func validate(authKey: String) async throws -> String? {
+        try await authenticatedIdentity(authKey: authKey).email
     }
 
     private static func get<T: Decodable>(_ path: String) async throws -> T {
@@ -130,7 +142,17 @@ enum LinkAuthService {
     }
 
     private struct UserDTO: Decodable {
+        let uid: String?
         let email: String?
+
+        enum CodingKeys: String, CodingKey { case uid = "_id", id, email }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            uid = try c.decodeIfPresent(String.self, forKey: .uid)
+                ?? c.decodeIfPresent(String.self, forKey: .id)
+            email = try c.decodeIfPresent(String.self, forKey: .email)
+        }
     }
 
     private struct LinkDataDTO: Decodable {

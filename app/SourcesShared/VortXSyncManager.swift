@@ -2756,9 +2756,10 @@ final class VortXSyncManager: ObservableObject {
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
                   id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
             let type = (item["type"] as? String) == "series" ? "series" : "movie"
-            await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type, stampIntent: false)
+            if await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type, stampIntent: false) {
+                recovered += 1
+            }
             guard isCurrent(capture) else { return }
-            recovered += 1
         }
         if recovered > 0 {
             DiagnosticsLog.log("sync", "recovered \(recovered) owner-library title(s) from the VortX account on a cold device")

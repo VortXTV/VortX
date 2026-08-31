@@ -25,6 +25,43 @@ enum PlaybackMutationOwnershipPolicy {
         let keychainAccount: String
         let credentialFingerprint: String
         let uid: String
+        let generation: UInt64
+    }
+
+    /// Receipt from an authenticated `getUser` request using the exact token that initiated an
+    /// engine auth. It is not derived from token contents and can therefore prove both restored
+    /// sessions and a same-UID reauthentication.
+    struct AuthenticatedAccountProof: Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let credentialFingerprint: String
+        let uid: String
+        let generation: UInt64
+    }
+
+    static func settle(_ proof: AuthenticatedAccountProof, activeProfileID: UUID?,
+                       activeUsesEngineHistory: Bool, activeKeychainAccount: String,
+                       activeCredentialFingerprint: String?, engineUID: String?) -> SettledAccountBinding? {
+        guard proof.profileID == activeProfileID,
+              activeUsesEngineHistory,
+              proof.keychainAccount == activeKeychainAccount,
+              proof.credentialFingerprint == activeCredentialFingerprint,
+              proof.uid == engineUID else { return nil }
+        return .init(profileID: proof.profileID, keychainAccount: proof.keychainAccount,
+                     credentialFingerprint: proof.credentialFingerprint, uid: proof.uid,
+                     generation: proof.generation)
+    }
+
+    static func bindingIsCurrent(_ captured: SettledAccountBinding,
+                                 current: SettledAccountBinding?) -> Bool {
+        captured == current
+    }
+
+    /// Resolver writes are account mutations, so a profile/uid-only player target is insufficient.
+    /// The target must be paired with the immutable credential binding captured before suspension.
+    static func allowsResolverDispatch(target: Target?, binding: SettledAccountBinding?) -> Bool {
+        guard let binding, case let .engine(profileID, account, uid) = target else { return false }
+        return profileID == binding.profileID && account == binding.keychainAccount && uid == binding.uid
     }
 
     static func allows(_ target: Target, in context: Context) -> Bool {

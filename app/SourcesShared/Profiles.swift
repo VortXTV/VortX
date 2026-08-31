@@ -1918,11 +1918,14 @@ extension ProfileStore {
                 LibraryWatchedMutationPolicy.isCanonicalCatalogID($0.metaId)
                     && LibraryWatchedMutationPolicy.normalizedCatalogType($0.type) != nil
             }
+            var applied = 0
             for item in accepted {
-                await CoreBridge.shared.addCatalogItemToAccount(id: item.metaId, type: item.type)
+                if await CoreBridge.shared.addCatalogItemToAccount(id: item.metaId, type: item.type) {
+                    applied += 1
+                }
             }
-            if !accepted.isEmpty { CoreBridge.shared.loadLibrary() }
-            return (accepted.count, items.count - accepted.count)
+            if applied > 0 { CoreBridge.shared.loadLibrary() }
+            return (applied, items.count - applied)
         }
 
         for item in items {
