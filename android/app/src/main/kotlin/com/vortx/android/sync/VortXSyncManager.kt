@@ -899,6 +899,7 @@ class VortXSyncManager(context: Context) {
 
     @Volatile private var requestTestSeam: SyncRequestTestSeam? = null
     @Volatile private var versionedPayloadTestObserver: (() -> Unit)? = null
+    @Volatile private var sessionRestoreTestSeam: SessionLoad? = null
 
     /** The roster/overlay store the sync engine reads + folds into. Set by [attachSyncSeams]. */
     @Volatile private var profileStore: ProfileStore? = null
@@ -936,7 +937,7 @@ class VortXSyncManager(context: Context) {
      * persisted session stays unknown so another subsystem cannot adopt signed-out local data by mistake.
      */
     internal fun sessionOwnerSnapshot(): SessionOwnerSnapshot = sessionState.serialized {
-        val loaded = store.load()
+        val loaded = sessionRestoreTestSeam ?: store.load()
         val available = loaded as? SessionLoad.Available
         if (available == null) {
             _sessionUiState.value = SessionUiState.UnknownOrUnavailable
@@ -947,6 +948,7 @@ class VortXSyncManager(context: Context) {
         val persistedOwnerEpoch = available.ownerEpoch
         if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable) {
             sessionState.restore(persisted, persistedOwnerEpoch)
+            AddonTombstones.activateAccount(persisted?.account?.id)
             _account.value = persisted?.account
         } else if (
             !sessionTruthMatches(live, persisted) ||
@@ -970,6 +972,21 @@ class VortXSyncManager(context: Context) {
     /** Retry an unavailable/corrupt secure-session read without misclassifying it as sign-out. */
     fun retrySessionRestore() {
         sessionOwnerSnapshot()
+    }
+
+    /** Supplies a persisted session read for local recovery-path tests without weakening secure storage. */
+    internal fun installSessionRestoreTestSeam(
+        testSession: Session?,
+        ownerEpoch: Long = INITIAL_SESSION_OWNER_EPOCH,
+    ) {
+        require(ownerEpoch >= INITIAL_SESSION_OWNER_EPOCH)
+        require(testSession == null || testSession.account.id.isNotBlank())
+        sessionRestoreTestSeam = SessionLoad.Available(testSession, ownerEpoch)
+    }
+
+    /** Forces the retryable secure-storage-unavailable branch for local recovery-path tests. */
+    internal fun installUnavailableSessionRestoreTestSeam() {
+        sessionRestoreTestSeam = SessionLoad.UnknownOrUnavailable
     }
 
     private fun beginAuthOperation(): SessionOperationCoordinator.AuthOperation =

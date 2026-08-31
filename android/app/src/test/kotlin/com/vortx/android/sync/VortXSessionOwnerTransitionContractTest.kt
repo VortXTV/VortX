@@ -64,13 +64,22 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("internal fun sessionOwnerSnapshot(): SessionOwnerSnapshot")
             .substringBefore("/** Retry an unavailable/corrupt secure-session read")
 
-        assertTrue(restore.contains("val loaded = store.load()"))
+        assertTrue(restore.contains("val loaded = sessionRestoreTestSeam ?: store.load()"))
         assertTrue(restore.contains("sessionState.restore(persisted, persistedOwnerEpoch)"))
+        assertTrue(restore.contains("AddonTombstones.activateAccount(persisted?.account?.id)"))
         assertTrue(restore.contains("_account.value = persisted?.account"))
         assertTrue(restore.contains("SessionOwnerSnapshot.SignedOutLocal(sessionState.ownerEpoch)"))
         assertTrue(
             restore.indexOf("if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable)") <
                 restore.indexOf("sessionState.restore(persisted, persistedOwnerEpoch)"),
+        )
+        assertTrue(
+            restore.indexOf("sessionState.restore(persisted, persistedOwnerEpoch)") <
+                restore.indexOf("AddonTombstones.activateAccount(persisted?.account?.id)"),
+        )
+        assertTrue(
+            restore.indexOf("AddonTombstones.activateAccount(persisted?.account?.id)") <
+                restore.indexOf("_account.value = persisted?.account"),
         )
         assertTrue(
             restore.indexOf("sessionState.restore(persisted, persistedOwnerEpoch)") <

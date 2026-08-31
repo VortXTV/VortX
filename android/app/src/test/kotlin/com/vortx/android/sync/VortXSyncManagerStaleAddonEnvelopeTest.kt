@@ -21,6 +21,37 @@ import org.junit.Test
 class VortXSyncManagerStaleAddonEnvelopeTest {
 
     @Test
+    fun `unavailable session retry restores signed in add-on tombstone scope and sync payload`() {
+        val context = MemoryContext()
+        val manager = VortXSyncManager(context)
+        val account = VortXSyncManager.Account("recovered-account", "person@example.test", "person", false)
+        val session = VortXSyncManager.Session("token", account, ByteArray(32) { (it + 1).toByte() })
+        val tombstones = AddonTombstones(context)
+        val removed = "https://recovered.example/manifest.json"
+
+        manager.installUnavailableSessionRestoreTestSeam()
+        assertTrue(manager.sessionOwnerSnapshot() is SessionOwnerSnapshot.UnknownOrUnavailable)
+        manager.installSessionRestoreTestSeam(session, ownerEpoch = 7L)
+        manager.retrySessionRestore()
+
+        assertEquals(SessionOwnerSnapshot.Account(account.id, 7L), manager.sessionOwnerSnapshot())
+        assertTrue(tombstones.tombstone(removed))
+        assertTrue(removed in tombstones.all())
+        assertEquals(
+            mapOf("removedAt" to tombstones.timestampsForSync().getValue(removed).getValue("removedAt")),
+            tombstones.timestampsForSync()[removed],
+        )
+        val syncPayload = applyAddonTombstonesToVortx(JSONObject(), tombstones)
+        assertEquals(removed, syncPayload.getJSONArray("deletedAddons").getString(0))
+        assertTrue(syncPayload.getJSONObject("deletedAddonsTs").has(removed))
+        assertTrue(
+            context.getSharedPreferences("vortx_settings", Context.MODE_PRIVATE)
+                .getString("stremiox.addons.deleted.account.recovered-account", null)
+                ?.contains(removed) == true,
+        )
+    }
+
+    @Test
     fun `public sync down folds only add-on tombstones from an authenticated older envelope`() = runBlocking {
         val main = UnconfinedTestDispatcher()
         Dispatchers.setMain(main)
