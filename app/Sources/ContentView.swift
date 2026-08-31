@@ -17,10 +17,11 @@ struct ContentView: View {
             .fullScreenCover(item: $nowPlaying) { item in
                 PlayerScreen(url: item.url, title: item.title,
                              resumeSeconds: item.resumeSeconds, hasNext: item.hasNext,
-                             onProgress: { time, duration in report("__stremioxProgress", time, duration) },
-                             onSeek: { time, duration in report("__stremioxSeek", time, duration) },
+                             onProgress: { time, duration, _ in report("__stremioxProgress", time, duration) },
+                             onSeek: { time, duration, _ in report("__stremioxSeek", time, duration) },
                              onNext: { nextEpisode() },
                              onClose: { closePlayer() })
+                    .id(item.id)
             }
     }
 

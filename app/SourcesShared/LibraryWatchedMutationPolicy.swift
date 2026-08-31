@@ -47,6 +47,19 @@ enum LibraryWatchedMutationPolicy {
         expected.id == residentID && expected.type == residentType
     }
 
+    static func renderedDetailTarget(routeID: String, routeType: String,
+                                     residentID: String?, residentType: String?) -> DetailTarget {
+        guard let residentID, !residentID.isEmpty,
+              let residentType, !residentType.isEmpty else {
+            return DetailTarget(id: routeID, type: routeType)
+        }
+        return DetailTarget(id: residentID, type: residentType)
+    }
+
+    static func canDispatchCatalogAdd(metaID: String, expectedType: String?, previewID: String?, previewType: String?) -> Bool {
+        metaID == previewID && (expectedType == nil || expectedType == previewType)
+    }
+
     /// Prefer only a ready meta for the open title. A ready response for a previous detail page
     /// must never be used to save the title currently on screen.
     static func detailPreview(targetID: String?, ready: [MetaPreview], catalog: MetaPreview?, decoded: MetaPreview?) -> MetaPreview? {

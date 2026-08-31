@@ -3123,14 +3123,15 @@ extension View {
                 // the engine's loaded Player, so it runs regardless of `item.meta` and no-ops if none is loaded.
                 // The ACCOUNT write moved into PlayerScreen.saveAccountProgress (keyed on curMeta): capturing
                 // item.meta here attributed every in-player binge advance's saves to the LAUNCH episode.
-                onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
-                onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
+                onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onClose: {
                     core.unloadEnginePlayer()
                     launch.wrappedValue = nil
                 }
             )
             .ignoresSafeArea()
+            .id(item.id)
         }
     }
 }

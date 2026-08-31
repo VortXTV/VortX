@@ -71,15 +71,15 @@ enum LibraryAutoAdd {
         guard !hasAutoAdded(id, profileID: profileID) else { return }   // already auto-added once for this profile -> respect removal
 
         if target.overlayProfileID == nil {
+            let type = meta.usesSeriesLifecycle ? "series" : "movie"
             // MAIN profile: go through the engine. Prefer the loaded meta_details (exact engine shape); if that
             // is not this title (a hub/CW launch may have replaced it), resolve the full meta from Cinemeta and
             // dispatch AddToLibrary. Both routes are the account-syncing engine path, never an app libraryItem.
-            if let loaded = core.metaDetails?.meta, loaded.id == id {
-                core.addToLibrary(metaId: id)
+            if let loaded = core.metaDetails?.meta, loaded.id == id, loaded.type == type,
+               core.addToLibrary(metaId: id, expectedType: type, target: target) {
                 rememberAutoAdded(id, profileID: profileID)
-                NSLog("[autolib] auto-added %@ to account library (engine, loaded meta)", id)
+                NSLog("[autolib] auto-added %@ to account library (engine, exact loaded meta)", id)
             } else {
-                let type = meta.usesSeriesLifecycle ? "series" : "movie"
                 Task { @MainActor in
                     // Only remember the auto-add once the account write actually succeeded; a failed resolve
                     // must retry on the next play, not be silently pinned as "already added".

@@ -50,6 +50,18 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "owner target may dispatch an account mutation")
         check(!Policy.allowsAccountMutation(overlayTarget, in: ownerContext),
               "overlay target may never dispatch an account mutation")
+        check(Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
+                                                activeProfileID: owner, activeAccount: account,
+                                                activeCredentialFingerprint: "fp", activeUID: "owner-uid"),
+              "queued owner add replays only in its original account context")
+        check(!Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
+                                                 activeProfileID: overlay, activeAccount: account,
+                                                 activeCredentialFingerprint: "fp", activeUID: "owner-uid"),
+              "queued owner add rejects an overlay context")
+        check(!Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
+                                                 activeProfileID: owner, activeAccount: account,
+                                                 activeCredentialFingerprint: "other", activeUID: "owner-uid"),
+              "queued owner add rejects a replaced credential")
         check(Policy.overlayEntries(from: nil, as: CacheEntry.self).isEmpty,
               "first inactive-overlay callback starts from an empty cache")
         let encoded = try! JSONEncoder().encode(["tt1": CacheEntry(value: 1)])

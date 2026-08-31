@@ -164,6 +164,18 @@ struct UserProfile: Codable, Identifiable, Equatable {
 /// primary slot keeps serving every shared profile. Mutate from the main thread only (the
 /// ThemeManager pattern; views observe via @EnvironmentObject).
 final class ProfileStore: ObservableObject {
+    /// Dashboard owner-library adds can arrive while another profile/account is visible. Keep their
+    /// intent bound to the receiving profile plus the exact credential fingerprint; replay only after
+    /// that same engine account is resident, never through the currently selected overlay.
+    private struct PendingAccountLibraryAdd: Codable, Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let credentialFingerprint: String
+        let metaID: String
+        let type: String
+    }
+    private static let pendingAccountLibraryAddsKey = "stremiox.profiles.pendingAccountLibraryAdds"
+    private var pendingAccountLibraryReplayIDs: Set<String> = []
     static let shared = ProfileStore()
 
     @Published private(set) var profiles: [UserProfile] = []
@@ -298,6 +310,70 @@ final class ProfileStore: ObservableObject {
                                       : Self.primaryTokenAccount
     }
 
+    private static func accountFingerprint(_ account: String) -> String? {
+        guard let token = Keychain.string(account), !token.isEmpty else { return nil }
+        return SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func pendingAccountLibraryAdds() -> [PendingAccountLibraryAdd] {
+        guard let data = UserDefaults.standard.data(forKey: Self.pendingAccountLibraryAddsKey),
+              let values = try? JSONDecoder().decode([PendingAccountLibraryAdd].self, from: data) else { return [] }
+        return values
+    }
+
+    private func savePendingAccountLibraryAdds(_ values: [PendingAccountLibraryAdd]) {
+        if values.isEmpty {
+            UserDefaults.standard.removeObject(forKey: Self.pendingAccountLibraryAddsKey)
+        } else if let data = try? JSONEncoder().encode(values) {
+            UserDefaults.standard.set(data, forKey: Self.pendingAccountLibraryAddsKey)
+        }
+    }
+
+    /// Preserve a dashboard add for its intended engine-backed profile. The current profile is
+    /// intentionally irrelevant here: a shared/overlay profile must never be used as a fallback.
+    private func enqueueAccountLibraryAdd(profile: UserProfile, metaID: String, type: String) {
+        guard profile.usesEngineHistory,
+              let fingerprint = Self.accountFingerprint(keychainAccount(for: profile)) else { return }
+        let entry = PendingAccountLibraryAdd(profileID: profile.id,
+                                             keychainAccount: keychainAccount(for: profile),
+                                             credentialFingerprint: fingerprint,
+                                             metaID: metaID,
+                                             type: type == "series" ? "series" : "movie")
+        var entries = pendingAccountLibraryAdds()
+        guard !entries.contains(entry) else { return }
+        entries.append(entry)
+        savePendingAccountLibraryAdds(entries)
+    }
+
+    /// Called only after a ctx event has made an engine account resident. Every queue record is
+    /// matched against profile, keychain slot, credential fingerprint, and current uid before its
+    /// async account mutation begins; failed attempts remain queued for the next valid ctx event.
+    func replayPendingAccountLibraryAdds(core: CoreBridge) {
+        guard let profile = active, profile.usesEngineHistory,
+              let uid = core.currentUID() else { return }
+        let account = keychainAccount(for: profile)
+        guard account == activeKeychainAccount,
+              let fingerprint = Self.accountFingerprint(account) else { return }
+        let target = PlaybackMutationTarget.engine(profileID: profile.id, keychainAccount: account, uid: uid)
+        for entry in pendingAccountLibraryAdds() where PlaybackMutationOwnershipPolicy.allowsQueuedAccountReplay(
+            profileID: entry.profileID, account: entry.keychainAccount,
+            credentialFingerprint: entry.credentialFingerprint, activeProfileID: profile.id,
+            activeAccount: account, activeCredentialFingerprint: fingerprint, activeUID: uid) {
+            let replayID = "\(entry.profileID.uuidString):\(entry.metaID):\(entry.type)"
+            guard !pendingAccountLibraryReplayIDs.contains(replayID) else { continue }
+            pendingAccountLibraryReplayIDs.insert(replayID)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let applied = await core.addCatalogItemToAccount(
+                    id: entry.metaID, type: entry.type, target: target)
+                self.pendingAccountLibraryReplayIDs.remove(replayID)
+                guard applied else { return }
+                self.savePendingAccountLibraryAdds(
+                    self.pendingAccountLibraryAdds().filter { $0 != entry })
+            }
+        }
+    }
+
     /// What the account layer must do after a switch. `.switchAccount` carries the new profile's
     /// stored token; `.needsSignIn` means the profile wants its own account but has no session yet.
     enum SwitchOutcome { case sameAccount, switchAccount(token: String), needsSignIn }
@@ -379,6 +455,7 @@ final class ProfileStore: ObservableObject {
         if target.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: target)) }
         UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(target.id))
         UserDefaults.standard.removeObject(forKey: Self.watchRemovalKey(target.id))
+        savePendingAccountLibraryAdds(pendingAccountLibraryAdds().filter { $0.profileID != target.id })
         tombstone(target.id)   // durable cross-device delete; the union-merge can no longer resurrect it
         persist()
         if activeID == target.id, let first = profiles.first { return select(first) }
@@ -455,13 +532,15 @@ final class ProfileStore: ObservableObject {
                 guard let uuid = UUID(uuidString: idStr), let items = raw as? [[String: Any]] else { continue }
                 if let target = profiles.first(where: { $0.id == uuid }), target.usesEngineHistory {
                     // Owner / own-account profile: its library IS the account (engine) library, not an
-                    // overlay. Add each resolved Cinemeta title to the engine (real catalog id, safe for
-                    // account sync). applyRemoteOverlay would skip it (it refuses engine-backed profiles).
+                    // overlay. A dashboard edit may arrive while a different local account is active,
+                    // so queue the real catalog add for the target's exact credential and replay only
+                    // when that account's ctx is resident. Never redirect it through an overlay.
                     for it in items {
                         guard let metaId = it["id"] as? String, !metaId.isEmpty else { continue }
                         let type = (it["type"] as? String) ?? "movie"
-                        Task { await CoreBridge.shared.addCatalogItemToAccount(id: metaId, type: type) }
+                        enqueueAccountLibraryAdd(profile: target, metaID: metaId, type: type)
                     }
+                    replayPendingAccountLibraryAdds(core: CoreBridge.shared)
                     continue
                 }
                 var entries: [String: WatchEntry] = [:]

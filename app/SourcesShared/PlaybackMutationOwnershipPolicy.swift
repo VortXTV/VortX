@@ -36,6 +36,15 @@ enum PlaybackMutationOwnershipPolicy {
         return allows(target, in: context)
     }
 
+    static func allowsQueuedAccountReplay(profileID: UUID, account: String, credentialFingerprint: String,
+                                          activeProfileID: UUID?, activeAccount: String,
+                                          activeCredentialFingerprint: String?, activeUID: String?) -> Bool {
+        profileID == activeProfileID
+            && account == activeAccount
+            && credentialFingerprint == activeCredentialFingerprint
+            && activeUID != nil
+    }
+
     /// An inactive overlay may not have been played before, hence no cache file exists yet. Its
     /// first callback must start from an empty dictionary rather than being silently discarded.
     static func overlayEntries<Entry: Decodable>(from data: Data?, as: Entry.Type) -> [String: Entry] {

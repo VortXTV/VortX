@@ -39,6 +39,21 @@ private struct LibraryWatchedMutationContractTests {
               "stale detail closure rejects a replacement resident meta")
         check(!Policy.residentMatches(expectedSeries, residentID: series.id, residentType: "movie"),
               "detail target requires matching type as well as id")
+        check(Policy.renderedDetailTarget(routeID: "tmdb:7", routeType: "movie",
+                                          residentID: series.id, residentType: series.type) == expectedSeries,
+              "recovered detail uses its rendered resident identity")
+        check(Policy.renderedDetailTarget(routeID: "tmdb:7", routeType: "movie",
+                                          residentID: nil, residentType: nil) == .init(id: "tmdb:7", type: "movie"),
+              "preload detail retains route identity only as a fallback")
+        check(Policy.canDispatchCatalogAdd(metaID: series.id, expectedType: series.type,
+                                           previewID: series.id, previewType: series.type),
+              "auto add confirms an exact catalog dispatch target")
+        check(!Policy.canDispatchCatalogAdd(metaID: series.id, expectedType: series.type,
+                                            previewID: series.id, previewType: "movie"),
+              "auto add refuses a catalog preview with the wrong type")
+        check(!Policy.canDispatchCatalogAdd(metaID: series.id, expectedType: series.type,
+                                            previewID: nil, previewType: nil),
+              "auto add does not claim dispatch without a catalog preview")
 
         // Movie and series, watched and unwatched, produce deterministic engine action sequences.
         for watched in [false, true] {

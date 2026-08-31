@@ -185,6 +185,7 @@ struct FeaturedHeroView: View {
             PlayerScreen(url: launch.url, title: launch.title, headers: nil, resumeSeconds: 0,
                          recordMeta: nil, isTrailer: true, audioSidecarURL: launch.audioSidecarURL,
                          onClose: { trailerPlay = nil })
+                .id(launch.id)
                 .ignoresSafeArea()
         }
     }

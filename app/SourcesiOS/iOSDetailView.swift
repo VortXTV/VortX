@@ -382,7 +382,11 @@ struct iOSDetailView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var detailTarget: LibraryWatchedMutationPolicy.DetailTarget {
-        .init(id: id, type: type)
+        // A recovered route (for example tmdb -> tt) must mutate the exact resident title the
+        // viewer sees. Before a meta is resident the route remains only a fail-closed fallback.
+        LibraryWatchedMutationPolicy.renderedDetailTarget(
+            routeID: metaRequestID, routeType: effectiveType,
+            residentID: meta?.id, residentType: meta?.type)
     }
 
     /// A remote Continue Watching offer remains readable only while its exact Trakt credential session is
@@ -1097,14 +1101,15 @@ struct iOSDetailView: View {
                     // watched time is tracked. The ACCOUNT write (account.saveProgress) moved INTO PlayerScreen
                     // (saveAccountProgress, keyed on curMeta): closing over launch.meta here pinned every account
                     // save to the LAUNCH episode across in-player binge advances (wrong-episode CW attribution).
-                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
-                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
+                    onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                    onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                     onClose: {
                         core.unloadEnginePlayer()
                         presentation = nil
                     }
                 )
                 .ignoresSafeArea()
+                .id(launch.id)
             case .trailerPlayer(let url, let title, let audioSidecar):
                 PlayerScreen(url: url, title: title, headers: nil, resumeSeconds: 0,
                              recordMeta: nil, isTrailer: true, audioSidecarURL: audioSidecar,
@@ -4274,14 +4279,15 @@ struct iOSEpisodeStreams: View {
                     // Engine feed only: the ACCOUNT write lives in PlayerScreen.saveAccountProgress, keyed on
                     // curMeta, so a binge advance attributes progress to the CURRENT episode (capturing
                     // launch.meta here saved every advance's progress against the launch episode).
-                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
-                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur) },
+                    onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                    onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                     onClose: {
                         core.unloadEnginePlayer()
                         presentation = nil
                     }
                 )
                 .ignoresSafeArea()
+                .id(launch.id)
             case .trailer(let launch):
                 // #95: a tapped trailer row plays in the SAME native player as a stream but with isTrailer:true
                 // and no recordMeta, so a dead trailer shows "Trailer unavailable" and never hops to content.

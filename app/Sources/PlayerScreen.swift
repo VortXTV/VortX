@@ -188,8 +188,10 @@ struct PlayerScreen: View {
     /// `loadEpisode`: it must NOT touch the engine's meta/player slot (that would hijack the current
     /// episode's progress), it only warms network I/O. Series detail wires it; nil elsewhere is a no-op.
     var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
-    var onProgress: (Double, Double) -> Void = { _, _ in }   // periodic forward progress (TimeChanged)
-    var onSeek: (Double, Double) -> Void = { _, _ in }       // exact position on user-seek (Seek)
+    /// The session target is forwarded to presenters that feed the engine, so this legacy callback
+    /// boundary cannot accidentally recapture whichever profile becomes active later.
+    var onProgress: (Double, Double, PlaybackMutationTarget) -> Void = { _, _, _ in }
+    var onSeek: (Double, Double, PlaybackMutationTarget) -> Void = { _, _, _ in }
     var onNext: () -> Void = {}                             // advance to the next episode (legacy, non-episode callers)
     let onClose: () -> Void
 
@@ -5532,7 +5534,7 @@ struct PlayerScreen: View {
                     // other save (the hosts no longer write the account from the closures).
                     if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
                        duration > 0 {
-                        if engineWritesOpen { onSeek(0, duration) }
+                        if engineWritesOpen { onSeek(0, duration, playbackMutationTarget) }
                         lastReported = 0
                         saveAccountProgress(0)
                     }
@@ -7922,7 +7924,7 @@ struct PlayerScreen: View {
             if position < floor { return }
             suppressedResumeFloor = nil
         }
-        if engineWritesOpen { onProgress(position, duration) }
+        if engineWritesOpen { onProgress(position, duration, playbackMutationTarget) }
         saveAccountProgress(position, acceptedOwner: integrityOwner)
     }
 
@@ -7939,7 +7941,7 @@ struct PlayerScreen: View {
             if target < floor { return }
             suppressedResumeFloor = nil
         }
-        if engineWritesOpen { onSeek(target, duration) }
+        if engineWritesOpen { onSeek(target, duration, playbackMutationTarget) }
         lastReported = target
         saveAccountProgress(target)
     }

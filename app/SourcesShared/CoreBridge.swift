@@ -2242,18 +2242,26 @@ final class CoreBridge: ObservableObject {
 
     /// Add a catalog item to the library. Round-trips the engine's own `MetaItemPreview` JSON (found by id
     /// in whichever catalog field holds it) so the shape is exactly what the engine expects back.
-    func addToLibrary(metaId: String) {
-        guard ProfileStore.shared.activeUsesEngineHistory else {
+    @discardableResult
+    func addToLibrary(metaId: String, expectedType: String? = nil,
+                      target: PlaybackMutationTarget? = nil) -> Bool {
+        let target = target ?? PlaybackMutationTarget.capture(core: self)
+        guard target.stillOwnsCurrentContext(core: self) else { return false }
+        guard target.overlayProfileID == nil else {
             // Overlay profile: save to the profile's private overlay, never the account library.
             if let info = overlayDisplayInfo(forId: metaId) {
                 ProfileStore.shared.addLibraryEntry(metaId: metaId, name: info.name,
                                                     type: info.type, poster: info.poster)
             }
-            return
+            return false
         }
-        guard let raw = rawMetaPreview(forId: metaId) else { return }
+        guard let raw = rawMetaPreview(forId: metaId),
+              LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
+                metaID: metaId, expectedType: expectedType,
+                previewID: raw["id"] as? String, previewType: raw["type"] as? String) else { return false }
         LibraryTombstones.forget(metaId)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
         dispatchCtx(["action": "AddToLibrary", "args": raw])
+        return true
     }
 
     /// Add a fully-formed meta object (e.g. a Cinemeta title resolved from a played magnet/link, #81) to
@@ -2690,6 +2698,9 @@ final class CoreBridge: ObservableObject {
                     self.refreshFromAPI()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
                 }
+                // Dashboard owner-library edits received while another profile was selected are
+                // replayed only after this ctx proves their exact engine account is resident.
+                ProfileStore.shared.replayPendingAccountLibraryAdds(core: self)
             }
         }
 
