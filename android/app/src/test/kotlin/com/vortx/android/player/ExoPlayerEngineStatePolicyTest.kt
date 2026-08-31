@@ -88,7 +88,7 @@ class ExoPlayerEngineStatePolicyTest {
     }
 
     @Test
-    fun `all ordinary Media3 streams use a redirect-capable http factory`() {
+    fun `trusted ordinary Media3 streams use a redirect-capable default factory`() {
         val source = readSource("ExoPlayerEngine.kt")
         val loadStart = source.indexOf("override fun load(playable: Playable)")
         val loadEnd = source.indexOf("override fun play()", startIndex = loadStart)
@@ -96,7 +96,9 @@ class ExoPlayerEngineStatePolicyTest {
 
         assertTrue(source.contains("val http = DefaultHttpDataSource.Factory().apply"))
         assertTrue(source.contains("setAllowCrossProtocolRedirects(true)"))
-        assertTrue(source.contains("return DefaultDataSource.Factory(appContext, http)"))
+        assertTrue(source.contains("DefaultDataSource.Factory(appContext, http)"))
+        assertTrue(source.contains("CommunityJsMedia3DataSourceFactory(rootUrl, scopedHeaders)"))
+        assertFalse(source.contains("DefaultDataSource.Factory(appContext, CommunityJsMedia3DataSourceFactory"))
         assertTrue(load.contains("val videoDataSource = media3DataSourceFactory"))
         assertTrue(load.contains("SingleSampleMediaSource") || source.contains("SingleSampleMediaSource.Factory"))
         assertFalse(load.contains("else {\n            DefaultMediaSourceFactory(appContext)"))

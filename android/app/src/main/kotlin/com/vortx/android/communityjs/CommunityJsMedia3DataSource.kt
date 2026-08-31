@@ -27,6 +27,8 @@ internal class CommunityJsMedia3DataSourceFactory(
     private val headers = providerHeaders.toMap()
 
     override fun createDataSource(): DataSource = CommunityJsMedia3DataSource(root, headers, timeoutMs)
+
+    internal fun admitsForTesting(rawUrl: String): Boolean = CommunityJsHttpPolicy.admit(rawUrl) != null
 }
 
 @UnstableApi
@@ -69,8 +71,7 @@ private class CommunityJsMedia3DataSource(
         var body = dataSpec.httpBody
         repeat(MAX_REDIRECTS + 1) { hop ->
             val request = Request.Builder().url(current).apply {
-                val scoped = CommunityJsHttpPolicy.requestHeaders(root, current, providerHeaders) +
-                    CommunityJsHttpPolicy.transportHeaders(dataSpec.httpRequestHeaders)
+                val scoped = communityJsMedia3RequestHeaders(root, current, providerHeaders, dataSpec.httpRequestHeaders)
                 scoped.forEach { (name, value) -> header(name, value) }
                 if (dataSpec.position != 0L || dataSpec.length != C.LENGTH_UNSET.toLong()) {
                     val end = if (dataSpec.length == C.LENGTH_UNSET.toLong()) "" else (dataSpec.position + dataSpec.length - 1).toString()
@@ -96,28 +97,25 @@ private class CommunityJsMedia3DataSource(
             }
             if (!next.isSuccessful) { val code = next.code; next.close(); throw IOException("HTTP $code") }
             val responseLength = next.body?.contentLength()?.takeIf { it >= 0L } ?: C.LENGTH_UNSET.toLong()
-            val skipBytes = when {
-                dataSpec.position == 0L -> 0L
-                next.code == 206 -> {
-                    val rangeStart = next.header("Content-Range")?.let(CONTENT_RANGE_START::find)
-                        ?.groupValues?.getOrNull(1)?.toLongOrNull()
-                    if (rangeStart != dataSpec.position) { next.close(); throw IOException("Invalid HTTP range response") }
-                    0L
-                }
-                next.code == 200 -> dataSpec.position
-                else -> { next.close(); throw IOException("Invalid HTTP range response") }
+            val responsePlan = try {
+                communityJsMedia3ResponsePlan(
+                    position = dataSpec.position,
+                    requestedLength = dataSpec.length,
+                    responseCode = next.code,
+                    contentRange = next.header("Content-Range"),
+                    responseLength = responseLength,
+                )
+            } catch (error: IOException) {
+                next.close()
+                throw error
             }
             response = next
             input = next.body?.byteStream()
             currentUri = Uri.parse(current.toString())
-            remaining = when {
-                dataSpec.length != C.LENGTH_UNSET.toLong() -> dataSpec.length
-                responseLength != C.LENGTH_UNSET.toLong() -> (responseLength - skipBytes).coerceAtLeast(0L)
-                else -> C.LENGTH_UNSET.toLong()
-            }
+            remaining = responsePlan.remaining
             opened = true
             transferStarted(dataSpec)
-            if (skipBytes > 0L) skipFully(skipBytes)
+            if (responsePlan.skipBytes > 0L) skipFully(responsePlan.skipBytes)
             return remaining
         }
         throw IOException("Too many redirects")
@@ -128,10 +126,11 @@ private class CommunityJsMedia3DataSource(
         if (remaining == 0L) return C.RESULT_END_OF_INPUT
         val count = input?.read(buffer, offset, if (remaining == C.LENGTH_UNSET.toLong()) length else minOf(length.toLong(), remaining).toInt())
             ?: C.RESULT_END_OF_INPUT
-        if (count < 0) return C.RESULT_END_OF_INPUT
-        if (remaining != C.LENGTH_UNSET.toLong()) remaining -= count
-        bytesTransferred(count)
-        return count
+        val readResult = communityJsMedia3ReadResult(count, remaining)
+        if (readResult < 0) return readResult
+        if (remaining != C.LENGTH_UNSET.toLong()) remaining -= readResult
+        bytesTransferred(readResult)
+        return readResult
     }
 
     override fun getUri(): Uri? = currentUri
@@ -160,6 +159,55 @@ private class CommunityJsMedia3DataSource(
     private companion object {
         const val MAX_REDIRECTS = 5
         val REDIRECTS = setOf(301, 302, 303, 307, 308)
-        val CONTENT_RANGE_START = Regex("^bytes\\s+(\\d+)-", RegexOption.IGNORE_CASE)
     }
 }
+
+internal data class CommunityJsMedia3ResponsePlan(
+    val skipBytes: Long,
+    val remaining: Long,
+)
+
+/** Pure response routing used by the datasource and JVM tests without constructing Android [DataSpec]. */
+internal fun communityJsMedia3ResponsePlan(
+    position: Long,
+    requestedLength: Long,
+    responseCode: Int,
+    contentRange: String?,
+    responseLength: Long,
+): CommunityJsMedia3ResponsePlan {
+    val skipBytes = when {
+        position == 0L -> 0L
+        responseCode == 206 -> {
+            val rangeStart = contentRange?.let(CONTENT_RANGE_START::find)
+                ?.groupValues?.getOrNull(1)?.toLongOrNull()
+            if (rangeStart != position) throw IOException("Invalid HTTP range response")
+            0L
+        }
+        responseCode == 200 -> position
+        else -> throw IOException("Invalid HTTP range response")
+    }
+    val remaining = when {
+        requestedLength != C.LENGTH_UNSET.toLong() -> requestedLength
+        responseLength != C.LENGTH_UNSET.toLong() -> (responseLength - skipBytes).coerceAtLeast(0L)
+        else -> C.LENGTH_UNSET.toLong()
+    }
+    return CommunityJsMedia3ResponsePlan(skipBytes, remaining)
+}
+
+/** Preserve unknown-length EOF while making a premature finite response an I/O failure. */
+internal fun communityJsMedia3ReadResult(bytesRead: Int, remaining: Long): Int {
+    if (bytesRead >= 0) return bytesRead
+    if (remaining == C.LENGTH_UNSET.toLong()) return C.RESULT_END_OF_INPUT
+    throw IOException("Unexpected end of response")
+}
+
+/** Provider credentials remain exact-origin scoped while Media3 forwarding is limited to safe headers. */
+internal fun communityJsMedia3RequestHeaders(
+    root: HttpUrl,
+    target: HttpUrl,
+    providerHeaders: Map<String, String>,
+    media3Headers: Map<String, String>,
+): Map<String, String> = CommunityJsHttpPolicy.requestHeaders(root, target, providerHeaders) +
+    CommunityJsHttpPolicy.transportHeaders(media3Headers)
+
+private val CONTENT_RANGE_START = Regex("^bytes\\s+(\\d+)-", RegexOption.IGNORE_CASE)

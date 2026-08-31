@@ -1,5 +1,7 @@
 package com.vortx.android.player
 
+import androidx.media3.datasource.DataSource
+import com.vortx.android.communityjs.CommunityJsMedia3DataSourceFactory
 import com.vortx.android.model.ExternalSubtitle
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
@@ -183,8 +185,49 @@ class ExoPlayerSidecarTransportTest {
         assertTrue(source.contains("setMimeType(mime)"))
         assertTrue(source.contains("setSelectionFlags(C.SELECTION_FLAG_DEFAULT)"))
         assertTrue(source.contains("setAllowCrossProtocolRedirects(true)"))
-        assertTrue(source.contains("return DefaultDataSource.Factory(appContext, http)"))
+        assertTrue(source.contains("DefaultDataSource.Factory(appContext, http)"))
+        assertFalse(source.contains("DefaultDataSource.Factory(appContext, CommunityJsMedia3DataSourceFactory"))
         assertFalse(source.contains("setSubtitleConfigurations(subtitleConfigs)"))
+    }
+
+    @Test
+    fun `community media factory rejects non-http child schemes while trusted route stays selectable`() {
+        val restricted = CommunityJsMedia3DataSourceFactory(
+            rootUrl = "https://93.184.216.34/master.m3u8",
+            providerHeaders = mapOf("Authorization" to "secret"),
+        )
+        assertFalse(restricted.admitsForTesting("file:///data/user/0/com.vortx.android/private"))
+        assertFalse(restricted.admitsForTesting("content://com.vortx.android/private"))
+        assertTrue(restricted.admitsForTesting("https://93.184.216.34/segment.ts"))
+
+        val trusted = object : DataSource.Factory {
+            override fun createDataSource(): DataSource = error("not opened")
+        }
+        assertTrue(selectMedia3DataSourceFactory(true, restricted = { restricted }, trusted = { trusted }) === restricted)
+        assertTrue(selectMedia3DataSourceFactory(false, restricted = { restricted }, trusted = { trusted }) === trusted)
+    }
+
+    @Test
+    fun `community playback never enters adaptive probe but trusted playback remains unchanged`() {
+        val secret = "provider-probe-secret"
+        val community = Playable(
+            url = "https://media.example/video.m3u8?token=$secret",
+            title = "Community",
+            headers = mapOf("Authorization" to secret),
+            communityJsTransport = true,
+        )
+        var communityCalls = 0
+        noteAdaptiveStreamIfTrusted(community) { _, _ -> communityCalls++ }
+        assertEquals(0, communityCalls)
+
+        val trusted = community.copy(
+            url = "https://trusted.example/video.m3u8",
+            headers = mapOf("Referer" to "https://trusted.example/"),
+            communityJsTransport = false,
+        )
+        var observed: Pair<String, Map<String, String>>? = null
+        noteAdaptiveStreamIfTrusted(trusted) { url, headers -> observed = url to headers }
+        assertEquals(trusted.url to trusted.headers, observed)
     }
 
     private fun readSource(name: String): String {

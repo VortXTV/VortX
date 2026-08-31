@@ -24,6 +24,7 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.DefaultDataSource
+import androidx.media3.datasource.DataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -220,7 +221,9 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
         // Record this stream so the adaptive tuner can (when opted in, on an unmetered link) measure its
         // host in the background for the NEXT play. Fail-soft and gated inside noteStream.
-        AdaptiveTuning.noteStream(appContext, playable.url, playable.headers)
+        noteAdaptiveStreamIfTrusted(playable) { url, headers ->
+            AdaptiveTuning.noteStream(appContext, url, headers)
+        }
 
         // External sidecars need a concrete Media3 MIME. Admit recognized path extensions and explicit
         // format metadata carried by extensionless URLs. Opaque extensionless URLs are rejected with a
@@ -324,17 +327,24 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         headers: Map<String, String>,
         userAgent: String? = null,
         communityJsTransport: Boolean = false,
-    ): DefaultDataSource.Factory {
-        if (communityJsTransport) {
-            val scopedHeaders = if (userAgent.isNullOrEmpty()) headers else headers + ("User-Agent" to userAgent)
-            return DefaultDataSource.Factory(appContext, CommunityJsMedia3DataSourceFactory(rootUrl, scopedHeaders))
-        }
-        val http = DefaultHttpDataSource.Factory().apply {
-            if (headers.isNotEmpty()) setDefaultRequestProperties(headers)
-            userAgent?.takeIf(String::isNotEmpty)?.let(::setUserAgent)
-            setAllowCrossProtocolRedirects(true)
-        }
-        return DefaultDataSource.Factory(appContext, http)
+    ): DataSource.Factory {
+        return selectMedia3DataSourceFactory(
+            communityJsTransport = communityJsTransport,
+            restricted = {
+                val scopedHeaders = if (userAgent.isNullOrEmpty()) headers else headers + ("User-Agent" to userAgent)
+                // Do not wrap this in DefaultDataSource: that class dispatches file/content/asset/data/
+                // rawresource/udp itself, which would let an untrusted manifest child bypass HTTP policy.
+                CommunityJsMedia3DataSourceFactory(rootUrl, scopedHeaders)
+            },
+            trusted = {
+                val http = DefaultHttpDataSource.Factory().apply {
+                    if (headers.isNotEmpty()) setDefaultRequestProperties(headers)
+                    userAgent?.takeIf(String::isNotEmpty)?.let(::setUserAgent)
+                    setAllowCrossProtocolRedirects(true)
+                }
+                DefaultDataSource.Factory(appContext, http)
+            },
+        )
     }
 
     override fun play() { player.play() }
@@ -574,6 +584,19 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
         // known, else its own 50 Mbps default), so the constant that used to live here moved there.
     }
 }
+
+internal fun noteAdaptiveStreamIfTrusted(
+    playable: Playable,
+    probe: (String, Map<String, String>) -> Unit,
+) {
+    if (!playable.communityJsTransport) probe(playable.url, playable.headers)
+}
+
+internal fun selectMedia3DataSourceFactory(
+    communityJsTransport: Boolean,
+    restricted: () -> DataSource.Factory,
+    trusted: () -> DataSource.Factory,
+): DataSource.Factory = if (communityJsTransport) restricted() else trusted()
 
 /** Apply a Media3 playback status while preserving the terminal-state exclusivity contract. */
 internal fun PlayerState.withPlaybackStatus(buffering: Boolean, ended: Boolean): PlayerState = copy(
