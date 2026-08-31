@@ -4,6 +4,79 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.16 (build 234)
+
+### Cross-platform reliability release
+
+**The action you chose stays attached to the right title, player, profile, and account.** This release closes a broad class of timing failures across Apple and Android. Starting a different title, switching profiles, signing out, removing an add-on, marking something watched, dismissing player controls, or recovering from interrupted playback can no longer let delayed work from an earlier screen or session overwrite what you are doing now.
+
+### Playback
+
+**A pause stays paused.** On Apple, an internal cache flush or delayed end notification can no longer impersonate episode completion while AVPlayer is manually paused. A paused movie cannot restart by itself, and a paused series episode cannot advance to the next episode without the viewer choosing Play.
+
+**Apple recovery keeps the selected player while it remains healthy.** Stall recovery preserves AVPlayer intent, avoids discarding a healthy remux producer, keeps the track-reset behavior required by libmpv, and prevents competing recovery owners from selecting the wrong fallback. A genuine terminal failure remains a failure instead of being translated into a successful end during cleanup.
+
+**Android mpv is safer under buffering and teardown pressure.** Cache-starvation recovery is bounded, unsupported disk-cache behavior is no longer advertised as a fix, native handle destruction is serialized, and reentrant startup, teardown, terminal-event, audio-fallback, and engine-handoff paths are fenced so an old player instance cannot take control of a new session.
+
+**Audio and subtitle selections survive the recovery that owns them.** The selected audio route is retained through supported player handoffs. Android Media3 and mpv subtitle sidecars isolate request headers, validate DNS and destinations, close cancelled responses, retain the correct request owner, bound copied content, and allow workers to exit cleanly.
+
+**Player controls remain usable on a remote.** Android TV compacts overflowing controls, restores focus to the control that opened a sheet, and returns from the player without leaving the app trapped in the wrong orientation. Apple TV source-column navigation now has a defined upward boundary.
+
+### Continue Watching, Library, and watched state
+
+**The same title has one cross-platform identity.** Apple, Android, and web now share the same Continue Watching identity and deduplication rules. The same series is less likely to appear twice after sync, provider-scoped episode identifiers no longer collide, and movie identifiers retain the suffixes required to distinguish the actual item.
+
+**Removing a Continue Watching item sticks.** Removal tombstones persist and merge deterministically across devices, so an older copy cannot resurrect a row that was deliberately removed.
+
+**Library and watched actions apply to the resident title and settled account.** Add or remove Library, watched or unwatched, per-episode, per-season, whole-series, playback-driven, and automatic Library effects are routed through explicit ownership policy. Recovered Android detail pages mutate the canonical loaded title instead of an obsolete route ID, and stale mutation completions cannot repaint a newer title or profile.
+
+**Account transitions fail closed.** On Apple, late work from a prior profile or account cannot publish after account switching, logout, rejected authentication, or imported-away state. Long-running playback mutations retain the profile that started the session instead of redirecting to whichever profile happens to be active when a timer or end callback fires.
+
+### Sources, add-ons, and loading
+
+**Source results settle on the title you opened.** Android source fan-out paints usable partial results while serializing Re-find, cache decoration, and final settlement. An older request cannot overwrite a newer title, a slow cache lookup cannot replace a fuller source list, and automatic next-episode selection can still wait briefly for the remembered provider without blocking manual choice.
+
+**Community JavaScript providers use a bounded media path.** Android validates public HTTP destinations, limits Binder payloads and settings by both character and UTF-8 byte size, controls runtime callbacks, and prevents stale or oversized request state from entering Media3.
+
+**Add-on removals stay with the account that made them.** Android removal tombstones are account-scoped, survive a session retry, keep anonymous removals local, fold compatible legacy state safely, and clear deliberately on reinstall. Old account work cannot remove an add-on from the newly selected account.
+
+**Apple stream proxying is strict without breaking legitimate IPv6.** Embedded requests pin vetted destinations, bound hostname resolution, reject active private and NAT64 targets, handle PREF64 and public IPv6 fallback correctly, and preserve valid playlist redirects and approved headers without widening the trust boundary.
+
+### Apple updates and diagnostics
+
+**Update notices are dependable again.** Apple TV, iPhone, iPad, and Mac schedule and present update checks from the active app lifecycle. A valid newer-version response is not lost during a transient lifecycle change, and presentation remains tied to the response that produced it.
+
+**Diagnostics remain exportable and more truthful.** The always-on diagnostic channel is available when a log can be safely exported. Listener failures, playback recovery, HDR and trickplay capture, and update behavior retain their actual state instead of reporting a misleading completed action. Apple TV listener recovery also rebinds after a fresh failure without starting duplicate recovery attempts.
+
+### Stability and security
+
+**Stale asynchronous work can no longer take over the current action.** Profile changes, logout, player transitions, detail actions, watched updates, add-on effects, source refreshes, and listener recovery now use generation, target, and ownership fences at the point where results are published.
+
+**Network work is destination-aware and bounded.** Community media, embedded proxying, Android subtitle sidecars, and Apple stream requests enforce tighter redirect, header, DNS, cancellation, size, and destination-lifetime rules.
+
+### Release delivery
+
+**Apple and Android publish as one transaction.** The Android release lane builds, production-signs, verifies, and attaches the Full mpv APK, Play Media3 APK, and Play AAB to a draft. It cannot publish on its own. The Apple coordinator then builds the Apple TV Full and Lite IPAs, iPhone and iPad IPA, and Mac DMG; verifies the complete Apple and Android asset set against one tag and source commit; activates the feed; publishes the stable release last; and verifies the public result.
+
+**The release does not reuse 0.3.15 build output.** Build 234 is produced from the protected `v0.3.16` tag on clean GitHub runners. Release assets, checksums, signing provenance, AltStore metadata, and the in-app update feed must all bind to that exact source before publication.
+
+### Validation limits
+
+- Source, unit, compile, packaging, signer, ABI, JNI, GPL-boundary, checksum, feed, tag, and release-identity gates are automated where the protected workflows support them.
+- Physical device coverage remains a separate claim. Sustained Dolby Vision and HDR playback across every Apple TV, display, cable, and source combination is not presented as universally solved.
+- Android phone, Android TV, Shield, and Fire TV behavior still benefits from representative physical install, upgrade, remote-focus, audio, HDR, Dolby Vision, torrent, subtitle, PiP, Cast, and long-play validation. A green build and verified APK are not a physical playback receipt.
+- TorBox availability is external. VortX avoids an invalid fallback route and preserves usable results from healthy search legs, but it cannot restore a TorBox hostname that is offline.
+
+### Install
+
+**Mac.** Download `VortX-macOS-v0.3.16-ci.dmg`, move VortX to Applications, then follow the [Install on Mac](https://github.com/VortXTV/VortX/wiki/Install-on-Mac) guide if macOS shows its one-time security prompt.
+
+**iPhone, iPad, and Apple TV.** Sideload the matching IPA with Sideloadly, AltStore, SideStore, or your signing service. For automatic feed updates, add `https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json`. Full instructions are in [Installing on iPhone, iPad, and Apple TV](https://github.com/VortXTV/VortX/wiki/Installing).
+
+**Android phone, tablet, Android TV, Shield, and Fire TV.** The normal sideload build is `VortX-0.3.16-full-mpv-universal.apk`. It contains both phone and TV interfaces plus `arm64-v8a`, `armeabi-v7a`, and `x86_64`; the `full-mpv` name identifies its GPL mpv engine and sideload distribution, not a phone-only UI. `VortX-0.3.16-play-media3-universal.apk` and `VortX-0.3.16-play-media3.aab` are the Google Play Media3 artifacts and also contain both phone and Android TV interfaces.
+
+**Verify every download.** The release includes Apple `SHA256SUMS-ci.txt`, Android `SHA256SUMS-android.txt`, and Android `SIGNING_PROVENANCE.txt`. The Android receipt records signer verification, release-tag commit, source commit, and protected workflow run. Stable Android packages are production-signed.
+
 ## 0.3.15 (build 233)
 
 ### Stable release from the complete 0.3.14 beta line

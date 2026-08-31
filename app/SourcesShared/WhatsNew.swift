@@ -5,8 +5,19 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.3.15"
+    static let version = "0.3.16"
     static let highlights: [String] = [
+        "A pause stays paused. Internal cache flushes and delayed end notifications can no longer impersonate episode completion, resume playback, or advance a series while you are paused.",
+        "Continue Watching, watched marks, and Library actions now stay attached to the real title, profile, and account that owns them. Duplicate series rows, stale account work, and cross-title mutations are fenced across Apple, Android, and web.",
+        "Playback recovery is calmer on both platforms. Apple keeps a healthy AVPlayer or remux session and preserves audio choices, while Android serializes mpv startup, teardown, buffering recovery, audio fallback, and terminal events.",
+        "Android source loading, Community JavaScript providers, subtitle sidecars, TV focus, and player controls are hardened against stale requests, unsafe destinations, oversized payloads, and dead player instances.",
+        "Apple update notices and diagnostic exports are dependable again, and Apple TV listener, audio-route, source-column, HDR, and trickplay recovery paths report and recover more truthfully.",
+        "Apple and Android now ship through one verified release transaction. Production-signed Android artifacts attach first, then the Apple coordinator validates every package, checksum, feed entry, tag, and source commit before publishing."
+    ]
+
+    // Kept as release-history fallback text for older bundled changelogs. The current screen uses
+    // `highlights` above, while the full bundled CHANGELOG remains the primary presentation.
+    static let legacyHighlights: [String] = [
         "Pick an audio language right from the source picker. A new Audio control next to Quality on the detail page filters and re-ranks the source list by audio language, so a release that carries your chosen language floats up without changing your saved language preference; Auto keeps your profile's preferred audio languages. The choice is for this session only and is never saved. Apple TV, iPhone, iPad, and Mac.",
         "Home and Discover rows translate their catalog titles as whole phrases instead of word by word. Titles like Popular Shows were being translated one word at a time in the English order, which reads wrong in French and other languages where the adjective follows the noun: Popular Shows now becomes Séries populaires, Featured Movies becomes Films à la une, and the new and trending rows follow the same correct order. Languages that already had a phrase translation are unchanged, and a language without one keeps its previous wording. French.",
         "External subtitles are fetched over the hardened transport on every player. Subtitle files served by add-ons are untrusted input, and the built-in player's subtitle download still resolved a subtitle hostname a second time at connection, which a hostile host could use to redirect it; it now resolves the host once, checks that every address is public, and connects only to that exact address, with hard size limits and no redirects, the same way the other player already did. Apple TV, iPhone, iPad, and Mac.",
