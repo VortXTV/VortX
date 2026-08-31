@@ -228,6 +228,34 @@ class VortXSessionOwnerTransitionContractTest {
     }
 
     @Test
+    fun `direct engine remove then reinstall route each changed tombstone through authenticated debounced sync`() {
+        val engine = readEngineSource()
+        val install = engine
+            .substringAfter("override suspend fun installAddon(url: String): Result<Unit> = runCatching {")
+            .substringBefore("override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {")
+        val remove = engine
+            .substringAfter("override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {")
+            .substringBefore("/** A successful local add-on remove/reinstall is account data")
+        val requester = engine
+            .substringAfter("private fun requestAddonTombstoneSync()")
+            .substringBefore("override suspend fun changeAddonUrl")
+        val sync = readSource()
+        val requestSync = sync
+            .substringAfter("fun requestSyncSoon()")
+            .substringBefore("/** Catch-up PULL entry point")
+        val armPendingSync = sync
+            .substringAfter("private fun armPendingSync(")
+            .substringBefore("/** Catch-up PULL entry point")
+
+        assertTrue(install.contains("if (addonTombstones.forget(normalized)) requestAddonTombstoneSync()"))
+        assertTrue(remove.contains("if (!addon.isProtected && addonTombstones.tombstone(addon.transportUrl)) requestAddonTombstoneSync()"))
+        assertTrue(requester.contains("(appContext as? VortXApplication)?.syncManager?.requestSyncSoon()"))
+        assertTrue(requestSync.contains("val lease = captureSyncLease() ?: return"))
+        assertTrue(requestSync.contains("armPendingSync(lease, recordEdit = true)"))
+        assertTrue(armPendingSync.contains("initialDelayMs = SYNC_DEBOUNCE_MS"))
+    }
+
+    @Test
     fun durableDirtyMarkerIsPerAccountAndRestoredBeforeRealtimeOrForegroundPull() {
         val source = readSource()
         val pendingState = source
@@ -342,6 +370,16 @@ class VortXSessionOwnerTransitionContractTest {
             assertTrue(postOk || preOk)
             request = nextRequest
         }
+    }
+
+    private fun readEngineSource(): String {
+        val candidates = listOf(
+            File("src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"),
+            File("app/src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"),
+            File("android/app/src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"),
+        )
+        return candidates.firstOrNull(File::isFile)?.readText()
+            ?: error("Could not locate EngineStremioRepository.kt from ${File(".").absolutePath}")
     }
 
     private fun assertMutatingAuthFence(

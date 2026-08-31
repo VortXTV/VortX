@@ -3,13 +3,22 @@ package com.vortx.android.data
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 /** In-memory persistence so the tombstone logic is exercised without Android SharedPreferences. */
 private class FakeTombstonePersistence : AddonTombstonePersistence {
     val store = HashMap<String, String>()
-    override fun read(key: String): String? = store[key]
+    val reads = mutableListOf<String>()
+    val writes = mutableListOf<String>()
+
+    override fun read(key: String): String? {
+        reads += key
+        return store[key]
+    }
+
     override fun write(key: String, value: String?) {
+        writes += key
         if (value == null) store.remove(key) else store[key] = value
     }
 }
@@ -20,6 +29,11 @@ class AddonTombstonesTest {
         AddonTombstones(persistence, now)
 
     private val url = "https://example.com/manifest.json"
+
+    @Before
+    fun activateTestAccount() {
+        AddonTombstones.activateAccount("test-account")
+    }
 
     @Test
     fun `tombstone marks a url effectively removed`() {
@@ -131,7 +145,7 @@ class AddonTombstonesTest {
         val p = FakeTombstonePersistence()
         val t = store(p) { 1_000.0 }
         t.tombstone(url)
-        val legacy = p.store["stremiox.addons.deleted"]
+        val legacy = p.store["stremiox.addons.deleted.account.test-account"]
         assertTrue(legacy != null && legacy.contains("example.com"))
     }
 
@@ -146,5 +160,43 @@ class AddonTombstonesTest {
         val entry = t.timestampsForSync()[AddonTombstones.normalize(url)]
         assertEquals(1_000.0, entry?.get("removedAt"))
         assertEquals(2_000.0, entry?.get("addedAt"))
+    }
+
+    @Test
+    fun `signed out tombstones never read or write persisted state`() {
+        val p = FakeTombstonePersistence().apply {
+            store["stremiox.addons.deleted"] = "[\"$url\"]"
+        }
+        val t = store(p) { 1_000.0 }
+        AddonTombstones.activateAccount(null)
+
+        assertTrue(t.all().isEmpty())
+        assertTrue(t.timestampsForSync().isEmpty())
+        assertFalse(t.tombstone(url))
+        assertFalse(t.forget(url))
+        assertFalse(t.merge(legacyIds = listOf(url), stamps = emptyMap()))
+        t.baselineInstalled(listOf(url))
+
+        assertTrue(p.reads.isEmpty())
+        assertTrue(p.writes.isEmpty())
+        assertEquals("[\"$url\"]", p.store["stremiox.addons.deleted"])
+    }
+
+    @Test
+    fun `legacy global keys remain quarantined from every account scope`() {
+        val p = FakeTombstonePersistence().apply {
+            store["stremiox.addons.deleted"] = "[\"$url\"]"
+            store["stremiox.addons.removedAt"] = "{\"$url\":1000}"
+        }
+        val t = store(p) { 2_000.0 }
+
+        assertTrue(t.all().isEmpty())
+        assertTrue(t.timestampsForSync().isEmpty())
+        assertTrue(t.tombstone(url))
+
+        assertEquals("[\"$url\"]", p.store["stremiox.addons.deleted"])
+        assertEquals("{\"$url\":1000}", p.store["stremiox.addons.removedAt"])
+        assertTrue(p.reads.none { it == "stremiox.addons.deleted" || it == "stremiox.addons.removedAt" })
+        assertTrue(p.writes.all { it.contains(".account.test-account") })
     }
 }
