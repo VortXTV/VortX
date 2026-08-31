@@ -130,16 +130,20 @@ final class CoreBridge: ObservableObject {
     private var authBindingGeneration: UInt64 = 0
     private var accountBindingVerificationTask: Task<Void, Never>?
     private var rejectedAccountBindingGeneration: UInt64?
-    /// Explicit disconnect waits for the engine's signed-out ctx before arming local recovery.
-    /// Imported-away logout owns its deterministic recovery separately and sets this false.
-    private var signedOutRepairAfterLogout = false
-
     /// Rust delivers NewState on its own worker.  Auth/profile state belongs to main, so workers must
     /// never read it directly.  They capture this lock-backed, immutable epoch and main validates it
     /// immediately before a decoded snapshot is published or used for a deferred engine mutation.
     private struct PublicationToken: Equatable { let epoch: UInt64 }
     private let publicationEpochLock = NSLock()
     private var publicationEpoch: UInt64 = 0
+    /// Explicit logout carries a unique identity into both its bounded poll and its later ctx receipt.
+    /// A rapid reconnect or a newer logout retires the old request, closing the Bool ABA race.
+    private struct SignedOutRepairRequest: Equatable {
+        let generation: UInt64
+        let publicationToken: PublicationToken
+    }
+    private var signedOutRepairGeneration: UInt64 = 0
+    private var signedOutRepairRequest: SignedOutRepairRequest?
 
     // MARK: Player-active gating (playback lag fix)
     //
@@ -948,27 +952,41 @@ final class CoreBridge: ObservableObject {
     /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
     func logOut(rearmSignedOutRepair: Bool = true) {
         invalidateAuthenticationGeneration()
-        signedOutRepairAfterLogout = rearmSignedOutRepair
+        let signedOutRepairRequest: SignedOutRepairRequest?
+        if rearmSignedOutRepair {
+            signedOutRepairGeneration &+= 1
+            let request = SignedOutRepairRequest(
+                generation: signedOutRepairGeneration,
+                publicationToken: capturePublicationToken()
+            )
+            self.signedOutRepairRequest = request
+            signedOutRepairRequest = request
+        } else {
+            signedOutRepairRequest = nil
+        }
         dispatchCtx(["action": "Logout"])
         clearUserState()
-        if rearmSignedOutRepair {
-            DispatchQueue.main.async { [weak self] in self?.rearmSignedOutRepairWhenSafe() }
+        if let signedOutRepairRequest {
+            DispatchQueue.main.async { [weak self] in
+                self?.rearmSignedOutRepairWhenSafe(signedOutRepairRequest)
+            }
         }
     }
 
     /// Do not schedule local recovery at logout dispatch time: the engine may still have the old
     /// authenticated ctx.  A short bounded poll is backed by the ctx receipt path below, and the
     /// one-shot flag makes both paths converge on exactly one repair timer.
-    private func rearmSignedOutRepairWhenSafe(attempt: Int = 0) {
-        guard signedOutRepairAfterLogout else { return }
+    private func rearmSignedOutRepairWhenSafe(_ request: SignedOutRepairRequest, attempt: Int = 0) {
+        guard signedOutRepairRequest == request,
+              publicationStillCurrent(request.publicationToken) else { return }
         guard !isLoggedIn() else {
             guard attempt < 30 else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.rearmSignedOutRepairWhenSafe(attempt: attempt + 1)
+                self?.rearmSignedOutRepairWhenSafe(request, attempt: attempt + 1)
             }
             return
         }
-        signedOutRepairAfterLogout = false
+        signedOutRepairRequest = nil
         scheduleSessionRepair()
     }
 
@@ -2759,6 +2777,7 @@ final class CoreBridge: ObservableObject {
     /// fails closed rather than borrowing whichever account happened to be resident.
     private func beginAccountBinding(for token: String) {
         cancelAccountBindingVerification()
+        retireSignedOutRepairRequest()
         invalidatePublicationEpoch()
         settledAccountBinding = nil
         authBindingGeneration &+= 1
@@ -2787,12 +2806,23 @@ final class CoreBridge: ObservableObject {
 
     private func invalidateAuthenticationGeneration() {
         cancelAccountBindingVerification()
+        retireSignedOutRepairRequest()
         invalidatePublicationEpoch()
         authBindingGeneration &+= 1
         pendingAccountBinding = nil
         settledAccountBinding = nil
         rejectedAccountBindingGeneration = nil
-        signedOutRepairAfterLogout = false
+        // Logout is terminal for every in-flight auth mode.  Retire the legacy PullUser and
+        // LoginWithToken gates synchronously so neither their delayed ctx nor 6-second backstop
+        // can block signed-out local recovery.
+        awaitingAuthMigration = false
+        switchInFlight = false
+        switchFromUID = nil
+    }
+
+    private func retireSignedOutRepairRequest() {
+        signedOutRepairGeneration &+= 1
+        signedOutRepairRequest = nil
     }
 
     private var enginePublicationBlocked: Bool {
@@ -3069,8 +3099,8 @@ final class CoreBridge: ObservableObject {
                 guard let self else { return }
                 // Explicit disconnect reaches local recovery only after this signed-out ctx is
                 // visible.  Do not let the default-profile receipt flow into stale account work.
-                if self.signedOutRepairAfterLogout, !self.isLoggedIn() {
-                    self.rearmSignedOutRepairWhenSafe()
+                if let signedOutRepairRequest = self.signedOutRepairRequest, !self.isLoggedIn() {
+                    self.rearmSignedOutRepairWhenSafe(signedOutRepairRequest)
                     return
                 }
                 // `ctx` is control-plane evidence: while B is pending it is the ONLY engine receipt
