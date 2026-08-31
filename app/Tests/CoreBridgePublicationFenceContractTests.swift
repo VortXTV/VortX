@@ -53,7 +53,10 @@ let board = section(bridge, from: "private func scheduleBoardRebuild()", until: 
 let rebuild = section(bridge, from: "func rebuildBoardRows()", until: "/// The Home board rows")
 let repair = section(bridge, from: "private func scheduleSessionRepair()", until: "/// Refresh installed addons")
 let settlement = section(bridge, from: "private func settleAccountBindingIfProven()", until: "private func finishSettledAccountBinding()")
+let finishSettlement = section(bridge, from: "private func finishSettledAccountBinding()", until: "/// Dispatch an `Action::Ctx")
 let invalidation = section(bridge, from: "private func invalidatePublicationEpoch()", until: "/// ProfileStore calls")
+let profileChange = section(bridge, from: "func activeProfileDidChange()", until: "private func verifyAccountBinding")
+let bootstrap = section(bridge, from: "private func bootstrapAuth()", until: "/// Self-heal a stale")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
@@ -68,6 +71,22 @@ check(appearsBefore("let bindingSettled = self.settleAccountBindingIfProven()", 
 check(settlement.contains("invalidatePublicationEpoch()")
                 && invalidation.contains("continueWatchingRebuildGeneration &+= 1"),
               "settlement advances epoch and invalidates stale Continue Watching rebuilds")
+check(finishSettlement.contains("let completingLegacyMigration = awaitingAuthMigration")
+                && finishSettlement.contains("awaitingAuthMigration = false")
+                && finishSettlement.contains("refreshFromAPI()")
+                && finishSettlement.contains("ProfileStore.shared.replayPendingAccountLibraryAdds(core: self)"),
+              "early PullUser ctx plus a late matching proof completes legacy migration exactly at settlement")
+check(repair.contains("self.sessionRepairWork?.cancel()")
+                && repair.contains("repairGeneration == self.sessionRepairGeneration")
+                && repair.contains("DispatchQueue.main.asyncAfter")
+                && invalidation.contains("sessionRepairWork?.cancel()")
+                && invalidation.contains("sessionRepairGeneration &+= 1"),
+              "stale launch repair is cancelled and only the newest context-bound timer may fire")
+check(finishSettlement.contains("scheduleSessionRepair()")
+                && profileChange.contains("scheduleSessionRepair()")
+                && bootstrap.contains("Keychain.set(nil, for: self.activeTokenAccount)")
+                && bootstrap.contains("self.scheduleSessionRepair()"),
+              "settled, no-token, and imported-away logout contexts each rearm one valid repair timer")
 check(seed.contains("capturePublicationToken()")
                 && seed.contains("publicationStillCurrent(publicationToken)")
                 && seed.contains("rebuildContinueWatching(capturedPublicationToken: publicationToken)")

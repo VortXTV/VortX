@@ -58,6 +58,10 @@ final class CoreBridge: ObservableObject {
     /// updates but only once per burst. Touched only on the main actor.
     private var boardRebuildWork: DispatchWorkItem?
     private static let boardRebuildDebounce: TimeInterval = 0.08
+    /// One current-context repair timer.  Auth/profile boundaries cancel it; settlement or an
+    /// explicitly signed-out context arms a fresh one with that context's publication token.
+    private var sessionRepairWork: DispatchWorkItem?
+    private var sessionRepairGeneration = 0
     /// Raw catalog count from the engine board. Hidden, disabled, empty, and failed rows are filtered
     /// out of `boardRows`, so their visible count cannot decide whether vertical pagination is finished.
     private var boardCatalogTotal = 0
@@ -729,6 +733,9 @@ final class CoreBridge: ObservableObject {
                         // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
                         // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
                         Keychain.set(nil, for: self.activeTokenAccount)
+                        // Logout invalidated the launch timer with the old Stremio context.  The now
+                        // signed-out local context gets one fresh, token-fenced repair opportunity.
+                        self.scheduleSessionRepair()
                         // Deterministic post-logout recovery: wait for the engine to actually process the Logout
                         // (isLoggedIn flips false and the library resets), then load that empty library and recover
                         // the owner library from doc.vortx at launch, not after the 14s repair.
@@ -810,40 +817,55 @@ final class CoreBridge: ObservableObject {
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         let publicationToken = capturePublicationToken()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-            guard let self, self.publicationStillCurrent(publicationToken), !self.switchInFlight, !self.awaitingAuthMigration,
-                  !self.enginePublicationBlocked else { return }
-            let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
-            let noAccountData = self.continueWatching.isEmpty && cwItems.isEmpty && (self.library?.catalog.isEmpty ?? true)
-            let noStreamAddon = self.hasNoUserStreamAddon   // user-installed stream add-ons gone (logout-proof)
-            guard noAccountData || noStreamAddon else { return }
-            guard PlaybackMutationOwnershipPolicy.allowsRepairHydration(
-                engineSignedIn: self.isLoggedIn(), hasSettledBinding: self.settledActiveAccountBinding() != nil) else { return }
-            let key = Keychain.string(self.activeTokenAccount)
-            let hasStremioToken = (key?.isEmpty == false)
-            // Account-owns-everything: hydrate the VortX account's owned add-ons + recover the owner
-            // library FIRST, regardless of whether a Stremio token exists. Idempotent + never-zero
-            // guarded inside the sync manager (a failed/empty account pull does nothing), so it can
-            // never make things worse. This is what fixes "post-update: 0 sources / 0 add-ons" on a
-            // genuinely-logged-out or degraded device.
-            Task { @MainActor in
-                guard self.publicationStillCurrent(publicationToken) else { return }
-                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
-                guard self.publicationStillCurrent(publicationToken) else { return }
-                // Re-establish a live Stremio session to reconcile on top of the hydrated floor ONLY when a
-                // usable token exists AND this device is NOT migrated-and-opted-out. Wave 4 (Finding 2): an
-                // importedAway device must NEVER re-auth Stremio here, or it would defeat the import with a
-                // logout / re-login ping-pong (and, since the post-import token is server-dead, thrash the UI).
-                // In that case (or when genuinely logged out), the VortX doc hydration above is the whole recovery.
-                // Never call switchAccount with an empty token.
-                if hasStremioToken, let key, !self.importedAwayFromStremio {
-                    NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token; hydrated account add-ons, now re-authenticating to reconcile from Stremio")
-                    self.switchAccount(token: key)
-                } else {
-                    NSLog("[CoreBridge] degraded session with no Stremio token; recovered from the VortX account doc")
-                    self.loadBoard()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sessionRepairWork?.cancel()
+            self.sessionRepairGeneration &+= 1
+            let repairGeneration = self.sessionRepairGeneration
+            let work = DispatchWorkItem { [weak self] in
+                guard let self,
+                      repairGeneration == self.sessionRepairGeneration,
+                      self.publicationStillCurrent(publicationToken),
+                      !self.switchInFlight,
+                      !self.awaitingAuthMigration,
+                      !self.enginePublicationBlocked else { return }
+                self.sessionRepairWork = nil
+                let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
+                let noAccountData = self.continueWatching.isEmpty && cwItems.isEmpty && (self.library?.catalog.isEmpty ?? true)
+                let noStreamAddon = self.hasNoUserStreamAddon   // user-installed stream add-ons gone (logout-proof)
+                guard noAccountData || noStreamAddon else { return }
+                guard PlaybackMutationOwnershipPolicy.allowsRepairHydration(
+                    engineSignedIn: self.isLoggedIn(), hasSettledBinding: self.settledActiveAccountBinding() != nil) else { return }
+                let key = Keychain.string(self.activeTokenAccount)
+                let hasStremioToken = (key?.isEmpty == false)
+                // Account-owns-everything: hydrate the VortX account's owned add-ons + recover the owner
+                // library FIRST, regardless of whether a Stremio token exists. Idempotent + never-zero
+                // guarded inside the sync manager (a failed/empty account pull does nothing), so it can
+                // never make things worse. This is what fixes "post-update: 0 sources / 0 add-ons" on a
+                // genuinely-logged-out or degraded device.
+                Task { @MainActor in
+                    guard repairGeneration == self.sessionRepairGeneration,
+                          self.publicationStillCurrent(publicationToken) else { return }
+                    await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    guard repairGeneration == self.sessionRepairGeneration,
+                          self.publicationStillCurrent(publicationToken) else { return }
+                    // Re-establish a live Stremio session to reconcile on top of the hydrated floor ONLY when a
+                    // usable token exists AND this device is NOT migrated-and-opted-out. Wave 4 (Finding 2): an
+                    // importedAway device must NEVER re-auth Stremio here, or it would defeat the import with a
+                    // logout / re-login ping-pong (and, since the post-import token is server-dead, thrash the UI).
+                    // In that case (or when genuinely logged out), the VortX doc hydration above is the whole recovery.
+                    // Never call switchAccount with an empty token.
+                    if hasStremioToken, let key, !self.importedAwayFromStremio {
+                        NSLog("%@", "[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token; hydrated account add-ons, now re-authenticating to reconcile from Stremio")
+                        self.switchAccount(token: key)
+                    } else {
+                        NSLog("[CoreBridge] degraded session with no Stremio token; recovered from the VortX account doc")
+                        self.loadBoard()
+                    }
                 }
             }
+            self.sessionRepairWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 14, execute: work)
         }
     }
 
@@ -2783,6 +2805,9 @@ final class CoreBridge: ObservableObject {
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         continueWatchingRebuildLock.unlock()
+        sessionRepairWork?.cancel()
+        sessionRepairWork = nil
+        sessionRepairGeneration &+= 1
         DispatchQueue.main.async { [weak self] in
             self?.boardRebuildWork?.cancel()
             self?.boardRebuildWork = nil
@@ -2796,7 +2821,12 @@ final class CoreBridge: ObservableObject {
     func activeProfileDidChange() {
         invalidateAuthenticationGeneration()
         guard !importedAwayFromStremio,
-              let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return }
+              let token = Keychain.string(activeTokenAccount), !token.isEmpty else {
+            // A profile without a Stremio token is a valid local-only context.  The old
+            // account's repair timer was invalidated above, so arm exactly one new local timer.
+            scheduleSessionRepair()
+            return
+        }
         beginAccountBinding(for: token)
     }
 
@@ -2884,16 +2914,27 @@ final class CoreBridge: ObservableObject {
     }
 
     private func finishSettledAccountBinding() {
-        if switchInFlight {
+        let completingLegacyMigration = awaitingAuthMigration
+        if completingLegacyMigration {
+            // A PullUser ctx can race ahead of getUser proof.  Once that proof later agrees with
+            // the same engine uid, finish the migration here instead of relying on another ctx
+            // event that may never come.
+            awaitingAuthMigration = false
+            NSLog("[CoreBridge] authKey migration identity verified -> pulling addons + syncing library")
+            refreshFromAPI()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
+        } else if switchInFlight {
             switchInFlight = false
             switchFromUID = nil
             NSLog("[CoreBridge] account switch identity verified -> reloading")
             refreshFromAPI()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
-        } else if !awaitingAuthMigration {
+        } else {
             refreshFromAPI()
         }
-        guard !awaitingAuthMigration else { return }
+        // The successful settlement advanced publicationEpoch.  Replace the launch/pending repair
+        // timer with exactly one timer bound to this now-valid account context.
+        scheduleSessionRepair()
         ProfileStore.shared.replayPendingAccountLibraryAdds(core: self)
     }
 
@@ -2999,7 +3040,10 @@ final class CoreBridge: ObservableObject {
                 // that can prove the authenticated B token is now resident.  Never apply the data
                 // publication gate before this settlement attempt.
                 let bindingSettled = self.settleAccountBindingIfProven()
-                if bindingSettled { self.finishSettledAccountBinding() }
+                if bindingSettled {
+                    self.finishSettledAccountBinding()
+                    return // finish performs the one owner-replay/refresh for this settlement
+                }
                 // Anything below publishes or dispatches based on the resident account.  It must
                 // wait for a settled/signed-out context, even though the control receipt above may
                 // run while the publication gate is blocked.
