@@ -64,6 +64,8 @@ let invalidateAuth = section(bridge, from: "private func invalidateAuthenticatio
 let signedOutRearm = section(bridge, from: "private func rearmSignedOutRepairWhenSafe", until: "/// Clear the published")
 let importedCapture = section(bridge, from: "private func captureImportedAwayBootstrapContext", until: "/// Clear the old binding")
 let publicationGate = section(bridge, from: "private var enginePublicationBlocked", until: "/// Invalidate every captured")
+let localRecovery = section(bridge, from: "private func captureImportedAwayLocalRecoveryContext", until: "/// Clear the old binding")
+let dispatch = section(bridge, from: "func dispatch(action:", until: "/// Compact human name")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
@@ -117,7 +119,9 @@ check(bootstrap.contains("guard let importedAwayContext = captureImportedAwayBoo
                 && bootstrap.contains("guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }")
                 && bootstrap.contains("Keychain.set(nil, for: importedAwayContext.keychainAccount)")
                 && bootstrap.contains("captureImportedAwayLocalRecoveryContext")
-                && bootstrap.components(separatedBy: "importedAwayLocalRecoveryStillCurrent(localRecovery)").count >= 5
+                && bootstrap.contains("for _ in 0 ..< 30")
+                && bootstrap.contains("importedAwayLocalRecoveryReady(localRecovery)")
+                && bootstrap.contains("signed-out ctx receipt timed out")
                 && !bootstrap.contains("Keychain.set(nil, for: self.activeTokenAccount)"),
               "imported-away A await is fenced to its captured profile, token slot, auth epoch, and recovery context")
 check(importedCapture.contains("profileID: profile.id")
@@ -129,11 +133,22 @@ check(importedCapture.contains("profileID: profile.id")
               "imported-away bootstrap captures exact account identity before its await")
 check(publicationGate.contains("signedOutRepairPending: signedOutRepairRequest != nil")
                 && signedOutRearm.contains("signedOutRepairRequestStillCurrent(request)")
+                && signedOutRearm.contains("receiptPublicationToken == request.publicationToken")
+                && signedOutRearm.contains("!isLoggedIn(), currentUID() == nil")
                 && signedOutRearm.contains("signedOutRepairRequest = nil")
                 && signedOutRearm.contains("if request.rearmSessionRepair")
                 && event.contains("if let signedOutRepairRequest = self.signedOutRepairRequest, !self.isLoggedIn()")
-                && event.contains("self.rearmSignedOutRepairWhenSafe(signedOutRepairRequest)"),
+                && event.contains("receiptPublicationToken: publicationToken"),
               "old account data stays gated during logout until only the exact signed-out control receipt clears it")
+check(localRecovery.contains("signedOutRequest: SignedOutRepairRequest")
+                && localRecovery.contains("signedOutRepairRequestStillCurrent(signedOutRequest)")
+                && localRecovery.contains("signedOutRepairRequest == nil")
+                && localRecovery.contains("confirmedSignedOutRepairRequest == context.signedOutRequest")
+                && localRecovery.contains("!isLoggedIn(), currentUID() == nil"),
+              "imported-away recovery times out unless the exact logout receipt is cleared and engine identity is blank")
+check(dispatch.contains("blocksAccountMutationDuringSignedOutRepair")
+                && dispatch.contains("dropped account mutation pending signed-out receipt"),
+              "central engine dispatch gate rejects pending-logout account mutations while leaving overlay state local")
 check(seed.contains("capturePublicationToken()")
                 && seed.contains("publicationStillCurrent(publicationToken)")
                 && seed.contains("rebuildContinueWatching(capturedPublicationToken: publicationToken)")

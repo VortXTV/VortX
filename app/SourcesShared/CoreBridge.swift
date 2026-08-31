@@ -147,6 +147,9 @@ final class CoreBridge: ObservableObject {
     }
     private var signedOutRepairGeneration: UInt64 = 0
     private var signedOutRepairRequest: SignedOutRepairRequest?
+    /// Set only by the token-matched signed-out ctx path.  Imported-away recovery uses this
+    /// receipt rather than treating an unrelated request retirement as a completed logout.
+    private var confirmedSignedOutRepairRequest: SignedOutRepairRequest?
     /// Imported-away logout runs through awaits, so it retains the exact profile/token identity
     /// that authorized it rather than re-reading the active profile after suspension.
     private struct ImportedAwayBootstrapContext {
@@ -162,6 +165,7 @@ final class CoreBridge: ObservableObject {
         let keychainAccount: String
         let authGeneration: UInt64
         let publicationToken: PublicationToken
+        let signedOutRequest: SignedOutRepairRequest
     }
 
     // MARK: Player-active gating (playback lag fix)
@@ -757,32 +761,38 @@ final class CoreBridge: ObservableObject {
                     if await VortXSyncManager.shared.accountDocReachable() {
                         guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }
                         NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
-                        self.logOut(rearmSignedOutRepair: false)   // imported-away owns deterministic local recovery below
+                        self.logOut(rearmSignedOutRepair: false) // imported-away owns deterministic local recovery below
                         // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
                         // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
                         // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
                         Keychain.set(nil, for: importedAwayContext.keychainAccount)
+                        guard let signedOutRequest = self.signedOutRepairRequest else { return }
                         let localRecovery = self.captureImportedAwayLocalRecoveryContext(
                             profileID: importedAwayContext.profileID,
-                            keychainAccount: importedAwayContext.keychainAccount
+                            keychainAccount: importedAwayContext.keychainAccount,
+                            signedOutRequest: signedOutRequest
                         )
                         guard let localRecovery else { return }
-                        // Logout invalidated the launch timer with the old Stremio context.  The now
-                        // signed-out local context gets one fresh, token-fenced repair opportunity.
-                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
-                        self.scheduleSessionRepair()
-                        // Deterministic post-logout recovery: wait for the engine to actually process the Logout
-                        // (isLoggedIn flips false and the library resets), then load that empty library and recover
-                        // the owner library from doc.vortx at launch, not after the 14s repair.
-                        for _ in 0 ..< 30 where self.isLoggedIn() {
+                        // Deterministic post-logout recovery waits for the exact signed-out ctx receipt,
+                        // not merely a transitional `isLoggedIn == false` read.  A timeout is a fail-closed
+                        // abort: never hydrate owner state into an engine that has not confirmed logout.
+                        for _ in 0 ..< 30 {
+                            guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
+                            if self.importedAwayLocalRecoveryReady(localRecovery) { break }
                             try? await Task.sleep(nanoseconds: 100_000_000)
                             guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
                         }
-                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
+                        guard self.importedAwayLocalRecoveryReady(localRecovery) else {
+                            NSLog("[CoreBridge] imported-away local recovery aborted: signed-out ctx receipt timed out")
+                            return
+                        }
+                        // Logout invalidated the launch timer with the old Stremio context.  The now
+                        // confirmed signed-out local context gets one fresh, token-fenced repair opportunity.
+                        self.scheduleSessionRepair()
                         await self.loadLibraryAndAwait()
-                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
+                        guard self.importedAwayLocalRecoveryReady(localRecovery) else { return }
                         await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
-                        guard self.importedAwayLocalRecoveryStillCurrent(localRecovery) else { return }
+                        guard self.importedAwayLocalRecoveryReady(localRecovery) else { return }
                         self.loadBoard()
                     } else {
                         NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
@@ -1002,11 +1012,14 @@ final class CoreBridge: ObservableObject {
     /// A matching signed-out `ctx` is the only receipt allowed to release the logout publication
     /// gate.  Polling `isLoggedIn()` is not enough: it can observe a transitional engine state
     /// while old board/library events are still queued behind it.
-    private func rearmSignedOutRepairWhenSafe(_ request: SignedOutRepairRequest) {
-        guard signedOutRepairRequestStillCurrent(request) else { return }
-        guard !isLoggedIn() else { return }
+    private func rearmSignedOutRepairWhenSafe(_ request: SignedOutRepairRequest,
+                                              receiptPublicationToken: PublicationToken) {
+        guard receiptPublicationToken == request.publicationToken,
+              signedOutRepairRequestStillCurrent(request),
+              !isLoggedIn(), currentUID() == nil else { return }
         guard signedOutRepairRequestStillCurrent(request) else { return }
         signedOutRepairRequest = nil
+        confirmedSignedOutRepairRequest = request
         if request.rearmSessionRepair {
             scheduleSessionRepair()
         }
@@ -1789,6 +1802,7 @@ final class CoreBridge: ObservableObject {
         case .engineAccount:
             break
         }
+        guard !logoutAccountMutationPending else { return }
         // `MarkAsWatched` changes only the library item's aggregate watched state. Episode ticks
         // come from the separate per-video watched bitfield, so BOTH directions must visit every
         // known video. The old true branch sent only the aggregate action, making a whole-series
@@ -1819,6 +1833,7 @@ final class CoreBridge: ObservableObject {
         if overlayMarkWatched(isWatched, videoIds: { meta in
             (meta.videos ?? []).filter { $0.season == season }.map(\.id)
         }) { return }
+        guard !logoutAccountMutationPending else { return }
         dispatchMetaDetails(["action": "MarkSeasonAsWatched", "args": [season, isWatched]])
     }
 
@@ -1830,6 +1845,7 @@ final class CoreBridge: ObservableObject {
                                                            residentType: residentMeta.type),
               residentMeta.videos?.contains(where: { $0.id == video.id }) == true else { return }
         if overlayMarkWatched(isWatched, videoIds: { _ in [video.id] }) { return }
+        guard !logoutAccountMutationPending else { return }
         var payload: [String: Any] = ["id": video.id]
         if let season = video.season { payload["season"] = season }
         if let episode = video.episode { payload["episode"] = episode }
@@ -1892,17 +1908,16 @@ final class CoreBridge: ObservableObject {
             NSLog("[playback] dropped watched callback after profile/account ownership changed")
             return
         }
-        // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
-        // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
-        // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
-        // never touches an engine libraryItem field, honoring the poison invariant.
-        // Scrobbling is account-owned. An inactive overlay callback may still update that overlay's
-        // private cache below, but it must never fan out through a newly active owner account.
-        if target.overlayProfileID == nil { ScrobbleCoordinator.shared.watched(meta) }
         if let profileID = target.overlayProfileID {
             ProfileStore.shared.markWatched(meta: meta, profileID: profileID)
             return
         }
+        guard !logoutAccountMutationPending else { return }
+        // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
+        // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
+        // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
+        // never touches an engine libraryItem field, honoring the poison invariant.
+        ScrobbleCoordinator.shared.watched(meta)
         // Scrobble and overlay-profile state above are keyed by the explicit PlaybackMeta and remain safe even
         // when an episodic engine re-point failed. Only the owner-engine dispatch depends on confirmed Player
         // attribution; callers close this leg rather than suppressing the correct external watched signal.
@@ -2059,6 +2074,7 @@ final class CoreBridge: ObservableObject {
             ProfileStore.shared.removeWatchEntry(metaId: id)
             return
         }
+        guard !logoutAccountMutationPending else { return }
         // Record the durable cross-device removal BEFORE the dispatch, the library analogue of
         // uninstallAddon's AddonTombstones.tombstone: vortxSummary pushes the set into
         // doc.vortx.deletedLibrary and SUBTRACTS it from the doc.vortx.library UNION, and syncDown re-folds
@@ -2091,6 +2107,7 @@ final class CoreBridge: ObservableObject {
             }
             return
         }
+        guard !logoutAccountMutationPending else { return }
         let ids = continueWatching.map(\.id)
         guard !ids.isEmpty else { return }
         for id in ids {
@@ -2112,6 +2129,7 @@ final class CoreBridge: ObservableObject {
             overlaySetWatchedById(id, isWatched)   // overlay profile: private history only
             return
         }
+        guard !logoutAccountMutationPending else { return }
         dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]])
     }
 
@@ -2270,6 +2288,7 @@ final class CoreBridge: ObservableObject {
             ProfileStore.shared.finishedWatching(metaId: libraryId, profileID: profileID)
             return
         }
+        guard !logoutAccountMutationPending else { return }
         // Stamp the LOCAL rewind before the dispatch. This is the app's single `RewindLibraryItem` site, and a
         // finish is indistinguishable by value from a Stremio rollback (t drops to 0), so the Continue Watching
         // FLOOR would otherwise refuse this device's own finish and pin the title in the rail whenever a Stremio
@@ -2302,15 +2321,6 @@ final class CoreBridge: ObservableObject {
     /// Library tab or Continue Watching is in no catalog, so this hands the engine
     /// its own full meta JSON instead (a superset of the preview it expects).
     func addDetailToLibrary() {
-        // External sync (Trakt/SIMKL): mirror a detail-page library ADD to each connected provider's
-        // watchlist. Whole-title intent (movie or show). Additive + fail-soft + gated inside the coordinator
-        // (owner profile only, watchlist toggle on); a no-op with empty creds. Built from the open detail
-        // meta, so this covers both iOS and tvOS (both route their add button here).
-        if let meta = metaDetails?.meta {
-            ScrobbleCoordinator.shared.addedToLibrary(
-                PlaybackMeta(libraryId: meta.id, videoId: meta.id, type: meta.type,
-                             name: meta.name, poster: meta.poster, season: nil, episode: nil))
-        }
         switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
         case .profileOverlay:
             // Overlay profile: save to the profile's private overlay, never the account library.
@@ -2321,6 +2331,14 @@ final class CoreBridge: ObservableObject {
             return
         case .engineAccount:
             break
+        }
+        guard !logoutAccountMutationPending else { return }
+        // External sync (Trakt/SIMKL): mirror a detail-page library ADD only after the owner
+        // account mutation gate accepts this operation.
+        if let opened = metaDetails?.meta {
+            ScrobbleCoordinator.shared.addedToLibrary(
+                PlaybackMeta(libraryId: opened.id, videoId: opened.id, type: opened.type,
+                             name: opened.name, poster: opened.poster, season: nil, episode: nil))
         }
         guard let meta = detailMetaPreview() else {
             NSLog("[CoreBridge] AddToLibrary found no usable detail meta")
@@ -2378,6 +2396,7 @@ final class CoreBridge: ObservableObject {
     /// with empty creds inside the coordinator.
     func removeDetailFromLibrary() {
         guard let meta = metaDetails?.meta else { return }
+        if ProfileStore.shared.activeUsesEngineHistory, logoutAccountMutationPending { return }
         ScrobbleCoordinator.shared.removedFromLibrary(
             PlaybackMeta(libraryId: meta.id, videoId: meta.id, type: meta.type,
                          name: meta.name, poster: meta.poster, season: nil, episode: nil))
@@ -2399,6 +2418,7 @@ final class CoreBridge: ObservableObject {
             }
             return false
         }
+        guard !logoutAccountMutationPending else { return false }
         guard let raw = rawMetaPreview(forId: metaId),
               LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
                 metaID: metaId, expectedType: expectedType,
@@ -2421,6 +2441,7 @@ final class CoreBridge: ObservableObject {
                                                 poster: meta["poster"] as? String)
             return
         }
+        guard !logoutAccountMutationPending else { return }
         LibraryTombstones.forget(id)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
         dispatchCtx(["action": "AddToLibrary", "args": meta])
     }
@@ -2438,7 +2459,8 @@ final class CoreBridge: ObservableObject {
     func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true,
                                  target: PlaybackMutationTarget? = nil) async -> Bool {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
-        guard target.stillOwnsAccountContext(core: self),
+        guard !logoutAccountMutationPending,
+              target.stillOwnsAccountContext(core: self),
               let binding = settledActiveAccountBinding(),
               PlaybackMutationOwnershipPolicy.allowsResolverDispatch(target: target, binding: binding) else { return false }
         guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
@@ -2450,6 +2472,7 @@ final class CoreBridge: ObservableObject {
               LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
                 metaID: id, expectedType: safeType,
                 previewID: meta["id"] as? String, previewType: meta["type"] as? String),
+              !logoutAccountMutationPending,
               PlaybackMutationOwnershipPolicy.bindingIsCurrent(binding, current: settledActiveAccountBinding()),
               target.stillOwnsAccountContext(core: self) else { return false }
         // An explicit user/dashboard add-to-library targeting the owner stamps the add so it supersedes a prior
@@ -2469,7 +2492,7 @@ final class CoreBridge: ObservableObject {
     @discardableResult
     func addCatalogItemLocalOnly(id: String, type: String,
                                  credentialCapture: CredentialScopeRegistry.Capture) async -> Bool {
-        guard localOnlyRecoveryAllowed(credentialCapture) else { return false }
+        guard !logoutAccountMutationPending, localOnlyRecoveryAllowed(credentialCapture) else { return false }
         guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
               let safeType = LibraryWatchedMutationPolicy.normalizedCatalogType(type),
               let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(id).json"),
@@ -2479,7 +2502,7 @@ final class CoreBridge: ObservableObject {
               LibraryWatchedMutationPolicy.canDispatchCatalogAdd(metaID: id, expectedType: safeType,
                                                                   previewID: meta["id"] as? String,
                                                                   previewType: meta["type"] as? String),
-              localOnlyRecoveryAllowed(credentialCapture) else { return false }
+              !logoutAccountMutationPending, localOnlyRecoveryAllowed(credentialCapture) else { return false }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
         return true
     }
@@ -2501,6 +2524,7 @@ final class CoreBridge: ObservableObject {
             overlaySetWatchedById(metaId, isWatched)   // overlay profile: private history only
             return
         }
+        guard !logoutAccountMutationPending else { return }
         guard let raw = rawMetaPreview(forId: metaId) else { return }
         dispatchCtx(["action": "MetaItemMarkAsWatched", "args": ["meta_item": raw, "is_watched": isWatched]])
     }
@@ -2733,6 +2757,7 @@ final class CoreBridge: ObservableObject {
         // Overlay profiles never feed the engine Player: it would write their progress into the
         // ACCOUNT library bucket and sync it, which is exactly what profile separation prevents.
         guard target.overlayProfileID == nil else { return }
+        guard !logoutAccountMutationPending else { return }
         guard durationSeconds.isFinite, timeSeconds.isFinite, durationSeconds > 0, timeSeconds >= 0 else { return }
         #if os(tvOS)
         let device = "tvOS"
@@ -2825,7 +2850,8 @@ final class CoreBridge: ObservableObject {
     }
 
     private func captureImportedAwayLocalRecoveryContext(profileID: UUID,
-                                                         keychainAccount: String) -> ImportedAwayLocalRecoveryContext? {
+                                                         keychainAccount: String,
+                                                         signedOutRequest: SignedOutRepairRequest) -> ImportedAwayLocalRecoveryContext? {
         guard let profile = ProfileStore.shared.active,
               profile.id == profileID,
               profile.usesEngineHistory,
@@ -2834,12 +2860,14 @@ final class CoreBridge: ObservableObject {
               !awaitingAuthMigration,
               !switchInFlight,
               pendingAccountBinding == nil,
+              signedOutRepairRequestStillCurrent(signedOutRequest),
               !importedAwayFromStremio else { return nil }
         return ImportedAwayLocalRecoveryContext(
             profileID: profileID,
             keychainAccount: keychainAccount,
             authGeneration: authBindingGeneration,
-            publicationToken: capturePublicationToken()
+            publicationToken: capturePublicationToken(),
+            signedOutRequest: signedOutRequest
         )
     }
 
@@ -2855,6 +2883,14 @@ final class CoreBridge: ObservableObject {
               !switchInFlight,
               pendingAccountBinding == nil,
               !importedAwayFromStremio else { return false }
+        return true
+    }
+
+    private func importedAwayLocalRecoveryReady(_ context: ImportedAwayLocalRecoveryContext) -> Bool {
+        guard importedAwayLocalRecoveryStillCurrent(context),
+              signedOutRepairRequest == nil,
+              confirmedSignedOutRepairRequest == context.signedOutRequest,
+              !isLoggedIn(), currentUID() == nil else { return false }
         return true
     }
 
@@ -2908,6 +2944,7 @@ final class CoreBridge: ObservableObject {
     private func retireSignedOutRepairRequest() {
         signedOutRepairGeneration &+= 1
         signedOutRepairRequest = nil
+        confirmedSignedOutRepairRequest = nil
     }
 
     private var enginePublicationBlocked: Bool {
@@ -2915,6 +2952,12 @@ final class CoreBridge: ObservableObject {
             hasPendingBinding: pendingAccountBinding != nil,
             credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration,
             signedOutRepairPending: signedOutRepairRequest != nil)
+    }
+
+    /// Unlike the broader publication gate, this applies specifically to engine writes.  Local
+    /// overlay history remains available while a prior owner account is completing Logout.
+    private var logoutAccountMutationPending: Bool {
+        signedOutRepairRequest != nil
     }
 
     private func capturePublicationToken() -> PublicationToken {
@@ -3107,6 +3150,15 @@ final class CoreBridge: ObservableObject {
     /// `action` is the engine's `Action` JSON, e.g.
     /// `["action": "Load", "args": ["model": "CatalogsWithExtra", "args": ["type": NSNull(), "extra": []]]]`.
     func dispatch(action: [String: Any], field: String? = nil) {
+        let topLevelAction = action["action"] as? String
+        let contextAction = (action["args"] as? [String: Any])?["action"] as? String
+        guard !PlaybackMutationOwnershipPolicy.blocksAccountMutationDuringSignedOutRepair(
+            logoutPending: logoutAccountMutationPending,
+            topLevelAction: topLevelAction,
+            contextAction: contextAction) else {
+            VXProbe.log("engine", "dropped account mutation pending signed-out receipt: \(Self.actionName(action))")
+            return
+        }
         let payload: [String: Any] = ["field": field ?? NSNull(), "action": action]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8) else { return }
@@ -3197,7 +3249,8 @@ final class CoreBridge: ObservableObject {
                 // Explicit disconnect reaches local recovery only after this signed-out ctx is
                 // visible.  Do not let the default-profile receipt flow into stale account work.
                 if let signedOutRepairRequest = self.signedOutRepairRequest, !self.isLoggedIn() {
-                    self.rearmSignedOutRepairWhenSafe(signedOutRepairRequest)
+                    self.rearmSignedOutRepairWhenSafe(signedOutRepairRequest,
+                                                       receiptPublicationToken: publicationToken)
                     return
                 }
                 // `ctx` is control-plane evidence: while B is pending it is the ONLY engine receipt

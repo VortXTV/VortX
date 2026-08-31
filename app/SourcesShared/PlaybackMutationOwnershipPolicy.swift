@@ -77,6 +77,26 @@ enum PlaybackMutationOwnershipPolicy {
         hasPendingBinding || credentialRejected || signedOutRepairPending
     }
 
+    /// A logout acknowledgement is a hard ownership boundary.  Until the engine emits the
+    /// matching signed-out context, only the small control-plane subset needed to finish that
+    /// transition may cross into the engine.  Overlay-only mutations never dispatch here.
+    static func blocksAccountMutationDuringSignedOutRepair(logoutPending: Bool,
+                                                            topLevelAction: String?,
+                                                            contextAction: String? = nil) -> Bool {
+        guard logoutPending else { return false }
+        switch topLevelAction {
+        case "Ctx":
+            guard let contextAction else { return true }
+            return contextAction != "Logout"
+                && contextAction != "Authenticate"
+                && !contextAction.hasPrefix("Pull")
+        case "MetaDetails", "Player":
+            return true
+        default:
+            return false
+        }
+    }
+
     static func allowsRepairHydration(engineSignedIn: Bool, hasSettledBinding: Bool) -> Bool {
         !engineSignedIn || hasSettledBinding
     }

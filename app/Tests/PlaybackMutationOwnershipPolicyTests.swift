@@ -88,6 +88,25 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "pending explicit logout blocks stale resident publication until signed-out control receipt")
         check(!Policy.blocksEnginePublication(hasPendingBinding: false, credentialRejected: false),
               "settled or signed-out engine may publish normally")
+        for mutation in [
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "Ctx", contextAction: "AddToLibrary"),
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "Ctx", contextAction: "RemoveFromLibrary"),
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "Ctx", contextAction: "LibraryItemMarkAsWatched"),
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "Ctx", contextAction: "MetaItemMarkAsWatched"),
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "Ctx", contextAction: "RewindLibraryItem"),
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "MetaDetails"),
+            Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true, topLevelAction: "Player"),
+        ] {
+            check(mutation, "pending logout blocks each watched, library, finish, and progress mutation family")
+        }
+        for control in ["Logout", "Authenticate", "PullUserFromAPI", "PullAddonsFromAPI"] {
+            check(!Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: true,
+                                                                      topLevelAction: "Ctx", contextAction: control),
+                  "pending logout permits required \(control) control action")
+        }
+        check(!Policy.blocksAccountMutationDuringSignedOutRepair(logoutPending: false,
+                                                                  topLevelAction: "Player"),
+              "settled logout state releases account mutation gate")
         check(!Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: false),
               "14-second repair cannot hydrate selected B into an unverified resident A session")
         check(Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: true),
