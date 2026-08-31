@@ -411,8 +411,11 @@ struct RootTabView: View {
         })
         // Automatic update popup on the shell (never over the player, which replaces this view). Appears once
         // per launch when a newer build exists, and again when the hourly re-check finds a still-newer one.
-        .sheet(item: $updates.prompt) { release in
-            UpdatePromptView(release: release) { updates.dismissPrompt() }
+        .sheet(item: updatePromptBinding) { release in
+            UpdatePromptView(release: release) {
+                updates.dismissPrompt()
+                Task { await armSeedingNag() }
+            }
         }
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
         // Apple TV still owes its first VortX-account sync. armLaunchNag waits out the splash + the
@@ -541,7 +544,7 @@ struct RootTabView: View {
     /// playing (the player covers the shell); MoveSeeding gates once-per-launch + needs-seeding.
     private func armSeedingNag() async {
         await MoveSeeding.armLaunchNag {
-            if presenter.request == nil { showSeedingNag = true }
+            if presenter.request == nil, updates.prompt == nil { showSeedingNag = true }
         }
     }
 
@@ -549,6 +552,10 @@ struct RootTabView: View {
     private func presentUpdateIfReady(force: Bool = false) {
         guard launchReady, selection == 0, !showSeedingNag else { return }
         updates.presentAvailableIfNeeded(force: force)
+    }
+
+    private var updatePromptBinding: Binding<UpdateChecker.Release?> {
+        Binding(get: { updates.prompt }, set: { if $0 == nil { updates.dismissPrompt() } })
     }
 
     private func applyTabBarAccent() {

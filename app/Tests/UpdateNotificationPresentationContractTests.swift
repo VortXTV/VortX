@@ -45,11 +45,12 @@ let checks = [
     (tvSettingsSource.contains("accessibilityValue(updates.manualOutcome.accessibilityText)") && iOSSettingsSource.contains("accessibilityValue(updates.manualOutcome.accessibilityText)"), "manual check state has a dynamic VoiceOver value"),
     (tvSettingsSource.contains("UIAccessibility.post(notification: .announcement") && iOSSettingsSource.contains("UIAccessibility.post(notification: .announcement"), "manual check results announce to assistive technology"),
     (tvSettingsSource.contains(".focused($updateCheckFocused)") && tvSettingsSource.contains("updateCheckFocused = true"), "tvOS returns focus to the update check after completion"),
-    (source.contains("!showSeedingNag") && source.contains("presentUpdateIfReady()\n        }) { MoveSeedingNagTV() }"), "tvOS defers update presentation until the seeding sheet closes"),
-    (iOSRootSource.contains("!showSeedingNag") && iOSRootSource.contains("presentUpdateIfReady()\n        }) { MoveSeedingNagView() }"), "iOS and macOS defer update presentation until the seeding sheet closes"),
+    (source.contains("!showSeedingNag") && source.contains("updates.prompt == nil") && source.contains("Task { await armSeedingNag() }"), "tvOS gives updates and seeding one symmetric modal slot"),
+    (iOSRootSource.contains("!showSeedingNag") && iOSRootSource.contains("updates.prompt == nil") && iOSRootSource.contains("Task { await armSeedingNag() }"), "iOS and macOS give updates and seeding one symmetric modal slot"),
     (iOSRootSource.contains("UpdateCheckFeedback") && iOSRootSource.contains(".alert(item: $updateCheckFeedback)"), "macOS menu checks have visible current and failure feedback"),
     (promptSource.contains(".accessibilityHidden(true)") && promptSource.contains(".accessibilityAddTraits(.isHeader)"), "update prompt exposes a clean accessibility hierarchy"),
     (promptSource.contains("Open release page") && promptSource.contains("Apple TV cannot install an IPA from inside VortX"), "tvOS prompt does not claim that opening a page installs an IPA"),
+    (promptSource.contains("UIAccessibility.post(notification: .announcement") && promptSource.contains("accessibilityValue(openFailed ? openFailureMessage : \"\")"), "tvOS open failures are exposed to VoiceOver"),
     (!tvSettingsSource.contains("GitHub releases page") && !iOSSettingsSource.contains("GitHub releases page"), "Settings hint copy does not name an implementation host")
 ]
 var failures = 0

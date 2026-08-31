@@ -182,6 +182,13 @@ func manualOutcome(_ checker: UpdateChecker) async -> UpdateChecker.ManualCheckO
     await MainActor.run { checker.manualOutcome }
 }
 
+func waitForManualOutcome(_ checker: UpdateChecker, _ expected: UpdateChecker.ManualCheckOutcome) async {
+    for _ in 0..<100 {
+        if await manualOutcome(checker) == expected { return }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+}
+
 func waitForSleeper(_ sleeper: ControlledSleeper, _ count: Int) async {
     for _ in 0..<100 {
         if await sleeper.waitingCount >= count { return }
@@ -464,6 +471,44 @@ struct UpdateCheckerTests {
         await waitForManualCheckToFinish(manualFailure)
         check(await manualOutcome(manualFailure) == .failure, "manual HTTP failure publishes a retryable failure")
 
+        // A later successful automatic result owns the overall discovery state and retires an old manual
+        // terminal outcome, whether that automatic result says current or finds a newer build.
+        let automaticCurrentDefaults = UserDefaults(suiteName: "\(suiteName).automatic-after-manual-current")!
+        defer { automaticCurrentDefaults.removePersistentDomain(forName: "\(suiteName).automatic-after-manual-current") }
+        let automaticCurrentLoader = ScriptedLoader([.success((Data("[]".utf8), response(503))),
+                                                     .success((release(build: 233), response(200)))])
+        let automaticCurrent = await MainActor.run {
+            UpdateChecker(defaults: automaticCurrentDefaults, now: { Date(timeIntervalSince1970: 1_250_000) },
+                          requestLoader: { request in try await automaticCurrentLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { automaticCurrent.checkNow() }
+        await waitForManualCheckToFinish(automaticCurrent)
+        await MainActor.run { automaticCurrent.checkIfStale() }
+        await waitForCalls(automaticCurrentLoader, 2)
+        await waitForManualOutcome(automaticCurrent, .idle)
+        check(await manualOutcome(automaticCurrent) == .idle,
+              "automatic current result clears stale manual failure feedback")
+
+        let automaticNewerDefaults = UserDefaults(suiteName: "\(suiteName).automatic-after-manual-newer")!
+        defer { automaticNewerDefaults.removePersistentDomain(forName: "\(suiteName).automatic-after-manual-newer") }
+        let automaticNewerLoader = ScriptedLoader([.success((Data("[]".utf8), response(503))),
+                                                   .success((release(build: 234), response(200)))])
+        let automaticNewer = await MainActor.run {
+            UpdateChecker(defaults: automaticNewerDefaults, now: { Date(timeIntervalSince1970: 1_260_000) },
+                          requestLoader: { request in try await automaticNewerLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { automaticNewer.checkNow() }
+        await waitForManualCheckToFinish(automaticNewer)
+        await MainActor.run { automaticNewer.checkIfStale() }
+        await waitForCalls(automaticNewerLoader, 2)
+        await waitForManualOutcome(automaticNewer, .idle)
+        let automaticNewerOutcome = await manualOutcome(automaticNewer)
+        let automaticNewerBuild = await MainActor.run { automaticNewer.available?.build }
+        check(automaticNewerOutcome == .idle && automaticNewerBuild == 234,
+              "automatic newer result clears stale manual failure feedback")
+
         // A newer release publishes the typed outcome and still emits the existing forced-presentation signal.
         let manualUpdateDefaults = UserDefaults(suiteName: "\(suiteName).manual-update")!
         defer { manualUpdateDefaults.removePersistentDomain(forName: "\(suiteName).manual-update") }
@@ -634,6 +679,46 @@ struct UpdateCheckerTests {
         check(bothFailedAppcastCalls == 1 && bothFailedGitHubCalls == 1,
               "both-source failure attempts the fallback once")
 
+        // A structurally current appcast cannot turn a failed GitHub comparison into a successful check. With
+        // no newer cached candidate it remains retryable; a newer validated cache is still retained.
+        let currentAppcastFailureDefaults = UserDefaults(suiteName: "\(suiteName).current-appcast-github-failure")!
+        defer { currentAppcastFailureDefaults.removePersistentDomain(forName: "\(suiteName).current-appcast-github-failure") }
+        let currentAppcastFailureLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.15", build: 233), response(200))),
+            github: .success((Data("[]".utf8), response(503)))
+        )
+        let currentAppcastFailure = await MainActor.run {
+            UpdateChecker(defaults: currentAppcastFailureDefaults, now: { Date(timeIntervalSince1970: 1_850_000) },
+                          requestLoader: { request in try await currentAppcastFailureLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { currentAppcastFailure.checkNow() }
+        await waitForManualCheckToFinish(currentAppcastFailure)
+        check(await manualOutcome(currentAppcastFailure) == .failure,
+              "current appcast plus failed GitHub is a retryable failed check")
+
+        let cachedFallbackDefaults = UserDefaults(suiteName: "\(suiteName).current-appcast-cached-fallback")!
+        defer { cachedFallbackDefaults.removePersistentDomain(forName: "\(suiteName).current-appcast-cached-fallback") }
+        let cachedFallbackRelease = UpdateChecker.Release(
+            version: "0.3.16", tag: "v0.3.16", build: 234, name: "VortX 0.3.16 (Build 234)", notes: "Release notes",
+            ipa: "https://github.com/VortXTV/VortX/releases/download/v0.3.16/VortX-macOS-v0.3.16-ci.dmg",
+            altstore: nil, size: nil, sha256: nil
+        )
+        cachedFallbackDefaults.set(try! JSONEncoder().encode(cachedFallbackRelease), forKey: "stremiox.update.cachedRelease")
+        let cachedFallbackLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.15", build: 233), response(200))),
+            github: .success((Data("[]".utf8), response(503)))
+        )
+        let cachedFallback = await MainActor.run {
+            UpdateChecker(defaults: cachedFallbackDefaults, now: { Date(timeIntervalSince1970: 1_860_000) },
+                          requestLoader: { request in try await cachedFallbackLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { cachedFallback.checkNow() }
+        await waitForManualCheckToFinish(cachedFallback)
+        check(await MainActor.run { cachedFallback.available?.build } == 234,
+              "newer validated cache survives current appcast and failed GitHub")
+
         // Monitoring can first be requested while a user-initiated check owns discovery. The manual completion
         // must inherit exactly one scheduler deadline rather than leaving monitoring stranded.
         let manualFirstDefaults = UserDefaults(suiteName: "\(suiteName).manual-first-monitoring")!
@@ -656,6 +741,29 @@ struct UpdateCheckerTests {
               "monitoring started during a manual check inherits one scheduler deadline")
         await MainActor.run { manualFirst.stopMonitoring() }
         await manualFirstSleeper.resumeNext()
+
+        // The same manual-first handoff must keep the short retry when both appcast and GitHub fail. The
+        // request began from Settings, but it was also the cold-launch monitoring request's only in-flight work.
+        let manualFirstFailureDefaults = UserDefaults(suiteName: "\(suiteName).manual-first-monitoring-failure")!
+        defer { manualFirstFailureDefaults.removePersistentDomain(forName: "\(suiteName).manual-first-monitoring-failure") }
+        let manualFirstFailureLoader = GateLoader((Data("[]".utf8), response(503)))
+        let manualFirstFailureSleeper = ControlledSleeper()
+        let manualFirstFailure = await MainActor.run {
+            UpdateChecker(defaults: manualFirstFailureDefaults, now: { Date(timeIntervalSince1970: 1_950_000) },
+                          requestLoader: { request in await manualFirstFailureLoader.load(request) },
+                          sleeper: { seconds in await manualFirstFailureSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { manualFirstFailure.checkNow() }
+        await waitForCalls(manualFirstFailureLoader, 1)
+        await MainActor.run { manualFirstFailure.startMonitoring() }
+        await manualFirstFailureLoader.resumeFirst()
+        await waitForManualCheckToFinish(manualFirstFailure)
+        await waitForSleeper(manualFirstFailureSleeper, 1)
+        check(await manualFirstFailureSleeper.duration(at: 0) == 60,
+              "manual-first total failure arms the monitoring short retry")
+        await MainActor.run { manualFirstFailure.stopMonitoring() }
+        await manualFirstFailureSleeper.resumeNext()
 
         // If the hourly task wakes while a manual fetch is in flight, it transfers scheduler ownership to that
         // request. It must not synchronously re-arm a zero-delay loop while the manual request is still gated.
@@ -848,6 +956,71 @@ struct UpdateCheckerTests {
         await waitForCalls(invalidCachedLoader, 1)
         await invalidCachedLoader.resumeFirst()
         await waitForManualCheckToFinish(invalidCached)
+
+        // Cached releases from the prior schema have no tag, size, or SHA keys. A stable artifact can derive
+        // its exact tag from the numeric version, while a beta path without a saved tag remains untrusted.
+        let legacyCacheDefaults = UserDefaults(suiteName: "\(suiteName).legacy-cache")!
+        defer { legacyCacheDefaults.removePersistentDomain(forName: "\(suiteName).legacy-cache") }
+        let legacyCacheJSON = #"{"version":"0.3.16","build":234,"name":"VortX 0.3.16 (Build 234)","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v0.3.16/VortX-macOS-v0.3.16-ci.dmg","altstore":null}"#
+        legacyCacheDefaults.set(Data(legacyCacheJSON.utf8), forKey: "stremiox.update.cachedRelease")
+        let legacyCacheLoader = GateLoader((release(build: 233), response(200)))
+        let legacyCache = await MainActor.run {
+            UpdateChecker(defaults: legacyCacheDefaults, now: { Date(timeIntervalSince1970: 2_600_000) },
+                          requestLoader: { request in await legacyCacheLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { legacyCache.checkNow() }
+        check(await MainActor.run { legacyCache.available?.build == 234 && legacyCache.available?.tag == nil },
+              "literal stable legacy cache derives its safe stable tag identity")
+        await waitForCalls(legacyCacheLoader, 1)
+        await legacyCacheLoader.resumeFirst()
+        await waitForManualCheckToFinish(legacyCache)
+
+        let legacyBetaCacheDefaults = UserDefaults(suiteName: "\(suiteName).legacy-beta-cache")!
+        defer { legacyBetaCacheDefaults.removePersistentDomain(forName: "\(suiteName).legacy-beta-cache") }
+        let legacyBetaCacheJSON = #"{"version":"0.3.16","build":235,"name":"VortX 0.3.16 (Build 235)","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v0.3.16-beta.31/VortX-macOS-v0.3.16-beta.31-ci.dmg","altstore":null}"#
+        legacyBetaCacheDefaults.set(Data(legacyBetaCacheJSON.utf8), forKey: "stremiox.update.cachedRelease")
+        let legacyBetaCacheLoader = GateLoader((release(build: 233), response(200)))
+        let legacyBetaCache = await MainActor.run {
+            UpdateChecker(defaults: legacyBetaCacheDefaults, now: { Date(timeIntervalSince1970: 2_610_000) },
+                          requestLoader: { request in await legacyBetaCacheLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { legacyBetaCache.checkNow() }
+        check(await MainActor.run { legacyBetaCache.available == nil },
+              "tagless beta legacy cache cannot derive a safe artifact identity")
+        await waitForCalls(legacyBetaCacheLoader, 1)
+        await legacyBetaCacheLoader.resumeFirst()
+        await waitForManualCheckToFinish(legacyBetaCache)
+
+        let canonicalArtifact = "https://github.com/VortXTV/VortX/releases/download/v0.3.16/VortX-macOS-v0.3.16-ci.dmg"
+        let trustedDirectRelease = UpdateChecker.Release(version: "0.3.16", tag: "v0.3.16", build: 234,
+                                                          name: "VortX 0.3.16 (Build 234)", notes: "",
+                                                          ipa: canonicalArtifact, altstore: nil, size: nil, sha256: nil)
+        check(trustedDirectRelease.installURL?.absoluteString == canonicalArtifact,
+              "Release intrinsically accepts only the canonical stable artifact")
+        let unsafeAltstores = [
+            "https://vortx.tv/altstore.json?x=1", "https://user@vortx.tv/altstore.json",
+            "https://vortx.tv:443/altstore.json", "https://vortx.tv/altstore.json#x", "http://vortx.tv/altstore.json"
+        ]
+        check(unsafeAltstores.allSatisfy {
+            UpdateChecker.Release(version: "0.3.16", tag: "v0.3.16", build: 234, name: "VortX 0.3.16 (Build 234)", notes: "", ipa: nil, altstore: $0, size: nil, sha256: nil).installURL == nil
+        }, "Release intrinsically rejects noncanonical AltStore URLs")
+        let unsafeArtifacts = [
+            canonicalArtifact + "?x=1", canonicalArtifact + "#x",
+            canonicalArtifact.replacingOccurrences(of: "https://", with: "https://user@"),
+            canonicalArtifact.replacingOccurrences(of: "github.com", with: "github.com:443"),
+            canonicalArtifact.replacingOccurrences(of: "/VortXTV/", with: "/%56ortXTV/"),
+            canonicalArtifact.replacingOccurrences(of: "https://", with: "http://")
+        ]
+        check(unsafeArtifacts.allSatisfy {
+            UpdateChecker.Release(version: "0.3.16", tag: "v0.3.16", build: 234, name: "VortX 0.3.16 (Build 234)", notes: "", ipa: $0, altstore: nil, size: nil, sha256: nil).installURL == nil
+        }, "Release intrinsically rejects userinfo, port, query, fragment, encoded-path, and custom-scheme artifacts")
+        let overflowVersion = String(repeating: "9", count: 80) + ".1"
+        let overflowTag = "v\(overflowVersion)"
+        let overflowArtifact = "https://github.com/VortXTV/VortX/releases/download/\(overflowTag)/VortX-macOS-\(overflowTag)-ci.dmg"
+        check(UpdateChecker.Release(version: overflowVersion, tag: overflowTag, build: 234, name: "VortX", notes: "", ipa: overflowArtifact, altstore: nil, size: nil, sha256: nil).installURL == nil,
+              "Release intrinsically rejects overflowing version components and has no fallback URL")
 
         exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE)
     }

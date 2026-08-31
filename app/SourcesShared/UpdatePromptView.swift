@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// The modal "an update is available" popup, shared by every Apple platform. Bound via `.sheet(item:)` to
 /// `UpdateChecker.shared.prompt`, so it appears automatically once per launch (and again when the hourly
@@ -76,6 +79,7 @@ struct UpdatePromptView: View {
                 // PrimaryActionStyle uses Theme.Palette.onAccent for the label; the old `.borderedProminent`
                 // + `.tint(accent)` auto-picked white text that vanished on the gold accent (invisible-text).
                 .buttonStyle(PrimaryActionStyle())
+                .accessibilityValue(openFailed ? openFailureMessage : "")
 
                 if openFailed {
                     Text(openFailureMessage)
@@ -141,15 +145,22 @@ struct UpdatePromptView: View {
     }
 
     private func openInstallDestination() {
-        guard let url = installDestination else { openFailed = true; return }
+        guard let url = installDestination else { showOpenFailure(); return }
         openURL(url) { accepted in
             if accepted {
                 // On tvOS this only confirms that the release page opened. The copy never claims an IPA installed.
                 finish()
             } else {
-                openFailed = true
+                showOpenFailure()
             }
         }
+    }
+
+    private func showOpenFailure() {
+        openFailed = true
+        #if os(tvOS)
+        UIAccessibility.post(notification: .announcement, argument: openFailureMessage)
+        #endif
     }
 
     // Platform sizing: a roomy 10-foot dialog on tvOS, a compact centered card on phone/iPad/Mac.

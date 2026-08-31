@@ -166,6 +166,10 @@ struct iOSRootView: View {
         updates.presentAvailableIfNeeded(force: force)
     }
 
+    private var updatePromptBinding: Binding<UpdateChecker.Release?> {
+        Binding(get: { updates.prompt }, set: { if $0 == nil { updates.dismissPrompt() } })
+    }
+
     /// Presentation binding for the launch picker: shown while it is owed; dismissing it by any means marks
     /// the launch as picked (pickedThisLaunch), so it never re-appears until Settings' Switch Profile asks.
     /// Mirrors tvOS RootView.pickerPresented.
@@ -235,8 +239,11 @@ struct iOSRootView: View {
         // What's New is no longer shown on launch; it lives in Settings > What's New (the full changelog).
         // Automatic update popup: appears once per launch when a newer build exists (and again when the
         // hourly re-check finds a still-newer one), so users learn about updates without opening Settings.
-        .sheet(item: $updates.prompt) { release in
-            UpdatePromptView(release: release) { updates.dismissPrompt() }
+        .sheet(item: updatePromptBinding) { release in
+            UpdatePromptView(release: release) {
+                updates.dismissPrompt()
+                Task { await armSeedingNag() }
+            }
         }
         .onChange(of: launchReady) { _ in presentUpdateIfReady() }
         .onChange(of: shellVisible) { _ in presentUpdateIfReady() }
@@ -411,7 +418,9 @@ struct iOSRootView: View {
     /// body's already-tight type-check budget pays nothing for it. MoveSeeding gates once-per-launch,
     /// waits out the profile picker, and only fires while the device still needs seeding.
     private func armSeedingNag() async {
-        await MoveSeeding.armLaunchNag { showSeedingNag = true }
+        await MoveSeeding.armLaunchNag {
+            if presenter.request == nil, updates.prompt == nil { showSeedingNag = true }
+        }
     }
 
     #if os(macOS)

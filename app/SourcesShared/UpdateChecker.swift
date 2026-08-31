@@ -45,9 +45,59 @@ final class UpdateChecker: ObservableObject {
         var id: String { key }
 
         var installURL: URL? {
-            if let a = altstore, let u = URL(string: a) { return u }
-            if let i = ipa, let u = URL(string: i) { return u }
-            return URL(string: "https://github.com/VortXTV/VortX/releases/latest")
+            if let altstore, let url = Self.canonicalAltstoreURL(altstore) { return url }
+            return Self.canonicalArtifactURL(ipa, version: version, tag: tag)
+        }
+
+        private static func canonicalAltstoreURL(_ rawURL: String) -> URL? {
+            guard let url = URL(string: rawURL),
+                  let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  components.scheme == "https", components.host == "vortx.tv",
+                  components.user == nil, components.password == nil, components.port == nil,
+                  components.query == nil, components.fragment == nil,
+                  components.path == "/altstore.json", components.percentEncodedPath == "/altstore.json" else { return nil }
+            return url
+        }
+
+        private static func canonicalArtifactURL(_ rawURL: String?, version: String, tag: String?) -> URL? {
+            let resolvedTag = tag ?? "v\(version)"
+            guard let tagVersion = numericVersion(from: resolvedTag), tagVersion == version else { return nil }
+            guard let url = URL(string: rawURL ?? ""),
+                  let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  components.scheme == "https", components.host == "github.com",
+                  components.user == nil, components.password == nil, components.port == nil,
+                  components.query == nil, components.fragment == nil,
+                  components.path == "/VortXTV/VortX/releases/download/\(resolvedTag)/\(canonicalArtifactFilename(resolvedTag))",
+                  components.percentEncodedPath == "/VortXTV/VortX/releases/download/\(resolvedTag)/\(canonicalArtifactFilename(resolvedTag))" else {
+                return nil
+            }
+            return url
+        }
+
+        private static func numericVersion(from tag: String) -> String? {
+            guard tag.first == "v" else { return nil }
+            let parts = tag.dropFirst().split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let version = parts.first.map(String.init) else { return nil }
+            let components = version.split(separator: ".", omittingEmptySubsequences: false)
+            guard
+                  components.count >= 2,
+                  components.allSatisfy({ !$0.isEmpty && $0.allSatisfy({ $0.isASCII && $0.isNumber }) }),
+                  components.compactMap({ Int($0) }).count == components.count,
+                  parts.count == 1 || (!parts[1].isEmpty && parts[1].allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == ".") }) else {
+                return nil
+            }
+            return version
+        }
+
+        private static func canonicalArtifactFilename(_ tag: String) -> String {
+            #if os(tvOS)
+            let lite = Bundle.main.bundleIdentifier == "com.stremiox.tv.lite"
+            return lite ? "VortX-tvOS-lite-\(tag)-ci.ipa" : "VortX-tvOS-\(tag)-ci.ipa"
+            #elseif os(macOS)
+            return "VortX-macOS-\(tag)-ci.dmg"
+            #else
+            return "VortX-iOS-\(tag)-ci.ipa"
+            #endif
         }
     }
 
@@ -81,7 +131,7 @@ final class UpdateChecker: ObservableObject {
     @Published private(set) var available: Release?
 
     /// The active signal consumed by the shared tvOS, iOS, and macOS update sheet.
-    @Published var prompt: Release?
+    @Published private(set) var prompt: Release?
 
     /// Bumped after a manual check finds an update. Roots observe it and honor their launch/player gates before
     /// forcing the sheet to reappear, rather than letting the network layer present behind another surface.
@@ -136,7 +186,7 @@ final class UpdateChecker: ObservableObject {
     init(
         defaults: UserDefaults = .standard,
         now: @escaping @Sendable () -> Date = { Date() },
-        requestLoader: @escaping RequestLoader = { request in try await URLSession.shared.data(for: request) },
+        requestLoader: @escaping RequestLoader = { request in try await UpdateChecker.loadBoundedRequest(request) },
         sleeper: @escaping Sleeper = { seconds in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
         },
@@ -151,6 +201,77 @@ final class UpdateChecker: ObservableObject {
         self.buildOverride = currentBuild
         self.versionOverride = currentVersion
         self.liteOverride = isLite
+    }
+
+    /// The production loader rejects redirects and oversized payloads while bytes are still arriving. Injected
+    /// loaders remain available for deterministic tests, but shipping checks never allocate an unbounded body.
+    private static func loadBoundedRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
+        try await BoundedRequestLoader(maximumBytes: 2 * 1024 * 1024).load(request)
+    }
+
+    private final class BoundedRequestLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let maximumBytes: Int
+        private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+        private var response: URLResponse?
+        private var data = Data()
+        private var session: URLSession?
+
+        init(maximumBytes: Int) { self.maximumBytes = maximumBytes }
+
+        func load(_ request: URLRequest) async throws -> (Data, URLResponse) {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+            let queue = OperationQueue()
+            queue.maxConcurrentOperationCount = 1
+            let session = URLSession(configuration: configuration, delegate: self, delegateQueue: queue)
+            self.session = session
+            return try await withCheckedThrowingContinuation { continuation in
+                self.continuation = continuation
+                session.dataTask(with: request).resume()
+            }
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
+                        didReceive response: URLResponse,
+                        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+            guard response.expectedContentLength < 0 || response.expectedContentLength <= Int64(maximumBytes) else {
+                finish(.failure(URLError(.dataLengthExceedsMaximum)))
+                dataTask.cancel()
+                completionHandler(.cancel)
+                return
+            }
+            self.response = response
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+            guard data.count <= maximumBytes - chunk.count else {
+                finish(.failure(URLError(.dataLengthExceedsMaximum)))
+                dataTask.cancel()
+                return
+            }
+            data.append(chunk)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error { finish(.failure(error)); return }
+            guard let response else { finish(.failure(URLError(.badServerResponse))); return }
+            finish(.success((data, response)))
+        }
+
+        private func finish(_ result: Result<(Data, URLResponse), Error>) {
+            guard let continuation else { return }
+            self.continuation = nil
+            session?.finishTasksAndInvalidate()
+            session = nil
+            continuation.resume(with: result)
+        }
     }
 
     private var currentBuild: Int {
@@ -273,6 +394,7 @@ final class UpdateChecker: ObservableObject {
                 if case .current = discovery {
                     self.recordSuccessfulCheck()
                     if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
+                    if !isManual { self.manualOutcome = .idle }
                     succeeded = true
                     self.available = nil
                     self.prompt = nil
@@ -286,6 +408,7 @@ final class UpdateChecker: ObservableObject {
             // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
             self.recordSuccessfulCheck()
             if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
+            if !isManual { self.manualOutcome = .idle }
             succeeded = true
 
             // Never regress a cached/newer candidate because a successful but older endpoint replied later.
@@ -302,7 +425,6 @@ final class UpdateChecker: ObservableObject {
                 return
             }
             self.available = latest
-            if !isManual, case .upToDate = self.manualOutcome { self.manualOutcome = .idle }
             outcome = .updateAvailable(latest)
             if forcePrompt { self.forcePresentationNonce &+= 1 }
         }
@@ -345,7 +467,7 @@ final class UpdateChecker: ObservableObject {
         let githubCandidate: Release?
         if case .release(let release) = github { githubCandidate = release }
         else { githubCandidate = nil }
-        if let newest = newestRelease(in: [cached, appcastCandidate, githubCandidate]) {
+        if let newest = newestRelease(in: [cached, appcastCandidate, githubCandidate]), isNewer(newest) {
             return .release(newest)
         }
         if case .failure = github { return .failure }
@@ -405,7 +527,15 @@ final class UpdateChecker: ObservableObject {
     private func finishCheck(success: Bool, forcePrompt: Bool, isManual: Bool,
                              manualOutcome: ManualCheckOutcome, onFinish: (() -> Void)?) {
         isChecking = false
-        if !forcePrompt { automaticCheckFailedThisSession = !success }
+        // A manual request can be the request that monitoring was waiting on at cold launch. Keep request
+        // success separate from its presentation origin: a total failure in that deferred monitoring path
+        // must take the short retry, while an unrelated failed Settings check must not perturb cadence.
+        let completesDeferredMonitoring = isMonitoring && pendingMonitoringGeneration != nil
+        if success {
+            automaticCheckFailedThisSession = false
+        } else if !isManual || completesDeferredMonitoring {
+            automaticCheckFailedThisSession = true
+        }
         if isManual { self.manualOutcome = manualOutcome }
         onFinish?()
         guard manualCheckPending else {
@@ -553,7 +683,8 @@ final class UpdateChecker: ObservableObject {
               components.scheme == "https", components.host == "github.com",
               components.user == nil, components.password == nil, components.port == nil,
               components.query == nil, components.fragment == nil,
-              components.path == "/VortXTV/VortX/releases/download/\(tag)/\(expectedArtifactFilename(tag))" else {
+              components.path == "/VortXTV/VortX/releases/download/\(tag)/\(expectedArtifactFilename(tag))",
+              components.percentEncodedPath == "/VortXTV/VortX/releases/download/\(tag)/\(expectedArtifactFilename(tag))" else {
             return nil
         }
         return url
@@ -565,7 +696,7 @@ final class UpdateChecker: ObservableObject {
               components.scheme == "https", components.host == "vortx.tv",
               components.user == nil, components.password == nil, components.port == nil,
               components.query == nil, components.fragment == nil,
-              components.path == "/altstore.json" else {
+              components.path == "/altstore.json", components.percentEncodedPath == "/altstore.json" else {
             return nil
         }
         return url
