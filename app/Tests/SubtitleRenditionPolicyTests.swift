@@ -841,6 +841,14 @@ check("doc: a cue-less stretch still serves a valid document",
         && Policy.webVTTDocument(cues: []).hasPrefix("WEBVTT"))
 check("doc: a zero-length cue is not written",
       parseVTT(Policy.webVTTDocument(cues: [Cue(start: 2, end: 2, text: "x")])).cues.isEmpty)
+let firstSpoolIdentity = Policy.cueIdentifier(startSeconds: 5, endSeconds: 8, text: "Crosses boundary")
+let extendedSpoolIdentity = Policy.cueIdentifier(startSeconds: 5, endSeconds: 12, text: "Crosses boundary")
+check("doc: extending an already-spooled cue end retains its native cue identity",
+      firstSpoolIdentity == extendedSpoolIdentity)
+check("doc: a changed cue start receives a distinct native cue identity",
+      firstSpoolIdentity != Policy.cueIdentifier(startSeconds: 6, endSeconds: 12, text: "Crosses boundary"))
+check("doc: a changed cue body receives a distinct native cue identity",
+      firstSpoolIdentity != Policy.cueIdentifier(startSeconds: 5, endSeconds: 12, text: "Different line"))
 let adjacentSegmentCue = Cue(start: 5, end: 8, text: "Crosses boundary")
 let localSegment = parseVTT(Policy.webVTTDocument(
     cues: [adjacentSegmentCue], segmentStart: 6, segmentEnd: 12))

@@ -934,11 +934,11 @@ enum SubtitleRenditionPolicy {
             let endMilliseconds = Int((max(0, end) * 1_000).rounded())
             guard endMilliseconds > startMilliseconds else { continue }
             lines.append("")
-            // A STABLE cue identifier, derived from the cue's absolute identity (start, end, text) so every
-            // segment's copy of a straddling cue carries the SAME id. Apple's HLS authoring guidance uses the
-            // id for exactly this: AVFoundation recognises the copies as one cue across segment boundaries
-            // and renders it once, instead of stacking the outgoing segment's instance on top of the incoming
-            // one for the overlap (the Dolby Vision "subtitle shows 3-4 copies for a second" flicker).
+            // A STABLE cue identifier, derived from the cue's immutable absolute identity (start, text) so every
+            // segment's copy of a straddling cue carries the SAME id. A remux may extend the already-spooled
+            // cue's end as it learns more of the stream; including that mutable boundary would create a second
+            // AVFoundation cue identity and stack both native subtitles. Apple's HLS authoring guidance uses the
+            // id so AVFoundation recognises cross-segment copies as one cue and renders it once.
             lines.append(Self.cueIdentifier(startSeconds: cue.start, endSeconds: cue.end, text: cue.text))
             lines.append("\(timestamp(start)) --> \(timestamp(end))")
             lines.append(cue.text)
@@ -947,11 +947,13 @@ enum SubtitleRenditionPolicy {
         return lines.joined(separator: "\n")
     }
 
-    /// FNV-1a over the cue's absolute identity: the same cue served from any segment gets the same id, and
-    /// distinct cues cannot collide in practice. The id carries no user text; it only needs uniqueness.
-    static func cueIdentifier(startSeconds: Double, endSeconds: Double, text: String) -> String {
+    /// FNV-1a over the cue's immutable identity: the same cue served from any segment, or with a later-known
+    /// end, gets the same id. `endSeconds` remains an explicit call-site argument because it is the cue's actual
+    /// timing, but it intentionally does not participate in identity. The id carries no user text; it only needs
+    /// uniqueness among distinct cue starts and bodies.
+    static func cueIdentifier(startSeconds: Double, endSeconds _: Double, text: String) -> String {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in "\(startSeconds)|\(endSeconds)|\(text)".utf8 {
+        for byte in "\(startSeconds)|\(text)".utf8 {
             hash ^= UInt64(byte)
             hash &*= 0x0000_0100_0000_01b3
         }
