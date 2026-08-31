@@ -957,7 +957,6 @@ fun PlayerChrome(
                 emberAccent = emberAccent,
                 accessory = castButton,
                 onDismiss = {
-                    restoreMoreFocus = true
                     openSheet = ControlSheet.NONE
                 },
             )
