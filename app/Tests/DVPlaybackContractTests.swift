@@ -194,6 +194,10 @@ private struct StartupWiringRule {
             end: "if let server = remuxHLSServer {",
             exactSection: """
             videoFrameEverProduced = true
+            forwardBufferCouplingFirstFrameUptime = (
+                generation: itemGeneration,
+                uptime: ProcessInfo.processInfo.systemUptime
+            )
             if isRemuxMounted {
                 applyForwardBufferCouplingIfDue()
             }
