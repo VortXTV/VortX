@@ -63,6 +63,7 @@ enum VortXRemuxProducerLeadPolicyTests {
         elapsedEvidencePhaseSamplesOnRealTimeAndReplacesFallback()
         elapsedEvidencePhaseRejectsInvalidAndRegressingTime()
         elapsedEvidencePhaseResetsForReplacementGeneration()
+        nonterminalFallbackReachesEngineForwardBufferAssignment()
         fieldLoopSimulationOldTargetStarvesNewTargetDoesNot()
 
         print("===== FAILURES: \(failures) =====")
@@ -430,6 +431,54 @@ enum VortXRemuxProducerLeadPolicyTests {
             aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
         check("replacement generation starts its own two-second cadence",
               newItemSample.state.samplesTaken == 1 && !newItemSample.finished)
+    }
+
+    static func nonterminalFallbackReachesEngineForwardBufferAssignment() {
+        let generation: UInt64 = 140
+        let base = VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds
+        var state = VortXRemuxForwardBufferCoupling.AttemptState()
+        var fallback: (state: VortXRemuxForwardBufferCoupling.AttemptState,
+                       applyDuration: TimeInterval?, finished: Bool)?
+        for elapsed in [2.0, 4.0, 6.0, 8.0] {
+            let decision = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
+                state: state, currentGeneration: generation, elapsedSinceFirstFrame: elapsed,
+                observedBitsPerSecond: nil, indicatedBitsPerSecond: nil,
+                aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes, baseDuration: base)
+            state = decision.state
+            fallback = decision
+        }
+        check("policy emits a nonterminal t=8 fallback for engine wiring",
+              fallback?.applyDuration == 8 && fallback?.finished == false)
+
+        let testURL = URL(fileURLWithPath: #filePath)
+        let engineURL = testURL.deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Player/AVPlayerEngine.swift")
+        guard let source = try? String(contentsOf: engineURL, encoding: .utf8),
+              let start = source.range(of: "private func applyForwardBufferCouplingIfDue()"),
+              let end = source.range(of: "private func latchPlayableVideoFrame", range: start.upperBound..<source.endIndex) else {
+            check("engine fallback wiring source is readable", false)
+            return
+        }
+        let function = String(source[start.lowerBound..<end.lowerBound])
+        let compact = function.components(separatedBy: .whitespacesAndNewlines).joined()
+        let durationGuard = "ifletappliedDuration=decision.applyDuration{"
+        let assignment = "item?.preferredForwardBufferDuration=appliedDuration"
+        let finalityGuard = "guarddecision.finishedelse{return}"
+        guard let durationGuardRange = compact.range(of: durationGuard),
+              let assignmentRange = compact.range(of: assignment, range: durationGuardRange.lowerBound..<compact.endIndex),
+              let guardRange = compact.range(of: finalityGuard) else {
+            check("engine assigns every nonnil coupling duration before checking finality", false)
+            return
+        }
+        check("engine assigns nonterminal fallback before returning to collect more evidence",
+              durationGuardRange.lowerBound < assignmentRange.lowerBound
+                && assignmentRange.lowerBound < guardRange.lowerBound)
+        let mutant = compact.replacingOccurrences(
+            of: durationGuard,
+            with: "ifdecision.finished,letappliedDuration=decision.applyDuration{")
+        check("engine wiring regression rejects a finished-only fallback assignment mutant",
+              !mutant.contains(durationGuard) && mutant.contains(assignment))
     }
 
     /// State-machine replay of the diag-6 loop (branch review finding 3: the configured target must CHANGE

@@ -389,15 +389,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 mount: .localRemux,
                 hasProducedFirstFrame: true))
         forwardBufferCouplingState = decision.state
-        guard decision.finished else { return }
-        if let steadyDuration = decision.applyDuration {
-            if item?.preferredForwardBufferDuration != steadyDuration {
-                item?.preferredForwardBufferDuration = steadyDuration
+        if let appliedDuration = decision.applyDuration {
+            if item?.preferredForwardBufferDuration != appliedDuration {
+                item?.preferredForwardBufferDuration = appliedDuration
             }
+            let phase = decision.finished ? "coupled" : "fallback"
             DiagnosticsLog.log(
                 "dv",
-                "forward-buffer coupled to producer byte budget coupled=\(String(format: "%.1f", steadyDuration))s bps=\(decision.state.bestBitsPerSecond.map { Int($0.rounded()) }.map(String.init) ?? "unknown") budget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) generation=\(itemGeneration)")
-        } else {
+                "forward-buffer \(phase) to producer byte budget seconds=\(String(format: "%.1f", appliedDuration)) bps=\(decision.state.bestBitsPerSecond.map { Int($0.rounded()) }.map(String.init) ?? "unknown") budget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) generation=\(itemGeneration)")
+        }
+        guard decision.finished else { return }
+        if decision.applyDuration == nil {
             DiagnosticsLog.log(
                 "dv",
                 "forward-buffer coupling gave up without an estimate after \(decision.state.attemptsUsed) attempts base=\(String(format: "%.1f", VortXRemuxForwardBufferPolicy.steadyStateSeconds))s generation=\(itemGeneration)")
