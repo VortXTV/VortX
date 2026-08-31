@@ -163,33 +163,44 @@ class AddonTombstonesTest {
     }
 
     @Test
-    fun `signed out tombstones never read or write persisted state`() {
+    fun `signed out removals persist locally, support reinstall, and never expose sync stamps`() {
         val p = FakeTombstonePersistence().apply {
             store["stremiox.addons.deleted"] = "[\"$url\"]"
         }
         val t = store(p) { 1_000.0 }
         AddonTombstones.activateAccount(null)
 
-        assertTrue(t.all().isEmpty())
+        assertTrue(url in t.all())
         assertTrue(t.timestampsForSync().isEmpty())
         assertFalse(t.tombstone(url))
-        assertFalse(t.forget(url))
+        assertTrue(t.forget(url))
+        assertTrue(t.tombstone(url))
         assertFalse(t.merge(legacyIds = listOf(url), stamps = emptyMap()))
         t.baselineInstalled(listOf(url))
 
-        assertTrue(p.reads.isEmpty())
-        assertTrue(p.writes.isEmpty())
-        assertEquals("[\"$url\"]", p.store["stremiox.addons.deleted"])
+        // Engine reset creates a fresh store instance. The removal must still suppress the re-seeded add-on.
+        val afterEngineReset = store(p) { 2_000.0 }
+        assertTrue(url in afterEngineReset.all())
+        assertTrue(url in t.all())
+        assertTrue(p.writes.all { !it.contains(".account.") })
+        assertTrue(p.store["stremiox.addons.deleted"]?.contains(url) == true)
     }
 
     @Test
-    fun `legacy global keys remain quarantined from every account scope`() {
+    fun `legacy unscoped removals survive upgrade but remain quarantined from every account`() {
         val p = FakeTombstonePersistence().apply {
             store["stremiox.addons.deleted"] = "[\"$url\"]"
             store["stremiox.addons.removedAt"] = "{\"$url\":1000}"
         }
         val t = store(p) { 2_000.0 }
 
+        AddonTombstones.activateAccount(null)
+        assertTrue(url in t.all())
+        assertTrue(t.timestampsForSync().isEmpty())
+
+        p.reads.clear()
+        p.writes.clear()
+        AddonTombstones.activateAccount("test-account")
         assertTrue(t.all().isEmpty())
         assertTrue(t.timestampsForSync().isEmpty())
         assertTrue(t.tombstone(url))
@@ -198,5 +209,32 @@ class AddonTombstonesTest {
         assertEquals("{\"$url\":1000}", p.store["stremiox.addons.removedAt"])
         assertTrue(p.reads.none { it == "stremiox.addons.deleted" || it == "stremiox.addons.removedAt" })
         assertTrue(p.writes.all { it.contains(".account.test-account") })
+    }
+
+    @Test
+    fun `account scopes isolate removals and restore their own state after sign out`() {
+        val p = FakeTombstonePersistence()
+        var now = 1_000.0
+        val t = store(p) { now }
+        val a = "https://a.example/manifest.json"
+        val b = "https://b.example/manifest.json"
+
+        AddonTombstones.activateAccount("account-a")
+        assertTrue(t.tombstone(a))
+        AddonTombstones.activateAccount("account-b")
+        assertTrue(t.all().isEmpty())
+        assertTrue(t.tombstone(b))
+
+        AddonTombstones.activateAccount(null)
+        assertTrue(t.all().isEmpty())
+        assertTrue(t.tombstone(url))
+        assertTrue(t.timestampsForSync().isEmpty())
+
+        AddonTombstones.activateAccount("account-a")
+        assertEquals(setOf(a), t.all())
+        AddonTombstones.activateAccount("account-b")
+        assertEquals(setOf(b), t.all())
+        AddonTombstones.activateAccount(null)
+        assertEquals(setOf(url), t.all())
     }
 }

@@ -25,8 +25,9 @@ import org.json.JSONObject
  * the recency of the last install versus the last removal, which is what lets a genuine reinstall out-race a
  * stale removal.
  *
- * WIRE COMPATIBILITY. The legacy `stremiox.addons.deleted` array keeps its old shape (an array of URLs), now
- * computed as the EFFECTIVE removed set, so older builds keep reading it. The companion stamp maps
+ * WIRE COMPATIBILITY. The anonymous device-local namespace keeps the legacy `stremiox.addons.deleted` array
+ * shape (an array of URLs), computed as the EFFECTIVE removed set, so older signed-out builds keep reading it.
+ * Account namespaces use account-suffixed keys and never overwrite that local fallback. The companion stamp maps
  * (`stremiox.addons.removedAt` / `stremiox.addons.addedAt`, url -> ms) carry the timestamps; clients that do
  * not know them ignore them. An incoming URL that appears only in the legacy array with NO stamp entry folds
  * at the migration epoch, so any real later reinstall out-races it.
@@ -75,11 +76,22 @@ class AddonTombstones internal constructor(
         val addedAt: MutableMap<String, Double>,
     )
 
-    private fun currentScope(): String? = accountScope()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+    /**
+     * Anonymous use remains durable on this device, but has no wire identity. Account storage is explicitly
+     * separate so an anonymous removal can neither leak into an account nor be published by an authenticated
+     * sync. The unscoped keys deliberately remain the legacy keys for downgrade compatibility.
+     */
+    private data class Scope(val accountId: String?) {
+        val isSyncable: Boolean get() = accountId != null
+    }
+
+    private fun currentScope(): Scope = Scope(
+        accountScope()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
+    )
 
     /** The current durable removal set (normalized transportUrls that are EFFECTIVELY removed). */
     fun all(): Set<String> = synchronized(PROCESS_LOCK) {
-        currentScope()?.let { effectiveRemoved(load(it)) } ?: emptySet()
+        effectiveRemoved(load(currentScope()))
     }
 
     /**
@@ -88,7 +100,8 @@ class AddonTombstones internal constructor(
      * `addedAt` and stops re-emitting a stale removal.
      */
     fun timestampsForSync(): Map<String, Map<String, Double>> = synchronized(PROCESS_LOCK) {
-        val scope = currentScope() ?: return@synchronized emptyMap()
+        val scope = currentScope()
+        if (!scope.isSyncable) return@synchronized emptyMap()
         val state = load(scope)
         val urls = state.removedAt.keys + state.addedAt.keys
         val out = LinkedHashMap<String, Map<String, Double>>(urls.size)
@@ -106,7 +119,7 @@ class AddonTombstones internal constructor(
      * Returns true when the url becomes NEWLY effectively-removed.
      */
     fun tombstone(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
-        val scope = currentScope() ?: return@synchronized false
+        val scope = currentScope()
         val key = normalize(transportUrl)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
         val state = load(scope)
@@ -121,7 +134,7 @@ class AddonTombstones internal constructor(
      * suppressed forever by an old removal. Returns true when the url flips from removed to present.
      */
     fun forget(transportUrl: String): Boolean = synchronized(PROCESS_LOCK) {
-        val scope = currentScope() ?: return@synchronized false
+        val scope = currentScope()
         val key = normalize(transportUrl)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
         val state = load(scope)
@@ -145,7 +158,9 @@ class AddonTombstones internal constructor(
         stamps: Map<String, Map<String, Double>>,
         webIds: List<String> = emptyList(),
     ): Boolean = synchronized(PROCESS_LOCK) {
-        val scope = currentScope() ?: return@synchronized false
+        val scope = currentScope()
+        // Cloud entries are account data. Never mint or fold them into the anonymous local-only namespace.
+        if (!scope.isSyncable) return@synchronized false
         val state = load(scope)
         val before = effectiveRemoved(state)
         val futureThresholdMs = nowMs() + 48.0 * 60.0 * 60.0 * 1000.0
@@ -197,7 +212,7 @@ class AddonTombstones internal constructor(
      * demonstrably has. Skips any url whose folded removedAt is a real, post-epoch removal.
      */
     fun baselineInstalled(transportUrls: List<String>) = synchronized(PROCESS_LOCK) {
-        val scope = currentScope() ?: return@synchronized
+        val scope = currentScope()
         if (transportUrls.isEmpty()) return
         val state = load(scope)
         val now = nowMs()
@@ -224,7 +239,7 @@ class AddonTombstones internal constructor(
         return out
     }
 
-    private fun load(scope: String): State {
+    private fun load(scope: Scope): State {
         val removedAt = loadMap(scopedKey(REMOVED_AT_KEY, scope))
         val addedAt = loadMap(scopedKey(ADDED_AT_KEY, scope))
         // Fold the legacy plain removal array at the migration epoch on EVERY load. The max-fold is monotone
@@ -236,12 +251,13 @@ class AddonTombstones internal constructor(
         return State(removedAt, addedAt)
     }
 
-    private fun save(scope: String, state: State) {
+    private fun save(scope: Scope, state: State) {
         val bounded = capped(state)
         persistence.write(scopedKey(REMOVED_AT_KEY, scope), encodeMap(bounded.removedAt))
         persistence.write(scopedKey(ADDED_AT_KEY, scope), encodeMap(bounded.addedAt))
-        // Dual-write the effective removed set back to the legacy key so an older build still reads current
-        // removals (it reads this array directly; load() re-folds it at the epoch on the next upgrade).
+        // The anonymous scope writes the literal legacy key so older signed-out builds retain the same local
+        // removal protection. Account scope writes its own suffixed legacy array to avoid leaking one account's
+        // removals into another account or into later signed-out use.
         persistence.write(scopedKey(LEGACY_DELETED_KEY, scope), JSONArray(effectiveRemoved(bounded).toList()).toString())
     }
 
@@ -306,12 +322,13 @@ class AddonTombstones internal constructor(
 
         @Volatile private var activeAccountScope: String? = null
 
-        /** Session ownership comes only from VortXSyncManager; signed-out callers see no persisted state. */
+        /** Session ownership comes only from VortXSyncManager. Signed-out state is device-local only. */
         fun activateAccount(accountId: String?) {
             activeAccountScope = accountId?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         }
 
-        private fun scopedKey(key: String, scope: String): String = "$key.account.$scope"
+        private fun scopedKey(key: String, scope: Scope): String =
+            scope.accountId?.let { "$key.account.$it" } ?: key
 
         /** Trim + lowercase, applied on both the write and the match side, matching Apple `normalize`. */
         fun normalize(url: String): String = url.trim().lowercase()
