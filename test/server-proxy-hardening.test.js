@@ -6,8 +6,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const child = require("child_process");
-const http = require("http");
-const https = require("https");
 const querystring = require("querystring");
 const stream = require("stream");
 const net = require("net");
@@ -60,7 +58,7 @@ try {
     assert.notStrictEqual(ambiguousResult.status, 0, "a duplicate end anchor must fail closed");
     assert(ambiguousResult.stderr.includes("unique proxy module anchors not found"), "duplicate end reports the explicit anchor-integrity error");
     fs.unlinkSync(ambiguous);
-    executeRedirectedPlaylistFixture(output).then(({ rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, activePref64Results, publicIPv6DNSResult, publicIPv6LiteralResult, noPref64PublicResult, malformedPref64Result, mixedFallbackNever, mixedFallbackLate, mixedFallbackPinned, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, discoveryNeverResult, discoveryLateResult, lateDiscoveryCallbackCount, methodResult, oversizedResult }) => {
+    executeRedirectedPlaylistFixture(output).then(({ rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, activePref64Results, publicIPv6DNSResult, publicIPv6LiteralResult, noPref64PublicResult, malformedPref64Result, mixedFallbackNever, mixedFallbackLate, mixedFallbackPinned, abortedMixedResult, abortedMixedLateDiscoveryCallbackCount, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, discoveryNeverResult, discoveryLateResult, lateDiscoveryCallbackCount, methodResult, oversizedResult }) => {
         const childURL = new URL(rewritten.trim(), "http://127.0.0.1");
         const encoded = childURL.pathname.slice("/proxy/".length).split("/")[0];
         const childOpts = querystring.parse(encoded);
@@ -91,6 +89,9 @@ try {
         assert.strictEqual(malformedPref64Result.status, 502, "a malformed /96 discovery answer with nonzero u octet is rejected");
         assert(mixedFallbackNever.status === 200 && mixedFallbackLate.status === 200 && mixedFallbackPinned.every(address => address === "9.9.9.9"),
             "uncertain PREF64 discovery discards IPv6 and pins an independently vetted public IPv4 answer");
+        assert(abortedMixedResult.status === 504 && abortedMixedResult.abortListeners === 0 && abortedMixedLateDiscoveryCallbackCount === 1
+            && abortedMixedResult.fetches === 0 && abortedMixedResult.agents === 0 && abortedMixedResult.sockets === 0,
+        "downstream abort rethrows through mixed-family PREF64 discovery without a late fallback or leaked listener");
         assert.strictEqual(mixedDNSResult.status, 502, "mixed public/private DNS snapshots fail closed against rebinding");
         assert.strictEqual(redirectDNSResult.status, 502, "a redirect hop resolving private fails before its fetch");
         assert(neverDNSResult.status === 504 && neverDNSResult.elapsed < 250 && neverDNSResult.abortListeners === 0,
@@ -102,7 +103,7 @@ try {
         assert.strictEqual(methodResult.status, 405, "non-GET/HEAD methods are rejected");
         assert(oversizedResult.closed && oversizedResult.status === 200, "unterminated over-limit playlist is terminated after headers");
         assert(redirectBodies.length === 2 && redirectBodies.every(body => body.destroyed), "redirect response bodies are destroyed before the next hop");
-        console.log("Embedded server proxy hardening: PASS (58 checks)");
+        console.log("Embedded server proxy hardening: PASS (59 checks)");
     }).catch(error => { process.nextTick(() => { throw error; }); });
 } finally {
     // The behavior promise has already loaded the generated module source into memory.
@@ -111,7 +112,11 @@ try {
 
 async function executeRedirectedPlaylistFixture(generatedSource) {
     let handler;
-    const calls = [], redirectBodies = [];
+    const calls = [], agents = [], redirectBodies = [];
+    let socketCreations = 0;
+    function TrackingAgent(options) { this.options = options; agents.push(this); }
+    TrackingAgent.prototype.destroy = function() { this.destroyed = true; };
+    TrackingAgent.prototype.createConnection = function() { socketCreations += 1; };
     const Router = () => ({ all: (_, callback) => { handler = callback; return this; } });
     const HeadersImpl = globalThis.Headers;
     const fetchFixture = async (target, options) => {
@@ -119,6 +124,7 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
         const pinnedAddress = await new Promise((resolve, reject) => {
             options.agent.options.lookup(parsed.hostname, {}, (error, address) => error ? reject(error) : resolve(address));
         });
+        options.agent.createConnection();
         calls.push({ target, headers: options.headers, pinnedAddress });
         if (parsed.hostname === "a.example") {
             const body = stream.Readable.from(["discard-me"]); redirectBodies.push(body);
@@ -156,11 +162,12 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
         "pref64-40.example": [ { address: "2001:4860:ab0a:0:1::", family: 6 } ],
         "mixed.example": [ { address: "8.8.8.8", family: 4 }, { address: "127.0.0.1", family: 4 } ]
     };
-    let lateDNSCallbackCount = 0, lateDiscoveryCallbackCount = 0, pref64Mode = "normal", pref64Answers = [ { address: "2001:4860:64::c000:aa", family: 6 } ];
+    let lateDNSCallbackCount = 0, lateDiscoveryCallbackCount = 0, abortedMixedLateDiscoveryCallbackCount = 0, pref64Mode = "normal", pref64Answers = [ { address: "2001:4860:64::c000:aa", family: 6 } ];
     const dnsFixture = { lookup(host, options, callback) {
         if (host === "ipv4only.arpa") {
             if (pref64Mode === "never") return;
             if (pref64Mode === "late") return setTimeout(() => { lateDiscoveryCallbackCount += 1; callback(null, pref64Answers); }, 60);
+            if (pref64Mode === "abort-late") return setTimeout(() => { abortedMixedLateDiscoveryCallbackCount += 1; callback(null, pref64Answers); }, 60);
             if (pref64Mode === "none") return callback(null, [ { address: "192.0.0.170", family: 4 }, { address: "192.0.0.171", family: 4 } ]);
             if (pref64Mode === "malformed") return callback(null, [ { address: "2001:4860:64:0:100:0:c000:aa", family: 6 } ]);
             return callback(null, pref64Answers);
@@ -172,11 +179,11 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
     const context = { AbortController, Buffer, clearTimeout, setTimeout: (callback, milliseconds) => setTimeout(callback, milliseconds === 3000 ? 10 : milliseconds === 15000 ? 20 : milliseconds) };
     vm.runInNewContext(generatedSource, context);
     const proxyModule = { exports: {} };
-    const dependencies = { 3: stream, 5: path, 6: require("url"), 11: http, 20: https, 24: querystring, 34: fetchFixture, 39: net, 100: Router, 620: dnsFixture };
+    const dependencies = { 3: stream, 5: path, 6: require("url"), 11: { Agent: TrackingAgent }, 20: { Agent: TrackingAgent }, 24: querystring, 34: fetchFixture, 39: net, 100: Router, 620: dnsFixture };
     context.modules[1](proxyModule, proxyModule.exports, id => dependencies[id]);
     proxyModule.exports.getRouter();
 
-    async function request(opts, pathname, method = "GET") {
+    async function request(opts, pathname, method = "GET", abortAfterMilliseconds) {
         const startedAt = Date.now();
         const req = new (require("events").EventEmitter)();
         req.params = { opts, pathname }; req.headers = {}; req.method = method; req.search = "";
@@ -192,6 +199,7 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
             res.once("error", error => { streamError = error; complete(); });
         });
         handler(req, res, error => { if (error) res.destroy(error); });
+        if (abortAfterMilliseconds !== undefined) setTimeout(() => req.emit("aborted"), abortAfterMilliseconds);
         await finished;
         return { body: Buffer.concat(chunks).toString("utf8"), status: res.statusCode, closed, streamError, elapsed: Date.now() - startedAt, abortListeners: req.listenerCount("aborted") };
     }
@@ -256,7 +264,14 @@ async function executeRedirectedPlaylistFixture(generatedSource) {
     const mixedFallbackLate = await request(querystring.stringify({ d: "https://mixed-public.example" }), "video.ts");
     mixedFallbackPinned.push(calls[calls.length - 1].pinnedAddress);
     await new Promise(resolve => setTimeout(resolve, 80)); pref64Mode = "normal";
+    const beforeAbortedMixed = { fetches: calls.length, agents: agents.length, sockets: socketCreations };
+    pref64Mode = "abort-late";
+    const abortedMixedResult = await request(querystring.stringify({ d: "https://mixed-public.example" }), "video.ts", "GET", 1);
+    await new Promise(resolve => setTimeout(resolve, 80)); pref64Mode = "normal";
+    abortedMixedResult.fetches = calls.length - beforeAbortedMixed.fetches;
+    abortedMixedResult.agents = agents.length - beforeAbortedMixed.agents;
+    abortedMixedResult.sockets = socketCreations - beforeAbortedMixed.sockets;
     const methodResult = await request(querystring.stringify({ d: "https://b.example" }), "segment.ts", "POST");
     const oversizedResult = await request(querystring.stringify({ d: "https://big.example" }), "list.m3u8");
-    return { rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, activePref64Results, publicIPv6DNSResult, publicIPv6LiteralResult, noPref64PublicResult, malformedPref64Result, mixedFallbackNever, mixedFallbackLate, mixedFallbackPinned, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, discoveryNeverResult, discoveryLateResult, lateDiscoveryCallbackCount, methodResult, oversizedResult };
+    return { rewritten, calls, redirectBodies, privateResult, privateIPv6Result, nat64WellKnownResult, nat64LocalResult, hostileDNSResult, nat64DNSResult, nat64LocalDNSResult, activePref64Results, publicIPv6DNSResult, publicIPv6LiteralResult, noPref64PublicResult, malformedPref64Result, mixedFallbackNever, mixedFallbackLate, mixedFallbackPinned, abortedMixedResult, abortedMixedLateDiscoveryCallbackCount, mixedDNSResult, redirectDNSResult, neverDNSResult, lateDNSResult, lateDNSCallbackCount, discoveryNeverResult, discoveryLateResult, lateDiscoveryCallbackCount, methodResult, oversizedResult };
 }

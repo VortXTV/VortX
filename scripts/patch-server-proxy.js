@@ -139,6 +139,7 @@ const moduleSource = `}, function(module, exports, __webpack_require__) {
             if (!safe.length) throw new Error("Unsafe PREF64 destination");
             return safe[0];
         }, error => {
+            if (signal.aborted) throw error;
             if (ipv4.length) return ipv4[0];
             throw error;
         });
