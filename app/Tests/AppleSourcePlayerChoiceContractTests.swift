@@ -66,7 +66,8 @@ private enum AppleSourcePlayerChoiceContractTests {
         let tvDetail = source("app/SourcesTV/DetailView.swift", root: root)
         let iosDetail = source("app/SourcesiOS/iOSDetailView.swift", root: root)
         let player = source("app/Sources/PlayerScreen.swift", root: root)
-        check("production sources are readable", !tvDetail.isEmpty && !iosDetail.isEmpty && !player.isEmpty)
+        let tvPlayer = source("app/SourcesTV/TVPlayerView.swift", root: root)
+        check("production sources are readable", !tvDetail.isEmpty && !iosDetail.isEmpty && !player.isEmpty && !tvPlayer.isEmpty)
 
         resetFlags()
         let mp4 = URL(string: "https://cdn.example.test/movie.mp4")!
@@ -154,6 +155,40 @@ private enum AppleSourcePlayerChoiceContractTests {
               player.contains("switchStream(to: opt.stream")
                 && playerSources.contains("switchStream(to: stream")
                 && player.contains("accessibilityHint: \"Switches at the current playback position\""))
+
+        let tvSourceRows = section(tvPlayer, from: "private func sourceRows()", to: "private func sourceLabel")
+        let tvAudioRows = section(tvPlayer, from: "private func audioLanguageFilterRows()", to: "private func playerSettingsRows()")
+        check("tvOS source Audio returns to visibly re-ranked Sources without auto-switching",
+              tvSourceRows.contains("TrackPreferences.$audioLanguagesOverride.withValue(sessionAudioLanguages)")
+                && tvAudioRows.components(separatedBy: "openPanel(.sources)").count == 3
+                && !tvAudioRows.contains("resolveAndSwitchStream"))
+        check("tvOS episode advance preserves the outgoing surface until a replacement is issued",
+              tvPlayer.contains("if pendingAdvance?.issued == true {")
+                && !tvPlayer.contains("if pendingAdvance != nil {\n                Color.black.ignoresSafeArea()"))
+        check("tvOS transport warm caller gates before claiming warmed identity",
+              ordered([
+                "private func warmNextIfReady()",
+                "NextEpisodePreloadPolicy.isTransportWarmEligible(",
+                "guard let pre = preloaded, warmedID != pre.episodeID else { return }",
+                "warmedID = pre.episodeID"
+              ], in: tvPlayer))
+        let tvStall = section(tvPlayer, from: "private func recoverFromStall", to: "private func reloadAtPlayhead")
+        check("tvOS AVPlayer stall caller is generation-fenced and never falls through to legacy reload",
+              tvPlayer.contains("@State private var avStallWatchdogItemGeneration: UInt64?")
+                && tvStall.contains("recoverFreshItemForProvenSurfaceStall(")
+                && tvStall.contains("expectedItemGeneration: expectedItemGeneration")
+                && tvStall.contains("case .retain(let reason):")
+                && tvStall.contains("case .replaceFreshItem:")
+                && ordered([
+                    "case .terminal(let proof):",
+                    "return",
+                    "}\n        }\n        guard stallRecoveries < 3"
+                ], in: tvStall))
+        let tvTrickplay = section(tvPlayer, from: "private func currentLocalTrickplayCaptureDecision", to: "/// The one place a trickplay frame")
+        check("tvOS trickplay declares AVPlayer video-output versus libmpv inline backend",
+              tvTrickplay.contains("player is AVPlayerEngineController")
+                && tvTrickplay.contains(".avPlayerVideoOutput")
+                && tvTrickplay.contains(".libmpvInlineDrawable"))
 
         check("long episode lists publish a stable top anchor",
               iosDetail.contains("private static let episodesTopAnchor")

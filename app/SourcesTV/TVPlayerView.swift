@@ -812,6 +812,10 @@ struct TVPlayerView: View {
     // position freezes while NOT buffering or paused (the black-screen / hard-stall
     // case), bounded so a genuinely dead source still falls through to the overlay.
     @State private var stallWatchdog: Task<Void, Never>?
+    /// Exact AVPlayer-item ownership captured when the post-first-frame watchdog starts observing. A
+    /// same-token fresh-item transaction advances this generation, so a delayed watchdog can never recover a
+    /// retired item or turn ordinary buffering into the legacy full re-load path.
+    @State private var avStallWatchdogItemGeneration: UInt64?
     @State private var lastObservedTime = -1.0
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
@@ -920,7 +924,7 @@ struct TVPlayerView: View {
             // the first-frame commit, so the first visible frame IS the committed episode. The published
             // identity itself is untouched (still first-frame commit); this gates only what is VISIBLE.
             // Source switches (switchStream) never park a pendingAdvance and are deliberately not covered.
-            if pendingAdvance != nil {
+            if pendingAdvance?.issued == true {
                 Color.black.ignoresSafeArea()
             }
 
@@ -1979,7 +1983,10 @@ struct TVPlayerView: View {
                 // Wake the provider (ranged read of the preloaded source): near the end when duration is known,
                 // or once we're a few minutes in when it isn't (best-effort for durationless streams).
                 if assetSanityAccepted,
-                   ((duration > 0 && duration - d <= 180) || (duration <= 0 && d >= 240)) {
+                   NextEpisodePreloadPolicy.isTransportWarmEligible(
+                    position: d,
+                    duration: duration
+                   ) {
                     warmNextIfReady()
                 }
             }
@@ -3457,10 +3464,12 @@ struct TVPlayerView: View {
         var rs: [OptionRow] = [OptionRow(label: String(localized: "Audio"), isHeader: true)]
         rs.append(OptionRow(label: String(localized: "Auto"), isSelected: sessionAudioLanguages == nil) {
             sessionAudioLanguages = nil
+            openPanel(.sources)
         })
         for lang in TrackPreferences.commonLanguages {
             rs.append(OptionRow(label: lang.label, isSelected: sessionAudioLanguages == [lang.id]) {
                 sessionAudioLanguages = [lang.id]
+                openPanel(.sources)
             })
         }
         return rs
@@ -4775,6 +4784,8 @@ struct TVPlayerView: View {
     /// the SAME shared policy `PlayerScreen` already uses on iOS/macOS (ports it here identically).
     private func startStallWatchdog() {
         stallWatchdog?.cancel()
+        avStallWatchdogItemGeneration = (coordinator.player as? AVPlayerEngineController)?
+            .currentItemGeneration
         lastObservedTime = -1
         stalledTicks = 0
         stallStableProgressTicks = 0
@@ -5049,6 +5060,40 @@ struct TVPlayerView: View {
     }
 
     private func recoverFromStall(stalledTicksAtRecovery: Int) {
+        if let avPlayer = coordinator.player as? AVPlayerEngineController,
+           let expectedItemGeneration = avStallWatchdogItemGeneration {
+            let action = avPlayer.recoverFreshItemForProvenSurfaceStall(
+                expectedItemGeneration: expectedItemGeneration,
+                surfaceStalled: true
+            )
+            switch action {
+            case .retain(let reason):
+                // The first frozen sample intentionally only establishes the engine-owned producer baseline.
+                // Keep observing this item. In particular, AVPlayer's ordinary rebuffering must never fall
+                // through to reloadAtPlayhead(), which destroys a healthy remux and looks like a restart.
+                DiagnosticsLog.log("player", "AVPlayer stall retained reason=\(String(describing: reason)) generation=\(expectedItemGeneration)")
+                return
+            case .replaceFreshItem:
+                // The engine transaction retains the mounted producer, source-time origin, transport intent,
+                // DV signalling, and semantic media selections. Re-arm only the surface-owned first-frame
+                // state for its NEW exact item generation; do not call the legacy player re-load path.
+                avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
+                buffering = true
+                hasStartedPlaying = false
+                firstFrameRenderedAt = nil
+                appliedResume = true
+                appliedAutoTracks = true
+                DiagnosticsLog.log("player", "AVPlayer proven surface stall replaced fresh item generation=\(avPlayer.currentItemGeneration)")
+                return
+            case .terminal(let proof):
+                DiagnosticsLog.log("player", "AVPlayer stall terminal proof=\(String(describing: proof))")
+                if !hopToNextSource(reason: "AVPlayer terminal stall") {
+                    loadErrorMsg = "Playback stopped on this source."
+                    presentTerminalLoadFailure()
+                }
+                return
+            }
+        }
         guard stallRecoveries < 3 else {
             // Repeated stalls on the same source: stop reloading and let the viewer
             // pick another source from the error overlay.
@@ -8672,6 +8717,10 @@ struct TVPlayerView: View {
     /// cold start there is what used to cost 30 to 60 seconds. Torrents start
     /// their peer search at the same moment.
     private func warmNextIfReady() {
+        guard NextEpisodePreloadPolicy.isTransportWarmEligible(
+            position: currentTime,
+            duration: duration
+        ) else { return }
         guard let pre = preloaded, warmedID != pre.episodeID else { return }
         let url = pre.url
         let target = NextEpisodePreloadPolicy.Target(
@@ -9321,7 +9370,10 @@ struct TVPlayerView: View {
             .init(
                 isUltraHighDefinition: TVOSFramePresentationPolicy.isUltraHighDefinition(
                     width: summary.width, height: summary.height),
-                dynamicRange: dynamicRange
+                dynamicRange: dynamicRange,
+                captureBackend: player is AVPlayerEngineController
+                    ? .avPlayerVideoOutput
+                    : .libmpvInlineDrawable
             )
         )
     }
