@@ -38,6 +38,11 @@ private func section(_ source: String, from start: String, until end: String) ->
     return String(source[startRange.lowerBound..<endRange.lowerBound])
 }
 
+private func appearsBefore(_ needle: String, _ other: String, in source: String) -> Bool {
+    guard let left = source.range(of: needle), let right = source.range(of: other) else { return false }
+    return left.lowerBound < right.lowerBound
+}
+
 let bridge = source()
 let seed = section(bridge, from: "private func seedInitialState()", until: "/// Refresh the installed-addons")
 let refresh = section(bridge, from: "private func refreshAddons()", until: "/// Remove an installed addon")
@@ -47,6 +52,8 @@ let meta = section(bridge, from: "private func scheduleMetaDetailsRepublish()", 
 let board = section(bridge, from: "private func scheduleBoardRebuild()", until: "private func buildBoardRows()")
 let rebuild = section(bridge, from: "func rebuildBoardRows()", until: "/// The Home board rows")
 let repair = section(bridge, from: "private func scheduleSessionRepair()", until: "/// Refresh installed addons")
+let settlement = section(bridge, from: "private func settleAccountBindingIfProven()", until: "private func finishSettledAccountBinding()")
+let invalidation = section(bridge, from: "private func invalidatePublicationEpoch()", until: "/// ProfileStore calls")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
@@ -55,6 +62,12 @@ check(bridge.contains("private let publicationEpochLock = NSLock()")
 check(!event.contains("let publicationGeneration = authBindingGeneration")
                 && event.contains("let publicationToken = capturePublicationToken()"),
               "Rust NewState worker never reads main-owned auth generation")
+check(appearsBefore("let bindingSettled = self.settleAccountBindingIfProven()", "guard !self.enginePublicationBlocked", in: event)
+                && !event.contains("guard let self, self.publicationStillCurrent(publicationToken) else { return }\n                // `ctx` is control-plane"),
+              "pending-B ctx receipt reaches identity settlement before data publication is gated")
+check(settlement.contains("invalidatePublicationEpoch()")
+                && invalidation.contains("continueWatchingRebuildGeneration &+= 1"),
+              "settlement advances epoch and invalidates stale Continue Watching rebuilds")
 check(seed.contains("capturePublicationToken()")
                 && seed.contains("publicationStillCurrent(publicationToken)")
                 && seed.contains("rebuildContinueWatching(capturedPublicationToken: publicationToken)")
@@ -73,6 +86,12 @@ check(event.contains("scheduleBoardRebuild(capturedPublicationToken: publication
                 && event.contains("self.library = value")
                 && event.contains("self.discover = value"),
               "account-scoped event branches pass one token into each downstream publisher")
+check(event.contains("guard let self, self.publicationStillCurrent(publicationToken), self.searchLoaded else { return }")
+                && event.contains("self.loadSearchRange()"),
+              "ctx search-range redispatch is dropped for stale or blocked account context")
+check(event.contains("guard let self, self.publicationStillCurrent(publicationToken) else { return }\n                    guard fingerprint != self.discoverPublishedFingerprint")
+                && event.contains("self.discoverPublishedFingerprint = fingerprint"),
+              "Discover fingerprint mutation is main-gated by the captured publication token")
 check(meta.contains("publicationStillCurrent(publicationToken)")
                 && meta.contains("self.metaDetailsWork?.cancel()"),
               "meta-details coalescer checks the token at schedule and final publication")

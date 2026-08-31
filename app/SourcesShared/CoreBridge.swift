@@ -1158,9 +1158,8 @@ final class CoreBridge: ObservableObject {
     /// a change-detection fingerprint, NOT a parallel copy of engine-owned state: it covers every byte, so
     /// any real change to `selected` or any catalog item always differs and always republishes. Reset to
     /// nil wherever `self.discover` is cleared so a fresh load after a clear is never suppressed. Touched
-    /// on the engine worker thread inside `handleEvent`; the lone cross-thread reset in `clearUserState`
-    /// is a benign nil-write (worst case one redundant republish, never a dropped change), matching the
-    /// file's existing tolerance for cross-thread reads of these optimization flags (see `playerActive`).
+    /// only on main alongside the published Discover snapshot, so an old engine event cannot poison the
+    /// no-op gate for a newly settled profile.
     private var discoverPublishedFingerprint: Int?
 
     /// Load the next page of the current Discover catalog (infinite scroll). The engine appends the
@@ -2781,6 +2780,9 @@ final class CoreBridge: ObservableObject {
         publicationEpochLock.lock()
         publicationEpoch &+= 1
         publicationEpochLock.unlock()
+        continueWatchingRebuildLock.lock()
+        continueWatchingRebuildGeneration &+= 1
+        continueWatchingRebuildLock.unlock()
         DispatchQueue.main.async { [weak self] in
             self?.boardRebuildWork?.cancel()
             self?.boardRebuildWork = nil
@@ -2874,6 +2876,10 @@ final class CoreBridge: ObservableObject {
         else { return false }
         settledAccountBinding = binding
         pendingAccountBinding = nil
+        // Pending-generation snapshots are intentionally blocked rather than discarded while this
+        // ctx receipt proves the account.  Once proof clears the gate, advance the epoch so none of
+        // those old-A / pending-B snapshots can become publishable under the newly settled B context.
+        invalidatePublicationEpoch()
         return true
     }
 
@@ -2988,15 +2994,22 @@ final class CoreBridge: ObservableObject {
         // stuck-true (the switched account never reloads) through an unsynchronized cross-thread write.
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                guard let self else { return }
+                // `ctx` is control-plane evidence: while B is pending it is the ONLY engine receipt
+                // that can prove the authenticated B token is now resident.  Never apply the data
+                // publication gate before this settlement attempt.
                 let bindingSettled = self.settleAccountBindingIfProven()
+                if bindingSettled { self.finishSettledAccountBinding() }
+                // Anything below publishes or dispatches based on the resident account.  It must
+                // wait for a settled/signed-out context, even though the control receipt above may
+                // run while the publication gate is blocked.
+                guard !self.enginePublicationBlocked else { return }
                 if self.awaitingAuthMigration, self.isLoggedIn() {
                     self.awaitingAuthMigration = false
                     NSLog("[CoreBridge] authKey migrated -> pulling addons + syncing library")
                     self.refreshFromAPI()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
                 }
-                if bindingSettled { self.finishSettledAccountBinding() }
                 // Dashboard owner-library edits received while another profile was selected are
                 // replayed only after this ctx proves their exact engine account is resident.
                 ProfileStore.shared.replayPendingAccountLibraryAdds(core: self)
@@ -3035,7 +3048,10 @@ final class CoreBridge: ObservableObject {
             // only fills the holes: no re-load of settled results, no flicker. Gated on `searchLoaded` so
             // it never fires with no search loaded, and idempotent (a settled range emits nothing via the
             // engine's `eq_update`). The app is re-issuing its OWN query, not mirroring engine state.
-            if searchLoaded { loadSearchRange() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.publicationStillCurrent(publicationToken), self.searchLoaded else { return }
+                self.loadSearchRange()
+            }
         }
         if fields.contains("meta_details") {
             // Coalesce a source-search burst into one trailing decode+diff (see metaDetailsWork). The heavy
@@ -3063,43 +3079,44 @@ final class CoreBridge: ObservableObject {
                 // `discoverPageInFlight` (and latches `discoverExhausted` for a cursorless catalog) can
                 // arrive with bytes byte-identical to the last publish and WITHOUT an intervening
                 // isLoadingPage=true emit; swallowing it would wedge `discoverPageInFlight` true (further
-                // paging blocked) and never latch exhausted. `discoverPageInFlight` is the exact flag this
-                // branch clears on settle, so gating on it makes the paging path provably safe rather than
-                // relying on the interim "Loading" emit differing. Read here on the worker thread; it is a
-                // plain Bool written on main/UI well before the engine round-trips a page emit back, so the
-                // read is benign (matches the `playerActive` cross-thread convention in this file). The
-                // ordinary idle re-announce (in flight false) is still suppressed, which is the whole point.
-                if fingerprint != discoverPublishedFingerprint || discoverPageInFlight {
-                    discoverPublishedFingerprint = fingerprint
-                    published = true
-                    let value: CoreDiscover?
-                    do { value = try Self.decoder.decode(CoreDiscover.self, from: data) }
-                    catch { NSLog("%@", "[CoreBridge] decode discover failed: \(error)"); value = nil }
-                    VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
-                    DispatchQueue.main.async { [weak self] in
+                // paging blocked) and never latch exhausted.  The fingerprint belongs to the published
+                // snapshot, so decide and record it on main under the same token gate, never on Rust's
+                // worker.  That prevents an old-A callback from suppressing B's first Discover payload.
+                published = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                    guard fingerprint != self.discoverPublishedFingerprint || self.discoverPageInFlight else { return }
+                    self.discoverPublishedFingerprint = fingerprint
+                    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                         guard let self else { return }
-                        guard self.publicationStillCurrent(publicationToken) else { return }
-                        // End-stop (#95): a next-page load that has FULLY settled (no page still loading)
-                        // without growing the list means there are no more pages, whether the catalog was
-                        // cursorless or its cursor went nil mid-catalog. Gate on !isLoadingPage so the
-                        // interim "Loading" emit (same count, more coming) never latches exhausted early.
-                        if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
-                            self.discoverExhausted = true
-                        }
-                        self.discover = value
-                        // Clear the in-flight flag only once the load has settled, so onAppear bursts during
-                        // the page fetch can't fire a duplicate load (the interim "Loading" emit keeps it set).
-                        if value?.isLoadingPage != true { self.discoverPageInFlight = false }
-                    }
-                    // A null first load derives the default catalog before the selectable is refreshed from
-                    // addons, so it can land with catalogs available but nothing selected (Discover stuck on
-                    // the spinner). If so, load the first catalog to unstick it.
-                    if let value, value.items.isEmpty,
-                       !value.selectable.types.contains(where: { $0.selected }),
-                       let first = value.selectable.types.first {
+                        let value: CoreDiscover?
+                        do { value = try Self.decoder.decode(CoreDiscover.self, from: data) }
+                        catch { NSLog("%@", "[CoreBridge] decode discover failed: \(error)"); value = nil }
+                        VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
                         DispatchQueue.main.async { [weak self] in
                             guard let self, self.publicationStillCurrent(publicationToken) else { return }
-                            self.selectDiscover(first.request)
+                            // End-stop (#95): a next-page load that has FULLY settled (no page still loading)
+                            // without growing the list means there are no more pages, whether the catalog was
+                            // cursorless or its cursor went nil mid-catalog. Gate on !isLoadingPage so the
+                            // interim "Loading" emit (same count, more coming) never latches exhausted early.
+                            if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
+                                self.discoverExhausted = true
+                            }
+                            self.discover = value
+                            // Clear the in-flight flag only once the load has settled, so onAppear bursts during
+                            // the page fetch can't fire a duplicate load (the interim "Loading" emit keeps it set).
+                            if value?.isLoadingPage != true { self.discoverPageInFlight = false }
+                        }
+                        // A null first load derives the default catalog before the selectable is refreshed from
+                        // addons, so it can land with catalogs available but nothing selected (Discover stuck on
+                        // the spinner). If so, load the first catalog to unstick it.
+                        if let value, value.items.isEmpty,
+                           !value.selectable.types.contains(where: { $0.selected }),
+                           let first = value.selectable.types.first {
+                            DispatchQueue.main.async { [weak self] in
+                                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                                self.selectDiscover(first.request)
+                            }
                         }
                     }
                 }
