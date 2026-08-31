@@ -393,6 +393,13 @@ struct iOSSettingsView: View {
                 }
             }
             .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
+            .onChange(of: updates.manualOutcome) { outcome in
+                if case .updateAvailable = outcome {
+                    // Keep one sheet owner in the root shell. An explicit Settings request may use it from this
+                    // tab, but unattended automatic checks retain the root's Home/player presentation gates.
+                    updates.presentAvailableIfNeeded(force: true)
+                }
+            }
             .onAppear { SettingsChangeLog.prime() }   // I-settings: baseline the [settings] change log for this visit
             // I-settings: ONE centralized hook records every preference write on the [settings] channel (see
             // SettingsChangeLog), covering all the @AppStorage controls without a scattered .onChange per control.
@@ -2010,6 +2017,14 @@ struct iOSSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            Button { updates.checkNow() } label: {
+                Label(updates.isManualCheckInProgress ? "Checking for Updates…" : "Check for Updates",
+                      systemImage: updates.isManualCheckInProgress ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+            }
+            .disabled(updates.isManualCheckInProgress)
+            .accessibilityLabel("Check for Updates")
+            .accessibilityHint("Checks GitHub now and shows the available update or a retry message.")
+            manualUpdateResult
             LabeledContent("Version", value: appVersion)
             LabeledContent("Player", value: String(localized: "libmpv · MPVKit"))
             NavigationLink {
@@ -2022,6 +2037,28 @@ struct iOSSettingsView: View {
             } label: {
                 Label("Watch Stats", systemImage: "chart.bar.xaxis")
             }
+        }
+    }
+
+    @ViewBuilder private var manualUpdateResult: some View {
+        switch updates.manualOutcome {
+        case .idle, .updateAvailable:
+            EmptyView()
+        case .checking:
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Checking for updates…")
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("Checking for updates")
+        case .upToDate:
+            Label("You’re up to date", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("You’re up to date")
+        case .failure:
+            Label("Unable to check. Try again.", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Unable to check for updates. Try again.")
         }
     }
 

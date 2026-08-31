@@ -1498,6 +1498,15 @@ struct SettingsView: View {
                 }
                 .padding(.vertical, Theme.Space.xs)
             }
+            Button { updates.checkNow() } label: {
+                Label(updates.isManualCheckInProgress ? "Checking for Updates…" : "Check for Updates",
+                      systemImage: updates.isManualCheckInProgress ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+            }
+            .buttonStyle(ChipButtonStyle(selected: false))
+            .disabled(updates.isManualCheckInProgress)
+            .accessibilityLabel("Check for Updates")
+            .accessibilityHint("Checks GitHub now and shows the available update or a retry message.")
+            manualUpdateResult
             infoRow(String(localized: "Version"), appVersion)
             infoRow(String(localized: "Player"), String(localized: "libmpv · MPVKit"))
             infoRow(String(localized: "Server"), String(localized: "Stremio streaming server (nodejs-mobile)"))
@@ -1507,6 +1516,38 @@ struct SettingsView: View {
             .buttonStyle(ChipButtonStyle(selected: false))
         }
         .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
+        .onChange(of: updates.manualOutcome) { _, outcome in
+            if case .updateAvailable = outcome {
+                // The shell owns the only update sheet. A Settings-initiated check may present it on this tab,
+                // while unattended automatic checks continue to wait for the existing Home/player safety gates.
+                updates.presentAvailableIfNeeded(force: true)
+            }
+        }
+    }
+
+    @ViewBuilder private var manualUpdateResult: some View {
+        switch updates.manualOutcome {
+        case .idle, .updateAvailable:
+            EmptyView()
+        case .checking:
+            HStack(spacing: Theme.Space.sm) {
+                ProgressView()
+                Text("Checking for updates…")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            .accessibilityLabel("Checking for updates")
+        case .upToDate:
+            Label("You’re up to date", systemImage: "checkmark.circle.fill")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .accessibilityLabel("You’re up to date")
+        case .failure:
+            Label("Unable to check. Try again.", systemImage: "exclamationmark.triangle.fill")
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .accessibilityLabel("Unable to check for updates. Try again.")
+        }
     }
 
     private var appVersion: String {

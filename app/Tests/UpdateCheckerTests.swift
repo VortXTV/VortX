@@ -14,6 +14,8 @@ actor ScriptedLoader {
     init(_ results: [Result<(Data, URLResponse), Error>]) { self.results = results }
 
     func load(_ request: URLRequest) throws -> (Data, URLResponse) {
+        // Existing fixtures exercise the GitHub fallback. The production checker always probes the appcast first.
+        if request.url?.host == "vortx.tv" { return (Data("{}".utf8), response(503)) }
         calls += 1
         guard !results.isEmpty else { throw Failure.exhausted }
         return try results.removeFirst().get()
@@ -57,6 +59,7 @@ actor LatencyLoader {
     }
 
     func load(_ request: URLRequest) -> (Data, URLResponse) {
+        if request.url?.host == "vortx.tv" { return (Data("{}".utf8), response(503)) }
         calls += 1
         clock.seconds += latency
         return result
@@ -75,6 +78,7 @@ actor GateLoader {
     }
 
     func load(_ request: URLRequest) async -> (Data, URLResponse) {
+        if request.url?.host == "vortx.tv" { return (Data("{}".utf8), response(503)) }
         calls += 1
         if calls == gatedCall {
             await withCheckedContinuation { continuation = $0 }
@@ -89,6 +93,26 @@ actor GateLoader {
     }
 }
 
+actor RoutedLoader {
+    private let appcast: Result<(Data, URLResponse), Error>
+    private let github: Result<(Data, URLResponse), Error>
+    private(set) var requestedHosts: [String] = []
+
+    init(appcast: Result<(Data, URLResponse), Error>, github: Result<(Data, URLResponse), Error>) {
+        self.appcast = appcast
+        self.github = github
+    }
+
+    func load(_ request: URLRequest) throws -> (Data, URLResponse) {
+        let host = request.url?.host ?? ""
+        requestedHosts.append(host)
+        return try (host == "vortx.tv" ? appcast : github).get()
+    }
+
+    var appcastCalls: Int { requestedHosts.filter { $0 == "vortx.tv" }.count }
+    var githubCalls: Int { requestedHosts.filter { $0 == "api.github.com" }.count }
+}
+
 func response(_ status: Int) -> URLResponse {
     HTTPURLResponse(url: URL(string: "https://api.github.com")!, statusCode: status,
                     httpVersion: nil, headerFields: nil)!
@@ -97,6 +121,17 @@ func response(_ status: Int) -> URLResponse {
 func release(build: Int, body: String = "") -> Data {
     let fixture = """
     [{"tag_name":"v0.3.15","name":"VortX 0.3.15 (Build \(build))","body":"\(body)","draft":false,"prerelease":false,"published_at":"2026-08-30T00:00:00Z","assets":[{"name":"VortX-macOS.dmg","browser_download_url":"https://example.invalid/VortX-macOS.dmg"}]}]
+    """
+    return Data(fixture.utf8)
+}
+
+func appcast(version: String, build: Int) -> Data {
+    let sha256 = String(repeating: "a", count: 64)
+    let fixture = """
+    {"schemaVersion":2,
+     "ios":{"version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-iOS-v\(version)-ci.ipa","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-iOS-v\(version)-ci.ipa","size":101,"sha256":"\(sha256)","altstore":"https://vortx.tv/altstore.json","artifactType":"ipa"},
+     "tvos":{"version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-tvOS-v\(version)-ci.ipa","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-tvOS-v\(version)-ci.ipa","size":102,"sha256":"\(sha256)","altstore":null,"artifactType":"ipa"},
+     "mac":{"version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-macOS-v\(version)-ci.dmg","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-macOS-v\(version)-ci.dmg","size":103,"sha256":"\(sha256)","altstore":null,"artifactType":"dmg"}}
     """
     return Data(fixture.utf8)
 }
@@ -127,6 +162,17 @@ func waitForAvailable(_ checker: UpdateChecker, build: Int) async {
         if await MainActor.run(body: { checker.available?.build == build }) { return }
         try? await Task.sleep(for: .milliseconds(5))
     }
+}
+
+func waitForManualCheckToFinish(_ checker: UpdateChecker) async {
+    for _ in 0..<100 {
+        if !(await MainActor.run(body: { checker.isManualCheckInProgress })) { return }
+        try? await Task.sleep(for: .milliseconds(5))
+    }
+}
+
+func manualOutcome(_ checker: UpdateChecker) async -> UpdateChecker.ManualCheckOutcome {
+    await MainActor.run { checker.manualOutcome }
 }
 
 func waitForSleeper(_ sleeper: ControlledSleeper, _ count: Int) async {
@@ -353,6 +399,202 @@ struct UpdateCheckerTests {
         await scheduledStopLoader.resumeFirst()
         try? await Task.sleep(for: .milliseconds(20))
         check(await scheduledStopSleeper.waitingCount == 0, "stop during scheduled request leaves no replacement scheduler")
+
+        // An explicit check reports current instead of failing silently. It does not use the automatic cadence
+        // timestamp, so the result is always fresh and visible to Settings.
+        let currentDefaults = UserDefaults(suiteName: "\(suiteName).manual-current")!
+        defer { currentDefaults.removePersistentDomain(forName: "\(suiteName).manual-current") }
+        let currentLoader = ScriptedLoader([.success((release(build: 233), response(200)))])
+        let current = await MainActor.run {
+            UpdateChecker(defaults: currentDefaults, now: { Date(timeIntervalSince1970: 1_100_000) },
+                          requestLoader: { request in try await currentLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { current.checkNow() }
+        await waitForCalls(currentLoader, 1)
+        await waitForManualCheckToFinish(current)
+        check(await manualOutcome(current) == .upToDate, "manual current check publishes an up-to-date result")
+
+        // HTTP failures become an explicit retryable outcome. No raw request, decoder, or server error leaks
+        // through the observable UI contract.
+        let manualFailureDefaults = UserDefaults(suiteName: "\(suiteName).manual-failure")!
+        defer { manualFailureDefaults.removePersistentDomain(forName: "\(suiteName).manual-failure") }
+        let manualFailureLoader = ScriptedLoader([.success((Data("[]".utf8), response(503)))])
+        let manualFailure = await MainActor.run {
+            UpdateChecker(defaults: manualFailureDefaults, now: { Date(timeIntervalSince1970: 1_200_000) },
+                          requestLoader: { request in try await manualFailureLoader.load(request) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { manualFailure.checkNow() }
+        await waitForCalls(manualFailureLoader, 1)
+        await waitForManualCheckToFinish(manualFailure)
+        check(await manualOutcome(manualFailure) == .failure, "manual HTTP failure publishes a retryable failure")
+
+        // A newer release publishes the typed outcome and still emits the existing forced-presentation signal.
+        let manualUpdateDefaults = UserDefaults(suiteName: "\(suiteName).manual-update")!
+        defer { manualUpdateDefaults.removePersistentDomain(forName: "\(suiteName).manual-update") }
+        let manualUpdateLoader = ScriptedLoader([.success((release(build: 233), response(200)))])
+        let manualUpdate = await MainActor.run {
+            UpdateChecker(defaults: manualUpdateDefaults, now: { Date(timeIntervalSince1970: 1_300_000) },
+                          requestLoader: { request in try await manualUpdateLoader.load(request) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { manualUpdate.checkNow() }
+        await waitForCalls(manualUpdateLoader, 1)
+        await waitForManualCheckToFinish(manualUpdate)
+        let updateOutcome = await manualOutcome(manualUpdate)
+        let discoveredManualBuild: Int?
+        if case .updateAvailable(let release) = updateOutcome { discoveredManualBuild = release.build }
+        else { discoveredManualBuild = nil }
+        let manualPresentationNonce = await MainActor.run { manualUpdate.forcePresentationNonce }
+        check(discoveredManualBuild == 233, "manual newer check publishes the discovered release")
+        check(manualPresentationNonce == 1, "manual newer check preserves the existing forced-presentation signal")
+
+        // A Settings request made while automatic monitoring is in flight remains single-flight, then performs
+        // its own forced request after the automatic response completes.
+        let queuedDefaults = UserDefaults(suiteName: "\(suiteName).manual-queued")!
+        defer { queuedDefaults.removePersistentDomain(forName: "\(suiteName).manual-queued") }
+        let queuedLoader = GateLoader((release(build: 233), response(200)))
+        let queued = await MainActor.run {
+            UpdateChecker(defaults: queuedDefaults, now: { Date(timeIntervalSince1970: 1_400_000) },
+                          requestLoader: { request in await queuedLoader.load(request) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { queued.startMonitoring() }
+        await waitForCalls(queuedLoader, 1)
+        await MainActor.run { queued.checkNow() }
+        check(await queuedLoader.calls == 1, "manual request queues behind the automatic in-flight request")
+        check(await MainActor.run { queued.isManualCheckInProgress }, "queued manual request remains visibly checking")
+        await queuedLoader.resumeFirst()
+        await waitForCalls(queuedLoader, 2)
+        await waitForManualCheckToFinish(queued)
+        let queuedOutcome = await manualOutcome(queued)
+        let queuedBuild: Int?
+        if case .updateAvailable(let release) = queuedOutcome { queuedBuild = release.build }
+        else { queuedBuild = nil }
+        check(queuedBuild == 233, "queued manual request ultimately performs its forced check")
+        check(await queuedLoader.calls == 2, "queued manual request never overlaps the automatic request")
+        await MainActor.run { queued.stopMonitoring() }
+
+        // The appcast is the primary Apple release contract. This fixture mirrors the live 0.3.16 / build 234
+        // shape and must win without consulting generic GitHub release assets.
+        let appcastNewerDefaults = UserDefaults(suiteName: "\(suiteName).appcast-newer")!
+        defer { appcastNewerDefaults.removePersistentDomain(forName: "\(suiteName).appcast-newer") }
+        let appcastNewerLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.16", build: 234), response(200))),
+            github: .failure(ScriptedLoader.Failure.exhausted)
+        )
+        let appcastNewer = await MainActor.run {
+            UpdateChecker(defaults: appcastNewerDefaults, now: { Date(timeIntervalSince1970: 1_500_000) },
+                          requestLoader: { request in try await appcastNewerLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { appcastNewer.checkNow() }
+        await waitForManualCheckToFinish(appcastNewer)
+        let appcastNewerOutcome = await manualOutcome(appcastNewer)
+        let appcastNewerBuild: Int?
+        let appcastNewerIntegrity: Bool
+        if case .updateAvailable(let release) = appcastNewerOutcome {
+            appcastNewerBuild = release.build
+            appcastNewerIntegrity = release.size == 103 && release.sha256 == String(repeating: "a", count: 64)
+        } else {
+            appcastNewerBuild = nil
+            appcastNewerIntegrity = false
+        }
+        check(appcastNewerBuild == 234, "live-shaped appcast discovers 0.3.16 build 234")
+        check(appcastNewerIntegrity, "appcast release retains validated size and SHA-256 metadata")
+        let appcastNewerAppcastCalls = await appcastNewerLoader.appcastCalls
+        let appcastNewerGitHubCalls = await appcastNewerLoader.githubCalls
+        check(appcastNewerAppcastCalls == 1 && appcastNewerGitHubCalls == 0,
+              "valid appcast is authoritative and does not merge GitHub")
+
+        // A valid appcast that exactly matches the installed build is still authoritative and must report current
+        // instead of falling through to a potentially different GitHub result.
+        let appcastCurrentDefaults = UserDefaults(suiteName: "\(suiteName).appcast-current")!
+        defer { appcastCurrentDefaults.removePersistentDomain(forName: "\(suiteName).appcast-current") }
+        let appcastCurrentLoader = RoutedLoader(
+            appcast: .success((appcast(version: "0.3.15", build: 233), response(200))),
+            github: .success((release(build: 234), response(200)))
+        )
+        let appcastCurrent = await MainActor.run {
+            UpdateChecker(defaults: appcastCurrentDefaults, now: { Date(timeIntervalSince1970: 1_600_000) },
+                          requestLoader: { request in try await appcastCurrentLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { appcastCurrent.checkNow() }
+        await waitForManualCheckToFinish(appcastCurrent)
+        check(await manualOutcome(appcastCurrent) == .upToDate, "valid current appcast reports current")
+        let appcastCurrentAppcastCalls = await appcastCurrentLoader.appcastCalls
+        let appcastCurrentGitHubCalls = await appcastCurrentLoader.githubCalls
+        check(appcastCurrentAppcastCalls == 1 && appcastCurrentGitHubCalls == 0,
+              "valid current appcast avoids the GitHub fallback")
+
+        // Primary status or schema failure falls back to the existing GitHub parser. Both transport chains
+        // failing still surface the manual retry state instead of quietly recording the request.
+        let fallbackDefaults = UserDefaults(suiteName: "\(suiteName).appcast-fallback")!
+        defer { fallbackDefaults.removePersistentDomain(forName: "\(suiteName).appcast-fallback") }
+        let fallbackLoader = RoutedLoader(
+            appcast: .success((Data("not an appcast".utf8), response(200))),
+            github: .success((release(build: 234), response(200)))
+        )
+        let fallback = await MainActor.run {
+            UpdateChecker(defaults: fallbackDefaults, now: { Date(timeIntervalSince1970: 1_700_000) },
+                          requestLoader: { request in try await fallbackLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { fallback.checkNow() }
+        await waitForManualCheckToFinish(fallback)
+        let fallbackOutcome = await manualOutcome(fallback)
+        let fallbackBuild: Int?
+        if case .updateAvailable(let release) = fallbackOutcome { fallbackBuild = release.build }
+        else { fallbackBuild = nil }
+        check(fallbackBuild == 234, "malformed appcast falls back to the GitHub release parser")
+        let fallbackAppcastCalls = await fallbackLoader.appcastCalls
+        let fallbackGitHubCalls = await fallbackLoader.githubCalls
+        check(fallbackAppcastCalls == 1 && fallbackGitHubCalls == 1,
+              "malformed appcast performs exactly one GitHub fallback")
+
+        let statusFallbackDefaults = UserDefaults(suiteName: "\(suiteName).appcast-status-fallback")!
+        defer { statusFallbackDefaults.removePersistentDomain(forName: "\(suiteName).appcast-status-fallback") }
+        let statusFallbackLoader = RoutedLoader(
+            appcast: .success((Data("{}".utf8), response(503))),
+            github: .success((release(build: 234), response(200)))
+        )
+        let statusFallback = await MainActor.run {
+            UpdateChecker(defaults: statusFallbackDefaults, now: { Date(timeIntervalSince1970: 1_750_000) },
+                          requestLoader: { request in try await statusFallbackLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { statusFallback.checkNow() }
+        await waitForManualCheckToFinish(statusFallback)
+        let statusFallbackOutcome = await manualOutcome(statusFallback)
+        let statusFallbackBuild: Int?
+        if case .updateAvailable(let release) = statusFallbackOutcome { statusFallbackBuild = release.build }
+        else { statusFallbackBuild = nil }
+        check(statusFallbackBuild == 234, "non-200 appcast falls back to the GitHub release parser")
+        let statusFallbackAppcastCalls = await statusFallbackLoader.appcastCalls
+        let statusFallbackGitHubCalls = await statusFallbackLoader.githubCalls
+        check(statusFallbackAppcastCalls == 1 && statusFallbackGitHubCalls == 1,
+              "non-200 appcast performs exactly one GitHub fallback")
+
+        let bothFailedDefaults = UserDefaults(suiteName: "\(suiteName).appcast-both-failed")!
+        defer { bothFailedDefaults.removePersistentDomain(forName: "\(suiteName).appcast-both-failed") }
+        let bothFailedLoader = RoutedLoader(
+            appcast: .success((Data("{}".utf8), response(503))),
+            github: .success((Data("[]".utf8), response(503)))
+        )
+        let bothFailed = await MainActor.run {
+            UpdateChecker(defaults: bothFailedDefaults, now: { Date(timeIntervalSince1970: 1_800_000) },
+                          requestLoader: { request in try await bothFailedLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { bothFailed.checkNow() }
+        await waitForManualCheckToFinish(bothFailed)
+        check(await manualOutcome(bothFailed) == .failure, "both appcast and GitHub failure stay visibly retryable")
+        let bothFailedAppcastCalls = await bothFailedLoader.appcastCalls
+        let bothFailedGitHubCalls = await bothFailedLoader.githubCalls
+        check(bothFailedAppcastCalls == 1 && bothFailedGitHubCalls == 1,
+              "both-source failure attempts the fallback once")
 
         exit(failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE)
     }

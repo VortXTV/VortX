@@ -106,6 +106,9 @@ struct VortXiOSApp: App {
     var body: some Scene {
         WindowGroup {
             iOSRootView(launchReady: splashDone)
+                // ScenePhase's initial value does not necessarily emit a change on cold launch. Starting here
+                // closes that gap; UpdateChecker makes repeated root/scene calls idempotent and single-flight.
+                .onAppear { UpdateChecker.shared.startMonitoring() }
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     // Termination evidence: keep the receipt's last-known phase current so the next
                     // launch can distinguish a backgrounded jetsam kill from a foreground kill.
@@ -298,7 +301,7 @@ struct VortXiOSApp: App {
         .commands {
             CommandGroup(replacing: .newItem) { }
             CommandGroup(after: .appInfo) {
-                Button("Check for Updates...") { UpdateChecker.shared.checkIfStale(maxAge: 0) }
+                Button("Check for Updates...") { UpdateChecker.shared.checkNow() }
             }
             CommandMenu("Navigate") {
                 Button("Home")     { MacCommands.go(.home) }.keyboardShortcut("1", modifiers: .command)

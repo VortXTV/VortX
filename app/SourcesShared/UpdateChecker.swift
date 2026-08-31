@@ -22,6 +22,9 @@ final class UpdateChecker: ObservableObject {
         let notes: String
         let ipa: String?
         let altstore: String?
+        /// Integrity metadata from the verified appcast. GitHub fallback releases do not carry these fields.
+        let size: Int?
+        let sha256: String?
 
         var key: String { "\(version).\(build)" }
         var id: String { key }
@@ -30,6 +33,22 @@ final class UpdateChecker: ObservableObject {
             if let a = altstore, let u = URL(string: a) { return u }
             if let i = ipa, let u = URL(string: i) { return u }
             return URL(string: "https://github.com/VortXTV/VortX/releases/latest")
+        }
+    }
+
+    /// User-visible state for an explicit Settings or macOS menu check. The generic failure case intentionally
+    /// keeps transport, HTTP, and decoding details out of the UI while still making every failed manual request
+    /// visibly retryable.
+    enum ManualCheckOutcome: Equatable {
+        case idle
+        case checking
+        case upToDate
+        case updateAvailable(Release)
+        case failure
+
+        var isChecking: Bool {
+            if case .checking = self { return true }
+            return false
         }
     }
 
@@ -43,11 +62,18 @@ final class UpdateChecker: ObservableObject {
     /// forcing the sheet to reappear, rather than letting the network layer present behind another surface.
     @Published private(set) var forcePresentationNonce = 0
 
+    /// The outcome of the latest explicit check. Automatic monitoring intentionally leaves this untouched so a
+    /// background retry never replaces a Settings result the user is reading.
+    @Published private(set) var manualOutcome: ManualCheckOutcome = .idle
+
+    var isManualCheckInProgress: Bool { manualOutcome.isChecking }
+
     /// Builds already surfaced during this process. The set resets on relaunch, so a cached update can produce
     /// the requested one launch alert without another network request inside the daily gate.
     private var promptedKeys: Set<String> = []
     private var isChecking = false
     private var manualCheckPending = false
+    private var pendingManualFinishHandlers: [() -> Void] = []
     private var restoredCache = false
     private var monitoringTask: Task<Void, Never>?
     private var didStartMonitoring = false
@@ -66,6 +92,7 @@ final class UpdateChecker: ObservableObject {
     private static let lastCheckedKey = "stremiox.update.lastChecked"
     private static let dismissedKey = "stremiox.update.dismissedVersion"
     private static let cachedReleaseKey = "stremiox.update.cachedRelease"
+    private static let appcastURL = "https://vortx.tv/appcast.json"
     private static let releasesURL = "https://api.github.com/repos/VortXTV/VortX/releases?per_page=100"
     /// A fresh automatic request is allowed on launch and once per hour while the app remains alive.
     /// This is deliberately much shorter than a day because sideloaded installs have no store daemon to
@@ -125,7 +152,7 @@ final class UpdateChecker: ObservableObject {
         if !didStartMonitoring {
             didStartMonitoring = true
             if !isChecking {
-                check(forcePrompt: false) { [weak self] in self?.completeMonitoringCheck(generation) }
+                check(forcePrompt: false, isManual: false) { [weak self] in self?.completeMonitoringCheck(generation) }
             } else {
                 pendingMonitoringGeneration = generation
             }
@@ -153,18 +180,31 @@ final class UpdateChecker: ObservableObject {
         prompt = nil
     }
 
-    /// Passing zero is the explicit manual path and always requests a fresh fetch. Every nonzero call is an
-    /// automatic request and uses the fixed hourly gate, even when an older caller supplies a shorter age.
+    /// Performs an explicit fresh update check. If automatic monitoring already owns the one network request,
+    /// this queues exactly one forced check behind it rather than opening a second request in parallel.
+    func checkNow() {
+        checkNow(onFinish: nil)
+    }
+
+    private func checkNow(onFinish: (() -> Void)?) {
+        restoreCachedReleaseIfNeeded()
+        manualOutcome = .checking
+        if isChecking {
+            manualCheckPending = true
+            if let onFinish { pendingManualFinishHandlers.append(onFinish) }
+        } else {
+            check(forcePrompt: true, isManual: true, onFinish: onFinish)
+        }
+    }
+
+    /// Passing zero remains the legacy explicit-manual path and always requests a fresh fetch. Every nonzero call
+    /// is an automatic request and uses the fixed hourly gate, even when an older caller supplies a shorter age.
     /// A failed request is intentionally not timestamped: it must be retried the next time the shell becomes
     /// active, while `isChecking` keeps repeated appearance notifications single-flight.
     func checkIfStale(maxAge: TimeInterval = 3600, onFinish: (() -> Void)? = nil) {
         restoreCachedReleaseIfNeeded()
         if maxAge <= 0 {
-            if isChecking {
-                manualCheckPending = true
-            } else {
-                check(forcePrompt: true, onFinish: onFinish)
-            }
+            checkNow(onFinish: onFinish)
             return
         }
 
@@ -176,41 +216,36 @@ final class UpdateChecker: ObservableObject {
             onFinish?()
             return
         }
-        check(forcePrompt: false, onFinish: onFinish)
+        check(forcePrompt: false, isManual: false, onFinish: onFinish)
     }
 
-    private func check(forcePrompt: Bool, onFinish: (() -> Void)? = nil) {
+    private func check(forcePrompt: Bool, isManual: Bool, onFinish: (() -> Void)? = nil) {
         isChecking = true
         Task { [weak self] in
             guard let self else { return }
             var succeeded = false
-            defer { self.finishCheck(success: succeeded, forcePrompt: forcePrompt, onFinish: onFinish) }
-            guard let url = URL(string: Self.releasesURL) else { return }
-            var request = URLRequest(url: url)
-            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-            request.setValue("VortX-UpdateChecker", forHTTPHeaderField: "User-Agent")
-            request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
-            guard let (data, response) = try? await self.requestLoader(request),
-                  (response as? HTTPURLResponse)?.statusCode == 200,
-                  let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
+            var outcome: ManualCheckOutcome = .failure
+            defer {
+                self.finishCheck(success: succeeded, forcePrompt: forcePrompt, isManual: isManual,
+                                 manualOutcome: outcome, onFinish: onFinish)
+            }
+            let discovery = await self.discoverLatestRelease()
+            guard case let .release(latest) = discovery else {
+                if case .current = discovery {
+                    self.recordSuccessfulCheck()
+                    succeeded = true
+                    self.available = nil
+                    self.prompt = nil
+                    self.defaults.removeObject(forKey: Self.cachedReleaseKey)
+                    outcome = .upToDate
+                }
                 return
             }
 
             // Persist a check only after transport, status, and payload decoding all succeeded. Recording
             // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
-            self.defaults.set(self.now().timeIntervalSince1970, forKey: Self.lastCheckedKey)
-            self.lastSuccessfulCheckThisSession = self.now().timeIntervalSince1970
+            self.recordSuccessfulCheck()
             succeeded = true
-
-            guard let latest = releases
-                .filter({ !$0.draft && $0.publishedAt != nil })
-                .compactMap({ self.release(from: $0) })
-                .max(by: { self.compare($0, $1) == .orderedAscending }) else {
-                self.available = nil
-                self.prompt = nil
-                self.defaults.removeObject(forKey: Self.cachedReleaseKey)
-                return
-            }
 
             if let encoded = try? JSONEncoder().encode(latest) {
                 self.defaults.set(encoded, forKey: Self.cachedReleaseKey)
@@ -219,20 +254,89 @@ final class UpdateChecker: ObservableObject {
             guard self.isNewer(latest) else {
                 self.available = nil
                 self.prompt = nil
+                outcome = .upToDate
                 return
             }
             self.available = latest
+            outcome = .updateAvailable(latest)
             if forcePrompt { self.forcePresentationNonce &+= 1 }
         }
     }
 
-    private func finishCheck(success: Bool, forcePrompt: Bool, onFinish: (() -> Void)?) {
+    private func recordSuccessfulCheck() {
+        let timestamp = now().timeIntervalSince1970
+        defaults.set(timestamp, forKey: Self.lastCheckedKey)
+        lastSuccessfulCheckThisSession = timestamp
+    }
+
+    /// The appcast names exactly one asset for this platform and carries the release integrity receipt. It is
+    /// authoritative whenever it passes the client-side schema and artifact checks. GitHub is only a fallback
+    /// for transport, HTTP, decoding, schema, or selected-entry validation failure, never a second source to
+    /// merge or rank against it.
+    private func discoverLatestRelease() async -> DiscoveryResult {
+        switch await appcastDiscovery() {
+        case .release(let release):
+            return .release(release)
+        case .current:
+            return .current
+        case .failure:
+            return await gitHubDiscovery()
+        }
+    }
+
+    private func appcastDiscovery() async -> DiscoveryResult {
+        guard let url = URL(string: Self.appcastURL),
+              let (data, response) = try? await request(url, githubAPI: false),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let appcast = try? JSONDecoder().decode(Appcast.self, from: data),
+              appcast.schemaVersion == 2,
+              let entry = appcastEntry(in: appcast),
+              let release = release(from: entry) else {
+            return .failure
+        }
+        return .release(release)
+    }
+
+    private func gitHubDiscovery() async -> DiscoveryResult {
+        guard let url = URL(string: Self.releasesURL),
+              let (data, response) = try? await request(url, githubAPI: true),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let releases = try? JSONDecoder().decode([GitHubRelease].self, from: data) else {
+            return .failure
+        }
+        guard let latest = releases
+            .filter({ !$0.draft && $0.publishedAt != nil })
+            .compactMap({ release(from: $0) })
+            .max(by: { compare($0, $1) == .orderedAscending }) else {
+            return .current
+        }
+        return .release(latest)
+    }
+
+    private func request(_ url: URL, githubAPI: Bool) async throws -> (Data, URLResponse) {
+        var request = URLRequest(url: url)
+        // The updater's cadence is its cache policy. A manual check must not receive a prior URLSession response
+        // merely because the user opened Settings shortly after an automatic attempt.
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue(githubAPI ? "application/vnd.github+json" : "application/json", forHTTPHeaderField: "Accept")
+        request.setValue("VortX-UpdateChecker", forHTTPHeaderField: "User-Agent")
+        if githubAPI { request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version") }
+        return try await requestLoader(request)
+    }
+
+    private func finishCheck(success: Bool, forcePrompt: Bool, isManual: Bool,
+                             manualOutcome: ManualCheckOutcome, onFinish: (() -> Void)?) {
         isChecking = false
         if !forcePrompt { automaticCheckFailedThisSession = !success }
+        if isManual { self.manualOutcome = manualOutcome }
         onFinish?()
         guard manualCheckPending else { return }
         manualCheckPending = false
-        check(forcePrompt: true)
+        let pendingHandlers = pendingManualFinishHandlers
+        pendingManualFinishHandlers.removeAll()
+        check(forcePrompt: true, isManual: true) {
+            pendingHandlers.forEach { $0() }
+        }
     }
 
     /// Arms one one-shot task. The next deadline is always computed after the prior request finished,
@@ -242,7 +346,7 @@ final class UpdateChecker: ObservableObject {
             if isMonitoring, pendingMonitoringGeneration == monitoringGeneration {
                 let pending = monitoringGeneration
                 pendingMonitoringGeneration = nil
-                check(forcePrompt: false) { [weak self] in self?.completeMonitoringCheck(pending) }
+                check(forcePrompt: false, isManual: false) { [weak self] in self?.completeMonitoringCheck(pending) }
             }
             return
         }
@@ -291,6 +395,57 @@ final class UpdateChecker: ObservableObject {
         prompt = release
     }
 
+    private enum DiscoveryResult {
+        case release(Release)
+        case current
+        case failure
+    }
+
+    private func appcastEntry(in appcast: Appcast) -> AppcastEntry? {
+        #if os(tvOS)
+        return appcast.tvos
+        #elseif os(macOS)
+        return appcast.mac
+        #else
+        return appcast.ios
+        #endif
+    }
+
+    private func release(from entry: AppcastEntry) -> Release? {
+        let expectedType: String
+        let expectedExtension: String
+        #if os(macOS)
+        expectedType = "dmg"
+        expectedExtension = ".dmg"
+        #else
+        expectedType = "ipa"
+        expectedExtension = ".ipa"
+        #endif
+
+        guard entry.build > 0,
+              !numericVersion(entry.version).isEmpty,
+              entry.artifactType.lowercased() == expectedType,
+              entry.size > 0,
+              isLowercaseSHA256(entry.sha256),
+              let rawURL = entry.url ?? entry.ipa,
+              let artifactURL = URL(string: rawURL),
+              artifactURL.scheme == "https",
+              artifactURL.host == "github.com",
+              artifactURL.path.hasPrefix("/VortXTV/VortX/releases/download/"),
+              artifactURL.path.lowercased().hasSuffix(expectedExtension) else {
+            return nil
+        }
+        let altstore = entry.altstore.flatMap { URL(string: $0)?.scheme == "https" ? $0 : nil }
+        return Release(version: entry.version, build: entry.build, name: entry.name, notes: entry.notes,
+                       ipa: artifactURL.absoluteString, altstore: altstore, size: entry.size, sha256: entry.sha256)
+    }
+
+    private func isLowercaseSHA256(_ value: String) -> Bool {
+        value.count == 64 && value.unicodeScalars.allSatisfy {
+            (48...57).contains($0.value) || (97...102).contains($0.value)
+        }
+    }
+
     private func release(from github: GitHubRelease) -> Release? {
         guard let version = marketingVersion(in: github.tagName),
               // The public release title is canonical. Release-note bodies carry older beta history, so their
@@ -304,7 +459,9 @@ final class UpdateChecker: ObservableObject {
                        name: github.name ?? github.tagName,
                        notes: github.body ?? "",
                        ipa: asset.browserDownloadURL,
-                       altstore: nil)
+                       altstore: nil,
+                       size: nil,
+                       sha256: nil)
     }
 
     private func platformAsset(_ asset: GitHubAsset) -> Bool {
@@ -395,6 +552,26 @@ final class UpdateChecker: ObservableObject {
             case name, body, draft, prerelease, assets
             case publishedAt = "published_at"
         }
+    }
+
+    private struct Appcast: Decodable {
+        let schemaVersion: Int
+        let ios: AppcastEntry?
+        let tvos: AppcastEntry?
+        let mac: AppcastEntry?
+    }
+
+    private struct AppcastEntry: Decodable {
+        let version: String
+        let build: Int
+        let name: String
+        let notes: String
+        let ipa: String?
+        let url: String?
+        let size: Int
+        let sha256: String
+        let altstore: String?
+        let artifactType: String
     }
 
     private struct GitHubAsset: Decodable {
