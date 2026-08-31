@@ -83,6 +83,31 @@ class PlayerChromeOverflowPolicyTest {
         assertTrue(header.contains("\"More player controls\""))
     }
 
+    @Test
+    fun `selection and volume overlays consume Back before player exit`() {
+        val chrome = source("src/main/kotlin/com/vortx/android/player/PlayerChrome.kt")
+        val selection = chrome.substringAfter("private fun ControlSelectionSheet(")
+            .substringBefore("private fun VolumeSheet(")
+        val volume = chrome.substringAfter("private fun VolumeSheet(")
+            .substringBefore("private fun PlayerErrorOverlay(")
+
+        assertTrue(selection.contains("BackHandler { onDismiss() }"))
+        assertTrue(volume.contains("BackHandler { onDismiss() }"))
+    }
+
+    @Test
+    fun `volume overlay starts on a labeled full-size mute control without duplicate icon action`() {
+        val chrome = source("src/main/kotlin/com/vortx/android/player/PlayerChrome.kt")
+        val volume = chrome.substringAfter("private fun VolumeSheet(")
+            .substringBefore("private fun PlayerErrorOverlay(")
+
+        assertTrue(volume.contains("val muteFocus = remember { FocusRequester() }"))
+        assertTrue(volume.contains("muteFocus.requestFocus()"))
+        assertTrue(volume.contains(".focusRequester(muteFocus)"))
+        assertTrue(volume.contains(".heightIn(min = 48.dp)"))
+        assertFalse(volume.contains(".size(28.dp)\n                        .clickable(onClick = onToggleMute)"))
+    }
+
     private fun fullyPopulatedPlacement() = playerChromeActionPlacement(
         hasQualityChoices = true,
         hasEpisodes = true,

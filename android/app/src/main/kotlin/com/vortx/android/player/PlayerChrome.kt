@@ -1749,6 +1749,9 @@ private fun ControlSelectionSheet(
     accessory: (@Composable () -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
+    // The active overlay owns Remote Back/Escape. Letting it fall through would exit the player instead
+    // of closing the topmost sheet and restoring the compact chrome's expected focus target.
+    BackHandler { onDismiss() }
     val firstEnabledIndex = options.indexOfFirst(SheetOption::enabled)
     val firstOptionFocus = remember(title) { FocusRequester() }
     LaunchedEffect(title, firstEnabledIndex, options.size) {
@@ -1873,6 +1876,14 @@ private fun VolumeSheet(
     onToggleMute: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    // Unlike a phone touch target, a TV remote needs an explicit entry point when the overlay appears.
+    // Start on the labeled mute control rather than relying on focus search to discover the slider.
+    val muteFocus = remember { FocusRequester() }
+    BackHandler { onDismiss() }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        runCatching { muteFocus.requestFocus() }
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1903,9 +1914,7 @@ private fun VolumeSheet(
                     },
                     contentDescription = null,
                     tint = Color.White,
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clickable(onClick = onToggleMute),
+                    modifier = Modifier.size(28.dp),
                 )
                 Slider(
                     value = (volume / 100.0).toFloat().coerceIn(0f, 1f),
@@ -1929,7 +1938,9 @@ private fun VolumeSheet(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
+                    .focusRequester(muteFocus)
                     .clickable(role = Role.Button, onClick = onToggleMute)
+                    .heightIn(min = 48.dp)
                     .padding(vertical = 10.dp, horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
