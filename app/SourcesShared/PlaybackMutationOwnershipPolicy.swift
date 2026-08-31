@@ -72,6 +72,14 @@ enum PlaybackMutationOwnershipPolicy {
             && !authMigration && activeProfileIsOwner && activeUsesEngineHistory && credentialCurrent
     }
 
+    static func blocksEnginePublication(hasPendingBinding: Bool, credentialRejected: Bool) -> Bool {
+        hasPendingBinding || credentialRejected
+    }
+
+    static func allowsRepairHydration(engineSignedIn: Bool, hasSettledBinding: Bool) -> Bool {
+        !engineSignedIn || hasSettledBinding
+    }
+
     static func allows(_ target: Target, in context: Context) -> Bool {
         switch target {
         case .overlay(let profileID):

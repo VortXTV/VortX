@@ -79,6 +79,18 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "default resolver caller fails closed without a settled credential binding")
         check(Policy.allowsResolverDispatch(target: ownerTarget, binding: settledOwner),
               "resolver dispatch requires the captured target and settled credential binding")
+        check(Policy.blocksEnginePublication(hasPendingBinding: true, credentialRejected: false),
+              "pending B proof suppresses resident A publishing and hydration")
+        check(Policy.blocksEnginePublication(hasPendingBinding: true, credentialRejected: true),
+              "rejected B blocks both launch and repair timers from indirect retry")
+        check(!Policy.blocksEnginePublication(hasPendingBinding: false, credentialRejected: false),
+              "settled or signed-out engine may publish normally")
+        check(!Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: false),
+              "14-second repair cannot hydrate selected B into an unverified resident A session")
+        check(Policy.allowsRepairHydration(engineSignedIn: true, hasSettledBinding: true),
+              "signed-in repair requires the exact settled binding")
+        check(Policy.allowsRepairHydration(engineSignedIn: false, hasSettledBinding: false),
+              "signed-out local recovery remains available")
         check(Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false,
                                              hasPendingBinding: false, authMigration: false,
                                              activeProfileIsOwner: true, activeUsesEngineHistory: true,

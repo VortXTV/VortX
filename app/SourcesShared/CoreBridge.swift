@@ -125,6 +125,7 @@ final class CoreBridge: ObservableObject {
     private var settledAccountBinding: PlaybackMutationOwnershipPolicy.SettledAccountBinding?
     private var authBindingGeneration: UInt64 = 0
     private var accountBindingVerificationTask: Task<Void, Never>?
+    private var rejectedAccountBindingGeneration: UInt64?
 
     // MARK: Player-active gating (playback lag fix)
     //
@@ -201,6 +202,7 @@ final class CoreBridge: ObservableObject {
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
     /// hydrated library), it emits no `NewState`, so capture it once after init; events keep it fresh.
     private func seedInitialState() {
+        guard !enginePublicationBlocked else { return }
         let rows = buildBoardRows()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -232,6 +234,7 @@ final class CoreBridge: ObservableObject {
     /// NOT suppressed here. The same holds for an explicit Stremio reconnect (`signedInWithLegacyAuthKey`
     /// clears the removal set before the account import).
     private func refreshAddons() {
+        guard !enginePublicationBlocked else { return }
         let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
         // A synced order can arrive before OR after the final add-on hydrate. Keep the full-range intent
         // alive across both sequences: if an explicit order already exists when ctx grows, widen only when
@@ -791,11 +794,14 @@ final class CoreBridge: ObservableObject {
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-            guard let self, !self.switchInFlight, !self.awaitingAuthMigration else { return }
+            guard let self, !self.switchInFlight, !self.awaitingAuthMigration,
+                  !self.enginePublicationBlocked else { return }
             let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
             let noAccountData = self.continueWatching.isEmpty && cwItems.isEmpty && (self.library?.catalog.isEmpty ?? true)
             let noStreamAddon = self.hasNoUserStreamAddon   // user-installed stream add-ons gone (logout-proof)
             guard noAccountData || noStreamAddon else { return }
+            guard PlaybackMutationOwnershipPolicy.allowsRepairHydration(
+                engineSignedIn: self.isLoggedIn(), hasSettledBinding: self.settledActiveAccountBinding() != nil) else { return }
             let key = Keychain.string(self.activeTokenAccount)
             let hasStremioToken = (key?.isEmpty == false)
             // Account-owns-everything: hydrate the VortX account's owned add-ons + recover the owner
@@ -824,6 +830,7 @@ final class CoreBridge: ObservableObject {
 
     /// Refresh installed addons + library from api.strem.io (needs an authenticated session).
     private func refreshFromAPI() {
+        guard !enginePublicationBlocked else { return }
         dispatchCtx(["action": "PullAddonsFromAPI"])
         dispatchCtx(["action": "SyncLibraryWithAPI"])
     }
@@ -920,6 +927,7 @@ final class CoreBridge: ObservableObject {
     /// Load the Home board: every catalog of every installed addon, then fetch the first `rows`.
     /// (Targets the `board` field specifically, `search` is also a CatalogsWithExtra.)
     func loadBoard(rows: Int = 30) {
+        guard !enginePublicationBlocked else { return }
         let installedCatalogTotal = installedCatalogs(
             includeTombstoned: true,
             includeDisabled: true
@@ -2037,6 +2045,7 @@ final class CoreBridge: ObservableObject {
     /// the caller's thread (the Rust worker thread on the event path) to keep the JSON parse off main, then
     /// synthesizes + publishes on main.
     func rebuildContinueWatching() {
+        guard !enginePublicationBlocked else { return }
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         let generation = continueWatchingRebuildGeneration
@@ -2687,6 +2696,7 @@ final class CoreBridge: ObservableObject {
         cancelAccountBindingVerification()
         settledAccountBinding = nil
         authBindingGeneration &+= 1
+        rejectedAccountBindingGeneration = nil
         guard let profile = ProfileStore.shared.active, profile.usesEngineHistory, !token.isEmpty else {
             pendingAccountBinding = nil
             return
@@ -2707,6 +2717,12 @@ final class CoreBridge: ObservableObject {
     private func cancelAccountBindingVerification() {
         accountBindingVerificationTask?.cancel()
         accountBindingVerificationTask = nil
+    }
+
+    private var enginePublicationBlocked: Bool {
+        PlaybackMutationOwnershipPolicy.blocksEnginePublication(
+            hasPendingBinding: pendingAccountBinding != nil,
+            credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration)
     }
 
     /// ProfileStore calls this in the same turn as selection. It invalidates any completion for
@@ -2744,6 +2760,11 @@ final class CoreBridge: ObservableObject {
                 }
             }
         } catch LinkAuthService.IdentityVerificationError.rejected {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.pendingAccountBinding?.generation == pending.generation else { return }
+                self.rejectedAccountBindingGeneration = pending.generation
+                self.clearUserState()
+            }
             NSLog("[CoreBridge] account identity verification rejected")
         } catch is CancellationError {
             return
@@ -3318,6 +3339,7 @@ final class CoreBridge: ObservableObject {
     /// (`buildBoardRows`) runs off the main thread; only the `boardRows` assignment lands on main. Net effect:
     /// the launch/page-land storm that used to fire N full decodes + N republishes now fires exactly one.
     private func scheduleBoardRebuild() {
+        guard !enginePublicationBlocked else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.boardRebuildWork?.cancel()
