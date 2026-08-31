@@ -266,6 +266,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// Monotonic exact-item ownership. Logical retries may intentionally reuse a load token, so queued
     /// delivery must also prove that the AVPlayerItem generation that emitted the event is still mounted.
     private var itemGeneration: UInt64 = 0
+    /// The chrome captures this value when it starts a surface-stall observation and passes it back to
+    /// `recoverFreshItemForProvenSurfaceStall`. A source switch or item replacement changes the value, so an
+    /// old watchdog callback is unable to touch the newer item.
+    var currentItemGeneration: UInt64 { itemGeneration }
     private(set) var activeLoadToken: PlayerLoadToken?
     /// Newest-wins ownership for asynchronous local-HLS seeks. A later scrub/D-pad input invalidates every
     /// older task and completion callback, even when they target the same AVPlayerItem generation.
@@ -354,6 +358,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// so the coupling RETRIES on the periodic observer instead of latching once; a replaced item resets the
     /// schedule because the stored generation no longer matches.
     private var forwardBufferCouplingState = VortXRemuxForwardBufferCoupling.AttemptState()
+    /// Monotonic first-frame receipt for the exact item generation. The coupling policy samples in real elapsed
+    /// time, not periodic-observer callbacks: the 0.25 s observer may run four times a second without spending
+    /// its two-second evidence cadence. A replacement clears this receipt before its new item can publish.
+    private var forwardBufferCouplingFirstFrameUptime: (generation: UInt64, uptime: TimeInterval)?
 
     /// Applies (or retries) the producer-budget coupling for the CURRENT local-remux item. Only meaningful
     /// after the first frame: before it, the item must keep the proven-startable startup floor.
@@ -362,12 +370,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               isRemuxMounted,
               forwardBufferMount == .localRemux,
               let server = remuxHLSServer,
+              let firstFrame = forwardBufferCouplingFirstFrameUptime,
+              firstFrame.generation == itemGeneration else { return }
+        let elapsed = ProcessInfo.processInfo.systemUptime - firstFrame.uptime
+        guard elapsed.isFinite, elapsed >= 0,
               VortXRemuxForwardBufferCoupling.isAttemptDue(
                   state: forwardBufferCouplingState,
-                  currentGeneration: itemGeneration) else { return }
+                  currentGeneration: itemGeneration,
+                  elapsedSinceFirstFrame: elapsed) else { return }
         let decision = VortXRemuxForwardBufferCoupling.nextCouplingAttempt(
             state: forwardBufferCouplingState,
             currentGeneration: itemGeneration,
+            elapsedSinceFirstFrame: elapsed,
             observedBitsPerSecond: server.observedSourceBitsPerSecond(),
             indicatedBitsPerSecond: (server.signaling?.bandwidth).map(Double.init),
             aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
@@ -394,6 +408,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if videoFrameEverProduced { return true }
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
+        forwardBufferCouplingFirstFrameUptime = (
+            generation: itemGeneration,
+            uptime: ProcessInfo.processInfo.systemUptime
+        )
         if isRemuxMounted {
             applyForwardBufferCouplingIfDue()
         }
@@ -424,6 +442,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// by the periodic time observer (end, only once the media clock proves forward progress). Reset alongside
     /// the other item-scoped latches in `loadFile`.
     private var stallEpisode = AVPlayerStallEpisodeState()
+    /// Last producer sample used by the engine-owned mid-play recovery contract. It is deliberately item
+    /// generation scoped: a previous title's byte or playlist movement must never suppress recovery here.
+    private var lastMidPlaybackRecoveryProgress: VortXMKVRemuxStream.MountProgress?
+    private var midPlaybackRecoveryProgressGeneration: UInt64?
+    private var midPlaybackRecoveryBudget = AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget()
     /// Sustained window of advancing playback clock with ZERO video frames before demoting. Long enough to
     /// clear a slow first-frame on a healthy native DV start (normally sub-second once timePos ticks), short
     /// enough that black-with-Atmos flips to a working picture on libmpv in well under ten seconds.
@@ -600,6 +623,102 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if let remote = remuxRemoteMount { return remote.mountProgress }
         if let loader = remuxLoader { return loader.mountProgress }
         return nil
+    }
+
+    /// Current evidence for a later chrome-owned mid-play watchdog. The chrome supplies only two facts it owns:
+    /// that its exact generation is still selected, and that the AVPlayer surface is genuinely frozen. The
+    /// engine supplies the rest from the mounted remux, the committed transport intent and the item's published
+    /// window. A caller must map `.replaceFreshItem` to `recoverFreshItemForProvenSurfaceStall`, `.terminal` to
+    /// its normal terminal path, and every `.retain` to continuing to observe the current item.
+    func midPlaybackRecoveryDecision(
+        expectedItemGeneration: UInt64,
+        surfaceStalled: Bool
+    ) -> AVPlayerMidPlaybackRecoveryPolicy.Action {
+        let progress = remuxMountProgress
+        let hasCurrentOwnership = expectedItemGeneration == itemGeneration
+            && item != nil
+            && player.currentItem === item
+        let previous = midPlaybackRecoveryProgressGeneration == itemGeneration
+            ? lastMidPlaybackRecoveryProgress
+            : nil
+        let producerProgressed = progress.map { current in
+            guard let previous else { return false }
+            return current.producedBytes > previous.producedBytes
+                || (current.inputBytesRead ?? -1) > (previous.inputBytesRead ?? -1)
+        } ?? false
+        let playlistProgressed = progress.map { current in
+            guard let previous else { return false }
+            return current.segmentCount > previous.segmentCount
+                || (!previous.initPublished && current.initPublished)
+                || (!previous.signalingPublished && current.signalingPublished)
+        } ?? false
+        let terminalProof: AVPlayerMidPlaybackRecoveryPolicy.TerminalProof
+        if item?.error != nil || terminalLatch.hasEmitted {
+            terminalProof = .itemFailed
+        } else if progress?.failed == true {
+            terminalProof = .producerFailed
+        } else if progress?.ended == true {
+            terminalProof = .producerEnded
+        } else {
+            terminalProof = .none
+        }
+        let playerSeconds = item?.currentTime().seconds ?? 0
+        let publishedAhead = playerSeconds.isFinite
+            ? max(0, mountedPlayerWindowBounds.producedEdge - playerSeconds)
+            : 0
+        let evidence = AVPlayerMidPlaybackRecoveryPolicy.Evidence(
+            generation: itemGeneration,
+            ownershipMatches: hasCurrentOwnership,
+            playbackRequested: playbackRequested,
+            isLocalRemux: forwardBufferMount == .localRemux,
+            hasPreviousProgressSample: previous != nil,
+            producerProgressed: producerProgressed,
+            inputOpenInFlight: progress?.inputOpenInFlight == true,
+            playlistProgressed: playlistProgressed,
+            surfaceStalled: surfaceStalled,
+            publishedAheadSeconds: publishedAhead,
+            terminalProof: terminalProof
+        )
+        lastMidPlaybackRecoveryProgress = progress
+        midPlaybackRecoveryProgressGeneration = itemGeneration
+        return AVPlayerMidPlaybackRecoveryPolicy.action(
+            evidence: evidence,
+            replacementAlreadyUsed: midPlaybackRecoveryBudget.replacementUsed
+        )
+    }
+
+    /// Keep a generation-owned producer baseline while the media clock is healthy. The first watchdog poll
+    /// after a visible freeze is therefore an evidence comparison, not an unproven snapshot. If AVFoundation
+    /// stops delivering ticks entirely, the watchdog's first poll retains and records a baseline; only a later
+    /// unchanged sample can qualify as a proven surface stall.
+    private func recordMidPlaybackRecoveryProgressSnapshot() {
+        lastMidPlaybackRecoveryProgress = remuxMountProgress
+        midPlaybackRecoveryProgressGeneration = itemGeneration
+    }
+
+    /// Executes the only non-terminal action the engine's mid-play policy can authorize. This is intentionally
+    /// separate from the existing published-tail/HDR retry paths: those have their own terminal semantics and
+    /// must not be reclassified as a surface stall. A successful same-mount item replacement carries the
+    /// current source time, transport intent, DV signaling and semantic media selections through the existing
+    /// `retryFreshItemOnHealthyMount` transaction.
+    @discardableResult
+    func recoverFreshItemForProvenSurfaceStall(
+        expectedItemGeneration: UInt64,
+        surfaceStalled: Bool
+    ) -> AVPlayerMidPlaybackRecoveryPolicy.Action {
+        let action = midPlaybackRecoveryDecision(
+            expectedItemGeneration: expectedItemGeneration,
+            surfaceStalled: surfaceStalled)
+        guard action == .replaceFreshItem else { return action }
+        guard retryFreshItemOnHealthyMount(
+            reason: "proven AVPlayer surface stall",
+            claimsPublishedTailRetry: false) else {
+            return .retain(.insufficientPublishedTail)
+        }
+        midPlaybackRecoveryBudget.recordReplacement(for: itemGeneration)
+        lastMidPlaybackRecoveryProgress = nil
+        midPlaybackRecoveryProgressGeneration = itemGeneration
+        return .replaceFreshItem
     }
 
     /// One coherent player-clock window for a mounted remux. Local HLS reads both bounds from one server
@@ -881,6 +1000,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         deferredPublishedTailRecoveryGeneration = nil
         playbackMountIdentity &+= 1
         let issuedGeneration = itemGeneration
+        midPlaybackRecoveryBudget.reset(for: issuedGeneration)
+        lastMidPlaybackRecoveryProgress = nil
+        midPlaybackRecoveryProgressGeneration = nil
         audioReplacement?.bind(to: issuedGeneration)
         pendingPlaybackIntent?.bind(
             generation: issuedGeneration,
@@ -923,6 +1045,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         coreMediaReloadRetried = false
         lastLoadURL = url; lastLoadHeaders = headers; lastLoadLive = live
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
+        forwardBufferCouplingFirstFrameUptime = nil
         audioOverBlackSince = 0; audioOverBlackFired = false
         stallEpisode.reset()
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
@@ -1630,6 +1753,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         player.pause()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
+        forwardBufferCouplingFirstFrameUptime = nil
         audioOverBlackSince = 0; audioOverBlackFired = false
         stallEpisode.reset()
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
@@ -1638,6 +1762,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: fallbackURL))
         itemGeneration &+= 1
+        midPlaybackRecoveryBudget.reset(for: itemGeneration)
+        lastMidPlaybackRecoveryProgress = nil
+        midPlaybackRecoveryProgressGeneration = nil
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
         if remuxRemoteMount != nil {
@@ -1707,6 +1834,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         player.pause()
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         videoFrameEverProduced = false; preferredPeakBitRatePinned = false
+        forwardBufferCouplingFirstFrameUptime = nil
         audioOverBlackSince = 0; audioOverBlackFired = false
         stallEpisode.reset()
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []
@@ -1716,6 +1844,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: playlistURL))
         itemGeneration &+= 1
+        midPlaybackRecoveryBudget.reset(for: itemGeneration)
+        lastMidPlaybackRecoveryProgress = nil
+        midPlaybackRecoveryProgressGeneration = nil
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
         deferredPublishedTailRecoveryGeneration = nil
@@ -3202,6 +3333,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 if case .ended = self.stallEpisode.mediaAdvanced(to: time.seconds) {
                     VXProbe.event("player", "stall end")
                 }
+                self.midPlaybackRecoveryBudget.recordMediaPosition(
+                    time.seconds,
+                    generation: self.itemGeneration)
+                self.recordMidPlaybackRecoveryProgressSnapshot()
                 // Gate the two EXPENSIVE side effects (the NSLock probe write and the loadedTimeRanges scan)
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.

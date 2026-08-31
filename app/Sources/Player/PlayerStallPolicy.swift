@@ -65,6 +65,144 @@ enum PlayerMidPlaybackStallPolicy {
     }
 }
 
+/// The engine-side admission contract for a post-first-frame AVPlayer replacement.  A replacement is much
+/// more invasive than a seek nudge: it tears down AVFoundation's item-local decoder, media selections and
+/// display route.  It is therefore available only for a proven surface freeze on a healthy *local* HLS mount
+/// which still has enough published media to make a new item useful.  Producer activity is affirmative
+/// evidence that the current item should be retained while AVFoundation re-buffers.
+enum AVPlayerMidPlaybackRecoveryPolicy {
+    enum TerminalProof: Equatable {
+        case none
+        case producerEnded
+        case producerFailed
+        case itemFailed
+    }
+
+    enum RetainReason: Equatable {
+        case staleOwnership
+        case userPaused
+        case nonLocalRemux
+        case missingProgressEvidence
+        case producerProgress
+        case inputInFlight
+        case playlistProgress
+        case noSurfaceStall
+        case insufficientPublishedTail
+        case replacementAlreadyUsed
+    }
+
+    enum Action: Equatable {
+        case retain(RetainReason)
+        case replaceFreshItem
+        case terminal(TerminalProof)
+    }
+
+    struct Evidence: Equatable {
+        let generation: UInt64
+        let ownershipMatches: Bool
+        let playbackRequested: Bool
+        let isLocalRemux: Bool
+        let hasPreviousProgressSample: Bool
+        let producerProgressed: Bool
+        let inputOpenInFlight: Bool
+        let playlistProgressed: Bool
+        let surfaceStalled: Bool
+        let publishedAheadSeconds: Double
+        let terminalProof: TerminalProof
+
+        init(
+            generation: UInt64,
+            ownershipMatches: Bool,
+            playbackRequested: Bool,
+            isLocalRemux: Bool,
+            hasPreviousProgressSample: Bool,
+            producerProgressed: Bool,
+            inputOpenInFlight: Bool,
+            playlistProgressed: Bool,
+            surfaceStalled: Bool,
+            publishedAheadSeconds: Double,
+            terminalProof: TerminalProof
+        ) {
+            self.generation = generation
+            self.ownershipMatches = ownershipMatches
+            self.playbackRequested = playbackRequested
+            self.isLocalRemux = isLocalRemux
+            self.hasPreviousProgressSample = hasPreviousProgressSample
+            self.producerProgressed = producerProgressed
+            self.inputOpenInFlight = inputOpenInFlight
+            self.playlistProgressed = playlistProgressed
+            self.surfaceStalled = surfaceStalled
+            self.publishedAheadSeconds = publishedAheadSeconds
+            self.terminalProof = terminalProof
+        }
+    }
+
+    /// One replacement may be spent by an exact item generation. A new item starts with a fresh budget, while
+    /// ten consecutive positive clock receipts demonstrate that a previously replaced item really recovered
+    /// rather than merely framed once before freezing again.
+    struct RecoveryBudget: Equatable {
+        static let sustainedProgressSamplesToReset = 10
+
+        private(set) var generation: UInt64?
+        private(set) var replacementUsed = false
+        private(set) var sustainedProgressSamples = 0
+        private var lastMediaPosition: Double?
+
+        mutating func reset(for generation: UInt64) {
+            guard self.generation != generation else { return }
+            self.generation = generation
+            replacementUsed = false
+            sustainedProgressSamples = 0
+            lastMediaPosition = nil
+        }
+
+        mutating func recordReplacement(for generation: UInt64) {
+            reset(for: generation)
+            replacementUsed = true
+            sustainedProgressSamples = 0
+        }
+
+        mutating func recordMediaPosition(_ position: Double, generation: UInt64) {
+            reset(for: generation)
+            guard position.isFinite else { return }
+            defer { lastMediaPosition = position }
+            guard let lastMediaPosition else { return }
+            guard position > lastMediaPosition else {
+                sustainedProgressSamples = 0
+                return
+            }
+            sustainedProgressSamples += 1
+            if replacementUsed,
+               sustainedProgressSamples >= Self.sustainedProgressSamplesToReset {
+                replacementUsed = false
+                sustainedProgressSamples = 0
+            }
+        }
+    }
+
+    static func action(
+        evidence: Evidence,
+        replacementAlreadyUsed: Bool
+    ) -> Action {
+        // A user pause is an absolute intent boundary. Terminal delivery is deferred by the engine until Play,
+        // so a background end/failure cannot turn a deliberate pause into a replacement or autoplay.
+        guard evidence.ownershipMatches else { return .retain(.staleOwnership) }
+        guard evidence.playbackRequested else { return .retain(.userPaused) }
+        guard evidence.terminalProof == .none else { return .terminal(evidence.terminalProof) }
+        guard evidence.isLocalRemux else { return .retain(.nonLocalRemux) }
+        guard evidence.hasPreviousProgressSample else { return .retain(.missingProgressEvidence) }
+        guard !evidence.producerProgressed else { return .retain(.producerProgress) }
+        guard !evidence.inputOpenInFlight else { return .retain(.inputInFlight) }
+        guard !evidence.playlistProgressed else { return .retain(.playlistProgress) }
+        guard evidence.surfaceStalled else { return .retain(.noSurfaceStall) }
+        guard PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
+            bufferedAheadSeconds: evidence.publishedAheadSeconds
+        ) else { return .retain(.insufficientPublishedTail) }
+        guard !replacementAlreadyUsed else { return .retain(.replacementAlreadyUsed) }
+        return .replaceFreshItem
+    }
+}
+
 /// Detects the rapid cache-empty loop that a coarse playhead watchdog cannot see: mpv can briefly advance
 /// between rebuffer events, resetting a "frozen for N polls" counter while remaining unwatchable. The caller
 /// supplies only eligible buffering-start transitions, keeping startup, live playback, seeks and user pauses
