@@ -318,6 +318,18 @@ internal fun engineHistoryPrincipalMatches(profile: UserProfile?, state: AuthSta
 internal fun matchesDetailMutationTarget(detail: MetaDetail?, type: MediaType, id: String): Boolean =
     detail?.type == type && detail.id == id
 
+/** Detail screens additionally need local watched/video state broadcasts, not only ctx/library changes. */
+internal fun isDetailStateUpdate(fields: Set<String>): Boolean =
+    fields.any {
+        it == EngineActions.FIELD_CTX ||
+            it == EngineActions.FIELD_LIBRARY ||
+            it == EngineActions.FIELD_META_DETAILS
+    }
+
+/** The exact, deterministic episode action order for a whole-series watched toggle. */
+internal fun wholeSeriesWatchedVideos(detail: MetaDetail): List<Episode> =
+    detail.videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
+
 /**
  * The native engine exposes exactly one mutable MetaDetails model. Every Load, Re-find, stream-detail
  * request and id-less detail mutation must use this cancellable gate so a different title cannot replace
@@ -1490,6 +1502,15 @@ class EngineStremioRepository(
         // consistent with homeUpdates -- collectors re-read the engine on each tick, so never on Main.
     }.conflate().flowOn(Dispatchers.Default)
 
+    override fun detailUpdates(): Flow<Unit> = channelFlow {
+        send(Unit)
+        launch {
+            changedFields.collect { fields ->
+                if (isDetailStateUpdate(fields)) send(Unit)
+            }
+        }
+    }.conflate().flowOn(Dispatchers.Default)
+
     /// Parse the CURRENT engine state into Home rails: titled board rows (real "<add-on> · <catalog>"
     /// names from the installed manifests) with Continue Watching prepended (id = "continue" is the
     /// contract HomeScreen keys its editorial eyebrow off of). Pure read -- no dispatch, no await --
@@ -2654,9 +2675,26 @@ class EngineStremioRepository(
             val detail = requireResidentMutationTarget(type, id)
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
-                    overlay.setWatched(isWatched, id, listOf(id), detail.name, type.id, detail.poster)
+                    val videoIds = detail.videos.map { it.id }.ifEmpty { listOf(id) }
+                    overlay.setWatched(isWatched, id, videoIds, detail.name, type.id, detail.poster)
                 }
-                HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
+                HistoryRoute.Engine -> {
+                    // A series' aggregate action does not update its episode bitfield. Keep every
+                    // dependent dispatch in this one MetaDetails transaction so another detail load or
+                    // mutation cannot interleave a partially-marked series.
+                    wholeSeriesWatchedVideos(detail)
+                        .forEach { video ->
+                            StremioCoreNative.dispatch(
+                                EngineActions.markVideoAsWatched(
+                                    video.id,
+                                    video.season.takeIf { it > 0 },
+                                    video.episode.takeIf { it > 0 },
+                                    isWatched,
+                                ),
+                            )
+                        }
+                    StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
+                }
             }
             requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                 ?: throw IllegalStateException("Couldn't update watched state.")
@@ -2779,7 +2817,8 @@ class EngineStremioRepository(
     // (via currentMetaDetail) must stay off the collector's (Main) context.
     override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = withContext(Dispatchers.Default) {
         val permit = historyOwnerFence.captureRead() ?: return@withContext null
-        currentMetaDetail()?.takeIf { it.id == id }?.let { withOverlayState(it, permit) }
+        currentMetaDetail()?.takeIf { matchesDetailMutationTarget(it, type, id) }
+            ?.let { withOverlayState(it, permit) }
     }
 
     // ---- AuthRepository ----

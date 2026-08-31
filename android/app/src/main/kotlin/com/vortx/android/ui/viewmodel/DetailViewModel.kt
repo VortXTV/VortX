@@ -61,6 +61,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
 internal data class EpisodeSwitchSelectionLease(
@@ -94,6 +96,36 @@ internal suspend fun <T> withEpisodeSwitchCancellationRollback(
 } catch (cancelled: CancellationException) {
     rollbackIfOwned()
     throw cancelled
+}
+
+/**
+ * A detail mutation belongs to the profile and canonical meta target visible when the viewer tapped.
+ * Rebuilding the screen advances [generation], so an old asynchronous completion cannot repaint the
+ * newly selected profile.
+ */
+internal class DetailMutationFence {
+    class Lease internal constructor(
+        val generation: Long,
+        val profileId: String,
+        val type: MediaType,
+        val id: String,
+    )
+
+    private var generation = 0L
+
+    fun begin(detail: MetaDetail, profileId: String): Lease = Lease(generation, profileId, detail.type, detail.id)
+
+    fun invalidate() {
+        generation += 1
+    }
+
+    fun accepts(lease: Lease): Boolean = lease.generation == generation
+
+    fun canPublish(lease: Lease, currentProfileId: String, current: MetaDetail?): Boolean =
+        accepts(lease) &&
+            lease.profileId == currentProfileId &&
+            current?.type == lease.type &&
+            current.id == lease.id
 }
 
 internal fun MetaDetail.episodeForResolve(selectedEpisodeId: String?): Episode? =
@@ -266,6 +298,8 @@ class DetailViewModel(
     /// One-shot latch for the non-`tt` meta recovery, re-armed by [retryMeta] so Try Again is a genuine
     /// second attempt. Mirrors Apple `metaRecoveryAttempted`.
     @Volatile private var metaRecoveryAttempted = false
+    private val detailMutationFence = DetailMutationFence()
+    private val detailMutationMutex = Mutex()
 
     // ---- Source-list assembly + debrid orchestration (the assembly + coordinator wave) ----
     //
@@ -417,7 +451,7 @@ class DetailViewModel(
     /// warmed, superseded, or a different episode) falls straight through to the cold resolve.
     @Volatile private var warmNextSourceByEpisode: Pair<String, StreamSource>? = null
 
-    /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
+    /// Detail reactivity (see [CatalogRepository.detailUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
     /// long-press elsewhere, another Detail instance in the backstack -- not only this ViewModel's own
     /// [toggleLibrary]/[setWatched] calls (device finding 1b: "Detail's Saved chip stays stale until an
@@ -426,7 +460,7 @@ class DetailViewModel(
     /// succeeded, so it can never race ahead of or clobber the first load.
     init {
         viewModelScope.launch {
-            repo.ctxUpdates().collect {
+            repo.detailUpdates().collect {
                 if (_meta.value !is UiState.Success) return@collect
                 repo.peekMeta(type, metaId)?.let { fresh -> _meta.value = UiState.Success(fresh) }
             }
@@ -573,6 +607,7 @@ class DetailViewModel(
     /// the ORIGINAL route id again (not the previously-recovered one), and re-run the load. Mirrors Apple
     /// `retryMeta`.
     fun retryMeta() {
+        detailMutationFence.invalidate()
         profileReloadJob?.cancel()
         sourceLoadJob?.cancel()
         metaRecoveryAttempted = false
@@ -623,6 +658,7 @@ class DetailViewModel(
     }
 
     private fun rebuildForProfile(profileId: String) {
+        detailMutationFence.invalidate()
         sourceLoadJob?.cancel()
         playbackResolveJob?.cancel()
         profileReloadJob?.cancel()
@@ -1899,57 +1935,30 @@ class DetailViewModel(
     /// already iterated per-video (see the loop below) for the same reason Apple's `CoreBridge.markWatched`
     /// documents, so only the `true` branch was affected.
     ///
-    /// Fix: BOTH directions iterate every video, every season (sorted, deterministic order -- not the
-    /// engine's raw JSON order, which is not guaranteed stable) via `MarkVideoAsWatched`, so every tick
-    /// updates the instant this returns; then re-dispatch the aggregate `MarkAsWatched` too (best-effort)
-    /// so the movie-style `timesWatched`/resume-target metadata the hero button reads stays in sync. Each
-    /// dispatch is a synchronous engine call immediately re-read (see [CatalogRepository]'s S05 doc
-    /// comment), so the loop can never race itself -- the final [applyMutation] snapshot already reflects
-    /// every prior step in the same sequence.
+    /// The repository performs the series episode loop under its one native MetaDetails transaction, so
+    /// a second detail action cannot interleave a partially-completed whole-series change.
     fun setWatched(isWatched: Boolean) {
         val current = (_meta.value as? UiState.Success)?.data ?: return
-        viewModelScope.launch {
-            val result = if (current.videos.isEmpty()) {
-                repo.setWatched(type, id, isWatched)
-            } else {
-                var last: Result<MetaDetail> = Result.success(current)
-                for (video in sortedEpisodes(current.videos)) {
-                    last = repo.setVideoWatched(
-                        type = type,
-                        id = id,
-                        videoId = video.id,
-                        season = video.season.takeIf { it > 0 },
-                        episode = video.episode.takeIf { it > 0 },
-                        isWatched = isWatched,
-                    )
-                    if (last.isFailure) break
-                }
-                if (last.isSuccess) last = repo.setWatched(type, id, isWatched)
-                last
-            }
-            applyMutation(result)
-        }
+        launchDetailMutation(current) { target -> repo.setWatched(target.type, target.id, isWatched) }
     }
 
     /// Mark every episode of [season] watched/unwatched.
     fun setSeasonWatched(season: Int, isWatched: Boolean) {
-        viewModelScope.launch {
-            applyMutation(repo.setSeasonWatched(type, id, season, isWatched))
-        }
+        val current = (_meta.value as? UiState.Success)?.data ?: return
+        launchDetailMutation(current) { target -> repo.setSeasonWatched(target.type, target.id, season, isWatched) }
     }
 
     /// Mark one episode watched/unwatched (the per-episode long-press menu / checkmark toggle).
     fun setVideoWatched(episode: Episode, isWatched: Boolean) {
-        viewModelScope.launch {
-            applyMutation(
-                repo.setVideoWatched(
-                    type = type,
-                    id = id,
-                    videoId = episode.id,
-                    season = episode.season.takeIf { it > 0 },
-                    episode = episode.episode.takeIf { it > 0 },
-                    isWatched = isWatched,
-                ),
+        val current = (_meta.value as? UiState.Success)?.data ?: return
+        launchDetailMutation(current) { target ->
+            repo.setVideoWatched(
+                type = target.type,
+                id = target.id,
+                videoId = episode.id,
+                season = episode.season.takeIf { it > 0 },
+                episode = episode.episode.takeIf { it > 0 },
+                isWatched = isWatched,
             )
         }
     }
@@ -1959,13 +1968,12 @@ class DetailViewModel(
     fun toggleLibrary() {
         val current = (_meta.value as? UiState.Success)?.data ?: return
         val inLibrary = current.libraryItem?.savedToLibrary == true
-        viewModelScope.launch {
-            val result = if (inLibrary) {
-                repo.removeFromLibrary(type, id)
+        launchDetailMutation(current) { target ->
+            if (inLibrary) {
+                repo.removeFromLibrary(target.type, target.id)
             } else {
-                repo.addToLibrary(type, id, current.name, current.poster)
+                repo.addToLibrary(target.type, target.id, current.name, current.poster)
             }
-            applyMutation(result)
         }
     }
 
@@ -1983,6 +1991,28 @@ class DetailViewModel(
             )
         }
     }
+
+    private fun launchDetailMutation(
+        current: MetaDetail,
+        action: suspend (DetailMutationFence.Lease) -> Result<MetaDetail>,
+    ) {
+        val lease = detailMutationFence.begin(current, sourceSticky.currentProfileId())
+        viewModelScope.launch {
+            val result = detailMutationMutex.withLock {
+                if (!isCurrentMutationLease(lease)) return@withLock null
+                action(lease)
+            } ?: return@launch
+            if (!isCurrentMutationLease(lease)) return@launch
+            applyMutation(result)
+        }
+    }
+
+    private fun isCurrentMutationLease(lease: DetailMutationFence.Lease): Boolean =
+        detailMutationFence.canPublish(
+            lease,
+            sourceSticky.currentProfileId(),
+            (_meta.value as? UiState.Success)?.data,
+        )
 
     private fun applyMutation(result: Result<MetaDetail>) {
         result.fold(

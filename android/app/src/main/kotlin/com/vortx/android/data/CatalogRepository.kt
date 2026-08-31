@@ -159,6 +159,11 @@ interface CatalogRepository {
     /// local list edits the caller re-reads directly, so there is nothing to observe.
     fun ctxUpdates(): Flow<Unit> = flow { emit(Unit) }
 
+    /// Detail-local mutation updates. Unlike [ctxUpdates], this also includes native `meta_details`
+    /// events, which carry watched episode ticks from another detail screen or playback callback.
+    /// Defaulting to [ctxUpdates] keeps preview and alternate repositories source-compatible.
+    fun detailUpdates(): Flow<Unit> = ctxUpdates()
+
     /// Discover: the currently selected catalog's items plus the type/catalog/genre pivot chips
     /// (S04). [requestJson] is null for the engine's own default selection (first load), or the exact
     /// `request` JSON echoed back from a [DiscoverFilters] type/catalog/genre option the caller tapped
