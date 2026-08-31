@@ -58,6 +58,90 @@
       "expected": ["episode-three"]
     },
     {
+      "name": "anime provider episode ids collapse to their title",
+      "items": [
+        {
+          "key": "kitsu-episode-two",
+          "id": " KITSU:123:1:2 ",
+          "type": "series",
+          "name": "Anime Example",
+          "poster": "https://img/kitsu-episode-two.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 2400,
+          "updatedAt": 600
+        },
+        {
+          "key": "kitsu-episode-one",
+          "id": "kitsu:123:1:1",
+          "type": "series",
+          "name": "Anime Example",
+          "poster": "https://img/kitsu-episode-one.jpg",
+          "aliases": [],
+          "position": 300,
+          "duration": 2400,
+          "updatedAt": 500
+        }
+      ],
+      "expected": ["kitsu-episode-two"]
+    },
+    {
+      "name": "different anime provider title ids stay separate",
+      "items": [
+        {
+          "key": "kitsu-123",
+          "id": "kitsu:123:1:2",
+          "type": "series",
+          "name": "Same Title",
+          "poster": "https://img/kitsu-123.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 2400,
+          "updatedAt": 600
+        },
+        {
+          "key": "kitsu-124",
+          "id": "kitsu:124:1:2",
+          "type": "series",
+          "name": "Same Title",
+          "poster": "https://img/kitsu-124.jpg",
+          "aliases": [],
+          "position": 500,
+          "duration": 2400,
+          "updatedAt": 500
+        }
+      ],
+      "expected": ["kitsu-123", "kitsu-124"]
+    },
+    {
+      "name": "opaque numeric custom ids do not lose their suffix",
+      "items": [
+        {
+          "key": "custom-episode-two",
+          "id": "custom:123:1:2",
+          "type": "series",
+          "name": "Custom Example",
+          "poster": "https://img/custom-episode-two.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 2400,
+          "updatedAt": 600
+        },
+        {
+          "key": "custom-episode-one",
+          "id": "custom:123:1:1",
+          "type": "series",
+          "name": "Custom Example",
+          "poster": "https://img/custom-episode-one.jpg",
+          "aliases": [],
+          "position": 500,
+          "duration": 2400,
+          "updatedAt": 500
+        }
+      ],
+      "expected": ["custom-episode-two", "custom-episode-one"]
+    },
+    {
       "name": "same title and poster without identity overlap stay separate",
       "items": [
         {

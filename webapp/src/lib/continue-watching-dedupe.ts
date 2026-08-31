@@ -116,11 +116,8 @@ function normalizeType(value: string): string {
 }
 
 function canonicalProviderId(value: string, type: string, reduceEpisode: boolean): string | null {
-  let raw = value.trim().toLowerCase();
+  const raw = value.trim().toLowerCase();
   if (!raw) return null;
-  if (type === "series" && reduceEpisode && !raw.includes("://")) {
-    raw = raw.replace(/:[0-9]{1,4}:[0-9]{1,4}$/, "");
-  }
 
   const imdb = /^(?:imdb:)?(tt[0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$/.exec(raw);
   if (imdb) return `imdb:${imdb[1]}${reduceEpisode ? "" : (imdb[2] ?? "")}`;
@@ -130,6 +127,9 @@ function canonicalProviderId(value: string, type: string, reduceEpisode: boolean
     const namespace = tmdb[1] === "movie" ? "movie" : tmdb[1] ? "series" : type;
     return `tmdb:${namespace}:${tmdb[2]}${reduceEpisode ? "" : (tmdb[3] ?? "")}`;
   }
+
+  const anime = /^(kitsu|anilist|mal|anidb):([0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$/.exec(raw);
+  if (anime) return `${anime[1]}:${anime[2]}${reduceEpisode ? "" : (anime[3] ?? "")}`;
 
   return raw;
 }

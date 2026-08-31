@@ -97,13 +97,10 @@ internal object ContinueWatchingDedupe {
     }
 
     private fun canonicalProviderId(value: String, type: String): String? {
-        var raw = value.trim().lowercase(Locale.ROOT)
+        val raw = value.trim().lowercase(Locale.ROOT)
         if (raw.isEmpty()) return null
-        if (type == "series" && !raw.contains("://")) {
-            raw = raw.replace(EPISODE_SUFFIX, "")
-        }
         if (IMDB.matches(raw)) {
-            return "imdb:${raw.removePrefix("imdb:")}"
+            return "imdb:${raw.removePrefix("imdb:").substringBefore(":")}"
         }
         val tmdb = TMDB.matchEntire(raw)
         if (tmdb != null) {
@@ -115,10 +112,12 @@ internal object ContinueWatchingDedupe {
             }
             return "tmdb:$namespace:${tmdb.groupValues[2]}"
         }
+        val anime = ANIME.matchEntire(raw)
+        if (anime != null) return "${anime.groupValues[1]}:${anime.groupValues[2]}"
         return raw
     }
 
-    private val EPISODE_SUFFIX = Regex(":[0-9]{1,4}:[0-9]{1,4}$")
-    private val IMDB = Regex("^(?:imdb:)?tt[0-9]{1,10}$")
-    private val TMDB = Regex("^tmdb:(?:(movie|tv|series|show):)?([0-9]{1,10})$")
+    private val IMDB = Regex("^(?:imdb:)?tt[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$")
+    private val TMDB = Regex("^tmdb:(?:(movie|tv|series|show):)?([0-9]{1,10})(?::[0-9]{1,4}:[0-9]{1,4})?$")
+    private val ANIME = Regex("^(kitsu|anilist|mal|anidb):([0-9]{1,10})(?::[0-9]{1,4}:[0-9]{1,4})?$")
 }

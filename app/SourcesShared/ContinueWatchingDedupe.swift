@@ -121,29 +121,29 @@ enum ContinueWatchingDedupe {
         }
     }
 
-    /// Canonicalize provider spelling and, for series, reduce a concrete `:season:episode` id to its title.
-    /// Unknown provider ids retain their normalized opaque base. Nothing here consults name or artwork.
+    /// Canonicalize known provider spelling and reduce their concrete series episode ids to title ids.
+    /// Unknown provider ids retain their normalized opaque value. Nothing here consults name or artwork.
     private static func canonicalProviderID(_ value: String, type: String) -> String? {
-        var raw = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let raw = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !raw.isEmpty else { return nil }
-        if type == "series", !raw.contains("://"),
-           let match = raw.range(of: #":[0-9]{1,4}:[0-9]{1,4}$"#, options: .regularExpression) {
-            raw.removeSubrange(match)
-        }
 
-        if let match = raw.range(of: #"^(?:imdb:)?tt[0-9]{1,10}$"#, options: .regularExpression),
+        if let match = raw.range(of: #"^(?:imdb:)?tt[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$"#, options: .regularExpression),
            match == raw.startIndex..<raw.endIndex {
-            let imdb = raw.hasPrefix("imdb:") ? String(raw.dropFirst(5)) : raw
+            let imdb = raw
+                .dropFirst(raw.hasPrefix("imdb:") ? 5 : 0)
+                .split(separator: ":", maxSplits: 1)
+                .first
+                .map(String.init) ?? ""
             return "imdb:\(imdb)"
         }
 
         if let match = raw.range(
-            of: #"^tmdb:(?:(movie|tv|series|show):)?[0-9]{1,10}$"#,
+            of: #"^tmdb:(?:(movie|tv|series|show):)?[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$"#,
             options: .regularExpression
         ), match == raw.startIndex..<raw.endIndex {
             let parts = raw.split(separator: ":").map(String.init)
-            let numeric = parts.last ?? ""
-            let explicit = parts.count == 3 ? parts[1] : nil
+            let explicit = parts.count >= 3 ? parts[1] : nil
+            let numeric = parts[explicit == nil ? 1 : 2]
             let namespace: String
             switch explicit {
             case "tv", "series", "show": namespace = "series"
@@ -151,6 +151,14 @@ enum ContinueWatchingDedupe {
             default: namespace = type
             }
             return "tmdb:\(namespace):\(numeric)"
+        }
+
+        if let match = raw.range(
+            of: #"^(kitsu|anilist|mal|anidb):[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$"#,
+            options: .regularExpression
+        ), match == raw.startIndex..<raw.endIndex {
+            let parts = raw.split(separator: ":").map(String.init)
+            return "\(parts[0]):\(parts[1])"
         }
 
         return raw
