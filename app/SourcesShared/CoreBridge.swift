@@ -902,9 +902,7 @@ final class CoreBridge: ObservableObject {
     /// Log out of the engine (clears the persisted profile + library, and kills the session
     /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
     func logOut() {
-        cancelAccountBindingVerification()
-        pendingAccountBinding = nil
-        settledAccountBinding = nil
+        invalidateAuthenticationGeneration()
         dispatchCtx(["action": "Logout"])
         clearUserState()
     }
@@ -2719,18 +2717,30 @@ final class CoreBridge: ObservableObject {
         accountBindingVerificationTask = nil
     }
 
+    private func invalidateAuthenticationGeneration() {
+        cancelAccountBindingVerification()
+        authBindingGeneration &+= 1
+        pendingAccountBinding = nil
+        settledAccountBinding = nil
+        rejectedAccountBindingGeneration = nil
+    }
+
     private var enginePublicationBlocked: Bool {
         PlaybackMutationOwnershipPolicy.blocksEnginePublication(
             hasPendingBinding: pendingAccountBinding != nil,
             credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration)
     }
 
+    private func publicationStillCurrent(_ capturedGeneration: UInt64) -> Bool {
+        PlaybackMutationOwnershipPolicy.mayPublish(capturedGeneration: capturedGeneration,
+                                                   currentGeneration: authBindingGeneration,
+                                                   blocked: enginePublicationBlocked)
+    }
+
     /// ProfileStore calls this in the same turn as selection. It invalidates any completion for
     /// the prior profile before a new account switch or a same-account revalidation can begin.
     func activeProfileDidChange() {
-        cancelAccountBindingVerification()
-        pendingAccountBinding = nil
-        settledAccountBinding = nil
+        invalidateAuthenticationGeneration()
         guard !importedAwayFromStremio,
               let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return }
         beginAccountBinding(for: token)
@@ -2915,6 +2925,7 @@ final class CoreBridge: ObservableObject {
         // friends) as changed on every library tick for free, so an idle device woke every `revision` observer
         // several times a minute to re-render identical state. Bump only when something was really published.
         var published = false
+        let publicationGeneration = authBindingGeneration
 
         // Legacy authKey migration + account-switch completion both depend on `ctx` landing while logged in.
         // Their state (awaitingAuthMigration, switchInFlight, switchFromUID) is ALSO written on the MAIN thread
@@ -3010,6 +3021,7 @@ final class CoreBridge: ObservableObject {
                     VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
+                        guard self.publicationStillCurrent(publicationGeneration) else { return }
                         // End-stop (#95): a next-page load that has FULLY settled (no page still loading)
                         // without growing the list means there are no more pages, whether the catalog was
                         // cursorless or its cursor went nil mid-catalog. Gate on !isLoadingPage so the
@@ -3036,7 +3048,10 @@ final class CoreBridge: ObservableObject {
         if fields.contains("library") {
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
-            DispatchQueue.main.async { [weak self] in self?.library = value }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.publicationStillCurrent(publicationGeneration) else { return }
+                self.library = value
+            }
             published = true
             // A library change can change which owner titles belong in Continue Watching: the cold-recovery
             // re-add lands at time 0 and NEVER fires a continue_watching_preview event, and a newly-synced

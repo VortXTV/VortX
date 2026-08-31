@@ -80,6 +80,10 @@ enum PlaybackMutationOwnershipPolicy {
         !engineSignedIn || hasSettledBinding
     }
 
+    static func mayPublish(capturedGeneration: UInt64, currentGeneration: UInt64, blocked: Bool) -> Bool {
+        capturedGeneration == currentGeneration && !blocked
+    }
+
     static func allows(_ target: Target, in context: Context) -> Bool {
         switch target {
         case .overlay(let profileID):

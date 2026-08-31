@@ -91,6 +91,12 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "signed-in repair requires the exact settled binding")
         check(Policy.allowsRepairHydration(engineSignedIn: false, hasSettledBinding: false),
               "signed-out local recovery remains available")
+        check(!Policy.mayPublish(capturedGeneration: 1, currentGeneration: 2, blocked: false),
+              "captured A async publication is dropped after B binding begins or settles")
+        check(!Policy.mayPublish(capturedGeneration: 2, currentGeneration: 2, blocked: true),
+              "rejected generation cannot publish through delayed jobs")
+        check(Policy.mayPublish(capturedGeneration: 3, currentGeneration: 3, blocked: false),
+              "logout or no-token generation reset releases signed-out local publication")
         check(Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false,
                                              hasPendingBinding: false, authMigration: false,
                                              activeProfileIsOwner: true, activeUsesEngineHistory: true,
