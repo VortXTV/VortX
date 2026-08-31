@@ -18,16 +18,6 @@
       "screenshotURLs": [],
       "versions": [
         {
-          "version": "0.3.16",
-          "buildVersion": "234",
-          "date": "2026-08-31",
-          "localizedDescription": "Playback, watch-state, source loading, account ownership, and Android reliability hardening.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.16/VortX-iOS-v0.3.16-ci.ipa",
-          "size": 64881912,
-          "sha256": "22760aade1c0bc1c3e612a11d66db9346c9072815267af3e2e60977e35004a34",
-          "minOSVersion": "16.0"
-        },
-        {
           "version": "0.3.15",
           "buildVersion": "233",
           "date": "2026-08-29",
@@ -94,6 +84,15 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-iOS-v0.3.14-beta.16-ci.ipa",
           "size": 64182016,
           "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "217",
+          "date": "2026-08-16",
+          "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. Streams that spun forever now recover on their own, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. Trakt sign-in works again, no app update needed. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-iOS-v0.3.14-beta.15-ci.ipa",
+          "size": 64172346,
+          "minOSVersion": "16.0"
         }
       ]
     },
@@ -108,16 +107,6 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
-        {
-          "version": "0.3.16",
-          "buildVersion": "234",
-          "date": "2026-08-31",
-          "localizedDescription": "Playback, watch-state, source loading, account ownership, and Android reliability hardening.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.16/VortX-tvOS-v0.3.16-ci.ipa",
-          "size": 64442485,
-          "sha256": "b4515cdae2b86e5627678b0cedbce2f1c1b0d4c587e848eb5fd2bb6961de1fb9",
-          "minOSVersion": "18.0"
-        },
         {
           "version": "0.3.15",
           "buildVersion": "233",
@@ -184,6 +173,15 @@
           "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-tvOS-v0.3.14-beta.16-ci.ipa",
           "size": 63617303,
+          "minOSVersion": "18.0"
+        },
+        {
+          "version": "0.3.14",
+          "buildVersion": "217",
+          "date": "2026-08-16",
+          "localizedDescription": "0.3.14 Beta 15. A focused playback-reliability wave from a full diagnostic-log audit. On Apple TV a stream that froze mid-play now recovers on its own instead of spinning forever, a dead source is dropped in a couple of seconds instead of half a minute, marking something watched shows up right away, rewinding keeps working on long streams, and an unsafe Dolby Vision colour fallback is corrected. In-place update over any earlier build, nothing resets.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.15/VortX-tvOS-v0.3.14-beta.15-ci.ipa",
+          "size": 63601691,
           "minOSVersion": "18.0"
         }
       ]
