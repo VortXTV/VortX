@@ -246,8 +246,16 @@ class AddonTombstones internal constructor(
         // and idempotent, so no once-flag is needed (a flag has three holes: a kill between setting it and
         // doing the work loses the set, a downgrade reads a frozen array, and a downgrade-then-upgrade skips
         // re-migration). Mirrors Apple `load`.
-        // Pre-scope values have no trustworthy owner. Deliberately quarantine them rather than assigning a
-        // prior account's removals to whichever account signs in next.
+        // Pre-scope values have no trustworthy account owner. They remain a local anonymous fallback only:
+        // fold the literal old-reader array there, but never assign it to whichever account signs in next.
+        if (!scope.isSyncable) {
+            readArray(LEGACY_DELETED_KEY)?.take(MAX_ENTRIES)?.forEach { raw ->
+                val url = normalize(raw)
+                if (url.isNotEmpty() && url.length <= MAX_ID_LENGTH) {
+                    removedAt[url] = maxOf(removedAt[url] ?: 0.0, MIGRATION_EPOCH_MS)
+                }
+            }
+        }
         return State(removedAt, addedAt)
     }
 

@@ -1,10 +1,12 @@
 package com.vortx.android.data
 
+import com.vortx.android.sync.applyAddonTombstonesToVortx
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import org.json.JSONObject
 
 /** In-memory persistence so the tombstone logic is exercised without Android SharedPreferences. */
 private class FakeTombstonePersistence : AddonTombstonePersistence {
@@ -167,19 +169,22 @@ class AddonTombstonesTest {
         val p = FakeTombstonePersistence().apply {
             store["stremiox.addons.deleted"] = "[\"$url\"]"
         }
-        val t = store(p) { 1_000.0 }
+        var now = 1_000.0
+        val t = store(p) { now }
         AddonTombstones.activateAccount(null)
 
         assertTrue(url in t.all())
         assertTrue(t.timestampsForSync().isEmpty())
         assertFalse(t.tombstone(url))
+        now = 2_000.0
         assertTrue(t.forget(url))
+        now = 3_000.0
         assertTrue(t.tombstone(url))
         assertFalse(t.merge(legacyIds = listOf(url), stamps = emptyMap()))
         t.baselineInstalled(listOf(url))
 
         // Engine reset creates a fresh store instance. The removal must still suppress the re-seeded add-on.
-        val afterEngineReset = store(p) { 2_000.0 }
+        val afterEngineReset = store(p) { 4_000.0 }
         assertTrue(url in afterEngineReset.all())
         assertTrue(url in t.all())
         assertTrue(p.writes.all { !it.contains(".account.") })
@@ -236,5 +241,22 @@ class AddonTombstonesTest {
         assertEquals(setOf(b), t.all())
         AddonTombstones.activateAccount(null)
         assertEquals(setOf(url), t.all())
+    }
+
+    @Test
+    fun `anonymous legacy removals never appear in an account sync payload`() {
+        val p = FakeTombstonePersistence()
+        val t = store(p) { 1_000.0 }
+
+        AddonTombstones.activateAccount(null)
+        assertTrue(t.tombstone(url))
+        assertTrue(url in store(p) { 2_000.0 }.all())
+
+        AddonTombstones.activateAccount("account-a")
+        assertTrue(t.all().isEmpty())
+        assertTrue(t.timestampsForSync().isEmpty())
+        val accountPayload = applyAddonTombstonesToVortx(JSONObject(), t)
+        assertFalse(accountPayload.has("deletedAddons"))
+        assertFalse(accountPayload.has("deletedAddonsTs"))
     }
 }
