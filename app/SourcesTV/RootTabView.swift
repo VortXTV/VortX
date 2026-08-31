@@ -411,10 +411,11 @@ struct RootTabView: View {
         })
         // Automatic update popup on the shell (never over the player, which replaces this view). Appears once
         // per launch when a newer build exists, and again when the hourly re-check finds a still-newer one.
-        .sheet(item: updatePromptBinding) { release in
+        .sheet(item: updatePromptBinding, onDismiss: {
+            Task { await armSeedingNag() }
+        }) { release in
             UpdatePromptView(release: release) {
                 updates.dismissPrompt()
-                Task { await armSeedingNag() }
             }
         }
         // Phase-0 seeding nag for the com.vortx move (see MoveSeeding): once per launch, only while this
@@ -544,7 +545,9 @@ struct RootTabView: View {
     /// playing (the player covers the shell); MoveSeeding gates once-per-launch + needs-seeding.
     private func armSeedingNag() async {
         await MoveSeeding.armLaunchNag {
-            if presenter.request == nil, updates.prompt == nil { showSeedingNag = true }
+            guard presenter.request == nil, updates.prompt == nil else { return false }
+            showSeedingNag = true
+            return true
         }
     }
 

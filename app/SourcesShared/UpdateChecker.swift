@@ -390,11 +390,11 @@ final class UpdateChecker: ObservableObject {
                                  manualOutcome: outcome, onFinish: onFinish)
             }
             let discovery = await self.discoverLatestRelease(cached: self.validatedRelease(self.available))
-            guard case let .release(latest) = discovery else {
+            guard case let .release(latest, networkSucceeded) = discovery else {
                 if case .current = discovery {
                     self.recordSuccessfulCheck()
                     if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
-                    if !isManual { self.manualOutcome = .idle }
+                    if !isManual, !self.manualCheckPending { self.manualOutcome = .idle }
                     succeeded = true
                     self.available = nil
                     self.prompt = nil
@@ -406,10 +406,10 @@ final class UpdateChecker: ObservableObject {
 
             // Persist a check only after transport, status, and payload decoding all succeeded. Recording
             // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
-            self.recordSuccessfulCheck()
+            if networkSucceeded { self.recordSuccessfulCheck() }
             if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
-            if !isManual { self.manualOutcome = .idle }
-            succeeded = true
+            if networkSucceeded, !isManual, !self.manualCheckPending { self.manualOutcome = .idle }
+            succeeded = networkSucceeded
 
             // Never regress a cached/newer candidate because a successful but older endpoint replied later.
             let selected = self.newerRelease(latest, than: self.validatedRelease(self.available))
@@ -452,23 +452,24 @@ final class UpdateChecker: ObservableObject {
     /// merge or rank against it.
     private func discoverLatestRelease(cached: Release?) async -> DiscoveryResult {
         let appcast = await appcastDiscovery()
-        if case .release(let release) = appcast,
+        if case .release(let release, _) = appcast,
            isNewer(release), newerRelease(release, than: cached) == release {
             // A valid, actually newer appcast is the authoritative source. Do not merge it with GitHub.
-            return .release(release)
+            return .release(release, networkSucceeded: true)
         }
 
         // A current or stale appcast is not sufficient evidence to suppress an already-known newer release or a
         // newer GitHub fallback. This also repairs a stale edge cache without trusting it over a validated cache.
         let github = await gitHubDiscovery()
         let appcastCandidate: Release?
-        if case .release(let release) = appcast { appcastCandidate = release }
+        if case .release(let release, _) = appcast { appcastCandidate = release }
         else { appcastCandidate = nil }
         let githubCandidate: Release?
-        if case .release(let release) = github { githubCandidate = release }
+        if case .release(let release, _) = github { githubCandidate = release }
         else { githubCandidate = nil }
         if let newest = newestRelease(in: [cached, appcastCandidate, githubCandidate]), isNewer(newest) {
-            return .release(newest)
+            if case .failure = github { return .release(newest, networkSucceeded: false) }
+            return .release(newest, networkSucceeded: true)
         }
         if case .failure = github { return .failure }
         return .current
@@ -487,7 +488,7 @@ final class UpdateChecker: ObservableObject {
               let release = release(from: entry) else {
             return .failure
         }
-        return .release(release)
+        return .release(release, networkSucceeded: true)
     }
 
     private func gitHubDiscovery() async -> DiscoveryResult {
@@ -504,7 +505,7 @@ final class UpdateChecker: ObservableObject {
             .max(by: { compare($0, $1) == .orderedAscending }) else {
             return .current
         }
-        return .release(latest)
+        return .release(latest, networkSucceeded: true)
     }
 
     private func request(_ url: URL, githubAPI: Bool) async throws -> (Data, URLResponse) {
@@ -589,10 +590,11 @@ final class UpdateChecker: ObservableObject {
     }
 
     private func nextScheduledDelay() -> TimeInterval {
+        if automaticCheckFailedThisSession { return Self.retryInterval }
         if let successful = lastSuccessfulCheckThisSession {
             return max(0, successful + Self.automaticInterval - now().timeIntervalSince1970)
         }
-        return automaticCheckFailedThisSession ? Self.retryInterval : Self.automaticInterval
+        return Self.automaticInterval
     }
 
     private func restoreCachedReleaseIfNeeded() {
@@ -622,7 +624,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     private enum DiscoveryResult {
-        case release(Release)
+        case release(Release, networkSucceeded: Bool)
         case current
         case failure
     }

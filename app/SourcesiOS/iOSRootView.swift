@@ -239,10 +239,11 @@ struct iOSRootView: View {
         // What's New is no longer shown on launch; it lives in Settings > What's New (the full changelog).
         // Automatic update popup: appears once per launch when a newer build exists (and again when the
         // hourly re-check finds a still-newer one), so users learn about updates without opening Settings.
-        .sheet(item: updatePromptBinding) { release in
+        .sheet(item: updatePromptBinding, onDismiss: {
+            Task { await armSeedingNag() }
+        }) { release in
             UpdatePromptView(release: release) {
                 updates.dismissPrompt()
-                Task { await armSeedingNag() }
             }
         }
         .onChange(of: launchReady) { _ in presentUpdateIfReady() }
@@ -419,7 +420,9 @@ struct iOSRootView: View {
     /// waits out the profile picker, and only fires while the device still needs seeding.
     private func armSeedingNag() async {
         await MoveSeeding.armLaunchNag {
-            if presenter.request == nil, updates.prompt == nil { showSeedingNag = true }
+            guard presenter.request == nil, updates.prompt == nil else { return false }
+            showSeedingNag = true
+            return true
         }
     }
 

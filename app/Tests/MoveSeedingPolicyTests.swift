@@ -138,6 +138,19 @@ struct MoveSeedingPolicyTests {
             )
         )
 
+        MoveSeeding.presentedThisLaunch = false
+        MoveSeeding.acknowledgeLaunchNagPresentation(false)
+        check(
+            "a rejected modal slot does not consume the once-per-launch launch nag",
+            !MoveSeeding.presentedThisLaunch
+        )
+        MoveSeeding.acknowledgeLaunchNagPresentation(true)
+        check(
+            "an accepted modal slot consumes the once-per-launch launch nag exactly once",
+            MoveSeeding.presentedThisLaunch
+        )
+        MoveSeeding.presentedThisLaunch = false
+
         let suite = "MoveSeedingPolicyTests.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suite) else {
             print("FAIL: could not create isolated defaults")

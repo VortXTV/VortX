@@ -57,11 +57,11 @@ enum MoveSeeding {
     /// never completed a push/pull round-trip).
     static var needsSeeding: Bool { !VortXSyncManager.shared.hasCompletedFirstSync }
 
-    /// Arm the launch nag: waits out the launch chores (splash, profile picker) and then fires `present`
-    /// exactly once per launch IF the device still needs seeding. Cheap and cancellable (rides the caller's
+    /// Arm the launch nag: waits out the launch chores (splash, profile picker) and then asks `present` to
+    /// accept the modal. The once-per-launch latch advances only after that acceptance. Cheap and cancellable (rides the caller's
     /// `.task`). The profile-picker wait is bounded so an abandoned picker never leaks an armed nag into a
     /// much later moment mid-use.
-    static func armLaunchNag(present: @escaping () -> Void) async {
+    static func armLaunchNag(present: @escaping () -> Bool) async {
         let buildIdentifier = currentBuildIdentifier()
         guard shouldPresentLaunchNag(
             needsSeeding: needsSeeding,
@@ -83,8 +83,13 @@ enum MoveSeeding {
             currentBuildIdentifier: buildIdentifier,
             dismissedBuildIdentifier: dismissedBuildIdentifier()
         ) else { return }
-        presentedThisLaunch = true
-        present()
+        acknowledgeLaunchNagPresentation(present())
+    }
+
+    /// A caller may reject presentation because another modal owns the slot. Only an accepted request consumes
+    /// this process's once-per-launch reminder, allowing the owning shell to retry after that modal closes.
+    static func acknowledgeLaunchNagPresentation(_ accepted: Bool) {
+        if accepted { presentedThisLaunch = true }
     }
 
     /// "Last synced 2 hours ago" / "Last synced just now" for the signed-in confirmation states.

@@ -1522,9 +1522,9 @@ struct SettingsView: View {
             .buttonStyle(ChipButtonStyle(selected: false))
         }
         .task { updates.checkIfStale() }   // automatic network checks share the once-daily gate
-        .onChange(of: updates.manualOutcome) { _, outcome in
+        .onChange(of: updates.manualOutcome) { oldOutcome, outcome in
             announceManualUpdateOutcome(outcome)
-            if !outcome.isChecking { updateCheckFocused = true }
+            if oldOutcome.isChecking, !outcome.isChecking { updateCheckFocused = true }
             if case .updateAvailable = outcome {
                 // The shell owns the only update sheet. A Settings-initiated check may present it on this tab,
                 // while unattended automatic checks continue to wait for the existing Home/player safety gates.

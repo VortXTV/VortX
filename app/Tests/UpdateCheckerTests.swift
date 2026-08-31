@@ -68,19 +68,24 @@ actor LatencyLoader {
 
 actor GateLoader {
     private var continuation: CheckedContinuation<Void, Never>?
-    private let gatedCall: Int
+    private let gatedCalls: Set<Int>
     private let result: (Data, URLResponse)
     private(set) var calls = 0
 
     init(_ result: (Data, URLResponse), gatedCall: Int = 1) {
         self.result = result
-        self.gatedCall = gatedCall
+        self.gatedCalls = [gatedCall]
+    }
+
+    init(_ result: (Data, URLResponse), gatedCalls: Set<Int>) {
+        self.result = result
+        self.gatedCalls = gatedCalls
     }
 
     func load(_ request: URLRequest) async -> (Data, URLResponse) {
         if request.url?.host == "vortx.tv" { return (Data("{}".utf8), response(503)) }
         calls += 1
-        if calls == gatedCall {
+        if gatedCalls.contains(calls) {
             await withCheckedContinuation { continuation = $0 }
         }
         return result
@@ -327,6 +332,36 @@ struct UpdateCheckerTests {
         await waitForCalls(latencyLoader, 2)
         check(await latencyLoader.calls == 2, "successful completion schedules the next unattended check exactly one hour later")
 
+        // A failure after a successful hourly check must override the old successful timestamp. Otherwise the
+        // replacement task computes a zero delay and hammers the endpoints instead of respecting the retry floor.
+        let postSuccessFailureDefaults = UserDefaults(suiteName: "\(suiteName).post-success-failure")!
+        defer { postSuccessFailureDefaults.removePersistentDomain(forName: "\(suiteName).post-success-failure") }
+        let postSuccessFailureClock = TestClock(600_000)
+        let postSuccessFailureSleeper = ControlledSleeper()
+        let postSuccessFailureLoader = ScriptedLoader([.success((release(build: 233), response(200))),
+                                                       .success((Data("[]".utf8), response(503)))])
+        let postSuccessFailure = await MainActor.run {
+            UpdateChecker(defaults: postSuccessFailureDefaults, now: { postSuccessFailureClock.date() },
+                          requestLoader: { request in try await postSuccessFailureLoader.load(request) },
+                          sleeper: { seconds in await postSuccessFailureSleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { postSuccessFailure.startMonitoring() }
+        await waitForCalls(postSuccessFailureLoader, 1)
+        await waitForSleeper(postSuccessFailureSleeper, 1)
+        postSuccessFailureClock.seconds += 3_600
+        await postSuccessFailureSleeper.resumeNext()
+        await waitForCalls(postSuccessFailureLoader, 2)
+        await waitForSleeper(postSuccessFailureSleeper, 1)
+        let postSuccessFailureRetryDelay = await postSuccessFailureSleeper.duration(at: 1)
+        check(postSuccessFailureRetryDelay == 60,
+              "failure after a successful hourly check uses the 60-second retry floor")
+        try? await Task.sleep(for: .milliseconds(20))
+        check(await postSuccessFailureLoader.calls == 2,
+              "post-success failure does not immediately hot-retry")
+        await MainActor.run { postSuccessFailure.stopMonitoring() }
+        await postSuccessFailureSleeper.resumeNext()
+
         // A forced cold-launch request that fails cannot inherit a former process's recent success as a long
         // suppression window. A stop/start foreground cycle retains the short retry cadence.
         let failedDefaults = UserDefaults(suiteName: "\(suiteName).failed")!
@@ -554,6 +589,27 @@ struct UpdateCheckerTests {
         check(queuedBuild == 233, "queued manual request ultimately performs its forced check")
         check(await queuedLoader.calls == 2, "queued manual request never overlaps the automatic request")
         await MainActor.run { queued.stopMonitoring() }
+
+        // The automatic success that hands off to a queued manual request must not briefly publish `.idle`.
+        // Settings derives its disabled state from this outcome, so it must remain checking until call two ends.
+        let queuedStateDefaults = UserDefaults(suiteName: "\(suiteName).manual-queued-state")!
+        defer { queuedStateDefaults.removePersistentDomain(forName: "\(suiteName).manual-queued-state") }
+        let queuedStateLoader = GateLoader((release(build: 233), response(200)), gatedCalls: [1, 2])
+        let queuedState = await MainActor.run {
+            UpdateChecker(defaults: queuedStateDefaults, now: { Date(timeIntervalSince1970: 1_450_000) },
+                          requestLoader: { request in await queuedStateLoader.load(request) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { queuedState.startMonitoring() }
+        await waitForCalls(queuedStateLoader, 1)
+        await MainActor.run { queuedState.checkNow() }
+        await queuedStateLoader.resumeFirst()
+        await waitForCalls(queuedStateLoader, 2)
+        check(await manualOutcome(queuedState) == .checking,
+              "queued manual request stays visibly checking through automatic handoff")
+        await queuedStateLoader.resumeFirst()
+        await waitForManualCheckToFinish(queuedState)
+        await MainActor.run { queuedState.stopMonitoring() }
 
         // The appcast is the primary Apple release contract. This fixture mirrors the live 0.3.16 / build 234
         // shape and must win without consulting generic GitHub release assets.
