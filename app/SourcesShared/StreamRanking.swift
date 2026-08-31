@@ -89,6 +89,17 @@ enum StreamRanking {
         return hasher.finalize()
     }
 
+    /// The audio preference contributes to a stream score, so score's memo identity must carry the same
+    /// canonical value that languageScore evaluates. The picker and persisted values are user input: normalize
+    /// case and whitespace, drop blanks, then remove order/duplicate noise because the ranking treats them as a
+    /// membership set rather than a priority list.
+    private static func canonicalAudioLanguagePreference() -> [String] {
+        Array(Set(TrackPreferences.current.audioLanguages.compactMap { language in
+            let normalized = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return normalized.isEmpty ? nil : normalized
+        })).sorted()
+    }
+
     /// Drop memoized scores; called when ranking preferences change (scores embed them).
     static func invalidateCaches() {
         cacheLock.lock(); scoreCache.removeAll(); cacheLock.unlock()
@@ -324,6 +335,13 @@ enum StreamRanking {
     }
 
     static func score(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
+        // `TrackPreferences.current` may be task-local for an in-player source-language choice. Freeze its
+        // semantic value before building the memo identity AND before computing the score: reading it once for
+        // the key and again in languageScore would let a task-local scope change between those reads and cache
+        // the result under the wrong preference. Empty keeps the legacy keys exactly, including the cached-hit
+        // variant, so the common no-session-override path remains byte-for-byte compatible with its existing
+        // memo entries.
+        let preferredAudioLanguages = canonicalAudioLanguagePreference()
         // A coordinator-confirmed debrid cache hit adjusts the score, so it must NOT share a memo entry with
         // the same stream scored without the cached set (that would leak a hit-adjusted score into an empty-set
         // call and vice-versa). Earlier this BYPASSED the memo for cached hits, but that made every cached
@@ -338,18 +356,27 @@ enum StreamRanking {
         let isCachedHit = !debridCachedHashes.isEmpty
             && (s.infoHash?.lowercased()).map(debridCachedHashes.contains) == true
         let key: Int
-        if isCachedHit {
+        if preferredAudioLanguages.isEmpty {
+            if isCachedHit {
+                var hasher = Hasher()
+                hasher.combine(streamKey(s))
+                hasher.combine(true)
+                key = hasher.finalize()
+            } else {
+                key = streamKey(s)
+            }
+        } else {
             var hasher = Hasher()
             hasher.combine(streamKey(s))
-            hasher.combine(true)
+            hasher.combine(isCachedHit)
+            hasher.combine(preferredAudioLanguages)
             key = hasher.finalize()
-        } else {
-            key = streamKey(s)
         }
         cacheLock.lock()
         if let hit = scoreCache[key] { cacheLock.unlock(); return hit }
         cacheLock.unlock()
-        let value = isCachedHit ? computeScore(s, debridCachedHashes: debridCachedHashes) : computeScore(s)
+        let value = computeScore(s, debridCachedHashes: debridCachedHashes,
+                                 preferredAudioLanguages: Set(preferredAudioLanguages))
         cacheLock.lock()
         // Cap above the largest realistic source list (popular titles return a few thousand
         // streams across add-ons). At 4096 a single big title thrashed the cache mid-render
@@ -361,7 +388,8 @@ enum StreamRanking {
         return value
     }
 
-    private static func computeScore(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
+    private static func computeScore(_ s: CoreStream, debridCachedHashes: Set<String> = [],
+                                     preferredAudioLanguages: Set<String>) -> Int {
         let text = qualityText(s)
         var score = resolution(text)
         // Source ladder: STRICT and the dominant WITHIN-resolution key (issue #68, a remux must beat
@@ -426,7 +454,7 @@ enum StreamRanking {
         // exactly the reported case. Smaller than the cached (+8000) and tier (15000) gaps,
         // so cache and the source-type order still win first. Untagged releases (most
         // English originals) are never penalised.
-        score += languageScore(text)
+        score += languageScore(text, preferredAudioLanguages: preferredAudioLanguages)
         // Smart Source Selection (Lane A): the Prefer boost and, in "rank" mode, the Avoid demotion. Read
         // through SourcePreferences.reading so the off-main rank uses the frozen Snapshot (race contract).
         // Prefer +2500 lifts a matching source WITHIN its tier but is sized so prefer + cache (+8000) + the
@@ -557,8 +585,7 @@ enum StreamRanking {
     /// carries or can select the viewer's track) keeps its resolution rank. The earlier version
     /// only exempted the literal words "multi"/"dual", so a release tagging several real languages
     /// it could not perfectly match was wrongly sunk below a single-language lower resolution.
-    static func languageScore(_ text: String) -> Int {
-        let preferred = Set(TrackPreferences.current.audioLanguages)
+    private static func languageScore(_ text: String, preferredAudioLanguages preferred: Set<String>) -> Int {
         guard !preferred.isEmpty else { return 0 }
         // Carries the viewer's selected language (anywhere): rank normally.
         if preferred.contains(where: { claimsLanguage(text, $0) }) { return 0 }
@@ -815,6 +842,7 @@ enum StreamRanking {
     /// preferences pass everything, so this is a no-op until the user opts in.
     static func passesUserFilters(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Bool {
         let prefs = SourcePreferences.reading
+        let preferredAudioLanguages = Set(canonicalAudioLanguagePreference())
         let kids = ProfileStore.activeIsKids()
         if !kids, prefs.noFiltersActive { return true }   // fast path: nothing opted in (and not a Kids profile)
         let text = qualityText(s)
@@ -863,7 +891,8 @@ enum StreamRanking {
         // single foreign-audio release (languageScore's conservative -5000 case). A release with no
         // language stated, the viewer's language, or multiple languages scores 0 and is always kept,
         // so untagged add-on output can never be emptied by this toggle.
-        if prefs.preferredAudioOnly, languageScore(text) < 0 { return false }
+        if prefs.preferredAudioOnly,
+           languageScore(text, preferredAudioLanguages: preferredAudioLanguages) < 0 { return false }
         if prefs.maxFileSizeGB > 0 {                                                          // cap advertised file size
             let gb = sizeGB(text) > 0 ? sizeGB(text) : sizeMB(text) / 1024
             if gb > 0, gb > prefs.maxFileSizeGB { return false }                              // unknown-size sources pass

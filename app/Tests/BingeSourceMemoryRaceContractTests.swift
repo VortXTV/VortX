@@ -66,6 +66,44 @@ enum StremioServer {
 
 enum PlaybackSettings { static let torrentsDisabled = false }
 
+// Current CoreModels also references these Apple playback seams. They are outside this ranker/settlement
+// contract, so lightweight stubs keep this executable focused on compiling the real StreamRanking source.
+struct AppleCWSeriesEpisode: Equatable, Hashable {
+    let id: String
+    let season: Int
+    let episode: Int
+}
+
+struct AppleCWSeriesInventory: Equatable {
+    enum Authority: Equatable { case launch, authoritativeFullSeries }
+    let ordered: [AppleCWSeriesEpisode]
+    init?(raw: [AppleCWSeriesEpisode], authority: Authority) {
+        guard !raw.isEmpty else { return nil }
+        ordered = raw.sorted {
+            $0.season != $1.season ? $0.season < $1.season
+                : ($0.episode != $1.episode ? $0.episode < $1.episode : $0.id < $1.id)
+        }
+    }
+    func index(of id: String) -> Int? { ordered.firstIndex { $0.id == id } }
+}
+
+enum AppleCWSeriesRefreshResult: Equatable { case notAttempted, completedWithoutFullInventory, completedWithFullInventory }
+enum AppleCWSeriesTerminalDecision: Equatable { case refresh, advance(String), keepState }
+enum AppleCWSeriesTerminalPolicy {
+    static func decide(currentID: String, inventory: AppleCWSeriesInventory?,
+                       refresh: AppleCWSeriesRefreshResult) -> AppleCWSeriesTerminalDecision { .keepState }
+}
+
+final class CommunityStreamGateway {
+    static let shared = CommunityStreamGateway()
+    func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { upstream }
+}
+
+final class DebridPlaybackAvailability {
+    static let shared = DebridPlaybackAvailability()
+    var canResolveUsenet: Bool { false }
+}
+
 // MARK: - StreamRanking peripheral stubs (the ranker names them; the settle gate never calls them)
 
 /// The read surface `StreamRanking` needs from source preferences at score / filter time. Mirror of the real
@@ -153,7 +191,15 @@ enum SeriesSourceSticky {
 }
 
 struct TrackPreferencesSnapshot { var audioLanguages: [String] = [] }
-enum TrackPreferences { static var current = TrackPreferencesSnapshot() }
+enum TrackPreferences {
+    /// Mirrors the production source-picker scope: each ranking task can temporarily select a language without
+    /// mutating the persisted profile preference. The cache regression below must use the real ranker under
+    /// two simultaneous task-local values, not a hand-written score mirror.
+    @TaskLocal static var audioLanguagesOverride: [String]? = nil
+    static var current: TrackPreferencesSnapshot {
+        TrackPreferencesSnapshot(audioLanguages: audioLanguagesOverride ?? [])
+    }
+}
 
 enum ProfileStore { static func activeIsKids() -> Bool { false } }
 
@@ -206,7 +252,7 @@ private func settledOld(_ groups: [CoreStreamSourceGroup], loaded: Int, total: I
 
 @main
 enum BingeSourceMemoryRaceContractTests {
-    static func main() {
+    static func main() async {
         SourcePreferences.stub = StubPrefs()   // default order: debrid first (torrents NOT ranked first)
 
         // Sanity on the fixtures themselves (proves the real CoreStream decode + classification we rely on).
@@ -287,6 +333,60 @@ enum BingeSourceMemoryRaceContractTests {
         expect(StreamRanking.best(completeGroups, continuity: nil, pin: nil)?.url == superior.url,
                "late superior: ranking the complete set selects the superior late source")
 
+        // MARK: 6 - Task-local source-audio choice must partition StreamRanking's score memo
+        // The same English-tagged stream is deliberately scored under English and Japanese. English carries the
+        // requested audio and ranks normally; Japanese gets the ranker's conservative single-foreign-audio
+        // demotion. If audio preference is omitted from scoreCache's key, whichever task runs first poisons the
+        // other result. Use the real `score`, rather than a mirror, because the regression is specifically in
+        // memo identity and task-local capture.
+        let englishTagged = stream(#"{"url":"https://cdn.invalid/english.mkv","name":"Example 1080p WEB-DL English"}"#)
+        func score(_ languages: [String]) -> Int {
+            TrackPreferences.$audioLanguagesOverride.withValue(languages) {
+                StreamRanking.score(englishTagged)
+            }
+        }
+        StreamRanking.invalidateCaches()
+        let englishPreferred = score(["en"])
+        let japanesePreferred = score(["ja"])
+        expect(japanesePreferred == englishPreferred - 5000,
+               "audio cache sequential: Japanese cannot reuse the English-ranked score")
+
+        // Canonicalisation is semantic, not cosmetic: the picker/profile may carry whitespace, case variants,
+        // duplicates, or a different order, but all mean the same language membership for ranking and memo use.
+        StreamRanking.invalidateCaches()
+        let noisyEnglishPreferred = score([" EN ", "en", "EN"])
+        let reorderedEnglishPreferred = score(["en", " EN "])
+        expect(noisyEnglishPreferred == englishPreferred && reorderedEnglishPreferred == englishPreferred,
+               "audio cache canonicalisation: case, whitespace, duplicate, and order noise share English semantics")
+
+        // Start both task-local preferences from an empty memo concurrently. The old Int-only key makes all
+        // results equal to whichever task wins the first write; the repaired key keeps every result bound to the
+        // preference that invoked `score`.
+        StreamRanking.invalidateCaches()
+        let concurrentScores = await withTaskGroup(of: (String, Int).self, returning: [(String, Int)].self) { group in
+            for _ in 0..<32 {
+                group.addTask {
+                    ("en", TrackPreferences.$audioLanguagesOverride.withValue(["en"]) {
+                        StreamRanking.score(englishTagged)
+                    })
+                }
+                group.addTask {
+                    ("ja", TrackPreferences.$audioLanguagesOverride.withValue(["ja"]) {
+                        StreamRanking.score(englishTagged)
+                    })
+                }
+            }
+            var collected: [(String, Int)] = []
+            for await score in group { collected.append(score) }
+            return collected
+        }
+        let concurrentEnglish = concurrentScores.filter { $0.0 == "en" }.map(\.1)
+        let concurrentJapanese = concurrentScores.filter { $0.0 == "ja" }.map(\.1)
+        expect(concurrentEnglish.count == 32 && concurrentJapanese.count == 32
+               && concurrentEnglish.allSatisfy { $0 == englishPreferred }
+               && concurrentJapanese.allSatisfy { $0 == japanesePreferred },
+               "audio cache concurrent: each task-local language receives its own memoized score")
+
         let callerPaths = [
             "app/SourcesiOS/iOSDetailView.swift",
             "app/SourcesiOS/iOSBatchDownloadCoordinator.swift",
@@ -295,7 +395,7 @@ enum BingeSourceMemoryRaceContractTests {
         ]
         let callerSource = callerPaths.compactMap { try? String(contentsOfFile: $0, encoding: .utf8) }
             .joined(separator: "\n")
-        expect(callerSource.components(separatedBy: "secondsSinceRequestStart:").count - 1 == 6,
+        expect(callerSource.components(separatedBy: "secondsSinceRequestStart:").count - 1 == 7,
                "caller clock: every raw settle call passes request-start elapsed time")
         expect(!callerSource.contains("secondsSinceFirstPlayable"),
                "caller clock: no production raw settle loop retains the first-playable reset")
