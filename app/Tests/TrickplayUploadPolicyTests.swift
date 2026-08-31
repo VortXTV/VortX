@@ -8,6 +8,8 @@ private enum TrickplayUploadPolicyTests {
         testFixedCaptureCadenceContinuesDuringActivePlayback()
         testCaptureCadenceKeepsWorkBounded()
         testUHDHDRLocalCaptureEligibilityMatrix()
+        testBackendQualifiedUHDHDRCaptureEligibility()
+        testCommunityUploadRequiresRealDuration()
         testBackwardSeekRestartsCaptureCadence()
         testCaptureSessionIdentityBoundaries()
         testCommunityDurationRekeyPreservesSessionFramesWiring()
@@ -247,6 +249,64 @@ private enum TrickplayUploadPolicyTests {
         )
     }
 
+    private static func testBackendQualifiedUHDHDRCaptureEligibility() {
+        typealias Policy = TrickplayLocalCaptureEligibilityPolicy
+        let libmpv = Policy.decision(
+            .init(
+                isUltraHighDefinition: true,
+                dynamicRange: .dolbyVision,
+                captureBackend: .libmpvInlineDrawable
+            )
+        )
+        let avPlayer = Policy.decision(
+            .init(
+                isUltraHighDefinition: true,
+                dynamicRange: .dolbyVision,
+                captureBackend: .avPlayerVideoOutput
+            )
+        )
+        let legacyCaller = Policy.decision(
+            .init(isUltraHighDefinition: true, dynamicRange: .hdr10)
+        )
+        expect(
+            libmpv.isUltraHighDefinitionHDR && !libmpv.permitsLocalCapture,
+            "UHD Dolby Vision remains blocked for inline libmpv drawable capture"
+        )
+        expect(
+            avPlayer.isUltraHighDefinitionHDR && avPlayer.permitsLocalCapture,
+            "UHD Dolby Vision is eligible for AVPlayer video-output pull capture"
+        )
+        expect(
+            !legacyCaller.permitsLocalCapture
+                && legacyCaller.captureBackend == .libmpvInlineDrawable,
+            "callers not yet wired with an engine remain on the conservative inline path"
+        )
+    }
+
+    private static func testCommunityUploadRequiresRealDuration() {
+        expect(
+            !TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
+                communityEnabled: true,
+                hasRealDuration: false
+            ),
+            "a provisional duration may fetch and retain local frames, but cannot admit a community POST"
+        )
+        expect(
+            TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
+                communityEnabled: true,
+                hasRealDuration: true
+            ),
+            "retained frames become uploadable only after the real duration arrives"
+        )
+        expect(
+            !TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
+                communityEnabled: false,
+                hasRealDuration: true
+            ),
+            "a real duration never bypasses the community feature flag"
+        )
+    }
+
     private static func testBackwardSeekRestartsCaptureCadence() {
         expect(
             TrickplayCaptureCadencePolicy.shouldCapture(
@@ -368,6 +428,17 @@ private enum TrickplayUploadPolicyTests {
                 && !communityConfigure.contains("sessionFrames =")
                 && !communityConfigure.contains("sessionFrames.remove"),
             "a provisional-to-real community duration re-key must preserve time-indexed session frames"
+        )
+        expect(
+            communityConfigure.contains("if isRealDuration { maybeUploadProgressively() }")
+                && communityConfigure.contains("if hasRealDuration { maybeUploadProgressively() }"),
+            "both same-bucket and bucket-changing real-duration arrivals must reconsider retained frames"
+        )
+        expect(
+            source.contains("private var permitsCommunityUpload: Bool")
+                && source.contains("guard permitsCommunityUpload,")
+                && !source.contains("guard CommunityTrickplay.isEnabled,\n              let key = communityKey"),
+            "provisional duration can retain local frames and fetch, but no progressive, final, or retirement POST may be admitted"
         )
     }
 

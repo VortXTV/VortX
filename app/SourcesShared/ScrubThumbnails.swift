@@ -119,6 +119,18 @@ final class ScrubThumbnailsStore: ObservableObject {
         )
     }
 
+    /// A provisional metadata duration is enough to look up a community sheet
+    /// and retain local capture frames, but never enough to publish one. The
+    /// server key includes a duration bucket, so admitting a POST before the
+    /// engine reports the real duration can permanently poison a neighbouring
+    /// title's bucket.
+    private var permitsCommunityUpload: Bool {
+        TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
+            communityEnabled: CommunityTrickplay.isEnabled,
+            hasRealDuration: hasRealDuration
+        )
+    }
+
     deinit { communityFetchTask?.cancel() }
 
     private func cancelCommunityFetch() {
@@ -185,7 +197,13 @@ final class ScrubThumbnailsStore: ObservableObject {
         if isRealDuration { hasRealDuration = true }
         // No-op if already keyed on this exact content key (idempotent across repeated calls). The real
         // duration re-keys ONLY when its bucket differs from the provisional one.
-        if communityKey == key { return }
+        if communityKey == key {
+            // A real duration can land in the same bucket as the provisional
+            // estimate. Retained local frames become uploadable at that moment,
+            // so do not wait for another capture tick to reconsider them.
+            if isRealDuration { maybeUploadProgressively() }
+            return
+        }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands
         let rekeying = communityKey != nil
         if rekeying { cancelCommunityFetch() }
@@ -216,6 +234,9 @@ final class ScrubThumbnailsStore: ObservableObject {
                 self?.completeCommunityFetch(result, epoch: fetchEpoch, key: key)
             }
         }
+        // A bucket-changing real-duration re-key preserves session frames. They
+        // are now attributable to this exact bucket and may be admitted once.
+        if hasRealDuration { maybeUploadProgressively() }
     }
 
     private func completeCommunityFetch(_ result: CommunityTrickplay.FetchResult, epoch: UInt64, key: String) {
@@ -454,7 +475,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// Upload during playback once the local capture is storable. Teardown may replace it once after material
     /// coverage growth. A deliberate decline is terminal; a transport/build failure gets one teardown retry.
     private func maybeUploadProgressively() {
-        guard CommunityTrickplay.isEnabled,
+        guard permitsCommunityUpload,
               let key = communityKey,
               let imdb = communityImdb else { return }
         // Fix C: once this key can do no more progressive work, stop the per-capture recompute and gate log that
@@ -485,7 +506,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// retry after a transient progressive failure. It never repeats a stored or deliberately declined key.
     func finishAndUploadIfNeeded(srcHeight: Int = 0) {
         if srcHeight > 0 { communitySrcHeight = srcHeight }
-        guard CommunityTrickplay.isEnabled,
+        guard permitsCommunityUpload,
               let key = communityKey,
               let imdb = communityImdb else { return }
         let coverageReady = CommunityTrickplay.uploadCanStore(
@@ -507,7 +528,7 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// switch clears its mutable capture state. If an explicit teardown already
     /// reserved the final, the policy returns nil and this remains once-only.
     private func retireCommunityUploadIfNeeded() {
-        guard CommunityTrickplay.isEnabled,
+        guard permitsCommunityUpload,
               communityKey != nil,
               let imdb = communityImdb else {
             uploadPolicy.reset(for: nil)

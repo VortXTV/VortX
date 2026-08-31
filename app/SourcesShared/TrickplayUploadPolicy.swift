@@ -38,6 +38,15 @@ struct TrickplayCaptureCadencePolicy {
 /// grabs can extend the renderer's drawable-acquire work, while a provider sprite sheet has no such cost.
 /// Unknown or unprobed media is deliberately non-UHD here, so it fails open to the ordinary local path.
 struct TrickplayLocalCaptureEligibilityPolicy {
+    /// The renderer path that services a local preview request. libmpv's capture
+    /// runs inline with its drawable/present work; AVPlayer's video output pulls
+    /// an already-decoded pixel buffer instead. They therefore cannot share the
+    /// same UHD HDR safety rule.
+    enum CaptureBackend: Equatable, Sendable {
+        case libmpvInlineDrawable
+        case avPlayerVideoOutput
+    }
+
     enum DynamicRange: Equatable, Sendable {
         case dolbyVision
         case hdr10
@@ -59,20 +68,36 @@ struct TrickplayLocalCaptureEligibilityPolicy {
     struct Input: Equatable, Sendable {
         let isUltraHighDefinition: Bool
         let dynamicRange: DynamicRange
+        let captureBackend: CaptureBackend
+
+        /// Preserve the former conservative behavior until each caller declares
+        /// its backend. An omitted backend is treated as the inline libmpv path,
+        /// never as the lower-cost AVPlayer pull path.
+        init(
+            isUltraHighDefinition: Bool,
+            dynamicRange: DynamicRange,
+            captureBackend: CaptureBackend = .libmpvInlineDrawable
+        ) {
+            self.isUltraHighDefinition = isUltraHighDefinition
+            self.dynamicRange = dynamicRange
+            self.captureBackend = captureBackend
+        }
     }
 
     struct Decision: Equatable, Sendable {
         let isUltraHighDefinitionHDR: Bool
         let permitsLocalCapture: Bool
         let permitsRemoteProviderPreviews: Bool
+        let captureBackend: CaptureBackend
     }
 
     static func decision(_ input: Input) -> Decision {
         let isUltraHighDefinitionHDR = input.isUltraHighDefinition && input.dynamicRange.isHDR
         return .init(
             isUltraHighDefinitionHDR: isUltraHighDefinitionHDR,
-            permitsLocalCapture: !isUltraHighDefinitionHDR,
-            permitsRemoteProviderPreviews: true
+            permitsLocalCapture: !isUltraHighDefinitionHDR || input.captureBackend == .avPlayerVideoOutput,
+            permitsRemoteProviderPreviews: true,
+            captureBackend: input.captureBackend
         )
     }
 }
@@ -99,6 +124,19 @@ enum TrickplayPresentationReadinessPolicy {
         }
         let threshold = isUltraHighDefinitionHDR ? uhdHDRSettleSeconds : defaultSettleSeconds
         return elapsedSinceFirstFrame >= threshold
+    }
+}
+
+/// Community lookup and local capture are useful with an estimated runtime,
+/// but a community POST is keyed by a duration bucket. Keep that publication
+/// boundary explicit and testable so a provisional key can never escape into
+/// the shared pool.
+enum TrickplayCommunityUploadEligibilityPolicy {
+    static func permitsUpload(
+        communityEnabled: Bool,
+        hasRealDuration: Bool
+    ) -> Bool {
+        communityEnabled && hasRealDuration
     }
 }
 
