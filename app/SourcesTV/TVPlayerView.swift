@@ -454,6 +454,11 @@ struct TVPlayerView: View {
     /// over a manual AVPlayer pick (a failed manual switch falls back to libmpv, no loop), and a fresh
     /// PlaybackRequest resets it via `.id(req.id)` like the latch.
     @State private var manualEngineAVPlayer: Bool?
+    /// A user engine switch constructs a new surface. A fresh native-debrid URL must be available to that
+    /// surface immediately, rather than mounting the immutable launch URL and correcting it later.
+    @State private var engineSurfaceURLOverride: URL?
+    @State private var engineSurfaceHeadersOverride: [String: String]?
+    @State private var engineSurfaceUsesActiveTuple = false
     /// Source-timeline origin handed to a newly mounted AVPlayer surface. nil means the initial account resume
     /// is still unresolved; a manual engine swap replaces it with the live position before the host is built.
     @State private var avSurfaceResumeOrigin: Double?
@@ -578,9 +583,13 @@ struct TVPlayerView: View {
     /// True while the INITIAL source is a Continue-Watching resume (see startedFromResume). Cleared once the
     /// player switches to any other source, so only the first stored-link attempt gets resume-hop treatment.
     @State private var currentPlaybackIsResume = false
-    /// True once a resume has already re-selected its SAME source (re-resolved a fresh link for the same file)
-    /// after a stale-link failure, so a second failure hops to a DIFFERENT source instead of looping on it.
+    /// Compatibility receipt for the former Continue-Watching-only recovery path. The real gate is now
+    /// `nativeDebridFreshLinkRecoveryUsed`, which applies to every native-debrid mount, not just CW.
     @State private var resumeSourceReresolved = false
+    /// Exactly one same-source fresh-link request is permitted for the current native-debrid mount after a
+    /// confirmed failure. The provider reference is durable; its URL is transport state and can expire while a
+    /// title is playing. This gate resets only when the source or episode genuinely changes.
+    @State private var nativeDebridFreshLinkRecoveryUsed = false
     /// When the app was last suspended while this player stayed mounted, so the foreground hook knows HOW LONG
     /// it was away. Nothing on-device can tell a live debrid link from an expired one, and re-minting a healthy
     /// one would cost the viewer a reload for nothing, so the suspension length is the only honest gate.
@@ -1335,7 +1344,7 @@ struct TVPlayerView: View {
                 AVPlayerEngineView(coordinator: coordinator)
                     // AVFoundation and the remux server apply required headers themselves. A loopback proxy
                     // would hide the original container from remux routing and defeat the resume-origin mount.
-                    .play(url, headers: headers,
+                    .play(engineSurfacePlayback.url, headers: engineSurfacePlayback.headers,
                           isDolbyVision: StreamRanking.isDolbyVision(sourceHint ?? ""))
                     .live(initialLiveMode)
                     .resumeOrigin(resumeOrigin)
@@ -2113,13 +2122,12 @@ struct TVPlayerView: View {
                 // A viewer-selected source and a saved Continue-Watching source retain their established
                 // in-place / one-time re-resolution policy. Automatic playback otherwise hops immediately:
                 // the AV and MPV attempts already consumed this source's one bounded opportunity.
+                if recoverCurrentNativeDebridLink(reason: "fallback MPV produced no frame") {
+                    return
+                }
                 if currentPickWasExplicit {
                     loadErrorMsg = "This source didn't produce playable media. Choose another source."
                     presentTerminalLoadFailure()
-                    return
-                }
-                if currentPlaybackIsResume, !resumeSourceReresolved,
-                   retryResumeSameSource() {
                     return
                 }
                 if hopToNextSource(reason: "fallback MPV produced no frame") { return }
@@ -3843,6 +3851,7 @@ struct TVPlayerView: View {
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         resetRapidBufferingRecovery(reason: "issued source switch")
         sourceHops = 0; exhaustedURLs = []
+        nativeDebridFreshLinkRecoveryUsed = false
         if userInitiated {
             avEngineFailed = false
             recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -4945,6 +4954,24 @@ struct TVPlayerView: View {
         return derived
     }
 
+    /// A raw torrent mount is served by the local engine, so a changed loopback port proves the old engine
+    /// endpoint disappeared. Reissue its idempotent create before the replacement player opens the new route.
+    /// `prepareTorrent` is intentionally asynchronous because server configuration/create cannot be awaited by
+    /// the synchronous load call; the existing torrent warm-up and retry owners remain responsible for startup.
+    /// Direct add-on URLs and native-debrid links do not own a local engine and are strict no-ops here.
+    private func prepareRawTorrentAfterLoopbackRebind(from previous: URL?, to replacement: URL?) {
+        guard curDebridRef == nil,
+              let stream = curSourceStream,
+              stream.url == nil,
+              let previous, let replacement,
+              isLoopback(previous), isLoopback(replacement),
+              previous.port != replacement.port,
+              streamingServerTorrentHash(of: previous) == streamingServerTorrentHash(of: replacement),
+              streamingServerTorrentHash(of: replacement) != nil else { return }
+        DiagnosticsLog.log("torrent", "loopback authority changed under raw torrent; creating engine before replacement load")
+        prepareTorrent(stream)
+    }
+
     /// A URL served by this device's own streaming server. Host-based, NOT port-based: the port is exactly
     /// what drifts across a background cycle, so comparing it is what went stale in the first place.
     private func isLoopback(_ u: URL) -> Bool {
@@ -4988,8 +5015,9 @@ struct TVPlayerView: View {
             // proactive re-mount would restart the episode where it began.
             resumeSeconds = resume
             resumeIsMidPlayRecovery = true   // a live play head carried across the re-mount, not a stored offset
-            resumeSourceReresolved = false   // one re-resolve per suspension, not one per playback
-            if retryResumeSameSource() {
+            resumeSourceReresolved = false
+            nativeDebridFreshLinkRecoveryUsed = false   // one proactive fresh link per suspension
+            if recoverCurrentNativeDebridLink(reason: "foreground") {
                 DiagnosticsLog.log("player", "foreground: re-resolving the debrid mount after \(Int(seconds))s suspended")
             }
             return
@@ -5017,7 +5045,9 @@ struct TVPlayerView: View {
             return
         }
         DiagnosticsLog.log("player", "foreground: embedded server moved port, re-mounting the same source in place")
+        let previousURL = curURL
         curURL = healed
+        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: healed)
         let resume = max(currentTime, suppressedResumeFloor ?? 0)   // R9 floor: never re-mount below where the viewer was
         resumeSeconds = resume
         resumeIsMidPlayRecovery = true   // a live play head carried across the re-mount, not a stored offset
@@ -5179,7 +5209,10 @@ struct TVPlayerView: View {
         // now-stale first frame across the reload instead of the fresh one this recovery is about to render.
         // Mirrors iOS PlayerScreen.recoverFromStall.
         firstFrameRenderedAt = nil
-        curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
+        let previousURL = curURL
+        let replacementURL = liveMountURL()
+        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: replacementURL)
+        curURL = replacementURL   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
                                          reusing: recoveryToken, resumeOrigin: currentTime)
         guard issuedToken != nil else {
@@ -5301,13 +5334,12 @@ struct TVPlayerView: View {
             // established explicit-pick and Continue Watching recovery contracts before an
             // automatic route spends the source-hop budget. In particular, Continue Watching
             // gets its one same-source re-resolution through `handleLoadFailure`.
+            if recoverCurrentNativeDebridLink(reason: "direct AVPlayer and libmpv produced no frame") {
+                return
+            }
             if currentPickWasExplicit {
                 loadErrorMsg = "This source didn't produce playable media. Choose another source."
                 presentTerminalLoadFailure()
-                return
-            }
-            if currentPlaybackIsResume, !resumeSourceReresolved,
-               retryResumeSameSource() {
                 return
             }
             if hopToNextSource(reason: "direct AVPlayer and libmpv produced no frame") { return }
@@ -5573,6 +5605,24 @@ struct TVPlayerView: View {
         return nil
     }
 
+    /// User-invoked mid-title engine swap entry point. When the active native-debrid mount is reconnecting, a
+    /// fresh provider URL is acquired before either surface is constructed. Healthy switches retain their
+    /// current URL and never make a provider request.
+    private func switchPlayerEngine(toAVPlayer: Bool) {
+        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
+        if toAVPlayer, !canUseAVPlayerEngine {
+            showEngineNote("This source can only play on the built-in (libmpv) engine.")
+            withAnimation { showOptions = false }; return
+        }
+        let needsFreshNativeDebridLink = reconnecting || autoRetryTask != nil
+        if needsFreshNativeDebridLink,
+           recoverCurrentNativeDebridLink(reason: "engine switch", requestedEngine: toAVPlayer) {
+            withAnimation { showOptions = false }
+            return
+        }
+        performPlayerEngineSwitch(toAVPlayer: toAVPlayer)
+    }
+
     /// User-invoked mid-title engine swap (P3, #76). Generalizes `demoteAVPlayerToMPV` into a bidirectional,
     /// user-driven switch: tears the live engine down synchronously (straddle invariant) BEFORE flipping the
     /// manual override so `playerSurface` re-renders the other engine on the SAME view, carries the live
@@ -5580,7 +5630,10 @@ struct TVPlayerView: View {
     /// and subtitle sync are re-applied once the new engine's controller mounts. Track choices re-derive from
     /// `TrackPreferences` via the automatic trackList -> `TrackSelector` flow (engine id spaces differ by
     /// design; matching is by lang/title). No-op when already on the requested engine.
-    private func switchPlayerEngine(toAVPlayer: Bool) {
+    private func performPlayerEngineSwitch(
+        toAVPlayer: Bool,
+        preservingNativeDebridRecoveryGeneration: Bool = false
+    ) {
         guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
         if !toAVPlayer, coordinator.player is AVPlayerEngineController {
             _ = demoteAVPlayerToMPV()
@@ -5599,7 +5652,9 @@ struct TVPlayerView: View {
         captureRecoverySelections()
         queueIncomingTransportIntent(paused: desiredPaused)
         DiagnosticsLog.log("player", "user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
-        resumeRetryGeneration &+= 1
+        if !preservingNativeDebridRecoveryGeneration {
+            resumeRetryGeneration &+= 1
+        }
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
@@ -5623,6 +5678,9 @@ struct TVPlayerView: View {
         demotedEngineLoadToken = coordinator.player?.activeLoadToken
         coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
         clearCachedAudioOutputTruth()
+        engineSurfaceURLOverride = curURL ?? url
+        engineSurfaceHeadersOverride = curHeaders
+        engineSurfaceUsesActiveTuple = true
         avSurfaceResumeOrigin = reconcileResume
         manualEngineAVPlayer = toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
@@ -6203,17 +6261,23 @@ struct TVPlayerView: View {
         return try? JSONDecoder().decode(TorrentStats.self, from: data)
     }
 
-    /// A pre-playback failure (an endFileError before the first frame). Auto-retry up to `maxAutoRetries`
-    /// times with a short backoff before falling back to the manual error overlay, so a transient source
-    /// hiccup recovers on its own instead of dumping the viewer to an error screen.
-    /// A resume's exact stored source failed (its debrid link expired). Re-select the SAME source: mint a fresh
-    /// link for the same file via DebridCoordinator (a single requestdl / re-add, not a full source re-pick),
-    /// reset the load state, and replay it in place. Returns true once it kicks off (the caller stops); false
-    /// when there is no debrid provenance to re-resolve, so the caller falls through to the failover hop.
-    private func retryResumeSameSource() -> Bool {
+    /// Re-resolve one fresh URL for the active native-debrid source. This is intentionally the sole owner of
+    /// same-source provider recovery for pre-play failure, mid-play failure, foreground reconciliation, and a
+    /// user engine switch made while a source is reconnecting. It never changes the semantic stream or failure
+    /// bookkeeping: source hops and exhausted URLs remain owned by the caller that decides the refresh failed.
+    ///
+    /// A fresh URL is accepted only when the original episode/source/retry generation, player token, metadata,
+    /// provider reference, stream identity, and URL are all still current. A late provider answer after a user
+    /// source or engine switch is therefore inert rather than resurrecting stale audio/subtitle/position state.
+    @discardableResult
+    private func recoverCurrentNativeDebridLink(
+        reason: String,
+        requestedEngine: Bool? = nil
+    ) -> Bool {
         let retryRef = pendingAdvance?.debridRef ?? curDebridRef
         let retryMeta = pendingAdvance?.meta ?? curMeta
-        guard let ref = retryRef, !ref.infoHash.isEmpty else { return false }
+        guard !nativeDebridFreshLinkRecoveryUsed,
+              let ref = retryRef, !ref.infoHash.isEmpty else { return false }
         let hint = episodeHint(for: retryMeta)
         let retryRequiresSemanticSelection = isEpisodePlaybackContext
         let hasExactProviderIDs = ref.service == .torBox && ref.torrentId != nil && ref.fileId != nil
@@ -6225,14 +6289,16 @@ struct TVPlayerView: View {
         let targetVideoID = retryMeta?.videoId
         let retryURL = curURL
         let retrySource = curSourceStream
+        let retryToken = coordinator.player?.activeLoadToken
+        let retryEpisodeGeneration = episodeSwitchGeneration
+        let retrySourceGeneration = sourceSwitchGeneration
+        let resume = max(currentTime, suppressedResumeFloor ?? (resumeSeconds ?? 0))
+        let pausedIntent = isPaused
         captureRecoverySelections()
+        queueIncomingTransportIntent(paused: pausedIntent)
+        nativeDebridFreshLinkRecoveryUsed = true
         resumeSourceReresolved = true
-        coordinator.player?.invalidateLoadToken()
-        // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
-        hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedSize = false; appliedResume = false; pendingLibmpvResumeSeek = nil
-        loadErrorMsg = ""; autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         withAnimation { reconnecting = true }
-        let resume: Double? = resumeSeconds
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
             let fresh = try? await DebridCoordinator.shared.reresolve(
@@ -6246,9 +6312,12 @@ struct TVPlayerView: View {
                     capturedGeneration: generation, currentGeneration: resumeRetryGeneration,
                     capturedVideoID: targetVideoID, currentVideoID: activeMeta?.videoId
                   ),
+                  retryEpisodeGeneration == episodeSwitchGeneration,
+                  retrySourceGeneration == sourceSwitchGeneration,
+                  coordinator.player?.activeLoadToken == retryToken,
                   activeRef == ref, curURL == retryURL, curSourceStream == retrySource else { return }
             if let fresh {
-                DiagnosticsLog.log("player", "resume: re-selected the SAME source (fresh link) after the stored link expired")
+                DiagnosticsLog.log("player", "native-debrid fresh-link accepted service=\(ref.service) reason=\(safeFailureClass(reason)) generation=\(generation)")
                 reconnecting = false
                 curURL = fresh
                 let freshRef = DebridPlaybackRef(
@@ -6267,17 +6336,46 @@ struct TVPlayerView: View {
                     )
                 }
                 resumeSeconds = resume
-                let issuedToken = loadIntoPlayer(fresh, headers: curHeaders, live: curIsLive)
-                if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
-                startLoadTimeout()
+                if let requestedEngine {
+                    // `engineSurfacePlayback` seeds the next SwiftUI controller with this fresh URL. The
+                    // actual mount remains owned by the normal switch transaction, which preserves all
+                    // stop-before-swap and token fencing guarantees.
+                    engineSurfaceURLOverride = fresh
+                    engineSurfaceHeadersOverride = curHeaders
+                    performPlayerEngineSwitch(
+                        toAVPlayer: requestedEngine,
+                        preservingNativeDebridRecoveryGeneration: true
+                    )
+                } else {
+                    coordinator.player?.invalidateLoadToken()
+                    hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedSize = false
+                    appliedResume = false; pendingLibmpvResumeSeek = nil; loadErrorMsg = ""
+                    autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
+                    let issuedToken = loadIntoPlayer(fresh, headers: curHeaders, live: curIsLive,
+                                                     resumeOrigin: resume)
+                    if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
+                    if issuedToken != nil { startLoadTimeout() }
+                }
             } else {
-                // The same source is genuinely gone (evicted / no key): now hop to a DIFFERENT source.
-                DiagnosticsLog.log("player", "resume: same source unavailable on re-resolve -> hopping to another")
+                // The source's semantic provider selection is genuinely unavailable. Keep the one-refresh
+                // receipt, then let the original caller honor explicit-pick terminal behavior or auto-hop.
+                DiagnosticsLog.log("player", "native-debrid fresh-link unavailable service=\(ref.service) reason=\(safeFailureClass(reason)) generation=\(generation)")
                 reconnecting = false
-                if !hopToNextSource(reason: "resume source gone") { presentTerminalLoadFailure() }
+                if currentPickWasExplicit {
+                    if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
+                    presentTerminalLoadFailure()
+                } else if !hopToNextSource(reason: "native debrid source unavailable", resumeOverride: resume) {
+                    presentTerminalLoadFailure()
+                }
             }
         }
         return true
+    }
+
+    /// Compatibility spelling retained for source-contract consumers. It delegates to the generalized owner,
+    /// so Continue Watching no longer owns a distinct recovery path.
+    private func retryResumeSameSource() -> Bool {
+        recoverCurrentNativeDebridLink(reason: "resume")
     }
 
     /// MID-PLAY libmpv FAILURE (diag-21). Before wave-1 this fell off the end of the endFileError switch with
@@ -6342,6 +6440,7 @@ struct TVPlayerView: View {
         }
         if DVPlaybackPolicy.isSourceCapabilityMismatch(msg) {
             reconnecting = false
+            if recoverCurrentNativeDebridLink(reason: msg) { return }
             if currentPickWasExplicit && !currentPlaybackIsResume {
                 presentTerminalLoadFailure()
                 return
@@ -6357,6 +6456,7 @@ struct TVPlayerView: View {
             // source. Only the auto path (Watch Now) dead-ends this way. A Continue-Watching RESUME is NOT a
             // manual pick: its stored debrid link expires, so a hard failure must fall through to the failover
             // hop + fresh-sources wait below (get the viewer watching) rather than dead-ending on the overlay.
+            if recoverCurrentNativeDebridLink(reason: msg) { return }
             if currentPickWasExplicit && !currentPlaybackIsResume {
                 if loadErrorMsg.isEmpty {
                     loadErrorMsg = curIsMediaServer
@@ -6366,11 +6466,8 @@ struct TVPlayerView: View {
                 presentTerminalLoadFailure()
                 return
             }
-            // RESUME (Continue Watching): the exact source's stored link expired. Re-select the SAME source once
-            // more, minting a fresh debrid link for the same file, BEFORE hopping to a different source, so a
-            // resume stays on the source you chose. Only if that source is genuinely gone (re-resolve fails) do
-            // we fall through to the failover hop below.
-            if currentPlaybackIsResume, !resumeSourceReresolved, retryResumeSameSource() { return }
+            // The single native-debrid fresh-link chance was consumed above. If it could not prove a usable
+            // replacement, the existing explicit terminal / auto-hop policy owns the next step.
             if hopToNextSource(reason: "load failed: \(msg)") { return }
             // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
             // HomeView.directResume kicks off a background reload of the title's streams, but they may not
@@ -6417,7 +6514,10 @@ struct TVPlayerView: View {
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
         buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""; pendingLibmpvResumeSeek = nil
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
-        curURL = liveMountURL()   // self-heal a drifted embedded-server port before replaying the mount
+        let previousURL = curURL
+        let replacementURL = liveMountURL()
+        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: replacementURL)
+        curURL = replacementURL   // self-heal a drifted embedded-server port before replaying the mount
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
                        resumeOrigin: resume)
         startLoadTimeout()
@@ -6988,6 +7088,16 @@ struct TVPlayerView: View {
     private var initialPlayback: (url: URL, headers: [String: String]?) {
         if let h = headers, !h.isEmpty, let proxied = StremioServer.proxiedURL(for: url, headers: h) {
             return (proxied, nil)
+        }
+        return (url, headers)
+    }
+
+    /// The launch tuple remains the normal initial surface input. A user-driven engine replacement may supply
+    /// the active tuple first, notably after a native-debrid fresh-link recovery, so the new controller never
+    /// opens a URL whose failure already triggered the recovery.
+    private var engineSurfacePlayback: (url: URL, headers: [String: String]?) {
+        if engineSurfaceUsesActiveTuple {
+            return (engineSurfaceURLOverride ?? url, engineSurfaceHeadersOverride)
         }
         return (url, headers)
     }
@@ -7655,6 +7765,7 @@ struct TVPlayerView: View {
         avEngineFailed = false
         currentPickWasExplicit = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         currentPlaybackIsResume = false; resumeSourceReresolved = false
+        nativeDebridFreshLinkRecoveryUsed = false
         directAVNoFrameRecovery = nil
         libmpvStartupNudgeIssued = false
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []

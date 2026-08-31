@@ -74,11 +74,11 @@ private enum TVSourceReliabilityContractTests {
                 && tvPlayer.contains("hopToNextSource(reason:")
         )
         check(
-            "a frame-less fallback terminals explicit picks and consumes one Continue Watching re-resolution",
+            "a frame-less fallback terminals explicit picks only after its one native-debrid fresh-link recovery",
             tvPlayer.contains("if currentPickWasExplicit {")
                 && tvPlayer.contains("This source didn't produce playable media. Choose another source.")
-                && tvPlayer.contains("if currentPlaybackIsResume, !resumeSourceReresolved,")
-                && tvPlayer.contains("retryResumeSameSource()")
+                && tvPlayer.contains("recoverCurrentNativeDebridLink(reason: \"fallback MPV produced no frame\")")
+                && tvPlayer.contains("nativeDebridFreshLinkRecoveryUsed")
         )
         check(
             "cold-resume nudge is bounded and stays on the relative-seek path",
