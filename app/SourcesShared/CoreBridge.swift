@@ -1636,15 +1636,20 @@ final class CoreBridge: ObservableObject {
         // come from the separate per-video watched bitfield, so BOTH directions must visit every
         // known video. The old true branch sent only the aggregate action, making a whole-series
         // mark look like a silent no-op on the detail page.
-        for v in metaDetails?.meta?.videos ?? [] {
-            var payload: [String: Any] = ["id": v.id]
-            if let season = v.season { payload["season"] = season }
-            if let episode = v.episode { payload["episode"] = episode }
-            dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, isWatched]])
+        let videos = (metaDetails?.meta?.videos ?? []).map {
+            LibraryWatchedMutationPolicy.Video(id: $0.id, season: $0.season, episode: $0.episode)
         }
-        // Keep the title-level library state in sync as well. This also covers movies and sparse
-        // details that have not supplied a videos array yet.
-        dispatchMetaDetails(["action": "MarkAsWatched", "args": isWatched])
+        for action in LibraryWatchedMutationPolicy.wholeTitleActions(videos: videos, isWatched: isWatched) {
+            switch action {
+            case .video(let video, let watched):
+                var payload: [String: Any] = ["id": video.id]
+                if let season = video.season { payload["season"] = season }
+                if let episode = video.episode { payload["episode"] = episode }
+                dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, watched]])
+            case .title(let watched):
+                dispatchMetaDetails(["action": "MarkAsWatched", "args": watched])
+            }
+        }
     }
 
     /// Mark every episode of a season watched/unwatched.
@@ -2136,6 +2141,7 @@ final class CoreBridge: ObservableObject {
     /// final fallback rather than making a deliberate Library button tap a silent no-op.
     private func detailMetaPreview() -> [String: Any]? {
         let selectedID = metaDetails?.meta?.id
+        var ready: [LibraryWatchedMutationPolicy.MetaPreview] = []
         if let data = stateData("meta_details"),
            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let metaItems = object["metaItems"] as? [[String: Any]] {
@@ -2143,14 +2149,26 @@ final class CoreBridge: ObservableObject {
                 guard let loadable = entry["content"] as? [String: Any],
                       loadable["type"] as? String == "Ready",
                       let meta = loadable["content"] as? [String: Any] else { continue }
-                if selectedID == nil || meta["id"] as? String == selectedID { return meta }
+                guard let id = meta["id"] as? String,
+                      let type = meta["type"] as? String,
+                      let name = meta["name"] as? String else { continue }
+                ready.append(.init(id: id, type: type, name: name, poster: meta["poster"] as? String))
             }
         }
-        if let selectedID, let catalog = rawMetaPreview(forId: selectedID) { return catalog }
-        guard let detail = metaDetails?.meta else { return nil }
-        var preview: [String: Any] = ["id": detail.id, "type": detail.type, "name": detail.name]
-        if let poster = detail.poster { preview["poster"] = poster }
-        return preview
+        let catalog = selectedID.flatMap(rawMetaPreview(forId:)).flatMap(Self.mutationPreview)
+        let decoded = metaDetails?.meta.map {
+            LibraryWatchedMutationPolicy.MetaPreview(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster)
+        }
+        return LibraryWatchedMutationPolicy.detailPreview(
+            targetID: selectedID, ready: ready, catalog: catalog, decoded: decoded
+        )?.dictionary
+    }
+
+    private static func mutationPreview(_ raw: [String: Any]) -> LibraryWatchedMutationPolicy.MetaPreview? {
+        guard let id = raw["id"] as? String,
+              let type = raw["type"] as? String,
+              let name = raw["name"] as? String else { return nil }
+        return .init(id: id, type: type, name: name, poster: raw["poster"] as? String)
     }
 
     /// Remove the open detail-page title from the library, mirroring the removal to each connected external
@@ -2745,7 +2763,7 @@ final class CoreBridge: ObservableObject {
                     // An account/sync refresh can exchange one episode id for another while
                     // preserving the count. Comparing the count made the open detail page retain
                     // its old tick set until a reload, falsely appearing to undo a successful mark.
-                    || WatchedMembershipPolicy.changed(current.watchedVideoIds, details?.watchedVideoIds)
+                    || LibraryWatchedMutationPolicy.watchedMembershipChanged(current.watchedVideoIds, details?.watchedVideoIds)
                 if changed { self.metaDetails = details }
             }
         }
