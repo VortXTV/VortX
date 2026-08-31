@@ -17,6 +17,8 @@ final class UpdateChecker: ObservableObject {
 
     struct Release: Codable, Equatable, Identifiable {
         let version: String
+        /// Exact public release tag. Marketing version comparison intentionally excludes a beta suffix.
+        let tag: String?
         let build: Int
         let name: String
         let notes: String
@@ -25,6 +27,19 @@ final class UpdateChecker: ObservableObject {
         /// Published appcast metadata. It is not a claim that a downloaded artifact was locally verified.
         let size: Int?
         let sha256: String?
+
+        init(version: String, tag: String? = nil, build: Int, name: String, notes: String,
+             ipa: String?, altstore: String?, size: Int?, sha256: String?) {
+            self.version = version
+            self.tag = tag
+            self.build = build
+            self.name = name
+            self.notes = notes
+            self.ipa = ipa
+            self.altstore = altstore
+            self.size = size
+            self.sha256 = sha256
+        }
 
         var key: String { "\(version).\(build)" }
         var id: String { key }
@@ -257,6 +272,7 @@ final class UpdateChecker: ObservableObject {
             guard case let .release(latest) = discovery else {
                 if case .current = discovery {
                     self.recordSuccessfulCheck()
+                    if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
                     succeeded = true
                     self.available = nil
                     self.prompt = nil
@@ -269,6 +285,7 @@ final class UpdateChecker: ObservableObject {
             // Persist a check only after transport, status, and payload decoding all succeeded. Recording
             // before the request makes a temporary GitHub/DNS failure suppress every later foreground retry.
             self.recordSuccessfulCheck()
+            if isManual { self.replaceMonitoringDeadlineAfterManualSuccess() }
             succeeded = true
 
             // Never regress a cached/newer candidate because a successful but older endpoint replied later.
@@ -295,6 +312,16 @@ final class UpdateChecker: ObservableObject {
         let timestamp = now().timeIntervalSince1970
         defaults.set(timestamp, forKey: Self.lastCheckedKey)
         lastSuccessfulCheckThisSession = timestamp
+    }
+
+    /// A successful manual recovery supersedes a short retry that was armed after a failed automatic request.
+    /// Replacing it here keeps the next automatic attempt on the normal hourly cadence.
+    private func replaceMonitoringDeadlineAfterManualSuccess() {
+        automaticCheckFailedThisSession = false
+        guard isMonitoring else { return }
+        monitoringTask?.cancel()
+        monitoringTask = nil
+        armScheduledCheck(monitoringGeneration)
     }
 
     /// The appcast names exactly one asset for this platform and carries the release integrity receipt. It is
@@ -482,7 +509,7 @@ final class UpdateChecker: ObservableObject {
 
     private func release(from entry: AppcastEntry) -> Release? {
         guard entry.artifactType == expectedArtifactType else { return nil }
-        let release = Release(version: entry.version, build: entry.build, name: entry.name, notes: entry.notes,
+        let release = Release(version: entry.version, tag: entry.tag, build: entry.build, name: entry.name, notes: entry.notes,
                               ipa: entry.url ?? entry.ipa, altstore: entry.altstore,
                               size: entry.size, sha256: entry.sha256)
         return validatedRelease(release, requiresIntegrity: true)
@@ -503,7 +530,8 @@ final class UpdateChecker: ObservableObject {
               release.name.count > 0, release.name.count <= Self.maxNameLength,
               release.notes.count <= Self.maxNotesLength,
               release.name.localizedCaseInsensitiveContains(release.version),
-              let artifact = exactArtifactURL(release.ipa, version: release.version),
+              let tag = validatedReleaseTag(release.tag, version: release.version),
+              let artifact = exactArtifactURL(release.ipa, tag: tag),
               release.ipa == artifact.absoluteString else {
             return nil
         }
@@ -519,13 +547,13 @@ final class UpdateChecker: ObservableObject {
         return release
     }
 
-    private func exactArtifactURL(_ rawURL: String?, version: String) -> URL? {
+    private func exactArtifactURL(_ rawURL: String?, tag: String) -> URL? {
         guard let rawURL, let url = URL(string: rawURL),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               components.scheme == "https", components.host == "github.com",
               components.user == nil, components.password == nil, components.port == nil,
               components.query == nil, components.fragment == nil,
-              components.path == "/VortXTV/VortX/releases/download/v\(version)/\(expectedArtifactFilename(version))" else {
+              components.path == "/VortXTV/VortX/releases/download/\(tag)/\(expectedArtifactFilename(tag))" else {
             return nil
         }
         return url
@@ -564,13 +592,13 @@ final class UpdateChecker: ObservableObject {
         #endif
     }
 
-    private func expectedArtifactFilename(_ version: String) -> String {
+    private func expectedArtifactFilename(_ tag: String) -> String {
         #if os(tvOS)
-        return isLiteBuild ? "VortX-tvOS-Lite-v\(version)-ci.ipa" : "VortX-tvOS-v\(version)-ci.ipa"
+        return isLiteBuild ? "VortX-tvOS-lite-\(tag)-ci.ipa" : "VortX-tvOS-\(tag)-ci.ipa"
         #elseif os(macOS)
-        return isLiteBuild ? "VortX-tvOS-Lite-v\(version)-ci.ipa" : "VortX-macOS-v\(version)-ci.dmg"
+        return isLiteBuild ? "VortX-tvOS-lite-\(tag)-ci.ipa" : "VortX-macOS-\(tag)-ci.dmg"
         #else
-        return isLiteBuild ? "VortX-tvOS-Lite-v\(version)-ci.ipa" : "VortX-iOS-v\(version)-ci.ipa"
+        return isLiteBuild ? "VortX-tvOS-lite-\(tag)-ci.ipa" : "VortX-iOS-\(tag)-ci.ipa"
         #endif
     }
 
@@ -595,15 +623,15 @@ final class UpdateChecker: ObservableObject {
     }
 
     private func release(from github: GitHubRelease) -> Release? {
-        guard let version = version(fromTag: github.tagName),
+        guard let identity = releaseIdentity(from: github.tagName),
               // The public release title is canonical. Release-note bodies carry older beta history, so their
               // first "Build" marker is not necessarily the build of this release.
               let build = buildNumber(in: github.name ?? "") ?? highestBuildNumber(in: github.body ?? ""),
               build > 0,
-              let asset = github.assets.first(where: { $0.name == expectedArtifactFilename(version) }) else {
+              let asset = github.assets.first(where: { $0.name == expectedArtifactFilename(identity.tag) }) else {
             return nil
         }
-        let release = Release(version: version, build: build,
+        let release = Release(version: identity.version, tag: identity.tag, build: build,
                               name: github.name ?? github.tagName,
                               notes: github.body ?? "",
                               ipa: asset.browserDownloadURL,
@@ -631,7 +659,7 @@ final class UpdateChecker: ObservableObject {
         return lhs.build < rhs.build ? .orderedAscending : .orderedDescending
     }
 
-    private func version(fromTag tag: String) -> String? {
+    private func releaseIdentity(from tag: String) -> (tag: String, version: String)? {
         guard tag.first == "v" else { return nil }
         let body = String(tag.dropFirst())
         let parts = body.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
@@ -639,7 +667,13 @@ final class UpdateChecker: ObservableObject {
               parts.count == 1 || (!parts[1].isEmpty && parts[1].allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == ".") }) else {
             return nil
         }
-        return version
+        return (tag, version)
+    }
+
+    private func validatedReleaseTag(_ explicitTag: String?, version: String) -> String? {
+        let candidate = explicitTag ?? "v\(version)"
+        guard let identity = releaseIdentity(from: candidate), identity.version == version else { return nil }
+        return identity.tag
     }
 
     private func buildNumber(in text: String) -> Int? {
@@ -713,6 +747,7 @@ final class UpdateChecker: ObservableObject {
     }
 
     private struct AppcastEntry: Decodable {
+        let tag: String
         let version: String
         let build: Int
         let name: String

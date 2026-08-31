@@ -123,9 +123,11 @@ func response(_ status: Int, url: URL = URL(string: "https://api.github.com/repo
                     httpVersion: nil, headerFields: nil)!
 }
 
-func release(build: Int, body: String = "", assetName: String = "VortX-macOS-v0.3.15-ci.dmg") -> Data {
+func release(build: Int, body: String = "", tag: String = "v0.3.15", assetName: String? = nil) -> Data {
+    let resolvedAssetName = assetName ?? "VortX-macOS-\(tag)-ci.dmg"
+    let version = String(tag.dropFirst().split(separator: "-", maxSplits: 1)[0])
     let fixture = """
-    [{"tag_name":"v0.3.15","name":"VortX 0.3.15 (Build \(build))","body":"\(body)","draft":false,"prerelease":false,"published_at":"2026-08-30T00:00:00Z","assets":[{"name":"\(assetName)","browser_download_url":"https://github.com/VortXTV/VortX/releases/download/v0.3.15/\(assetName)"}]}]
+    [{"tag_name":"\(tag)","name":"VortX \(version) (Build \(build))","body":"\(body)","draft":false,"prerelease":false,"published_at":"2026-08-30T00:00:00Z","assets":[{"name":"\(resolvedAssetName)","browser_download_url":"https://github.com/VortXTV/VortX/releases/download/\(tag)/\(resolvedAssetName)"}]}]
     """
     return Data(fixture.utf8)
 }
@@ -134,9 +136,9 @@ func appcast(version: String, build: Int) -> Data {
     let sha256 = String(repeating: "a", count: 64)
     let fixture = """
     {"schemaVersion":2,
-     "ios":{"version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-iOS-v\(version)-ci.ipa","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-iOS-v\(version)-ci.ipa","size":101,"sha256":"\(sha256)","altstore":"https://vortx.tv/altstore.json","artifactType":"ipa"},
-     "tvos":{"version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-tvOS-v\(version)-ci.ipa","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-tvOS-v\(version)-ci.ipa","size":102,"sha256":"\(sha256)","altstore":null,"artifactType":"ipa"},
-     "mac":{"version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-macOS-v\(version)-ci.dmg","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-macOS-v\(version)-ci.dmg","size":103,"sha256":"\(sha256)","altstore":null,"artifactType":"dmg"}}
+     "ios":{"tag":"v\(version)","version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-iOS-v\(version)-ci.ipa","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-iOS-v\(version)-ci.ipa","size":101,"sha256":"\(sha256)","altstore":"https://vortx.tv/altstore.json","artifactType":"ipa"},
+     "tvos":{"tag":"v\(version)","version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-tvOS-v\(version)-ci.ipa","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-tvOS-v\(version)-ci.ipa","size":102,"sha256":"\(sha256)","altstore":null,"artifactType":"ipa"},
+     "mac":{"tag":"v\(version)","version":"\(version)","build":\(build),"name":"VortX \(version) (build \(build))","notes":"Release notes","ipa":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-macOS-v\(version)-ci.dmg","url":"https://github.com/VortXTV/VortX/releases/download/v\(version)/VortX-macOS-v\(version)-ci.dmg","size":103,"sha256":"\(sha256)","altstore":null,"artifactType":"dmg"}}
     """
     return Data(fixture.utf8)
 }
@@ -342,6 +344,33 @@ struct UpdateCheckerTests {
         await failedSleeper.resumeNext() // foreground task
         await waitForCalls(failedLoader, 2)
         check(await failedLoader.calls == 2, "foreground after failed cold launch retries without inheriting the old timestamp")
+
+        // A manual success after a failed automatic request replaces the pending 60-second retry with a normal
+        // hourly deadline. Otherwise the user can recover in Settings and still receive a redundant retry.
+        let recoveryDefaults = UserDefaults(suiteName: "\(suiteName).manual-recovery")!
+        defer { recoveryDefaults.removePersistentDomain(forName: "\(suiteName).manual-recovery") }
+        let recoverySleeper = ControlledSleeper()
+        let recoveryLoader = ScriptedLoader([.success((Data("[]".utf8), response(503))),
+                                            .success((release(build: 233), response(200)))])
+        let recovery = await MainActor.run {
+            UpdateChecker(defaults: recoveryDefaults, now: { Date(timeIntervalSince1970: 750_000) },
+                          requestLoader: { request in try await recoveryLoader.load(request) },
+                          sleeper: { seconds in await recoverySleeper.sleep(seconds) },
+                          currentBuild: 230, currentVersion: "0.3.14")
+        }
+        await MainActor.run { recovery.startMonitoring() }
+        await waitForCalls(recoveryLoader, 1)
+        await waitForSleeper(recoverySleeper, 1)
+        check(await recoverySleeper.duration(at: 0) == 60, "automatic failure first arms a short retry")
+        await MainActor.run { recovery.checkNow() }
+        await waitForCalls(recoveryLoader, 2)
+        await waitForManualCheckToFinish(recovery)
+        await waitForSleeper(recoverySleeper, 2)
+        check(await recoverySleeper.duration(at: 1) == 3_600,
+              "successful manual recovery replaces the short retry with the hourly deadline")
+        await MainActor.run { recovery.stopMonitoring() }
+        await recoverySleeper.resumeNext()
+        await recoverySleeper.resumeNext()
 
         // An in-flight initial request cannot re-arm monitoring after the app becomes inactive.
         let stoppedDefaults = UserDefaults(suiteName: "\(suiteName).stopped")!
@@ -738,7 +767,7 @@ struct UpdateCheckerTests {
         defer { liteDefaults.removePersistentDomain(forName: "\(suiteName).lite") }
         let liteLoader = RoutedLoader(
             appcast: .success((appcast(version: "0.3.16", build: 234), response(200))),
-            github: .success((release(build: 234, assetName: "VortX-tvOS-Lite-v0.3.15-ci.ipa"), response(200))))
+            github: .success((release(build: 234, assetName: "VortX-tvOS-lite-v0.3.15-ci.ipa"), response(200))))
         let lite = await MainActor.run {
             UpdateChecker(defaults: liteDefaults, now: { Date(timeIntervalSince1970: 2_300_000) },
                           requestLoader: { request in try await liteLoader.load(request) },
@@ -746,12 +775,38 @@ struct UpdateCheckerTests {
         }
         await MainActor.run { lite.checkNow() }
         await waitForManualCheckToFinish(lite)
-        check(await MainActor.run { lite.available?.ipa?.hasSuffix("VortX-tvOS-Lite-v0.3.15-ci.ipa") == true },
+        check(await MainActor.run { lite.available?.ipa?.hasSuffix("VortX-tvOS-lite-v0.3.15-ci.ipa") == true },
               "Lite selects only its exact IPA asset")
         let liteAppcastCalls = await liteLoader.appcastCalls
         let liteGitHubCalls = await liteLoader.githubCalls
         check(liteAppcastCalls == 0 && liteGitHubCalls == 1,
               "Lite bypasses the Full-only appcast entry while remaining update-eligible")
+
+        let betaFullDefaults = UserDefaults(suiteName: "\(suiteName).beta-full")!
+        defer { betaFullDefaults.removePersistentDomain(forName: "\(suiteName).beta-full") }
+        let betaFullLoader = ScriptedLoader([.success((release(build: 235, tag: "v0.3.16-beta.31"), response(200)))])
+        let betaFull = await MainActor.run {
+            UpdateChecker(defaults: betaFullDefaults, now: { Date(timeIntervalSince1970: 2_350_000) },
+                          requestLoader: { request in try await betaFullLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15")
+        }
+        await MainActor.run { betaFull.checkNow() }
+        await waitForManualCheckToFinish(betaFull)
+        check(await MainActor.run { betaFull.available?.tag == "v0.3.16-beta.31" && betaFull.available?.ipa?.hasSuffix("VortX-macOS-v0.3.16-beta.31-ci.dmg") == true },
+              "public beta tags bind the standard artifact URL to the full tag")
+
+        let betaLiteDefaults = UserDefaults(suiteName: "\(suiteName).beta-lite")!
+        defer { betaLiteDefaults.removePersistentDomain(forName: "\(suiteName).beta-lite") }
+        let betaLiteLoader = ScriptedLoader([.success((release(build: 235, tag: "v0.3.16-beta.31", assetName: "VortX-tvOS-lite-v0.3.16-beta.31-ci.ipa"), response(200)))])
+        let betaLite = await MainActor.run {
+            UpdateChecker(defaults: betaLiteDefaults, now: { Date(timeIntervalSince1970: 2_360_000) },
+                          requestLoader: { request in try await betaLiteLoader.load(request) },
+                          currentBuild: 233, currentVersion: "0.3.15", isLite: true)
+        }
+        await MainActor.run { betaLite.checkNow() }
+        await waitForManualCheckToFinish(betaLite)
+        check(await MainActor.run { betaLite.available?.tag == "v0.3.16-beta.31" && betaLite.available?.ipa?.hasSuffix("VortX-tvOS-lite-v0.3.16-beta.31-ci.ipa") == true },
+              "public beta tags bind the Lite artifact URL to the full tag")
 
         let cachedRelease = UpdateChecker.Release(
             version: "0.3.16", build: 234, name: "VortX 0.3.16 (Build 234)", notes: "Release notes",
