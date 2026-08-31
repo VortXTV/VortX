@@ -126,9 +126,14 @@ enum ContinueWatchingDedupe {
     private static func canonicalProviderID(_ value: String, type: String) -> String? {
         let raw = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !raw.isEmpty else { return nil }
+        let retainsEpisodeSuffix = type != "series" && raw.range(
+            of: #":[0-9]{1,4}:[0-9]{1,4}$"#,
+            options: .regularExpression
+        ) != nil
 
         if let match = raw.range(of: #"^(?:imdb:)?tt[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$"#, options: .regularExpression),
            match == raw.startIndex..<raw.endIndex {
+            guard !retainsEpisodeSuffix else { return raw }
             let imdb = raw
                 .dropFirst(raw.hasPrefix("imdb:") ? 5 : 0)
                 .split(separator: ":", maxSplits: 1)
@@ -141,6 +146,7 @@ enum ContinueWatchingDedupe {
             of: #"^tmdb:(?:(movie|tv|series|show):)?[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$"#,
             options: .regularExpression
         ), match == raw.startIndex..<raw.endIndex {
+            guard !retainsEpisodeSuffix else { return raw }
             let parts = raw.split(separator: ":").map(String.init)
             let explicit = parts.count >= 3 ? parts[1] : nil
             let numeric = parts[explicit == nil ? 1 : 2]
@@ -157,6 +163,7 @@ enum ContinueWatchingDedupe {
             of: #"^(kitsu|anilist|mal|anidb):[0-9]{1,10}(?::[0-9]{1,4}:[0-9]{1,4})?$"#,
             options: .regularExpression
         ), match == raw.startIndex..<raw.endIndex {
+            guard !retainsEpisodeSuffix else { return raw }
             let parts = raw.split(separator: ":").map(String.init)
             return "\(parts[0]):\(parts[1])"
         }

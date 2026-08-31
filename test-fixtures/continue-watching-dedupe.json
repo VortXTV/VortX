@@ -86,6 +86,34 @@
       "expected": ["kitsu-episode-two"]
     },
     {
+      "name": "movie typed provider ids retain distinct numeric suffixes",
+      "items": [
+        {
+          "key": "tmdb-movie-suffix-one",
+          "id": "tmdb:movie:456:1:1",
+          "type": "movie",
+          "name": "Provider Movie",
+          "poster": "https://img/tmdb-movie-suffix-one.jpg",
+          "aliases": [],
+          "position": 600,
+          "duration": 2400,
+          "updatedAt": 600
+        },
+        {
+          "key": "tmdb-movie-suffix-two",
+          "id": "tmdb:movie:456:1:2",
+          "type": "movie",
+          "name": "Provider Movie",
+          "poster": "https://img/tmdb-movie-suffix-two.jpg",
+          "aliases": [],
+          "position": 500,
+          "duration": 2400,
+          "updatedAt": 500
+        }
+      ],
+      "expected": ["tmdb-movie-suffix-one", "tmdb-movie-suffix-two"]
+    },
+    {
       "name": "different anime provider title ids stay separate",
       "items": [
         {

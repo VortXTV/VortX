@@ -73,7 +73,7 @@ export function continueWatchingIdentityKeys(identity: ContinueWatchingIdentity)
   if (!type) return new Set();
   const keys = new Set<string>();
   for (const raw of [identity.id, ...(identity.aliases ?? [])]) {
-    const canonical = canonicalProviderId(raw, type, true);
+    const canonical = canonicalProviderId(raw, type, type === "series", type !== "series");
     if (canonical) keys.add(`${type}\u001f${canonical}`);
   }
   return keys;
@@ -115,20 +115,28 @@ function normalizeType(value: string): string {
   return type;
 }
 
-function canonicalProviderId(value: string, type: string, reduceEpisode: boolean): string | null {
+function canonicalProviderId(
+  value: string,
+  type: string,
+  reduceEpisode: boolean,
+  preserveOpaqueEpisode = false,
+): string | null {
   const raw = value.trim().toLowerCase();
   if (!raw) return null;
 
   const imdb = /^(?:imdb:)?(tt[0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$/.exec(raw);
+  if (imdb?.[2] && preserveOpaqueEpisode) return raw;
   if (imdb) return `imdb:${imdb[1]}${reduceEpisode ? "" : (imdb[2] ?? "")}`;
 
   const tmdb = /^tmdb:(?:(movie|tv|series|show):)?([0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$/.exec(raw);
   if (tmdb) {
+    if (tmdb[3] && preserveOpaqueEpisode) return raw;
     const namespace = tmdb[1] === "movie" ? "movie" : tmdb[1] ? "series" : type;
     return `tmdb:${namespace}:${tmdb[2]}${reduceEpisode ? "" : (tmdb[3] ?? "")}`;
   }
 
   const anime = /^(kitsu|anilist|mal|anidb):([0-9]{1,10})(:[0-9]{1,4}:[0-9]{1,4})?$/.exec(raw);
+  if (anime?.[3] && preserveOpaqueEpisode) return raw;
   if (anime) return `${anime[1]}:${anime[2]}${reduceEpisode ? "" : (anime[3] ?? "")}`;
 
   return raw;
