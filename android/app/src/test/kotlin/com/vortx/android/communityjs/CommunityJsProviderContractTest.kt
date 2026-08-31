@@ -300,6 +300,41 @@ class CommunityJsProviderContractTest {
     }
 
     @Test
+    fun `broker rejects oversized inbound execute without complete or fetch callback admission`() {
+        var completeCallbacks = 0
+        var fetchCallbacks = 0
+        assertFalse(communityJsDispatchInboundBrokerExecute(
+            token = "t".repeat(CommunityJsBinderPayloads.MAX_TOKEN_CHARS + 1),
+            code = "module.exports = {}",
+            tmdbId = "1",
+            mediaType = "movie",
+            settingsJson = "{}",
+        ) { completeCallbacks += 1; fetchCallbacks += 1 })
+        assertFalse(communityJsDispatchInboundBrokerExecute(
+            token = "token",
+            code = "c".repeat(CommunityJsBinderPayloads.MAX_EXECUTE_CODE_CHARS + 1),
+            tmdbId = "1",
+            mediaType = "movie",
+            settingsJson = "{}",
+        ) { completeCallbacks += 1; fetchCallbacks += 1 })
+        assertEquals(0, completeCallbacks)
+        assertEquals(0, fetchCallbacks)
+    }
+
+    @Test
+    fun `settings are bounded before parsing and invalid JSON never canonicalizes`() {
+        assertNull(CommunityJsBinderPayloads.canonicalSettingsJson(
+            "x".repeat(CommunityJsBinderPayloads.MAX_EXECUTE_SETTINGS_CHARS + 1),
+        ))
+        assertNull(CommunityJsBinderPayloads.canonicalSettingsJson("{broken"))
+
+        val escaped = "{\"title\":\"" + "\\u0061".repeat(1_000) + "\"}"
+        val canonical = requireNotNull(CommunityJsBinderPayloads.canonicalSettingsJson(escaped))
+        assertTrue(canonical.length <= CommunityJsBinderPayloads.MAX_EXECUTE_SETTINGS_CHARS)
+        assertTrue(canonical.contains("a".repeat(1_000)))
+    }
+
+    @Test
     fun `oversized fetch payload is rejected without calling the Binder callback`() {
         var callbackCalls = 0
         val result = communityJsFetchOverBinder(

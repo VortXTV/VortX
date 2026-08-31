@@ -29,27 +29,25 @@ class CommunityJsBrokerService : Service() {
             memoryLimitBytes: Long,
             callback: ICommunityJsBrokerCallback,
         ) {
-            if (!CommunityJsBinderPayloads.isExecuteRequestSafe(token, code, tmdbId, mediaType, settingsJson) ||
-                code.toByteArray().size > MAX_SOURCE_BYTES || settingsJson.toByteArray().size > MAX_SETTINGS_BYTES
-            ) {
-                completeSafely(callback, token, FAILURE_ENVELOPE)
-                return
-            }
-            val accepted = controller.submit(token) { cancelledFlag ->
-                val host = object : CommunityJsRuntime.NativeFetch {
-                    override fun fetch(url: String, optionsJson: String, remainingTimeoutMs: Long): String =
-                        communityJsFetchOverBinder(token, url, optionsJson, remainingTimeoutMs) { safeToken, safeUrl, safeOptions, safeTimeout ->
-                            callback.fetch(safeToken, safeUrl, safeOptions, safeTimeout)
-                        }
+            // The token and every other string are caller-controlled until admitted. Do not echo a
+            // rejected token or otherwise make an outbound callback Binder transaction here.
+            communityJsDispatchInboundBrokerExecute(token, code, tmdbId, mediaType, settingsJson) {
+                val accepted = controller.submit(token) { cancelledFlag ->
+                    val host = object : CommunityJsRuntime.NativeFetch {
+                        override fun fetch(url: String, optionsJson: String, remainingTimeoutMs: Long): String =
+                            communityJsFetchOverBinder(token, url, optionsJson, remainingTimeoutMs) { safeToken, safeUrl, safeOptions, safeTimeout ->
+                                callback.fetch(safeToken, safeUrl, safeOptions, safeTimeout)
+                            }
 
-                    override fun isCancelled(): Boolean = cancelledFlag.get() || runCatching { callback.isCancelled(token) }.getOrDefault(true)
+                        override fun isCancelled(): Boolean = cancelledFlag.get() || runCatching { callback.isCancelled(token) }.getOrDefault(true)
+                    }
+                    val envelope = runCatching {
+                        CommunityJsNative.evaluate(host, code, tmdbId, mediaType, settingsJson, season, episode, timeoutMs, memoryLimitBytes)
+                    }.getOrDefault(FAILURE_ENVELOPE)
+                    completeSafely(callback, token, communityJsBoundedEnvelope(envelope))
                 }
-                val envelope = runCatching {
-                    CommunityJsNative.evaluate(host, code, tmdbId, mediaType, settingsJson, season, episode, timeoutMs, memoryLimitBytes)
-                }.getOrDefault(FAILURE_ENVELOPE)
-                completeSafely(callback, token, communityJsBoundedEnvelope(envelope))
+                if (!accepted) completeSafely(callback, token, OVERLOADED_ENVELOPE)
             }
-            if (!accepted) completeSafely(callback, token, OVERLOADED_ENVELOPE)
         }
 
         override fun cancel(token: String) {
@@ -65,8 +63,6 @@ class CommunityJsBrokerService : Service() {
     }
 
     private companion object {
-        const val MAX_SOURCE_BYTES = 1_000_000
-        const val MAX_SETTINGS_BYTES = 64 * 1024
         const val FAILURE_ENVELOPE = "{\"ok\":false,\"error\":\"Provider execution failed\"}"
         const val OVERLOADED_ENVELOPE = "{\"ok\":false,\"error\":\"Provider service busy\"}"
     }

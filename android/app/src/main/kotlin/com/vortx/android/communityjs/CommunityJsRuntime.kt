@@ -89,7 +89,8 @@ class CommunityJsRuntime(
 
     private suspend fun executeInBroker(invocation: Invocation, host: NativeFetchImpl): String {
         val token = UUID.randomUUID().toString()
-        val settingsJson = JSONObject(invocation.settingsJson).toString()
+        val settingsJson = CommunityJsBinderPayloads.canonicalSettingsJson(invocation.settingsJson)
+            ?: return FAILURE_ENVELOPE
         if (!CommunityJsBinderPayloads.isExecuteRequestSafe(
                 token, invocation.provider.code, invocation.tmdbId, invocation.mediaType, settingsJson,
             )

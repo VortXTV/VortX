@@ -1,5 +1,7 @@
 package com.vortx.android.communityjs
 
+import org.json.JSONObject
+
 /**
  * Conservative UTF-16 string limits for every AIDL hop. Binder's transaction limit is shared
  * with parcel metadata, so these are intentionally substantially below one MiB.
@@ -34,6 +36,14 @@ internal object CommunityJsBinderPayloads {
 
     fun boundedFetchResponse(response: String): String =
         if (response.length <= MAX_FETCH_RESPONSE_CHARS) response else COMMUNITY_JS_EMPTY_FETCH_RESPONSE
+
+    /** Bounds the raw document before JSON parsing, then verifies its canonical form too. */
+    fun canonicalSettingsJson(rawSettingsJson: String): String? {
+        if (rawSettingsJson.length > MAX_EXECUTE_SETTINGS_CHARS) return null
+        return runCatching { JSONObject(rawSettingsJson).toString() }
+            .getOrNull()
+            ?.takeIf { it.length <= MAX_EXECUTE_SETTINGS_CHARS }
+    }
 }
 
 /** Calls the remote callback only after its outbound Binder payload has passed the local budget. */
@@ -69,5 +79,33 @@ internal fun communityJsExecuteOverBinder(
     return true
 }
 
+/** Receiver-side execute admission. A rejected transaction must not trigger any callback IPC. */
+internal fun communityJsBrokerExecuteAdmits(
+    token: String,
+    code: String,
+    tmdbId: String,
+    mediaType: String,
+    settingsJson: String,
+): Boolean =
+    CommunityJsBinderPayloads.isExecuteRequestSafe(token, code, tmdbId, mediaType, settingsJson) &&
+        code.toByteArray().size <= COMMUNITY_JS_MAX_SOURCE_BYTES &&
+        settingsJson.toByteArray().size <= COMMUNITY_JS_MAX_SETTINGS_BYTES
+
+/** Runs the broker's callback-producing path only for an admitted request. */
+internal fun communityJsDispatchInboundBrokerExecute(
+    token: String,
+    code: String,
+    tmdbId: String,
+    mediaType: String,
+    settingsJson: String,
+    onAdmitted: () -> Unit,
+): Boolean {
+    if (!communityJsBrokerExecuteAdmits(token, code, tmdbId, mediaType, settingsJson)) return false
+    onAdmitted()
+    return true
+}
+
 internal const val COMMUNITY_JS_EMPTY_FETCH_RESPONSE =
     "{\"status\":0,\"statusText\":\"Unavailable\",\"body\":\"\",\"headers\":{}}"
+internal const val COMMUNITY_JS_MAX_SOURCE_BYTES = 1_000_000
+internal const val COMMUNITY_JS_MAX_SETTINGS_BYTES = 64 * 1024
