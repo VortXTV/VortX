@@ -124,6 +124,7 @@ final class CoreBridge: ObservableObject {
     private var pendingAccountBinding: PendingAccountBinding?
     private var settledAccountBinding: PlaybackMutationOwnershipPolicy.SettledAccountBinding?
     private var authBindingGeneration: UInt64 = 0
+    private var accountBindingVerificationTask: Task<Void, Never>?
 
     // MARK: Player-active gating (playback lag fix)
     //
@@ -686,10 +687,8 @@ final class CoreBridge: ObservableObject {
         let importedAway = importedAwayFromStremio
 
         if isLoggedIn() {
-            // Persisted engine ctx is only a candidate. Independently bind its active Keychain
-            // credential to a user before allowing any owner-targeted replay.
-            if hasStremioToken, let stremioToken { beginAccountBinding(for: stremioToken) }
             if importedAway {
+                cancelAccountBindingVerification()
                 // Wave 4 (Finding 2): this account is migrated to VortX and NOT opted into two-way sync, yet the
                 // engine still holds a live Stremio session from its own persisted storage. stremio-core
                 // auto-persists library / progress mutations to api.strem.io whenever a session is loaded (the
@@ -722,6 +721,13 @@ final class CoreBridge: ObservableObject {
                     }
                     self.loadBoard()
                 }
+                loadBoard()
+                return
+            }
+            // Persisted engine ctx is only a candidate. Independently bind its active Keychain
+            // credential to a user before allowing any owner-targeted replay.
+            if hasStremioToken, let stremioToken {
+                beginAccountBinding(for: stremioToken)
                 loadBoard()
                 return
             }
@@ -876,8 +882,11 @@ final class CoreBridge: ObservableObject {
             guard let self, self.switchInFlight else { return }
             self.switchInFlight = false
             self.switchFromUID = nil
-            NSLog("[CoreBridge] account switch backstop → reloading")
-            self.refreshFromAPI()
+            // Never refresh the pre-switch account merely because time elapsed. A verified
+            // binding will perform its own refresh; an unresolved switch remains fail-closed.
+            if self.pendingAccountBinding == nil, self.settledAccountBinding != nil {
+                self.refreshFromAPI()
+            }
             self.seedInitialState()
             self.loadBoard()
         }
@@ -886,6 +895,7 @@ final class CoreBridge: ObservableObject {
     /// Log out of the engine (clears the persisted profile + library, and kills the session
     /// server-side) and the published UI state. For explicit sign-out, never for profile switching.
     func logOut() {
+        cancelAccountBindingVerification()
         pendingAccountBinding = nil
         settledAccountBinding = nil
         dispatchCtx(["action": "Logout"])
@@ -2338,6 +2348,38 @@ final class CoreBridge: ObservableObject {
         return true
     }
 
+    /// VortX-owned cold recovery is deliberately separate from authenticated Stremio account
+    /// mutation. It can operate only while the engine is positively signed out, so it can never
+    /// redirect a document recovery into a resident Stremio session.
+    @MainActor
+    @discardableResult
+    func addCatalogItemLocalOnly(id: String, type: String,
+                                 credentialCapture: CredentialScopeRegistry.Capture) async -> Bool {
+        guard localOnlyRecoveryAllowed(credentialCapture) else { return false }
+        guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
+              let safeType = LibraryWatchedMutationPolicy.normalizedCatalogType(type),
+              let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(id).json"),
+              let (data, _) = try? await URLSession.shared.data(from: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let meta = obj["meta"] as? [String: Any],
+              LibraryWatchedMutationPolicy.canDispatchCatalogAdd(metaID: id, expectedType: safeType,
+                                                                  previewID: meta["id"] as? String,
+                                                                  previewType: meta["type"] as? String),
+              localOnlyRecoveryAllowed(credentialCapture) else { return false }
+        dispatchCtx(["action": "AddToLibrary", "args": meta])
+        return true
+    }
+
+    private func localOnlyRecoveryAllowed(_ credentialCapture: CredentialScopeRegistry.Capture) -> Bool {
+        let profile = ProfileStore.shared.active
+        return PlaybackMutationOwnershipPolicy.allowsLocalOnlyRecovery(
+            engineSignedIn: isLoggedIn(), engineUID: currentUID(), switchInFlight: switchInFlight,
+            hasPendingBinding: pendingAccountBinding != nil, authMigration: awaitingAuthMigration,
+            activeProfileIsOwner: profile?.isOwner == true,
+            activeUsesEngineHistory: profile?.usesEngineHistory == true,
+            credentialCurrent: CredentialScopeRegistry.shared.isCurrent(credentialCapture))
+    }
+
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
     func setCatalogWatched(metaId: String, _ isWatched: Bool) {
@@ -2620,7 +2662,8 @@ final class CoreBridge: ObservableObject {
     /// selected profile plus an engine uid is not enough because the engine can retain the uid
     /// from the profile that was active immediately before a switch.
     func settledActiveAccountBinding() -> PlaybackMutationOwnershipPolicy.SettledAccountBinding? {
-        guard pendingAccountBinding == nil,
+        guard !importedAwayFromStremio,
+              pendingAccountBinding == nil,
               !switchInFlight,
               !awaitingAuthMigration,
               let binding = settledAccountBinding,
@@ -2641,6 +2684,7 @@ final class CoreBridge: ObservableObject {
     /// Clear the old binding before dispatching authentication. A missing active engine profile
     /// fails closed rather than borrowing whichever account happened to be resident.
     private func beginAccountBinding(for token: String) {
+        cancelAccountBindingVerification()
         settledAccountBinding = nil
         authBindingGeneration &+= 1
         guard let profile = ProfileStore.shared.active, profile.usesEngineHistory, !token.isEmpty else {
@@ -2655,22 +2699,73 @@ final class CoreBridge: ObservableObject {
             verifiedUID: nil
         )
         pendingAccountBinding = pending
-        Task { [weak self] in
-            guard let identity = try? await LinkAuthService.authenticatedIdentity(authKey: token) else { return }
-            DispatchQueue.main.async {
+        accountBindingVerificationTask = Task { [weak self] in
+            await self?.verifyAccountBinding(pending: pending, token: token, attempt: 0)
+        }
+    }
+
+    private func cancelAccountBindingVerification() {
+        accountBindingVerificationTask?.cancel()
+        accountBindingVerificationTask = nil
+    }
+
+    /// ProfileStore calls this in the same turn as selection. It invalidates any completion for
+    /// the prior profile before a new account switch or a same-account revalidation can begin.
+    func activeProfileDidChange() {
+        cancelAccountBindingVerification()
+        pendingAccountBinding = nil
+        settledAccountBinding = nil
+        guard !importedAwayFromStremio,
+              let token = Keychain.string(activeTokenAccount), !token.isEmpty else { return }
+        beginAccountBinding(for: token)
+    }
+
+    private func verifyAccountBinding(pending: PendingAccountBinding, token: String, attempt: Int) async {
+        do {
+            let identity = try await LinkAuthService.authenticatedIdentity(authKey: token)
+            guard !Task.isCancelled else { return }
+            DispatchQueue.main.async { [weak self] in
                 guard let self, var current = self.pendingAccountBinding,
                       current.generation == pending.generation,
                       current.profileID == pending.profileID,
                       current.keychainAccount == pending.keychainAccount,
                       current.credentialFingerprint == pending.credentialFingerprint,
+                      !self.importedAwayFromStremio,
                       let latestToken = Keychain.string(current.keychainAccount), !latestToken.isEmpty,
                       Self.credentialFingerprint(latestToken) == current.credentialFingerprint else { return }
                 current.verifiedUID = identity.uid
                 self.pendingAccountBinding = current
-                guard self.settleAccountBindingIfProven() else { return }
-                self.finishSettledAccountBinding()
+                if self.settleAccountBindingIfProven() {
+                    self.finishSettledAccountBinding()
+                } else if self.currentUID() != identity.uid {
+                    // Authenticated B over restored engine A: the proof owns this exact generation,
+                    // so replace A once without refreshing its library/add-ons first.
+                    self.startVerifiedAccountSwitch(pending: pending, token: latestToken)
+                }
             }
+        } catch LinkAuthService.IdentityVerificationError.rejected {
+            NSLog("[CoreBridge] account identity verification rejected")
+        } catch is CancellationError {
+            return
+        } catch {
+            guard attempt < 2, !Task.isCancelled else {
+                NSLog("[CoreBridge] account identity verification unavailable")
+                return
+            }
+            try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 500_000_000)
+            guard !Task.isCancelled else { return }
+            await verifyAccountBinding(pending: pending, token: token, attempt: attempt + 1)
         }
+    }
+
+    private func startVerifiedAccountSwitch(pending: PendingAccountBinding, token: String) {
+        guard !switchInFlight,
+              self.pendingAccountBinding?.generation == pending.generation,
+              !importedAwayFromStremio else { return }
+        switchInFlight = true
+        switchFromUID = currentUID()
+        clearUserState()
+        dispatchCtx(["action": "Authenticate", "args": ["type": "LoginWithToken", "token": token]])
     }
 
     /// Require two independent facts: `getUser` authenticated with the captured token and the
@@ -2681,6 +2776,7 @@ final class CoreBridge: ObservableObject {
     private func settleAccountBindingIfProven() -> Bool {
         guard let pending = pendingAccountBinding,
               let verifiedUID = pending.verifiedUID,
+              !importedAwayFromStremio,
               isLoggedIn(),
               let profile = ProfileStore.shared.active,
               let token = Keychain.string(pending.keychainAccount), !token.isEmpty else { return false }
@@ -2705,6 +2801,8 @@ final class CoreBridge: ObservableObject {
             NSLog("[CoreBridge] account switch identity verified -> reloading")
             refreshFromAPI()
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
+        } else if !awaitingAuthMigration {
+            refreshFromAPI()
         }
         guard !awaitingAuthMigration else { return }
         ProfileStore.shared.replayPendingAccountLibraryAdds(core: self)

@@ -420,6 +420,7 @@ final class ProfileStore: ObservableObject {
         flushScheduledWatchCacheSave()
         let beforeAccount = active.map(keychainAccount(for:))
         activeID = profile.id
+        CoreBridge.shared.activeProfileDidChange()
         pickedThisLaunch = true
         persist(touch: false)   // selection is per-device, not a roster edit
         applyTheme(profile)

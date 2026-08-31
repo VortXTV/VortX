@@ -2756,7 +2756,7 @@ final class VortXSyncManager: ObservableObject {
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
                   id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
             let type = (item["type"] as? String) == "series" ? "series" : "movie"
-            if await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type, stampIntent: false) {
+            if await CoreBridge.shared.addCatalogItemLocalOnly(id: id, type: type, credentialCapture: capture) {
                 recovered += 1
             }
             guard isCurrent(capture) else { return }

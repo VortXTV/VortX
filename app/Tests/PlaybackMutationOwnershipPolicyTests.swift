@@ -79,6 +79,22 @@ private struct PlaybackMutationOwnershipPolicyTests {
               "default resolver caller fails closed without a settled credential binding")
         check(Policy.allowsResolverDispatch(target: ownerTarget, binding: settledOwner),
               "resolver dispatch requires the captured target and settled credential binding")
+        check(Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false,
+                                             hasPendingBinding: false, authMigration: false,
+                                             activeProfileIsOwner: true, activeUsesEngineHistory: true,
+                                             credentialCurrent: true),
+              "Stremio-less owner recovery accepts a current VortX credential capture")
+        for blockedLocal in [
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: true, engineUID: nil, switchInFlight: false, hasPendingBinding: false, authMigration: false, activeProfileIsOwner: true, activeUsesEngineHistory: true, credentialCurrent: true),
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: "uid", switchInFlight: false, hasPendingBinding: false, authMigration: false, activeProfileIsOwner: true, activeUsesEngineHistory: true, credentialCurrent: true),
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: true, hasPendingBinding: false, authMigration: false, activeProfileIsOwner: true, activeUsesEngineHistory: true, credentialCurrent: true),
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false, hasPendingBinding: true, authMigration: false, activeProfileIsOwner: true, activeUsesEngineHistory: true, credentialCurrent: true),
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false, hasPendingBinding: false, authMigration: true, activeProfileIsOwner: true, activeUsesEngineHistory: true, credentialCurrent: true),
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false, hasPendingBinding: false, authMigration: false, activeProfileIsOwner: false, activeUsesEngineHistory: true, credentialCurrent: true),
+            Policy.allowsLocalOnlyRecovery(engineSignedIn: false, engineUID: nil, switchInFlight: false, hasPendingBinding: false, authMigration: false, activeProfileIsOwner: true, activeUsesEngineHistory: true, credentialCurrent: false),
+        ] {
+            check(!blockedLocal, "local recovery fails closed when session, auth, profile, or capture changes")
+        }
         check(Policy.allowsQueuedAccountReplay(profileID: owner, account: account, credentialFingerprint: "fp",
                                                 binding: settledOwner),
               "queued owner add replays only in its original account context")

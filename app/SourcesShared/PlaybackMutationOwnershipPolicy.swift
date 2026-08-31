@@ -64,6 +64,14 @@ enum PlaybackMutationOwnershipPolicy {
         return profileID == binding.profileID && account == binding.keychainAccount && uid == binding.uid
     }
 
+    static func allowsLocalOnlyRecovery(engineSignedIn: Bool, engineUID: String?, switchInFlight: Bool,
+                                        hasPendingBinding: Bool, authMigration: Bool,
+                                        activeProfileIsOwner: Bool, activeUsesEngineHistory: Bool,
+                                        credentialCurrent: Bool) -> Bool {
+        !engineSignedIn && engineUID == nil && !switchInFlight && !hasPendingBinding
+            && !authMigration && activeProfileIsOwner && activeUsesEngineHistory && credentialCurrent
+    }
+
     static func allows(_ target: Target, in context: Context) -> Bool {
         switch target {
         case .overlay(let profileID):

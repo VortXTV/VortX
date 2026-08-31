@@ -3,6 +3,7 @@ import Foundation
 /// Direct client for Stremio's device-link sign-in flow.
 /// The link API only returns an auth key; the caller still finalizes the session through StremioAccount.
 enum LinkAuthService {
+    enum IdentityVerificationError: Error { case rejected, transient }
     struct LinkCode: Equatable {
         let code: String
         let link: String
@@ -84,17 +85,23 @@ enum LinkAuthService {
         request.httpBody = try JSONEncoder().encode(Req(authKey: authKey))
         request.timeoutInterval = 15
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do { (data, response) = try await URLSession.shared.data(for: request) }
+        catch { throw IdentityVerificationError.transient }
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw LinkAuthError.server("Account service returned HTTP \(http.statusCode).")
+            throw IdentityVerificationError.transient
         }
-        let decoded = try JSONDecoder().decode(APIResponse<UserDTO>.self, from: data)
+        guard let decoded = try? JSONDecoder().decode(APIResponse<UserDTO>.self, from: data) else {
+            throw IdentityVerificationError.transient
+        }
         if let error = decoded.error {
-            throw LinkAuthError.server(error.message ?? "This sign-in code is no longer valid.")
+            _ = error
+            throw IdentityVerificationError.rejected
         }
         guard let result = decoded.result,
               let uid = result.uid, !uid.isEmpty else {
-            throw LinkAuthError.server("Account service did not return an authenticated user.")
+            throw IdentityVerificationError.transient
         }
         return AuthenticatedIdentity(uid: uid, email: result.email)
     }
