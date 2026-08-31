@@ -71,6 +71,8 @@ import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -224,6 +226,21 @@ internal fun engineHistoryPrincipalMatches(profile: UserProfile?, state: AuthSta
         ?.takeIf { it.isNotEmpty() }
         ?: return false
     return expected == actual
+}
+
+/** A native detail mutation is safe only when its resident model is the title the UI requested. */
+internal fun matchesDetailMutationTarget(detail: MetaDetail?, type: MediaType, id: String): Boolean =
+    detail?.type == type && detail.id == id
+
+/**
+ * The native engine exposes exactly one mutable MetaDetails model. Every Load, Re-find, stream-detail
+ * request and id-less detail mutation must use this cancellable gate so a different title cannot replace
+ * the resident model between mutation validation and dispatch.
+ */
+internal class MetaDetailsTransactionGate {
+    private val mutex = Mutex()
+
+    suspend fun <T> exclusive(block: suspend () -> T): T = mutex.withLock { block() }
 }
 
 /// Synthetic, clearly-local request base for locally-bound playback sessions. The engine's
@@ -728,6 +745,7 @@ class EngineStremioRepository(
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val streamLoadLock = Any()
     private val streamLoadGate = StreamLoadDispatchGate()
+    private val metaDetailsGate = MetaDetailsTransactionGate()
     private var streamLoadJob: Job? = null
 
     private val _authState = MutableStateFlow<AuthState>(AuthState.SignedOut)
@@ -2057,24 +2075,27 @@ class EngineStremioRepository(
         }
     }
 
-    override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
+    override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+        metaDetailsGate.exclusive {
         val permit = historyOwnerFence.captureRead()
             ?: throw IllegalStateException("History owner is changing. Try again.")
         // Ready = the meta actually parsed (first Ready Loadable in metaItems). The immediate
         // post-Load state is Loading, so a single-event await would leak a not-ready miss to the UI
         // (the "meta_details not ready" string the S03 device round saw rendered raw).
         val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id)) {
-            EngineState.parseMetaDetail(it) != null
+            matchesDetailMutationTarget(EngineState.parseMetaDetail(it, addonPrefs.appliedOrder()), type, id)
         }
         // The applied add-on order rides the meta pick (#144 on Apple): the detail meta resolves from
         // the user's #1 add-on (e.g. a localized meta provider), not whichever the engine lists first.
         // An empty order (never reordered) keeps the old first-Ready pick byte-identically.
         val detail = EngineState.parseMetaDetail(state, addonPrefs.appliedOrder())
+            ?.takeIf { matchesDetailMutationTarget(it, type, id) }
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
         // Per-profile gate: replace the account-derived saved/resume/ticks with the overlay's for an
         // overlay profile (no-op for engine-backed profiles).
         withOverlayState(detail, permit)
             ?: throw IllegalStateException("History owner changed while loading this title.")
+        }
     } }
 
     override suspend fun streams(
@@ -2086,6 +2107,7 @@ class EngineStremioRepository(
         forceRefresh: Boolean,
     ): Result<List<StreamGroup>> = runLatestStreamLoad { generation ->
         withContext(Dispatchers.Default) { runCatchingStreamLoad {
+        metaDetailsGate.exclusive {
         // Re-find sources: the engine caches this title's stream groups, so the plain Load below is a
         // no-op with ZERO add-on HTTP once they are resident. Unload the MetaDetails model FIRST so the
         // Load re-queries every stream add-on fresh and expired/dead sources are replaced. Default off:
@@ -2143,6 +2165,7 @@ class EngineStremioRepository(
         // list returned below; with the flag at its default OFF this line is one volatile read.
         if (shadowRankingConfigured && VortxRankingShadow.enabled) VortxRankingShadow.compareAsync(groups, snapshot)
         StreamRanking.rankedGroups(groups, prefs = snapshot, pin = pin)
+        }
         } }
     }
 
@@ -2552,17 +2575,47 @@ class EngineStremioRepository(
     private fun currentMetaDetail(): MetaDetail? =
         EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()), addonPrefs.appliedOrder())
 
-    override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
-        historyOwnerFence.mutate { owner ->
-            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+    /**
+     * Native detail actions such as MarkAsWatched act on the ONE resident MetaDetails model. A detail
+     * screen can outlive a source refresh or another detail load, so its displayed title is not proof
+     * that the resident model is still its title. Dispatching without this check quietly changes the
+     * other title and leaves the pressed button looking broken.
+     */
+    /** Load the requested detail only when the native resident model is not already its exact target. */
+    private suspend fun ensureResidentMutationTarget(type: MediaType, id: String): MetaDetail {
+        currentMetaDetail()?.takeIf { matchesDetailMutationTarget(it, type, id) }?.let { return it }
+        val state = loadFieldUntil(
+            EngineActions.FIELD_META_DETAILS,
+            EngineActions.loadMeta(type.id, id),
+        ) { candidate ->
+            matchesDetailMutationTarget(EngineState.parseMetaDetail(candidate, addonPrefs.appliedOrder()), type, id)
+        }
+        return EngineState.parseMetaDetail(state, addonPrefs.appliedOrder())
+            ?.takeIf { matchesDetailMutationTarget(it, type, id) }
+            ?: throw IllegalStateException("Couldn't load this title before saving its change.")
+    }
+
+    /** Fail closed if another native detail load replaced the resident target between the two actions. */
+    private fun requireResidentMutationTarget(type: MediaType, id: String): MetaDetail =
+        currentMetaDetail()?.takeIf { matchesDetailMutationTarget(it, type, id) }
+            ?: throw IllegalStateException("This title changed while saving. Try again.")
+
+    override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+        metaDetailsGate.exclusive {
+        val permit = historyOwnerFence.captureRead()
+            ?: throw IllegalStateException("History owner is changing. Try again.")
+        ensureResidentMutationTarget(type, id)
+        historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+            val detail = requireResidentMutationTarget(type, id)
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.setWatched(isWatched, id, listOf(id), detail.name, type.id, detail.poster)
                 }
                 HistoryRoute.Engine -> StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
             }
-            currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+            requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                 ?: throw IllegalStateException("Couldn't update watched state.")
+        }
         }
     } }
 
@@ -2573,9 +2626,13 @@ class EngineStremioRepository(
         season: Int?,
         episode: Int?,
         isWatched: Boolean,
-    ): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
-        historyOwnerFence.mutate { owner ->
-            val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+    ): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+        metaDetailsGate.exclusive {
+        val permit = historyOwnerFence.captureRead()
+            ?: throw IllegalStateException("History owner is changing. Try again.")
+        ensureResidentMutationTarget(type, id)
+        historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+            val detail = requireResidentMutationTarget(type, id)
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.setWatched(
@@ -2591,15 +2648,20 @@ class EngineStremioRepository(
                     EngineActions.markVideoAsWatched(videoId, season, episode, isWatched),
                 )
             }
-            currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+            requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                 ?: throw IllegalStateException("Couldn't update watched state.")
+        }
         }
     } }
 
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
-        withContext(Dispatchers.Default) { runCatching {
-            historyOwnerFence.mutate { owner ->
-                val detail = currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+        withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+            metaDetailsGate.exclusive {
+            val permit = historyOwnerFence.captureRead()
+                ?: throw IllegalStateException("History owner is changing. Try again.")
+            ensureResidentMutationTarget(type, id)
+            historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+                val detail = requireResidentMutationTarget(type, id)
                 when (val route = historyRouteLocked(owner)) {
                     is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                         val ids = detail.videos.filter { it.season == season }.map { it.id }
@@ -2609,14 +2671,19 @@ class EngineStremioRepository(
                         EngineActions.markSeasonAsWatched(season, isWatched),
                     )
                 }
-                currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                     ?: throw IllegalStateException("Couldn't update watched state.")
+            }
             }
         } }
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
-        withContext(Dispatchers.Default) { runCatching {
-            historyOwnerFence.mutate { owner ->
+        withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+            metaDetailsGate.exclusive {
+            val permit = historyOwnerFence.captureRead()
+                ?: throw IllegalStateException("History owner is changing. Try again.")
+            ensureResidentMutationTarget(type, id)
+            historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
                 when (val route = historyRouteLocked(owner)) {
                     is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                         overlay.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
@@ -2630,13 +2697,18 @@ class EngineStremioRepository(
                         AccountLibrarySync.onLibraryAdded(appContext, type, id)
                     }
                 }
-                currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+                requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                     ?: throw IllegalStateException("Couldn't add this title to your library.")
+            }
             }
         } }
 
-    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatching {
-        historyOwnerFence.mutate { owner ->
+    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+        metaDetailsGate.exclusive {
+        val permit = historyOwnerFence.captureRead()
+            ?: throw IllegalStateException("History owner is changing. Try again.")
+        ensureResidentMutationTarget(type, id)
+        historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.removeWatchEntry(id)
@@ -2648,8 +2720,9 @@ class EngineStremioRepository(
                     AccountLibrarySync.onLibraryRemoved(appContext, id, type)
                 }
             }
-            currentMetaDetail()?.let { withOverlayState(it, HistoryReadPermit(owner)) }
+            requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                 ?: throw IllegalStateException("Couldn't remove this title from your library.")
+        }
         }
     } }
 
