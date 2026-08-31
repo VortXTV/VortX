@@ -472,8 +472,10 @@ require_grep "Android checksum lists downloadable basenames" \
     "sed 's#  dist/#  #' > dist/SHA256SUMS-android.txt" "$RELEASE_WF"
 require_grep "Apple coordinator requires the complete Android set before publish" \
     'Android checksum asset is missing' "$APPLE_RELEASE_WF"
-require_grep "Stable publish explicitly verifies latest release state" \
-    'make_latest=true' "$APPLE_RELEASE_WF"
+require_grep "Stable publish sends GitHub's string-valued latest mode" \
+    'gh api --method PATCH -f draft=false -f make_latest=true' "$APPLE_RELEASE_WF"
+require_absent "Stable publish must not encode make_latest as a JSON boolean" \
+    '[-]F make_latest=true' "$APPLE_RELEASE_WF"
 require_absent "numeric release objects must not use the non-existent is_latest field" '\.is_latest' "$APPLE_RELEASE_WF"
 latest_identity_checks="$(grep -Fc 'repos/$GH_REPO/releases/latest' "$APPLE_RELEASE_WF")"
 [[ "$latest_identity_checks" -eq 3 ]] || fail "stable publication, readiness, and verifier must each query /releases/latest"

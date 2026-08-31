@@ -1385,7 +1385,7 @@ jobs:
           PUBLISHED=0
           while [ "$(date +%s)" -lt "$PUBLISH_DEADLINE" ]; do
             if [ "$IS_PRERELEASE" = false ]; then
-              gh api --method PATCH -f draft=false -F make_latest=true -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
+              gh api --method PATCH -f draft=false -f make_latest=true -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
             else
               gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
             fi
