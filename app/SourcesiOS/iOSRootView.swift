@@ -420,7 +420,7 @@ struct iOSRootView: View {
     /// waits out the profile picker, and only fires while the device still needs seeding.
     private func armSeedingNag() async {
         await MoveSeeding.armLaunchNag {
-            guard presenter.request == nil, updates.prompt == nil else { return false }
+            guard !playbackGate.playerActive, updates.prompt == nil else { return false }
             showSeedingNag = true
             return true
         }
