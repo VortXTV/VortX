@@ -335,6 +335,21 @@ class CommunityJsProviderContractTest {
     }
 
     @Test
+    fun `settings enforce exact UTF-8 byte ceiling before and after canonicalization`() {
+        val prefix = "{\"x\":\""
+        val suffix = "\"}"
+        val exact = prefix + "a".repeat(COMMUNITY_JS_MAX_SETTINGS_BYTES - prefix.toByteArray().size - suffix.toByteArray().size) + suffix
+        assertEquals(COMMUNITY_JS_MAX_SETTINGS_BYTES, exact.toByteArray().size)
+        assertNotNull(CommunityJsBinderPayloads.canonicalSettingsJson(exact))
+
+        // The UTF-16 character count is under 64 Ki, but the UTF-8 byte count exceeds it.
+        val multibyteOver = prefix + "😀".repeat(COMMUNITY_JS_MAX_SETTINGS_BYTES / 4) + suffix
+        assertTrue(multibyteOver.length <= CommunityJsBinderPayloads.MAX_EXECUTE_SETTINGS_CHARS)
+        assertTrue(multibyteOver.toByteArray().size > COMMUNITY_JS_MAX_SETTINGS_BYTES)
+        assertNull(CommunityJsBinderPayloads.canonicalSettingsJson(multibyteOver))
+    }
+
+    @Test
     fun `oversized fetch payload is rejected without calling the Binder callback`() {
         var callbackCalls = 0
         val result = communityJsFetchOverBinder(

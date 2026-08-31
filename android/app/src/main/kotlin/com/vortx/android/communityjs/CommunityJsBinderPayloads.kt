@@ -39,10 +39,15 @@ internal object CommunityJsBinderPayloads {
 
     /** Bounds the raw document before JSON parsing, then verifies its canonical form too. */
     fun canonicalSettingsJson(rawSettingsJson: String): String? {
-        if (rawSettingsJson.length > MAX_EXECUTE_SETTINGS_CHARS) return null
+        if (rawSettingsJson.length > MAX_EXECUTE_SETTINGS_CHARS ||
+            rawSettingsJson.toByteArray().size > COMMUNITY_JS_MAX_SETTINGS_BYTES
+        ) return null
         return runCatching { JSONObject(rawSettingsJson).toString() }
             .getOrNull()
-            ?.takeIf { it.length <= MAX_EXECUTE_SETTINGS_CHARS }
+            ?.takeIf {
+                it.length <= MAX_EXECUTE_SETTINGS_CHARS &&
+                    it.toByteArray().size <= COMMUNITY_JS_MAX_SETTINGS_BYTES
+            }
     }
 }
 
