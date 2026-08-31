@@ -3,13 +3,21 @@ package com.vortx.android.player.mpv
 import com.vortx.android.model.ExternalSubtitle
 import com.vortx.android.model.Playable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import okhttp3.Request
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.io.InputStream
 import java.net.URI
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 class MpvExternalSubtitleTransportTest {
     @Test
@@ -120,5 +128,76 @@ class MpvExternalSubtitleTransportTest {
 
             assertTrue(result.isFailure)
         }
+    }
+
+    @Test
+    fun `cancelling a blocked content stream closes it and removes its partial file`() = runBlocking(Dispatchers.Default) {
+        val readStarted = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val target = File.createTempFile("vortx-content-test-", ".srt")
+        val blockingInput = object : InputStream() {
+            override fun read(): Int {
+                readStarted.countDown()
+                closed.await()
+                return -1
+            }
+
+            override fun close() {
+                closed.countDown()
+            }
+        }
+        val job = launch(Dispatchers.Default) {
+            copyBoundedContentSubtitle(
+                openInput = { blockingInput },
+                target = target,
+                maxBytes = 8L * 1024L * 1024L,
+                timeoutMs = 20_000L,
+            )
+        }
+
+        try {
+            assertTrue("content read did not begin", readStarted.await(2, TimeUnit.SECONDS))
+        } finally {
+            job.cancelAndJoin()
+        }
+        assertTrue("cancellation did not close the live content stream", closed.await(2, TimeUnit.SECONDS))
+        assertFalse("partial content subtitle remained", target.exists())
+    }
+
+    @Test
+    fun `content subtitle deadline is cumulative elapsed time and closes its live stream`() = runBlocking(Dispatchers.Default) {
+        val readStarted = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val target = File.createTempFile("vortx-content-deadline-", ".srt")
+        val blockingInput = object : InputStream() {
+            override fun read(): Int = -1
+
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                readStarted.countDown()
+                closed.await()
+                return -1
+            }
+
+            override fun close() {
+                closed.countDown()
+            }
+        }
+        val startedAt = System.nanoTime()
+        val result = runCatching {
+            copyBoundedContentSubtitle(
+                openInput = { blockingInput },
+                target = target,
+                maxBytes = 8L * 1024L * 1024L,
+                timeoutMs = 100L,
+            )
+        }
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+        assertTrue("content read did not begin", readStarted.await(2, TimeUnit.SECONDS))
+        assertTrue("deadline did not close the live content stream", closed.await(2, TimeUnit.SECONDS))
+        assertTrue("expected deadline failure, got ${result.exceptionOrNull()}", result.exceptionOrNull() is java.util.concurrent.TimeoutException)
+        assertTrue("deadline fired too early after ${elapsedMs}ms", elapsedMs >= 75L)
+        assertTrue("deadline did not bound elapsed copy time: ${elapsedMs}ms", elapsedMs < 2_000L)
+        assertFalse("timed-out content subtitle remained", target.exists())
     }
 }

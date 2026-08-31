@@ -53,15 +53,21 @@ import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
+import java.io.InputStream
 import java.net.Proxy
 import java.net.URI
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.Dns
@@ -644,21 +650,12 @@ class MpvPlayer private constructor(
         var temp: File? = null
         return try {
             temp = File.createTempFile("vortx-extsub-", ".$extension", appContext.cacheDir)
-            val complete = appContext.contentResolver.openInputStream(uri)?.use { input ->
-                temp!!.outputStream().use outputUse@{ output ->
-                    val buffer = ByteArray(16 * 1024)
-                    var total = 0L
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        total += read
-                        if (total > MAX_EXTERNAL_SUBTITLE_BYTES) return@outputUse false
-                        output.write(buffer, 0, read)
-                    }
-                    total > 0
-                }
-            } ?: false
+            val complete = copyBoundedContentSubtitle(
+                openInput = { appContext.contentResolver.openInputStream(uri) },
+                target = temp!!,
+                maxBytes = MAX_EXTERNAL_SUBTITLE_BYTES,
+                timeoutMs = EXTERNAL_SUBTITLE_TIMEOUT_MS.toLong(),
+            )
             if (!complete) return null
             if (temp!!.renameTo(target)) {
                 temp = null
@@ -1412,6 +1409,102 @@ private suspend fun OkHttpClient.awaitResponse(request: Request, timeoutMs: Long
             }
         })
     }
+
+/**
+ * ContentResolver streams are provider-owned and can block outside coroutine cancellation. Keep that work
+ * on one interruptible worker, then make cancellation and the cumulative deadline close the live stream.
+ * Aborting also unlinks the temporary target immediately, so a hostile provider that ignores both close and
+ * interrupt cannot leave a partial sidecar behind after the caller has timed out or moved on.
+ */
+internal suspend fun copyBoundedContentSubtitle(
+    openInput: () -> InputStream?,
+    target: File,
+    maxBytes: Long,
+    timeoutMs: Long,
+): Boolean = suspendCancellableCoroutine { continuation ->
+    val input = AtomicReference<InputStream?>()
+    val future = AtomicReference<Future<*>?>()
+    val completed = AtomicBoolean(false)
+    val aborted = AtomicBoolean(false)
+    val ioLock = Any()
+    lateinit var deadline: ScheduledFuture<*>
+
+    fun abort() {
+        aborted.set(true)
+        synchronized(ioLock) {
+            runCatching { input.getAndSet(null)?.close() }
+            target.delete()
+        }
+        future.get()?.cancel(true)
+    }
+
+    fun complete(result: Result<Boolean>): Boolean {
+        if (completed.compareAndSet(false, true)) {
+            deadline.cancel(false)
+            continuation.resumeWith(result)
+            return true
+        }
+        return false
+    }
+
+    continuation.invokeOnCancellation { abort() }
+    deadline = CONTENT_COPY_DEADLINES.schedule(
+        {
+            if (completed.compareAndSet(false, true)) {
+                abort()
+                continuation.resumeWith(Result.failure(TimeoutException("content subtitle transfer exceeded deadline")))
+            }
+        },
+        timeoutMs.coerceAtLeast(1L),
+        TimeUnit.MILLISECONDS,
+    )
+    val worker = CONTENT_COPY_WORKER.submit {
+        var success = false
+        try {
+            val opened = openInput() ?: return@submit complete(Result.success(false))
+            val output = synchronized(ioLock) {
+                if (aborted.get()) {
+                    runCatching { opened.close() }
+                    null
+                } else {
+                    input.set(opened)
+                    target.outputStream()
+                }
+            } ?: return@submit complete(Result.success(false))
+            opened.use { stream ->
+                output.use outputUse@{ output ->
+                    val buffer = ByteArray(16 * 1024)
+                    var total = 0L
+                    while (true) {
+                        if (Thread.currentThread().isInterrupted) return@outputUse false
+                        val read = stream.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        if (total > maxBytes) return@outputUse false
+                        output.write(buffer, 0, read)
+                    }
+                    total > 0
+                }
+            }.also { success = it }
+            complete(Result.success(success))
+        } catch (error: Throwable) {
+            complete(Result.failure(error))
+        } finally {
+            runCatching { input.getAndSet(null)?.close() }
+            if (!success) target.delete()
+        }
+    }
+    future.set(worker)
+    if (aborted.get()) worker.cancel(true)
+}
+
+private val CONTENT_COPY_WORKER = Executors.newSingleThreadExecutor { runnable ->
+    Thread(runnable, "vortx-content-subtitle-copy").apply { isDaemon = true }
+}
+
+private val CONTENT_COPY_DEADLINES = Executors.newSingleThreadScheduledExecutor { runnable ->
+    Thread(runnable, "vortx-content-subtitle-deadline").apply { isDaemon = true }
+}
 
 internal fun requireMpvSecurityOption(name: String, result: Int) {
     check(result >= 0) {
