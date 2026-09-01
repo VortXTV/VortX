@@ -76,6 +76,7 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         case producerEnded
         case producerFailed
         case itemFailed
+        case sustainedSurfaceStall
     }
 
     enum RetainReason: Equatable {
@@ -107,6 +108,7 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         let inputOpenInFlight: Bool
         let playlistProgressed: Bool
         let surfaceStalled: Bool
+        let surfaceStallElapsedSeconds: TimeInterval
         let publishedAheadSeconds: Double
         let terminalProof: TerminalProof
 
@@ -120,6 +122,7 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
             inputOpenInFlight: Bool,
             playlistProgressed: Bool,
             surfaceStalled: Bool,
+            surfaceStallElapsedSeconds: TimeInterval,
             publishedAheadSeconds: Double,
             terminalProof: TerminalProof
         ) {
@@ -132,53 +135,71 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
             self.inputOpenInFlight = inputOpenInFlight
             self.playlistProgressed = playlistProgressed
             self.surfaceStalled = surfaceStalled
+            self.surfaceStallElapsedSeconds = surfaceStallElapsedSeconds
             self.publishedAheadSeconds = publishedAheadSeconds
             self.terminalProof = terminalProof
         }
     }
 
     /// One replacement may be spent by an exact item generation. A new item starts with a fresh budget, while
-    /// ten consecutive positive clock receipts demonstrate that a previously replaced item really recovered
-    /// rather than merely framed once before freezing again.
+    /// one minute of monotonic, positive media-clock progress demonstrates that a previously replaced item
+    /// really recovered rather than merely framed once before freezing again. Observer cadence is deliberately
+    /// irrelevant: a 0.25 s callback must not turn ten samples into a fake minute of healthy playback.
     struct RecoveryBudget: Equatable {
-        static let sustainedProgressSamplesToReset = 10
+        static let sustainedProgressSecondsToReset: TimeInterval = 60
 
         private(set) var generation: UInt64?
         private(set) var replacementUsed = false
-        private(set) var sustainedProgressSamples = 0
+        private(set) var stableProgressSinceUptime: TimeInterval?
         private var lastMediaPosition: Double?
 
         mutating func reset(for generation: UInt64) {
             guard self.generation != generation else { return }
             self.generation = generation
             replacementUsed = false
-            sustainedProgressSamples = 0
+            stableProgressSinceUptime = nil
             lastMediaPosition = nil
         }
 
         mutating func recordReplacement(for generation: UInt64) {
             reset(for: generation)
             replacementUsed = true
-            sustainedProgressSamples = 0
+            stableProgressSinceUptime = nil
         }
 
-        mutating func recordMediaPosition(_ position: Double, generation: UInt64) {
+        /// Returns true only for a real positive media-clock receipt. The engine uses that edge to reset the
+        /// active hard-stall timer; stable replacement-budget renewal additionally requires a full minute.
+        @discardableResult
+        mutating func recordMediaPosition(
+            _ position: Double,
+            generation: UInt64,
+            now: TimeInterval
+        ) -> Bool {
             reset(for: generation)
-            guard position.isFinite else { return }
+            guard position.isFinite, now.isFinite else { return false }
             defer { lastMediaPosition = position }
-            guard let lastMediaPosition else { return }
+            guard let lastMediaPosition else { return false }
             guard position > lastMediaPosition else {
-                sustainedProgressSamples = 0
-                return
+                stableProgressSinceUptime = nil
+                return false
             }
-            sustainedProgressSamples += 1
+            if stableProgressSinceUptime == nil { stableProgressSinceUptime = now }
             if replacementUsed,
-               sustainedProgressSamples >= Self.sustainedProgressSamplesToReset {
+               let stableProgressSinceUptime,
+               now >= stableProgressSinceUptime,
+               now - stableProgressSinceUptime >= Self.sustainedProgressSecondsToReset {
                 replacementUsed = false
-                sustainedProgressSamples = 0
+                self.stableProgressSinceUptime = nil
             }
+            return true
         }
     }
+
+    /// After this much uninterrupted frozen-surface evidence with no producer/input/playlist activity, keeping
+    /// the item is no longer an ordinary rebuffer decision. The caller maps this terminal proof to its existing
+    /// source-hop/error path. The value is intentionally longer than the outer 30-second first recovery so a
+    /// slow healthy remux has multiple chances to publish progress before it is abandoned.
+    static let sustainedSurfaceStallEscalationSeconds: TimeInterval = 60
 
     static func action(
         evidence: Evidence,
@@ -189,12 +210,21 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         guard evidence.ownershipMatches else { return .retain(.staleOwnership) }
         guard evidence.playbackRequested else { return .retain(.userPaused) }
         guard evidence.terminalProof == .none else { return .terminal(evidence.terminalProof) }
-        guard evidence.isLocalRemux else { return .retain(.nonLocalRemux) }
-        guard evidence.hasPreviousProgressSample else { return .retain(.missingProgressEvidence) }
         guard !evidence.producerProgressed else { return .retain(.producerProgress) }
         guard !evidence.inputOpenInFlight else { return .retain(.inputInFlight) }
         guard !evidence.playlistProgressed else { return .retain(.playlistProgress) }
         guard evidence.surfaceStalled else { return .retain(.noSurfaceStall) }
+        let shouldEscalate = evidence.surfaceStallElapsedSeconds.isFinite
+            && evidence.surfaceStallElapsedSeconds >= sustainedSurfaceStallEscalationSeconds
+        if shouldEscalate,
+           (!evidence.isLocalRemux
+                || !PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
+                    bufferedAheadSeconds: evidence.publishedAheadSeconds)
+                || replacementAlreadyUsed) {
+            return .terminal(.sustainedSurfaceStall)
+        }
+        guard evidence.isLocalRemux else { return .retain(.nonLocalRemux) }
+        guard evidence.hasPreviousProgressSample else { return .retain(.missingProgressEvidence) }
         guard PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
             bufferedAheadSeconds: evidence.publishedAheadSeconds
         ) else { return .retain(.insufficientPublishedTail) }

@@ -30,7 +30,8 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
         insufficientPublishedTailRetainsCurrentItem()
         terminalEvidenceStaysTerminal()
         onlyOneReplacementIsAllowedUntilRecovery()
-        newGenerationAndSustainedProgressResetBudget()
+        boundedHardStallEscalates()
+        newGenerationAndTimeBasedStableProgressResetBudget()
         staleOwnershipIsFenced()
 
         print("===== FAILURES: \(failures) =====")
@@ -45,6 +46,7 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
         inputOpenInFlight: Bool = false,
         playlistProgressed: Bool = false,
         surfaceStalled: Bool = true,
+        surfaceStallElapsedSeconds: TimeInterval = 0,
         publishedAheadSeconds: Double = 15,
         terminalProof: AVPlayerMidPlaybackRecoveryPolicy.TerminalProof = .none
     ) -> AVPlayerMidPlaybackRecoveryPolicy.Evidence {
@@ -58,6 +60,7 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
             inputOpenInFlight: inputOpenInFlight,
             playlistProgressed: playlistProgressed,
             surfaceStalled: surfaceStalled,
+            surfaceStallElapsedSeconds: surfaceStallElapsedSeconds,
             publishedAheadSeconds: publishedAheadSeconds,
             terminalProof: terminalProof)
     }
@@ -129,7 +132,46 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
                 replacementAlreadyUsed: true) == .retain(.replacementAlreadyUsed))
     }
 
-    private static func newGenerationAndSustainedProgressResetBudget() {
+    private static func boundedHardStallEscalates() {
+        let deadline = AVPlayerMidPlaybackRecoveryPolicy.sustainedSurfaceStallEscalationSeconds
+        check(
+            "a non-local frozen AVPlayer path escalates after the bounded hard-stall window",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    surfaceStallElapsedSeconds: deadline,
+                    publishedAheadSeconds: 0
+                ).withLocalRemux(false),
+                replacementAlreadyUsed: false) == .terminal(.sustainedSurfaceStall))
+        check(
+            "one instant before the escalation edge still retains the non-local player",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    surfaceStallElapsedSeconds: deadline - 0.001,
+                    publishedAheadSeconds: 0
+                ).withLocalRemux(false),
+                replacementAlreadyUsed: false) == .retain(.nonLocalRemux))
+        check(
+            "an insufficient published tail escalates instead of retaining forever",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    surfaceStallElapsedSeconds: deadline,
+                    publishedAheadSeconds: 0),
+                replacementAlreadyUsed: false) == .terminal(.sustainedSurfaceStall))
+        check(
+            "a spent replacement budget escalates instead of restarting repeatedly",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(surfaceStallElapsedSeconds: deadline),
+                replacementAlreadyUsed: true) == .terminal(.sustainedSurfaceStall))
+        check(
+            "producer movement remains an ordinary rebuffer retain even at the escalation edge",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    producerProgressed: true,
+                    surfaceStallElapsedSeconds: deadline),
+                replacementAlreadyUsed: true) == .retain(.producerProgress))
+    }
+
+    private static func newGenerationAndTimeBasedStableProgressResetBudget() {
         var budget = AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget()
         budget.recordReplacement(for: generation)
         check("replacement records a spent generation budget", budget.replacementUsed)
@@ -137,10 +179,21 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
         check("a new generation owns a fresh recovery budget", !budget.replacementUsed)
 
         budget.recordReplacement(for: generation + 1)
-        for position in 0...AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget.sustainedProgressSamplesToReset {
-            budget.recordMediaPosition(Double(position), generation: generation + 1)
+        _ = budget.recordMediaPosition(0, generation: generation + 1, now: 0)
+        for position in 1...10 {
+            _ = budget.recordMediaPosition(Double(position), generation: generation + 1,
+                                           now: Double(position) * 0.25)
         }
-        check("sustained forward media progress reopens one recovery budget", !budget.replacementUsed)
+        check("ten fast observer callbacks do not manufacture one minute of stable progress", budget.replacementUsed)
+        _ = budget.recordMediaPosition(11, generation: generation + 1,
+                                       now: 0.25 + AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget.sustainedProgressSecondsToReset)
+        check("one monotonic minute of real media progress reopens one recovery budget", !budget.replacementUsed)
+
+        budget.recordReplacement(for: generation + 1)
+        _ = budget.recordMediaPosition(20, generation: generation + 1, now: 100)
+        _ = budget.recordMediaPosition(21, generation: generation + 1, now: 101)
+        _ = budget.recordMediaPosition(21, generation: generation + 1, now: 160)
+        check("a frozen clock breaks the stable-progress interval instead of renewing the budget", budget.replacementUsed)
     }
 
     private static func staleOwnershipIsFenced() {
@@ -149,5 +202,23 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
             AVPlayerMidPlaybackRecoveryPolicy.action(
                 evidence: evidence(ownershipMatches: false),
                 replacementAlreadyUsed: false) == .retain(.staleOwnership))
+    }
+}
+
+private extension AVPlayerMidPlaybackRecoveryPolicy.Evidence {
+    func withLocalRemux(_ isLocalRemux: Bool) -> Self {
+        .init(
+            generation: generation,
+            ownershipMatches: ownershipMatches,
+            playbackRequested: playbackRequested,
+            isLocalRemux: isLocalRemux,
+            hasPreviousProgressSample: hasPreviousProgressSample,
+            producerProgressed: producerProgressed,
+            inputOpenInFlight: inputOpenInFlight,
+            playlistProgressed: playlistProgressed,
+            surfaceStalled: surfaceStalled,
+            surfaceStallElapsedSeconds: surfaceStallElapsedSeconds,
+            publishedAheadSeconds: publishedAheadSeconds,
+            terminalProof: terminalProof)
     }
 }

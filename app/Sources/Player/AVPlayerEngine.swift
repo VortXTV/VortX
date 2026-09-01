@@ -449,6 +449,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var lastMidPlaybackRecoveryProgress: VortXMKVRemuxStream.MountProgress?
     private var midPlaybackRecoveryProgressGeneration: UInt64?
     private var midPlaybackRecoveryBudget = AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget()
+    /// A true surface freeze gets one monotonic window per exact item generation. Producer/input/playlist
+    /// progress or real media-clock movement clears it; otherwise the policy eventually returns terminal so the
+    /// tvOS watchdog can hop instead of retaining forever.
+    private var midPlaybackSurfaceStallGeneration: UInt64?
+    private var midPlaybackSurfaceStallSinceUptime: TimeInterval?
     /// Sustained window of advancing playback clock with ZERO video frames before demoting. Long enough to
     /// clear a slow first-frame on a healthy native DV start (normally sub-second once timePos ticks), short
     /// enough that black-with-Atmos flips to a working picture on libmpv in well under ten seconds.
@@ -668,6 +673,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let publishedAhead = playerSeconds.isFinite
             ? max(0, mountedPlayerWindowBounds.producedEdge - playerSeconds)
             : 0
+        let surfaceStallElapsed = elapsedSurfaceStall(
+            isSurfaceStalled: surfaceStalled,
+            generation: itemGeneration,
+            now: ProcessInfo.processInfo.systemUptime)
         let evidence = AVPlayerMidPlaybackRecoveryPolicy.Evidence(
             generation: itemGeneration,
             ownershipMatches: hasCurrentOwnership,
@@ -678,6 +687,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             inputOpenInFlight: progress?.inputOpenInFlight == true,
             playlistProgressed: playlistProgressed,
             surfaceStalled: surfaceStalled,
+            surfaceStallElapsedSeconds: surfaceStallElapsed,
             publishedAheadSeconds: publishedAhead,
             terminalProof: terminalProof
         )
@@ -696,6 +706,31 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private func recordMidPlaybackRecoveryProgressSnapshot() {
         lastMidPlaybackRecoveryProgress = remuxMountProgress
         midPlaybackRecoveryProgressGeneration = itemGeneration
+    }
+
+    private func elapsedSurfaceStall(
+        isSurfaceStalled: Bool,
+        generation: UInt64,
+        now: TimeInterval
+    ) -> TimeInterval {
+        guard isSurfaceStalled, now.isFinite else {
+            midPlaybackSurfaceStallGeneration = nil
+            midPlaybackSurfaceStallSinceUptime = nil
+            return 0
+        }
+        if midPlaybackSurfaceStallGeneration != generation
+            || midPlaybackSurfaceStallSinceUptime == nil {
+            midPlaybackSurfaceStallGeneration = generation
+            midPlaybackSurfaceStallSinceUptime = now
+            return 0
+        }
+        guard let since = midPlaybackSurfaceStallSinceUptime, now >= since else { return 0 }
+        return now - since
+    }
+
+    private func resetSurfaceStallEvidence() {
+        midPlaybackSurfaceStallGeneration = nil
+        midPlaybackSurfaceStallSinceUptime = nil
     }
 
     /// Executes the only non-terminal action the engine's mid-play policy can authorize. This is intentionally
@@ -720,6 +755,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         midPlaybackRecoveryBudget.recordReplacement(for: itemGeneration)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = itemGeneration
+        resetSurfaceStallEvidence()
         return .replaceFreshItem
     }
 
@@ -1005,6 +1041,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         midPlaybackRecoveryBudget.reset(for: issuedGeneration)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = nil
+        resetSurfaceStallEvidence()
         audioReplacement?.bind(to: issuedGeneration)
         pendingPlaybackIntent?.bind(
             generation: issuedGeneration,
@@ -1767,6 +1804,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         midPlaybackRecoveryBudget.reset(for: itemGeneration)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = nil
+        resetSurfaceStallEvidence()
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
         if remuxRemoteMount != nil {
@@ -1849,6 +1887,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         midPlaybackRecoveryBudget.reset(for: itemGeneration)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = nil
+        resetSurfaceStallEvidence()
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
         deferredPublishedTailRecoveryGeneration = nil
@@ -3328,6 +3367,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     loadToken: loadToken
                 )
                 self.updateSubtitleOverlay(atClock: position)   // sync external-sub overlay to source time
+                let clock = ProcessInfo.processInfo.systemUptime
                 // Proven-progress stall-episode end (root-cause report section 2): the raw AVPlayer clock, in
                 // the SAME seconds space the KVO handler above baselined the episode against. `.paused`/
                 // `.playing` transitions never end the episode on their own; only actual forward movement of
@@ -3335,14 +3375,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 if case .ended = self.stallEpisode.mediaAdvanced(to: time.seconds) {
                     VXProbe.event("player", "stall end")
                 }
-                self.midPlaybackRecoveryBudget.recordMediaPosition(
+                if self.midPlaybackRecoveryBudget.recordMediaPosition(
                     time.seconds,
-                    generation: self.itemGeneration)
+                    generation: self.itemGeneration,
+                    now: clock
+                ) {
+                    self.resetSurfaceStallEvidence()
+                }
                 self.recordMidPlaybackRecoveryProgressSnapshot()
                 // Gate the two EXPENSIVE side effects (the NSLock probe write and the loadedTimeRanges scan)
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
-                let clock = ProcessInfo.processInfo.systemUptime
                 self.pinPreferredPeakBitRateAfterFirstFrame(item, atClock: time.seconds)
                 // Diag-6 coupling retry (branch review finding 2): the first frame can beat the server's
                 // bitrate sample, so keep the bounded retry schedule ticking here until it lands or gives
