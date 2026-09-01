@@ -116,6 +116,41 @@ private struct PlayerBufferedBand: View {
     }
 }
 
+/// One provider refresh belongs to one native-debrid mount.  A requested engine change joins that refresh
+/// instead of constructing a new surface from the expired signed URL that triggered it.
+private struct NativeDebridFreshLinkRecoveryState: Equatable {
+    private(set) var freshLinkUsed = false
+    private(set) var freshLinkInFlight = false
+    private(set) var requestedEngine: Bool?
+
+    mutating func beginFreshLink(requestedEngine: Bool? = nil) -> Bool {
+        guard !freshLinkUsed, !freshLinkInFlight else { return false }
+        freshLinkUsed = true
+        freshLinkInFlight = true
+        self.requestedEngine = requestedEngine
+        return true
+    }
+
+    mutating func joinEngineSwitch(_ engine: Bool) -> Bool {
+        guard freshLinkInFlight else { return false }
+        requestedEngine = engine
+        return true
+    }
+
+    mutating func finishFreshLink() -> Bool? {
+        guard freshLinkInFlight else { return nil }
+        freshLinkInFlight = false
+        defer { requestedEngine = nil }
+        return requestedEngine
+    }
+
+    mutating func reset() {
+        freshLinkUsed = false
+        freshLinkInFlight = false
+        requestedEngine = nil
+    }
+}
+
 struct PlayerScreen: View {
     #if os(iOS) || os(macOS)
     private struct DirectAVNoFrameRecovery: Equatable {
@@ -494,6 +529,9 @@ struct PlayerScreen: View {
     // on the new engine's first trackList instead of the preference-derived auto pick. Consumed in
     // autoSelectTracks; only read while userPickedSubtitle is true. Mirror of TVPlayerView.
     @State private var pendingSubtitleReapply: SubtitleChoice?
+    /// Audio track IDs are engine-local. Same-source recovery carries only semantic language/title identity and
+    /// consumes it once when the replacement mount publishes selectable tracks.
+    @State private var pendingAudioReapply: PlayerRecoveryAudioChoice?
     // A DV-remux switch that starts at 0 (forward-only, the resume seek is dropped) keeps the REAL resume
     // point here, so the periodic / exit progress writes refuse to REGRESS the account resume below it. Clears
     // once the playhead passes it. iOS port of TVPlayerView.suppressedResumeFloor.
@@ -662,6 +700,9 @@ struct PlayerScreen: View {
     @State private var srcProbeLoadStart = Date()
     #if os(iOS) || os(macOS)
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
+    /// Exact item observed by the surface-stall watchdog. An AVPlayer replacement advances this value, fencing
+    /// a stale watchdog callback away from the new item.
+    @State private var avStallWatchdogItemGeneration: UInt64?
     /// No MPV surface is constructed until the retiring AV/remux route acknowledges producer unwind.
     @State private var avToMPVHandoff: AVToMPVHandoff?
     @State private var avToMPVHandoffBlocked = false
@@ -787,6 +828,9 @@ struct PlayerScreen: View {
     /// True once a resume has already re-selected its SAME source (re-resolved a fresh link for the same file)
     /// after a stale-link failure, so a second failure hops to a DIFFERENT source instead of looping on it.
     @State private var resumeSourceReresolved = false
+    /// A native-debrid signed URL is disposable transport state. Keep its one permitted refresh fenced to the
+    /// exact mount so a late provider result cannot remount an older episode/source/engine request.
+    @State private var nativeDebridFreshLinkRecovery = NativeDebridFreshLinkRecoveryState()
     /// When the app was last suspended while this player stayed mounted, so the foreground hook knows HOW LONG
     /// it was away. Nothing on-device can tell a live debrid link from an expired one, and re-minting a healthy
     /// one would cost the viewer a reload for nothing, so the suspension length is the only honest gate.
@@ -2380,6 +2424,8 @@ struct PlayerScreen: View {
             isScrubbing: scrubbing,
             captureInFlight: localTrickplayCaptureInFlight
         ) else { return }
+        let captureDecision = currentLocalTrickplayCaptureDecision()
+        guard captureDecision.permitsLocalCapture else { return }
         // Report item 8: withhold capture until first frame + display settle so its GPU work cannot land in
         // the startup/renegotiation window the diagnosed drop bursts cluster in. tvOS is the platform with a
         // real HDMI display-mode renegotiation; HDRDisplayMode.isSwitchSettled is a permanently-true no-op
@@ -2389,21 +2435,43 @@ struct PlayerScreen: View {
         guard TrickplayPresentationReadinessPolicy.isReady(
             elapsedSinceFirstFrame: firstFrameRenderedAt.map { ProcessInfo.processInfo.systemUptime - $0 },
             displaySwitchSettled: HDRDisplayMode.isSwitchSettled,
-            isUltraHighDefinitionHDR: isCurrentContentUHDHDR()
+            isUltraHighDefinitionHDR: captureDecision.isUltraHighDefinitionHDR
         ) else { return }
         captureTrickplayFrame(at: time)
     }
 
-    /// Longer trickplay settle threshold for the most expensive frame to scale (report item 8: "lower
-    /// cadence during 4K HDR/DV"). Fail-open like the equivalent tvOS check: unknown/unprobed resolution or
-    /// HDR state keeps the shorter, default threshold rather than withholding capture indefinitely.
-    private func isCurrentContentUHDHDR() -> Bool {
-        guard let player = coordinator.player else { return false }
-        guard player.contentIsDolbyVision || player.hdrAvailable else { return false }
+    /// AVPlayer pulls an already-decoded pixel buffer, while libmpv captures inside the drawable path. Declare
+    /// that backend explicitly so UHD HDR/DV keeps the safety gate only where the renderer can be disturbed.
+    private func currentLocalTrickplayCaptureDecision() -> TrickplayLocalCaptureEligibilityPolicy.Decision {
+        guard let player = coordinator.player else {
+            return TrickplayLocalCaptureEligibilityPolicy.decision(
+                .init(isUltraHighDefinition: false, dynamicRange: .unknown)
+            )
+        }
+        let hint = (curHint ?? recordQualityText ?? "").lowercased()
+        let dynamicRange: TrickplayLocalCaptureEligibilityPolicy.DynamicRange
+        if player.contentIsDolbyVision || StreamRanking.isDolbyVision(hint) {
+            dynamicRange = .dolbyVision
+        } else if hint.contains("hdr10") {
+            dynamicRange = .hdr10
+        } else if hint.contains("hlg") {
+            dynamicRange = .hlg
+        } else if player.hdrAvailable || hint.contains("hdr") {
+            dynamicRange = .hdr
+        } else {
+            dynamicRange = .unknown
+        }
         let summary = player.mediaSummary()
-        guard summary.width > 0, summary.height > 0 else { return false }
-        return TVOSFramePresentationPolicy.isUltraHighDefinition(
-            width: summary.width, height: summary.height)
+        return TrickplayLocalCaptureEligibilityPolicy.decision(
+            .init(
+                isUltraHighDefinition: TVOSFramePresentationPolicy.isUltraHighDefinition(
+                    width: summary.width, height: summary.height),
+                dynamicRange: dynamicRange,
+                captureBackend: player is AVPlayerEngineController
+                    ? .avPlayerVideoOutput
+                    : .libmpvInlineDrawable
+            )
+        )
     }
 
     private func invalidateLocalTrickplayCapture() {
@@ -2841,14 +2909,22 @@ struct PlayerScreen: View {
     /// isn't warm yet so a quick retry won't help - warm it up (poll peers/bytes) then reload. Otherwise
     /// auto-retry a couple of times, then hop to another source, then show the manual error overlay.
     /// Now at full parity with tvOS `handleLoadFailure`, including the embedded-server torrent warm-up.
-    /// A resume's exact stored source failed (its debrid link expired). Re-select the SAME source: mint a fresh
-    /// link for the same file via DebridCoordinator (a single requestdl / re-add, not a full source re-pick),
-    /// reset the load state, and replay it in place. Returns true once it kicks off (the caller stops); false
-    /// when there is no debrid provenance to re-resolve, so the caller falls through to the failover hop.
-    private func retryResumeSameSource() -> Bool {
+    /// Refresh the signed URL for exactly the mounted native-debrid source. One refresh is admitted per mount;
+    /// an engine switch that arrives while it is pending joins the transaction so no replacement surface ever
+    /// starts from the URL that just failed.
+    @discardableResult
+    private func recoverCurrentNativeDebridLink(
+        reason: String,
+        requestedEngine: Bool? = nil
+    ) -> Bool {
+        if nativeDebridFreshLinkRecovery.freshLinkInFlight {
+            if let requestedEngine { _ = nativeDebridFreshLinkRecovery.joinEngineSwitch(requestedEngine) }
+            return true
+        }
         let retryRef = pendingAdvance?.debridRef ?? curDebridRef
         let retryMeta = pendingAdvance?.meta ?? curMeta
-        guard let ref = retryRef, !ref.infoHash.isEmpty else { return false }
+        guard !nativeDebridFreshLinkRecovery.freshLinkUsed,
+              let ref = retryRef, !ref.infoHash.isEmpty else { return false }
         let episodeHint: DebridEpisode? = retryMeta.flatMap { meta -> DebridEpisode? in
             guard let season = meta.season, season >= 0,
                   let episode = meta.episode, episode > 0 else { return nil }
@@ -2866,7 +2942,15 @@ struct PlayerScreen: View {
         let retrySource = currentStream
         guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }
         let retryResume = retryResumeTarget()
+        let pausedIntent = isPaused
+        let audioChoice = captureSelectedAudioChoice()
+        let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
+        let retryEpisodeGeneration = episodeSwitchGeneration
+        let retrySourceGeneration = sourceSwitchGeneration
+        guard nativeDebridFreshLinkRecovery.beginFreshLink(requestedEngine: requestedEngine) else { return false }
         resumeSourceReresolved = true
+        pendingAudioReapply = audioChoice
+        pendingSubtitleReapply = subtitleChoice
         // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
         autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
@@ -2884,12 +2968,18 @@ struct PlayerScreen: View {
                     capturedGeneration: generation, currentGeneration: resumeRetryGeneration,
                     capturedVideoID: targetVideoID, currentVideoID: activeMeta?.videoId
                   ),
+                  retryEpisodeGeneration == episodeSwitchGeneration,
+                  retrySourceGeneration == sourceSwitchGeneration,
                   activeRef == ref, curURL == retryURL, currentStream == retrySource,
                   coordinator.player?.activeLoadToken == retryLoadToken else { return }
+            let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()
             if let fresh {
-                srcProbe("resume: re-selected the SAME source (fresh link) after the stored link expired")
+                srcProbe("native debrid: accepted fresh same-source link reason=\(reason)")
                 reconnecting = false
                 curURL = fresh
+                // A replacement comes from the debrid provider, not the original add-on host. Never send an
+                // add-on's origin-scoped credentials to that new provider URL.
+                curHeaders = nil
                 let freshRef = DebridPlaybackRef(
                     url: fresh, service: ref.service, infoHash: ref.infoHash,
                     torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx
@@ -2909,18 +2999,38 @@ struct PlayerScreen: View {
                         requestedVideoID: target.videoId, bindingSucceeded: succeeded
                     )
                 }
-                let issuedToken = loadRetryIntoPlayer(
-                    fresh, headers: curHeaders, live: isLive, resumeTarget: retryResume
-                )
-                if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
-                startLoadTimeout()
+                if let requestedEngine = joinedEngine, requestedEngine != isAVPlayerActive {
+                    switchPlayerEngine(toAVPlayer: requestedEngine, preservingNativeDebridRecoveryGeneration: true)
+                } else {
+                    coordinator.player?.invalidateLoadToken()
+                    hasStartedPlaying = false; buffering = true; appliedSize = false; appliedAutoTracks = false
+                    pendingLibmpvResumeSeek = nil; loadErrorMsg = ""
+                    let issuedToken = loadRetryIntoPlayer(
+                        fresh, headers: curHeaders, live: isLive, resumeTarget: retryResume
+                    )
+                    if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
+                    if issuedToken != nil {
+                        if pausedIntent { coordinator.player?.pause() }
+                        startLoadTimeout()
+                    }
+                }
             } else {
-                srcProbe("resume: same source unavailable on re-resolve -> hopping to another")
+                srcProbe("native debrid: fresh same-source link unavailable reason=\(reason)")
                 reconnecting = false
-                if !hopToNextSource(reason: "resume source gone") { presentTerminalLoadFailure() }
+                if currentPickWasExplicit {
+                    if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
+                    presentTerminalLoadFailure()
+                } else if !hopToNextSource(reason: "native debrid source unavailable", resumeOverride: retryResume) {
+                    presentTerminalLoadFailure()
+                }
             }
         }
         return true
+    }
+
+    /// Compatibility entry for Continue Watching. The recovery owner is deliberately not resume-specific.
+    private func retryResumeSameSource() -> Bool {
+        recoverCurrentNativeDebridLink(reason: "resume")
     }
 
     /// MID-PLAY libmpv FAILURE (diag-21). This case used to only log "IGNORED": `handleLoadFailure` is gated on
@@ -3082,6 +3192,11 @@ struct PlayerScreen: View {
             bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         }
         autoRetryTask?.cancel()
+        // A retry that actually issues a fresh player load is a new mount and earns its own one-shot signed
+        // link refresh. Do not disturb a provider request already in flight; that request owns this reload.
+        if !nativeDebridFreshLinkRecovery.freshLinkInFlight {
+            nativeDebridFreshLinkRecovery.reset()
+        }
         #if os(iOS) || os(macOS)
         avToMPVHandoffBlocked = false
         #endif
@@ -3335,6 +3450,52 @@ struct PlayerScreen: View {
         return (hash.count == 40 && hash.allSatisfy(\.isHexDigit)) ? hash : nil
     }
 
+    /// A re-bound raw-torrent route names a newly started local server, not merely a different authority. Create
+    /// the same torrent engine before the replacement player opens it. Direct URLs and debrid links never enter.
+    private func prepareRawTorrentAfterLoopbackRebind(from previous: URL?, to replacement: URL?) {
+        guard curDebridRef == nil,
+              let stream = currentStream,
+              stream.url == nil,
+              let previous, let replacement,
+              isLoopback(previous), isLoopback(replacement),
+              previous.port != replacement.port,
+              torrentHash(in: previous) == torrentHash(in: replacement),
+              torrentHash(in: replacement) != nil else { return }
+        DiagnosticsLog.log("torrent", "loopback authority changed under raw torrent; recreating engine before replacement load")
+        prepareTorrent(stream)
+    }
+
+    private func torrentHash(in url: URL) -> String? {
+        guard url.pathComponents.count >= 2 else { return nil }
+        let hash = url.pathComponents[1]
+        return hash.count == 40 && hash.allSatisfy(\.isHexDigit) ? hash.lowercased() : nil
+    }
+
+    /// Idempotently ensure a raw torrent has a local engine after a recovery or foreground port rebind.
+    private func prepareTorrent(_ stream: CoreStream) {
+        guard !PlaybackSettings.torrentsDisabled,
+              stream.url == nil,
+              let hash = stream.infoHash?.lowercased(),
+              let endpoint = URL(string: "\(StremioServer.base)/\(hash)/create") else { return }
+        let trackers = TorrentTrackers.sources(forHash: hash, streamSources: stream.sources)
+        let body: [String: Any] = [
+            "torrent": ["infoHash": hash],
+            "peerSearch": ["sources": trackers, "min": 40, "max": 150]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        Task {
+            await StremioServer.applyServerConfig(maxAttempts: 3)
+            do {
+                let status = try await TorrentCreateTransport.shared.create(url: endpoint, jsonBody: data)
+                if status / 100 != 2 {
+                    DiagnosticsLog.log("torrent", "create HTTP \(status) after player recovery")
+                }
+            } catch {
+                DiagnosticsLog.log("torrent", "create failed after player recovery: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// The URL to (re)mount for the CURRENTLY playing source. Normally that is exactly what is already
     /// loaded - but a loopback mount can go stale WITHOUT the source changing: the in-process engine server is
     /// stopped on background and rebinds a FRESH ephemeral port on every foreground start, while
@@ -3438,7 +3599,9 @@ struct PlayerScreen: View {
         }
         DiagnosticsLog.log("player", "foreground: embedded server moved port, re-mounting the same source in place")
         srcProbe("foreground: embedded server moved port, re-mounting the same source in place")
+        let previousURL = curURL
         curURL = healed
+        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: healed)
         let resume = retryResumeTarget()
         reconnectMsg = "Recovering…"
         withAnimation { reconnecting = true }
@@ -3448,6 +3611,7 @@ struct PlayerScreen: View {
         // subtitles silently vanished on every port-move re-mount. Re-arm the latch ONLY when there is a pick to
         // restore, so a mount with no explicit choice keeps exactly today's behavior.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        pendingAudioReapply = captureSelectedAudioChoice()
         if pendingSubtitleReapply != nil { appliedAutoTracks = false }
         appliedSize = false; hasStartedPlaying = false; isSeekable = true; buffering = true
         srcProbeLoadStart = Date()
@@ -3469,6 +3633,7 @@ struct PlayerScreen: View {
             // The OLD mount is still live and still carries the viewer's pick, so drop the snapshot and put the
             // latch back: re-applying it would re-add an external subtitle that was never removed.
             if pendingSubtitleReapply != nil { appliedAutoTracks = true }
+            pendingAudioReapply = nil
             pendingSubtitleReapply = nil
             return
         }
@@ -3573,6 +3738,37 @@ struct PlayerScreen: View {
     }
 
     private func recoverFromStall() {
+        #if os(iOS) || os(macOS)
+        if let avPlayer = coordinator.player as? AVPlayerEngineController {
+            let expectedGeneration = avStallWatchdogItemGeneration ?? avPlayer.currentItemGeneration
+            avStallWatchdogItemGeneration = expectedGeneration
+            switch avPlayer.recoverFreshItemForProvenSurfaceStall(
+                expectedItemGeneration: expectedGeneration,
+                surfaceStalled: true
+            ) {
+            case .retain(let reason):
+                // Ordinary AVPlayer rebuffering and a first frozen sample are not an authorization to reload
+                // the source. The engine owns the producer evidence and keeps the existing item alive.
+                DiagnosticsLog.log("player", "AVPlayer stall retained reason=\(String(describing: reason)) generation=\(expectedGeneration)")
+                return
+            case .replaceFreshItem:
+                avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
+                buffering = true
+                hasStartedPlaying = false
+                firstFrameRenderedAt = nil
+                appliedAutoTracks = true
+                DiagnosticsLog.log("player", "AVPlayer proven surface stall replaced fresh item generation=\(avPlayer.currentItemGeneration)")
+                return
+            case .terminal(let proof):
+                DiagnosticsLog.log("player", "AVPlayer stall terminal proof=\(String(describing: proof))")
+                if !hopToNextSource(reason: "AVPlayer terminal stall", resumeOverride: currentTime) {
+                    loadErrorMsg = "Playback stopped on this source."
+                    presentTerminalLoadFailure()
+                }
+                return
+            }
+        }
+        #endif
         let recoveryToken = coordinator.player is AVPlayerEngineController
             ? coordinator.player?.activeLoadToken : nil
         srcProbe("recoverFromStall ENTER (mid-play freeze) stallRecoveries=\(stallRecoveries)/3 at pos=\(String(format: "%.1f", currentTime))s")
@@ -3661,12 +3857,14 @@ struct PlayerScreen: View {
         // (MPVMetalPlayerView.makeController copies it onto the new controller).
         coordinator.dolbyVisionFallbackInfo =
             retiringAVPlayer.dolbyVisionFallbackInfo
+        pendingAudioReapply = captureSelectedAudioChoice()
+        pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
         // Engine of origin for the `avDemotedAt` grace (W2-A item 3a; tvOS twin in TVPlayerView). Captured
         // BEFORE stop() clears the engine's active token: this is the exact load the grace exists to swallow.
         demotedEngineLoadToken = retiringAVPlayer.activeLoadToken
-        // The next-episode prep is scoped to the TARGET episode's owner identity, not the engine surface
-        // (Beta 26 C1, F7). An AV-to-mpv demote is a same-stream DV fallback, so the prewarmed next episode
-        // must survive it; `PreparedEpisodeRetentionPolicy` still rejects a genuinely stale prep by episode id.
+        // The AV-to-mpv handoff tears down the mounted transport. A prewarmed next episode can retain a lease
+        // tied to that retiring owner, so invalidate it before the replacement surface is allowed to mount.
+        invalidatePreparedEpisode(reason: "AV-to-mpv handoff")
         let quiescence = retiringAVPlayer.stopForMPVFallback()
         clearCachedAudioOutputTruth()
         // An engine-owned target is a newer explicit seek and is authoritative in BOTH directions. In
@@ -3784,7 +3982,10 @@ struct PlayerScreen: View {
     /// and subtitle sync are re-applied once the new engine's controller mounts. Track choices re-derive from
     /// `TrackPreferences` via the automatic trackList -> `TrackSelector` flow (engine id spaces differ by
     /// design; matching is by lang/title). No-op when already on the requested engine.
-    private func switchPlayerEngine(toAVPlayer: Bool) {
+    private func switchPlayerEngine(
+        toAVPlayer: Bool,
+        preservingNativeDebridRecoveryGeneration: Bool = false
+    ) {
         guard toAVPlayer != isAVPlayerActive else { close(); return }
         // A manual AV→MPV pick is the same physical handoff as automatic recovery.  Going through the shared
         // transaction preserves the live URL/generations and refuses to mount MPV until every producer stops.
@@ -3800,8 +4001,18 @@ struct PlayerScreen: View {
             showEngineNotice("This source can only play on the built-in (libmpv) engine.")
             close(); return
         }
+        if nativeDebridFreshLinkRecovery.freshLinkInFlight {
+            _ = nativeDebridFreshLinkRecovery.joinEngineSwitch(toAVPlayer)
+            close()
+            return
+        }
+        if (reconnecting || autoRetryTask != nil),
+           recoverCurrentNativeDebridLink(reason: "engine switch", requestedEngine: toAVPlayer) {
+            close()
+            return
+        }
         srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
-        resumeRetryGeneration &+= 1
+        if !preservingNativeDebridRecoveryGeneration { resumeRetryGeneration &+= 1 }
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
@@ -3814,6 +4025,7 @@ struct PlayerScreen: View {
         // Preserve an explicit in-session subtitle pick across the switch (mandated check 8): capture it NOW,
         // before the reset below, so the new engine re-applies it instead of the preference-derived auto pick.
         pendingSubtitleReapply = userPickedSubtitle ? captureSubtitleChoice() : nil
+        pendingAudioReapply = captureSelectedAudioChoice()
         // Engine of origin for the grace below (W2-A item 3a). Captured before stop() clears it, for WHICHEVER
         // engine is outgoing here: a stale token from an earlier demote would make the grace treat this switch's
         // own stale error as "from the incoming engine" and stop swallowing it.
@@ -4232,6 +4444,7 @@ struct PlayerScreen: View {
         deferredResumeAttempt.invalidate()
         currentPickWasExplicit = explicitPick
         currentPlaybackIsResume = false
+        nativeDebridFreshLinkRecovery.reset()
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         bufferedTime = 0
         stallRecoveries = 0
@@ -4246,7 +4459,7 @@ struct PlayerScreen: View {
         }
         appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false
         userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false
-        pendingSubtitleReapply = nil; suppressedResumeFloor = nil; pendingLibmpvResumeSeek = nil
+        pendingAudioReapply = nil; pendingSubtitleReapply = nil; suppressedResumeFloor = nil; pendingLibmpvResumeSeek = nil
         postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         midPlayFailureResume = nil   // consumed by this switch's resumeOverride; it must not leak to the next load
@@ -7881,7 +8094,22 @@ struct PlayerScreen: View {
         let automaticAudio = TrackSelector.automaticAudioSelection(
             pick.audio,
             remuxOwnsInitialSelection: remuxOwnsInitialAudio)
-        if let automaticAudio { coordinator.player?.setAudioTrack(automaticAudio) }
+        if let pendingAudioReapply {
+            let candidates = audioTracks.map {
+                PlayerRecoveryAudioChoice.Candidate(
+                    id: $0.id, language: $0.lang, title: $0.title, selectable: $0.isSelectable
+                )
+            }
+            if candidates.contains(where: \.selectable) {
+                let recovered = PlayerRecoveryAudioChoice.matchingID(
+                    for: pendingAudioReapply, in: candidates
+                ) ?? automaticAudio
+                if let recovered { coordinator.player?.setAudioTrack(recovered) }
+                self.pendingAudioReapply = nil
+            }
+        } else if let automaticAudio {
+            coordinator.player?.setAudioTrack(automaticAudio)
+        }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
         // the switch. Re-apply it here instead of the preference-derived auto pick, which would otherwise
         // override an explicit Off / language choice on the fresh mount. Only fall back to TrackSelector when
@@ -7994,6 +8222,11 @@ struct PlayerScreen: View {
             return .pooled(id: p.id)
         }
         return .embedded(lang: sel.lang, title: sel.title)
+    }
+
+    private func captureSelectedAudioChoice() -> PlayerRecoveryAudioChoice? {
+        guard let selected = audioTracks.first(where: { $0.selected && $0.isSelectable }) else { return nil }
+        return PlayerRecoveryAudioChoice(language: selected.lang, title: selected.title)
     }
 
     /// Re-apply a captured subtitle choice on the NEW engine after a switch. Track id spaces differ per engine,
