@@ -32,6 +32,10 @@ private final class MockOrigin: @unchecked Sendable {
             ]))
         case "/cross-start":
             try await onHead(.init(statusCode: 302, headers: ["location": "https://other.example/final"]))
+        case "/debrid-private-redirect":
+            try await onHead(.init(statusCode: 302, headers: ["location": "https://127.0.0.1/private"]))
+        case "/debrid-mixed-redirect":
+            try await onHead(.init(statusCode: 302, headers: ["location": "https://mixed.example/private"]))
         case "/final":
             try await onHead(.init(statusCode: 206, headers: ["content-length": "2", "content-type": "video/mp4"]))
             try await onBody(Data("OK".utf8))
@@ -163,6 +167,38 @@ private struct CommunityStreamGatewayBehaviorTests {
         expect(origin.snapshot().cancelledHangs == 1, "downstream disconnect cancels the active upstream operation")
 
         gateway.stop()
+
+        // Native debrid receives the same opaque loopback route, but its redirect rule uses the direct-link
+        // public-address policy rather than the community HTTPS-only policy. The injected resolver makes the
+        // rejection deterministic: no request reaches either unsafe redirect target.
+        let debridGateway = CommunityStreamGateway(
+            streamOperation: { request, onHead, onBody in
+                try await origin.stream(request, onHead: onHead, onBody: onBody)
+            },
+            nativeDebridURLPolicy: { url in
+                DebridPublicURLPolicy.permits(url, resolvingAddresses: { host in
+                    host == "mixed.example" ? ["8.8.8.8", "127.0.0.1"] : ["8.8.8.8"]
+                })
+            }
+        )
+        try! await debridGateway.start()
+        let privateRedirect = try! await debridGateway.registerNativeDebrid(
+            upstream: URL(string: "https://8.8.8.8/debrid-private-redirect")!
+        )
+        expect(privateRedirect.pathComponents.dropFirst().first == "debrid", "native debrid route uses its opaque scope")
+        let privateWire = try! await loopbackRequest(privateRedirect)
+        expect(status(privateWire) == 403, "redirect to loopback is rejected at the media gateway")
+        let mixedRedirect = try! await debridGateway.registerNativeDebrid(
+            upstream: URL(string: "https://8.8.8.8/debrid-mixed-redirect")!
+        )
+        let mixedWire = try! await loopbackRequest(mixedRedirect)
+        expect(status(mixedWire) == 403, "mixed public/private redirect DNS is rejected at the media gateway")
+        let nativeHits = origin.snapshot().hits
+        expect(nativeHits.filter { $0.url.path == "/debrid-private-redirect" }.count == 1
+               && nativeHits.filter { $0.url.path == "/debrid-mixed-redirect" }.count == 1
+               && !nativeHits.contains(where: { $0.url.host == "127.0.0.1" || $0.url.host == "mixed.example" }),
+               "unsafe redirect targets are never sent to the upstream transport")
+        debridGateway.stop()
         print("Community stream gateway behavior: PASS (\(checks) checks)")
     }
 

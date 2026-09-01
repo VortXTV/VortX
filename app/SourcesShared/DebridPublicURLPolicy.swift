@@ -27,11 +27,12 @@ enum DebridPublicURLPolicy {
         return !addresses.isEmpty && addresses.allSatisfy(isPublicAddress)
     }
 
-    /// Converts a provider's raw download field into a usable playback URL, rejecting an unsafe or unresolved
-    /// destination before it enters playback state.
-    static func playbackURL(from raw: String, failure: Error) throws -> URL {
+    /// Converts a provider's raw download field into an opaque local playback URL. The media engines never see
+    /// the remote host: the loopback gateway resolves and pins every media request and redirect at dial time.
+    static func playbackURL(from raw: String, failure: Error) async throws -> URL {
         guard let url = URL(string: raw), permits(url) else { throw failure }
-        return url
+        do { return try await CommunityStreamGateway.shared.registerNativeDebrid(upstream: url) }
+        catch { throw failure }
     }
 
     /// Used by the URLSession redirect delegate. Returning nil cancels the redirect before URLSession sends it.
@@ -142,8 +143,8 @@ enum DebridPublicURLPolicy {
     }
 }
 
-/// URLSession retains this delegate for the session lifetime. It refuses an unsafe redirect before a provider
-/// request can cross the public-network boundary, including query-authenticated provider requests.
+/// URLSession retains this delegate for provider API requests. Media redirects are separately enforced at the
+/// loopback gateway because AVPlayer and libmpv otherwise own their transport independently.
 final class DebridRedirectPolicyDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse,

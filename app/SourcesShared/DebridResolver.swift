@@ -381,7 +381,7 @@ actor TorBoxResolver: DebridResolving {
         }
         let link: Envelope<String> = try await get(url)
         guard let s = link.data else { throw DebridError.notCached }
-        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
+        return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
     }
 
     /// Fetch one torrent by numeric id.
@@ -592,7 +592,7 @@ actor TorBoxUsenetResolver {
         }
         let link: Envelope<String> = try await get(url)
         guard let s = link.data else { throw DebridError.notCached }
-        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
+        return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
     }
 
     private func fetchItem(id: Int) async throws -> Item? {
@@ -733,7 +733,7 @@ actor RealDebridResolver: DebridResolving {
             throw DebridError.notReady
         }
         let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": link])
-        let u = try DebridPublicURLPolicy.playbackURL(from: un.download, failure: DebridError.providerError("no download url"))
+        let u = try await DebridPublicURLPolicy.playbackURL(from: un.download, failure: DebridError.providerError("no download url"))
         DebridProbe.log("resolve.rd", "infoHash=\(DebridProbe.h8(infoHash)) -> OK unrestricted link elapsed=\(DebridProbe.since(srcProbeStart))ms")
         return u
     }
@@ -850,7 +850,7 @@ actor AllDebridResolver: DebridResolving {
               links.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
         let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: links[pick.id].link)]))
         guard let s = un.data?.link else { throw DebridError.providerError("unlock") }
-        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("unlock"))
+        return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("unlock"))
     }
 
     private func authed(_ path: String, _ extra: [URLQueryItem]) -> URL {
@@ -936,7 +936,7 @@ actor PremiumizeResolver: DebridResolving {
               content.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
         let item = content[pick.id]
         guard let s = item.streamLink ?? item.link else { throw DebridError.providerError("no link") }
-        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("no link"))
+        return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("no link"))
     }
 
     private func form<T: Decodable>(_ path: String, _ fields: [String: String]) async throws -> T {
@@ -1987,7 +1987,7 @@ extension RealDebridResolver {
             throw DebridError.noMatchingFile
         }
         let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": links[pick.id]])
-        return try DebridPublicURLPolicy.playbackURL(from: un.download, failure: DebridError.providerError("no download url"))
+        return try await DebridPublicURLPolicy.playbackURL(from: un.download, failure: DebridError.providerError("no download url"))
     }
 }
 
@@ -2040,7 +2040,7 @@ extension AllDebridResolver {
         guard let restricted = item.restrictedLink else { throw DebridError.noMatchingFile }
         let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: restricted)]))
         guard let s = un.data?.link else { throw DebridError.providerError("unlock") }
-        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("unlock"))
+        return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("unlock"))
     }
 }
 
@@ -2091,7 +2091,7 @@ extension PremiumizeResolver {
 
     func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
         guard let s = item.directLink else { throw DebridError.providerError("no link") }
-        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("no link"))
+        return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("no link"))
     }
 
     /// GET with the apikey query (folder/list is a GET), reusing the shared decode contract.

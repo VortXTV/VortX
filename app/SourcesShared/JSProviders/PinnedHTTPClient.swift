@@ -24,6 +24,7 @@ enum PinnedHTTPClient {
     struct Endpoint: Equatable, Sendable {
         let address: String
         let port: UInt16
+        let usesTLS: Bool
         let tlsServerName: String
         let hostHeader: String
     }
@@ -33,12 +34,17 @@ enum PinnedHTTPClient {
         let method: String
         let headers: [String: String]
         let body: Data?
+        /// Community routes are HTTPS-only. Native debrid routes may use an explicit HTTP CDN endpoint, but
+        /// still resolve and dial an exact public numeric peer through this transport.
+        let allowsInsecureHTTP: Bool
 
-        init(url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil) {
+        init(url: URL, method: String = "GET", headers: [String: String] = [:], body: Data? = nil,
+             allowsInsecureHTTP: Bool = false) {
             self.url = url
             self.method = method.uppercased()
             self.headers = PinnedHTTPClient.sanitizedRequestHeaders(headers)
             self.body = body
+            self.allowsInsecureHTTP = allowsInsecureHTTP
         }
     }
 
@@ -72,16 +78,21 @@ enum PinnedHTTPClient {
         return try endpoints(for: url, addresses: addresses, limits: limits)
     }
 
-    private static func endpoints(for url: URL, addresses: [NumericAddress], limits: Limits) throws -> [Endpoint] {
-        guard url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty,
+    private static func endpoints(for url: URL, addresses: [NumericAddress], limits: Limits,
+                                  allowsInsecureHTTP: Bool = false) throws -> [Endpoint] {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "https" || (allowsInsecureHTTP && scheme == "http"),
+              let host = url.host, !host.isEmpty,
               !addresses.isEmpty else {
             throw Failure.unsafeResolution
         }
         let explicitPort = url.port
         guard explicitPort == nil || (1...65_535).contains(explicitPort!) else { throw Failure.invalidURL }
-        let port = UInt16(explicitPort ?? 443)
+        let usesTLS = scheme == "https"
+        let defaultPort = usesTLS ? 443 : 80
+        let port = UInt16(explicitPort ?? defaultPort)
         let hostForHeader = host.contains(":") ? "[\(host)]" : host
-        let hostHeader = explicitPort == nil || explicitPort == 443 ? hostForHeader : "\(hostForHeader):\(port)"
+        let hostHeader = explicitPort == nil || explicitPort == defaultPort ? hostForHeader : "\(hostForHeader):\(port)"
         var familyCount: [Int32: Int] = [:]
         guard limits.maximumPeers > 0, limits.maximumPeersPerFamily > 0 else { throw Failure.unsafeResolution }
         let distinct = Set(addresses).sorted()
@@ -92,7 +103,7 @@ enum PinnedHTTPClient {
         }
         guard !selected.isEmpty else { throw Failure.unsafeResolution }
         return selected.prefix(limits.maximumPeers).map {
-            Endpoint(address: $0.presentation, port: port, tlsServerName: host, hostHeader: hostHeader)
+            Endpoint(address: $0.presentation, port: port, usesTLS: usesTLS, tlsServerName: host, hostHeader: hostHeader)
         }
     }
 
@@ -350,11 +361,15 @@ enum PinnedHTTPClient {
     }
 
     private static func prepare(_ request: Request, limits: Limits, resolver: Resolver) async throws -> ([Endpoint], Data) {
-        guard request.url.scheme?.lowercased() == "https", request.url.user == nil, request.url.password == nil,
-              JSProviderURLPolicy.default.isAllowed(request.url), let host = request.url.host else {
+        guard let scheme = request.url.scheme?.lowercased(),
+              scheme == "https" || (request.allowsInsecureHTTP && scheme == "http"),
+              request.url.user == nil, request.url.password == nil,
+              (request.allowsInsecureHTTP || JSProviderURLPolicy.default.isAllowed(request.url)),
+              let host = request.url.host else {
             throw Failure.invalidURL
         }
-        let peers = try endpoints(for: request.url, addresses: try await resolver(host), limits: limits)
+        let peers = try endpoints(for: request.url, addresses: try await resolver(host), limits: limits,
+                                  allowsInsecureHTTP: request.allowsInsecureHTTP)
         return (peers, try requestBytes(for: request, endpoint: peers[0], limits: limits))
     }
 
@@ -396,10 +411,15 @@ enum PinnedHTTPClient {
     }
 
     private static func makeConnection(_ endpoint: Endpoint) -> NWConnection {
-        let tls = NWProtocolTLS.Options()
-        sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, endpoint.tlsServerName)
-        sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
-        let parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        let parameters: NWParameters
+        if endpoint.usesTLS {
+            let tls = NWProtocolTLS.Options()
+            sec_protocol_options_set_tls_server_name(tls.securityProtocolOptions, endpoint.tlsServerName)
+            sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
+            parameters = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+        } else {
+            parameters = .tcp
+        }
         parameters.prohibitExpensivePaths = false
         return NWConnection(host: NWEndpoint.Host(endpoint.address), port: NWEndpoint.Port(rawValue: endpoint.port)!, using: parameters)
     }

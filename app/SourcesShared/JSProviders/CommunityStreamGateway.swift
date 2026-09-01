@@ -10,6 +10,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
         @escaping @Sendable (PinnedHTTPClient.ResponseHead) async throws -> Void,
         @escaping @Sendable (Data) async throws -> Void
     ) async throws -> Void
+    typealias NativeDebridURLPolicy = @Sendable (URL) -> Bool
 
     static let shared = CommunityStreamGateway()
 
@@ -20,9 +21,15 @@ final class CommunityStreamGateway: @unchecked Sendable {
         case malformedRequest
     }
 
+    enum RouteScope: String, Sendable, Equatable {
+        case community
+        case debrid
+    }
+
     struct Route: Sendable, Equatable {
         let upstream: URL
         let headers: [String: String]
+        let scope: RouteScope
         let expiresAt: Date
         let hardExpiresAt: Date
         let providerID: String?
@@ -40,14 +47,19 @@ final class CommunityStreamGateway: @unchecked Sendable {
     private let maximumPlaylistBytes = 2 * 1024 * 1024
     private let maximumClientHeaderBytes = 32 * 1024
     private let streamOperation: StreamOperation
+    private let nativeDebridURLPolicy: NativeDebridURLPolicy
 
     private convenience init() {
         self.init(streamOperation: { request, onHead, onBody in
             try await PinnedHTTPClient.stream(request, onHead: onHead, onBody: onBody)
-        })
+        }, nativeDebridURLPolicy: { url in DebridPublicURLPolicy.permits(url) })
     }
 
-    init(streamOperation: @escaping StreamOperation) { self.streamOperation = streamOperation }
+    init(streamOperation: @escaping StreamOperation,
+         nativeDebridURLPolicy: @escaping NativeDebridURLPolicy = { url in DebridPublicURLPolicy.permits(url) }) {
+        self.streamOperation = streamOperation
+        self.nativeDebridURLPolicy = nativeDebridURLPolicy
+    }
 
     /// Starts a listener bound to 127.0.0.1 only. It is intentionally never exposed on LAN interfaces.
     func start() async throws {
@@ -128,25 +140,37 @@ final class CommunityStreamGateway: @unchecked Sendable {
     /// Registers a provider URL and returns the only URL media clients may receive. No remote URL or request
     /// header is encoded into the local address. Every token is random, scoped to this process, and expires.
     func register(upstream: URL, headers: [String: String] = [:], providerID: String? = nil, now: Date = Date()) throws -> URL {
-        guard upstream.scheme?.lowercased() == "https", JSProviderURLPolicy.default.isAllowed(upstream) else {
-            throw Failure.invalidStream
-        }
+        try register(upstream: upstream, headers: headers, providerID: providerID, scope: .community, now: now)
+    }
+
+    /// Native debrid URLs are never handed to AVPlayer or libmpv. The listener is made ready before its opaque
+    /// route is returned, and each request uses the pinned transport instead of letting a media framework resolve
+    /// the destination itself.
+    func registerNativeDebrid(upstream: URL) async throws -> URL {
+        try await start()
+        return try register(upstream: upstream, headers: [:], providerID: nil, scope: .debrid)
+    }
+
+    private func register(upstream: URL, headers: [String: String], providerID: String?, scope: RouteScope,
+                          now: Date = Date()) throws -> URL {
+        guard isAllowed(upstream, scope: scope) else { throw Failure.invalidStream }
         lock.lock()
         defer { lock.unlock() }
         pruneLocked(now: now)
         guard let port else { throw Failure.unavailable }
         if let token = routes.first(where: {
-            $0.value.upstream == upstream && $0.value.headers == safeHeaders(headers) && $0.value.providerID == providerID
+            $0.value.upstream == upstream && $0.value.headers == safeHeaders(headers)
+                && $0.value.providerID == providerID && $0.value.scope == scope
         })?.key {
-            return URL(string: "http://127.0.0.1:\(port)/community/\(token)")!
+            return URL(string: "http://127.0.0.1:\(port)/\(scope.rawValue)/\(token)")!
         }
         if routes.count >= maximumRoutes, let oldest = routes.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
             routes[oldest] = nil
         }
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        routes[token] = Route(upstream: upstream, headers: safeHeaders(headers), expiresAt: now.addingTimeInterval(routeLifetime),
+        routes[token] = Route(upstream: upstream, headers: safeHeaders(headers), scope: scope, expiresAt: now.addingTimeInterval(routeLifetime),
                               hardExpiresAt: now.addingTimeInterval(maximumRouteLifetime), providerID: providerID)
-        return URL(string: "http://127.0.0.1:\(port)/community/\(token)")!
+        return URL(string: "http://127.0.0.1:\(port)/\(scope.rawValue)/\(token)")!
     }
 
     /// Adapts only streams carrying the community-provider provenance marker. This is the integration seam for
@@ -227,15 +251,16 @@ final class CommunityStreamGateway: @unchecked Sendable {
         }
     }
 
-    private struct ClientRequest { let method: String; let token: String; let range: String? }
+    private struct ClientRequest { let method: String; let token: String; let scope: RouteScope; let range: String? }
 
     private func parseRequest(_ header: String) -> ClientRequest? {
         let lines = header.components(separatedBy: "\r\n")
         guard let first = lines.first?.split(separator: " "), first.count == 3,
               first[0] == "GET" || first[0] == "HEAD", first[2] == "HTTP/1.1" else { return nil }
         let path = String(first[1])
-        guard path.hasPrefix("/community/"), path.dropFirst("/community/".count).count == 32,
-              path.dropFirst("/community/".count).allSatisfy({ $0.isHexDigit }) else { return nil }
+        let pathParts = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard pathParts.count == 2, let scope = RouteScope(rawValue: String(pathParts[0])),
+              pathParts[1].count == 32, pathParts[1].allSatisfy({ $0.isHexDigit }) else { return nil }
         var range: String?
         for line in lines.dropFirst() {
             guard let colon = line.firstIndex(of: ":") else { return nil }
@@ -246,15 +271,15 @@ final class CommunityStreamGateway: @unchecked Sendable {
                 range = value
             }
         }
-        return ClientRequest(method: String(first[0]), token: String(path.dropFirst("/community/".count)), range: range)
+        return ClientRequest(method: String(first[0]), token: String(pathParts[1]), scope: scope, range: range)
     }
 
     private func serve(_ connection: NWConnection, request: ClientRequest) async {
-        guard let route = route(for: request.token) else { reply(connection, status: "404 Not Found"); return }
+        guard let route = route(for: request.token), route.scope == request.scope else { reply(connection, status: "404 Not Found"); return }
         var headers = route.headers
         if let range = request.range { headers["Range"] = range }
         do {
-            try await forwardFollowingRedirects(connection, request: request, upstream: route.upstream, headers: headers)
+            try await forwardFollowingRedirects(connection, request: request, route: route, headers: headers)
         } catch PinnedHTTPClient.Failure.unsafeResolution {
             reply(connection, status: "403 Forbidden")
         } catch PinnedHTTPClient.Failure.timedOut {
@@ -274,16 +299,17 @@ final class CommunityStreamGateway: @unchecked Sendable {
     /// Follows redirects and streams the first non-redirect response from the request that discovered it.
     /// The old probe-then-forward shape fetched the final origin twice, which doubled signed-CDN hits and could
     /// consume a one-use URL before the player received any bytes.
-    private func forwardFollowingRedirects(_ connection: NWConnection, request: ClientRequest,
-                                            upstream: URL, headers: [String: String]) async throws {
-        var currentURL = upstream
+    private func forwardFollowingRedirects(_ connection: NWConnection, request: ClientRequest, route: Route,
+                                            headers: [String: String]) async throws {
+        var currentURL = route.upstream
         var currentHeaders = headers
         for hop in 0...3 {
             let state = ForwardState(method: request.method, upstream: currentURL, headers: currentHeaders,
                                      maximumPlaylistBytes: maximumPlaylistBytes)
             do {
                 try await streamOperation(
-                    .init(url: currentURL, method: request.method, headers: currentHeaders),
+                    .init(url: currentURL, method: request.method, headers: currentHeaders,
+                          allowsInsecureHTTP: route.scope == .debrid),
                     { head in
                         if (300...399).contains(head.statusCode) { throw RedirectReceived(head: head) }
                         try await state.accept(head: head, send: { [weak self] status, responseHeaders in
@@ -300,7 +326,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
                 )
                 if let body = try state.finish(rewrite: { body, base, routeHeaders, responseHeaders in
                     try self.rewritePlaylistIfNeeded(body, upstream: base, routeHeaders: routeHeaders,
-                                                     responseHeaders: responseHeaders)
+                                                     responseHeaders: responseHeaders, scope: route.scope)
                 }) {
                     let sent = request.method == "HEAD" ? Data() : body
                     try await sendHead(connection, status: state.status,
@@ -314,8 +340,8 @@ final class CommunityStreamGateway: @unchecked Sendable {
                 guard hop < 3,
                       let value = redirect.head.headers["location"],
                       let next = URL(string: value, relativeTo: currentURL)?.absoluteURL,
-                      next.scheme?.lowercased() == "https",
-                      JSProviderURLPolicy.default.isAllowed(next) else {
+                      isAllowed(next, scope: route.scope) else {
+                    if route.scope == .debrid { throw PinnedHTTPClient.Failure.unsafeResolution }
                     throw PinnedHTTPClient.Failure.redirect(redirect.head.statusCode)
                 }
                 currentHeaders = CommunityGatewayTransportPolicy.childHeaders(currentHeaders, parent: currentURL, child: next)
@@ -334,7 +360,7 @@ final class CommunityStreamGateway: @unchecked Sendable {
         guard var route = routes[token], route.hardExpiresAt > now else { routes[token] = nil; return nil }
         // Renew only an active route, never beyond its immutable hard lifetime. This lets a long HLS session
         // survive normal token rotation while a forgotten token still disappears deterministically.
-        route = Route(upstream: route.upstream, headers: route.headers,
+        route = Route(upstream: route.upstream, headers: route.headers, scope: route.scope,
                       expiresAt: min(route.hardExpiresAt, now.addingTimeInterval(routeLifetime)),
                       hardExpiresAt: route.hardExpiresAt, providerID: route.providerID)
         routes[token] = route
@@ -348,19 +374,20 @@ final class CommunityStreamGateway: @unchecked Sendable {
         return listener != nil
     }
 
-    private func rewritePlaylistIfNeeded(_ body: Data, upstream: URL, routeHeaders: [String: String], responseHeaders: [String: String]) throws -> Data {
+    private func rewritePlaylistIfNeeded(_ body: Data, upstream: URL, routeHeaders: [String: String], responseHeaders: [String: String],
+                                         scope: RouteScope) throws -> Data {
         let contentType = responseHeaders["content-type"]?.lowercased() ?? ""
         guard contentType.contains("mpegurl") || upstream.path.lowercased().hasSuffix(".m3u8"),
               let playlist = String(data: body, encoding: .utf8) else { return body }
-        let rewritten = playlist.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map { line -> String in
+        let rewritten = try playlist.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).map { line -> String in
             let text = String(line)
-            if text.hasPrefix("#") { return rewriteURIAttributes(in: text, upstream: upstream, headers: routeHeaders) }
-            return rewriteChild(text, upstream: upstream, headers: routeHeaders)
+            if text.hasPrefix("#") { return try rewriteURIAttributes(in: text, upstream: upstream, headers: routeHeaders, scope: scope) }
+            return try rewriteChild(text, upstream: upstream, headers: routeHeaders, scope: scope)
         }.joined(separator: "\n")
         return Data(rewritten.utf8)
     }
 
-    private func rewriteURIAttributes(in line: String, upstream: URL, headers: [String: String]) -> String {
+    private func rewriteURIAttributes(in line: String, upstream: URL, headers: [String: String], scope: RouteScope) throws -> String {
         // RFC 8216 URI attributes occur on KEY, MAP, MEDIA, I-FRAME-STREAM-INF, RENDITION-REPORT,
         // PRELOAD-HINT and SESSION-KEY variants. Match the attribute grammar rather than a small tag list.
         let expression = try? NSRegularExpression(pattern: "(?i)URI=(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^,\\s]*))")
@@ -373,15 +400,32 @@ final class CommunityStreamGateway: @unchecked Sendable {
                 let r = match.range(at: index); return r.location == NSNotFound ? nil : Range(r, in: output)
             }.first
             guard let captured else { continue }
-            output.replaceSubrange(captured, with: rewriteChild(String(output[captured]), upstream: upstream, headers: headers))
+            output.replaceSubrange(captured, with: try rewriteChild(String(output[captured]), upstream: upstream, headers: headers, scope: scope))
         }
         return output
     }
 
-    private func rewriteChild(_ value: String, upstream: URL, headers: [String: String]) -> String {
-        guard !value.isEmpty, let child = URL(string: value, relativeTo: upstream)?.absoluteURL,
-              let local = try? register(upstream: child, headers: CommunityGatewayTransportPolicy.childHeaders(headers, parent: upstream, child: child)) else { return value }
-        return local.absoluteString
+    private func rewriteChild(_ value: String, upstream: URL, headers: [String: String], scope: RouteScope) throws -> String {
+        guard !value.isEmpty, let child = URL(string: value, relativeTo: upstream)?.absoluteURL else {
+            if scope == .debrid { throw PinnedHTTPClient.Failure.unsafeResolution }
+            return value
+        }
+        do {
+            return try register(upstream: child, headers: CommunityGatewayTransportPolicy.childHeaders(headers, parent: upstream, child: child),
+                                providerID: nil, scope: scope).absoluteString
+        } catch {
+            if scope == .debrid { throw PinnedHTTPClient.Failure.unsafeResolution }
+            return value
+        }
+    }
+
+    private func isAllowed(_ url: URL, scope: RouteScope) -> Bool {
+        switch scope {
+        case .community:
+            return url.scheme?.lowercased() == "https" && JSProviderURLPolicy.default.isAllowed(url)
+        case .debrid:
+            return nativeDebridURLPolicy(url)
+        }
     }
 
     private func filteredHeaders(_ input: [String: String], bodyLength: Int, preserveLength: Bool) -> [String: String] {

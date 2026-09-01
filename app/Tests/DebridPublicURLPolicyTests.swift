@@ -2,10 +2,23 @@
 //
 // Run:
 //   xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
-//     app/SourcesShared/DebridPublicURLPolicy.swift app/Tests/DebridPublicURLPolicyTests.swift \
+//     app/SourcesShared/JSProviders/JSProviderURLPolicy.swift app/SourcesShared/JSProviders/PinnedHTTPClient.swift \
+//     app/SourcesShared/DebridPublicURLPolicy.swift app/SourcesShared/JSProviders/CommunityStreamGateway.swift \
+//     app/Sources/Player/StreamRequestHeaderPolicy.swift app/Tests/DebridPublicURLPolicyTests.swift \
 //     -o /tmp/debrid-public-url-policy && /tmp/debrid-public-url-policy
 
 import Foundation
+
+// Minimal product-model seams required to compile the loopback gateway linked by the playback URL adapter.
+enum DiagnosticsLog {
+    static func log(_ category: String, _ message: String) { _ = category; _ = message }
+}
+
+struct CoreStream {
+    let isCommunityJavaScriptProvider: Bool
+    let requestHeaders: [String: String]?
+    let vortxProvider: String?
+}
 
 @main
 struct DebridPublicURLPolicyTests {
