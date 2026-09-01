@@ -86,19 +86,40 @@ private struct TVAVPostReplacementFirstFrameDeadlineModel {
     var currentItemGeneration: UInt64
     var hasFirstFrame = false
     var paused = false
+    var deadlineArmed = false
 
-    mutating func arm(owner: Owner) { self.owner = owner }
+    mutating func arm(owner: Owner) {
+        self.owner = owner
+        deadlineArmed = true
+    }
+
+    mutating func pause() {
+        paused = true
+        deadlineArmed = false
+    }
+
+    mutating func resume(loadToken: Int) {
+        paused = false
+        guard !hasFirstFrame,
+              let owner,
+              owner.loadToken == loadToken,
+              owner.loadToken == activeToken,
+              owner.itemGeneration == currentItemGeneration else { return }
+        deadlineArmed = true
+    }
 
     mutating func acceptFirstFrame(loadToken: Int) {
         guard owner?.loadToken == loadToken,
               currentItemGeneration == owner?.itemGeneration else { return }
         hasFirstFrame = true
+        deadlineArmed = false
         owner = nil
     }
 
     func expiryCanTakeTerminalPath() -> Bool {
         guard let owner else { return false }
-        return !hasFirstFrame
+        return deadlineArmed
+            && !hasFirstFrame
             && !paused
             && owner.loadToken == activeToken
             && owner.itemGeneration == currentItemGeneration
@@ -272,6 +293,13 @@ private enum AppleSourcePlayerChoiceContractTests {
                 && tvReplacementDeadline.contains("PlayerLoadProvenanceState.accepts(")
                 && tvReplacementDeadline.contains("avPlayer.currentItemGeneration == owner.itemGeneration")
                 && tvReplacementDeadline.contains("hopToNextSource(reason: \"AVPlayer replacement produced no frame\")"))
+        let tvPause = section(tvPlayer, from: "case MPVProperty.pause:", to: "case MPVProperty.timePos:")
+        check("tvOS replacement first-frame deadline suspends on pause and re-arms only on the exact resumed AV item",
+              tvPause.contains("suspendAVPostReplacementFirstFrameDeadlineIfOwned(by: loadToken)")
+                && tvPause.contains("resumeAVPostReplacementFirstFrameDeadlineIfOwned(by: loadToken)")
+                && tvReplacementDeadline.contains("private func suspendAVPostReplacementFirstFrameDeadlineIfOwned")
+                && tvReplacementDeadline.contains("private func resumeAVPostReplacementFirstFrameDeadlineIfOwned")
+                && tvReplacementDeadline.contains("avPlayer.currentItemGeneration == owner.itemGeneration"))
         var replacementDeadline = TVAVPostReplacementFirstFrameDeadlineModel(
             owner: nil,
             activeToken: 11,
@@ -280,9 +308,17 @@ private enum AppleSourcePlayerChoiceContractTests {
         replacementDeadline.arm(owner: .init(loadToken: 11, itemGeneration: 42))
         check("tvOS replacement with no first frame reaches the bounded terminal/source-hop path",
               replacementDeadline.expiryCanTakeTerminalPath())
+        replacementDeadline.pause()
+        check("tvOS pause before replacement deadline expiry cannot hop sources",
+              !replacementDeadline.expiryCanTakeTerminalPath())
+        replacementDeadline.resume(loadToken: 11)
+        check("tvOS resume without a replacement first frame restores the bounded terminal/source-hop path",
+              replacementDeadline.expiryCanTakeTerminalPath())
+        replacementDeadline.pause()
         replacementDeadline.activeToken = 12
         replacementDeadline.currentItemGeneration = 43
-        check("tvOS stale replacement deadline cannot terminal a newer item",
+        replacementDeadline.resume(loadToken: 11)
+        check("tvOS stale replacement deadline after resume cannot terminal a newer item",
               !replacementDeadline.expiryCanTakeTerminalPath())
         let tvTrickplay = section(tvPlayer, from: "private func currentLocalTrickplayCaptureDecision", to: "/// The one place a trickplay frame")
         check("tvOS trickplay declares AVPlayer video-output versus libmpv inline backend",

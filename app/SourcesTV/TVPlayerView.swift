@@ -1822,6 +1822,9 @@ struct TVPlayerView: View {
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
                 if b {
+                    if let loadToken {
+                        suspendAVPostReplacementFirstFrameDeadlineIfOwned(by: loadToken)
+                    }
                     resetRapidBufferingRecovery(reason: "user pause")
                     // EOF may have already admitted the next episode. Carry this late user pause into that
                     // replacement rather than letting its default-playing controller restart the series.
@@ -1829,6 +1832,8 @@ struct TVPlayerView: View {
                         queueIncomingTransportIntent(paused: true)
                         if let token = pending.loadToken { bindIncomingTransportIntent(to: token) }
                     }
+                } else if let loadToken {
+                    resumeAVPostReplacementFirstFrameDeadlineIfOwned(by: loadToken)
                 }
                 UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
                 // #157: reflect play/pause on the system card AT ONCE. The play head stops ticking while
@@ -5165,12 +5170,17 @@ struct TVPlayerView: View {
         avPostReplacementFirstFrameDeadlineOwner = owner
         avPostReplacementFirstFrameDeadline = Task { @MainActor in
             try? await Task.sleep(for: .seconds(avPostReplacementFirstFrameDeadlineSeconds))
-            guard !Task.isCancelled,
-                  !hasStartedPlaying,
-                  !isPaused,
+            guard !Task.isCancelled else { return }
+            guard avPostReplacementFirstFrameDeadlineOwner?.loadToken == owner.loadToken,
+                  avPostReplacementFirstFrameDeadlineOwner?.itemGeneration == owner.itemGeneration else { return }
+            // A user pause suspends this one-shot timer. The matching play callback re-arms a fresh,
+            // bounded window only when this exact AVPlayer item is still active.
+            if isPaused {
+                avPostReplacementFirstFrameDeadline = nil
+                return
+            }
+            guard !hasStartedPlaying,
                   !loadFailed,
-                  avPostReplacementFirstFrameDeadlineOwner?.loadToken == owner.loadToken,
-                  avPostReplacementFirstFrameDeadlineOwner?.itemGeneration == owner.itemGeneration,
                   let avPlayer = coordinator.player as? AVPlayerEngineController,
                   PlayerLoadProvenanceState.accepts(
                     callbackToken: owner.loadToken,
@@ -5185,6 +5195,41 @@ struct TVPlayerView: View {
                 presentTerminalLoadFailure()
             }
         }
+    }
+
+    /// Suspending retains the exact replacement owner but retires its one-shot task. A paused user must
+    /// never be moved to another source merely because the fresh AVPlayer item has not rendered yet.
+    private func suspendAVPostReplacementFirstFrameDeadlineIfOwned(by loadToken: PlayerLoadToken) {
+        guard let owner = avPostReplacementFirstFrameDeadlineOwner,
+              owner.loadToken == loadToken,
+              let avPlayer = coordinator.player as? AVPlayerEngineController,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: loadToken,
+                activeToken: avPlayer.activeLoadToken
+              ),
+              avPlayer.currentItemGeneration == owner.itemGeneration else { return }
+        avPostReplacementFirstFrameDeadline?.cancel()
+        avPostReplacementFirstFrameDeadline = nil
+    }
+
+    /// Resume begins a new bounded first-frame observation only for the suspended AVPlayer replacement that
+    /// still owns the active load and item generation. A source or episode transition makes the old owner inert.
+    private func resumeAVPostReplacementFirstFrameDeadlineIfOwned(by loadToken: PlayerLoadToken) {
+        guard !isPaused,
+              !hasStartedPlaying,
+              !loadFailed,
+              let owner = avPostReplacementFirstFrameDeadlineOwner,
+              owner.loadToken == loadToken,
+              let avPlayer = coordinator.player as? AVPlayerEngineController,
+              PlayerLoadProvenanceState.accepts(
+                callbackToken: loadToken,
+                activeToken: avPlayer.activeLoadToken
+              ),
+              avPlayer.currentItemGeneration == owner.itemGeneration else { return }
+        armAVPostReplacementFirstFrameDeadline(
+            loadToken: owner.loadToken,
+            itemGeneration: owner.itemGeneration
+        )
     }
 
     private func cancelAVPostReplacementFirstFrameDeadlineIfOwned(by loadToken: PlayerLoadToken) {
