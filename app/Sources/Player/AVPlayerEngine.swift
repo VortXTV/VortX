@@ -449,11 +449,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var lastMidPlaybackRecoveryProgress: VortXMKVRemuxStream.MountProgress?
     private var midPlaybackRecoveryProgressGeneration: UInt64?
     private var midPlaybackRecoveryBudget = AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget()
-    /// A true surface freeze gets one monotonic window per exact item generation. Producer/input/playlist
-    /// progress or real media-clock movement clears it; otherwise the policy eventually returns terminal so the
-    /// tvOS watchdog can hop instead of retaining forever.
-    private var midPlaybackSurfaceStallGeneration: UInt64?
-    private var midPlaybackSurfaceStallSinceUptime: TimeInterval?
+    private var midPlaybackHardStallTimer = AVPlayerMidPlaybackRecoveryPolicy.HardStallTimer()
     /// Sustained window of advancing playback clock with ZERO video frames before demoting. Long enough to
     /// clear a slow first-frame on a healthy native DV start (normally sub-second once timePos ticks), short
     /// enough that black-with-Atmos flips to a working picture on libmpv in well under ten seconds.
@@ -673,9 +669,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let publishedAhead = playerSeconds.isFinite
             ? max(0, mountedPlayerWindowBounds.producedEdge - playerSeconds)
             : 0
-        let surfaceStallElapsed = elapsedSurfaceStall(
-            isSurfaceStalled: surfaceStalled,
+        let inputOpenInFlight = progress?.inputOpenInFlight == true
+        let hardStallObserved = surfaceStalled
+            && !producerProgressed
+            && !inputOpenInFlight
+            && !playlistProgressed
+        let surfaceStallElapsed = midPlaybackHardStallTimer.elapsed(
             generation: itemGeneration,
+            hardStallObserved: hardStallObserved,
             now: ProcessInfo.processInfo.systemUptime)
         let evidence = AVPlayerMidPlaybackRecoveryPolicy.Evidence(
             generation: itemGeneration,
@@ -684,7 +685,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             isLocalRemux: forwardBufferMount == .localRemux,
             hasPreviousProgressSample: previous != nil,
             producerProgressed: producerProgressed,
-            inputOpenInFlight: progress?.inputOpenInFlight == true,
+            inputOpenInFlight: inputOpenInFlight,
             playlistProgressed: playlistProgressed,
             surfaceStalled: surfaceStalled,
             surfaceStallElapsedSeconds: surfaceStallElapsed,
@@ -708,29 +709,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         midPlaybackRecoveryProgressGeneration = itemGeneration
     }
 
-    private func elapsedSurfaceStall(
-        isSurfaceStalled: Bool,
-        generation: UInt64,
-        now: TimeInterval
-    ) -> TimeInterval {
-        guard isSurfaceStalled, now.isFinite else {
-            midPlaybackSurfaceStallGeneration = nil
-            midPlaybackSurfaceStallSinceUptime = nil
-            return 0
-        }
-        if midPlaybackSurfaceStallGeneration != generation
-            || midPlaybackSurfaceStallSinceUptime == nil {
-            midPlaybackSurfaceStallGeneration = generation
-            midPlaybackSurfaceStallSinceUptime = now
-            return 0
-        }
-        guard let since = midPlaybackSurfaceStallSinceUptime, now >= since else { return 0 }
-        return now - since
-    }
-
     private func resetSurfaceStallEvidence() {
-        midPlaybackSurfaceStallGeneration = nil
-        midPlaybackSurfaceStallSinceUptime = nil
+        midPlaybackHardStallTimer.reset()
     }
 
     /// Executes the only non-terminal action the engine's mid-play policy can authorize. This is intentionally

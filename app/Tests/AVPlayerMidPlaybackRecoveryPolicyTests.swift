@@ -31,6 +31,7 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
         terminalEvidenceStaysTerminal()
         onlyOneReplacementIsAllowedUntilRecovery()
         boundedHardStallEscalates()
+        hardStallProgressResetsEscalationOrigin()
         newGenerationAndTimeBasedStableProgressResetBudget()
         staleOwnershipIsFenced()
 
@@ -169,6 +170,24 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
                     producerProgressed: true,
                     surfaceStallElapsedSeconds: deadline),
                 replacementAlreadyUsed: true) == .retain(.producerProgress))
+    }
+
+    private static func hardStallProgressResetsEscalationOrigin() {
+        let deadline = AVPlayerMidPlaybackRecoveryPolicy.sustainedSurfaceStallEscalationSeconds
+        var timer = AVPlayerMidPlaybackRecoveryPolicy.HardStallTimer()
+        check("hard-stall timer starts at the first frozen no-progress receipt",
+              timer.elapsed(generation: generation, hardStallObserved: true, now: 0) == 0)
+        check("hard-stall timer measures uninterrupted no-progress evidence",
+              timer.elapsed(generation: generation, hardStallObserved: true, now: 59) == 59)
+        check("producer/input/playlist progress at t=59 clears the escalation origin",
+              timer.elapsed(generation: generation, hardStallObserved: false, now: 59) == 0)
+        check("a new freeze at t=120 receives a fresh hard-stall origin",
+              timer.elapsed(generation: generation, hardStallObserved: true, now: 120) == 0)
+        check("the post-progress freeze cannot escalate before a fresh full window",
+              timer.elapsed(generation: generation, hardStallObserved: true, now: 120 + deadline - 0.001)
+                < deadline)
+        check("only uninterrupted hard-stall evidence reaches the new escalation edge",
+              timer.elapsed(generation: generation, hardStallObserved: true, now: 120 + deadline) == deadline)
     }
 
     private static func newGenerationAndTimeBasedStableProgressResetBudget() {

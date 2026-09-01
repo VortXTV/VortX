@@ -195,6 +195,37 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         }
     }
 
+    /// Generation-owned monotonic origin for only an *uninterrupted* hard surface stall. Any contrary health
+    /// evidence clears the origin, so the escalation window cannot accumulate across a producer's ordinary
+    /// rebuffering progress. Invalid clocks fail open to a fresh zero-duration observation.
+    struct HardStallTimer: Equatable {
+        private(set) var generation: UInt64?
+        private(set) var sinceUptime: TimeInterval?
+
+        mutating func elapsed(
+            generation: UInt64,
+            hardStallObserved: Bool,
+            now: TimeInterval
+        ) -> TimeInterval {
+            guard hardStallObserved, now.isFinite else {
+                reset()
+                return 0
+            }
+            guard self.generation == generation, let sinceUptime else {
+                self.generation = generation
+                self.sinceUptime = now
+                return 0
+            }
+            guard now >= sinceUptime else { return 0 }
+            return now - sinceUptime
+        }
+
+        mutating func reset() {
+            generation = nil
+            sinceUptime = nil
+        }
+    }
+
     /// After this much uninterrupted frozen-surface evidence with no producer/input/playlist activity, keeping
     /// the item is no longer an ordinary rebuffer decision. The caller maps this terminal proof to its existing
     /// source-hop/error path. The value is intentionally longer than the outer 30-second first recovery so a
