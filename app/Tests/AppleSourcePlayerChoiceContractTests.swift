@@ -73,6 +73,38 @@ private struct TVAVStallWatchdogGenerationModel {
     }
 }
 
+/// Mirror of the token-and-item-owned deadline armed only after the engine has accepted a fresh AVPlayer item.
+/// It makes the post-replacement blank-surface branch independently executable without linking the app target.
+private struct TVAVPostReplacementFirstFrameDeadlineModel {
+    struct Owner: Equatable {
+        let loadToken: Int
+        let itemGeneration: UInt64
+    }
+
+    var owner: Owner?
+    var activeToken: Int
+    var currentItemGeneration: UInt64
+    var hasFirstFrame = false
+    var paused = false
+
+    mutating func arm(owner: Owner) { self.owner = owner }
+
+    mutating func acceptFirstFrame(loadToken: Int) {
+        guard owner?.loadToken == loadToken,
+              currentItemGeneration == owner?.itemGeneration else { return }
+        hasFirstFrame = true
+        owner = nil
+    }
+
+    func expiryCanTakeTerminalPath() -> Bool {
+        guard let owner else { return false }
+        return !hasFirstFrame
+            && !paused
+            && owner.loadToken == activeToken
+            && owner.itemGeneration == currentItemGeneration
+    }
+}
+
 @main
 private enum AppleSourcePlayerChoiceContractTests {
     @MainActor
@@ -229,6 +261,29 @@ private enum AppleSourcePlayerChoiceContractTests {
         generationModel.firstFrame(loadToken: 11)
         check("tvOS stale retired-item first frame cannot rearm the newer AV watchdog generation",
               !generationModel.canRecoverProvenSurfaceStall)
+        let tvReplacementDeadline = section(
+            tvPlayer,
+            from: "private func armAVPostReplacementFirstFrameDeadline",
+            to: "/// Arm the bounded terminal (EOF) fallback"
+        )
+        check("tvOS proven AV replacement arms and accepted replacement first frame cancels an exact-owner deadline",
+              tvStall.contains("armAVPostReplacementFirstFrameDeadline(")
+                && tvFirstFrame.contains("cancelAVPostReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)")
+                && tvReplacementDeadline.contains("PlayerLoadProvenanceState.accepts(")
+                && tvReplacementDeadline.contains("avPlayer.currentItemGeneration == owner.itemGeneration")
+                && tvReplacementDeadline.contains("hopToNextSource(reason: \"AVPlayer replacement produced no frame\")"))
+        var replacementDeadline = TVAVPostReplacementFirstFrameDeadlineModel(
+            owner: nil,
+            activeToken: 11,
+            currentItemGeneration: 42
+        )
+        replacementDeadline.arm(owner: .init(loadToken: 11, itemGeneration: 42))
+        check("tvOS replacement with no first frame reaches the bounded terminal/source-hop path",
+              replacementDeadline.expiryCanTakeTerminalPath())
+        replacementDeadline.activeToken = 12
+        replacementDeadline.currentItemGeneration = 43
+        check("tvOS stale replacement deadline cannot terminal a newer item",
+              !replacementDeadline.expiryCanTakeTerminalPath())
         let tvTrickplay = section(tvPlayer, from: "private func currentLocalTrickplayCaptureDecision", to: "/// The one place a trickplay frame")
         check("tvOS trickplay declares AVPlayer video-output versus libmpv inline backend",
               tvTrickplay.contains("player is AVPlayerEngineController")

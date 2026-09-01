@@ -848,6 +848,13 @@ struct TVPlayerView: View {
         var deferredTrackList = false
         var subtitleTimingScope: SubtitleTimingScope? = nil
     }
+    /// A same-token AVPlayer replacement changes item generation without recreating this SwiftUI view. Its
+    /// first-frame deadline therefore needs both identities, or a retired replacement task could hop a later
+    /// source/episode that happens to share the outer player view.
+    private struct AVPostReplacementFirstFrameDeadlineOwner {
+        let loadToken: PlayerLoadToken
+        let itemGeneration: UInt64
+    }
     private struct EpisodeSourceSnapshot {
         let url: URL?
         let headers: [String: String]?
@@ -940,6 +947,9 @@ struct TVPlayerView: View {
     /// same-token fresh-item transaction advances this generation, so a delayed watchdog can never recover a
     /// retired item or turn ordinary buffering into the legacy full re-load path.
     @State private var avStallWatchdogItemGeneration: UInt64?
+    @State private var avPostReplacementFirstFrameDeadline: Task<Void, Never>?
+    @State private var avPostReplacementFirstFrameDeadlineOwner: AVPostReplacementFirstFrameDeadlineOwner?
+    private let avPostReplacementFirstFrameDeadlineSeconds: Double = 12
     @State private var lastObservedTime = -1.0
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
@@ -1292,7 +1302,7 @@ struct TVPlayerView: View {
             invalidateNextEpisodePreparation(reason: "player view disappeared")
             invalidateLocalTrickplayCapture()
             cancelAssetSanityObservationDeadline()
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); libmpvResumeWatchdog?.cancel(); postFrameResumeSeekWatchdog?.cancel(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); avPostReplacementFirstFrameDeadline?.cancel(); libmpvResumeWatchdog?.cancel(); postFrameResumeSeekWatchdog?.cancel(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
             cancelTerminalFinalityRefresh()
             invalidateEpisodeResolution()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
@@ -1909,6 +1919,7 @@ struct TVPlayerView: View {
                     )
                     hasStartedPlaying = true
                     rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)
+                    cancelAVPostReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)
                     applyIncomingTransportIntentIfOwned(by: event.loadToken)
                     // A real frame from the same-source fallback completes its recovery obligation. Clearing
                     // this before any later callbacks makes a retired watchdog inert for this source.
@@ -5142,6 +5153,50 @@ struct TVPlayerView: View {
         avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
     }
 
+    private func armAVPostReplacementFirstFrameDeadline(
+        loadToken: PlayerLoadToken,
+        itemGeneration: UInt64
+    ) {
+        avPostReplacementFirstFrameDeadline?.cancel()
+        let owner = AVPostReplacementFirstFrameDeadlineOwner(
+            loadToken: loadToken,
+            itemGeneration: itemGeneration
+        )
+        avPostReplacementFirstFrameDeadlineOwner = owner
+        avPostReplacementFirstFrameDeadline = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(avPostReplacementFirstFrameDeadlineSeconds))
+            guard !Task.isCancelled,
+                  !hasStartedPlaying,
+                  !isPaused,
+                  !loadFailed,
+                  avPostReplacementFirstFrameDeadlineOwner?.loadToken == owner.loadToken,
+                  avPostReplacementFirstFrameDeadlineOwner?.itemGeneration == owner.itemGeneration,
+                  let avPlayer = coordinator.player as? AVPlayerEngineController,
+                  PlayerLoadProvenanceState.accepts(
+                    callbackToken: owner.loadToken,
+                    activeToken: avPlayer.activeLoadToken
+                  ),
+                  avPlayer.currentItemGeneration == owner.itemGeneration else { return }
+            avPostReplacementFirstFrameDeadline = nil
+            avPostReplacementFirstFrameDeadlineOwner = nil
+            DiagnosticsLog.log("player", "AVPlayer replacement produced no frame within \(Int(avPostReplacementFirstFrameDeadlineSeconds))s generation=\(owner.itemGeneration)")
+            if !hopToNextSource(reason: "AVPlayer replacement produced no frame") {
+                loadErrorMsg = "Playback did not recover on this source."
+                presentTerminalLoadFailure()
+            }
+        }
+    }
+
+    private func cancelAVPostReplacementFirstFrameDeadlineIfOwned(by loadToken: PlayerLoadToken) {
+        guard let owner = avPostReplacementFirstFrameDeadlineOwner,
+              owner.loadToken == loadToken,
+              let avPlayer = coordinator.player as? AVPlayerEngineController,
+              avPlayer.currentItemGeneration == owner.itemGeneration else { return }
+        avPostReplacementFirstFrameDeadline?.cancel()
+        avPostReplacementFirstFrameDeadline = nil
+        avPostReplacementFirstFrameDeadlineOwner = nil
+    }
+
     /// Arm the bounded terminal (EOF) fallback. The outgoing episode reached true end-of-file but the EOF
     /// handler cannot advance or exit yet because the requested next target is still resolving. NEVER trust
     /// that resolve to be bounded (diag-22: a dead TorBox left an episode frozen ~15 min on its final frame).
@@ -5361,13 +5416,20 @@ struct TVPlayerView: View {
                 // The engine transaction retains the mounted producer, source-time origin, transport intent,
                 // DV signalling, and semantic media selections. Re-arm only the surface-owned first-frame
                 // state for its NEW exact item generation; do not call the legacy player re-load path.
-                avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
+                let replacementItemGeneration = avPlayer.currentItemGeneration
+                avStallWatchdogItemGeneration = replacementItemGeneration
                 buffering = true
                 hasStartedPlaying = false
                 firstFrameRenderedAt = nil
                 appliedResume = true
                 appliedAutoTracks = true
-                DiagnosticsLog.log("player", "AVPlayer proven surface stall replaced fresh item generation=\(avPlayer.currentItemGeneration)")
+                if let replacementLoadToken = avPlayer.activeLoadToken {
+                    armAVPostReplacementFirstFrameDeadline(
+                        loadToken: replacementLoadToken,
+                        itemGeneration: replacementItemGeneration
+                    )
+                }
+                DiagnosticsLog.log("player", "AVPlayer proven surface stall replaced fresh item generation=\(replacementItemGeneration)")
                 return
             case .terminal(let proof):
                 DiagnosticsLog.log("player", "AVPlayer stall terminal proof=\(String(describing: proof))")
