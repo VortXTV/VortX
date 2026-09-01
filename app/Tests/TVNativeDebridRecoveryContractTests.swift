@@ -30,9 +30,9 @@ private enum TVNativeDebridRecoveryContractTests {
 
         check(
             "one fresh native-debrid link is allowed per current mount",
-            source.contains("nativeDebridFreshLinkRecoveryUsed")
-                && source.contains("guard !nativeDebridFreshLinkRecoveryUsed")
-                && source.contains("nativeDebridFreshLinkRecoveryUsed = true")
+            source.contains("nativeDebridFreshLinkRecovery.freshLinkUsed")
+                && source.contains("nativeDebridFreshLinkRecovery.beginFreshLink")
+                && source.contains("freshLinkUsed = true")
         )
         check(
             "the generalized recovery owner preserves TorBox provider identifiers",
@@ -60,7 +60,7 @@ private enum TVNativeDebridRecoveryContractTests {
         check(
             "direct URLs without a native reference remain outside provider recovery",
             source.contains("let retryRef = pendingAdvance?.debridRef ?? curDebridRef")
-                && source.contains("guard !nativeDebridFreshLinkRecoveryUsed,")
+                && source.contains("guard !nativeDebridFreshLinkRecovery.freshLinkUsed,")
                 && source.contains("let ref = retryRef, !ref.infoHash.isEmpty else { return false }")
         )
         check(
@@ -79,6 +79,23 @@ private enum TVNativeDebridRecoveryContractTests {
             "healthy engine switches remain provider-free",
             source.contains("if needsFreshNativeDebridLink,")
                 && source.contains("performPlayerEngineSwitch(toAVPlayer: toAVPlayer)")
+        )
+        check(
+            "an engine switch joins an in-flight fresh-link recovery instead of mounting stale transport",
+            source.contains("nativeDebridFreshLinkRecovery.freshLinkInFlight")
+                && source.contains("nativeDebridFreshLinkRecovery.joinEngineSwitch(toAVPlayer)")
+                && source.contains("let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()")
+        )
+        check(
+            "a provider fresh-link clears old add-on credentials before either player mounts it",
+            URL(string: "https://addon.example.invalid/stream")?.host
+                != URL(string: "https://provider.example.invalid/download")?.host
+                && ["Authorization": "Bearer addon-token", "Cookie": "addon-session", "Referer": "https://addon.example.invalid"]
+                    .keys.count == 3
+                && source.contains("curURL = fresh")
+                && source.contains("curHeaders = nil")
+                && source.contains("loadIntoPlayer(fresh, headers: curHeaders")
+                && source.contains("engineSurfaceHeadersOverride = curHeaders")
         )
         check(
             "only a raw torrent rebind creates before a replacement load",

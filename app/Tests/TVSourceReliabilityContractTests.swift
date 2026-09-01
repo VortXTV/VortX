@@ -78,7 +78,7 @@ private enum TVSourceReliabilityContractTests {
             tvPlayer.contains("if currentPickWasExplicit {")
                 && tvPlayer.contains("This source didn't produce playable media. Choose another source.")
                 && tvPlayer.contains("recoverCurrentNativeDebridLink(reason: \"fallback MPV produced no frame\")")
-                && tvPlayer.contains("nativeDebridFreshLinkRecoveryUsed")
+                && tvPlayer.contains("nativeDebridFreshLinkRecovery.freshLinkUsed")
         )
         check(
             "cold-resume nudge is bounded and stays on the relative-seek path",

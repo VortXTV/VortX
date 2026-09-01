@@ -2753,7 +2753,7 @@ enum PlayerLiveContractTests {
         let midPlaybackRecovery = sourceSection(
             playerScreen,
             from: "private func recoverFromStall()",
-            to: "#if os(iOS) || os(macOS)")
+            to: "/// Show a small transient notice over the video")
         let firstFrameCommit = sourceSection(
             playerScreen,
             from: "case MPVProperty.timePos:",
@@ -4170,14 +4170,16 @@ enum PlayerLiveContractTests {
               ]))
         let autoTrackSelection = sourceSection(
             tvPlayer,
-            from: "private func autoSelectTracks()",
+            from: "private func autoSelectTracks(",
             to: "/// Snapshot the viewer's CURRENT explicit subtitle selection")
         check("wiring: automatic recovery re-applies semantic audio once then falls back to TrackSelector",
               sourceContainsInOrder(autoTrackSelection, [
                   "if let pendingAudioReapply",
-                  "PlayerRecoveryAudioChoice.matchingID",
+                  "TVTrackRecoveryPolicy.audioAction",
+                  "case let .reapply(id)",
                   "coordinator.player?.setAudioTrack(id)",
-                  "else if let automaticAudio",
+                  "case let .automatic(id)",
+                  "recovery audio unavailable; applied automatic fallback",
                   "self.pendingAudioReapply = nil",
               ]))
         check("wiring: automatic reload and source hop carry audio, while refusal restores it",
@@ -4325,10 +4327,14 @@ enum PlayerLiveContractTests {
                     "pendingPlaybackIntent = nil",
                   ])
                   && groupLoad?.contains("registerSeekAdmission(") == false)
-        check("wiring: an accepted mid-play reload rearms the start watchdog",
+        check("wiring: AVPlayer mid-play recovery uses the item-generation-owned surface-stall transaction",
               sourceContainsInOrder(midPlaybackRecovery, [
-                  "let issuedToken = loadIntoPlayer(",
-                  "if issuedToken != nil { startLoadTimeout() }",
+                  "let expectedGeneration = avStallWatchdogItemGeneration ?? avPlayer.currentItemGeneration",
+                  "recoverFreshItemForProvenSurfaceStall(",
+                  "case .retain",
+                  "case .replaceFreshItem",
+                  "avStallWatchdogItemGeneration = avPlayer.currentItemGeneration",
+                  "case .terminal",
               ]))
         check("wiring: first-frame delivery does not replenish the mid-play recovery budget",
               firstFrameCommit?.contains("stallRecoveries = 0") == false)

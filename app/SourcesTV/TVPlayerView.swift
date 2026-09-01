@@ -149,6 +149,49 @@ enum TVTrackRecoveryPolicy {
         }
     }
 }
+
+// BEGIN native-debrid recovery switch state machine
+/// The provider request is one transaction per current native-debrid mount. A user engine request that lands
+/// while it is in flight joins the transaction, so the new player can only be mounted from the accepted fresh
+/// URL rather than racing ahead on the stale transport URL.
+enum TVNativeDebridRecoveryStateMachine {
+    struct State: Equatable {
+        private(set) var freshLinkUsed = false
+        private(set) var freshLinkInFlight = false
+        private(set) var requestedEngine: Bool?
+
+        mutating func beginFreshLink(requestedEngine: Bool? = nil) -> Bool {
+            guard !freshLinkUsed, !freshLinkInFlight else { return false }
+            freshLinkUsed = true
+            freshLinkInFlight = true
+            self.requestedEngine = requestedEngine
+            return true
+        }
+
+        /// Returns false when there is no live recovery to join. The latest user request wins while the stale
+        /// URL is deliberately kept mounted; no provider call and no player surface swap happens here.
+        mutating func joinEngineSwitch(_ engine: Bool) -> Bool {
+            guard freshLinkInFlight else { return false }
+            requestedEngine = engine
+            return true
+        }
+
+        /// Consumes the joined engine request exactly once with the accepted fresh URL.
+        mutating func finishFreshLink() -> Bool? {
+            guard freshLinkInFlight else { return nil }
+            freshLinkInFlight = false
+            defer { requestedEngine = nil }
+            return requestedEngine
+        }
+
+        mutating func reset() {
+            freshLinkUsed = false
+            freshLinkInFlight = false
+            requestedEngine = nil
+        }
+    }
+}
+// END native-debrid recovery switch state machine
 // END tvOS track recovery policy
 
 /// Pure ownership and first-frame gates shared by the 30-second source-hop timer and the event surface.
@@ -583,13 +626,12 @@ struct TVPlayerView: View {
     /// True while the INITIAL source is a Continue-Watching resume (see startedFromResume). Cleared once the
     /// player switches to any other source, so only the first stored-link attempt gets resume-hop treatment.
     @State private var currentPlaybackIsResume = false
-    /// Compatibility receipt for the former Continue-Watching-only recovery path. The real gate is now
-    /// `nativeDebridFreshLinkRecoveryUsed`, which applies to every native-debrid mount, not just CW.
+    /// Compatibility receipt for the former Continue-Watching-only recovery path. The real gate is now the
+    /// joinable `nativeDebridFreshLinkRecovery` transaction, which applies to every native-debrid mount.
     @State private var resumeSourceReresolved = false
-    /// Exactly one same-source fresh-link request is permitted for the current native-debrid mount after a
-    /// confirmed failure. The provider reference is durable; its URL is transport state and can expire while a
-    /// title is playing. This gate resets only when the source or episode genuinely changes.
-    @State private var nativeDebridFreshLinkRecoveryUsed = false
+    /// Exactly one same-source provider refresh is permitted for the current native-debrid mount. While its
+    /// fresh URL is in flight, an engine switch joins rather than mounting the known-stale URL.
+    @State private var nativeDebridFreshLinkRecovery = TVNativeDebridRecoveryStateMachine.State()
     /// When the app was last suspended while this player stayed mounted, so the foreground hook knows HOW LONG
     /// it was away. Nothing on-device can tell a live debrid link from an expired one, and re-minting a healthy
     /// one would cost the viewer a reload for nothing, so the suspension length is the only honest gate.
@@ -3852,7 +3894,7 @@ struct TVPlayerView: View {
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         resetRapidBufferingRecovery(reason: "issued source switch")
         sourceHops = 0; exhaustedURLs = []
-        nativeDebridFreshLinkRecoveryUsed = false
+        nativeDebridFreshLinkRecovery.reset()
         if userInitiated {
             avEngineFailed = false
             recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -5033,7 +5075,7 @@ struct TVPlayerView: View {
             resumeSeconds = resume
             resumeIsMidPlayRecovery = true   // a live play head carried across the re-mount, not a stored offset
             resumeSourceReresolved = false
-            nativeDebridFreshLinkRecoveryUsed = false   // one proactive fresh link per suspension
+            nativeDebridFreshLinkRecovery.reset()   // one proactive fresh link per suspension
             if recoverCurrentNativeDebridLink(reason: "foreground") {
                 DiagnosticsLog.log("player", "foreground: re-resolving the debrid mount after \(Int(seconds))s suspended")
             }
@@ -5226,9 +5268,9 @@ struct TVPlayerView: View {
         // now-stale first frame across the reload instead of the fresh one this recovery is about to render.
         // Mirrors iOS PlayerScreen.recoverFromStall.
         firstFrameRenderedAt = nil
-        let previousURL = curURL
+        let mountPreviousURL = curURL
         let replacementURL = liveMountURL()
-        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: replacementURL)
+        prepareRawTorrentAfterLoopbackRebind(from: mountPreviousURL, to: replacementURL)
         curURL = replacementURL   // self-heal a drifted embedded-server port before replaying the mount
         let issuedToken = loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
                                          reusing: recoveryToken, resumeOrigin: currentTime)
@@ -5630,6 +5672,12 @@ struct TVPlayerView: View {
         if toAVPlayer, !canUseAVPlayerEngine {
             showEngineNote("This source can only play on the built-in (libmpv) engine.")
             withAnimation { showOptions = false }; return
+        }
+        if nativeDebridFreshLinkRecovery.freshLinkInFlight {
+            _ = nativeDebridFreshLinkRecovery.joinEngineSwitch(toAVPlayer)
+            DiagnosticsLog.log("player", "user engine switch joined native-debrid fresh-link recovery")
+            withAnimation { showOptions = false }
+            return
         }
         let needsFreshNativeDebridLink = reconnecting || autoRetryTask != nil
         if needsFreshNativeDebridLink,
@@ -6291,9 +6339,15 @@ struct TVPlayerView: View {
         reason: String,
         requestedEngine: Bool? = nil
     ) -> Bool {
+        if nativeDebridFreshLinkRecovery.freshLinkInFlight {
+            if let requestedEngine {
+                _ = nativeDebridFreshLinkRecovery.joinEngineSwitch(requestedEngine)
+            }
+            return true
+        }
         let retryRef = pendingAdvance?.debridRef ?? curDebridRef
         let retryMeta = pendingAdvance?.meta ?? curMeta
-        guard !nativeDebridFreshLinkRecoveryUsed,
+        guard !nativeDebridFreshLinkRecovery.freshLinkUsed,
               let ref = retryRef, !ref.infoHash.isEmpty else { return false }
         let hint = episodeHint(for: retryMeta)
         let retryRequiresSemanticSelection = isEpisodePlaybackContext
@@ -6313,7 +6367,9 @@ struct TVPlayerView: View {
         let pausedIntent = isPaused
         captureRecoverySelections()
         queueIncomingTransportIntent(paused: pausedIntent)
-        nativeDebridFreshLinkRecoveryUsed = true
+        guard nativeDebridFreshLinkRecovery.beginFreshLink(requestedEngine: requestedEngine) else {
+            return false
+        }
         resumeSourceReresolved = true
         withAnimation { reconnecting = true }
         autoRetryTask?.cancel()
@@ -6333,10 +6389,15 @@ struct TVPlayerView: View {
                   retrySourceGeneration == sourceSwitchGeneration,
                   coordinator.player?.activeLoadToken == retryToken,
                   activeRef == ref, curURL == retryURL, curSourceStream == retrySource else { return }
+            let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()
             if let fresh {
                 DiagnosticsLog.log("player", "native-debrid fresh-link accepted service=\(ref.service) reason=\(safeFailureClass(reason)) generation=\(generation)")
                 reconnecting = false
                 curURL = fresh
+                // A native-debrid URL is a provider-owned transport boundary. The original add-on headers may
+                // contain credentials scoped to a different origin, and DebridCoordinator currently returns no
+                // provider-scoped replacement headers. Never forward those credentials across this handoff.
+                curHeaders = nil
                 let freshRef = DebridPlaybackRef(
                     url: fresh, service: ref.service, infoHash: ref.infoHash,
                     torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx
@@ -6353,7 +6414,7 @@ struct TVPlayerView: View {
                     )
                 }
                 resumeSeconds = resume
-                if let requestedEngine {
+                if let requestedEngine = joinedEngine {
                     // `engineSurfacePlayback` seeds the next SwiftUI controller with this fresh URL. The
                     // actual mount remains owned by the normal switch transaction, which preserves all
                     // stop-before-swap and token fencing guarantees.
@@ -7782,7 +7843,7 @@ struct TVPlayerView: View {
         avEngineFailed = false
         currentPickWasExplicit = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         currentPlaybackIsResume = false; resumeSourceReresolved = false
-        nativeDebridFreshLinkRecoveryUsed = false
+        nativeDebridFreshLinkRecovery.reset()
         directAVNoFrameRecovery = nil
         libmpvStartupNudgeIssued = false
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
