@@ -156,16 +156,24 @@ enum TVTrackRecoveryPolicy {
 /// URL rather than racing ahead on the stale transport URL.
 enum TVNativeDebridRecoveryStateMachine {
     struct State: Equatable {
+        struct Completion: Equatable {
+            let requestedEngine: Bool?
+        }
+
         private(set) var freshLinkUsed = false
         private(set) var freshLinkInFlight = false
         private(set) var requestedEngine: Bool?
+        private(set) var activeRecoveryID: UInt64?
+        private var nextRecoveryID: UInt64 = 0
 
-        mutating func beginFreshLink(requestedEngine: Bool? = nil) -> Bool {
-            guard !freshLinkUsed, !freshLinkInFlight else { return false }
+        mutating func beginFreshLink(requestedEngine: Bool? = nil) -> UInt64? {
+            guard !freshLinkUsed, !freshLinkInFlight else { return nil }
+            nextRecoveryID &+= 1
             freshLinkUsed = true
             freshLinkInFlight = true
             self.requestedEngine = requestedEngine
-            return true
+            activeRecoveryID = nextRecoveryID
+            return nextRecoveryID
         }
 
         /// Returns false when there is no live recovery to join. The latest user request wins while the stale
@@ -176,18 +184,34 @@ enum TVNativeDebridRecoveryStateMachine {
             return true
         }
 
-        /// Consumes the joined engine request exactly once with the accepted fresh URL.
-        mutating func finishFreshLink() -> Bool? {
-            guard freshLinkInFlight else { return nil }
+        /// Consumes the joined engine request exactly once with the accepted fresh URL. A stale or cancelled
+        /// task has no authority to finish a later transaction after the source state has been reset.
+        mutating func finishFreshLink(ownedBy recoveryID: UInt64) -> Completion? {
+            guard freshLinkInFlight, activeRecoveryID == recoveryID else { return nil }
             freshLinkInFlight = false
+            activeRecoveryID = nil
             defer { requestedEngine = nil }
-            return requestedEngine
+            return Completion(requestedEngine: requestedEngine)
+        }
+
+        /// Cancellation and stale ownership failures make the provider retryable again. The exact owner check
+        /// is essential: an old request may complete after an episode/source reset but cannot retire that new
+        /// mount's transaction.
+        @discardableResult
+        mutating func retireFreshLink(ownedBy recoveryID: UInt64) -> Bool {
+            guard freshLinkInFlight, activeRecoveryID == recoveryID else { return false }
+            freshLinkUsed = false
+            freshLinkInFlight = false
+            requestedEngine = nil
+            activeRecoveryID = nil
+            return true
         }
 
         mutating func reset() {
             freshLinkUsed = false
             freshLinkInFlight = false
             requestedEngine = nil
+            activeRecoveryID = nil
         }
     }
 }
@@ -6438,13 +6462,17 @@ struct TVPlayerView: View {
         let pausedIntent = isPaused
         captureRecoverySelections()
         queueIncomingTransportIntent(paused: pausedIntent)
-        guard nativeDebridFreshLinkRecovery.beginFreshLink(requestedEngine: requestedEngine) else {
+        guard let recoveryID = nativeDebridFreshLinkRecovery.beginFreshLink(requestedEngine: requestedEngine) else {
             return false
         }
         resumeSourceReresolved = true
         withAnimation { reconnecting = true }
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
+            // Every return below, including cooperative cancellation and a generation/token ownership fence,
+            // must retire only THIS request. Otherwise a late first frame can cancel this task and strand the
+            // source forever in an in-flight state that all later recovery/engine-switch attempts merely join.
+            defer { _ = nativeDebridFreshLinkRecovery.retireFreshLink(ownedBy: recoveryID) }
             let fresh = try? await DebridCoordinator.shared.reresolve(
                 service: ref.service, infoHash: ref.infoHash,
                 torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
@@ -6460,7 +6488,9 @@ struct TVPlayerView: View {
                   retrySourceGeneration == sourceSwitchGeneration,
                   coordinator.player?.activeLoadToken == retryToken,
                   activeRef == ref, curURL == retryURL, curSourceStream == retrySource else { return }
-            let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()
+            guard let recoveryCompletion = nativeDebridFreshLinkRecovery.finishFreshLink(ownedBy: recoveryID) else {
+                return
+            }
             if let fresh {
                 DiagnosticsLog.log("player", "native-debrid fresh-link accepted service=\(ref.service) reason=\(safeFailureClass(reason)) generation=\(generation)")
                 reconnecting = false
@@ -6485,7 +6515,7 @@ struct TVPlayerView: View {
                     )
                 }
                 resumeSeconds = resume
-                if let requestedEngine = joinedEngine {
+                if let requestedEngine = recoveryCompletion.requestedEngine {
                     // `engineSurfacePlayback` seeds the next SwiftUI controller with this fresh URL. The
                     // actual mount remains owned by the normal switch transaction, which preserves all
                     // stop-before-swap and token fencing guarantees.

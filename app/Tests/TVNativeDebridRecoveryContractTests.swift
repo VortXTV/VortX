@@ -84,7 +84,9 @@ private enum TVNativeDebridRecoveryContractTests {
             "an engine switch joins an in-flight fresh-link recovery instead of mounting stale transport",
             source.contains("nativeDebridFreshLinkRecovery.freshLinkInFlight")
                 && source.contains("nativeDebridFreshLinkRecovery.joinEngineSwitch(toAVPlayer)")
-                && source.contains("let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()")
+                && source.contains("let recoveryID = nativeDebridFreshLinkRecovery.beginFreshLink")
+                && source.contains("nativeDebridFreshLinkRecovery.finishFreshLink(ownedBy: recoveryID)")
+                && source.contains("nativeDebridFreshLinkRecovery.retireFreshLink(ownedBy: recoveryID)")
         )
         check(
             "a provider fresh-link clears old add-on credentials before either player mounts it",
