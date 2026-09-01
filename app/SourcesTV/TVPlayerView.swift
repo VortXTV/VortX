@@ -325,6 +325,7 @@ struct TVPlayerView: View {
 
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     /// Episode-scoped auxiliary contributors owned by the player's preload generation. They are separate from
     /// the covered detail page so preparing E2 never mutates the E1 rows behind the player.
     @StateObject private var preloadTorboxSearch = TorBoxSearchSource()
@@ -981,7 +982,17 @@ struct TVPlayerView: View {
 
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
-            RemoteCatcher(onPress: { handlePress($0) }, onSwipe: { noteInteraction(); if !stillWatching { showControls() } })
+            RemoteCatcher(
+                onPress: { handlePress($0) },
+                onSwipe: { noteInteraction(); if !stillWatching { showControls() } },
+                accessibilityItems: remoteAccessibilityItems,
+                accessibilityFocusedID: remoteAccessibilityFocusedID,
+                accessibilityAnnouncement: remoteAccessibilityAnnouncement,
+                onAccessibilityFocus: remoteAccessibilityFocus,
+                onAccessibilityActivate: remoteAccessibilityActivate,
+                onAccessibilityAdjust: remoteAccessibilityAdjust,
+                onAccessibilityEscape: { handlePress(.menu) }
+            )
 
             if buffering && !loadFailed {
                 VStack(spacing: Theme.Space.md) {
@@ -2383,6 +2394,7 @@ struct TVPlayerView: View {
                 case .audioSettings:    openPanel(.audio)
                 case .subtitleSettings: openPanel(.subtitles)
                 case .subtitleLanguage: openPanel(.subtitles)
+                case .sourceAudio:      openPanel(.sources, preferredAccessibilityID: "sources.audio")
                 case .engine:           openPanel(.playerSettings)
                 case .sleep:            openPanel(.playerSettings)
                 default:                closePanel()
@@ -2828,11 +2840,14 @@ struct TVPlayerView: View {
                     .offset(x: max(0, w * frac - knob / 2))
             }
             .frame(maxHeight: .infinity, alignment: .center)
-            .animation(.easeOut(duration: 0.15), value: focused)
+            .animation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.15), value: focused)
             // Linear so consecutive scrub steps blend into one continuous glide instead of each easing
             // out and stuttering against the next; slightly longer when not scrubbing so the play head
             // drifts smoothly between the position updates.
-            .animation(scrubbing ? .linear(duration: 0.16) : .linear(duration: 0.28), value: frac)
+            .animation(
+                accessibilityReduceMotion ? nil : (scrubbing ? .linear(duration: 0.16) : .linear(duration: 0.28)),
+                value: frac
+            )
         }
         .frame(height: 28)
     }
@@ -2868,8 +2883,8 @@ struct TVPlayerView: View {
             .foregroundStyle(sel ? Theme.Palette.canvas : Theme.Palette.textPrimary)
             .frame(width: d, height: d)
             .background { ctrlButtonBackground(sel) }
-            .scaleEffect(sel ? 1.12 : 1.0)
-            .animation(.easeOut(duration: 0.18), value: sel)
+            .scaleEffect(accessibilityReduceMotion ? 1.0 : (sel ? 1.12 : 1.0))
+            .animation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.18), value: sel)
     }
 
     /// The SELECTED (remote-focused) button keeps the solid accent fill: that bold ember disc IS the
@@ -2892,7 +2907,8 @@ struct TVPlayerView: View {
     private enum SkipField { case start, end }
 
     private struct OptionRow: Identifiable {
-        let id = UUID()
+        let id: String
+        let accessibilityID: String
         let label: String
         var detail: String = ""        // right-aligned secondary text (e.g. current value)
         var isSelected: Bool = false
@@ -2900,6 +2916,28 @@ struct TVPlayerView: View {
         var isEnabled: Bool = true
         var skipField: SkipField? = nil   // non-nil only on the skip editor's Start/End rows
         var action: () -> Void = {}
+
+        init(
+            accessibilityID: String? = nil,
+            label: String,
+            detail: String = "",
+            isSelected: Bool = false,
+            isHeader: Bool = false,
+            isEnabled: Bool = true,
+            skipField: SkipField? = nil,
+            action: @escaping () -> Void = {}
+        ) {
+            let identity = accessibilityID ?? "row.\(UUID().uuidString)"
+            self.id = identity
+            self.accessibilityID = identity
+            self.label = label
+            self.detail = detail
+            self.isSelected = isSelected
+            self.isHeader = isHeader
+            self.isEnabled = isEnabled
+            self.skipField = skipField
+            self.action = action
+        }
     }
 
     // Subtitle-sync nudge steps. Primary is 0.5s so a multi-second offset takes a few taps (5s = 10 taps, not
@@ -3472,7 +3510,9 @@ struct TVPlayerView: View {
         if !qualityOptions.isEmpty {
             rows.append(OptionRow(label: "Quality", detail: "›") { openPanel(.quality) })
         }
-        rows.append(OptionRow(label: "Audio", detail: "›") { openPanel(.sourceAudio) })
+        rows.append(OptionRow(accessibilityID: "sources.audio", label: "Audio", detail: "›") {
+            openPanel(.sourceAudio)
+        })
         rows.append(OptionRow(label: "Sources", isHeader: true))
         // Install the session audio-language filter as a task-local for the ranking reads only (iOS parity,
         // #204): `StreamRanking.score` -> `languageScore` reads `TrackPreferences.current.audioLanguages` live
@@ -3512,15 +3552,27 @@ struct TVPlayerView: View {
     /// "Auto" + the curated language list. Selecting a language sets `sessionAudioLanguages`, which re-ranks
     /// the rows built above so releases carrying that audio float up.
     private func audioLanguageFilterRows() -> [OptionRow] {
-        var rs: [OptionRow] = [OptionRow(label: String(localized: "Audio"), isHeader: true)]
-        rs.append(OptionRow(label: String(localized: "Auto"), isSelected: sessionAudioLanguages == nil) {
+        var rs: [OptionRow] = [OptionRow(
+            accessibilityID: "source-audio.heading",
+            label: String(localized: "Audio"),
+            isHeader: true
+        )]
+        rs.append(OptionRow(
+            accessibilityID: "source-audio.auto",
+            label: String(localized: "Auto"),
+            isSelected: sessionAudioLanguages == nil
+        ) {
             sessionAudioLanguages = nil
-            openPanel(.sources)
+            openPanel(.sources, preferredAccessibilityID: "sources.audio")
         })
         for lang in TrackPreferences.commonLanguages {
-            rs.append(OptionRow(label: lang.label, isSelected: sessionAudioLanguages == [lang.id]) {
+            rs.append(OptionRow(
+                accessibilityID: "source-audio.language.\(lang.id)",
+                label: lang.label,
+                isSelected: sessionAudioLanguages == [lang.id]
+            ) {
                 sessionAudioLanguages = [lang.id]
-                openPanel(.sources)
+                openPanel(.sources, preferredAccessibilityID: "sources.audio")
             })
         }
         return rs
@@ -4416,7 +4468,13 @@ struct TVPlayerView: View {
                     }
                     .padding(Theme.Space.lg)
                 }
-                .onChange(of: optionRow) { _ in withAnimation { proxy.scrollTo(optionRow, anchor: .center) } }
+                .onChange(of: optionRow) { _ in
+                    if accessibilityReduceMotion {
+                        proxy.scrollTo(optionRow, anchor: .center)
+                    } else {
+                        withAnimation(.easeOut(duration: 0.18)) { proxy.scrollTo(optionRow, anchor: .center) }
+                    }
+                }
                 }
             }
             .frame(width: 760)
@@ -4426,7 +4484,7 @@ struct TVPlayerView: View {
             .vortxGlassPanel(in: Rectangle(), dockedTo: .trailing)
         }
         .ignoresSafeArea()
-        .transition(.move(edge: .trailing))
+        .transition(accessibilityReduceMotion ? .identity : .move(edge: .trailing))
         .task(id: showOptions) {
             // Backstop: rebuild the cached rows of WHATEVER panel is open, ~1 Hz, so no async
             // completion can leave a stale row. Sources/episodes keep arriving after the panel opens
@@ -4486,7 +4544,7 @@ struct TVPlayerView: View {
         return rows[optionRow].skipField
     }
 
-    private func openPanel(_ kind: PanelKind) {
+    private func openPanel(_ kind: PanelKind, preferredAccessibilityID: String? = nil) {
         panelKind = kind
         refreshTracks()
         refreshSourceOptionCounts()
@@ -4498,14 +4556,16 @@ struct TVPlayerView: View {
         // Single-choice panels open on the current selection; the mixed settings panel opens
         // at the top (its decoder radio would otherwise swallow the seed and skip "Play in").
         let seedOnSelection = kind != .playerSettings
-        optionRow = (seedOnSelection
+        optionRow = preferredAccessibilityID.flatMap { identity in
+            panelRows.firstIndex { $0.accessibilityID == identity && !$0.isHeader && $0.isEnabled }
+        } ?? (seedOnSelection
             ? panelRows.firstIndex { $0.isSelected && $0.isEnabled }
             : nil)
             ?? panelRows.firstIndex { !$0.isHeader && $0.isEnabled } ?? 0
-        withAnimation { showOptions = true }
+        withAnimation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.2)) { showOptions = true }
     }
     private func closePanel() {
-        withAnimation { showOptions = false }
+        withAnimation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.2)) { showOptions = false }
         showInfo = true; selected = .play; scheduleHide()
     }
 
@@ -7393,8 +7453,8 @@ struct TVPlayerView: View {
                 .padding(Theme.Space.screenEdge * 1.5)
             }
         }
-        .transition(.move(edge: .bottom).combined(with: .opacity))
-        .animation(.easeOut(duration: 0.15), value: upNextWantsCredits)
+        .transition(accessibilityReduceMotion ? .identity : .move(edge: .bottom).combined(with: .opacity))
+        .animation(accessibilityReduceMotion ? nil : .easeOut(duration: 0.15), value: upNextWantsCredits)
     }
 
     private func upNextButton(_ title: String, systemImage: String?, highlighted: Bool) -> some View {
@@ -7411,7 +7471,7 @@ struct TVPlayerView: View {
         .background { if highlighted { Capsule().fill(Theme.Palette.accent) } }
         .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
         .overlay(Capsule().stroke(Theme.Palette.canvas, lineWidth: highlighted ? 3 : 0))
-        .scaleEffect(highlighted ? 1.06 : 1.0)
+        .scaleEffect(accessibilityReduceMotion ? 1.0 : (highlighted ? 1.06 : 1.0))
         .fixedSize(horizontal: true, vertical: false)
     }
 
@@ -9864,8 +9924,198 @@ struct TVPlayerView: View {
         .background { if highlighted { Capsule().fill(Theme.Palette.accent) } }
         .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
         .overlay(Capsule().stroke(Theme.Palette.canvas, lineWidth: highlighted ? 3 : 0))
-        .scaleEffect(highlighted ? 1.06 : 1.0)
+        .scaleEffect(accessibilityReduceMotion ? 1.0 : (highlighted ? 1.06 : 1.0))
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    // MARK: - Remote-catcher accessibility bridge
+
+    /// The transparent UIKit catcher remains the only physical tvOS focus target, but VoiceOver and Switch
+    /// Control need individual semantic targets. These virtual rows mirror the same `selected` / `optionRow`
+    /// state and call the same activation functions as the Siri Remote, so accessibility never forks behavior.
+    private var remoteAccessibilityItems: [RemoteCatcher.AccessibilityItem] {
+        if stillWatching {
+            return [
+                .init(id: "still-watching.continue", label: "Continue watching", hint: "Resumes playback",
+                      traits: stillWatchingWantsStop ? .button : [.button, .selected]),
+                .init(id: "still-watching.stop", label: "Stop watching", hint: "Closes the player",
+                      traits: stillWatchingWantsStop ? [.button, .selected] : .button)
+            ]
+        }
+
+        if showOptions {
+            var items: [RemoteCatcher.AccessibilityItem] = [
+                .init(id: "panel.heading.\(panelTitle)", label: panelTitle, traits: .header, isEnabled: false)
+            ]
+            items.append(contentsOf: panelRows.map { row in
+                let opensSubmenu = row.detail == "›" || row.detail.hasSuffix(" ›")
+                let value = row.detail.isEmpty || opensSubmenu ? nil : row.detail
+                var traits: UIAccessibilityTraits = row.isHeader ? .header : .button
+                if row.isSelected { traits.insert(.selected) }
+                if !row.isEnabled { traits.insert(.notEnabled) }
+                return .init(
+                    id: "option.\(row.accessibilityID)",
+                    label: row.label,
+                    value: value,
+                    hint: opensSubmenu ? "Opens submenu" : nil,
+                    traits: traits,
+                    isEnabled: row.isEnabled && !row.isHeader
+                )
+            })
+            return items
+        }
+
+        if controlsHidden, upNextRemaining != nil || isCreditsUpNext {
+            return [
+                .init(id: "up-next.play", label: "Play next episode now",
+                      traits: upNextWantsCredits ? .button : [.button, .selected]),
+                .init(id: "up-next.credits", label: "Watch credits",
+                      traits: upNextWantsCredits ? [.button, .selected] : .button)
+            ]
+        }
+
+        if showInfo {
+            var controls: [Control] = [.close]
+            if !isCurrentLiveStream { controls.append(.scrub) }
+            controls.append(contentsOf: buttonRow)
+            return controls.map { control in
+                var traits: UIAccessibilityTraits = control == .scrub ? .adjustable : .button
+                if selected == control { traits.insert(.selected) }
+                return .init(
+                    id: "control.\(controlAccessibilityID(control))",
+                    label: controlAccessibilityLabel(control),
+                    value: control == .scrub ? "\(timeString(scrubbing ? scrubTarget : currentTime)) of \(timeString(duration))" : nil,
+                    hint: control == .scrub ? "Swipe up or down to seek" : nil,
+                    traits: traits,
+                    isAdjustable: control == .scrub
+                )
+            }
+        }
+
+        return [
+            .init(id: "hidden.show-controls", label: "Show playback controls", traits: .button),
+            .init(id: "hidden.play-pause", label: isPaused ? "Resume playback" : "Pause playback", traits: .button)
+        ]
+    }
+
+    private var remoteAccessibilityFocusedID: String? {
+        if stillWatching { return stillWatchingWantsStop ? "still-watching.stop" : "still-watching.continue" }
+        if showOptions, panelRows.indices.contains(optionRow) {
+            return "option.\(panelRows[optionRow].accessibilityID)"
+        }
+        if controlsHidden, upNextRemaining != nil || isCreditsUpNext {
+            return upNextWantsCredits ? "up-next.credits" : "up-next.play"
+        }
+        if showInfo { return "control.\(controlAccessibilityID(selected))" }
+        return nil
+    }
+
+    /// Only transition edges are spoken. `RemoteCatcher` remembers the last non-nil value, preventing the
+    /// player's frequent time updates from repeating an announcement while one recovery remains active.
+    private var remoteAccessibilityAnnouncement: String? {
+        if let pending = pendingAdvance {
+            return "Loading season \(pending.meta.season ?? 0), episode \(pending.meta.episode ?? 0)"
+        }
+        if reconnecting { return "Reconnecting playback" }
+        if sourceHops > 0, !hasStartedPlaying { return "Source failed. Trying another source" }
+        return nil
+    }
+
+    private func controlAccessibilityID(_ control: Control) -> String {
+        switch control {
+        case .close: return "close"
+        case .scrub: return "scrub"
+        case .restart: return "restart"
+        case .back: return "seek-back"
+        case .play: return "play-pause"
+        case .fwd: return "seek-forward"
+        case .audio: return "audio"
+        case .subs: return "subtitles"
+        case .aspect: return "aspect"
+        case .playback: return "playback-speed"
+        case .prev: return "previous-episode"
+        case .next: return "next-episode"
+        case .episodes: return "episodes"
+        case .chapters: return "chapters"
+        case .sources: return "sources"
+        case .quality: return "quality"
+        case .settings: return "settings"
+        case .skipEdit: return "skip-editor"
+        }
+    }
+
+    private func controlAccessibilityLabel(_ control: Control) -> String {
+        switch control {
+        case .close: return "Close player"
+        case .scrub: return "Playback position"
+        case .restart: return "Restart from beginning"
+        case .back: return "Skip back \(seekStep) seconds"
+        case .play: return isPaused ? "Resume playback" : "Pause playback"
+        case .fwd: return "Skip forward \(seekStep) seconds"
+        case .audio: return "Audio tracks"
+        case .subs: return "Subtitles"
+        case .aspect: return "Aspect ratio"
+        case .playback: return "Playback speed"
+        case .prev: return "Previous episode"
+        case .next: return "Next episode"
+        case .episodes: return "Episodes"
+        case .chapters: return "Chapters"
+        case .sources: return "Sources"
+        case .quality: return "Quality"
+        case .settings: return "Player settings"
+        case .skipEdit: return "Edit skip segment"
+        }
+    }
+
+    private func remoteAccessibilityFocus(_ identity: String) {
+        if identity.hasPrefix("option."),
+           let index = panelRows.firstIndex(where: { "option.\($0.accessibilityID)" == identity }),
+           !panelRows[index].isHeader, panelRows[index].isEnabled {
+            optionRow = index
+            return
+        }
+        if let control = ([Control.close] + buttonRow + [.scrub]).first(where: {
+            "control.\(controlAccessibilityID($0))" == identity
+        }) {
+            selected = control
+            if control != .close && control != .scrub { lastButton = control }
+        }
+        if identity == "still-watching.continue" { stillWatchingWantsStop = false }
+        if identity == "still-watching.stop" { stillWatchingWantsStop = true }
+        if identity == "up-next.play" { upNextWantsCredits = false }
+        if identity == "up-next.credits" { upNextWantsCredits = true }
+    }
+
+    private func remoteAccessibilityActivate(_ identity: String) {
+        noteInteraction()
+        if identity.hasPrefix("option."),
+           let index = panelRows.firstIndex(where: { "option.\($0.accessibilityID)" == identity }) {
+            optionRow = index
+            activateOption()
+            return
+        }
+        if let control = ([Control.close] + buttonRow + [.scrub]).first(where: {
+            "control.\(controlAccessibilityID($0))" == identity
+        }) {
+            selected = control
+            activate(control)
+            return
+        }
+        switch identity {
+        case "hidden.show-controls": showControls()
+        case "hidden.play-pause": toggle()
+        case "still-watching.continue": continueStillWatching()
+        case "still-watching.stop": stopStillWatching()
+        case "up-next.play": playNext()
+        case "up-next.credits": upNextSuppressed = true
+        default: break
+        }
+    }
+
+    private func remoteAccessibilityAdjust(_ identity: String, _ direction: Int) {
+        guard identity == "control.scrub" else { return }
+        selected = .scrub
+        scrubBy(direction)
     }
 
     private func timeString(_ t: Double) -> String {
@@ -9880,17 +10130,89 @@ struct TVPlayerView: View {
 /// A focusable UIView that captures every Siri-remote press and forwards it to SwiftUI. This is far more
 /// reliable than SwiftUI `@FocusState` + `onMoveCommand` inside a full-screen cover on tvOS.
 private struct RemoteCatcher: UIViewControllerRepresentable {
+    fileprivate struct AccessibilityItem {
+        let id: String
+        let label: String
+        var value: String? = nil
+        var hint: String? = nil
+        var traits: UIAccessibilityTraits = .button
+        var isEnabled: Bool = true
+        var isAdjustable: Bool = false
+    }
+
     var onPress: (UIPress.PressType) -> Void
     var onSwipe: () -> Void
+    var accessibilityItems: [AccessibilityItem]
+    var accessibilityFocusedID: String?
+    var accessibilityAnnouncement: String?
+    var onAccessibilityFocus: (String) -> Void
+    var onAccessibilityActivate: (String) -> Void
+    var onAccessibilityAdjust: (String, Int) -> Void
+    var onAccessibilityEscape: () -> Void
 
     func makeUIViewController(context: Context) -> CatchVC {
-        let vc = CatchVC(); vc.onPress = onPress; vc.onSwipe = onSwipe; return vc
+        let vc = CatchVC()
+        vc.loadViewIfNeeded()
+        update(vc)
+        return vc
     }
-    func updateUIViewController(_ vc: CatchVC, context: Context) { vc.onPress = onPress; vc.onSwipe = onSwipe }
+    func updateUIViewController(_ vc: CatchVC, context: Context) {
+        update(vc)
+    }
+
+    private func update(_ vc: CatchVC) {
+        vc.onPress = onPress
+        vc.onSwipe = onSwipe
+        vc.onAccessibilityFocus = onAccessibilityFocus
+        vc.onAccessibilityActivate = onAccessibilityActivate
+        vc.onAccessibilityAdjust = onAccessibilityAdjust
+        vc.onAccessibilityEscape = onAccessibilityEscape
+        vc.updateAccessibility(
+            items: accessibilityItems,
+            focusedID: accessibilityFocusedID,
+            announcement: accessibilityAnnouncement
+        )
+    }
 
     /// Focusable root view for the catcher controller.
     final class FocusableView: UIView {
         override var canBecomeFocused: Bool { true }
+    }
+
+    /// A virtual accessibility control hosted by the transparent catcher. UIKit asks this object to activate,
+    /// escape, or adjust; each callback is routed back to the exact SwiftUI state machine the remote uses.
+    final class ActionAccessibilityElement: UIAccessibilityElement {
+        let stableID: String
+        var focusAction: (() -> Void)?
+        var activateAction: (() -> Void)?
+        var incrementAction: (() -> Void)?
+        var decrementAction: (() -> Void)?
+        var escapeAction: (() -> Void)?
+
+        init(stableID: String, accessibilityContainer container: Any) {
+            self.stableID = stableID
+            super.init(accessibilityContainer: container)
+        }
+
+        override func accessibilityElementDidBecomeFocused() {
+            super.accessibilityElementDidBecomeFocused()
+            focusAction?()
+        }
+
+        override func accessibilityActivate() -> Bool {
+            guard let activateAction else { return false }
+            activateAction()
+            return true
+        }
+
+        override func accessibilityIncrement() { incrementAction?() }
+        override func accessibilityDecrement() { decrementAction?() }
+
+        override func accessibilityPerformEscape() -> Bool {
+            guard let escapeAction else { return false }
+            escapeAction()
+            return true
+        }
     }
 
     /// Owns the remote. Its root view is the only focusable; `preferredFocusEnvironments` points at it, so
@@ -9899,6 +10221,13 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
     final class CatchVC: UIViewController {
         var onPress: ((UIPress.PressType) -> Void)?
         var onSwipe: (() -> Void)?
+        var onAccessibilityFocus: ((String) -> Void)?
+        var onAccessibilityActivate: ((String) -> Void)?
+        var onAccessibilityAdjust: ((String, Int) -> Void)?
+        var onAccessibilityEscape: (() -> Void)?
+        private var accessibilityControls: [ActionAccessibilityElement] = []
+        private var requestedAccessibilityFocusID: String?
+        private var lastAccessibilityAnnouncement: String?
 
         override func loadView() { view = FocusableView() }
 
@@ -9909,11 +10238,82 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
         override func viewDidLoad() {
             super.viewDidLoad()
             view.backgroundColor = .clear
+            view.isAccessibilityElement = false
             // Swipes on the Siri-remote touch surface are NOT UIPress events, so pressesBegan never sees
             // them. A pan recognizer for indirect (remote) touches wakes the controls on a swipe.
             let pan = UIPanGestureRecognizer(target: self, action: #selector(handleSurfaceTouch))
             pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirect.rawValue)]
             view.addGestureRecognizer(pan)
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            layoutAccessibilityControls()
+        }
+
+        func updateAccessibility(
+            items: [AccessibilityItem],
+            focusedID: String?,
+            announcement: String?
+        ) {
+            guard isViewLoaded else {
+                requestedAccessibilityFocusID = focusedID
+                if announcement == nil { lastAccessibilityAnnouncement = nil }
+                return
+            }
+
+            let previous = Dictionary(uniqueKeysWithValues: accessibilityControls.map { ($0.stableID, $0) })
+            accessibilityControls = items.map { item in
+                let element = previous[item.id]
+                    ?? ActionAccessibilityElement(stableID: item.id, accessibilityContainer: view as Any)
+                element.accessibilityLabel = item.label
+                element.accessibilityValue = item.value
+                element.accessibilityHint = item.hint
+                element.accessibilityTraits = item.traits
+                element.isAccessibilityElement = true
+                element.focusAction = { [weak self] in self?.onAccessibilityFocus?(item.id) }
+                element.activateAction = item.isEnabled ? { [weak self] in
+                    self?.onAccessibilityActivate?(item.id)
+                } : nil
+                element.incrementAction = item.isAdjustable ? { [weak self] in
+                    self?.onAccessibilityAdjust?(item.id, 1)
+                } : nil
+                element.decrementAction = item.isAdjustable ? { [weak self] in
+                    self?.onAccessibilityAdjust?(item.id, -1)
+                } : nil
+                element.escapeAction = { [weak self] in self?.onAccessibilityEscape?() }
+                return element
+            }
+            view.accessibilityElements = accessibilityControls
+            layoutAccessibilityControls()
+
+            if requestedAccessibilityFocusID != focusedID {
+                requestedAccessibilityFocusID = focusedID
+                if let focusedID,
+                   let element = accessibilityControls.first(where: { $0.stableID == focusedID }) {
+                    UIAccessibility.post(notification: .layoutChanged, argument: element)
+                }
+            }
+
+            if let announcement, announcement != lastAccessibilityAnnouncement {
+                lastAccessibilityAnnouncement = announcement
+                UIAccessibility.post(notification: .announcement, argument: announcement)
+            } else if announcement == nil {
+                lastAccessibilityAnnouncement = nil
+            }
+        }
+
+        private func layoutAccessibilityControls() {
+            guard !accessibilityControls.isEmpty else { return }
+            let sliceHeight = max(1, view.bounds.height / CGFloat(accessibilityControls.count))
+            for (index, element) in accessibilityControls.enumerated() {
+                element.accessibilityFrameInContainerSpace = CGRect(
+                    x: 0,
+                    y: CGFloat(index) * sliceHeight,
+                    width: view.bounds.width,
+                    height: sliceHeight
+                )
+            }
         }
 
         override func viewDidAppear(_ animated: Bool) {
