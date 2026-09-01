@@ -9,8 +9,13 @@ FAIL=0
 
 run() {
   local name="$1"; shift
+  local -a swiftc_flags=()
+  while [[ "${1:-}" == --swiftc-flag ]]; do
+    swiftc_flags+=("$2")
+    shift 2
+  done
   echo "===== SUITE $name ====="
-  if ! xcrun swiftc -strict-concurrency=complete -warnings-as-errors -o "$OUT/$name" "$@" 2>&1; then
+  if ! xcrun swiftc "${swiftc_flags[@]}" -strict-concurrency=complete -warnings-as-errors -o "$OUT/$name" "$@" 2>&1; then
     echo "SUITE $name BUILD FAILED"; FAIL=$((FAIL+1)); return
   fi
   if "$OUT/$name"; then echo "SUITE $name PASS"; else echo "SUITE $name FAIL"; FAIL=$((FAIL+1)); fi
@@ -43,9 +48,9 @@ run remux-first-packet-failure-policy \
   app/Sources/Player/RemuxFirstPacketFailurePolicy.swift \
   app/Tests/RemuxFirstPacketFailurePolicyTests.swift
 
-run read-liveness-policy \
-  app/Sources/Player/VortXRemuxReadLivenessPolicy.swift \
-  app/Tests/VortXRemuxReadLivenessPolicyTests.swift
+run read-failure-policy --swiftc-flag -parse-as-library \
+  app/Sources/Player/VortXRemuxReadFailurePolicy.swift \
+  app/Tests/VortXRemuxReadFailurePolicyTests.swift
 
 run termination-receipt-policy \
   app/SourcesShared/TerminationReceiptPolicy.swift \
