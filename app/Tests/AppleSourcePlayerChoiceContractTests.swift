@@ -176,10 +176,16 @@ private enum AppleSourcePlayerChoiceContractTests {
 
         let tvSourceRows = section(tvPlayer, from: "private func sourceRows()", to: "private func sourceLabel")
         let tvAudioRows = section(tvPlayer, from: "private func audioLanguageFilterRows()", to: "private func playerSettingsRows()")
+        let tvRemoteHandling = section(tvPlayer, from: "private func handlePress(_ type: UIPress.PressType)", to: "private var canEditSkip")
         check("tvOS source Audio returns to visibly re-ranked Sources without auto-switching",
               tvSourceRows.contains("TrackPreferences.$audioLanguagesOverride.withValue(sessionAudioLanguages)")
-                && tvAudioRows.components(separatedBy: "openPanel(.sources)").count == 3
+                && tvAudioRows.components(separatedBy:
+                    "openPanel(.sources, preferredAccessibilityID: \"sources.audio\")").count == 3
                 && !tvAudioRows.contains("resolveAndSwitchStream"))
+        check("tvOS source Audio Back restores the stable Audio parent",
+              tvRemoteHandling.contains(
+                "case .sourceAudio:      openPanel(.sources, preferredAccessibilityID: \"sources.audio\")")
+                && !tvRemoteHandling.contains("case .sourceAudio:      closePanel()"))
         check("tvOS episode advance preserves the outgoing surface until a replacement is issued",
               tvPlayer.contains("if pendingAdvance?.issued == true {")
                 && !tvPlayer.contains("if pendingAdvance != nil {\n                Color.black.ignoresSafeArea()"))
