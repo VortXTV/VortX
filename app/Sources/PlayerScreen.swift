@@ -3113,6 +3113,11 @@ struct PlayerScreen: View {
         }
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
+            // A native-debrid transport can expire during an ordinary startup or a mid-play recovery. Once the
+            // normal in-place budget is spent, re-mint that exact provider file before either terminalizing an
+            // explicit pick or hopping an automatic one. The transaction admits once per mount and fences its
+            // callback to the current load, so a stale result cannot resurrect a retired source.
+            if recoverCurrentNativeDebridLink(reason: "load failure") { return }
             // Honor an explicit user pick: a hard failure after the in-place retries surfaces a clear
             // "choose another source" error instead of silently hopping to a different (often lower-quality)
             // source. Only the auto path (Watch Now / resume) falls through to the failover hop below.
@@ -3128,11 +3133,6 @@ struct PlayerScreen: View {
                 presentTerminalLoadFailure()
                 return
             }
-            // A native-debrid transport can expire during an ordinary startup or a mid-play recovery. Once the
-            // normal in-place budget is spent, re-mint that exact provider file before either terminalizing an
-            // explicit pick or hopping an automatic one. The transaction admits once per mount and fences its
-            // callback to the current load, so a stale result cannot resurrect a retired source.
-            if recoverCurrentNativeDebridLink(reason: "load failure") { return }
             srcProbe("handleLoadFailure -> auto path, retries exhausted, trying hopToNextSource")
             if hopToNextSource(reason: "load failed") { return }
             // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):

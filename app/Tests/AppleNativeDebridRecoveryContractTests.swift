@@ -32,6 +32,13 @@ private func nativeDebridFailureOutcome(
     return explicitPick ? .terminalExplicitPick : .hopAutomaticPick
 }
 
+private func sourceSection(_ source: String, from start: String, to end: String) -> String {
+    guard let startRange = source.range(of: start) else { return "" }
+    let suffix = source[startRange.lowerBound...]
+    guard let endRange = suffix.range(of: end) else { return String(suffix) }
+    return String(suffix[..<endRange.lowerBound])
+}
+
 @main @MainActor
 private enum AppleNativeDebridRecoveryContractTests {
     private static var failures = 0
@@ -73,6 +80,27 @@ private enum AppleNativeDebridRecoveryContractTests {
                 && source.contains("recoverCurrentNativeDebridLink(reason: \"post-AV MPV no-frame\")")
                 && source.contains("recoverCurrentNativeDebridLink(reason: \"post-AV MPV start timeout\")")
                 && source.contains("recoverCurrentNativeDebridLink(reason: \"start timeout\")")
+        )
+        let ordinaryFailure = sourceSection(
+            source,
+            from: "private func handleLoadFailure(_ msg: String)",
+            to: "private func scheduleReconnect"
+        )
+        let ordinaryRefresh = ordinaryFailure.range(
+            of: "recoverCurrentNativeDebridLink(reason: \"load failure\")"
+        )?.lowerBound
+        let ordinaryExplicitTerminal = ordinaryFailure.range(
+            of: "if currentPickWasExplicit && !currentPlaybackIsResume"
+        )?.lowerBound
+        check(
+            "ordinary explicit native-debrid failure admits fresh link before terminal behavior",
+            ordinaryRefresh != nil
+                && ordinaryExplicitTerminal != nil
+                && ordinaryRefresh! < ordinaryExplicitTerminal!
+        )
+        check(
+            "ordinary explicit native-debrid outcome returns fresh transport before terminal fallback",
+            nativeDebridFailureOutcome(freshLinkAccepted: true, explicitPick: true) == .refreshed
         )
         check(
             "failed fresh link preserves explicit-pick terminal behavior",
