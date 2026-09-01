@@ -8,6 +8,30 @@
 
 import Foundation
 
+private struct AVStallGenerationTransitionModel {
+    var activeToken: Int
+    var observedGeneration: UInt64?
+
+    mutating func acceptedFirstFrame(token: Int, generation: UInt64) {
+        guard token == activeToken else { return }
+        observedGeneration = generation
+    }
+}
+
+private enum NativeDebridFailureOutcome: Equatable {
+    case refreshed
+    case terminalExplicitPick
+    case hopAutomaticPick
+}
+
+private func nativeDebridFailureOutcome(
+    freshLinkAccepted: Bool,
+    explicitPick: Bool
+) -> NativeDebridFailureOutcome {
+    if freshLinkAccepted { return .refreshed }
+    return explicitPick ? .terminalExplicitPick : .hopAutomaticPick
+}
+
 @main @MainActor
 private enum AppleNativeDebridRecoveryContractTests {
     private static var failures = 0
@@ -43,6 +67,22 @@ private enum AppleNativeDebridRecoveryContractTests {
                 && source.contains("coordinator.player?.activeLoadToken == retryLoadToken")
         )
         check(
+            "ordinary exhausted retry, AV failure, and both no-frame paths refresh native-debrid before terminal or engine handoff",
+            source.contains("recoverCurrentNativeDebridLink(reason: \"load failure\")")
+                && source.contains("recoverCurrentNativeDebridLink(reason: \"AVPlayer failure\")")
+                && source.contains("recoverCurrentNativeDebridLink(reason: \"post-AV MPV no-frame\")")
+                && source.contains("recoverCurrentNativeDebridLink(reason: \"post-AV MPV start timeout\")")
+                && source.contains("recoverCurrentNativeDebridLink(reason: \"start timeout\")")
+        )
+        check(
+            "failed fresh link preserves explicit-pick terminal behavior",
+            nativeDebridFailureOutcome(freshLinkAccepted: false, explicitPick: true) == .terminalExplicitPick
+        )
+        check(
+            "failed fresh link preserves automatic source hop behavior",
+            nativeDebridFailureOutcome(freshLinkAccepted: false, explicitPick: false) == .hopAutomaticPick
+        )
+        check(
             "accepted provider links retain TorBox identity and do not forward add-on headers",
             source.contains("torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx")
                 && source.contains("curHeaders = nil")
@@ -71,6 +111,17 @@ private enum AppleNativeDebridRecoveryContractTests {
                 && source.contains("case .replaceFreshItem:")
                 && source.contains("case .terminal(let proof):")
         )
+        check(
+            "accepted AV first frame rearms the watchdog while a retired callback cannot replace its generation",
+            source.contains("private func rearmAVStallWatchdogItemGenerationIfOwned(by loadToken: PlayerLoadToken)")
+                && source.contains("hasStartedPlaying = true\n                    rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)")
+                && source.contains("activeToken: avPlayer.activeLoadToken")
+        )
+        var transition = AVStallGenerationTransitionModel(activeToken: 42, observedGeneration: 7)
+        transition.acceptedFirstFrame(token: 99, generation: 8)
+        check("retired AV callback leaves the next mounted generation intact", transition.observedGeneration == 7)
+        transition.acceptedFirstFrame(token: 42, generation: 8)
+        check("accepted AV first frame advances the recoverable generation", transition.observedGeneration == 8)
         check(
             "a raw torrent port rebind recreates only its matching local engine before replacement load",
             source.contains("private func prepareRawTorrentAfterLoopbackRebind")

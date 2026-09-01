@@ -1819,6 +1819,7 @@ struct PlayerScreen: View {
                     // then cleared here, not a real failure.
                     srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
+                    rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)
                     directAVNoFrameRecovery = nil
                     firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
                     // Deferred libmpv resume seek: the pipeline is now warm (first frame rendered), so this lands
@@ -2129,6 +2130,10 @@ struct PlayerScreen: View {
             // the informative DV notice. Either way it re-loads the SAME source on libmpv, never a source hop.
             if coordinator.player is AVPlayerEngineController, !avEngineFailed {
                 let avFailureMessage = (data as? String) ?? "-"
+                // A provider-issued transport URL can fail on either native engine without proving a decoder
+                // fault. Re-mint this exact debrid file once before an AV -> MPV handoff, so the fallback
+                // never inherits the URL that just failed to open.
+                if recoverCurrentNativeDebridLink(reason: "AVPlayer failure") { return }
                 // A terminal zero-packet source (the remux pre-scan proved EOF before any timestamped
                 // base-video packet) can never produce a frame on libmpv either: it is the same dead bytes,
                 // not a decoder problem. Hop to the next source instead of burning ~30s on a second engine
@@ -2171,6 +2176,7 @@ struct PlayerScreen: View {
                 loadTimeout?.cancel()
                 directAVNoFrameRecovery = nil
                 DiagnosticsLog.log("playback", "fallback attempt=\(recovery.attemptID) stage=mpv-terminal outcome=no-first-frame")
+                if recoverCurrentNativeDebridLink(reason: "post-AV MPV no-frame") { return }
                 if currentPickWasExplicit {
                     loadErrorMsg = "This source didn't produce playable media. Choose another source."
                     presentTerminalLoadFailure()
@@ -3122,10 +3128,11 @@ struct PlayerScreen: View {
                 presentTerminalLoadFailure()
                 return
             }
-            // RESUME (Continue Watching): the exact source's stored link expired. Re-select the SAME source once
-            // more, minting a fresh debrid link for the same file, BEFORE hopping to a different source, so a
-            // resume stays on the source you chose. Only if that source is genuinely gone do we fall through.
-            if currentPlaybackIsResume, !resumeSourceReresolved, retryResumeSameSource() { return }
+            // A native-debrid transport can expire during an ordinary startup or a mid-play recovery. Once the
+            // normal in-place budget is spent, re-mint that exact provider file before either terminalizing an
+            // explicit pick or hopping an automatic one. The transaction admits once per mount and fences its
+            // callback to the current load, so a stale result cannot resurrect a retired source.
+            if recoverCurrentNativeDebridLink(reason: "load failure") { return }
             srcProbe("handleLoadFailure -> auto path, retries exhausted, trying hopToNextSource")
             if hopToNextSource(reason: "load failed") { return }
             // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
@@ -3292,6 +3299,7 @@ struct PlayerScreen: View {
            !hasStartedPlaying {
             directAVNoFrameRecovery = nil
             DiagnosticsLog.log("playback", "source attempt route=libmpv-after-avplayer attempt=\(recovery.attemptID) outcome=no-first-frame")
+            if recoverCurrentNativeDebridLink(reason: "post-AV MPV start timeout") { return }
             if currentPickWasExplicit {
                 loadErrorMsg = "This source didn't produce playable media. Choose another source."
                 presentTerminalLoadFailure()
@@ -3326,6 +3334,9 @@ struct PlayerScreen: View {
             }
             return
         }
+        // A no-frame timeout with no buffer progress can be an expired native-debrid transport URL. Refresh
+        // that exact file once before retrying an explicit source or hopping an automatic pick.
+        if recoverCurrentNativeDebridLink(reason: "start timeout") { return }
         // Honor an explicit user pick: retry the SAME source in place (a longer grace) instead of hopping
         // to a different, possibly lower-quality, source. Once the grace is spent, surface a clear error
         // that points at the source list, not a silent quality drop.
@@ -3735,6 +3746,22 @@ struct PlayerScreen: View {
                 lastObservedTime = currentTime
             }
         }
+    }
+
+    /// The view survives source, episode, foreground, and engine transitions while AVPlayer replaces its
+    /// item underneath it. Re-arm the observed item generation only at the accepted first-frame commit for
+    /// the active load token. A late time tick from the retired item must leave the current watchdog owner
+    /// untouched, otherwise a later real stall would be retained forever as an ownership mismatch.
+    private func rearmAVStallWatchdogItemGenerationIfOwned(by loadToken: PlayerLoadToken) {
+        guard let avPlayer = coordinator.player as? AVPlayerEngineController else {
+            avStallWatchdogItemGeneration = nil
+            return
+        }
+        guard PlayerLoadProvenanceState.accepts(
+            callbackToken: loadToken,
+            activeToken: avPlayer.activeLoadToken
+        ) else { return }
+        avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
     }
 
     private func recoverFromStall() {
