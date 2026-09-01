@@ -2120,6 +2120,13 @@ struct PlayerScreen: View {
             // idempotent, so running it only on a real change is correct.
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
+                #if os(iOS) || os(macOS)
+                if b {
+                    suspendAVReplacementFirstFrameDeadline()
+                } else {
+                    resumeAVReplacementFirstFrameDeadlineIfOwned()
+                }
+                #endif
                 // Reflect the play/pause state on the Lock Screen immediately (timePos stops ticking while
                 // paused, so without this the now-playing rate would stay stuck at "playing").
                 updateNowPlaying(force: true)
@@ -3847,6 +3854,7 @@ struct PlayerScreen: View {
                   avReplacementFirstFrameOwner == owner,
                   !playbackExited,
                   !hasStartedPlaying,
+                  !isPaused,
                   let activeAVPlayer = coordinator.player as? AVPlayerEngineController,
                   activeAVPlayer.activeLoadToken == owner.loadToken,
                   activeAVPlayer.currentItemGeneration == owner.itemGeneration else { return }
@@ -3874,6 +3882,23 @@ struct PlayerScreen: View {
         avReplacementFirstFrameDeadlineTask?.cancel()
         avReplacementFirstFrameDeadlineTask = nil
         avReplacementFirstFrameOwner = nil
+    }
+
+    /// A deliberate pause is a viewer-owned frozen playhead, not a failed replacement. Keep the exact owner
+    /// but suspend its wall clock; the matching play transition below gives the same item a full bounded window.
+    private func suspendAVReplacementFirstFrameDeadline() {
+        guard avReplacementFirstFrameOwner != nil else { return }
+        avReplacementFirstFrameDeadlineTask?.cancel()
+        avReplacementFirstFrameDeadlineTask = nil
+    }
+
+    private func resumeAVReplacementFirstFrameDeadlineIfOwned() {
+        guard !hasStartedPlaying,
+              let owner = avReplacementFirstFrameOwner,
+              let activeAVPlayer = coordinator.player as? AVPlayerEngineController,
+              activeAVPlayer.activeLoadToken == owner.loadToken,
+              activeAVPlayer.currentItemGeneration == owner.itemGeneration else { return }
+        armAVReplacementFirstFrameDeadline(activeAVPlayer)
     }
 
     private func recoverFromStall() {

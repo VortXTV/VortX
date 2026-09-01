@@ -87,11 +87,16 @@ private struct AVReplacementDeadlineModel {
 
     private(set) var owner: Owner?
     private(set) var terminalized = false
+    private var paused = false
 
     mutating func replace(token: Int, itemGeneration: UInt64) {
         owner = Owner(token: token, itemGeneration: itemGeneration)
         terminalized = false
+        paused = false
     }
+
+    mutating func pause() { paused = true }
+    mutating func resume() { paused = false }
 
     mutating func firstFrame(token: Int, itemGeneration: UInt64) {
         guard owner == Owner(token: token, itemGeneration: itemGeneration) else { return }
@@ -99,7 +104,7 @@ private struct AVReplacementDeadlineModel {
     }
 
     mutating func expire(token: Int, itemGeneration: UInt64) {
-        guard owner == Owner(token: token, itemGeneration: itemGeneration) else { return }
+        guard !paused, owner == Owner(token: token, itemGeneration: itemGeneration) else { return }
         owner = nil
         terminalized = true
     }
@@ -237,14 +242,21 @@ private enum AppleNativeDebridRecoveryContractTests {
                 && source.contains("armAVReplacementFirstFrameDeadline(avPlayer)")
                 && source.contains("activeAVPlayer.currentItemGeneration == owner.itemGeneration")
                 && source.contains("cancelAVReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)")
+                && source.contains("!isPaused")
+                && source.contains("suspendAVReplacementFirstFrameDeadline()")
+                && source.contains("resumeAVReplacementFirstFrameDeadlineIfOwned()")
         )
         var replacementDeadline = AVReplacementDeadlineModel()
         replacementDeadline.replace(token: 10, itemGeneration: 1)
+        replacementDeadline.pause()
         replacementDeadline.expire(token: 10, itemGeneration: 1)
-        check("replacement with no frame reaches bounded terminal path", replacementDeadline.terminalized)
+        check("paused replacement deadline never hops or terminalizes", !replacementDeadline.terminalized)
+        replacementDeadline.resume()
+        replacementDeadline.expire(token: 9, itemGeneration: 1)
+        check("stale replacement owner after resume is inert", !replacementDeadline.terminalized)
+        replacementDeadline.expire(token: 10, itemGeneration: 1)
+        check("resumed replacement with no frame reaches bounded terminal path", replacementDeadline.terminalized)
         replacementDeadline.replace(token: 11, itemGeneration: 2)
-        replacementDeadline.expire(token: 10, itemGeneration: 1)
-        check("stale replacement deadline cannot affect newer item", !replacementDeadline.terminalized)
         replacementDeadline.firstFrame(token: 11, itemGeneration: 2)
         check("accepted replacement first frame retires its deadline", replacementDeadline.owner == nil)
         check(
