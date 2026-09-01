@@ -33,11 +33,21 @@ private struct TVDetailEpisodeListFocusContractTests {
                    "episode row \(index) keeps native Up navigation")
         }
 
-        expect(TVDetailEpisodeListFocusPolicy.owns(direction: .up, at: 0),
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .up, fromEpisodeIndex: 0, episodeCount: 12) == .hero,
                "first episode forwards Up to the detail hero")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: 0, episodeCount: 12) == .episode(1),
+               "first episode explicitly focuses the second episode on Down")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: 0, episodeCount: 1) == .native,
+               "a one-episode list has no invented Down destination")
         for direction in [MoveCommandDirection.down, .left, .right] {
-            expect(!TVDetailEpisodeListFocusPolicy.owns(direction: direction, at: 0),
-                   "first episode keeps \(String(describing: direction)) native")
+            if direction != .down {
+                expect(TVDetailEpisodeListFocusPolicy.destination(for: direction, fromEpisodeIndex: 0, episodeCount: 12) == .native,
+                       "first episode keeps \(String(describing: direction)) native")
+            }
+        }
+        for index in 1...12 {
+            expect(TVDetailEpisodeListFocusPolicy.destination(for: .up, fromEpisodeIndex: index, episodeCount: 13) == .native,
+                   "episode row \(index) keeps native Up navigation")
         }
 
         // A season can grow while its rows are lazily realized. The index boundary stays at the first
@@ -63,6 +73,10 @@ private struct TVDetailEpisodeListFocusContractTests {
                "episode row focus and scroll identities remain CoreVideo.id")
         expect(detailView.contains("TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index)"),
                "SwiftUI asks the production boundary policy at each episode row")
+        expect(detailView.contains("TVDetailEpisodeListFocusPolicy.destination("),
+               "first-row directional routing is decided by the production policy")
+        expect(detailView.contains("focusedEpisode = episodes[targetIndex].id"),
+               "first-row Down targets the second row through its stable CoreVideo id")
         expect(detailView.contains("onEpisodeMove: { direction in"),
                "series detail supplies the optional hero-focus bridge")
         expect(!detailView.contains(".id(\"detailContent\")\n                            .onMoveCommand"),

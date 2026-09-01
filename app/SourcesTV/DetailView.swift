@@ -1814,9 +1814,10 @@ struct CoreSeasonedEpisodes: View {
                     ForEach(Array(episodes.enumerated()), id: \.element.id) { index, v in
                         let row = episodeRow(v).focused($focusedEpisode, equals: v.id).id(v.id)
                         if TVDetailEpisodeListFocusPolicy.rowOwnsUpEscape(at: index) {
-                            // The first row is the list's sole upward boundary. Every deeper row has no
-                            // move-command owner, so Up remains tvOS's native previous-episode movement.
-                            row.modifier(DetailMoveCommandHandler(action: episodeMoveHandler(at: index)))
+                            // The first row is the list's sole upward boundary. Its handler also gives Down
+                            // an explicit second-row target, so registering an Up handler cannot swallow the
+                            // first native downward list movement. Every deeper row has no move-command owner.
+                            row.modifier(DetailMoveCommandHandler(action: episodeMoveHandler()))
                         } else {
                             row
                         }
@@ -1947,14 +1948,25 @@ struct CoreSeasonedEpisodes: View {
         spoilerSafe && !isWatched && focusedEpisode != v.id
     }
 
-    /// SwiftUI delivers all directional commands to a registered handler. Keep that handler at the first
-    /// row only and forward exactly Up; returning for every other direction leaves the local focus graph
-    /// untouched, matching the action/source boundary handlers elsewhere in this file.
-    private func episodeMoveHandler(at index: Int) -> ((MoveCommandDirection) -> Void)? {
+    /// The only row-level handler belongs to row zero. Its two owned directions have explicit destinations:
+    /// Up returns to the detail hero, while Down seats focus on row one by its stable CoreVideo id. This does
+    /// not rely on `onMoveCommand` propagation semantics for the first downward list movement.
+    private func episodeMoveHandler() -> ((MoveCommandDirection) -> Void)? {
         guard let onEpisodeMove else { return nil }
         return { direction in
-            guard TVDetailEpisodeListFocusPolicy.owns(direction: direction, at: index) else { return }
-            onEpisodeMove(direction)
+            switch TVDetailEpisodeListFocusPolicy.destination(
+                for: direction,
+                fromEpisodeIndex: 0,
+                episodeCount: episodes.count
+            ) {
+            case .hero:
+                onEpisodeMove(direction)
+            case .episode(let targetIndex):
+                guard episodes.indices.contains(targetIndex) else { return }
+                focusedEpisode = episodes[targetIndex].id
+            case .native:
+                break
+            }
         }
     }
 
