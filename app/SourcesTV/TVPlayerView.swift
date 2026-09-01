@@ -2,6 +2,54 @@ import SwiftUI
 import UIKit
 import os
 
+/// Stable, opaque identities for the player's virtual accessibility rows. Async panel refreshes may reorder
+/// rows or change their detail text while VoiceOver is focused. Identity therefore uses the panel, semantic
+/// label, role, and same-label occurrence, never the mutable detail and never raw provider data in the output.
+/// Kept pure so focus retention can be exercised without compiling the full SwiftUI player.
+enum TVPlayerAccessibilityRowIdentityPolicy {
+    struct Candidate: Equatable {
+        let explicitID: String?
+        let label: String
+        let isHeader: Bool
+    }
+
+    static func identities(panelKey: String, rows: [Candidate]) -> [String] {
+        var semanticOccurrences: [String: Int] = [:]
+        var emittedOccurrences: [String: Int] = [:]
+        return rows.map { row in
+            let base: String
+            if let explicitID = row.explicitID, !explicitID.isEmpty {
+                base = explicitID
+            } else {
+                let semanticKey = "\(panelKey)|\(row.isHeader ? "header" : "row")|\(row.label)"
+                let occurrence = semanticOccurrences[semanticKey, default: 0]
+                semanticOccurrences[semanticKey] = occurrence + 1
+                base = "panel.row.\(opaqueHash(semanticKey)).\(occurrence)"
+            }
+            let emitted = emittedOccurrences[base, default: 0]
+            emittedOccurrences[base] = emitted + 1
+            return emitted == 0 ? base : "\(base).duplicate.\(emitted)"
+        }
+    }
+
+    static func restoredFocusIndex(previousID: String?, identities: [String], fallback: Int) -> Int {
+        guard let previousID, let restored = identities.firstIndex(of: previousID) else { return fallback }
+        return restored
+    }
+
+    /// FNV-1a over a bounded UTF-8 prefix is deterministic and intentionally opaque. This is an identity key,
+    /// not a security decision; the bound prevents a provider-controlled label from creating unbounded work.
+    private static func opaqueHash(_ value: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in value.utf8.prefix(1_024) {
+            hash ^= UInt64(byte)
+            hash = hash &* 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
+    }
+}
+// END TVPlayerAccessibilityRowIdentityPolicy
+
 /// Pure startup decision for the tvOS AVPlayer watchdog. Kept outside `TVPlayerView` so the boundary cases can
 /// run in a standalone harness without compiling the full SwiftUI player surface.
 enum TVAVStartWatchdogPolicy {
@@ -942,7 +990,7 @@ struct TVPlayerView: View {
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
     private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, subtitleLanguage, aspect, playback, episodes, chapters, sources, sourceAudio, quality, playerSettings, engine, sleep, skipEditor }
+    private enum PanelKind: String { case audio, audioSettings, subtitles, subtitleSettings, subtitleLanguage, aspect, playback, episodes, chapters, sources, sourceAudio, quality, playerSettings, engine, sleep, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -2933,6 +2981,7 @@ struct TVPlayerView: View {
     private struct OptionRow: Identifiable {
         let id: String
         let accessibilityID: String
+        let explicitAccessibilityID: String?
         let label: String
         var detail: String = ""        // right-aligned secondary text (e.g. current value)
         var isSelected: Bool = false
@@ -2954,6 +3003,7 @@ struct TVPlayerView: View {
             let identity = accessibilityID ?? "row.\(UUID().uuidString)"
             self.id = identity
             self.accessibilityID = identity
+            self.explicitAccessibilityID = accessibilityID
             self.label = label
             self.detail = detail
             self.isSelected = isSelected
@@ -2961,6 +3011,19 @@ struct TVPlayerView: View {
             self.isEnabled = isEnabled
             self.skipField = skipField
             self.action = action
+        }
+
+        func replacingAccessibilityID(_ identity: String) -> OptionRow {
+            OptionRow(
+                accessibilityID: identity,
+                label: label,
+                detail: detail,
+                isSelected: isSelected,
+                isHeader: isHeader,
+                isEnabled: isEnabled,
+                skipField: skipField,
+                action: action
+            )
         }
     }
 
@@ -3371,7 +3434,7 @@ struct TVPlayerView: View {
         let target = field == .start ? skipEditStart : skipEditEnd
         coordinator.player?.seek(to: target)
         currentTime = target
-        if showOptions { panelRows = optionRows }   // refresh the time readout in place
+        if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }   // refresh the time readout in place
         scheduleHide()
     }
 
@@ -3383,7 +3446,7 @@ struct TVPlayerView: View {
         skipEditSubmitting = true
         skipEditError = nil
         skipEditDone = false
-        if showOptions { panelRows = optionRows }
+        if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }
         let req = SkipDBClient.SubmitRequest(
             imdb_id: meta.libraryId,
             season: meta.season,
@@ -3409,7 +3472,7 @@ struct TVPlayerView: View {
                 skipEditError = error.localizedDescription
             }
             skipEditSubmitting = false
-            if showOptions { panelRows = optionRows }
+            if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }
         }
     }
 
@@ -4424,7 +4487,7 @@ struct TVPlayerView: View {
         subSizeScale = (clamped * 100).rounded() / 100
         coordinator.player?.applySubtitleStyle()
         schedulePlaybackPrefsSave()
-        if showOptions { panelRows = optionRows }   // refresh the % readout in place
+        if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }   // refresh the % readout in place
     }
     private func setSubtitleColor(_ id: String) {
         subColor = id; coordinator.player?.applySubtitleStyle(); schedulePlaybackPrefsSave()
@@ -4543,9 +4606,46 @@ struct TVPlayerView: View {
                     seenRevision = core.revision
                     refreshSourceOptionCounts()   // same gate, same tick: late sources move the button gates too
                 }
-                panelRows = optionRows
+                refreshPanelRowsPreservingAccessibilityFocus()
             }
         }
+    }
+
+    private func stabilizedOptionRows(_ rows: [OptionRow], for kind: PanelKind) -> [OptionRow] {
+        let candidates = rows.map {
+            TVPlayerAccessibilityRowIdentityPolicy.Candidate(
+                explicitID: $0.explicitAccessibilityID,
+                label: $0.label,
+                isHeader: $0.isHeader
+            )
+        }
+        let identities = TVPlayerAccessibilityRowIdentityPolicy.identities(
+            panelKey: kind.rawValue,
+            rows: candidates
+        )
+        return zip(rows, identities).map { row, identity in
+            row.replacingAccessibilityID(identity)
+        }
+    }
+
+    /// Rebuild an asynchronously changing panel without moving assistive focus. The old implementation kept
+    /// only `optionRow`, so inserting a subtitle or source above it silently focused a different action. Stable
+    /// semantic identity lets the row move while VoiceOver and the custom visual cursor stay on the same action.
+    private func refreshPanelRowsPreservingAccessibilityFocus() {
+        let previousID = panelRows.indices.contains(optionRow)
+            ? panelRows[optionRow].accessibilityID
+            : nil
+        let refreshed = stabilizedOptionRows(optionRows, for: panelKind)
+        let fallback = refreshed.indices.first(where: {
+            !refreshed[$0].isHeader && refreshed[$0].isEnabled
+        }) ?? 0
+        let restored = TVPlayerAccessibilityRowIdentityPolicy.restoredFocusIndex(
+            previousID: previousID,
+            identities: refreshed.map(\.accessibilityID),
+            fallback: fallback
+        )
+        panelRows = refreshed
+        optionRow = restored
     }
 
     private func moveOption(_ d: Int) {
@@ -4567,7 +4667,7 @@ struct TVPlayerView: View {
         // Selection state may have changed (speed, tracks, aspect, stats); one
         // recompute per press keeps the checkmarks honest.
         refreshSourceOptionCounts()   // a row can switch source / episode, changing the button gates
-        if showOptions { panelRows = optionRows }
+        if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }
     }
 
     /// The skip-editor Start/End field under the cursor, or nil when the highlighted row is not a time
@@ -4587,7 +4687,7 @@ struct TVPlayerView: View {
         // Late add-on subtitle recovery: if the start-of-playback fetch raced an empty add-on collection,
         // retry now. Key-latched inside (no-op once a real fetch ran); the async result refreshes the rows.
         if kind == .subtitles { fetchAddonSubtitles() }
-        panelRows = optionRows
+        panelRows = stabilizedOptionRows(optionRows, for: kind)
         // Single-choice panels open on the current selection; the mixed settings panel opens
         // at the top (its decoder radio would otherwise swallow the seed and skip "Play in").
         let seedOnSelection = kind != .playerSettings
@@ -4617,7 +4717,7 @@ struct TVPlayerView: View {
             // "Loading…" forever, success or failure (the stuck-on-loading report). Mirrors iOS
             // PlayerScreen.refreshSoon, which has always rebuilt the open panel here. The sources /
             // episodes panels additionally keep their own 1 Hz refresher.
-            if showOptions { panelRows = optionRows }
+            if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }
         }
     }
 
@@ -4638,7 +4738,7 @@ struct TVPlayerView: View {
             }
         }
         if type == "audio" { audioTracks = remap(audioTracks) } else { subtitleTracks = remap(subtitleTracks) }
-        if showOptions { panelRows = optionRows }
+        if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }
     }
 
     /// Auto-pick defaults once per load, while retaining explicit recovery intent across staged track-list events.
@@ -6767,7 +6867,7 @@ struct TVPlayerView: View {
             let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: effectiveVideoId)
             guard addonSubsKey == key else { return }   // episode changed / re-keyed mid-fetch
             addonSubs = subs
-            if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+            if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
             // The add-on list can land AFTER autoSelectTracks already ran (and left subs off because the
             // container had no chain match): re-evaluate the add-on fallback now that candidates exist.
             autoSelectAddonSubtitleIfNeeded()
@@ -7021,7 +7121,7 @@ struct TVPlayerView: View {
                 applyCurrentSubtitleDelayIfReady(force: false)
                 VXProbe.log("subs", "subs sync \(seconds)s (community seed)")
             }
-            if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+            if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
         }
     }
 
@@ -7034,7 +7134,7 @@ struct TVPlayerView: View {
         let marker = sub.url.absoluteString
         let downloadID = subtitlePoolRequests.beginDownload()
         subtitleLoadingURL = marker
-        if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+        if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
         Task { @MainActor in
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
             let signedIn = VortXSyncManager.shared.isSignedIn
@@ -7047,14 +7147,14 @@ struct TVPlayerView: View {
             guard mayPublishDownload else {
                 if subtitlePoolRequests.finishDownload(downloadID) {
                     subtitleLoadingURL = nil
-                    if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+                    if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
                 }
                 return
             }
             guard let localURL = downloaded else {
                 if subtitlePoolRequests.finishDownload(downloadID) {
                     subtitleLoadingURL = nil
-                    if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+                    if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
                 }
                 // Honest failure on a manual pick; the automatic tier-2 pick stays silent (mirrors iOS).
                 if !auto { showEngineNote(String(localized: "Subtitle failed to load")) }
@@ -7068,7 +7168,7 @@ struct TVPlayerView: View {
             guard let player = coordinator.player else {
                 if subtitlePoolRequests.finishExternal(externalID) {
                     subtitleLoadingURL = nil
-                    if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+                    if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
                 }
                 return
             }
@@ -7085,7 +7185,7 @@ struct TVPlayerView: View {
                 guard mayPublishExternal, loadStillCurrent else {
                     if subtitlePoolRequests.finishExternal(externalID) {
                         subtitleLoadingURL = nil
-                        if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+                        if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
                     }
                     return
                 }
@@ -7097,7 +7197,7 @@ struct TVPlayerView: View {
                 if ok, player === coordinator.player {
                     applyCurrentSubtitleDelayIfReady(force: false)
                 }
-                if showOptions, panelShowsSubtitleList { panelRows = optionRows }
+                if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
                 VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community ok=\(ok))")
             }
         }

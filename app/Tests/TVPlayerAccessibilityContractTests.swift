@@ -71,6 +71,12 @@ check.require(
     "the virtual accessibility tree mirrors labels, activation, and adjustable transport state"
 )
 check.require(
+    player.contains("refreshPanelRowsPreservingAccessibilityFocus()")
+        && player.contains("TVPlayerAccessibilityRowIdentityPolicy.restoredFocusIndex(")
+        && !player.contains("panelRows = optionRows"),
+    "every asynchronous panel snapshot is stabilized and restores the focused semantic row"
+)
+check.require(
     bridge.contains("if reconnecting { return \"Reconnecting playback\" }")
         && bridge.contains("return \"Loading season \\(pending.meta.season ?? 0), episode \\(pending.meta.episode ?? 0)\""),
     "episode loading and playback recovery publish status announcements"
