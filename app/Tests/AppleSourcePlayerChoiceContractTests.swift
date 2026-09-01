@@ -55,6 +55,24 @@ private func ordered(_ needles: [String], in source: String) -> Bool {
     return true
 }
 
+/// Small executable mirror of the tvOS watchdog ownership boundary. The production assertion below proves the
+/// first-frame callback calls the real helper; this model makes the normal source/episode replacement sequence
+/// fail if a future edit leaves the watchdog holding the retired item's generation.
+private struct TVAVStallWatchdogGenerationModel {
+    var activeToken: Int
+    var currentItemGeneration: UInt64
+    var observedItemGeneration: UInt64?
+
+    mutating func firstFrame(loadToken: Int) {
+        guard loadToken == activeToken else { return }
+        observedItemGeneration = currentItemGeneration
+    }
+
+    var canRecoverProvenSurfaceStall: Bool {
+        observedItemGeneration == currentItemGeneration
+    }
+}
+
 @main
 private enum AppleSourcePlayerChoiceContractTests {
     @MainActor
@@ -184,6 +202,27 @@ private enum AppleSourcePlayerChoiceContractTests {
                     "return",
                     "}\n        }\n        guard stallRecoveries < 3"
                 ], in: tvStall))
+        let tvFirstFrame = section(tvPlayer, from: "case MPVProperty.timePos:", to: "// Seek-in-flight guard")
+        check("tvOS normal AV source or episode first frame rearms the watchdog under the active load-token fence",
+              tvPlayer.contains("private func rearmAVStallWatchdogItemGenerationIfOwned(by loadToken: PlayerLoadToken)")
+                && tvFirstFrame.contains("hasStartedPlaying = true\n                    rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)")
+                && tvPlayer.contains("activeToken: avPlayer.activeLoadToken"))
+        var generationModel = TVAVStallWatchdogGenerationModel(
+            activeToken: 10,
+            currentItemGeneration: 41,
+            observedItemGeneration: 41)
+        // Normal accepted source/episode replacement keeps the outer view alive but advances both ownership
+        // values. The first frame for the NEW active token must make the subsequent proven freeze recoverable.
+        generationModel.activeToken = 11
+        generationModel.currentItemGeneration = 42
+        generationModel.firstFrame(loadToken: 11)
+        check("tvOS normal AV source or episode change re-arms a later proven surface-stall recovery",
+              generationModel.canRecoverProvenSurfaceStall)
+        generationModel.activeToken = 12
+        generationModel.currentItemGeneration = 43
+        generationModel.firstFrame(loadToken: 11)
+        check("tvOS stale retired-item first frame cannot rearm the newer AV watchdog generation",
+              !generationModel.canRecoverProvenSurfaceStall)
         let tvTrickplay = section(tvPlayer, from: "private func currentLocalTrickplayCaptureDecision", to: "/// The one place a trickplay frame")
         check("tvOS trickplay declares AVPlayer video-output versus libmpv inline backend",
               tvTrickplay.contains("player is AVPlayerEngineController")

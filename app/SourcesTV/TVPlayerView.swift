@@ -1783,6 +1783,7 @@ struct TVPlayerView: View {
                         )
                     )
                     hasStartedPlaying = true
+                    rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)
                     applyIncomingTransportIntentIfOwned(by: event.loadToken)
                     // A real frame from the same-source fallback completes its recovery obligation. Clearing
                     // this before any later callbacks makes a retired watchdog inert for this source.
@@ -4886,6 +4887,22 @@ struct TVPlayerView: View {
                 lastObservedTime = currentTime
             }
         }
+    }
+
+    /// A normal source switch, episode advance, foreground re-issue, or manual switch back to AVPlayer all
+    /// create a new exact AVPlayer item while retaining the outer SwiftUI view and its watchdog task. Refresh
+    /// the captured generation only when the first frame's load token is still the controller's active token.
+    /// That makes the newly rendered item recoverable while a late tick from the retired item stays fenced out.
+    private func rearmAVStallWatchdogItemGenerationIfOwned(by loadToken: PlayerLoadToken) {
+        guard let avPlayer = coordinator.player as? AVPlayerEngineController else {
+            avStallWatchdogItemGeneration = nil
+            return
+        }
+        guard PlayerLoadProvenanceState.accepts(
+            callbackToken: loadToken,
+            activeToken: avPlayer.activeLoadToken
+        ) else { return }
+        avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
     }
 
     /// Arm the bounded terminal (EOF) fallback. The outgoing episode reached true end-of-file but the EOF
