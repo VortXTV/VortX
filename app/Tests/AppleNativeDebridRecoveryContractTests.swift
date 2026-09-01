@@ -79,6 +79,32 @@ private struct NativeDebridRefreshLifecycleModel {
     }
 }
 
+private struct AVReplacementDeadlineModel {
+    struct Owner: Equatable {
+        let token: Int
+        let itemGeneration: UInt64
+    }
+
+    private(set) var owner: Owner?
+    private(set) var terminalized = false
+
+    mutating func replace(token: Int, itemGeneration: UInt64) {
+        owner = Owner(token: token, itemGeneration: itemGeneration)
+        terminalized = false
+    }
+
+    mutating func firstFrame(token: Int, itemGeneration: UInt64) {
+        guard owner == Owner(token: token, itemGeneration: itemGeneration) else { return }
+        owner = nil
+    }
+
+    mutating func expire(token: Int, itemGeneration: UInt64) {
+        guard owner == Owner(token: token, itemGeneration: itemGeneration) else { return }
+        owner = nil
+        terminalized = true
+    }
+}
+
 @main @MainActor
 private enum AppleNativeDebridRecoveryContractTests {
     private static var failures = 0
@@ -204,6 +230,23 @@ private enum AppleNativeDebridRecoveryContractTests {
         check("retired AV callback leaves the next mounted generation intact", transition.observedGeneration == 7)
         transition.acceptedFirstFrame(token: 42, generation: 8)
         check("accepted AV first frame advances the recoverable generation", transition.observedGeneration == 8)
+        check(
+            "AV replacement arms a token and item-generation-owned first-frame deadline",
+            source.contains("private struct AVReplacementFirstFrameOwner")
+                && source.contains("private func armAVReplacementFirstFrameDeadline")
+                && source.contains("armAVReplacementFirstFrameDeadline(avPlayer)")
+                && source.contains("activeAVPlayer.currentItemGeneration == owner.itemGeneration")
+                && source.contains("cancelAVReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)")
+        )
+        var replacementDeadline = AVReplacementDeadlineModel()
+        replacementDeadline.replace(token: 10, itemGeneration: 1)
+        replacementDeadline.expire(token: 10, itemGeneration: 1)
+        check("replacement with no frame reaches bounded terminal path", replacementDeadline.terminalized)
+        replacementDeadline.replace(token: 11, itemGeneration: 2)
+        replacementDeadline.expire(token: 10, itemGeneration: 1)
+        check("stale replacement deadline cannot affect newer item", !replacementDeadline.terminalized)
+        replacementDeadline.firstFrame(token: 11, itemGeneration: 2)
+        check("accepted replacement first frame retires its deadline", replacementDeadline.owner == nil)
         check(
             "a raw torrent port rebind recreates only its matching local engine before replacement load",
             source.contains("private func prepareRawTorrentAfterLoopbackRebind")

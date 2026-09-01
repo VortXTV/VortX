@@ -188,6 +188,10 @@ private struct NativeDebridFreshLinkRecoveryState: Equatable {
 
 struct PlayerScreen: View {
     #if os(iOS) || os(macOS)
+    private struct AVReplacementFirstFrameOwner: Equatable {
+        let loadToken: PlayerLoadToken
+        let itemGeneration: UInt64
+    }
     private struct DirectAVNoFrameRecovery: Equatable {
         let url: URL
         let episodeGeneration: Int
@@ -738,6 +742,11 @@ struct PlayerScreen: View {
     /// Exact item observed by the surface-stall watchdog. An AVPlayer replacement advances this value, fencing
     /// a stale watchdog callback away from the new item.
     @State private var avStallWatchdogItemGeneration: UInt64?
+    /// A policy-authorized same-mount AV item replacement does not issue the normal load timer. Keep an
+    /// explicit owner until its replacement item renders a frame, otherwise `hasStartedPlaying = false`
+    /// disables the ordinary stall watchdog and a blank replacement can persist indefinitely.
+    @State private var avReplacementFirstFrameOwner: AVReplacementFirstFrameOwner?
+    @State private var avReplacementFirstFrameDeadlineTask: Task<Void, Never>?
     /// No MPV surface is constructed until the retiring AV/remux route acknowledges producer unwind.
     @State private var avToMPVHandoff: AVToMPVHandoff?
     @State private var avToMPVHandoffBlocked = false
@@ -786,6 +795,7 @@ struct PlayerScreen: View {
     // Since the progress-aware rework this fixed wall only governs NON-remux AVPlayer mounts; a mounted remux
     // uses the stall/ceiling pair below (mirrors tvOS TVPlayerView).
     private let avStartWatchdogSeconds: Double = 20
+    private let avReplacementFirstFrameDeadlineSeconds: Double = 20
     // Progress-aware remux demote thresholds (the 0.3.13 field fix, tvOS twin in TVPlayerView): demote only on
     // a TRUE stall (no new muxed bytes / segments / classify-init flips for the whole window) or at a generous
     // hard ceiling, never merely because a heavy still-downloading 4K DV source needed longer than a fixed wall
@@ -1376,6 +1386,9 @@ struct PlayerScreen: View {
             cancelTerminalFinalityRefresh()
             #if os(iOS) || os(macOS)
             engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
+            avReplacementFirstFrameDeadlineTask?.cancel()
+            avReplacementFirstFrameDeadlineTask = nil
+            avReplacementFirstFrameOwner = nil
             #endif
             pendingLibmpvResumeSeek = nil   // teardown: drop any deferred resume seek so it cannot fire on a later mount
             postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
@@ -1855,6 +1868,7 @@ struct PlayerScreen: View {
                     srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
                     rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)
+                    cancelAVReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)
                     directAVNoFrameRecovery = nil
                     firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
                     // Deferred libmpv resume seek: the pipeline is now warm (first frame rendered), so this lands
@@ -3815,6 +3829,53 @@ struct PlayerScreen: View {
         avStallWatchdogItemGeneration = avPlayer.currentItemGeneration
     }
 
+    /// A same-token AVPlayer item replacement bypasses `loadIntoPlayer`, so the standard load timeout has
+    /// already been cancelled by the old item's first frame. This exact-owner deadline is the replacement
+    /// item's only first-frame backstop. It cannot fire for a later item because both token and item generation
+    /// must still match before it reuses the existing source-hop/terminal path.
+    private func armAVReplacementFirstFrameDeadline(_ avPlayer: AVPlayerEngineController) {
+        guard let loadToken = avPlayer.activeLoadToken else { return }
+        let owner = AVReplacementFirstFrameOwner(
+            loadToken: loadToken,
+            itemGeneration: avPlayer.currentItemGeneration
+        )
+        avReplacementFirstFrameDeadlineTask?.cancel()
+        avReplacementFirstFrameOwner = owner
+        avReplacementFirstFrameDeadlineTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(avReplacementFirstFrameDeadlineSeconds))
+            guard !Task.isCancelled,
+                  avReplacementFirstFrameOwner == owner,
+                  !playbackExited,
+                  !hasStartedPlaying,
+                  let activeAVPlayer = coordinator.player as? AVPlayerEngineController,
+                  activeAVPlayer.activeLoadToken == owner.loadToken,
+                  activeAVPlayer.currentItemGeneration == owner.itemGeneration else { return }
+            avReplacementFirstFrameOwner = nil
+            avReplacementFirstFrameDeadlineTask = nil
+            DiagnosticsLog.log(
+                "player",
+                "AVPlayer replacement first-frame deadline expired generation=\(owner.itemGeneration)"
+            )
+            if !hopToNextSource(reason: "AVPlayer replacement produced no frame", resumeOverride: currentTime) {
+                loadErrorMsg = "Playback did not resume after recovering this source."
+                presentTerminalLoadFailure()
+            }
+        }
+    }
+
+    /// A late tick can only retire a replacement deadline if it belongs to the replacement's active token and
+    /// item generation. Leaving a new owner's deadline armed is safer than cancelling the wrong transaction.
+    private func cancelAVReplacementFirstFrameDeadlineIfOwned(by loadToken: PlayerLoadToken) {
+        guard let owner = avReplacementFirstFrameOwner,
+              owner.loadToken == loadToken,
+              let activeAVPlayer = coordinator.player as? AVPlayerEngineController,
+              activeAVPlayer.activeLoadToken == owner.loadToken,
+              activeAVPlayer.currentItemGeneration == owner.itemGeneration else { return }
+        avReplacementFirstFrameDeadlineTask?.cancel()
+        avReplacementFirstFrameDeadlineTask = nil
+        avReplacementFirstFrameOwner = nil
+    }
+
     private func recoverFromStall() {
         #if os(iOS) || os(macOS)
         if let avPlayer = coordinator.player as? AVPlayerEngineController {
@@ -3835,6 +3896,7 @@ struct PlayerScreen: View {
                 hasStartedPlaying = false
                 firstFrameRenderedAt = nil
                 appliedAutoTracks = true
+                armAVReplacementFirstFrameDeadline(avPlayer)
                 DiagnosticsLog.log("player", "AVPlayer proven surface stall replaced fresh item generation=\(avPlayer.currentItemGeneration)")
                 return
             case .terminal(let proof):
@@ -8005,6 +8067,9 @@ struct PlayerScreen: View {
         postFrameResumeSeekWatchdog?.cancel()
         #if os(iOS) || os(macOS)
         avStartWatchdog?.cancel()
+        avReplacementFirstFrameDeadlineTask?.cancel()
+        avReplacementFirstFrameDeadlineTask = nil
+        avReplacementFirstFrameOwner = nil
         avToMPVHandoffTask?.cancel()
         #endif
         if assetSanityAccepted {
