@@ -128,7 +128,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         // The shared pool is give-to-get. Keep the master consent explicit at
         // admission as well as at CommunityTrickplay's final POST boundary.
         guard MoatConsent.contributeAndConsume else { return false }
-        TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
+        return TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
             communityEnabled: CommunityTrickplay.isEnabled,
             hasRealDuration: hasRealDuration
         )
