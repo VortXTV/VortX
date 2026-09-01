@@ -21,6 +21,8 @@ private enum TrickplayEndToEndCorrectionTests {
         testPreStrideGapEvidenceSurvivesAdversarialSheetStrides()
         testMediaGenerationRejectsStaleEpisodeCallback()
         testFetchEpochClaimRejectsABA()
+        testCommunityConsentBlocksUploadAdmission()
+        testCommunityConsentRevocationBlocksPost()
         testCommunityFetchContract()
         testStoreAndUICompletionContract()
         testProtectedUHDHDRCaptureContract()
@@ -461,6 +463,52 @@ private enum TrickplayEndToEndCorrectionTests {
         expect(published == ["A3"] && cleared == ["A3"], "only A3 may publish and clear the retained fetch handle")
     }
 
+    private static func testCommunityConsentBlocksUploadAdmission() {
+        let store = source("app/SourcesShared/ScrubThumbnails.swift")
+        guard let admissionStart = store.range(of: "private var permitsCommunityUpload: Bool"),
+              let admissionEnd = store.range(of: "    deinit", range: admissionStart.upperBound..<store.endIndex) else {
+            fatalError("cannot inspect community upload-admission boundary")
+        }
+        let admission = store[admissionStart.lowerBound..<admissionEnd.lowerBound]
+        expect(
+            !TrickplayCommunityPoolParticipation.permits(
+                featureEnabled: true,
+                masterConsent: false
+            ),
+            "withdrawn master consent must block community upload admission"
+        )
+        expect(
+            TrickplayCommunityPoolParticipation.permits(
+                featureEnabled: true,
+                masterConsent: true
+            ),
+            "the master consent does not override an enabled community feature"
+        )
+        expect(
+            admission.contains("guard MoatConsent.contributeAndConsume else { return false }")
+                && admission.contains("communityEnabled: CommunityTrickplay.isEnabled"),
+            "upload admission must apply master consent before reserving a policy claim"
+        )
+    }
+
+    private static func testCommunityConsentRevocationBlocksPost() {
+        let community = source("app/SourcesShared/CommunityTrickplay.swift")
+        guard let postStart = community.range(of: "private static func post("),
+              let postEnd = community.range(of: "/// `scheme://host/path`", range: postStart.upperBound..<community.endIndex) else {
+            fatalError("cannot inspect community POST boundary")
+        }
+        let post = community[postStart.lowerBound..<postEnd.lowerBound]
+        guard let signing = post.range(of: "VortXEdgeAuth.sign(&req)"),
+              let consent = post.range(of: "guard MoatConsent.contributeAndConsume"),
+              let request = post.range(of: "URLSession.shared.data(for: req)") else {
+            fatalError("cannot inspect post-consent ordering")
+        }
+        expect(
+            signing.lowerBound < consent.lowerBound && consent.lowerBound < request.lowerBound,
+            "a consent revocation during sprite composition must stop publication before URLSession POST"
+        )
+    }
+
     private static func testCommunityFetchContract() {
         let community = source("app/SourcesShared/CommunityTrickplay.swift")
         guard let fetchStart = community.range(of: "enum FetchUnavailableReason"),
@@ -479,6 +527,9 @@ private enum TrickplayEndToEndCorrectionTests {
         expect(fetch.contains("enum FetchStatus: Sendable") && fetch.contains("statusCode: Int") && !fetch.contains("cues = []") && !fetch.contains("?? []")
             && fetch.contains("return .unavailable(.advertisedIndexInvalid)"),
                "asset groups must pass typed status data and never manufacture an advertised-index hit")
+        expect(fetch.contains("guard isEnabled else { return .unavailable(.metadataUnavailable) }")
+                && fetch.components(separatedBy: "guard isEnabled else").count >= 4,
+               "give-to-get consent must prevent both new fetches and later community asset consumption")
     }
 
     private static func testStoreAndUICompletionContract() {
@@ -560,6 +611,12 @@ private enum TrickplayEndToEndCorrectionTests {
                 && community.contains("cueEndFences: picked.cueEndFences")
                 && community.contains("gapFenceInterval: retainedInterval"),
             "coverage, metadata, and VTT must share retained cadence plus propagated pre-stride gap evidence"
+        )
+        expect(
+            store.contains("guard MoatConsent.contributeAndConsume else { return false }")
+                && store.contains("if CommunityTrickplay.isEnabled,\n           let sheet = communitySheet")
+                && store.contains("guard CommunityTrickplay.isEnabled,\n              let sheet = communitySheet"),
+            "master consent must block upload admission and stop serving retained community previews after opt-out"
         )
         expect(
             localConfigure.contains("showToken &+= 1")

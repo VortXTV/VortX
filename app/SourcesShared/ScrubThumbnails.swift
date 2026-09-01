@@ -125,6 +125,9 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// engine reports the real duration can permanently poison a neighbouring
     /// title's bucket.
     private var permitsCommunityUpload: Bool {
+        // The shared pool is give-to-get. Keep the master consent explicit at
+        // admission as well as at CommunityTrickplay's final POST boundary.
+        guard MoatConsent.contributeAndConsume else { return false }
         TrickplayCommunityUploadEligibilityPolicy.permitsUpload(
             communityEnabled: CommunityTrickplay.isEnabled,
             hasRealDuration: hasRealDuration
@@ -174,7 +177,8 @@ final class ScrubThumbnailsStore: ObservableObject {
         // cached mapping proceeds inline; a miss kicks ONE async resolve and re-enters with the tt id (the
         // chrome re-calls this every tick anyway, so the cache also catches the next call).
         var imdbId = rawImdbId
-        if enabled, let raw = rawImdbId, raw.lowercased().hasPrefix("tmdb") {
+        if enabled, CommunityTrickplay.isEnabled,
+           let raw = rawImdbId, raw.lowercased().hasPrefix("tmdb") {
             if let tt = CommunityTrickplay.cachedIMDbID(for: raw) {
                 imdbId = tt
             } else {
@@ -183,7 +187,7 @@ final class ScrubThumbnailsStore: ObservableObject {
                 return
             }
         }
-        guard enabled, let imdbId, duration > 0,
+        guard enabled, CommunityTrickplay.isEnabled, let imdbId, duration > 0,
               let key = CommunityTrickplay.contentKey(imdbId: imdbId, season: season, episode: episode, duration: duration)
         else {
             // Diagnose an empty server table: log WHY we never key (the remaining culprits are a non-tt,
@@ -324,7 +328,8 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// is assigned back on the MainActor, gated by `showToken` so a stale late result can't overwrite a newer one.
     func show(time: Double) {
         activeScrubTime = time; showToken &+= 1; pendingLocalReadToken = nil; image = nil
-        if let sheet = communitySheet, let crop = sheet.crop(at: time) {
+        if CommunityTrickplay.isEnabled,
+           let sheet = communitySheet, let crop = sheet.crop(at: time) {
             image = crop; previewState = .ready; return
         }
         guard let key = localCacheKey else {
@@ -375,7 +380,8 @@ final class ScrubThumbnailsStore: ObservableObject {
     /// position: serve the NEAREST community tile so scrubbing shows an approximate frame instead of
     /// "Previews unavailable". nil only when this title has no downloaded community sheet.
     private func nearestCommunityFallback() -> ScrubImage? {
-        guard let sheet = communitySheet, let time = activeScrubTime else { return nil }
+        guard CommunityTrickplay.isEnabled,
+              let sheet = communitySheet, let time = activeScrubTime else { return nil }
         return sheet.nearestCrop(at: time)
     }
 

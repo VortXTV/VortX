@@ -470,6 +470,16 @@ enum TrickplayFetchClaim {
     }
 }
 
+/// The community preview pool is explicitly give-to-get: the same master consent
+/// controls both publication and consumption. Keep this Foundation-only predicate
+/// outside the production-only implementation block so focused tests can prove
+/// the two asynchronous publication boundaries without loading platform UI code.
+enum TrickplayCommunityPoolParticipation {
+    static func permits(featureEnabled: Bool, masterConsent: Bool) -> Bool {
+        featureEnabled && masterConsent
+    }
+}
+
 #if !TRICKPLAY_E2E_POLICY_TESTING
 
 /// Community trickplay: scrub-preview thumbnails SHARED across users, like Netflix / Plex storyboards.
@@ -510,8 +520,12 @@ enum CommunityTrickplay {
         // absent/null remote is identical to shipping; the user's own setting still governs.
         guard RemoteConfig.snapshot.isFeatureOn("communityTrickplay", default: true) else { return false }
         // Absent default = true. UserDefaults returns false for an unset bool, so check object presence.
-        if UserDefaults.standard.object(forKey: settingKey) == nil { return true }
-        return UserDefaults.standard.bool(forKey: settingKey)
+        let featureEnabled = UserDefaults.standard.object(forKey: settingKey) == nil
+            || UserDefaults.standard.bool(forKey: settingKey)
+        return TrickplayCommunityPoolParticipation.permits(
+            featureEnabled: featureEnabled,
+            masterConsent: MoatConsent.contributeAndConsume
+        )
     }
 
     /// floor(duration/10)*10, matching the Worker's durationBucket.
@@ -823,6 +837,7 @@ enum CommunityTrickplay {
     /// GET the community set for `key` and, on a hit, download + decode the sprite and advertised index.
     /// Every failure is reduced to a finite redacted reason so callers never receive raw transport details.
     static func fetch(key: String) async -> FetchResult {
+        guard isEnabled else { return .unavailable(.metadataUnavailable) }
         guard !Task.isCancelled, let url = URL(string: "\(baseURL)/tp/\(key)") else {
             return Task.isCancelled ? .cancelled : .unavailable(.metadataUnavailable)
         }
@@ -835,6 +850,7 @@ enum CommunityTrickplay {
             data = body
         case .response: return .unavailable(.metadataUnavailable)
         }
+        guard isEnabled else { return .unavailable(.metadataUnavailable) }
         guard !Task.isCancelled, let meta = try? JSONDecoder().decode(FetchResponse.self, from: data) else {
             return Task.isCancelled ? .cancelled : .unavailable(.metadataInvalid)
         }
@@ -858,6 +874,7 @@ enum CommunityTrickplay {
             sprite = readySprite
             advertisedVTT = readyVTT
         }
+        guard isEnabled else { return .unavailable(.metadataUnavailable) }
         guard case .response(let spriteData, 200) = sprite,
               let image = ScrubImage(data: spriteData), let cg = image.cgImageForCrop else {
             return .unavailable(.spriteUnavailable)
@@ -1125,6 +1142,12 @@ enum CommunityTrickplay {
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "content-type")
         req.httpBody = body
         VortXEdgeAuth.sign(&req)   // gated host (trickplay.vortx.tv /tp/<key> POST): stamp X-VX-Ts / X-VX-Sig
+        // Composition can take long enough for the user to withdraw their give-to-get consent. Recheck at
+        // the network boundary so an already-admitted task never publishes after that opt-out.
+        guard MoatConsent.contributeAndConsume,
+              TrickplayOwnedWorkGate.permitsStage(
+                  taskIsCancelled: Task.isCancelled
+              ) else { return .failed }
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             let http = resp as? HTTPURLResponse
