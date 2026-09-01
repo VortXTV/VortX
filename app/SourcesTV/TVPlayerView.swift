@@ -3508,12 +3508,14 @@ struct TVPlayerView: View {
         var rows: [OptionRow] = []
         let qualityOptions = StreamRanking.resolutionOptions(groups)
         if !qualityOptions.isEmpty {
-            rows.append(OptionRow(label: "Quality", detail: "›") { openPanel(.quality) })
+            rows.append(OptionRow(accessibilityID: "sources.quality", label: "Quality", detail: "›") {
+                openPanel(.quality)
+            })
         }
         rows.append(OptionRow(accessibilityID: "sources.audio", label: "Audio", detail: "›") {
             openPanel(.sourceAudio)
         })
-        rows.append(OptionRow(label: "Sources", isHeader: true))
+        rows.append(OptionRow(accessibilityID: "sources.heading", label: "Sources", isHeader: true))
         // Install the session audio-language filter as a task-local for the ranking reads only (iOS parity,
         // #204): `StreamRanking.score` -> `languageScore` reads `TrackPreferences.current.audioLanguages` live
         // at score time, so this floats the chosen-audio release above a same-resolution foreign-audio one.
@@ -3532,14 +3534,23 @@ struct TVPlayerView: View {
                     .prefix(perAddon)
                     .map(\.stream)
                 guard !best.isEmpty else { continue }
-                rows.append(OptionRow(label: group.addon, isHeader: true))
+                let groupIdentity = VXProbeRedaction.identityToken(group.id)
+                rows.append(OptionRow(
+                    accessibilityID: "sources.group.\(groupIdentity)",
+                    label: group.addon,
+                    isHeader: true
+                ))
                 for stream in best {
                     guard count < maxInPlayerSources else { break }
                     count += 1
                     let info = StreamRanking.sourceDetail(stream)
                     let name = String(sourceLabel(stream).prefix(40))
-                    rows.append(OptionRow(label: "\(info.tags)   \(name)", detail: info.size ?? "",
-                                          isSelected: playableURL(for: stream) == curURL) {
+                    rows.append(OptionRow(
+                        accessibilityID: "sources.stream.\(groupIdentity).\(VXProbeRedaction.identityToken(stream.id))",
+                        label: "\(info.tags)   \(name)",
+                        detail: info.size ?? "",
+                        isSelected: playableURL(for: stream) == curURL
+                    ) {
                         resolveAndSwitchStream(to: stream, addon: group.addon)
                     })
                 }

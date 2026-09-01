@@ -43,6 +43,8 @@ check.require(
 let sourceRows = section(player, from: "private func sourceRows()", to: "private func playerSettingsRows()") ?? ""
 check.require(
     sourceRows.contains("accessibilityID: \"sources.audio\"")
+        && sourceRows.contains("accessibilityID: \"sources.quality\"")
+        && sourceRows.contains("accessibilityID: \"sources.stream.\\(groupIdentity).\\(VXProbeRedaction.identityToken(stream.id))\"")
         && sourceRows.contains("accessibilityID: \"source-audio.auto\"")
         && sourceRows.contains("accessibilityID: \"source-audio.language.\\(lang.id)\""),
     "Sources and source-audio rows publish stable semantic identities"
