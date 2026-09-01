@@ -39,6 +39,46 @@ private func sourceSection(_ source: String, from start: String, to end: String)
     return String(suffix[..<endRange.lowerBound])
 }
 
+private struct NativeDebridRefreshLifecycleModel {
+    private var nextGeneration: UInt64 = 0
+    private var activeGeneration: UInt64?
+    private var inFlight = false
+    private var freshLinkUsed = false
+    private var joinedEngine: Bool?
+
+    mutating func begin() -> UInt64? {
+        guard !freshLinkUsed, !inFlight else { return nil }
+        nextGeneration &+= 1
+        activeGeneration = nextGeneration
+        inFlight = true
+        freshLinkUsed = true
+        return nextGeneration
+    }
+
+    mutating func retire(ownedBy generation: UInt64) -> Bool {
+        guard inFlight, activeGeneration == generation else { return false }
+        activeGeneration = nil
+        inFlight = false
+        freshLinkUsed = false
+        joinedEngine = nil
+        return true
+    }
+
+    mutating func join(engine: Bool) -> Bool {
+        guard inFlight else { return false }
+        joinedEngine = engine
+        return true
+    }
+
+    mutating func finish(ownedBy generation: UInt64) -> Bool? {
+        guard inFlight, activeGeneration == generation else { return nil }
+        inFlight = false
+        activeGeneration = nil
+        defer { joinedEngine = nil }
+        return joinedEngine
+    }
+}
+
 @main @MainActor
 private enum AppleNativeDebridRecoveryContractTests {
     private static var failures = 0
@@ -64,6 +104,7 @@ private enum AppleNativeDebridRecoveryContractTests {
             source.contains("NativeDebridFreshLinkRecoveryState")
                 && source.contains("guard !freshLinkUsed, !freshLinkInFlight")
                 && source.contains("nativeDebridFreshLinkRecovery.beginFreshLink")
+                && source.contains("retireFreshLinkIfOwned(by: recoveryGeneration)")
                 && source.contains("nativeDebridFreshLinkRecovery.reset()")
         )
         check(
@@ -121,9 +162,22 @@ private enum AppleNativeDebridRecoveryContractTests {
             "engine switches join an in-flight provider refresh and cannot mount the known-stale URL",
             source.contains("nativeDebridFreshLinkRecovery.freshLinkInFlight")
                 && source.contains("nativeDebridFreshLinkRecovery.joinEngineSwitch(toAVPlayer)")
-                && source.contains("let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()")
+                && source.contains("finishFreshLink(\n                ownedBy: recoveryGeneration")
                 && source.contains("preservingNativeDebridRecoveryGeneration: true")
         )
+        check(
+            "a first frame cancels a provider refresh only when it owns that request token",
+            source.contains("nativeDebridFreshLinkRecovery.isOwned(by: event.loadToken)")
+        )
+        var refreshLifecycle = NativeDebridRefreshLifecycleModel()
+        let cancelledGeneration = refreshLifecycle.begin()
+        check("cancelled refresh begins with an exact generation", cancelledGeneration != nil)
+        check("cancelled refresh retires its own transaction", refreshLifecycle.retire(ownedBy: cancelledGeneration!))
+        let secondGeneration = refreshLifecycle.begin()
+        check("cancelled refresh permits a second recovery", secondGeneration != nil)
+        check("stale first generation cannot retire the second recovery", !refreshLifecycle.retire(ownedBy: cancelledGeneration!))
+        check("engine switch joins the second recovery", refreshLifecycle.join(engine: false))
+        check("second recovery completes with the joined engine", refreshLifecycle.finish(ownedBy: secondGeneration!) == false)
         check(
             "recovery preserves paused transport intent and semantic audio across mount-local track IDs",
             source.contains("let pausedIntent = isPaused")

@@ -119,16 +119,29 @@ private struct PlayerBufferedBand: View {
 /// One provider refresh belongs to one native-debrid mount.  A requested engine change joins that refresh
 /// instead of constructing a new surface from the expired signed URL that triggered it.
 private struct NativeDebridFreshLinkRecoveryState: Equatable {
+    struct Completion: Equatable {
+        let requestedEngine: Bool?
+    }
+
     private(set) var freshLinkUsed = false
     private(set) var freshLinkInFlight = false
     private(set) var requestedEngine: Bool?
+    private(set) var activeGeneration: UInt64?
+    private(set) var activeLoadToken: PlayerLoadToken?
+    private var nextGeneration: UInt64 = 0
 
-    mutating func beginFreshLink(requestedEngine: Bool? = nil) -> Bool {
-        guard !freshLinkUsed, !freshLinkInFlight else { return false }
+    mutating func beginFreshLink(
+        requestedEngine: Bool? = nil,
+        loadToken: PlayerLoadToken
+    ) -> UInt64? {
+        guard !freshLinkUsed, !freshLinkInFlight else { return nil }
+        nextGeneration &+= 1
         freshLinkUsed = true
         freshLinkInFlight = true
         self.requestedEngine = requestedEngine
-        return true
+        activeGeneration = nextGeneration
+        activeLoadToken = loadToken
+        return nextGeneration
     }
 
     mutating func joinEngineSwitch(_ engine: Bool) -> Bool {
@@ -137,17 +150,39 @@ private struct NativeDebridFreshLinkRecoveryState: Equatable {
         return true
     }
 
-    mutating func finishFreshLink() -> Bool? {
-        guard freshLinkInFlight else { return nil }
+    mutating func finishFreshLink(ownedBy generation: UInt64) -> Completion? {
+        guard freshLinkInFlight, activeGeneration == generation else { return nil }
         freshLinkInFlight = false
-        defer { requestedEngine = nil }
-        return requestedEngine
+        let completion = Completion(requestedEngine: requestedEngine)
+        requestedEngine = nil
+        activeGeneration = nil
+        activeLoadToken = nil
+        return completion
+    }
+
+    /// Cancellation and stale results do not consume this mount's one actual provider result. Only the
+    /// transaction that owns `generation` can retire itself, so an old task cannot clear a newer recovery.
+    @discardableResult
+    mutating func retireFreshLinkIfOwned(by generation: UInt64) -> Bool {
+        guard freshLinkInFlight, activeGeneration == generation else { return false }
+        freshLinkUsed = false
+        freshLinkInFlight = false
+        requestedEngine = nil
+        activeGeneration = nil
+        activeLoadToken = nil
+        return true
+    }
+
+    func isOwned(by loadToken: PlayerLoadToken) -> Bool {
+        freshLinkInFlight && activeLoadToken == loadToken
     }
 
     mutating func reset() {
         freshLinkUsed = false
         freshLinkInFlight = false
         requestedEngine = nil
+        activeGeneration = nil
+        activeLoadToken = nil
     }
 }
 
@@ -1859,7 +1894,14 @@ struct PlayerScreen: View {
                     guard settleAssetSanityIfPossible(
                         loadToken: event.loadToken, position: d
                     ) else { return }
-                    loadTimeout?.cancel(); autoRetryTask?.cancel()
+                    loadTimeout?.cancel()
+                    // The retry task can be a native-debrid provider request. An accepted frame cancels it only
+                    // when this exact callback token owns that request; a delayed old-item frame must never
+                    // cancel a newer source's refresh transaction.
+                    if !nativeDebridFreshLinkRecovery.freshLinkInFlight
+                        || nativeDebridFreshLinkRecovery.isOwned(by: event.loadToken) {
+                        autoRetryTask?.cancel()
+                    }
                     recoveryDeadline?.cancel(); recoveryDeadline = nil
                     #if os(iOS) || os(macOS)
                     avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: keep AVPlayer
@@ -2953,7 +2995,10 @@ struct PlayerScreen: View {
         let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
         let retryEpisodeGeneration = episodeSwitchGeneration
         let retrySourceGeneration = sourceSwitchGeneration
-        guard nativeDebridFreshLinkRecovery.beginFreshLink(requestedEngine: requestedEngine) else { return false }
+        guard let recoveryGeneration = nativeDebridFreshLinkRecovery.beginFreshLink(
+            requestedEngine: requestedEngine,
+            loadToken: retryLoadToken
+        ) else { return false }
         resumeSourceReresolved = true
         pendingAudioReapply = audioChoice
         pendingSubtitleReapply = subtitleChoice
@@ -2963,6 +3008,9 @@ struct PlayerScreen: View {
         reconnectMsg = "Reloading your source…"; withAnimation { reconnecting = true }
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
+            // Every exit, including task cancellation and a stale provider completion, retires only this
+            // transaction. A later recovery has a distinct generation and is left untouched.
+            defer { _ = nativeDebridFreshLinkRecovery.retireFreshLinkIfOwned(by: recoveryGeneration) }
             let fresh = try? await DebridCoordinator.shared.reresolve(
                 service: ref.service, infoHash: ref.infoHash,
                 torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
@@ -2978,7 +3026,10 @@ struct PlayerScreen: View {
                   retrySourceGeneration == sourceSwitchGeneration,
                   activeRef == ref, curURL == retryURL, currentStream == retrySource,
                   coordinator.player?.activeLoadToken == retryLoadToken else { return }
-            let joinedEngine = nativeDebridFreshLinkRecovery.finishFreshLink()
+            guard let completion = nativeDebridFreshLinkRecovery.finishFreshLink(
+                ownedBy: recoveryGeneration
+            ) else { return }
+            let joinedEngine = completion.requestedEngine
             if let fresh {
                 srcProbe("native debrid: accepted fresh same-source link reason=\(reason)")
                 reconnecting = false
