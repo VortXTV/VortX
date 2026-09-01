@@ -252,9 +252,7 @@ actor TorBoxResolver: DebridResolving {
 
     init(apiKey: String) {
         self.apiKey = apiKey
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
-        self.session = URLSession(configuration: cfg)
+        self.session = DebridHTTPSession.make()
     }
 
     // Generic envelope: { success, error, detail, data }
@@ -382,8 +380,8 @@ actor TorBoxResolver: DebridResolving {
             throw DebridError.providerError("bad requestdl url")
         }
         let link: Envelope<String> = try await get(url)
-        guard let s = link.data, let u = URL(string: s) else { throw DebridError.notCached }
-        return u
+        guard let s = link.data else { throw DebridError.notCached }
+        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
     }
 
     /// Fetch one torrent by numeric id.
@@ -481,9 +479,7 @@ actor TorBoxUsenetResolver {
 
     init(apiKey: String) {
         self.apiKey = apiKey
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
-        self.session = URLSession(configuration: cfg)
+        self.session = DebridHTTPSession.make()
     }
 
     /// md5 of an nzb link, TorBox's usenet cache identifier (the usenet twin of the torrent infohash).
@@ -595,8 +591,8 @@ actor TorBoxUsenetResolver {
             throw DebridError.providerError("bad requestdl url")
         }
         let link: Envelope<String> = try await get(url)
-        guard let s = link.data, let u = URL(string: s) else { throw DebridError.notCached }
-        return u
+        guard let s = link.data else { throw DebridError.notCached }
+        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
     }
 
     private func fetchItem(id: Int) async throws -> Item? {
@@ -672,9 +668,7 @@ actor RealDebridResolver: DebridResolving {
 
     init(apiKey: String) {
         self.apiKey = apiKey
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
-        self.session = URLSession(configuration: cfg)
+        self.session = DebridHTTPSession.make()
     }
 
     func checkCache(hashes: [String]) async throws -> [String: [DebridFile]] { [:] }   // removed upstream
@@ -739,7 +733,7 @@ actor RealDebridResolver: DebridResolving {
             throw DebridError.notReady
         }
         let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": link])
-        guard let u = URL(string: un.download) else { throw DebridError.providerError("no download url") }
+        let u = try DebridPublicURLPolicy.playbackURL(from: un.download, failure: DebridError.providerError("no download url"))
         DebridProbe.log("resolve.rd", "infoHash=\(DebridProbe.h8(infoHash)) -> OK unrestricted link elapsed=\(DebridProbe.since(srcProbeStart))ms")
         return u
     }
@@ -785,9 +779,7 @@ actor AllDebridResolver: DebridResolving {
 
     init(apiKey: String) {
         self.apiKey = apiKey
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
-        self.session = URLSession(configuration: cfg)
+        self.session = DebridHTTPSession.make()
     }
 
     /// `GET /magnet/instant`, `magnets[]` = infohashes. AllDebrid still ships this in 2026 (only Real-Debrid
@@ -857,8 +849,8 @@ actor AllDebridResolver: DebridResolving {
         guard let pick = DebridResolve.pickFile(dfiles, episode: episode),
               links.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
         let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: links[pick.id].link)]))
-        guard let s = un.data?.link, let u = URL(string: s) else { throw DebridError.providerError("unlock") }
-        return u
+        guard let s = un.data?.link else { throw DebridError.providerError("unlock") }
+        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("unlock"))
     }
 
     private func authed(_ path: String, _ extra: [URLQueryItem]) -> URL {
@@ -883,9 +875,7 @@ actor PremiumizeResolver: DebridResolving {
 
     init(apiKey: String) {
         self.apiKey = apiKey
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 20
-        self.session = URLSession(configuration: cfg)
+        self.session = DebridHTTPSession.make()
     }
 
     /// `POST /api/cache/check` with `items[]` = bare infohashes. The response arrays are positionally aligned
@@ -945,8 +935,8 @@ actor PremiumizeResolver: DebridResolving {
         guard let pick = DebridResolve.pickFile(dfiles, episode: episode),
               content.indices.contains(pick.id) else { throw DebridError.noMatchingFile }
         let item = content[pick.id]
-        guard let s = item.streamLink ?? item.link, let u = URL(string: s) else { throw DebridError.providerError("no link") }
-        return u
+        guard let s = item.streamLink ?? item.link else { throw DebridError.providerError("no link") }
+        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("no link"))
     }
 
     private func form<T: Decodable>(_ path: String, _ fields: [String: String]) async throws -> T {
@@ -1997,8 +1987,7 @@ extension RealDebridResolver {
             throw DebridError.noMatchingFile
         }
         let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": links[pick.id]])
-        guard let u = URL(string: un.download) else { throw DebridError.providerError("no download url") }
-        return u
+        return try DebridPublicURLPolicy.playbackURL(from: un.download, failure: DebridError.providerError("no download url"))
     }
 }
 
@@ -2050,8 +2039,8 @@ extension AllDebridResolver {
     func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
         guard let restricted = item.restrictedLink else { throw DebridError.noMatchingFile }
         let un: Env<UnlockData> = try await get(authed("/link/unlock", [URLQueryItem(name: "link", value: restricted)]))
-        guard let s = un.data?.link, let u = URL(string: s) else { throw DebridError.providerError("unlock") }
-        return u
+        guard let s = un.data?.link else { throw DebridError.providerError("unlock") }
+        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("unlock"))
     }
 }
 
@@ -2101,8 +2090,8 @@ extension PremiumizeResolver {
     }
 
     func resolveLibraryItem(_ item: DebridLibraryItem) async throws -> URL {
-        guard let s = item.directLink, let u = URL(string: s) else { throw DebridError.providerError("no link") }
-        return u   // Premiumize folder files are already direct: no extra unrestrict round trip.
+        guard let s = item.directLink else { throw DebridError.providerError("no link") }
+        return try DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.providerError("no link"))
     }
 
     /// GET with the apikey query (folder/list is a GET), reusing the shared decode contract.
