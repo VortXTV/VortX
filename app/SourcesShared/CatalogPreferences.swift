@@ -151,55 +151,58 @@ enum HubCategoryKey {
 }
 
 enum CatalogPrefsStore {
-    static let hiddenKey = "stremiox.catalog.hidden"
-    static let orderKey = "stremiox.catalog.order"
+    static let hiddenKey = ProfileDiscoveryPreferencesStore.Key.hiddenCatalogs
+    static let orderKey = ProfileDiscoveryPreferencesStore.Key.catalogOrder
     static let landscapeKey = "stremiox.catalog.landscapeCards"
     static let widthKey = "stremiox.catalog.posterWidthPreset"
     static let radiusKey = "stremiox.catalog.posterRadiusPreset"
     static let hideLabelsKey = "stremiox.catalog.hidePosterLabels"
-    static let hiddenCategoriesKey = "vortx.discover.hiddenCategories"
-    static let regionKey = "vortx.discover.regionPreference"   // "" / absent = follow the device region
+    static let hiddenCategoriesKey = ProfileDiscoveryPreferencesStore.Key.hiddenHubCategories
+    static let regionKey = ProfileDiscoveryPreferencesStore.Key.regionOverride   // "" / absent = follow the device region
     static let homeLayoutKey = "vortx.home.layout"   // tvOS Home: "rails" (default) | "wall" (#105)
-    static let filtersKey = "vortx.discover.filters"   // advanced Discover filter set (JSON, absent = none)
+    static let filtersKey = ProfileDiscoveryPreferencesStore.Key.filters   // advanced Discover filter set (JSON, absent = none)
 
-    static func hidden() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: hiddenKey) ?? []) }
-    static func order() -> [String] { UserDefaults.standard.stringArray(forKey: orderKey) ?? [] }
+    static func hidden() -> Set<String> { Set(ProfileDiscoveryPreferencesStore.hiddenCatalogs()) }
+    static func order() -> [String] { ProfileDiscoveryPreferencesStore.catalogOrder() }
 
     /// Discover-hub categories the user has permanently hidden (see `HubCategoryKey`). Read as a plain static
     /// so the hub can filter off the main actor. Empty by default => every tile shows (today's behavior).
-    static func hiddenCategories() -> Set<String> { Set(UserDefaults.standard.stringArray(forKey: hiddenCategoriesKey) ?? []) }
+    static func hiddenCategories() -> Set<String> { Set(ProfileDiscoveryPreferencesStore.hiddenHubCategories()) }
     static func isCategoryHidden(_ key: String) -> Bool { hiddenCategories().contains(key) }
     static func setCategoryHidden(_ key: String, _ value: Bool) {
         var h = hiddenCategories()
         if value { h.insert(key) } else { h.remove(key) }
-        UserDefaults.standard.set(Array(h), forKey: hiddenCategoriesKey)
+        ProfileDiscoveryPreferencesStore.setHiddenHubCategories(Array(h))
+        ProfileStore.shared.captureDiscovery()
     }
 
     /// The user's explicit region override (ISO 3166-1 alpha-2, e.g. "GB"), or nil to follow the device
     /// region. Uppercased on read so a stored lowercase value still matches TMDB's region form.
     static func regionOverride() -> String? {
-        let v = (UserDefaults.standard.string(forKey: regionKey) ?? "").trimmingCharacters(in: .whitespaces)
-        return v.isEmpty ? nil : v.uppercased()
+        ProfileDiscoveryPreferencesStore.regionOverride()
     }
     static func setRegionOverride(_ code: String?) {
-        if let code, !code.isEmpty { UserDefaults.standard.set(code.uppercased(), forKey: regionKey) }
-        else { UserDefaults.standard.removeObject(forKey: regionKey) }
+        ProfileDiscoveryPreferencesStore.setRegionOverride(code)
+        ProfileStore.shared.captureDiscovery()
     }
 
     /// The user's advanced Discover filter set (genre include/exclude, year window, age rating, runtime,
     /// season count, upcoming-only), decoded from JSON. Absent / undecodable => `.empty`, so a default
     /// install filters nothing. Plain static so the Discover view can read it without touching the actor.
     static func discoverFilters() -> DiscoverFilters {
-        guard let data = UserDefaults.standard.data(forKey: filtersKey),
+        guard let data = ProfileDiscoveryPreferencesStore.filtersData(),
               let decoded = try? JSONDecoder().decode(DiscoverFilters.self, from: data) else { return .empty }
         return decoded
     }
     /// Persist the filter set. An inactive (empty) set removes the key so a default install stores nothing.
     static func setDiscoverFilters(_ filters: DiscoverFilters) {
         guard filters.isActive, let data = try? JSONEncoder().encode(filters) else {
-            UserDefaults.standard.removeObject(forKey: filtersKey); return
+            ProfileDiscoveryPreferencesStore.setFiltersData(nil)
+            ProfileStore.shared.captureDiscovery()
+            return
         }
-        UserDefaults.standard.set(data, forKey: filtersKey)
+        ProfileDiscoveryPreferencesStore.setFiltersData(data)
+        ProfileStore.shared.captureDiscovery()
     }
 
     /// Poster width preset (default `.balanced` = today's look). Read as a plain static so card/grid views
@@ -242,9 +245,13 @@ enum CatalogPrefsStore {
     static func setHidden(_ key: String, _ value: Bool) {
         var h = hidden()
         if value { h.insert(key) } else { h.remove(key) }
-        UserDefaults.standard.set(Array(h), forKey: hiddenKey)
+        ProfileDiscoveryPreferencesStore.setHiddenCatalogs(Array(h))
+        ProfileStore.shared.captureDiscovery()
     }
-    static func setOrder(_ keys: [String]) { UserDefaults.standard.set(keys, forKey: orderKey) }
+    static func setOrder(_ keys: [String]) {
+        ProfileDiscoveryPreferencesStore.setCatalogOrder(keys)
+        ProfileStore.shared.captureDiscovery()
+    }
 }
 
 @MainActor

@@ -28,6 +28,12 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// nil = never customized (pre-feature roster); seeded from the flat values on first load.
     var playback: PlaybackPrefs? = nil
 
+    /// Per-profile discovery preferences. The active viewer's snapshot is flattened into the
+    /// legacy UserDefaults keys that Home and Discover already read. nil is intentional for old
+    /// rosters and new profiles: a real switch resolves it to clean discovery defaults instead of
+    /// inheriting the previous viewer's catalog or provider choices.
+    var discovery: ProfileDiscoveryPreferences? = nil
+
     /// Add-on transport URLs this profile has turned OFF. A per-profile, local overlay: the add-on
     /// stays installed on the account, it is just hidden from THIS profile's Home rows, Discover,
     /// and stream sources. nil/empty = every installed add-on is on, so older rosters and freshly
@@ -143,6 +149,7 @@ struct UserProfile: Codable, Identifiable, Equatable {
         isOwner = try c.decodeIfPresent(Bool.self, forKey: .isOwner) ?? false
         familyEdit = try c.decodeIfPresent(Bool.self, forKey: .familyEdit) ?? false
         playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
+        discovery = try c.decodeIfPresent(ProfileDiscoveryPreferences.self, forKey: .discovery)
         disabledAddons = try c.decodeIfPresent([String].self, forKey: .disabledAddons)
         isKids = try c.decodeIfPresent(Bool.self, forKey: .isKids) ?? false
     }
@@ -150,10 +157,11 @@ struct UserProfile: Codable, Identifiable, Equatable {
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
          email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil,
-         disabledAddons: [String]? = nil, isKids: Bool = false) {
+         discovery: ProfileDiscoveryPreferences? = nil, disabledAddons: [String]? = nil, isKids: Bool = false) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
         self.email = email; self.isOwner = isOwner; self.familyEdit = familyEdit; self.playback = playback
+        self.discovery = discovery
         self.disabledAddons = disabledAddons
         self.isKids = isKids
     }
@@ -290,6 +298,16 @@ final class ProfileStore: ObservableObject {
             }
             persist(touch: false)
         }
+        // Unlike playback's original migration, discovery settings must NOT be copied to every old
+        // profile: that would make a new or previously inactive viewer inherit the currently active
+        // viewer's curated Home/Discover layout. Preserve the only flat state we can prove belongs to
+        // somebody, the active profile, and let every other nil snapshot resolve to clean defaults on
+        // its first real switch.
+        if let activeIndex = profiles.firstIndex(where: { $0.id == activeID }),
+           profiles[activeIndex].discovery == nil {
+            profiles[activeIndex].discovery = currentDiscoveryPrefs()
+            persist(touch: false)
+        }
         loadWatchCache()
     }
 
@@ -416,6 +434,7 @@ final class ProfileStore: ObservableObject {
         // roster already matches, and it safely does nothing when there is no active profile
         // (remove()'s select-after-removal: the removed profile is already gone from the roster).
         capturePlayback()
+        captureDiscovery()
         // Persist delayed progress against the outgoing profile before replacing the active watch dictionary.
         flushScheduledWatchCacheSave()
         let beforeAccount = active.map(keychainAccount(for:))
@@ -425,6 +444,7 @@ final class ProfileStore: ObservableObject {
         persist(touch: false)   // selection is per-device, not a roster edit
         applyTheme(profile)
         applyPlayback(profile, resetUnset: true)   // a switch resets unset filters to defaults, never inherits the old profile's
+        applyDiscovery(profile, resetUnset: true)
         SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on a switch
         SourcePinStore.shared.reload()      // pinned sources are per-profile too
         loadWatchCache()
@@ -447,6 +467,7 @@ final class ProfileStore: ObservableObject {
         if profile.id == activeID {
             applyTheme(profile)
             applyPlayback(profile)
+            applyDiscovery(profile)
         }
     }
 
@@ -888,6 +909,47 @@ final class ProfileStore: ObservableObject {
         update(profile)
     }
 
+    // MARK: Per-profile catalog and Discover preferences
+
+    /// The active flat catalog / Discover values as a profile-owned snapshot. Appearance options
+    /// deliberately do not appear here: those continue to be device-wide preferences.
+    private func currentDiscoveryPrefs() -> ProfileDiscoveryPreferences {
+        ProfileDiscoveryPreferencesStore.capture()
+    }
+
+    /// Flatten the target profile's discovery state into the existing keys every catalog, TMDB,
+    /// and provider caller already reads. A true profile switch clears every missing field so a
+    /// new profile starts clean, while sync folds leave unknown old-roster fields untouched.
+    private func applyDiscovery(_ profile: UserProfile, resetUnset: Bool = false) {
+        let p = profile.discovery
+        ProfileDiscoveryPreferencesStore.apply(p, resetUnset: resetUnset)
+        // The singleton views cache their @Published copies, and the hub holds region/provider
+        // tasks, so merely changing UserDefaults leaves the old viewer visible. ProfileStore also
+        // services off-main sync folds, so hop only this observable/UI refresh to the main actor.
+        // The flat keys above are already complete before the task is scheduled.
+        let appliedProfileID = profile.id
+        Task { @MainActor in
+            // A late A refresh after A -> B must not cancel/reload B's hub. If the viewer has
+            // switched back to A meanwhile, reading the now-current flat keys is correct.
+            guard ProfileStore.shared.activeID == appliedProfileID else { return }
+            CatalogPreferences.shared.reloadFromDefaults()
+            CollectionsHubModel.shared.reloadFromProfilePreferences()
+            CoreBridge.shared.rebuildBoardRows()
+        }
+    }
+
+    /// Fold an active viewer's already-applied discovery choices into its synced roster record.
+    /// This intentionally persists without applying again: the flat keys are the source of truth
+    /// for the live viewer at capture time, so a second reload would needlessly cancel hub work.
+    func captureDiscovery() {
+        guard let activeID,
+              let index = profiles.firstIndex(where: { $0.id == activeID }) else { return }
+        let now = currentDiscoveryPrefs()
+        guard profiles[index].discovery != now else { return }
+        profiles[index].discovery = now
+        persist()
+    }
+
     // MARK: Persistence
 
     /// First run after the upgrade: wrap the existing single account in a profile so nothing about
@@ -1007,6 +1069,7 @@ final class ProfileStore: ObservableObject {
         if let active {
             applyTheme(active)
             applyPlayback(active)
+            applyDiscovery(active)
         }
         persist(touch: false)
         loadWatchCache()
@@ -1150,6 +1213,7 @@ final class ProfileStore: ObservableObject {
         if let active {
             applyTheme(active)
             applyPlayback(active)
+            applyDiscovery(active)
             SourcePreferences.shared.reload()   // re-sync the singleton's @Published order on adopt
             SourcePinStore.shared.reload()
         }
@@ -1177,6 +1241,7 @@ final class ProfileStore: ObservableObject {
         if let active {
             applyTheme(active)
             applyPlayback(active)
+            applyDiscovery(active)
             SourcePreferences.shared.reload()
             SourcePinStore.shared.reload()
         }
@@ -1357,6 +1422,7 @@ final class ProfileStore: ObservableObject {
         if let active {
             applyTheme(active)
             applyPlayback(active)
+            applyDiscovery(active)
             SourcePreferences.shared.reload()
             SourcePinStore.shared.reload()
         }

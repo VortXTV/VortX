@@ -484,6 +484,7 @@ final class CollectionsHubModel: ObservableObject {
     private var genreGen = 0
     private var discoverGen = 0
     private var decadeGen = 0
+    private var globalGen = 0
     /// In-flight fetch of the global provider list (warmed only while a selection is active, so a selected
     /// service outside the viewer's region still resolves to a named, logo'd tile).
     private var globalTask: Task<Void, Never>?
@@ -538,6 +539,14 @@ final class CollectionsHubModel: ObservableObject {
         decadeTask?.cancel(); decadeTask = nil
         globalTask?.cancel(); globalTask = nil
         providers = []; genreBackdrops = [:]; discoverBackdrops = [:]; decadeCovers = [:]; loadedRegion = nil
+    }
+
+    /// A profile switch changes the flat provider selection and can also change the effective TMDB
+    /// region. Cancel any outgoing viewer's work before resolving the incoming viewer from its own
+    /// cached region/provider state, so the visible hub updates in the same UI turn.
+    func reloadFromProfilePreferences() {
+        clear()
+        load()
     }
 
     // MARK: genre backdrops (cadence-cached representative artwork per genre)
@@ -788,23 +797,22 @@ final class CollectionsHubModel: ObservableObject {
 
     // MARK: user reorder (the owner's "Prime first, Netflix last")
 
-    private static let orderKey = "vortx.collections.providerOrder"
+    static let orderKey = ProfileDiscoveryPreferencesStore.Key.providerOrder
 
     // MARK: user-selected services (the CEO picker)
 
     /// The user's explicit service selection: ordered canonical ids, comma-separated, e.g. "9,8,531,2336".
     /// EMPTY == AUTO (the region list + featured order + legacy `providerOrder`), byte-identical to before the
     /// picker; the same @AppStorage-compatible key on iOS/iPad/Mac AND tvOS.
-    static let selectedProvidersKey = "vortx.collections.selectedProviders"
+    static let selectedProvidersKey = ProfileDiscoveryPreferencesStore.Key.selectedProviders
 
     /// The selection as canonical ids, canonicalized + order-stably de-duplicated on read. `nonisolated` so the
     /// off-main sub-catalog loaders (`mergedDiscover`) can read it without a main-actor hop.
     nonisolated static func selectedProviders() -> [Int] {
-        let raw = UserDefaults.standard.string(forKey: selectedProvidersKey) ?? ""
+        let raw = ProfileDiscoveryPreferencesStore.selectedProviders()
         guard !raw.isEmpty else { return [] }
         var seen = Set<Int>()
-        return raw.split(separator: ",").compactMap { token in
-            guard let id = Int(String(token).trimmingCharacters(in: .whitespaces)) else { return nil }
+        return raw.compactMap { id in
             let canonical = TMDBClient.canonicalProviderID(id)
             return seen.insert(canonical).inserted ? canonical : nil
         }
@@ -813,11 +821,11 @@ final class CollectionsHubModel: ObservableObject {
     nonisolated static func setSelectedProviders(_ ids: [Int]) {
         var seen = Set<Int>()
         let canonical = ids.map { TMDBClient.canonicalProviderID($0) }.filter { seen.insert($0).inserted }
-        UserDefaults.standard.set(canonical.map(String.init).joined(separator: ","), forKey: selectedProvidersKey)
+        ProfileDiscoveryPreferencesStore.setSelectedProviders(canonical)
     }
 
-    static func customOrder() -> [Int] {
-        let saved = (UserDefaults.standard.array(forKey: orderKey) as? [Int]) ?? []
+    nonisolated static func customOrder() -> [Int] {
+        let saved = ProfileDiscoveryPreferencesStore.providerOrder()
         guard !saved.isEmpty else { return [] }
         // Canonicalize on read so a pin saved under a since-aliased id (NL/IN Prime 119, GB Discovery+ 524, the
         // Paramount+ tier ids) still matches the canonical tile the region query now returns; dedupe stably.
@@ -846,7 +854,7 @@ final class CollectionsHubModel: ObservableObject {
     /// when a selection is active the selection list IS the order, so persist it there and republish.
     func reorder(to ids: [Int]) {
         if Self.selectedProviders().isEmpty {
-            UserDefaults.standard.set(ids, forKey: Self.orderKey)
+            ProfileDiscoveryPreferencesStore.setProviderOrder(ids)
             providers = Self.applyOrder(providers)
         } else {
             // The reorder screen only passes the VISIBLE tiles. A selected service that is out of the viewer's
@@ -862,6 +870,7 @@ final class CollectionsHubModel: ObservableObject {
             Self.setSelectedProviders(merged)
             republishSelection()
         }
+        ProfileStore.shared.captureDiscovery()
     }
 
     // MARK: selection resolution + picker actions
@@ -888,14 +897,16 @@ final class CollectionsHubModel: ObservableObject {
     /// tile. No-op when the cache is fresh, when a fetch is already running, or when no selection is active.
     private func warmGlobalProviders() {
         guard !Self.selectedProviders().isEmpty, !Self.globalCacheIsFresh(), globalTask == nil else { return }
-        globalTask = Task { [weak self] in
+        globalGen += 1; let myGen = globalGen
+        let thisTask = Task { [weak self] in
             let fetched = await TMDBClient.allProviders()
-            guard let self else { return }
+            guard let self, !Task.isCancelled, self.globalGen == myGen else { return }
             self.globalTask = nil
             guard !fetched.isEmpty else { return }
             Self.cacheGlobalProviders(fetched)
             self.republishSelection()
         }
+        globalTask = thisTask
     }
 
     /// The full global provider list for the services picker (cadence-cached). Also warms the cache
@@ -924,6 +935,7 @@ final class CollectionsHubModel: ObservableObject {
         Self.setSelectedProviders(ids)
         warmGlobalProviders()
         republishSelection()
+        ProfileStore.shared.captureDiscovery()
     }
 
     /// Remove a service from the selection (activating the picker from the AUTO list if needed).
@@ -933,6 +945,7 @@ final class CollectionsHubModel: ObservableObject {
         ids.removeAll { $0 == canonical }
         Self.setSelectedProviders(ids)
         republishSelection()
+        ProfileStore.shared.captureDiscovery()
     }
 
     // MARK: genre tiles (incl. Anime keyword + Documentary)

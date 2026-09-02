@@ -392,7 +392,11 @@ final class VortXSyncManager: ObservableObject {
     private func currentSyncableDomain() -> [String: Any] {
         let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
         return (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:])
-            .filter { SettingsBackup.isSyncable($0.key) }
+            .filter {
+                SettingsBackup.isSyncable($0.key)
+                    && !ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(
+                        SettingsBackup.migratedKey($0.key))
+            }
     }
     /// Re-baseline the differ shadow to the live domain. Called after a remote apply / suppressed housekeeping
     /// window so those non-user writes become the baseline, never a future user edit's phantom diff.
@@ -1981,7 +1985,11 @@ final class VortXSyncManager: ObservableObject {
         // pulled: pushing a local-only snapshot over a blob we could not read is the very bug, and an
         // unreadable blob is the case where we know least about what we would be destroying. The rest of the
         // doc still pushes; the settings blob is preserved verbatim for a client that can read it.
-        if let merged = SettingsBackup.mergedSyncBlob(onto: doc["settings"], appliedBaseline: appliedSettingsBaseline) {
+        if let merged = SettingsBackup.mergedSyncBlob(
+            onto: doc["settings"],
+            appliedBaseline: appliedSettingsBaseline,
+            excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys
+        ) {
             doc["settings"] = merged.base64EncodedString()
         }
         doc["format"] = 1
@@ -2239,7 +2247,11 @@ final class VortXSyncManager: ObservableObject {
             // the "would not stay" interplay at :1175-1182). A restored/fresh device has an empty set, so a full
             // restore is unchanged. The skipped keys keep their local value, which flushDirtySettingsIfNeeded then
             // pushes so the account heals.
-            if ((try? SettingsBackup.restore(from: data, skipping: Set(dirtySettings.keys))) ?? 0) > 0 {
+            if ((try? SettingsBackup.restore(
+                from: data,
+                skipping: Set(dirtySettings.keys),
+                excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys
+            )) ?? 0) > 0 {
                 restored = true
                 // Stamp the applied-blob BASELINE (#145 resurrection fix): the syncable keys this pulled doc just
                 // wrote, in the SAME migrated form restore used. mergedSyncBlob reads it on the next push so a
@@ -2248,7 +2260,9 @@ final class VortXSyncManager: ObservableObject {
                 // UserDefaults write under the vortx.sync. prefix, so it stays inside this suppression window (no
                 // self-echo push) and never travels in a synced blob. REPLACE-not-union: the baseline tracks the
                 // LATEST applied doc's key set, not a growing history.
-                appliedSettingsBaseline = SettingsBackup.appliedKeys(from: data)
+                appliedSettingsBaseline = SettingsBackup.appliedKeys(
+                    from: data,
+                    excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys)
                 ProfileStore.shared.reloadFromDefaults()              // apply the cloud roster to the LIVE store, no relaunch
                 ProfileStore.shared.mergeInRoster(localRosterBefore)  // cloud UNION local: keep every local-only profile
                 ProfileStore.shared.applyLocalTombstones()           // a profile deleted this session stays gone even if the pulled doc predates its tombstone (the resurrect window)

@@ -12,6 +12,7 @@
 //
 //     xcrun swiftc -o /tmp/slwtest \
 //         app/SourcesShared/SettingsDirtyKeys.swift \
+//         app/SourcesShared/ProfileDiscoveryPreferences.swift \
 //         app/SourcesShared/SettingsBackup.swift \
 //         app/SourcesShared/CredentialScope.swift \
 //         app/SourcesShared/Keychain.swift \
@@ -206,7 +207,46 @@ func testAbsenceIsNotDeletionPreserved() {
     expect(decodedDel[kAcctOnly] == nil, "a key absent locally AND in the baseline is dropped (a real user clear)")
 }
 
-// MARK: - 7. The full narrative, tying the two sides together
+// MARK: - 7. Profile discovery has one cross-device authority
+
+@MainActor
+func testProfileProjectionKeysStayOutOfAccountSync() {
+    let projectionKeys = ProfileDiscoveryPreferencesStore.activeProjectionKeys
+    let rosterKey = "stremiox.profiles"
+    let roster = Data("profile-roster".utf8)
+    var peerDomain: [String: Any] = [rosterKey: roster]
+    for key in projectionKeys { peerDomain[key] = "peer-active-viewer" }
+
+    let peerBlob = accountBlob(peerDomain)
+    guard let merged = SettingsBackup.mergedSyncBlob(
+        onto: peerBlob.base64EncodedString(),
+        appliedBaseline: [],
+        excluding: projectionKeys
+    ), let decoded = try? SettingsBackup.decodeDomain(from: merged) else {
+        failures.append("profile projection account merge returned nil")
+        return
+    }
+    expectEqual(decoded[rosterKey] as? Data, roster,
+                "the per-profile roster remains in the account settings blob")
+    expect(projectionKeys.allSatisfy { decoded[$0] == nil },
+           "a peer's active-profile flat mirrors are scrubbed from the account settings blob")
+
+    let defaults = UserDefaults.standard
+    let localSentinel = "local-active-viewer"
+    for key in projectionKeys { defaults.set(localSentinel, forKey: key) }
+    defer { for key in projectionKeys { defaults.removeObject(forKey: key) } }
+    _ = try? SettingsBackup.restore(from: peerBlob, excluding: projectionKeys)
+    expect(projectionKeys.allSatisfy { defaults.string(forKey: $0) == localSentinel },
+           "account pull cannot overwrite this device's active-profile projection")
+
+    let applied = SettingsBackup.appliedKeys(from: peerBlob, excluding: projectionKeys)
+    expect(applied.contains(rosterKey) && projectionKeys.isDisjoint(with: applied),
+           "the deletion baseline tracks the roster but never profile projection keys")
+    expect(projectionKeys.allSatisfy(SettingsBackup.isSyncable),
+           "user-created backup files retain legacy flat profile keys for compatibility")
+}
+
+// MARK: - 8. The full narrative, tying the two sides together
 
 @MainActor
 func testFullClobberSurvivalNarrative() {
@@ -253,6 +293,7 @@ struct SettingsLocalWinsTests {
         await MainActor.run {
             testPullApplySkipsDirtyKey()
             testFreshInstallRestoreIsUnchanged()
+            testProfileProjectionKeysStayOutOfAccountSync()
             testFullClobberSurvivalNarrative()
         }
 

@@ -276,7 +276,8 @@ enum SettingsBackup {
     /// decoding the base with a `?? [:]` fallback would quietly reintroduce the exact wholesale replace this
     /// exists to kill, on the one path where we are LEAST sure what we would be destroying. The caller leaves
     /// `doc["settings"]` untouched instead, so an unreadable blob is preserved byte-for-byte.
-    static func mergedSyncBlob(onto pulledBlob: Any?, appliedBaseline: Set<String> = []) -> Data? {
+    static func mergedSyncBlob(onto pulledBlob: Any?, appliedBaseline: Set<String> = [],
+                               excluding excludedKeys: Set<String> = []) -> Data? {
         // Absent blob = this account has no settings yet, so there is nothing to merge and seeding it from
         // this device is correct. A PRESENT blob we cannot open is a different thing entirely: refuse, because
         // the fallback ("treat it as empty and carry on") IS the wholesale replace this function exists to
@@ -290,12 +291,12 @@ enum SettingsBackup {
             if !b64.isEmpty {   // "" is how the pull layer already spells "no document" (see pullSyncDocResult)
                 guard let raw = Data(base64Encoded: b64),
                       let base = try? decodeDomain(from: raw) else { return nil }
-                merged = base   // decodeDomain already filtered the base to syncable keys
+                merged = base.filter { !excludedKeys.contains(migratedKey($0.key)) }
             }
         }
         let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
         let local = (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:])
-            .filter { isSyncable($0.key) }
+            .filter { isSyncable($0.key) && !excludedKeys.contains(migratedKey($0.key)) }
         // Local overlays the account, key by key. 0.4 RENAME SEAM: neither side is run through `migratedKey`
         // here (it is empty today, so this is a no-op now). Once `keyPrefixMigrations` is non-empty, a base
         // written by an older client will keep its old key names alongside this device's new ones and the two
@@ -311,7 +312,9 @@ enum SettingsBackup {
         // read-merge invariant (a peer's brand-new key is never in this device's baseline) intact. Baseline keys are
         // stored in migrated form (VortXSyncManager stamps `appliedKeys(from:)`), matching `local`'s migrated keys,
         // so this comparison still holds once the 0.4 rename seam opens.
-        for key in appliedBaseline where local[key] == nil { merged.removeValue(forKey: key) }
+        for key in appliedBaseline where !excludedKeys.contains(key) && local[key] == nil {
+            merged.removeValue(forKey: key)
+        }
         let app = (Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String) ?? "VortX"
         return try? encode(domain: merged, bundleID: bundleID, app: app)
     }
@@ -335,9 +338,11 @@ enum SettingsBackup {
     /// is a deliberate overwrite and honors every key. The count returned is of keys ACTUALLY applied.
     @discardableResult
     @MainActor
-    static func restore(from data: Data, skipping dirtyKeys: Set<String> = []) throws -> Int {
+    static func restore(from data: Data, skipping dirtyKeys: Set<String> = [],
+                        excluding excludedKeys: Set<String> = []) throws -> Int {
         let pairs = try decodeDomain(from: data)
             .filter { dirtyKeys.isEmpty || !dirtyKeys.contains(migratedKey($0.key)) }
+            .filter { !excludedKeys.contains(migratedKey($0.key)) }
         var restoredConsent: Bool?
         var restoredServe: Bool?
         for (key, value) in pairs {
@@ -369,9 +374,9 @@ enum SettingsBackup {
     /// Migrated form is load-bearing: `local` in `mergedSyncBlob` also holds migrated keys, so the two must agree
     /// once the 0.4 rename seam opens. Returns empty on an unreadable blob, which is correct: restore would then
     /// have applied nothing, so the baseline it stamps is empty too.
-    static func appliedKeys(from data: Data) -> Set<String> {
+    static func appliedKeys(from data: Data, excluding excludedKeys: Set<String> = []) -> Set<String> {
         guard let pairs = try? decodeDomain(from: data) else { return [] }
-        return Set(pairs.keys.map(migratedKey))
+        return Set(pairs.keys.map(migratedKey).filter { !excludedKeys.contains($0) })
     }
 
     /// Re-read the restored `UserDefaults` into every store that caches it at init, so a restore is actually
