@@ -3710,7 +3710,7 @@ struct TVPlayerView: View {
                     rows.append(OptionRow(label: player.name, detail: "›") {
                         saveProgress(at: currentTime)
                         coordinator.player?.pause()
-                        ExternalPlayers.open(url, in: player)
+                        ExternalPlayers.open(url, in: player, metadata: curMeta)
                         withAnimation { showOptions = false }
                     })
                 }
@@ -3830,7 +3830,7 @@ struct TVPlayerView: View {
               !isTorrentPlayback, (curHeaders?.isEmpty ?? true),
               let u = curURL, let host = u.host, host != "127.0.0.1", host != "localhost", host != "::1"
         else { return }
-        ExternalPlayers.open(u, in: player)
+        ExternalPlayers.open(u, in: player, metadata: curMeta)
     }
 
     /// A concise one-line label for a source: the first line of its name, else its description.

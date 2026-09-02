@@ -2,11 +2,24 @@
 //
 // Run without an Xcode build:
 //   swiftc -parse-as-library -warnings-as-errors \
-//     app/Sources/ExternalPlayer.swift app/Tests/ExternalPlayerHandoffContractTests.swift \
+//     app/SourcesShared/InfuseDeepLink.swift app/Sources/ExternalPlayer.swift \
+//     app/Tests/ExternalPlayerHandoffContractTests.swift \
 //     -o /tmp/external-player-handoff-contract-tests && \
 //   /tmp/external-player-handoff-contract-tests
 
 import Foundation
+
+// The production app supplies this model from SourcesShared/StremioAccount.swift. Keep this narrow
+// standalone harness dependency-free while exercising the production filename helper against its real API.
+struct PlaybackMeta: Hashable {
+    let libraryId: String
+    let videoId: String
+    let type: String
+    let name: String
+    let poster: String?
+    let season: Int?
+    let episode: Int?
+}
 
 @MainActor private var failures = 0
 
@@ -54,7 +67,7 @@ private func tvDefaultRouteKeepsTrailersNative(_ source: String) -> Bool {
         "guard let player = ExternalPlayers.defaultPlayer(),",
         "!isTrailer,",
         "!isTorrentPlayback",
-        "ExternalPlayers.open(u, in: player)"
+        "ExternalPlayers.open(u, in: player, metadata: curMeta)"
     ], in: route)
 }
 
@@ -97,8 +110,12 @@ private enum ExternalPlayerHandoffContractTests {
         let externalPlayer = source(at: "app/Sources/ExternalPlayer.swift", root: root)
         let playerScreen = source(at: "app/Sources/PlayerScreen.swift", root: root)
         let tvPlayerView = source(at: "app/SourcesTV/TVPlayerView.swift", root: root)
+        let tvExternalPlayers = source(at: "app/SourcesTV/ExternalPlayers.swift", root: root)
+        let tvDetail = source(at: "app/SourcesTV/DetailView.swift", root: root)
+        let iosDetail = source(at: "app/SourcesiOS/iOSDetailView.swift", root: root)
         check("production sources are readable",
-              !externalPlayer.isEmpty && !playerScreen.isEmpty && !tvPlayerView.isEmpty)
+              !externalPlayer.isEmpty && !playerScreen.isEmpty && !tvPlayerView.isEmpty
+                  && !tvExternalPlayers.isEmpty && !tvDetail.isEmpty && !iosDetail.isEmpty)
 
         check("iOS open uses the platform completion handler",
               externalPlayer.contains("UIApplication.shared.open(link, options: [:])")
@@ -160,6 +177,24 @@ private enum ExternalPlayerHandoffContractTests {
         check("explicit completion revalidates before pausing or alerting",
               ordered(["ExternalPlayer.open", "externalHandoff.matches", "if launched"], in: explicitChooser))
 
+        check("iOS and macOS player handoffs forward the current media identity",
+              playerScreen.contains("routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta)")
+                  && playerScreen.contains("ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta)"))
+        check("tvOS player handoffs forward the current media identity",
+              tvPlayerView.components(separatedBy: "ExternalPlayers.open(").count == 3
+                  && tvPlayerView.contains("ExternalPlayers.open(url, in: player, metadata: curMeta)")
+                  && tvPlayerView.contains("ExternalPlayers.open(u, in: player, metadata: curMeta)"))
+        check("detail handoffs forward movie, episode, and live identities",
+              tvDetail.contains("ExternalPlayers.open(url, in: player, metadata: meta)")
+                  && iosDetail.contains("playbackMeta: moviePlaybackMeta")
+                  && iosDetail.contains("playbackMeta: livePlaybackMeta")
+                  && iosDetail.contains("metadata: playbackMeta"))
+        check("both Apple target catalogs use the shared Infuse metadata link",
+              externalPlayer.contains("InfuseDeepLink.playURL(stream: stream, metadata: metadata)")
+                  && tvExternalPlayers.contains("InfuseDeepLink.playURL(stream: stream, metadata: metadata)"))
+
+        infuseMetadataChecks()
+
         hostileDelayedCompletionChecks()
 
         if failures > 0 {
@@ -213,5 +248,52 @@ private enum ExternalPlayerHandoffContractTests {
         check("matching delayed success preserves chooser pause semantics", pauseCount == 1)
         delayed.finish(false)
         check("matching delayed failure preserves chooser fallback semantics", errorCount == 1)
+    }
+
+    @MainActor
+    private static func infuseMetadataChecks() {
+        let stream = URL(string: "https://cdn.example.test/media/The%20Last%20of%20Us.mkv?token=a%26b")!
+        let meta = PlaybackMeta(
+            libraryId: "tt3581920", videoId: "tt3581920:1:2", type: "series",
+            name: "The Last of Us", poster: nil, season: 1, episode: 2
+        )
+        guard let infuse = ExternalPlayer.all.first(where: { $0.id == "infuse" }),
+              let link = infuse.deepLink(for: stream, metadata: meta),
+              let items = URLComponents(url: link, resolvingAgainstBaseURL: false)?.queryItems
+        else {
+            check("Infuse target builds a documented play link", false)
+            return
+        }
+        let query = Dictionary(uniqueKeysWithValues: items.map { ($0.name, $0.value ?? "") })
+        check("Infuse link keeps the exact resolved stream URL", query["url"] == stream.absoluteString)
+        check("Infuse link carries episode and IMDb filename metadata",
+              query["filename"] == "The Last of Us S01E02 {imdb-tt3581920}.mkv")
+
+        let unsafe = PlaybackMeta(
+            libraryId: "tmdb:42", videoId: "42", type: "movie",
+            name: "A/B:C*D?E\"F<G>H|I", poster: nil, season: nil, episode: nil
+        )
+        let extensionless = URL(string: "https://cdn.example.test/stream?id=42")!
+        check("Infuse filename removes illegal filename characters and falls back safely",
+              InfuseDeepLink.filename(for: extensionless, metadata: unsafe)
+                  == "A B C D E F G H I {tmdb-42}.mkv")
+
+        let typedTMDB = PlaybackMeta(
+            libraryId: "tmdb:tv:94997", videoId: "94997:1:1", type: "series",
+            name: "House of the Dragon", poster: nil, season: 1, episode: 1
+        )
+        check("Infuse filename normalizes typed TMDB ids for exact metadata matching",
+              InfuseDeepLink.filename(for: extensionless, metadata: typedTMDB)
+                  == "House of the Dragon S01E01 {tmdb-94997}.mkv")
+
+        guard let vlc = ExternalPlayer.all.first(where: { $0.id == "vlc" }) else {
+            check("VLC target exists", false)
+            return
+        }
+        let legacyEncoded = stream.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
+        let expectedVLC = legacyEncoded.flatMap { URL(string: "vlc-x-callback://x-callback-url/stream?url=\($0)") }
+        check("non-Infuse player links stay byte-compatible with metadata present",
+              vlc.deepLink(for: stream, metadata: meta) == expectedVLC
+                  && vlc.deepLink(for: stream) == expectedVLC)
     }
 }

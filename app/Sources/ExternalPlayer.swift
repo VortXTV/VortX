@@ -37,7 +37,7 @@ enum ExternalPlayer {
         let name: String                    // display name in the chooser
         let icon: String                    // SF Symbol for the chooser row
         fileprivate let probe: URL          // scheme URL used for `canOpenURL`
-        fileprivate let make: (URL) -> URL? // builds the deep link for a given stream URL
+        fileprivate let make: (URL, PlaybackMeta?) -> URL? // builds the deep link for a given stream URL
 
         /// Is the app installed? On iOS the scheme must be listed in `LSApplicationQueriesSchemes`;
         /// on macOS NSWorkspace resolves a handler for the scheme.
@@ -51,7 +51,7 @@ enum ExternalPlayer {
             #endif
         }
 
-        func deepLink(for stream: URL) -> URL? { make(stream) }
+        func deepLink(for stream: URL, metadata: PlaybackMeta? = nil) -> URL? { make(stream, metadata) }
     }
 
     /// Every supported target (installed or not). Order = chooser order. Built per-platform: the
@@ -61,32 +61,32 @@ enum ExternalPlayer {
         var targets: [Target] = [
         Target(id: "infuse", name: "Infuse", icon: "play.rectangle.on.rectangle.fill",
                probe: URL(string: "infuse://")!,
-               make: { stream in
-                   encoded(stream).flatMap { URL(string: "infuse://x-callback-url/play?url=\($0)") }
+               make: { stream, metadata in
+                   InfuseDeepLink.playURL(stream: stream, metadata: metadata)
                }),
         Target(id: "vlc", name: "VLC", icon: "play.tv.fill",
                probe: URL(string: "vlc-x-callback://")!,
-               make: { stream in
+               make: { stream, _ in
                    encoded(stream).flatMap { URL(string: "vlc-x-callback://x-callback-url/stream?url=\($0)") }
                }),
         Target(id: "outplayer", name: "Outplayer", icon: "play.circle.fill",
                probe: URL(string: "outplayer://")!,
-               make: { stream in
+               make: { stream, _ in
                    encoded(stream).flatMap { URL(string: "outplayer://play?url=\($0)") }
                }),
         Target(id: "senplayer", name: "Sen Player", icon: "play.rectangle.fill",
                probe: URL(string: "senplayer://")!,
-               make: { stream in
+               make: { stream, _ in
                    encoded(stream).flatMap { URL(string: "senplayer://x-callback-url/play?url=\($0)") }
                }),
         Target(id: "nplayer", name: "nPlayer", icon: "play.square.fill",
                probe: URL(string: "nplayer-stremiox://")!,
-               make: { stream in
+               make: { stream, _ in
                    encoded(stream).flatMap { URL(string: "nplayer-stremiox://weblink?action=addotgo&url=\($0)") }
                }),
         Target(id: "mxplayer", name: "MX Player", icon: "play.fill",
                probe: URL(string: "mxplayer://")!,
-               make: { stream in
+               make: { stream, _ in
                    encoded(stream).flatMap { URL(string: "mxplayer://\($0)") }
                }),
         ]
@@ -96,7 +96,7 @@ enum ExternalPlayer {
         targets.append(
             Target(id: "iina", name: "IINA", icon: "play.rectangle.on.rectangle.fill",
                    probe: URL(string: "iina://")!,
-                   make: { stream in
+                   make: { stream, _ in
                        encoded(stream).flatMap { URL(string: "iina://weblink?url=\($0)") }
                    }))
         #endif
@@ -112,12 +112,13 @@ enum ExternalPlayer {
     @MainActor static func open(
         _ target: Target,
         stream: URL,
+        metadata: PlaybackMeta? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
         let finish: @Sendable (Bool) -> Void = { launched in
             DispatchQueue.main.async { completion(launched) }
         }
-        guard target.isInstalled, let link = target.deepLink(for: stream) else {
+        guard target.isInstalled, let link = target.deepLink(for: stream, metadata: metadata) else {
             finish(false)
             return
         }
@@ -191,9 +192,10 @@ enum ExternalPlayer {
     @MainActor static func routeToDefaultIfSet(
         _ stream: URL,
         isTorrent: Bool,
+        metadata: PlaybackMeta? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
         guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return }
-        open(target, stream: stream, completion: completion)
+        open(target, stream: stream, metadata: metadata, completion: completion)
     }
 }

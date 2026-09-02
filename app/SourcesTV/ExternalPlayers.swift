@@ -14,7 +14,7 @@ enum ExternalPlayers {
     struct Player: Identifiable {
         let name: String
         let scheme: String                       // bare scheme for the canOpenURL probe
-        let launch: (String) -> String           // percent-encoded stream URL -> open URL
+        let launch: (URL, PlaybackMeta?) -> URL? // stream + optional metadata -> open URL
         var id: String { name }
     }
 
@@ -23,17 +23,27 @@ enum ExternalPlayers {
     /// canOpenURL silently reports them as not installed.
     static let candidates: [Player] = [
         Player(name: "Infuse", scheme: "infuse",
-               launch: { "infuse://x-callback-url/play?url=\($0)" }),
+               launch: { stream, metadata in InfuseDeepLink.playURL(stream: stream, metadata: metadata) }),
         Player(name: "VLC", scheme: "vlc-x-callback",
-               launch: { "vlc-x-callback://x-callback-url/stream?url=\($0)" }),
+               launch: { stream, _ in
+                   encoded(stream).flatMap { URL(string: "vlc-x-callback://x-callback-url/stream?url=\($0)") }
+               }),
         Player(name: "Sen Player", scheme: "senplayer",
-               launch: { "senplayer://x-callback-url/play?url=\($0)" }),
+               launch: { stream, _ in
+                   encoded(stream).flatMap { URL(string: "senplayer://x-callback-url/play?url=\($0)") }
+               }),
         Player(name: "OutPlayer", scheme: "outplayer",
-               launch: { "outplayer://\($0)" }),
+               launch: { stream, _ in
+                   encoded(stream).flatMap { URL(string: "outplayer://\($0)") }
+               }),
         Player(name: "nPlayer", scheme: "nplayer-stremiox",
-               launch: { "nplayer-stremiox://weblink?action=addotgo&url=\($0)" }),
+               launch: { stream, _ in
+                   encoded(stream).flatMap { URL(string: "nplayer-stremiox://weblink?action=addotgo&url=\($0)") }
+               }),
         Player(name: "MX Player", scheme: "mxplayer",
-               launch: { "mxplayer://\($0)" }),
+               launch: { stream, _ in
+                   encoded(stream).flatMap { URL(string: "mxplayer://\($0)") }
+               }),
     ]
 
     /// Players detected as installed via canOpenURL.
@@ -73,13 +83,15 @@ enum ExternalPlayers {
         return candidates.first { $0.id == id }
     }
 
-    /// Open `streamURL` in `player`. Returns false when the URL cannot be encoded.
+    /// Open `streamURL` in `player`. `metadata` enriches only Infuse's documented filename field.
     @discardableResult
-    static func open(_ streamURL: URL, in player: Player) -> Bool {
-        guard let encoded = streamURL.absoluteString.addingPercentEncoding(
-            withAllowedCharacters: .alphanumerics) else { return false }
-        guard let url = URL(string: player.launch(encoded)) else { return false }
+    static func open(_ streamURL: URL, in player: Player, metadata: PlaybackMeta? = nil) -> Bool {
+        guard let url = player.launch(streamURL, metadata) else { return false }
         UIApplication.shared.open(url)
         return true
+    }
+
+    private static func encoded(_ url: URL) -> String? {
+        url.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
     }
 }

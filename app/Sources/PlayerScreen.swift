@@ -1313,7 +1313,7 @@ struct PlayerScreen: View {
                     episodeGeneration: episodeSwitchGeneration,
                     loadToken: externalHandoffLoadToken
                 )
-                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent) { launched in
+                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta) { launched in
                     guard !playbackExited,
                           externalHandoff.matches(
                               url: curURL ?? url,
@@ -1473,7 +1473,7 @@ struct PlayerScreen: View {
                               ) else { return }
                         guard probeSucceeded else { externalLinkDead = true; return }
                         // Handed off, stop local playback so the stream isn't decoded twice.
-                        ExternalPlayer.open(target, stream: externalHandoff.url) { launched in
+                        ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta) { launched in
                             guard !playbackExited,
                                   externalHandoff.matches(
                                       url: curURL ?? url,

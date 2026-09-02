@@ -2411,6 +2411,7 @@ struct iOSDetailView: View {
         iOSSourceList(
             groups: suspended ? [] : rankedMovie().groups,
             progress: core.streamLoadProgress(),
+            playbackMeta: moviePlaybackMeta,
             states: core.streamAddonStates(),
             sourcesSettled: sourceList.isSettled,
             continuity: rememberedQuality,
@@ -2892,6 +2893,14 @@ struct iOSDetailView: View {
                             name: m?.name ?? title, poster: m?.poster ?? seedBackdrop, season: nil, episode: nil)
     }
 
+    /// The live source list can offer Infuse without changing its existing native play route. Carry the
+    /// same live identity `playLiveStream` will use so Infuse receives an intelligible filename too.
+    private var livePlaybackMeta: PlaybackMeta {
+        let m = meta
+        return PlaybackMeta(libraryId: m?.id ?? id, videoId: m?.id ?? id, type: type,
+                            name: m?.name ?? title, poster: m?.poster ?? seedBackdrop, season: nil, episode: nil)
+    }
+
     /// The movie's saved resume position in seconds, or nil when there is none. Reads the SAME
     /// per-profile source `playMovie`'s `resume(_:)` uses (the engine library item for engine-history
     /// profiles via `engineResumeSeconds`, the overlay's own entry otherwise via `ProfileStore.resumeOffset`),
@@ -3363,6 +3372,7 @@ struct iOSDetailView: View {
         iOSSourceList(
             groups: suspended ? [] : rankedLive(),
             progress: core.streamLoadProgress(),
+            playbackMeta: livePlaybackMeta,
             states: core.streamAddonStates(),
             sourcesSettled: sourceList.isSettled,
             pinContext: pinContext,
@@ -4392,6 +4402,11 @@ struct iOSEpisodeStreams: View {
         iOSSourceList(
             groups: presentation != nil ? [] : rankedEpisode(),
             progress: core.streamLoadProgress(forStreamId: shownVideo.id),
+            playbackMeta: PlaybackMeta(
+                libraryId: meta.id, videoId: shownVideo.id, type: "series", name: meta.name,
+                poster: shownVideo.thumbnail ?? meta.poster, season: shownVideo.season,
+                episode: shownVideo.episode
+            ),
             states: core.streamAddonStates(forStreamId: shownVideo.id),
             sourcesSettled: sourceList.isSettled,
             continuity: rememberedQuality,
@@ -5436,6 +5451,8 @@ private struct WindowedGroup: Identifiable { let id: String; let group: CoreStre
 struct iOSSourceList: View {
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
+    /// The resolved movie, episode, or live identity. Only Infuse consumes it as filename metadata.
+    var playbackMeta: PlaybackMeta? = nil
     /// Per-add-on resolution state, used ONLY to explain an empty result: an add-on that errored
     /// (fetch/timeout/TLS) is surfaced distinctly from one that returned nothing. Empty by default.
     var states: [CoreBridge.StreamAddonState] = []
@@ -6041,7 +6058,7 @@ struct iOSSourceList: View {
         ), ExternalPlayer.canRouteExternally(url, isTorrent: stream.isTorrent) {
             ForEach(externalPlayerTargets) { target in
                 Button("Play in \(target.name)") {
-                    ExternalPlayer.open(target, stream: url) { launched in
+                    ExternalPlayer.open(target, stream: url, metadata: playbackMeta) { launched in
                         guard !launched else { return }
                         externalPlayerErrorMessage = "Could not open \(target.name)."
                         showExternalPlayerError = true

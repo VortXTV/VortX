@@ -3856,7 +3856,7 @@ struct CoreStreamList: View {
            ) {
             ForEach(ExternalPlayers.detected()) { player in
                 Button("Play in \(player.name)") {
-                    ExternalPlayers.open(url, in: player)
+                    ExternalPlayers.open(url, in: player, metadata: meta)
                 }
             }
         }
