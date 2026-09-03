@@ -838,7 +838,9 @@ private enum TrickplayUploadPolicyTests {
         let root = try? String(contentsOfFile: "app/SourcesTV/RootTabView.swift", encoding: .utf8)
         let sourceRows = tv.flatMap { sourceSection($0, from: "private func sourceRows()", to: "private func audioLanguageFilterRows()") }
         expect(sourceContainsInOrder(sourceRows, [
-            "OptionRow(label: \"Quality\"", "OptionRow(label: \"Audio\"", "OptionRow(label: \"Sources\", isHeader: true)"
+            "OptionRow(accessibilityID: \"sources.quality\", label: \"Quality\"",
+            "OptionRow(accessibilityID: \"sources.audio\", label: \"Audio\"",
+            "OptionRow(accessibilityID: \"sources.heading\", label: \"Sources\", isHeader: true)"
         ]) && sourceRows?.contains("var rows: [OptionRow] = audioLanguageFilterRows()") == false,
         "in-player source panel must present quality, then audio, then source rows without Audio-first flattening")
         expect(detail?.contains("initialEnginePreference: launchEnginePreference") == true
