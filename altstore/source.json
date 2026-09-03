@@ -18,6 +18,16 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "0.4.0",
+          "buildVersion": "235",
+          "date": "2026-09-03",
+          "localizedDescription": "0.4 Beta 1: AVPlayer recovery and remux synchronization, episode focus, debrid refresh, update checks, subtitles and previews. Android TV parity is planned separately.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.1/VortX-iOS-v0.4.0-beta.1-ci.ipa",
+          "size": 65011491,
+          "sha256": "4133383241123add3ebe25cb94947326db1d18459edee7837c09275d4f186ffe",
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.3.16",
           "buildVersion": "234",
           "date": "2026-08-31",
@@ -85,15 +95,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-iOS-v0.3.14-beta.17-ci.ipa",
           "size": 64227247,
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "218",
-          "date": "2026-08-19",
-          "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-iOS-v0.3.14-beta.16-ci.ipa",
-          "size": 64182016,
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -108,6 +109,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.4.0",
+          "buildVersion": "235",
+          "date": "2026-09-03",
+          "localizedDescription": "0.4 Beta 1: AVPlayer recovery and remux synchronization, episode focus, debrid refresh, update checks, subtitles and previews. Android TV parity is planned separately.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.1/VortX-tvOS-v0.4.0-beta.1-ci.ipa",
+          "size": 64593483,
+          "sha256": "82749f93f67210b96f0bb6ab8d4f7c3b09365c2148c6cc84333e059ed21e1dfb",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.3.16",
           "buildVersion": "234",
@@ -175,15 +186,6 @@
           "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-tvOS-v0.3.14-beta.17-ci.ipa",
           "size": 63660824,
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "218",
-          "date": "2026-08-19",
-          "localizedDescription": "0.3.14 Beta 16. One-tap update over any earlier build, nothing resets.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.16/VortX-tvOS-v0.3.14-beta.16-ci.ipa",
-          "size": 63617303,
           "minOSVersion": "18.0"
         }
       ]
