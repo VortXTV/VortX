@@ -1,5 +1,8 @@
 #import <AVFoundation/AVFoundation.h>
 
+// C11-atomic cancellation/progress bridge for the noncapturing FFmpeg remux callback.
+#include "VortXRemuxInputProbe.h"
+
 // Community JS provider runtime: exposes the QuickJS C bridge to Swift
 // (JSProviderRuntime.swift calls VortXQuickJSRun / VortXQuickJSFree). Quoted path is relative to this
 // header's directory and resolves on every target that compiles the QuickJS C sources.

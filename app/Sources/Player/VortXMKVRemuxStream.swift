@@ -99,24 +99,26 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// The server installs this before `start()`, and the closure never receives an open or unproven fragment.
     var onHLSSegmentPublished: (@Sendable (VortXHLSSegment) -> Void)?
 
-    /// F1: stable heap cell the INPUT context's `interrupt_callback` polls to abort a blocking network
+    /// F1: stable C11-atomic probe the INPUT context's `interrupt_callback` polls to abort a blocking network
     /// open/read/reconnect-sleep the instant cancel() fires. Without it a demote on a STALLED CDN leaves the
     /// remux thread (and its up-to-128 MiB buffer) parked in avformat_open_input / av_read_frame for the full
     /// rw_timeout (10s) x the reconnect retries, 10-20s AFTER demoteAVPlayerToMPV, exactly while mpv re-opens
     /// the same 4K stream and both lanes stack into the one Apple TV jetsam budget. Plain trivial memory (not
     /// the ManagedAtomicFlag) because the `@convention(c)` callback captures nothing and must read it through
-    /// the opaque pointer with no Swift-runtime calls. It MUST outlive the C callback: allocated here, set by
+    /// the opaque pointer without a Swift lock or actor hop. It MUST outlive the C callback: allocated here, set by
     /// cancel(), freed ONLY in deinit, which cannot run until the last reference drops and the remux thread
-    /// (which strong-captures self for run()'s lifetime) has exited. Single-word reads/writes.
+    /// (which strong-captures self for run()'s lifetime) has exited. C11 atomics are lock-free on supported
+    /// Apple 64-bit targets and provide acquire/release visibility across cancellation and watchdog polling.
     ///
-    /// W2-A: the same cell now also carries the INPUT-SIDE startup receipts (see `VortXRemuxInputProbeCell`).
+    /// W2-A: the same probe now also carries the INPUT-SIDE startup receipts (see `VortXRemuxInputProbe`).
     /// The interrupt callback is the only place that can observe the input while `avformat_open_input` is still
     /// blocked inside it, and it runs ON the producer thread, so sampling the AVFormatContext from there keeps
     /// every C-struct access single-threaded; the chrome only ever reads the resulting scalars.
-    private let interruptCell: UnsafeMutablePointer<VortXRemuxInputProbeCell> = {
-        let p = UnsafeMutablePointer<VortXRemuxInputProbeCell>.allocate(capacity: 1)
-        p.initialize(to: VortXRemuxInputProbeCell())
-        return p
+    private let interruptProbe: OpaquePointer = {
+        guard let probe = VortXRemuxInputProbeCreate() else {
+            fatalError("VortX remux input probe allocation failed")
+        }
+        return probe
     }()
 
     /// AVIO write scratch: libav wants an aligned malloc'd buffer it owns for the AVIO context. The callback's
@@ -853,19 +855,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             indexedEnd: snap.ended,
             streamFinished: st.finished,
             streamFailureReason: st.failure)
-        // Plain scalar reads of the producer's interrupt cell (see VortXRemuxInputProbeCell): no lock, because
-        // these are single-word, write-once-forward values and a torn sample can only cost one poll.
-        let probe = interruptCell.pointee
+        // The C bridge snapshots each cross-thread receipt with acquire loads. Individual fields are monotonic;
+        // this intentionally is not a transactional multi-field snapshot, but it is race-free.
+        var probe = VortXRemuxInputProbeSnapshot()
+        VortXRemuxInputProbeSnapshotRead(interruptProbe, &probe)
         return MountProgress(producedBytes: st.produced,
                              segmentCount: snap.segments.count,
                              initPublished: snap.initData != nil,
                              signalingPublished: snap.signaling != nil,
                              ended: ended,
                              failed: st.failure != nil,
-                             inputBytesRead: probe.inputBytesRead,
+                             inputBytesRead: probe.input_bytes_read,
                              inputOpened: probe.opened != 0,
-                             streamInfoDone: probe.streamInfoDone != 0,
-                             inputOpenInFlight: probe.openInFlight != 0)
+                             streamInfoDone: probe.stream_info_done != 0,
+                             inputOpenInFlight: probe.open_in_flight != 0)
     }
 
     /// When this stream was created (== the AVPlayer mount instant for either delivery). Anchors the
@@ -974,8 +977,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // F1: trip the INPUT context's interrupt flag too, so a thread blocked inside avformat_open_input /
         // av_read_frame / a reconnect sleep on a stalled CDN aborts in milliseconds (AVERROR_EXIT) instead of
         // waiting out rw_timeout x reconnects. Set-after cancelledFlag so isCancelled is already true when the
-        // interrupt lands. Never freed here: only in deinit, after the thread has exited (see interruptCell).
-        interruptCell.pointee.cancel = 1
+        // interrupt lands. Never freed here: only in deinit, after the thread has exited (see interruptProbe).
+        VortXRemuxInputProbeRequestCancel(interruptProbe)
         hlsLock.lock()
         pgsAcceptingPackets = false
         pgsAcceptingCompletions = false
@@ -1018,11 +1021,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     }
 
     deinit {
-        // Safe to free the interrupt cell only now: deinit cannot run until the last reference to self drops,
+        // Safe to free the interrupt probe only now: deinit cannot run until the last reference to self drops,
         // and the remux thread strong-captures self for the whole of run(), so the C interrupt callback can no
         // longer be executing. Ordered after every AVFormatContext teardown (all inside run()).
-        interruptCell.deinitialize(count: 1)
-        interruptCell.deallocate()
+        VortXRemuxInputProbeDestroy(interruptProbe)
     }
 
     // MARK: - Remux loop (background thread)
@@ -1149,15 +1151,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private func makeInterruptibleInputContext() -> UnsafeMutablePointer<AVFormatContext>? {
         guard let ctx = avformat_alloc_context() else { return nil }
         ctx.pointee.interrupt_callback.callback = vortxRemuxInterruptCallback
-        ctx.pointee.interrupt_callback.opaque = UnsafeMutableRawPointer(interruptCell)
-        interruptCell.pointee.inputContext = UnsafeMutableRawPointer(ctx)
+        ctx.pointee.interrupt_callback.opaque = UnsafeMutableRawPointer(interruptProbe)
+        VortXRemuxInputProbeSetInputContext(interruptProbe, UnsafeMutableRawPointer(ctx))
         return ctx
     }
 
     /// Stop sampling the input context. Called before every `avformat_close_input` and on every open-failure
     /// return, so the callback's only reader can never observe a context libav has freed. Producer thread only.
     private func clearProbeInputContext() {
-        interruptCell.pointee.inputContext = nil
+        VortXRemuxInputProbeSetInputContext(interruptProbe, nil)
     }
 
     /// Matroska exposes its track headers during `avformat_open_input`. When those headers already contain every
@@ -1290,7 +1292,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // transient/network errors and keep the connection persistent across the redirect + range requests so
         // the remux open matches mpv's resilience. Unknown keys are ignored by older protocol builds, not fatal.
         Self.applyDebridHTTPResilience(&openOpts)
-        interruptCell.pointee.openInFlight = 1
+        VortXRemuxInputProbeSetOpenInFlight(interruptProbe, true)
         var openRc = avformat_open_input(&ifmt, input, nil, &openOpts)
         // The latch is NOT dropped here: it stays raised across the cold -> warm-retry gap and is cleared once,
         // below, after the retry decision is made. Clearing it at this line left an observable window in which a
@@ -1322,17 +1324,17 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             guard ifmt != nil else {
                 // The alloc failure ends the open sequence: drop the latch before the terminal receipt so the
                 // watchdog never sees "failed, zero bytes, still opening" and holds off forever.
-                interruptCell.pointee.openInFlight = 0
+                VortXRemuxInputProbeSetOpenInFlight(interruptProbe, false)
                 av_dict_free(&retryOpts); buffer.fail("avformat_alloc_context failed (retry)"); return
             }
-            interruptCell.pointee.openInFlight = 1   // already raised; kept explicit so each attempt states its own phase
+            VortXRemuxInputProbeSetOpenInFlight(interruptProbe, true)   // already raised; each attempt states its own phase
             openRc = avformat_open_input(&ifmt, input, nil, &retryOpts)
             av_dict_free(&retryOpts)
             if openRc == 0 { VXProbe.log("dv", "probe open retry SUCCEEDED (warm debrid)") }
         }
         // One clear covering BOTH attempts: the open phase is over here whatever it returned, and this runs
         // before the failure guard below so a dead link's terminal receipt is never paired with a raised latch.
-        interruptCell.pointee.openInFlight = 0
+        VortXRemuxInputProbeSetOpenInFlight(interruptProbe, false)
         guard openRc == 0, let inCtx = ifmt else {
             // libav already freed the failed context; stop sampling it before anything else.
             clearProbeInputContext()
@@ -1355,7 +1357,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("avformat_open_input failed (\(openRc))")
             return
         }
-        interruptCell.pointee.opened = 1
+        VortXRemuxInputProbeSetOpened(interruptProbe)
         logStartupPhase("input-open")
         defer { var p: UnsafeMutablePointer<AVFormatContext>? = inCtx; avformat_close_input(&p) }
         // Registered AFTER the close defer so it runs BEFORE it (defers unwind LIFO): the interrupt callback
@@ -1372,7 +1374,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("avformat_find_stream_info failed (\(si))")
             return
         }
-        interruptCell.pointee.streamInfoDone = 1
+        VortXRemuxInputProbeSetStreamInfoDone(interruptProbe)
         logStartupPhase("stream-info")
 
         // Capture the source runtime while the demuxer context is open. AVFormatContext.duration is in
@@ -5796,51 +5798,11 @@ private let AVERROR_EXIT_CONST: Int32 = -1414092869   // AVERROR_EXIT
 /// not surface the AVERROR macro, so hardcode the observed value to gate the cold-debrid open retry.
 private let AVERROR_ETIMEDOUT_CONST: Int32 = -60
 
-/// The producer's plain-memory cell: the F1 cancellation flag plus the INPUT-SIDE startup receipts the
-/// progress-aware start watchdog needs (W2-A / FAIL-260804-05).
-///
-/// WHY IT EXISTS AT ALL: every counter in `MountProgress` used to be an OUTPUT-side one (muxed bytes, published
-/// segments, classify/init flips), and the producer's first phase - `avformat_open_input` (10s rw_timeout plus
-/// one cold-debrid warm retry) then `avformat_find_stream_info` - produces zero output bytes BY CONSTRUCTION.
-/// `produced=0B for 15s` therefore conflated "the upstream is dead" with "the open is still in flight and bytes
-/// ARE arriving", and the field logs prove the second case is real (a mount whose classify landed 103 ms after
-/// the watchdog demoted it). These fields are the missing half of that evidence.
-///
-/// THREADING: every field is a trivial scalar written ONLY by the remux thread (directly, or from the interrupt
-/// callback, which libav invokes on that same thread while it is blocked inside the open/read) and read, without
-/// a lock, by the chrome's ~1 Hz poller. Be precise about what that does and does not buy: these are unsynchronized
-/// scalar reads of a struct one thread writes, so each individual field is read whole on 64-bit, but the SAMPLE
-/// IS NOT CONSISTENT ACROSS FIELDS - the poller can see `opened` from before a write and `inputBytesRead` from
-/// after it. Nothing here is a control input, only evidence, and the one predicate that acts on it
-/// (`MountProgress.inputProvablyDead`) is gated on the producer's terminal `failed` receipt precisely so a
-/// mid-flight mixture of fields can never be mistaken for a settled verdict.
-///
-/// LIFETIME: `inputContext` is set by `makeInterruptibleInputContext()` and cleared before the matching
-/// `avformat_close_input`, and libav frees a FAILED open's context before returning to us, so the callback (the
-/// only reader) can never see a freed context: it runs exclusively INSIDE a libav call on the live context.
-private struct VortXRemuxInputProbeCell {
-    /// Set to 1 by cancel(); the interrupt callback returns it, which aborts the blocked libav call.
-    var cancel: Int32 = 0
-    /// 1 while an `avformat_open_input` attempt (cold or warm retry) is running. A source cannot be called dead
-    /// while we are still trying to open it: the documented cold-debrid shape is "first open times out at 10s,
-    /// the warm retry connects", which straddles the 15s stall window with zero bytes on the record.
-    var openInFlight: Int32 = 0
-    /// 1 once `avformat_open_input` returned 0 (the "input-open" startup phase).
-    var opened: Int32 = 0
-    /// 1 once `avformat_find_stream_info` returned >= 0 (the "stream-info" startup phase).
-    var streamInfoDone: Int32 = 0
-    /// The live input AVFormatContext, non-nil only between its allocation and its close. Sampled ONLY by the
-    /// interrupt callback, on the producer thread.
-    var inputContext: UnsafeMutableRawPointer?
-    /// High-water mark of `AVIOContext.bytes_read` on the input. Non-zero proves the socket delivered payload,
-    /// which is the one fact that separates a dead upstream from a slow one during the open.
-    var inputBytesRead: Int64 = 0
-}
-
 /// F1 interrupt callback for the remux INPUT context. libav polls this while blocked in a network
 /// open/read/reconnect-sleep; a non-zero return aborts that operation with AVERROR_EXIT within milliseconds.
-/// `opaque` is the stream's stable `interruptCell`. Top-level and non-capturing so it converts to a plain C
-/// function pointer and touches only plain memory (no Swift runtime, no ARC: every field is trivial).
+/// `opaque` is the stream's stable C11-atomic `interruptProbe`. Top-level and non-capturing so it converts to a
+/// plain C function pointer. C atomics are lock-free on supported Apple 64-bit targets; no Swift lock or actor
+/// hop occurs in this callback.
 ///
 /// W2-A: it doubles as the ONLY sampling point that can see the input while the open is still blocked inside
 /// libav. It runs on the producer thread, so reading the AVFormatContext here keeps every C-struct access
@@ -5849,15 +5811,15 @@ private struct VortXRemuxInputProbeCell {
 /// max() keeps the receipt monotonic across the cold open, the warm retry and the read loop.
 private func vortxRemuxInterruptCallback(_ opaque: UnsafeMutableRawPointer?) -> Int32 {
     guard let opaque else { return 0 }
-    let cell = opaque.assumingMemoryBound(to: VortXRemuxInputProbeCell.self)
-    if let raw = cell.pointee.inputContext {
+    let probe = OpaquePointer(opaque)
+    if let raw = VortXRemuxInputProbeInputContext(probe) {
         let context = raw.assumingMemoryBound(to: AVFormatContext.self)
         if let pb = context.pointee.pb {
             let read = pb.pointee.bytes_read
-            if read > cell.pointee.inputBytesRead { cell.pointee.inputBytesRead = read }
+            VortXRemuxInputProbeObserveInputBytes(probe, read)
         }
     }
-    return cell.pointee.cancel != 0 ? 1 : 0
+    return VortXRemuxInputProbeIsCancelled(probe) ? 1 : 0
 }
 
 /// AVERROR_HTTP_BAD_REQUEST = -FFERRTAG(0xF8,'4','0','0') = -808465656: a transient HTTP 400 a still-warming

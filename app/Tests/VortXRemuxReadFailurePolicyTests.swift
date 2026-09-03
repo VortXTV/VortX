@@ -66,8 +66,8 @@ struct VortXRemuxReadFailurePolicyTests {
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
 
         check(
-            source.contains("return cell.pointee.cancel != 0 ? 1 : 0"),
-            "production interrupt callback is hard-cancel-only"
+            source.contains("return VortXRemuxInputProbeIsCancelled(probe) ? 1 : 0"),
+            "production interrupt callback is hard-cancel-only through the atomic probe"
         )
         check(
             !source.contains("softInterrupt") && !source.contains("VortXRemuxInputLivenessWatchdog"),
