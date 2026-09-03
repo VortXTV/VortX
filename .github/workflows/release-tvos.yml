@@ -1156,7 +1156,11 @@ jobs:
           register_asset "SHA256SUMS-ci.txt" out/SHA256SUMS-ci.txt "$(wc -c <out/SHA256SUMS-ci.txt | tr -d ' ')" "$(shasum -a 256 out/SHA256SUMS-ci.txt | awk '{print $1}')"; CHECKSUM_ID="$REGISTERED_ID"
           # Android must already have attached its complete, signed flavor set. This gate does not
           # build Android, but it prevents the Apple coordinator from publishing a partial release.
+          # Apple artifact URLs retain the complete tag (including `-beta.N`), but Android staging
+          # names packages from Gradle's numeric versionName. Normalize the tag here before looking
+          # up the Android checksum entries, so v0.4.0-beta.1 correctly requires VortX-0.4.0-*.apk.
           VERSION="${TAG#v}"
+          VERSION="${VERSION%%-*}"
           ANDROID_SUMS_ID="$(jq -er '.assets[] | select(.name == "SHA256SUMS-android.txt" and .state == "uploaded") | .id' <<<"$RELEASE_JSON")" || { echo "::error::Android checksum asset is missing; attach the Android draft artifacts before this coordinator"; exit 1; }
           gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$ANDROID_SUMS_ID" > "$RUNNER_TEMP/SHA256SUMS-android.txt"
           for NAME in "VortX-$VERSION-full-mpv-universal.apk" "VortX-$VERSION-play-media3-universal.apk" "VortX-$VERSION-play-media3.aab"; do

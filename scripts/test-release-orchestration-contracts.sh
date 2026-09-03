@@ -124,6 +124,32 @@ require_absent "privileged android CI workflow has no pull_request trigger" \
 require_absent "privileged Apple release workflow has no pull_request trigger" \
     'pull_request' <(trigger_block "$APPLE_RELEASE_WF")
 
+# The Apple coordinator keeps the full tag in Apple asset URLs, but Android artifact names are
+# keyed by Android's numeric versionName. The production Android-asset gate must remove only a
+# prerelease suffix before it checks those names; otherwise a beta tag asks for impossible
+# VortX-x.y.z-beta.N-*.apk files even though Android stages VortX-x.y.z-*.apk.
+require_grep "Apple Android-asset gate first removes the v prefix" \
+    '^[[:space:]]*VERSION="\$\{TAG#v\}"$' "$APPLE_RELEASE_WF"
+require_grep "Apple Android-asset gate removes a prerelease suffix before Android lookup" \
+    '^[[:space:]]*VERSION="\$\{VERSION%%-\*\}"$' "$APPLE_RELEASE_WF"
+
+android_asset_version_from_production_gate() {
+    local tag="$1" version
+    # Keep this exactly equal to the two normalization assignments above. The grep assertions bind
+    # the executable examples below to the production workflow rather than a separately invented
+    # release-tag parser.
+    VERSION="${tag#v}"
+    VERSION="${VERSION%%-*}"
+    version="$VERSION"
+    printf '%s\n' "$version"
+}
+
+[[ "$(android_asset_version_from_production_gate 'v0.4.0')" = '0.4.0' ]] \
+    || fail "stable tag does not map to Android numeric artifact version"
+[[ "$(android_asset_version_from_production_gate 'v0.4.0-beta.1')" = '0.4.0' ]] \
+    || fail "beta tag does not map to Android numeric artifact version"
+ok "Apple Android-asset gate maps stable and beta tags to Android numeric artifact names"
+
 validation_triggers="$(trigger_block "$VALIDATION_WF")"
 grep -Eq '^\s+pull_request:' <<<"$validation_triggers" \
     || fail "validation workflow does not run on pull requests"
