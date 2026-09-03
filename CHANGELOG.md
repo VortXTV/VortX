@@ -4,6 +4,66 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.4 Beta 1 (build 235)
+
+### Playback and Dolby Vision
+
+**AVPlayer recovery now distinguishes an advancing remux from a failed playback surface.** Recovery considers producer progress, the playable buffer, and the current player-item generation. Ordinary waiting is not by itself permission to restart the stream. A genuinely frozen playback surface has a bounded recovery path, and the hard-stall clock resets when playback actually advances. Apple TV, iPhone, iPad, and Mac.
+
+**Replacement items cannot leave the player waiting indefinitely for their first frame.** A replacement has its own startup deadline and recovery budget. The deadline respects manual pause, resumes with the remaining active time, and does not let an old item's callbacks control the replacement. Selected playback intent, including the owned audio/subtitle choices, is retained through supported recovery. Apple TV, iPhone, iPad, and Mac.
+
+**The remux buffer and AVPlayer now agree using elapsed playback time.** Bitrate evidence is sampled over time rather than treating frequent watchdog calls as elapsed seconds. Missing evidence applies a conservative forward-buffer fallback, while later valid evidence can establish the byte-backed limit. The fallback is applied before coupling is marked complete, so a misleading completed state cannot leave the previous buffer request active. Apple TV, iPhone, iPad, and Mac.
+
+**Remux cancellation and progress cross threads safely.** The input producer, FFmpeg interrupt callback, and playback watchdog previously shared unsynchronized scalar fields. An opaque C11 atomic bridge now carries cancellation, startup receipts, and the input-byte high-water mark; the FFmpeg context remains on its producer thread. The callback still interrupts only for cancellation. The concurrency regression passes with ThreadSanitizer. This repairs a confirmed data race, not a claim that every reported Dolby Vision stall had the same cause. Apple TV, iPhone, iPad, and Mac.
+
+**Native subtitle cues no longer share an identity merely because their timestamps match.** Cue identity accounts for distinct content, preventing different built-in cues at the same time from colliding in the native subtitle path. Apple platforms.
+
+### Debrid sources and switching players
+
+**A stale native debrid link can be refreshed without asking you to select another source first.** Recovery retains the selected source's identity and can obtain a fresh native link. An engine switch joins an in-flight refresh instead of mounting the stale URL again. Explicit picks retain explicit failure behavior; automatic choices retain their separate failover policy. Apple TV, iPhone, iPad, and Mac.
+
+**Cancelled refreshes retire their ownership.** Leaving a source, changing playback intent, or cancelling a refresh cannot leave an in-flight marker blocking the next attempt. Recovery is rearmed for the current item and source rather than inheriting a spent or cancelled transaction. Apple TV, iPhone, iPad, and Mac.
+
+**Native debrid media uses the vetted request gateway.** URL validation, redirect handling, public-address checks, and DNS-pinned transport are applied to native playback while preserving the selected source's required request headers. This is client-side hardening, not a promise that a provider outage or expired entitlement can be repaired by the app. Apple platforms.
+
+### Apple TV navigation and binge watching
+
+**Up from an episode stays in the episode list.** The detail page no longer handles every episode's Up press as an instruction to jump to Add to Library. Only the first episode owns the upward exit, and Down from that first row explicitly targets the second episode. The regression tests cover both boundaries. Apple TV.
+
+**The next episode's transport can warm at the safe preparation boundary.** The preparation policy permits useful advance warming while retaining its cancellation, generation, and bounded-work guards. This improves readiness at the handoff without promising instantaneous starts for an unavailable or slow source. Apple TV.
+
+**Player source navigation retains stable accessibility identities.** Source rows and navigation targets remain attached to the same source across refreshes, helping preserve remote and accessibility focus instead of sending it to a newly rebuilt row. Apple TV.
+
+**Changing source audio preference invalidates the right ranking cache.** Cached source-language scores are isolated by their language preference so a newly selected preference does not reuse the previous selection's scores. Apple platforms.
+
+### Updates, previews, and integrations
+
+**There is now a visible Check for Updates action.** Apple Settings shows progress and a useful result instead of requiring the automatic prompt to appear. Discovery checks the appcast and supported GitHub fallback, binds downloads to the advertised release tag, preserves retry state across lifecycle changes, and retains presentation ownership so a valid update is not silently consumed behind another screen. Apple TV, iPhone, iPad, and Mac.
+
+**The update feed has additional publication safeguards.** Published feed recovery and the release coordinator's Latest-mode request were corrected. The combined beta gate now checks Android filenames against the numeric package version while retaining the complete beta tag for release identity. Beta releases retain their prerelease identity; stable and beta artifacts are verified against the exact release tag. A previously installed build still runs its own updater until it is upgraded, so this release cannot retroactively add the manual button to an older installation.
+
+**Seek-preview capture and community upload eligibility were corrected.** Preview work and upload admission respect their actual capture capability and the master community-consent switch. Upload admission reports its decision to the caller instead of allowing a rejected contribution to look accepted. Preview availability still depends on a usable local capture or community result. Apple platforms.
+
+**Catalog and collection choices stay with their profile.** Profile discovery preferences are isolated through profile changes, backup/import, and sync, including the refresh of the active collection model. One profile's browsing choices should not leak into another. Addresses [#215](https://github.com/VortXTV/VortX/issues/215). Apple platforms.
+
+**Infuse handoff includes the title's media identity.** Supported external-player links carry the available identity metadata as well as the stream, allowing Infuse to identify the item more reliably. Addresses [#217](https://github.com/VortXTV/VortX/issues/217). Apple platforms.
+
+**The seeding reminder follows native playback eligibility.** The reminder is gated on the playback path that actually supports the native seeding action. iPhone and iPad.
+
+### Android and the next parity pass
+
+**Apple and Android use the same Beta 1 release identity.** Android is rebuilt from the same tagged source with versionCode 235 and the existing production signing identity. Both Android packages contain phone/tablet and TV interfaces: Full mpv is the sideload package; Play Media3 is the Google Play-oriented engine variant. These names do not mean phone-only or TV-only packages.
+
+**The broader Android TV redesign is planned, not claimed complete in this beta.** Apple TV is the reference for the Home hero, Detail layout, action and source placement, episode navigation, settings, and focus restoration. The new Android parity prototype is excluded while its audio-selection race findings are corrected. The concrete follow-up and acceptance checks are in the [Android TV parity plan](https://github.com/VortXTV/VortX/blob/main/docs/ANDROID-TV-APPLE-PARITY-PLAN.md), tracking the scope of [#219](https://github.com/VortXTV/VortX/issues/219).
+
+### Validation and installation
+
+This beta contains the post-0.3.16 changes described above, not a rollback to an older beta. Protected CI builds fresh Apple and Android packages from `v0.4.0-beta.1`, verifies source identity, Android signing and ABIs, checksums, and the combined draft before publication. Physical Apple TV Dolby Vision/HDR soak tests and Android TV remote/playback checks remain separate from compile and policy-test results.
+
+The historical trailer short-read and transient-window retry fixes remain present and were already included in 0.3.16. This beta does not claim a newly proven fix for every report of a trailer ending early.
+
+For Apple, choose the matching iOS IPA, Apple TV Full or Lite IPA, or Mac DMG. For Android sideloading, choose `VortX-0.4.0-full-mpv-universal.apk`; the alternate `VortX-0.4.0-play-media3-universal.apk` uses Media3. Both universal APKs support `arm64-v8a`, `armeabi-v7a`, and `x86_64`. Keep the existing package/signing lineage when upgrading, and verify the release's checksum and signing-provenance files.
+
 ## 0.3.16 (build 234)
 
 ### Cross-platform reliability release
