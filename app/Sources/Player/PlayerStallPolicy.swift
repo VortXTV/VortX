@@ -68,8 +68,9 @@ enum PlayerMidPlaybackStallPolicy {
 /// The engine-side admission contract for a post-first-frame AVPlayer replacement.  A replacement is much
 /// more invasive than a seek nudge: it tears down AVFoundation's item-local decoder, media selections and
 /// display route.  It is therefore available only for a proven surface freeze on a healthy *local* HLS mount
-/// which still has enough published media to make a new item useful.  Producer activity is affirmative
-/// evidence that the current item should be retained while AVFoundation re-buffers.
+/// which still has enough published media to make a new item useful. Producer activity is ordinary rebuffer
+/// evidence at first, but becomes affirmative consumer-wedge evidence if AVPlayer's own media clock stays
+/// frozen for the bounded recovery window.
 enum AVPlayerMidPlaybackRecoveryPolicy {
     enum TerminalProof: Equatable {
         case none
@@ -141,28 +142,29 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         }
     }
 
-    /// One replacement may be spent by an exact item generation. A new item starts with a fresh budget, while
-    /// one minute of monotonic, positive media-clock progress demonstrates that a previously replaced item
+    /// One replacement may be spent by an exact remux mount/source. A new item on that same mount retains the
+    /// spent budget, while a new mount starts fresh. One minute of monotonic, positive media-clock progress
+    /// demonstrates that a previously replaced item
     /// really recovered rather than merely framed once before freezing again. Observer cadence is deliberately
     /// irrelevant: a 0.25 s callback must not turn ten samples into a fake minute of healthy playback.
     struct RecoveryBudget: Equatable {
         static let sustainedProgressSecondsToReset: TimeInterval = 60
 
-        private(set) var generation: UInt64?
+        private(set) var mountIdentity: UInt64?
         private(set) var replacementUsed = false
         private(set) var stableProgressSinceUptime: TimeInterval?
         private var lastMediaPosition: Double?
 
-        mutating func reset(for generation: UInt64) {
-            guard self.generation != generation else { return }
-            self.generation = generation
+        mutating func reset(for mountIdentity: UInt64) {
+            guard self.mountIdentity != mountIdentity else { return }
+            self.mountIdentity = mountIdentity
             replacementUsed = false
             stableProgressSinceUptime = nil
             lastMediaPosition = nil
         }
 
-        mutating func recordReplacement(for generation: UInt64) {
-            reset(for: generation)
+        mutating func recordReplacement(for mountIdentity: UInt64) {
+            reset(for: mountIdentity)
             replacementUsed = true
             stableProgressSinceUptime = nil
         }
@@ -172,10 +174,10 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         @discardableResult
         mutating func recordMediaPosition(
             _ position: Double,
-            generation: UInt64,
+            mountIdentity: UInt64,
             now: TimeInterval
         ) -> Bool {
-            reset(for: generation)
+            reset(for: mountIdentity)
             guard position.isFinite, now.isFinite else { return false }
             defer { lastMediaPosition = position }
             guard let lastMediaPosition else { return false }
@@ -226,6 +228,12 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         }
     }
 
+    /// A frozen AVPlayer clock despite a moving producer or a useful already-published HLS window is a consumer
+    /// wedge, not ordinary source starvation. Give AVFoundation twelve seconds to settle before one fresh item is
+    /// admitted. The same threshold deliberately applies to an already-rich published window: a byte-budget
+    /// parked producer need not manufacture a new segment merely to prove that the current mount is useful.
+    static let consumerWedgeRecoverySeconds: TimeInterval = 12
+
     /// After this much uninterrupted frozen-surface evidence with no producer/input/playlist activity, keeping
     /// the item is no longer an ordinary rebuffer decision. The caller maps this terminal proof to its existing
     /// source-hop/error path. The value is intentionally longer than the outer 30-second first recovery so a
@@ -241,12 +249,33 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         guard evidence.ownershipMatches else { return .retain(.staleOwnership) }
         guard evidence.playbackRequested else { return .retain(.userPaused) }
         guard evidence.terminalProof == .none else { return .terminal(evidence.terminalProof) }
-        guard !evidence.producerProgressed else { return .retain(.producerProgress) }
         guard !evidence.inputOpenInFlight else { return .retain(.inputInFlight) }
-        guard !evidence.playlistProgressed else { return .retain(.playlistProgress) }
         guard evidence.surfaceStalled else { return .retain(.noSurfaceStall) }
+        let hasUsefulPublishedTail = PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
+            bufferedAheadSeconds: evidence.publishedAheadSeconds)
         let shouldEscalate = evidence.surfaceStallElapsedSeconds.isFinite
             && evidence.surfaceStallElapsedSeconds >= sustainedSurfaceStallEscalationSeconds
+        if shouldEscalate,
+           !evidence.producerProgressed,
+           !evidence.playlistProgressed,
+           (!evidence.isLocalRemux || !hasUsefulPublishedTail || replacementAlreadyUsed) {
+            return .terminal(.sustainedSurfaceStall)
+        }
+        if replacementAlreadyUsed, evidence.producerProgressed {
+            return .retain(.producerProgress)
+        }
+        if replacementAlreadyUsed, evidence.playlistProgressed {
+            return .retain(.playlistProgress)
+        }
+        let sustainedConsumerWedge = evidence.surfaceStallElapsedSeconds.isFinite
+            && evidence.surfaceStallElapsedSeconds >= consumerWedgeRecoverySeconds
+            && (evidence.producerProgressed || evidence.playlistProgressed || hasUsefulPublishedTail)
+        if sustainedConsumerWedge, evidence.isLocalRemux {
+            guard !replacementAlreadyUsed else { return .retain(.replacementAlreadyUsed) }
+            return .replaceFreshItem
+        }
+        guard !evidence.producerProgressed else { return .retain(.producerProgress) }
+        guard !evidence.playlistProgressed else { return .retain(.playlistProgress) }
         if shouldEscalate,
            (!evidence.isLocalRemux
                 || !PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
@@ -256,11 +285,58 @@ enum AVPlayerMidPlaybackRecoveryPolicy {
         }
         guard evidence.isLocalRemux else { return .retain(.nonLocalRemux) }
         guard evidence.hasPreviousProgressSample else { return .retain(.missingProgressEvidence) }
-        guard PlayerMidPlaybackStallPolicy.prefersBufferedReloadBeforeRetirement(
-            bufferedAheadSeconds: evidence.publishedAheadSeconds
-        ) else { return .retain(.insufficientPublishedTail) }
+        guard hasUsefulPublishedTail else { return .retain(.insufficientPublishedTail) }
         guard !replacementAlreadyUsed else { return .retain(.replacementAlreadyUsed) }
         return .replaceFreshItem
+    }
+}
+
+/// Item-end and CoreMedia failure recovery own an event-local producer receipt.  They must not reuse the
+/// surface-stall watchdog's baseline because a healthy title may reach a growing playlist edge without ever
+/// opening that watchdog.  This pure seam makes the required post-event advancement explicit.
+enum AVPlayerEventRecoveryPolicy {
+    static let observationPollInterval: Duration = .milliseconds(250)
+    static let observationWindowSeconds: TimeInterval = 6
+    static let usefulPublishedWindowSeconds: Double = 10
+
+    struct ProducerReceipt: Equatable {
+        let producedBytes: Int
+        let inputBytesRead: Int64?
+        let segmentCount: Int
+        let initPublished: Bool
+        let signalingPublished: Bool
+    }
+
+    static func producerAdvanced(from previous: ProducerReceipt, to current: ProducerReceipt) -> Bool {
+        current.producedBytes > previous.producedBytes
+            || (current.inputBytesRead ?? -1) > (previous.inputBytesRead ?? -1)
+            || current.segmentCount > previous.segmentCount
+            || (!previous.initPublished && current.initPublished)
+            || (!previous.signalingPublished && current.signalingPublished)
+    }
+
+    /// A `-1008`/item-end replacement reloads the HLS playlist, so immediate admission needs a newly closed
+    /// playlist segment, not merely producer bytes still accumulating in an open segment. Init/signalling and
+    /// byte receipts remain useful diagnostics, but cannot prove a fresh AVPlayerItem sees different media.
+    static func playlistAdvanced(from previous: ProducerReceipt, to current: ProducerReceipt) -> Bool {
+        current.segmentCount > previous.segmentCount
+    }
+
+    /// A fresh HLS item is useful either after a producer advancement observed *after* the event, or when the
+    /// same healthy mount still exposes enough existing player-window media. The latter covers a byte-budget
+    /// parked producer without treating source starvation (no advance and no useful window) as a reload case.
+    static func admitsFreshItem(
+        producerAdvanced: Bool,
+        inputOpenInFlight: Bool,
+        publishedAheadSeconds: Double,
+        publishedWindowSeconds: Double
+    ) -> Bool {
+        guard !inputOpenInFlight else { return false }
+        guard producerAdvanced else {
+            return publishedAheadSeconds >= usefulPublishedWindowSeconds
+                || publishedWindowSeconds >= usefulPublishedWindowSeconds
+        }
+        return true
     }
 }
 

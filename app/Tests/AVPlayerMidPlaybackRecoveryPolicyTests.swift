@@ -30,6 +30,9 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
         insufficientPublishedTailRetainsCurrentItem()
         terminalEvidenceStaysTerminal()
         onlyOneReplacementIsAllowedUntilRecovery()
+        producerProgressHasWatchdogIntervalMeaning()
+        consumerWedgeAndSourceStarvationAreDistinct()
+        eventOwnedProducerReceiptsRequirePostEventAdvance()
         boundedHardStallEscalates()
         hardStallProgressResetsEscalationOrigin()
         newGenerationAndTimeBasedStableProgressResetBudget()
@@ -133,6 +136,100 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
                 replacementAlreadyUsed: true) == .retain(.replacementAlreadyUsed))
     }
 
+    private static func producerProgressHasWatchdogIntervalMeaning() {
+        // The engine samples producer counters at recovery decisions, not at every 4 Hz presentation tick.
+        // A same-item rebuffer can therefore prove producer motion across a real interval and retain its
+        // selections instead of being mistaken for a frozen renderer.
+        check(
+            "producer movement suppresses replacement after a real watchdog interval",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(producerProgressed: true, playlistProgressed: true),
+                replacementAlreadyUsed: false) == .retain(.producerProgress))
+    }
+
+    private static func consumerWedgeAndSourceStarvationAreDistinct() {
+        let threshold = AVPlayerMidPlaybackRecoveryPolicy.consumerWedgeRecoverySeconds
+        check(
+            "a frozen AVPlayer clock with post-sample producer progress admits one consumer-wedge replacement",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    producerProgressed: true,
+                    surfaceStallElapsedSeconds: threshold,
+                    publishedAheadSeconds: 10),
+                replacementAlreadyUsed: false) == .replaceFreshItem)
+        check(
+            "a frozen clock with a rich published tail admits recovery even without a prior watchdog baseline",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    hasPreviousProgressSample: false,
+                    surfaceStallElapsedSeconds: threshold,
+                    publishedAheadSeconds: 10),
+                replacementAlreadyUsed: false) == .replaceFreshItem)
+        check(
+            "a source-starved no-progress mount without a useful tail does not reload at the consumer threshold",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    surfaceStallElapsedSeconds: threshold,
+                    publishedAheadSeconds: 0),
+                replacementAlreadyUsed: false) == .retain(.insufficientPublishedTail))
+        check(
+            "an input-open producer remains non-destructive even with a frozen surface and rich tail",
+            AVPlayerMidPlaybackRecoveryPolicy.action(
+                evidence: evidence(
+                    inputOpenInFlight: true,
+                    surfaceStallElapsedSeconds: threshold,
+                    publishedAheadSeconds: 30),
+                replacementAlreadyUsed: false) == .retain(.inputInFlight))
+    }
+
+    private static func eventOwnedProducerReceiptsRequirePostEventAdvance() {
+        let event = AVPlayerEventRecoveryPolicy.ProducerReceipt(
+            producedBytes: 100, inputBytesRead: 100, segmentCount: 2,
+            initPublished: true, signalingPublished: true)
+        check(
+            "an item-end without a post-event producer advance cannot replace",
+            !AVPlayerEventRecoveryPolicy.producerAdvanced(from: event, to: event))
+        check(
+            "a later playlist advance authorizes an event-owned recovery observation",
+            AVPlayerEventRecoveryPolicy.playlistAdvanced(
+                from: event,
+                to: .init(producedBytes: 100, inputBytesRead: 100, segmentCount: 3,
+                          initPublished: true, signalingPublished: true)))
+        check(
+            "event bytes and input reads without a newly closed playlist segment cannot admit immediate replacement",
+            !AVPlayerEventRecoveryPolicy.playlistAdvanced(
+                from: event,
+                to: .init(producedBytes: 200, inputBytesRead: 200, segmentCount: 2,
+                          initPublished: true, signalingPublished: true)))
+        check(
+            "a byte-budget-parked producer with a rich current window remains recoverable after bounded polling",
+            AVPlayerEventRecoveryPolicy.admitsFreshItem(
+                producerAdvanced: false,
+                inputOpenInFlight: false,
+                publishedAheadSeconds: 0,
+                publishedWindowSeconds: AVPlayerEventRecoveryPolicy.usefulPublishedWindowSeconds))
+        check(
+            "a source-starved event without advance or useful current window cannot reload",
+            !AVPlayerEventRecoveryPolicy.admitsFreshItem(
+                producerAdvanced: false,
+                inputOpenInFlight: false,
+                publishedAheadSeconds: 0,
+                publishedWindowSeconds: 0))
+        check(
+            "an input-open event cannot reload even after a producer advance",
+            !AVPlayerEventRecoveryPolicy.admitsFreshItem(
+                producerAdvanced: true,
+                inputOpenInFlight: true,
+                publishedAheadSeconds: 30,
+                publishedWindowSeconds: 30))
+        check(
+            "a stale event receipt cannot manufacture an advance for a newer identical generation",
+            !AVPlayerEventRecoveryPolicy.producerAdvanced(
+                from: .init(producedBytes: 200, inputBytesRead: 200, segmentCount: 4,
+                            initPublished: true, signalingPublished: true),
+                to: event))
+    }
+
     private static func boundedHardStallEscalates() {
         let deadline = AVPlayerMidPlaybackRecoveryPolicy.sustainedSurfaceStallEscalationSeconds
         check(
@@ -195,23 +292,25 @@ enum AVPlayerMidPlaybackRecoveryPolicyTests {
         budget.recordReplacement(for: generation)
         check("replacement records a spent generation budget", budget.replacementUsed)
         budget.reset(for: generation + 1)
-        check("a new generation owns a fresh recovery budget", !budget.replacementUsed)
+        check("a new remux mount owns a fresh recovery budget", !budget.replacementUsed)
 
         budget.recordReplacement(for: generation + 1)
-        _ = budget.recordMediaPosition(0, generation: generation + 1, now: 0)
+        budget.reset(for: generation + 1)
+        check("a fresh AVPlayer item on the same mount cannot reopen a spent replacement budget", budget.replacementUsed)
+        _ = budget.recordMediaPosition(0, mountIdentity: generation + 1, now: 0)
         for position in 1...10 {
-            _ = budget.recordMediaPosition(Double(position), generation: generation + 1,
+            _ = budget.recordMediaPosition(Double(position), mountIdentity: generation + 1,
                                            now: Double(position) * 0.25)
         }
         check("ten fast observer callbacks do not manufacture one minute of stable progress", budget.replacementUsed)
-        _ = budget.recordMediaPosition(11, generation: generation + 1,
+        _ = budget.recordMediaPosition(11, mountIdentity: generation + 1,
                                        now: 0.25 + AVPlayerMidPlaybackRecoveryPolicy.RecoveryBudget.sustainedProgressSecondsToReset)
         check("one monotonic minute of real media progress reopens one recovery budget", !budget.replacementUsed)
 
         budget.recordReplacement(for: generation + 1)
-        _ = budget.recordMediaPosition(20, generation: generation + 1, now: 100)
-        _ = budget.recordMediaPosition(21, generation: generation + 1, now: 101)
-        _ = budget.recordMediaPosition(21, generation: generation + 1, now: 160)
+        _ = budget.recordMediaPosition(20, mountIdentity: generation + 1, now: 100)
+        _ = budget.recordMediaPosition(21, mountIdentity: generation + 1, now: 101)
+        _ = budget.recordMediaPosition(21, mountIdentity: generation + 1, now: 160)
         check("a frozen clock breaks the stable-progress interval instead of renewing the budget", budget.replacementUsed)
     }
 

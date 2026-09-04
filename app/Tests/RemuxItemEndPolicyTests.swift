@@ -332,12 +332,20 @@ enum RemuxItemEndPolicyTests {
                 "player.rate = requestedRate",
             ]))
         check(
-            "wiring: healthy remux tail replaces only the item and concrete failure remains terminal",
+            "wiring: a deliberate pause clears consumer-stall evidence before a later Play",
+            containsInOrder(engine, [
+                "func pause() {",
+                "playbackRequested = false",
+                "resetSurfaceStallEvidence()",
+                "refreshPendingIntentTransport()",
+            ]))
+        check(
+            "wiring: healthy remux tail replaces only after its own producer receipt advances, while concrete failure remains terminal",
             server?.contains("stream.hlsSnapshot().ended") == true
                 && containsInOrder(endHandler, [
                     "currentRemuxItemEndDecision()",
                     "case .recoverablePublishedTail:",
-                    "retryFreshItemOnHealthyMount(",
+                    "schedulePublishedTailRecovery(",
                     "case .remuxFailure(let reason):",
                     "guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }",
                 ])
@@ -427,23 +435,24 @@ enum RemuxItemEndPolicyTests {
                     "applyCommittedTransport()",
                 ]))
         check(
-            "wiring: paused published-tail recovery waits for explicit Play",
+            "wiring: paused published-tail recovery stores exact event ownership and waits for explicit Play",
             containsInOrder(endHandler, [
                 "case .recoverablePublishedTail:",
                 "if !playbackRequested {",
-                "deferredPublishedTailRecoveryGeneration = itemGeneration",
+                "deferredEventOwnedRecovery == nil",
+                "schedulePublishedTailRecovery(endedItem: endedItem, loadToken: loadToken)",
                 "return",
-                "retryFreshItemOnHealthyMount(",
             ])
                 && containsInOrder(engine, [
                     "func play() {",
-                    "deferredPublishedTailRecoveryGeneration == itemGeneration",
-                    "retryFreshItemOnHealthyMount(",
+                    "if let deferred = deferredEventOwnedRecovery",
+                    "deferredEventOwnedRecovery = nil",
+                    "scheduleEventOwnedRecovery(",
                 ])
                 && containsInOrder(engine, [
                     "func play() {",
                     "deferredTerminal.consume(generation: itemGeneration)",
-                    "deferredPublishedTailRecoveryGeneration == itemGeneration",
+                    "if let deferred = deferredEventOwnedRecovery",
                     "currentRemuxItemEndDecision()",
                 ]))
         check(
@@ -460,8 +469,8 @@ enum RemuxItemEndPolicyTests {
                 "if !playbackRequested {",
                 "switch currentRemuxItemEndDecision()",
                 "case .recoverablePublishedTail:",
-                "deferredPublishedTailRecoveryGeneration != itemGeneration",
-                "deferredPublishedTailRecoveryGeneration = itemGeneration",
+                "makeEventOwnedRecoveryReceipt(for: item, loadToken: loadToken)",
+                "deferredEventOwnedRecovery = DeferredEventOwnedRecovery(",
                 "case .remuxFailure(let reason):",
                 "deferredTerminal.capture(.error(reason), generation: itemGeneration)",
                 "case .contentEOF:",
@@ -470,25 +479,27 @@ enum RemuxItemEndPolicyTests {
                 "if shouldRetryViaPlainRemux",
             ]))
         check(
-            "wiring: paused healthy status tail keeps the existing one-shot Play recovery generation fence",
+            "wiring: paused healthy status tail keeps an exact token-generation-mount event receipt",
             containsInOrder(statusFailure, [
                 "case .recoverablePublishedTail:",
-                "guard deferredPublishedTailRecoveryGeneration != itemGeneration else { return }",
-                "deferredPublishedTailRecoveryGeneration = itemGeneration",
+                "guard deferredEventOwnedRecovery == nil,",
+                "let receipt = makeEventOwnedRecoveryReceipt(for: item, loadToken: loadToken)",
+                "deferredEventOwnedRecovery = DeferredEventOwnedRecovery(",
             ])
                 && containsInOrder(engine, [
                     "func play() {",
-                    "deferredPublishedTailRecoveryGeneration == itemGeneration",
-                    "retryFreshItemOnHealthyMount(",
+                    "deferred.receipt.loadToken == loadToken",
+                    "deferred.receipt.generation == itemGeneration",
+                    "deferred.receipt.mountIdentity == playbackMountIdentity",
                 ]))
 
         let coreMediaRecovery = sourceSection(
             engine,
-            from: "private func retryFreshItemForCoreMediaResourceUnavailable",
+            from: "private func makeEventOwnedRecoveryReceipt",
             to: "private func refreshPendingIntentTransport")
         let coreMediaFailure = sourceSection(
             statusFailure,
-            from: "if videoFrameEverProduced,",
+            from: "if isMidPlaybackCoreMediaResourceUnavailable,",
             to: "if recoverAudioReplacementIfNeeded")
         let coreMediaProofFailure = sourceSection(
             engine,
@@ -499,28 +510,33 @@ enum RemuxItemEndPolicyTests {
             from: "CoreMedia -1008 lacked healthy local-HLS ownership proof -> terminal/source-hop path",
             to: "finishFailure()")
         check(
-            "wiring: CoreMedia -1008 consumes its one-shot budget before a current healthy local-HLS replacement",
+            "wiring: CoreMedia -1008 consumes its one-shot budget before an event-owned healthy local-HLS observation",
             containsInOrder(coreMediaFailure, [
                 "!coreMediaReloadRetried",
                 "coreMediaReloadRetried = true",
-                "retryFreshItemForCoreMediaResourceUnavailable(",
+                "scheduleCoreMediaResourceUnavailableRecovery(",
             ]))
         check(
-            "wiring: CoreMedia -1008 replacement requires current local-HLS proof and the transitive callee cannot remount",
-            containsInOrder(coreMediaRecovery, [
-                "activeLoadToken == loadToken",
-                "item === failedItem",
-                "player.currentItem === failedItem",
-                "remuxHLSServer?.isMountHealthy == true",
-                "progress.initPublished",
-                "!progress.ended",
-                "!progress.failed",
-                "let publishedURL = localRemuxPlaylistURL",
-                "failedURL == publishedURL",
-                "retryFreshItemOnHealthyMount(",
-                "playbackMountIdentity == failedMountIdentity",
-                "itemGeneration == failedGeneration + 1",
-            ])
+            "wiring: CoreMedia -1008 keeps input-open non-admission above closed-playlist advance and rich-window recovery",
+            coreMediaRecovery?.contains("activeLoadToken == loadToken") == true
+                && coreMediaRecovery?.contains("item === eventItem") == true
+                && coreMediaRecovery?.contains("player.currentItem === eventItem") == true
+                && coreMediaRecovery?.contains("remuxHLSServer?.isMountHealthy == true") == true
+                && coreMediaRecovery?.contains("let publishedURL = localRemuxPlaylistURL") == true
+                && coreMediaRecovery?.contains("EventOwnedRecoveryReceipt(") == true
+                && coreMediaRecovery?.contains("generation: itemGeneration") == true
+                && coreMediaRecovery?.contains("mountIdentity: playbackMountIdentity") == true
+                && coreMediaRecovery?.contains("eventReceiptStillOwnsCurrentItem(") == true
+                && coreMediaRecovery?.contains("AVPlayerEventRecoveryPolicy.observationWindowSeconds") == true
+                && coreMediaRecovery?.contains("while !Task.isCancelled") == true
+                && coreMediaRecovery?.contains("publishedWindow") == true
+                && coreMediaRecovery?.contains("playlistAdvanced(current, after: receipt.progress)") == true
+                && coreMediaRecovery?.contains("producerAdvanced(current, after: receipt.progress)") == false
+                && coreMediaRecovery?.contains("AVPlayerEventRecoveryPolicy.admitsFreshItem(") == true
+                && coreMediaRecovery?.contains("!current.inputOpenInFlight && (playlistAdvanced || (timedOut") == true
+                && coreMediaRecovery?.contains("inputOpenInFlight: current.inputOpenInFlight") == true
+                && coreMediaRecovery?.contains("Task.sleep(for: AVPlayerEventRecoveryPolicy.observationPollInterval)") == true
+                && coreMediaRecovery?.contains("retryFreshItemOnHealthyMount(") == true
                 && coreMediaRecovery?.contains("loadFile(") == false
                 && coreMediaRecovery?.contains("teardownRemux(") == false
                 && tailRecovery?.contains("loadFile(") == false
@@ -530,7 +546,7 @@ enum RemuxItemEndPolicyTests {
         check(
             "wiring: a CoreMedia -1008 without ownership proof falls through the existing bounded audio-HDR-terminal chain",
             containsInOrder(coreMediaFailure, [
-                "retryFreshItemForCoreMediaResourceUnavailable(",
+                "scheduleCoreMediaResourceUnavailableRecovery(",
                 "CoreMedia -1008 lacked healthy local-HLS ownership proof -> terminal/source-hop path",
             ])
                 && coreMediaFailure?.contains("loadFile(") == false
