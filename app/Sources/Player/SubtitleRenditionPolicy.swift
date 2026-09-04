@@ -1007,32 +1007,29 @@ enum SubtitleRenditionPolicy {
     /// A complete WebVTT segment document.
     ///
     /// `X-TIMESTAMP-MAP` ties cue time zero to media time zero. The remux timeline starts at zero (the media
-    /// playlist states `EXT-X-START:TIME-OFFSET=0`) and cue times here are absolute source times, so the map
-    /// is the identity, but stating it is what makes that explicit to the player rather than assumed.
+    /// playlist states `EXT-X-START:TIME-OFFSET=0`) and cue times here are absolute remux times, so every
+    /// segment uses the same identity map. Keeping the full interval in every overlapping segment is required by
+    /// RFC 8216 section 3.5 and prevents AVFoundation from treating a clipped copy as a second cue.
     /// A cue-less segment still produces a valid document with a header and no cues, which is what a stretch
     /// of film with no dialogue must serve.
-    /// Renders a self-contained HLS WebVTT segment. Timings are local to the supplied video segment and the
-    /// timestamp map carries their absolute media position. Without this map AVFoundation can retain a cue
-    /// from the previous sliding segment and render its overlapping copy as a second native subtitle.
+    /// Renders a self-contained HLS WebVTT segment. Timings remain absolute on the zero-origin remux timeline;
+    /// `segmentStart` and `segmentEnd` are retained for the call-site contract and overlap selection, but are not
+    /// used to clip or rebase the cue. Without the full repeated interval AVFoundation can retain a cue from the
+    /// previous sliding segment and render its overlapping copy as a second native subtitle.
     static func webVTTDocument(cues: [Cue], segmentStart: Double? = nil,
                                segmentEnd: Double? = nil) -> String {
-        let origin = segmentStart.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        _ = segmentEnd // Segment overlap selects cues; a selected cue retains its complete interval.
-        let mpegTimestamp: Int64 = origin.map { seconds in
-            let ticks = (seconds * 90_000).rounded()
-            guard ticks.isFinite, ticks >= 0, ticks <= Double(Int64.max) else { return 0 }
-            return Int64(ticks) % 8_589_934_592 // MPEG-TS PTS is 33-bit.
-        } ?? 0
+        _ = segmentStart // Segment overlap selects cues; a selected cue retains its complete interval.
+        _ = segmentEnd
+        let mpegTimestamp: Int64 = 0
         var lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:\(mpegTimestamp),LOCAL:00:00:00.000", ""]
         for cue in cues {
             // A zero-or-negative-length cue is not displayable and some parsers reject the whole document
             // over one, so it is skipped here as a last line of defence even though `cue(payload:...)`
             // already enforces a minimum length.
-            let start = origin.map { max(0, cue.start - $0) } ?? cue.start
-            // RFC 8216 requires a full cue in every segment it overlaps. Clipping at this segment's end
-            // loses continuity during a playlist reload and creates a visible subtitle flash.
-            let absoluteEnd = cue.end
-            let end = origin.map { absoluteEnd - $0 } ?? absoluteEnd
+            // RFC 8216 requires a full cue in every segment it overlaps. Repeating the absolute interval keeps
+            // fresh joiners and AVFoundation's native cue identity on the same remux timeline.
+            let start = cue.start
+            let end = cue.end
             let startMilliseconds = Int((max(0, start) * 1_000).rounded())
             let endMilliseconds = Int((max(0, end) * 1_000).rounded())
             guard endMilliseconds > startMilliseconds else { continue }
@@ -1042,7 +1039,8 @@ enum SubtitleRenditionPolicy {
             // cue's end as it learns more of the stream; including that mutable boundary would create a second
             // AVFoundation cue identity and stack both native subtitles. Apple's HLS authoring guidance uses the
             // id so AVFoundation recognises cross-segment copies as one cue and renders it once.
-            lines.append(Self.cueIdentifier(startSeconds: cue.start, endSeconds: cue.end, text: cue.text))
+            lines.append(Self.cueIdentifier(startSeconds: cue.start, endSeconds: cue.end, text: cue.text,
+                                            provenance: cue.provenance))
             lines.append("\(timestamp(start)) --> \(timestamp(end))")
             lines.append(cue.text)
         }
@@ -1053,10 +1051,18 @@ enum SubtitleRenditionPolicy {
     /// FNV-1a over the cue's immutable identity: the same cue served from any segment, or with a later-known
     /// end, gets the same id. `endSeconds` remains an explicit call-site argument because it is the cue's actual
     /// timing, but it intentionally does not participate in identity. The id carries no user text; it only needs
-    /// uniqueness among distinct cue starts and bodies.
-    static func cueIdentifier(startSeconds: Double, endSeconds _: Double, text: String) -> String {
+    /// uniqueness among distinct cue starts and bodies. Proven ASS event identity is included when available so
+    /// two legitimate events with equal start and visible text cannot collide; the mutable end is excluded.
+    static func cueIdentifier(startSeconds: Double, endSeconds _: Double, text: String,
+                              provenance: Cue.Provenance? = nil) -> String {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in "\(startSeconds)|\(text)".utf8 {
+        let provenanceKey: String
+        if case let .assEvent(event)? = provenance {
+            provenanceKey = event
+        } else {
+            provenanceKey = ""
+        }
+        for byte in "\(startSeconds)|\(provenanceKey)|\(text)".utf8 {
             hash ^= UInt64(byte)
             hash &*= 0x0000_0100_0000_01b3
         }

@@ -603,7 +603,8 @@ check("normalize: distinct proven ASS events stay distinct and stable in every o
         && Policy.normalizedCues(Policy.normalizedCues(separateASSEvents))
             == Policy.normalizedCues(separateASSEvents))
 let separateASSCueIDs = Policy.normalizedCues(separateASSEvents).map {
-    Policy.cueIdentifier(startSeconds: $0.start, endSeconds: $0.end, text: $0.text)
+    Policy.cueIdentifier(startSeconds: $0.start, endSeconds: $0.end, text: $0.text,
+                         provenance: $0.provenance)
 }
 check("normalize: distinct ASS events retain stable distinct cue IDs across segment copies",
       Set(separateASSCueIDs).count == 2
@@ -950,25 +951,44 @@ check("doc: a changed cue start receives a distinct native cue identity",
       firstSpoolIdentity != Policy.cueIdentifier(startSeconds: 6, endSeconds: 12, text: "Crosses boundary"))
 check("doc: a changed cue body receives a distinct native cue identity",
       firstSpoolIdentity != Policy.cueIdentifier(startSeconds: 5, endSeconds: 12, text: "Different line"))
-let adjacentSegmentCue = Cue(start: 5, end: 8, text: "Crosses boundary")
+let adjacentSegmentCue = Cue(start: 9, end: 14, text: "Crosses boundary")
 let localSegment = parseVTT(Policy.webVTTDocument(
-    cues: [adjacentSegmentCue], segmentStart: 6, segmentEnd: 12))
-check("doc: a later HLS segment maps local zero to its exact 90 kHz media timestamp",
-      localSegment.header.contains("X-TIMESTAMP-MAP=MPEGTS:540000,LOCAL:00:00:00.000"))
-check("doc: a cue crossing a segment edge retains its full remaining interval",
-      localSegment.cues.first?.time == "00:00:00.000 --> 00:00:02.000")
+    cues: [adjacentSegmentCue], segmentStart: 6.125, segmentEnd: 12.375))
+check("doc: every remux segment uses the zero-origin timestamp map",
+      localSegment.header.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"))
+check("doc: a cue crossing a segment edge retains its full absolute interval",
+      localSegment.cues.first?.time == "00:00:09.000 --> 00:00:14.000")
 let nextLocalSegment = parseVTT(Policy.webVTTDocument(
-    cues: [adjacentSegmentCue], segmentStart: 7, segmentEnd: 12))
-check("doc: adjacent segment copies carry different timeline identities instead of duplicate absolute cues",
-      nextLocalSegment.header != localSegment.header
-        && nextLocalSegment.cues.first?.time == "00:00:00.000 --> 00:00:01.000")
+    cues: [adjacentSegmentCue], segmentStart: 12.375, segmentEnd: 18.625))
+check("doc: adjacent segment copies retain the exact same absolute interval",
+      nextLocalSegment.header == localSegment.header
+        && nextLocalSegment.cues.first?.time == "00:00:09.000 --> 00:00:14.000")
 let firstBoundaryFragment = parseVTT(Policy.webVTTDocument(
-    cues: [adjacentSegmentCue], segmentStart: 0, segmentEnd: 6))
-let secondBoundaryFragment = parseVTT(Policy.webVTTDocument(
     cues: [adjacentSegmentCue], segmentStart: 6, segmentEnd: 12))
-check("doc: adjacent HLS fragments retain the full cue interval for fresh joiners",
-      firstBoundaryFragment.cues.first?.time == "00:00:05.000 --> 00:00:08.000"
-        && secondBoundaryFragment.cues.first?.time == "00:00:00.000 --> 00:00:02.000")
+let secondBoundaryFragment = parseVTT(Policy.webVTTDocument(
+    cues: [adjacentSegmentCue], segmentStart: 12, segmentEnd: 18))
+check("doc: adjacent HLS fragments repeat the full absolute interval for fresh joiners",
+      firstBoundaryFragment.cues.first?.time == "00:00:09.000 --> 00:00:14.000"
+        && secondBoundaryFragment.cues.first?.time == "00:00:09.000 --> 00:00:14.000")
+let sameStartTextProvenanceA = Cue(start: 4.25, end: 5.5, text: "same",
+                                   provenance: .assEvent("41,0,Default,,0,0,0,,"))
+let sameStartTextProvenanceB = Cue(start: 4.25, end: 5.5, text: "same",
+                                   provenance: .assEvent("42,0,Default,,0,0,0,,"))
+check("doc: distinct ASS events with the same start and text receive distinct stable IDs",
+      Policy.cueIdentifier(startSeconds: sameStartTextProvenanceA.start,
+                           endSeconds: sameStartTextProvenanceA.end,
+                           text: sameStartTextProvenanceA.text,
+                           provenance: sameStartTextProvenanceA.provenance)
+        != Policy.cueIdentifier(startSeconds: sameStartTextProvenanceB.start,
+                                endSeconds: sameStartTextProvenanceB.end,
+                                text: sameStartTextProvenanceB.text,
+                                provenance: sameStartTextProvenanceB.provenance))
+let provenanceDocument = parseVTT(Policy.webVTTDocument(
+    cues: [sameStartTextProvenanceA, sameStartTextProvenanceB], segmentStart: 4, segmentEnd: 6))
+check("doc: distinct proven ASS events keep distinct IDs in the generated document",
+      provenanceDocument.cues.count == 2 && provenanceDocument.cues[0].body == "same"
+        && provenanceDocument.cues[1].body == "same"
+        && provenanceDocument.cues[0].time == provenanceDocument.cues[1].time)
 let wrappedSeconds = Double(8_589_934_592) / 90_000
 let wrappedTimestamp = Policy.webVTTDocument(
     cues: [Cue(start: wrappedSeconds, end: wrappedSeconds + 1, text: "wrap")],
