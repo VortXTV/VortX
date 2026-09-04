@@ -393,14 +393,22 @@ enum SubtitleRenditionPolicy {
 
     /// One subtitle cue on the OUTPUT timeline, in seconds.
     struct Cue: Equatable, Sendable {
+        /// Provenance retained only where the source format supplies an unambiguous event identity. It never
+        /// reaches the WebVTT document, so native cue identifiers remain a function of the visible timeline.
+        enum Provenance: Equatable, Sendable {
+            case assEvent(String)
+        }
+
         let start: Double
         let end: Double
         let text: String
+        let provenance: Provenance?
 
-        init(start: Double, end: Double, text: String) {
+        init(start: Double, end: Double, text: String, provenance: Provenance? = nil) {
             self.start = start
             self.end = end
             self.text = text
+            self.provenance = provenance
         }
     }
 
@@ -421,6 +429,9 @@ enum SubtitleRenditionPolicy {
     /// one forced-narrative line is real content, and past that a stack is an authoring artefact (layered
     /// typesetting, animation steps) that no viewer could read anyway.
     static let maxSimultaneousCues = 3
+    /// The maximum packet timestamp skew for duplicate records from one already-proven ASS event. This never
+    /// applies to SRT/WebVTT/plain/PGS cues or to ASS records without explicit event provenance.
+    private static let assEventDuplicateTimingTolerance = 0.15
     /// Seven days is far beyond any supported playback asset while keeping millisecond conversion safely
     /// inside `Int` on every product architecture.
     static let maximumTimelineSeconds = 7.0 * 24 * 60 * 60
@@ -437,30 +448,47 @@ enum SubtitleRenditionPolicy {
               startSeconds >= 0,
               startSeconds.isFinite,
               startSeconds <= maximumTimelineSeconds else { return nil }
-        guard let text = plainText(payload: payload, format: format) else { return nil }
+        let decoded = decodedCue(payload: payload, format: format)
+        guard let text = decoded.text else { return nil }
         var duration = durationSeconds
         if !duration.isFinite || duration <= 0 { duration = fallbackCueDuration }
         duration = min(max(duration, minCueDuration), maxCueDuration)
         guard duration <= maximumTimelineSeconds - startSeconds else { return nil }
-        return Cue(start: startSeconds, end: startSeconds + duration, text: text)
+        return Cue(start: startSeconds, end: startSeconds + duration, text: text,
+                   provenance: decoded.provenance)
     }
 
     /// The displayable text of a packet payload, or nil when there is none.
     static func plainText(payload: Data, format: TextFormat) -> String? {
+        decodedCue(payload: payload, format: format).text
+    }
+
+    /// Decode one packet's visible text and, for ASS only, preserve a source event identity when it is strong
+    /// enough to prove two packets came from the same dialogue event. The identity deliberately requires a
+    /// nonzero numeric ReadOrder and every non-text header field. Many loose ASS-like payloads use `0` for every
+    /// row, so treating that placeholder as an event identity would collapse intentional simultaneous cues.
+    private static func decodedCue(payload: Data, format: TextFormat)
+        -> (text: String?, provenance: Cue.Provenance?) {
         let raw: String
+        let provenance: Cue.Provenance?
         switch format {
         case .movText:
-            guard let unwrapped = movTextBody(payload) else { return nil }
+            guard let unwrapped = movTextBody(payload) else { return (nil, nil) }
             raw = unwrapped
+            provenance = nil
         case .ass:
-            raw = assDialogueText(decodeUTF8(payload))
+            let dialogue = assDialogue(decodeUTF8(payload))
+            raw = dialogue.text
+            provenance = dialogue.eventIdentity.map(Cue.Provenance.assEvent)
         case .subRip, .webVTT, .plainText, .pgs:
             raw = decodeUTF8(payload)
+            provenance = nil
         }
         // ASS override blocks and escapes appear inside SRT payloads too (rips convert one to the other and
         // leave `{\an8}` in place), so the unescape runs for every text format.
         let unescaped = stripASSMarkup(raw)
-        return sanitizeCueText(unescaped, escapeAngleBrackets: format != .subRip && format != .webVTT)
+        return (sanitizeCueText(unescaped, escapeAngleBrackets: format != .subRip && format != .webVTT),
+                provenance)
     }
 
     /// Decode bytes as UTF-8, substituting replacement characters for invalid sequences rather than failing:
@@ -494,9 +522,32 @@ enum SubtitleRenditionPolicy {
     /// deleted: a mutant that disabled it changed no output, which is the definition of a clause that enforces
     /// nothing.
     static func assDialogueText(_ raw: String) -> String {
+        assDialogue(raw).text
+    }
+
+    /// Parsed ASS dialogue text plus a conservative source-event identity. The source stream's rendition is
+    /// already fixed at the caller, so the ReadOrder plus complete non-text dialogue header is enough to bind
+    /// duplicate records to one event without comparing rendered text, style tags, or timestamps.
+    private static func assDialogue(_ raw: String) -> (text: String, eventIdentity: String?) {
         let fields = raw.split(separator: ",", maxSplits: assFieldsBeforeText, omittingEmptySubsequences: false)
-        guard fields.count > assFieldsBeforeText else { return raw }
-        return String(fields[assFieldsBeforeText])
+        guard fields.count > assFieldsBeforeText else { return (raw, nil) }
+        let readOrder = String(fields[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let identity: String?
+        if isExplicitASSReadOrder(readOrder) {
+            identity = fields[..<assFieldsBeforeText].joined(separator: ",")
+        } else {
+            identity = nil
+        }
+        return (String(fields[assFieldsBeforeText]), identity)
+    }
+
+    /// `0` is a common anonymous placeholder in ASS-like payloads. A nonzero decimal ReadOrder is the narrow
+    /// form we can treat as an explicit source event identifier; every other spelling remains unproven.
+    private static func isExplicitASSReadOrder(_ readOrder: String) -> Bool {
+        guard !readOrder.isEmpty,
+              readOrder.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let value = UInt64(readOrder), value > 0 else { return false }
+        return true
     }
 
     /// Remove ASS override blocks (`{\an8}`, `{\i1}`) and expand the ASS escapes that carry line structure.
@@ -630,10 +681,13 @@ enum SubtitleRenditionPolicy {
         var open: [Int] = []
         for cue in ordered {
             open.removeAll { merged[$0].end < cue.start }
-            if let slot = open.first(where: { merged[$0].text == cue.text }) {
+            if let slot = open.first(where: {
+                merged[$0].text == cue.text || isDuplicateASSRenderRecord(merged[$0], cue)
+            }) {
                 merged[slot] = Cue(start: merged[slot].start,
                                    end: max(merged[slot].end, cue.end),
-                                   text: merged[slot].text)
+                                   text: merged[slot].text,
+                                   provenance: merged[slot].provenance)
                 continue
             }
             merged.append(cue)
@@ -662,6 +716,31 @@ enum SubtitleRenditionPolicy {
         }
         guard !dropped.isEmpty else { return merged }
         return merged.indices.filter { !dropped.contains($0) }.map { merged[$0] }
+    }
+
+    /// Coalesce only an ASS duplicate record whose originating event is explicitly identical. Text is compared
+    /// after whitespace flattening because ASS override blocks and hard spaces have already lost their visual
+    /// semantics before this policy sees them. Nothing based only on visible text, styling, or timing qualifies.
+    private static func isDuplicateASSRenderRecord(_ lhs: Cue, _ rhs: Cue) -> Bool {
+        guard lhs.text != rhs.text,
+              case let .assEvent(lhsEvent)? = lhs.provenance,
+              case let .assEvent(rhsEvent)? = rhs.provenance,
+              lhsEvent == rhsEvent,
+              abs(lhs.start - rhs.start) <= assEventDuplicateTimingTolerance,
+              abs(lhs.end - rhs.end) <= assEventDuplicateTimingTolerance,
+              let lhsText = assFlattenedTextKey(lhs.text),
+              let rhsText = assFlattenedTextKey(rhs.text),
+              lhsText == rhsText else { return false }
+        return true
+    }
+
+    /// A deliberately literal ASS comparison key: only whitespace is flattened. Punctuation, words, markup,
+    /// and every other character remain significant, so this cannot turn a translation or a different lyric
+    /// into a duplicate merely because it shares a visual style.
+    private static func assFlattenedTextKey(_ text: String) -> String? {
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        guard !words.isEmpty else { return nil }
+        return words.joined(separator: " ")
     }
 
     /// The cues that fall inside `start..<end`, in start order.

@@ -566,6 +566,52 @@ check("normalize: identical text that only TOUCHES is still coalesced",
 check("normalize: identical text with a real gap between it stays two cues",
       Policy.normalizedCues([Cue(start: 0, end: 2, text: "A"), Cue(start: 2.5, end: 4, text: "A")])
         == [Cue(start: 0, end: 2, text: "A"), Cue(start: 2.5, end: 4, text: "A")])
+let intentionalNearCoincidentCues = [
+    Cue(start: 10, end: 12, text: "<i>Listen</i> now"),
+    Cue(start: 10.04, end: 12.03, text: "Listen now"),
+    Cue(start: 10.08, end: 12.07, text: "<c.yellow>Listen now</c>"),
+]
+check("normalize: near-coincident italic sign, plain dialogue, and styled lyric remain distinct",
+      Policy.normalizedCues(intentionalNearCoincidentCues).count == 3)
+check("normalize: language and ruby markup remain distinct cue bodies",
+      Policy.normalizedCues([
+          Cue(start: 10, end: 12, text: "<lang en>Hello</lang>"),
+          Cue(start: 10.04, end: 12.03, text: "<ruby>Hello<rt>Bonjour</rt></ruby>"),
+      ]).count == 2)
+let sameASSEvent = [
+    Policy.cue(payload: data("42,0,Default,,0,0,0,,{\\pos(10,20)}Listen  now"), format: .ass,
+               startSeconds: 10, durationSeconds: 2)!,
+    Policy.cue(payload: data("42,0,Default,,0,0,0,,{\\pos(20,30)}Listen now"), format: .ass,
+               startSeconds: 10.04, durationSeconds: 2)!,
+]
+check("normalize: visual records from one explicit ASS event collapse after flattening",
+      Policy.normalizedCues(sameASSEvent).count == 1)
+check("normalize: explicit ASS event identity is retained without changing visible cue text",
+      sameASSEvent.first?.provenance != nil && sameASSEvent.first?.text == "Listen  now")
+let separateASSEvents = [
+    Policy.cue(payload: data("42,0,Default,,0,0,0,,{\\pos(10,20)}Listen  now"), format: .ass,
+               startSeconds: 10, durationSeconds: 2)!,
+    Policy.cue(payload: data("43,0,Default,,0,0,0,,{\\pos(10,20)}Listen now"), format: .ass,
+               startSeconds: 10.04, durationSeconds: 2)!,
+]
+check("normalize: separate ASS events with same flattened text, style, layer, and position stay distinct",
+      Policy.normalizedCues(separateASSEvents).count == 2)
+let anonymousASSEvents = [
+    Policy.cue(payload: data("0,0,Default,,0,0,0,,Listen  now"), format: .ass,
+               startSeconds: 10, durationSeconds: 2)!,
+    Policy.cue(payload: data("0,0,Default,,0,0,0,,Listen now"), format: .ass,
+               startSeconds: 10.04, durationSeconds: 2)!,
+]
+check("normalize: anonymous ASS ReadOrder zero never authorizes semantic dedupe",
+      Policy.normalizedCues(anonymousASSEvents).count == 2
+        && anonymousASSEvents.allSatisfy { $0.provenance == nil })
+check("normalize: same ASS event outside the duplicate timing boundary stays distinct",
+      Policy.normalizedCues([
+          Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen  now"), format: .ass,
+                     startSeconds: 10, durationSeconds: 2)!,
+          Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen now"), format: .ass,
+                     startSeconds: 10.2, durationSeconds: 2)!,
+      ]).count == 2)
 check("normalize: coalescing bridges a run through an interleaved different line",
       Policy.normalizedCues([Cue(start: 0, end: 2, text: "A"),
                              Cue(start: 0.5, end: 1.5, text: "B"),

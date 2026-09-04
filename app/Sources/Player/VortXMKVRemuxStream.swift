@@ -4588,7 +4588,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
            cue.start <= last.end,
            cue.end > last.end {
             _subtitleCues[renditionID][_subtitleCues[renditionID].count - 1] =
-                SubtitleRenditionPolicy.Cue(start: last.start, end: cue.end, text: last.text)
+                SubtitleRenditionPolicy.Cue(start: last.start, end: cue.end, text: last.text,
+                                            provenance: last.provenance)
             return .appended(recoveredUnavailableRow: observeValidSubtitleCueLocked(sourceIndex: sourceIndex))
         }
         // An exact duplicate (identical text, no later end) adds nothing to show; count it as a valid cue and
