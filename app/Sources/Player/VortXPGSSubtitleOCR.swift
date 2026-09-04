@@ -324,13 +324,11 @@ final class VortXPGSSubtitleOCR {
             }
             if context.shouldStop { return .failed }
             guard let observations = request.results else { continue }
-            let recognised = observations.compactMap { $0.topCandidates(1).first?.string }
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            lines.append(contentsOf: recognised)
+            lines.append(contentsOf: observations.compactMap { $0.topCandidates(1).first?.string })
         }
-        guard !lines.isEmpty else { return .empty }
-        return .text(lines.joined(separator: "\n"))
+        let normalizedLines = PGSOCRTextComposition.normalizedLines(lines)
+        guard !normalizedLines.isEmpty else { return .empty }
+        return .text(normalizedLines.joined(separator: "\n"))
     }
 
     private static func image(from bitmap: PGSOCRBitmap) -> CGImage? {

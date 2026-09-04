@@ -538,6 +538,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private let subtitleRenderer = SubtitleCueRenderer()
     private weak var subtitleOverlay: SubtitleOverlayView?
     private var externalSubActive = false
+    /// Supersedes delayed native-legible settlement reads after a newer subtitle intent or item lifecycle.
+    private var subtitleSelectionRevision: UInt64 = 0
+    /// A loaded external cue file waits here while AVFoundation is still resolving the item's legible group.
+    private var pendingExternalSubtitleActivation = false
     /// Label of the loaded external overlay subtitle, so it can be published as a REAL row of `tracks(ofType:
     /// "sub")` instead of being invisible to the chrome. Build 191 field defect: on this engine an add-on /
     /// pooled subtitle rendered over the video while the picker showed "Off" ticked and the row the viewer
@@ -2705,8 +2709,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if id == Self.externalSubtitleTrackID {
                 guard externalSubLabel != nil, subtitleRenderer.hasCues else { return }
                 intent.selectExternalSubtitle()
-                externalSubActive = true
-                subtitleOverlay?.applyStyle()
+                disableExternalSubtitle()
             } else if id < 0 {
                 intent.selectSubtitlesOff()
                 disableExternalSubtitle()
@@ -2721,21 +2724,88 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         }
         if id == Self.externalSubtitleTrackID {
             guard externalSubLabel != nil, subtitleRenderer.hasCues else { return }
-            if let group = subGroup, let item = player.currentItem {
-                item.select(nil, in: group)   // never render an embedded track under the overlay
+            selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
+            return
+        }
+        guard nativeID < 0 || subGroup?.options.indices.contains(nativeID) == true else { return }
+        let option = nativeID < 0 ? nil : subGroup?.options[nativeID]
+        selectNativeSubtitle(option, activatingExternalAfterSettlement: false)
+    }
+
+    /// Own every native legible selection through one generation-fenced, bounded settlement path. In
+    /// particular, an external overlay is not activated until AVFoundation confirms that its native legible
+    /// counterpart is actually off. That prevents a late HLS selection from rendering under the overlay.
+    private func selectNativeSubtitle(
+        _ requested: AVMediaSelectionOption?,
+        activatingExternalAfterSettlement: Bool
+    ) {
+        subtitleSelectionRevision &+= 1
+        let revision = subtitleSelectionRevision
+        guard let group = subGroup, let item = player.currentItem else {
+            // A missing cached group while topology is loading is not evidence that AVFoundation has no native
+            // legible selection. Defer overlay activation until group loading has conclusively completed.
+            pendingExternalSubtitleActivation = activatingExternalAfterSettlement
+            if !activatingExternalAfterSettlement || selectionTopologyGeneration == itemGeneration {
+                pendingExternalSubtitleActivation = false
+                setExternalSubtitleActive(activatingExternalAfterSettlement)
+            } else {
+                setExternalSubtitleActive(false)
             }
-            externalSubActive = true
-            subtitleOverlay?.applyStyle()
-            updateSubtitleOverlay(atClock: player.currentTime().seconds)
             publishSelectionTracks()
             return
         }
-        let wasExternal = externalSubActive
-        if wasExternal { disableExternalSubtitle() }
-        select(nativeID, in: subGroup)
-        // A source with no legible renditions has no group, so `select` returns before publishing. Turning the
-        // overlay off there still changed which row is ticked, so publish it directly.
-        if wasExternal, subGroup == nil { publishSelectionTracks() }
+        pendingExternalSubtitleActivation = false
+        let generation = itemGeneration
+        let mountIdentity = playbackMountIdentity
+        setExternalSubtitleActive(false)
+        item.select(requested, in: group)
+        refreshSelectionTracks(for: item)
+
+        func settlesNow() -> Bool {
+            guard self.subtitleSelectionRevision == revision,
+                  self.selectionContextIsCurrent(
+                    item: item,
+                    generation: generation,
+                    mountIdentity: mountIdentity),
+                  item.currentMediaSelection.selectedMediaOption(in: group) == requested else {
+                return false
+            }
+            self.setExternalSubtitleActive(activatingExternalAfterSettlement)
+            self.refreshSelectionTracks(for: item)
+            return true
+        }
+
+        guard !settlesNow() else { return }
+        DiagnosticsLog.log(
+            "player",
+            "subtitle selection not settled synchronously (group=\(group.options.count) options, requested=\(requested?.displayName ?? "off")); retrying")
+        for delay in [0.3, 0.8, 1.6, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak item] in
+                guard let self, let item,
+                      self.subtitleSelectionRevision == revision,
+                      self.selectionContextIsCurrent(
+                        item: item,
+                        generation: generation,
+                        mountIdentity: mountIdentity) else { return }
+                guard item.currentMediaSelection.selectedMediaOption(in: group) != requested else {
+                    self.setExternalSubtitleActive(activatingExternalAfterSettlement)
+                    self.refreshSelectionTracks(for: item)
+                    return
+                }
+                item.select(requested, in: group)
+                self.refreshSelectionTracks(for: item)
+            }
+        }
+    }
+
+    private func setExternalSubtitleActive(_ active: Bool) {
+        externalSubActive = active
+        guard active else {
+            subtitleOverlay?.setText(nil)
+            return
+        }
+        subtitleOverlay?.applyStyle()
+        updateSubtitleOverlay(atClock: player.currentTime().seconds)
     }
 
     /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
@@ -2813,18 +2883,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     return
                 }
                 self.subtitleRenderer.load(cues: cues)
-                self.externalSubActive = true
                 self.externalSubLabel = (title: title, lang: lang)
-                // Turn off any embedded/HLS legible track so we don't render two subtitle streams at once.
-                // Use the normal selection path rather than selecting the AVPlayerItem directly. Besides
-                // issuing the deselect, it refreshes the picker from AVFoundation's authoritative state and
-                // schedules bounded settle reads when a rendition has not switched synchronously.
-                self.select(-1, in: self.subGroup)
-                self.subtitleOverlay?.applyStyle()
-                self.updateSubtitleOverlay(atClock: self.player.currentTime().seconds)
-                // Publish unconditionally: the external row is now part of the track list, so the picker must
-                // learn about it whether or not the native deselect changed a group index.
-                self.publishSelectionTracks()
+                self.selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
                 finish(true)
             }
         }
@@ -2839,6 +2899,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// the chrome has already hidden that add-on's own row (it lives in `addedSubURLs`) on the promise that
     /// the subtitle re-appears in the ordinary track list. `discardingCues: true` is the title-change reset.
     private func disableExternalSubtitle(discardingCues: Bool = false) {
+        // Cancellation is required even when keeping parsed cues for a picker detour: a newer selection may
+        // re-activate them, but delayed settlement work from the old one must never do so on its own.
+        pendingExternalSubtitleActivation = false
+        subtitleSelectionRevision &+= 1
         externalSubActive = false
         subtitleOverlay?.setText(nil)
         guard discardingCues else { return }
@@ -4231,8 +4295,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // arrives after the immediate deselect above could do anything, so explicitly deselect it now.
             // This intentionally runs only for the overlay-active state: native-only selection keeps the
             // framework's current legible choice untouched.
-            if externalSubActive {
-                select(-1, in: sg)
+            if externalSubActive || pendingExternalSubtitleActivation {
+                selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
             }
             let sourceBackedAudio = !remuxSourceAudioTracks.isEmpty
             let selectedSourcePublished = selectedRemuxAudioSourceIndex.map { selected in
@@ -4355,21 +4419,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 }
                 switch restore.subtitle {
                 case .external:
-                    if let group = sg {
-                        item.select(nil, in: group)
-                    }
-                    externalSubActive = true
+                    selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
                 case .off:
-                    if let group = sg { item.select(nil, in: group) }
-                    externalSubActive = false
+                    selectNativeSubtitle(nil, activatingExternalAfterSettlement: false)
                 case .embedded(let sourceIndex):
                     if let group = sg {
                         let index = nativeSubtitleIndex(forSourceID: sourceIndex) ?? sourceIndex
                         let option = group.options.indices.contains(index)
                             ? group.options[index] : nil
-                        item.select(option, in: group)
+                        selectNativeSubtitle(option, activatingExternalAfterSettlement: false)
+                    } else {
+                        setExternalSubtitleActive(false)
                     }
-                    externalSubActive = false
                 case .unresolved:
                     break
                 }
@@ -4397,6 +4458,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // force the newly available option topology to publish once even when both are Off.
             selectionTopologyGeneration = selectionGeneration
             selectionRefreshState.reset()
+            if pendingExternalSubtitleActivation {
+                // No legible group was ultimately published. It is now safe to activate the external overlay:
+                // this is the resolved-nil case, not the earlier asynchronous group-loading window.
+                selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
+            }
             refreshSelectionTracks(for: item)
             applyEmbeddedSubtitleTextStyle()   // P5: style native legible tracks from the start (best-effort)
         }
@@ -4467,6 +4533,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let changedItem = note.object as? AVPlayerItem,
               changedItem === player.currentItem,
               selectionTopologyGeneration == itemGeneration else { return }
+        if externalSubActive,
+           let group = subGroup,
+           changedItem.currentMediaSelection.selectedMediaOption(in: group) != nil {
+            // A system-driven HLS/legible selection must not render behind VortX's external overlay. Route it
+            // through the same bounded, generation-fenced path as user selection and recovery restoration.
+            selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
+            return
+        }
         refreshSelectionTracks(for: changedItem)
     }
 
