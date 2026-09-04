@@ -1,6 +1,7 @@
 package com.vortx.android.usenet
 
 import java.io.FileOutputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.CountDownLatch
@@ -13,6 +14,20 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UsenetProgressiveSessionTest {
+    @Test
+    fun `producer cancellation is rethrown instead of reporting a failed session`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/usenet/UsenetLocalResolver.kt")
+        val producer = source.substringAfter("val producer = CoroutineScope")
+            .substringBefore("session.attachProducer(producer)")
+        val cancellation = producer.indexOf("catch (error: CancellationException)")
+        val failure = producer.indexOf("catch (error: Throwable)")
+
+        assertTrue(cancellation >= 0)
+        assertTrue(failure > cancellation)
+        assertTrue(producer.substring(cancellation, failure).contains("throw error"))
+        assertFalse(producer.substring(cancellation, failure).contains("session.fail"))
+    }
+
     @Test
     fun `loopback range headers arrive before the requested ordered bytes`() {
         val home = createTempDirectory("usenet-progressive").toFile()
@@ -82,5 +97,11 @@ class UsenetProgressiveSessionTest {
             session.close()
             home.deleteRecursively()
         }
+    }
+
+    private fun readProjectFile(relativePath: String): String {
+        val candidates = listOf(File(relativePath), File("app/$relativePath"), File("android/app/$relativePath"))
+        return candidates.firstOrNull(File::isFile)?.readText()
+            ?: error("Could not locate $relativePath from ${File(".").absolutePath}")
     }
 }

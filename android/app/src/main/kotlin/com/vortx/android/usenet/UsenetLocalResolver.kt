@@ -77,6 +77,8 @@ internal class UsenetLocalResolver(
             try {
                 assemble(file, target, session)
                 session.finish()
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Throwable) {
                 session.fail(error)
                 target.delete()
