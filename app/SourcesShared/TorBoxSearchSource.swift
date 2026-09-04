@@ -20,6 +20,40 @@ import Foundation
 enum TorBoxSearch {
     private static let base = "https://search-api.torbox.app"
 
+    /// Why a completed search attempt did not produce a usable response. This stays distinct from an
+    /// empty result: an empty 2xx response is a cacheable answer, while any of these failures must be
+    /// retried and reported to the provider circuit breaker.
+    enum Failure: Equatable, Sendable {
+        case httpStatus(Int)
+        case network(URLError.Code)
+        case transport
+        case decode
+
+        fileprivate var circuitReason: ProviderCircuitBreaker.FailureReason {
+            switch self {
+            case let .httpStatus(code):
+                .httpStatus(code)
+            case let .network(code):
+                .network(code)
+            case .transport:
+                .network(.unknown)
+            case .decode:
+                .other("decode")
+            }
+        }
+
+        fileprivate var logLabel: String {
+            switch self {
+            case let .httpStatus(code): "http \(code)"
+            case let .network(code): "network \(code.rawValue)"
+            case .transport: "transport"
+            case .decode: "decode"
+            }
+        }
+    }
+
+    typealias Result = (streams: [CoreStream], failure: Failure?)
+
     /// One usenet result parsed from the search index into a playable `CoreStream` (nzb link + optional
     /// pick regex), plus torrent results (infoHash / magnet). Tolerant decoding: the index wraps items
     /// under `data.nzbs` / `data.torrents` (with fallbacks), and field names vary, so every field is
@@ -79,27 +113,28 @@ enum TorBoxSearch {
         }
     }
 
-    /// Fetch usenet + torrent search results for an imdb id and flatten to extra streams. Returns `[]` on
-    /// any failure (no key handled by the caller's gate; a network error / decode failure / timeout all
-    /// collapse to empty). `apiKey` lifts the anonymous rate limit (0/min: keyless requests always 429).
+    /// Fetch usenet + torrent search results for an imdb id and flatten to extra streams. A legitimate empty
+    /// 2xx answer remains distinct from HTTP, network, transport, and decode failures so only the former may
+    /// enter the session cache. `apiKey` lifts the anonymous rate limit (0/min: keyless requests always 429).
     /// `season`/`episode` scope a series fetch to one episode; nil for movies.
-    /// Combined usenet + torrent results plus two signal flags. `rateLimited` is `true` when the index
-    /// answered 429 (the account is over its TorBox scraper allowance / in the daily search cooldown), so the
-    /// caller backs off instead of re-firing on the next title and burning more of the quota. `transportError`
-    /// is `true` when a leg's request never completed (offline, DNS/TLS failure, timeout), so the caller keeps
-    /// the empty result OUT of the session cache and re-fetches for real once the network is back.
-    static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
-        guard imdbId.hasPrefix("tt") else { return ([], false, false) }
+    /// Combined usenet + torrent results. A failure is surfaced only when neither leg produced usable rows:
+    /// those partial rows remain useful and may be cached, while an all-empty failure remains retryable.
+    static func streams(imdbId: String, season: Int? = nil, episode: Int? = nil, apiKey: String) async -> Result {
+        guard imdbId.hasPrefix("tt") else { return ([], nil) }
         async let usenet = fetch(kind: "usenet", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         async let torrents = fetch(kind: "torrents", imdbId: imdbId, season: season, episode: episode, apiKey: apiKey)
         let (u, t) = await (usenet, torrents)
         let combined = u.streams + t.streams
-        let rateLimited = u.rateLimited || t.rateLimited
-        // A completed leg that supplied rows is useful even when its sibling could not connect. Preserve those
-        // rows and let the normal successful-result path cache them; only an all-empty response is a transport
-        // failure that must remain uncached and advance the circuit breaker.
-        let transportError = combined.isEmpty && (u.transportError || t.transportError)
-        return (combined, rateLimited, transportError)
+        guard combined.isEmpty else {
+            // A completed leg that supplied rows is useful even when its sibling failed. Preserve those rows
+            // and treat the contribution as successful rather than poisoning the title cache.
+            return (combined, nil)
+        }
+        // A rate limit must win over an ordinary sibling failure because it describes an account-wide cooldown.
+        let failures = [u.failure, t.failure].compactMap { $0 }
+        let failure = failures.first { if case .httpStatus(429) = $0 { return true }; return false }
+            ?? failures.first
+        return ([], failure)
     }
 
     /// One `GET /{kind}/imdb_id:{id}` call, bounded and fail-soft. The id-type prefix must be `imdb_id:`
@@ -107,7 +142,7 @@ enum TorBoxSearch {
     /// come back empty. Auth is the Bearer header ONLY (the JSON endpoints take no `apikey` query param,
     /// and the key must not ride in URLs anyway); anonymous requests are hard-429'd by the index.
     /// `check_cache=true` asks the index to flag which results the user's own account already has cached.
-    private static func fetch(kind: String, imdbId: String, season: Int?, episode: Int?, apiKey: String) async -> (streams: [CoreStream], rateLimited: Bool, transportError: Bool) {
+    private static func fetch(kind: String, imdbId: String, season: Int?, episode: Int?, apiKey: String) async -> Result {
         var comps = URLComponents(string: "\(base)/\(kind)/imdb_id:\(imdbId)")
         var query = [
             URLQueryItem(name: "metadata", value: "false"),
@@ -116,7 +151,7 @@ enum TorBoxSearch {
         if let season { query.append(URLQueryItem(name: "season", value: String(season))) }
         if let episode { query.append(URLQueryItem(name: "episode", value: String(episode))) }
         comps?.queryItems = query
-        guard let url = comps?.url else { return ([], false, false) }
+        guard let url = comps?.url else { return ([], .decode) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 12
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -124,19 +159,25 @@ enum TorBoxSearch {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 12
         let session = URLSession(configuration: cfg)
-        // A request that never completed (offline, DNS/TLS failure, timeout) yields no HTTP response. Report it
-        // as a distinct transportError so the caller does not cache the empty result as "no results" for the
-        // session; that is what made an offline first open stick until the app was relaunched.
-        guard let (data, response) = try? await session.data(for: req),
-              let code = (response as? HTTPURLResponse)?.statusCode else { return ([], false, true) }
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: req)
+        } catch let error as URLError {
+            return ([], .network(error.code))
+        } catch {
+            // Offline, DNS/TLS failures, and timeouts have no valid HTTP answer and must never cache as empty.
+            return ([], .transport)
+        }
+        guard let code = (response as? HTTPURLResponse)?.statusCode else { return ([], .transport) }
         // 429 = over the TorBox scraper allowance (the account's daily search cooldown). The index returns
         // "Rate limit exceeded: 0 per 1 minute" for EVERY search until the cooldown resets (~24h), so surface
         // it as a distinct signal instead of an empty "no results" the caller can't tell apart.
-        if code == 429 { return ([], true, false) }
-        guard (200...299).contains(code),
-              let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], false, false) }
+        if code == 429 { return ([], .httpStatus(429)) }
+        guard (200...299).contains(code) else { return ([], .httpStatus(code)) }
+        guard let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return ([], .decode) }
         let items = (decoded.data?.nzbs ?? []) + (decoded.data?.torrents ?? [])
-        return (items.compactMap { stream(from: $0, imdbId: imdbId) }, false, false)
+        return (items.compactMap { stream(from: $0, imdbId: imdbId) }, nil)
     }
 
     /// Build a `CoreStream` from one search item. Usenet vs torrent is discriminated by the index's own
@@ -219,10 +260,12 @@ enum TorBoxSearch {
 /// of the same title does not re-hit the index.
 @MainActor
 final class TorBoxSearchSource: ObservableObject {
-    typealias SearchResult = (streams: [CoreStream], rateLimited: Bool, transportError: Bool)
+    typealias SearchResult = TorBoxSearch.Result
     typealias FetchStreams = (SourceIndexIdentity.PublicationTarget, String) async -> SearchResult
     typealias KeyGate = @MainActor () -> Bool
     typealias KeyProvider = @MainActor () -> String
+    typealias RecordFailure = (TorBoxSearch.Failure) async -> Void
+    typealias RecordSuccess = () async -> Void
 
     /// The extra streams from the search index, ready to merge. Empty until a fetch completes (and always
     /// with no TorBox key). One group so the source list shows a single "TorBox Search" section.
@@ -254,23 +297,28 @@ final class TorBoxSearchSource: ObservableObject {
     /// so browsing back and forth never re-hits the TorBox scraper. Re-hitting on every open is exactly what
     /// exhausts the account's small daily search allowance and trips its ~24h `cooldown_until`.
     private var cache: [String: [CoreStream]] = [:]
-    /// The 429/transport-error backoff itself is NOT instance state anymore: it lives in the shared
-    /// `ProviderCircuitBreaker`, keyed by (provider, contentID). This type is a per-detail-view
+    /// The 429/request-failure backoff itself is NOT instance state anymore: it lives in the shared
+    /// `ProviderCircuitBreaker`, keyed by the provider account. This type is a per-detail-view
     /// `@StateObject`, so a `cooldownUntil` kept HERE was forgotten every time a view was torn down and
     /// rebuilt (every navigation away and back), letting the next view re-fire the request that just got
     /// rate-limited. The diag-21 log shows the same content id tripping TorBox's scraper cooldown six
     /// separate times because of exactly that. `shouldAttempt`/`recordFailure`/`recordSuccess` below are
-    /// the replacement; every instance shares the same breaker state.
+    /// the replacement; every instance shares the same breaker state. Search rate limits apply to the
+    /// account, not to an IMDb id, so the breaker key is deliberately stable while the result cache and
+    /// in-flight ownership remain keyed by the individual title.
     ///
     /// A literal, not `Self.breakerProvider`: this file also compiles standalone under
     /// `SOURCE_INDEX_IDENTITY_TESTING` (see `TorBoxIdentityBoundaryTests.swift`'s header), whose minimal
     /// `DebridService` stub carries no raw value. `DebridService` never overrides its raw values (they
     /// default to the case name), so this matches `Self.breakerProvider` in the real app exactly.
     private static let breakerProvider = "torBox"
+    private static let breakerSourceID = "search-api-account"
     private var task: Task<Void, Never>?
     private let fetchStreams: FetchStreams
     private let hasKey: KeyGate
     private let keyProvider: KeyProvider
+    private let recordFailure: RecordFailure
+    private let recordSuccess: RecordSuccess
 
     init(
         fetchStreams: @escaping FetchStreams = { target, apiKey in
@@ -286,11 +334,29 @@ final class TorBoxSearchSource: ObservableObject {
         },
         keyProvider: @escaping KeyProvider = {
             DebridKeys.shared.key(for: .torBox)
-        }
+        },
+        recordFailure: RecordFailure? = nil,
+        recordSuccess: RecordSuccess? = nil
     ) {
         self.fetchStreams = fetchStreams
         self.hasKey = hasKey
         self.keyProvider = keyProvider
+        let breakerProvider = Self.breakerProvider
+        let breakerSourceID = Self.breakerSourceID
+        self.recordFailure = recordFailure ?? { failure in
+            await ProviderCircuitBreaker.shared.recordFailure(
+                provider: breakerProvider,
+                sourceID: breakerSourceID,
+                phase: .discover,
+                reason: failure.circuitReason
+            )
+        }
+        self.recordSuccess = recordSuccess ?? {
+            await ProviderCircuitBreaker.shared.recordSuccess(
+                provider: breakerProvider,
+                sourceID: breakerSourceID
+            )
+        }
     }
 
     func settlementState(for contentID: String?) -> SourceContributorSettlement {
@@ -369,7 +435,7 @@ final class TorBoxSearchSource: ObservableObject {
             // episode with the seconds remaining is the honest summary. This path never consumes the
             // half-open probe: once the cooldown lapses, the ordinary shouldAttempt flow below grants it.
             if let remaining = await ProviderCircuitBreaker.shared.cooldownRemaining(
-                provider: Self.breakerProvider, sourceID: fetchKey
+                provider: Self.breakerProvider, sourceID: Self.breakerSourceID
             ) {
                 guard SourceContributorCompletionOwnership.accepts(
                     completedKey: fetchKey, shownKey: self.shownKey, inFlightKey: self.inFlightKey,
@@ -385,12 +451,12 @@ final class TorBoxSearchSource: ObservableObject {
                 return
             }
             // Ask the SHARED breaker, not instance state: an open circuit here means some earlier caller
-            // (possibly a now-dead view) already saw TorBox back off for this exact content id, and that
-            // memory must survive this view's own lifetime. `shouldAttempt` also grants at most one
+            // (possibly a now-dead view) already saw the account-level TorBox search service back off, and
+            // that memory must survive this view's own lifetime. `shouldAttempt` also grants at most one
             // half-open probe once the cooldown elapses, so this refresh may be the probe owner even while
             // the circuit was open a moment ago.
             guard await ProviderCircuitBreaker.shared.shouldAttempt(
-                provider: Self.breakerProvider, sourceID: fetchKey
+                provider: Self.breakerProvider, sourceID: Self.breakerSourceID
             ) else {
                 guard SourceContributorCompletionOwnership.accepts(
                     completedKey: fetchKey, shownKey: self.shownKey, inFlightKey: self.inFlightKey,
@@ -409,36 +475,33 @@ final class TorBoxSearchSource: ObservableObject {
                 inFlightKey: self.inFlightKey,
                 canceled: Task.isCancelled
             ) else { return }
-            self.inFlightKey = nil
-            self.task = nil
-            if result.rateLimited {
-                // Over the TorBox scraper allowance. A 429 IS a completed HTTP response (the host is
-                // reachable), so this trips the breaker on the FIRST occurrence rather than accumulating a
-                // streak; do NOT cache the empty result, so it re-fetches for real once the cooldown lifts.
-                await ProviderCircuitBreaker.shared.recordFailure(
-                    provider: Self.breakerProvider, sourceID: fetchKey,
-                    phase: .discover, reason: .httpStatus(429)
-                )
-                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(VXProbeRedaction.identityToken(target.titleID)), backing off")
-                self.publishSettlement(contentID: fetchKey, terminal: true)
-                return
-            }
-            if result.transportError {
-                // The request never completed (offline / network failure / a DNS-dead host). Do NOT cache
-                // the empty result. A single blip must self-heal immediately on the next attempt (the
-                // breaker only trips after a PERSISTENT streak for a plain transport failure), so a dead
-                // host is probed occasionally instead of firing failing lookups on every open.
-                await ProviderCircuitBreaker.shared.recordFailure(
-                    provider: Self.breakerProvider, sourceID: fetchKey,
-                    phase: .discover, reason: .other("transport")
-                )
-                VXProbe.log("torbox-search", "transport error for id=\(VXProbeRedaction.identityToken(target.titleID)), not caching")
+            if let failure = result.failure, result.streams.isEmpty {
+                // An unsuccessful request is never a cacheable empty result. A 429 trips on the first
+                // occurrence, while other failures use the shared breaker's ordinary failure policy.
+                await self.recordFailure(failure)
+                guard SourceContributorCompletionOwnership.accepts(
+                    completedKey: fetchKey,
+                    shownKey: self.shownKey,
+                    inFlightKey: self.inFlightKey,
+                    canceled: Task.isCancelled
+                ) else { return }
+                self.inFlightKey = nil
+                self.task = nil
+                VXProbe.log("torbox-search", "\(failure.logLabel) error for id=\(VXProbeRedaction.identityToken(target.titleID)), not caching")
                 self.publishSettlement(contentID: fetchKey, terminal: true)
                 return
             }
             // A completed HTTP response with results (or a legit empty 200): the host is reachable, so
             // reset the breaker before caching.
-            await ProviderCircuitBreaker.shared.recordSuccess(provider: Self.breakerProvider, sourceID: fetchKey)
+            await self.recordSuccess()
+            guard SourceContributorCompletionOwnership.accepts(
+                completedKey: fetchKey,
+                shownKey: self.shownKey,
+                inFlightKey: self.inFlightKey,
+                canceled: Task.isCancelled
+            ) else { return }
+            self.inFlightKey = nil
+            self.task = nil
             VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(VXProbeRedaction.identityToken(target.titleID))")
             self.cache[fetchKey] = result.streams
             self.streams = result.streams
@@ -450,6 +513,8 @@ final class TorBoxSearchSource: ObservableObject {
     func refresh(target resolution: SourceIndexIdentity.TargetResolution) {
         refresh(call: AuxiliarySourcePipeline.callForTesting(resolution))
     }
+
+    static var breakerSourceIDForTesting: String { breakerSourceID }
 
     var ownerStateForTesting: (shownKey: String?, inFlightKey: String?, hasTask: Bool) {
         (shownKey: shownKey, inFlightKey: inFlightKey, hasTask: task != nil)
@@ -476,8 +541,8 @@ final class TorBoxSearchSource: ObservableObject {
 
     /// Re-find sources: drop this title's SESSION-CACHED search result so the next `refresh` re-queries the
     /// scraper instead of re-serving the stale cached rows, then blank the published streams via
-    /// `clearResults`. The 429/transport cooldown lives in the shared `ProviderCircuitBreaker` (keyed by
-    /// provider + contentID) and the key gate lives in `hasKey`; BOTH are left untouched, so a re-find still
+    /// `clearResults`. The 429/request-failure cooldown lives in the shared `ProviderCircuitBreaker` (keyed
+    /// by the TorBox search account) and the key gate lives in `hasKey`; BOTH are left untouched, so a re-find still
     /// honors an active rate-limit cooldown and never re-fires without a configured key. Only the per-title
     /// result cache is invalidated.
     func invalidateCachedResult(for resolution: SourceIndexIdentity.TargetResolution) {

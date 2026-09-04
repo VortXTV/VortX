@@ -247,12 +247,15 @@ enum AddonTombstones {
 
     private static func save(_ state: State) {
         let bounded = capped(state)
-        UserDefaults.standard.set(bounded.removedAt, forKey: removedAtKey)
-        UserDefaults.standard.set(bounded.addedAt, forKey: addedAtKey)
+        TombstonePersistence.setMapIfChanged(bounded.removedAt, forKey: removedAtKey)
+        TombstonePersistence.setMapIfChanged(bounded.addedAt, forKey: addedAtKey)
         // Dual-write the effective removed set back to the pre-b172 legacy key so a downgrade to b171 still
         // reads the current removals (b171 reads this array directly; load() re-folds it at the epoch on the
         // next b172 upgrade).
-        UserDefaults.standard.set(Array(effectiveRemoved(bounded)), forKey: legacyDeletedKey)
+        TombstonePersistence.setArrayIfChanged(
+            TombstonePersistence.canonicalLegacy(effectiveRemoved(bounded)),
+            forKey: legacyDeletedKey
+        )
     }
 
     /// One-shot baseline used on the first b172 run: stamp `addedAt = now` for a set of currently-installed

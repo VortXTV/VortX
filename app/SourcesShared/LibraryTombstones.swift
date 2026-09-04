@@ -1,5 +1,40 @@
 import Foundation
 
+/// Shared write boundary for the two durable tombstone stores. UserDefaults bridges numeric dictionaries
+/// through NSNumber, so ordinary Foundation equality can report a change when the logical timestamps have
+/// not changed. Keep map comparison semantic, while legacy arrays remain ordered because their canonical
+/// sorted representation is part of the persisted compatibility format.
+enum TombstonePersistence {
+    static func canonicalLegacy(_ ids: Set<String>) -> [String] {
+        ids.sorted()
+    }
+
+    @discardableResult
+    static func setMapIfChanged(_ map: [String: Double], forKey key: String, defaults: UserDefaults = .standard) -> Bool {
+        guard numericMap(defaults.object(forKey: key)) != map else { return false }
+        defaults.set(map, forKey: key)
+        return true
+    }
+
+    @discardableResult
+    static func setArrayIfChanged(_ array: [String], forKey key: String, defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.stringArray(forKey: key) != array else { return false }
+        defaults.set(array, forKey: key)
+        return true
+    }
+
+    private static func numericMap(_ value: Any?) -> [String: Double]? {
+        guard let raw = value as? [String: Any] else { return nil }
+        var out: [String: Double] = [:]
+        out.reserveCapacity(raw.count)
+        for (key, value) in raw {
+            guard let number = value as? NSNumber else { return nil }
+            out[key] = number.doubleValue
+        }
+        return out
+    }
+}
+
 /// Durable cross-device REMOVE tombstones for LIBRARY / Continue-Watching titles, the library analogue of
 /// `AddonTombstones` (and of `ProfileStore`'s `deletedProfiles` set). The app OWNS this set (it lives in
 /// `doc.vortx.deletedLibrary`, the app's namespace) so a title the user removed on one device can never be
@@ -223,12 +258,15 @@ enum LibraryTombstones {
 
     private static func save(_ state: State) {
         let bounded = capped(state)
-        UserDefaults.standard.set(bounded.removedAt, forKey: removedAtKey)
-        UserDefaults.standard.set(bounded.addedAt, forKey: addedAtKey)
+        TombstonePersistence.setMapIfChanged(bounded.removedAt, forKey: removedAtKey)
+        TombstonePersistence.setMapIfChanged(bounded.addedAt, forKey: addedAtKey)
         // Dual-write the effective removed set back to the pre-b172 legacy key so a downgrade to b171 still
         // reads the current removals (b171 reads this array directly; load() re-folds it at the epoch on the
         // next b172 upgrade).
-        UserDefaults.standard.set(Array(effectiveRemoved(bounded)), forKey: legacyDeletedKey)
+        TombstonePersistence.setArrayIfChanged(
+            TombstonePersistence.canonicalLegacy(effectiveRemoved(bounded)),
+            forKey: legacyDeletedKey
+        )
     }
 
     private static func loadMap(_ key: String) -> [String: Double] {

@@ -112,7 +112,7 @@ actor ControlledSearch {
 
     func release(_ contentID: String, streams: [CoreStream]) {
         pending.removeValue(forKey: contentID)?.resume(
-            returning: (streams: streams, rateLimited: false, transportError: false)
+            returning: (streams: streams, failure: nil)
         )
     }
 
@@ -152,7 +152,7 @@ actor CacheHitRevisitSearch {
 
     func release(_ id: Int, streams: [CoreStream]) {
         pending.removeValue(forKey: id)?.resume(
-            returning: (streams: streams, rateLimited: false, transportError: false)
+            returning: (streams: streams, failure: nil)
         )
     }
 
@@ -172,7 +172,7 @@ actor CancellationProbe {
         } catch {
             cancelled += 1
         }
-        return (streams: [], rateLimited: false, transportError: false)
+        return (streams: [], failure: nil)
     }
 
     func startedCount() -> Int { started }
@@ -193,6 +193,62 @@ actor OutcomeProbe {
     }
 
     func count() -> Int { requests }
+}
+
+actor OutcomeSequenceProbe {
+    private var results: [TorBoxSearchSource.SearchResult]
+    private var requests = 0
+
+    init(results: [TorBoxSearchSource.SearchResult]) {
+        self.results = results
+    }
+
+    func run() -> TorBoxSearchSource.SearchResult {
+        let index = min(requests, results.count - 1)
+        requests += 1
+        return results[index]
+    }
+
+    func count() -> Int { requests }
+}
+
+actor FirstSuccessGate {
+    private var calls = 0
+    private var firstContinuation: CheckedContinuation<Void, Never>?
+
+    func record() async {
+        calls += 1
+        guard calls == 1 else { return }
+        await withCheckedContinuation { continuation in
+            firstContinuation = continuation
+        }
+    }
+
+    func hasFirstCall() -> Bool { calls >= 1 }
+
+    func releaseFirst() {
+        firstContinuation?.resume()
+        firstContinuation = nil
+    }
+}
+
+actor ResultGate {
+    private var started = false
+    private var continuation: CheckedContinuation<TorBoxSearchSource.SearchResult, Never>?
+
+    func run() async -> TorBoxSearchSource.SearchResult {
+        started = true
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func hasStarted() -> Bool { started }
+
+    func release(_ result: TorBoxSearchSource.SearchResult) {
+        continuation?.resume(returning: result)
+        continuation = nil
+    }
 }
 
 @main
@@ -368,6 +424,58 @@ struct TorBoxIdentityBoundaryTests {
         await revisitProbe.release(freshARequest, streams: [rowA])
         await waitUntil { revisitSource.streams == [rowA] }
 
+        // The breaker call itself awaits. If title A switches to B in that suspension window, A must not
+        // clear B's task ownership or publish A after it resumes.
+        let firstSuccessGate = FirstSuccessGate()
+        let secondFetchGate = ResultGate()
+        let breakerRaceSource = TorBoxSearchSource(
+            fetchStreams: { target, _ in
+                if target.contentID == targetAContent { return (streams: [rowA], failure: nil) }
+                return await secondFetchGate.run()
+            },
+            hasKey: { true },
+            keyProvider: { "test-key" },
+            recordSuccess: { await firstSuccessGate.record() }
+        )
+        breakerRaceSource.refresh(target: targetA)
+        await waitUntil { await firstSuccessGate.hasFirstCall() }
+        breakerRaceSource.refresh(target: targetB)
+        await waitUntil { await secondFetchGate.hasStarted() }
+        await firstSuccessGate.releaseFirst()
+        for _ in 0..<100 { await Task.yield() }
+        let ownerDuringB = breakerRaceSource.ownerStateForTesting
+        expect(ownerDuringB.inFlightKey == targetBContent
+               && ownerDuringB.hasTask
+               && breakerRaceSource.streams.isEmpty,
+               "a stale A completion after breaker await cannot clear or publish over B's live request")
+        await secondFetchGate.release((streams: [rowB], failure: nil))
+        await waitUntil { breakerRaceSource.streams == [rowB] }
+
+        let firstFailureGate = FirstSuccessGate()
+        let failureSecondFetchGate = ResultGate()
+        let failureRaceSource = TorBoxSearchSource(
+            fetchStreams: { target, _ in
+                if target.contentID == targetAContent { return (streams: [], failure: .decode) }
+                return await failureSecondFetchGate.run()
+            },
+            hasKey: { true },
+            keyProvider: { "test-key" },
+            recordFailure: { _ in await firstFailureGate.record() }
+        )
+        failureRaceSource.refresh(target: targetA)
+        await waitUntil { await firstFailureGate.hasFirstCall() }
+        failureRaceSource.refresh(target: targetB)
+        await waitUntil { await failureSecondFetchGate.hasStarted() }
+        await firstFailureGate.releaseFirst()
+        for _ in 0..<100 { await Task.yield() }
+        let failureOwnerDuringB = failureRaceSource.ownerStateForTesting
+        expect(failureOwnerDuringB.inFlightKey == targetBContent
+               && failureOwnerDuringB.hasTask
+               && failureRaceSource.streams.isEmpty,
+               "a stale A failure after breaker await cannot clear or settle B's live request")
+        await failureSecondFetchGate.release((streams: [rowB], failure: nil))
+        await waitUntil { failureRaceSource.streams == [rowB] }
+
         source.refresh(target: mismatch)
         expect(source.streams.isEmpty && source.publishedTarget?.contentID == nil,
                "a later mismatch synchronously clears the previous publication")
@@ -387,9 +495,9 @@ struct TorBoxIdentityBoundaryTests {
                    season: 0, episode: 0) == .absent,
                "nil identity remains absent even with complete zero coordinates")
 
-        // The production two-leg search keeps rows from a completed leg even if its sibling transport fails.
-        // `transportError` is therefore reserved for all-empty attempts, which must not poison the cache.
-        let partialProbe = OutcomeProbe(result: (streams: [rowA], rateLimited: false, transportError: false))
+        // The production two-leg search keeps rows from a completed leg even if its sibling receives a 503.
+        // A failure is therefore surfaced only for all-empty attempts, which must not poison the cache.
+        let partialProbe = OutcomeProbe(result: (streams: [rowA], failure: .httpStatus(503)))
         let partialSource = TorBoxSearchSource(
             fetchStreams: { _, _ in await partialProbe.run() },
             hasKey: { true }, keyProvider: { "test-key" }
@@ -400,9 +508,14 @@ struct TorBoxIdentityBoundaryTests {
         await Task.yield()
         let partialCalls = await partialProbe.count()
         expect(partialCalls == 1 && partialSource.streams == [rowA],
-               "a usable primary-leg result survives sibling transport failure and is cached")
+               "a usable primary-leg result survives sibling HTTP failure and is cached")
+        let partialStatus = await ProviderCircuitBreaker.shared.status(
+            provider: "torBox", sourceID: TorBoxSearchSource.breakerSourceIDForTesting
+        )
+        expect(partialStatus.consecutiveFailures == 0,
+               "a usable primary-leg result survives a sibling 503 and closes the shared breaker")
 
-        let allTransportProbe = OutcomeProbe(result: (streams: [], rateLimited: false, transportError: true))
+        let allTransportProbe = OutcomeProbe(result: (streams: [], failure: .transport))
         let allTransportSource = TorBoxSearchSource(
             fetchStreams: { _, _ in await allTransportProbe.run() },
             hasKey: { true }, keyProvider: { "test-key" }
@@ -419,15 +532,105 @@ struct TorBoxIdentityBoundaryTests {
         expect(allTransportCalls == 2 && allTransportSource.streams.isEmpty,
                "all-primary transport failure is not cached and advances a fresh retry")
 
+        // The converse remains intentional: a completed 2xx-equivalent empty answer has no failure and is
+        // terminal for this title, so revisiting it must use the empty session-cache entry without transport.
+        let emptySuccessProbe = OutcomeSequenceProbe(results: [
+            (streams: [], failure: nil),
+            (streams: [rowA], failure: nil),
+        ])
+        let emptySuccessSource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await emptySuccessProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        emptySuccessSource.refresh(target: targetA)
+        await waitUntil { await emptySuccessProbe.count() == 1 && !emptySuccessSource.ownerStateForTesting.hasTask }
+        emptySuccessSource.refresh(target: targetA)
+        await Task.yield()
+        let emptySuccessCalls = await emptySuccessProbe.count()
+        expect(emptySuccessCalls == 1 && emptySuccessSource.streams.isEmpty,
+               "a legitimate empty 2xx-equivalent TorBox answer is cached without a second transport")
+
+        // Non-2xx and decode failures used to masquerade as cacheable empty successes. Verify that both
+        // now retain the exact breaker reason and that the same title makes a real second request.
+        let breakerScope = TorBoxSearchSource.breakerSourceIDForTesting
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: "torBox", sourceID: breakerScope)
+        let httpRetryProbe = OutcomeSequenceProbe(results: [
+            (streams: [], failure: .httpStatus(503)),
+            (streams: [rowA], failure: nil),
+        ])
+        let httpRetrySource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await httpRetryProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        httpRetrySource.refresh(target: targetA)
+        await waitUntil { await httpRetryProbe.count() == 1 && !httpRetrySource.ownerStateForTesting.hasTask }
+        let httpFailure = await ProviderCircuitBreaker.shared.status(provider: "torBox", sourceID: breakerScope)
+        expect(httpFailure.lastFailure?.reason == .httpStatus(503),
+               "an all-empty HTTP 503 records failure instead of a false TorBox success")
+        httpRetrySource.refresh(target: targetA)
+        await waitUntil { await httpRetryProbe.count() == 2 && httpRetrySource.streams == [rowA] }
+        httpRetrySource.refresh(target: targetA)
+        await Task.yield()
+        let httpRetryCalls = await httpRetryProbe.count()
+        expect(httpRetryCalls == 2,
+               "an HTTP 503 leaves no empty cache entry; only the later 2xx result is cached")
+
+        let decodeTarget = SourceIndexIdentity.publicationTarget(
+            roles(catalog: "tt7654321", defaultVideo: "tt7654321:1:1", currentVideo: "tt7654321:1:1"),
+            season: 1, episode: 1
+        )
+        let decodeRetryProbe = OutcomeSequenceProbe(results: [
+            (streams: [], failure: .decode),
+            (streams: [rowB], failure: nil),
+        ])
+        let decodeRetrySource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await decodeRetryProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        decodeRetrySource.refresh(target: decodeTarget)
+        await waitUntil { await decodeRetryProbe.count() == 1 && !decodeRetrySource.ownerStateForTesting.hasTask }
+        let decodeFailure = await ProviderCircuitBreaker.shared.status(provider: "torBox", sourceID: breakerScope)
+        expect(decodeFailure.lastFailure?.reason == .other("decode"),
+               "an all-empty JSON decode failure records failure instead of a false TorBox success")
+        decodeRetrySource.refresh(target: decodeTarget)
+        await waitUntil { await decodeRetryProbe.count() == 2 && decodeRetrySource.streams == [rowB] }
+        decodeRetrySource.refresh(target: decodeTarget)
+        await Task.yield()
+        let decodeRetryCalls = await decodeRetryProbe.count()
+        expect(decodeRetryCalls == 2,
+               "a decode failure leaves no empty cache entry; only the later decoded result is cached")
+
+        // The search rate limit belongs to the TorBox account, not the title. A 429 on A must prevent B
+        // from spending another account-level search attempt while the common breaker is open.
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: "torBox", sourceID: breakerScope)
+        let rateLimitProbe = OutcomeProbe(result: (streams: [], failure: .httpStatus(429)))
+        let rateLimitedSource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await rateLimitProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        rateLimitedSource.refresh(target: targetA)
+        await waitUntil { await rateLimitProbe.count() == 1 && !rateLimitedSource.ownerStateForTesting.hasTask }
+        let blockedProbe = OutcomeProbe(result: (streams: [rowB], failure: nil))
+        let blockedSource = TorBoxSearchSource(
+            fetchStreams: { _, _ in await blockedProbe.run() },
+            hasKey: { true }, keyProvider: { "test-key" }
+        )
+        blockedSource.refresh(target: targetB)
+        await waitUntil { !blockedSource.ownerStateForTesting.hasTask }
+        let blockedCalls = await blockedProbe.count()
+        expect(blockedCalls == 0,
+               "a TorBox 429 on title A blocks a title B search through the account-wide breaker")
+        await ProviderCircuitBreaker.shared.recordSuccess(provider: "torBox", sourceID: breakerScope)
+
         let sourceURL = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("SourcesShared/TorBoxSearchSource.swift")
         let sourceText = (try? String(contentsOf: sourceURL, encoding: .utf8)) ?? ""
         expect(!sourceText.contains("/v1/api/torrents/search"),
                "the undocumented account-host fallback route is absent")
-        expect(sourceText.contains("guard (200...299).contains(code)")
-               && sourceText.contains("return ([], false, false)"),
-               "non-2xx search responses are unavailable rather than transport-success results")
+        expect(sourceText.contains("guard (200...299).contains(code) else { return ([], .httpStatus(code)) }")
+               && sourceText.contains("return ([], .decode)"),
+               "non-2xx and malformed JSON search responses are explicit failures, never empty successes")
         expect(sourceText.contains("forHTTPHeaderField: \"Authorization\"")
                && !sourceText.contains("URLQueryItem(name: \"apikey\"")
                && !sourceText.contains("URLQueryItem(name: \"token\""),
