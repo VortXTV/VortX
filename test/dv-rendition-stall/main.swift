@@ -577,7 +577,7 @@ struct ConsumerResult {
 /// playlist covers the whole file before AVPlayer's first fetch, and the client starts at the live edge -
 /// a shape the field never produces and one that would let a windowing bug through this gate.
 func startPacedSource(fixture: String, bytesPerSecond: Int) -> (process: Process, url: URL) {
-    let portFile = "/tmp/dd-dvpin/paced-port-\(UUID().uuidString.prefix(8))"
+    let portFile = "\(scratchRoot)/paced-port-\(UUID().uuidString.prefix(8))"
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
     process.arguments = ["python3", "test/player-conformance/range-server.py",
