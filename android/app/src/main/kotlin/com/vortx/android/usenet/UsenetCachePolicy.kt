@@ -8,7 +8,7 @@ internal object UsenetCachePolicy {
     private val active = linkedMapOf<String, Long>()
 
     data class Allocation(val file: File) {
-        fun complete() = synchronized(UsenetCachePolicy) { active.remove(file.absolutePath) }
+        fun complete() = Unit // still leased by the active loopback/player session
         fun abandon() = synchronized(UsenetCachePolicy) { active.remove(file.absolutePath) }
     }
 

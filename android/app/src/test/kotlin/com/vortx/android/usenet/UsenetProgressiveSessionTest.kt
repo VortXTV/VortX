@@ -55,6 +55,18 @@ class UsenetProgressiveSessionTest {
         } finally { session.close(); home.deleteRecursively() }
     }
 
+    @Test fun `non-byte and unsatisfiable ranges are refused with RFC 416 metadata`() {
+        val home = createTempDirectory("usenet-progressive").toFile(); val file = java.io.File(home, "title.mkv")
+        file.writeBytes("abcdef".toByteArray()); val session = UsenetProgressiveSession(file, 6)
+        try {
+            session.appendCommitted(6); session.finish()
+            val wrongUnit = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "widgets=0-1") }
+            assertEquals(416, wrongUnit.responseCode); assertEquals("bytes */6", wrongUnit.getHeaderField("Content-Range"))
+            val beyond = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "bytes=9-") }
+            assertEquals(416, beyond.responseCode); assertEquals("bytes */6", beyond.getHeaderField("Content-Range"))
+        } finally { session.close(); home.deleteRecursively() }
+    }
+
     @Test
     fun `HEAD describes the bounded loopback resource without downloading`() {
         val home = createTempDirectory("usenet-progressive").toFile()

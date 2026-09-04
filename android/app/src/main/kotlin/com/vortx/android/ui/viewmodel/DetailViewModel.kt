@@ -1194,7 +1194,9 @@ class DetailViewModel(
         val resolveLease = playbackResolveFence.begin(request)
         playbackResolveJob = viewModelScope.launch {
             val result = resolveForOwner(source, episode, actionOwner)
-            if (!canPublishPlaybackResolve(resolveLease)) return@launch
+            if (!canPublishPlaybackResolve(resolveLease)) {
+                result.getOrNull()?.playbackLease?.close(); return@launch
+            }
             val nextPlayback = result.fold(
                 onSuccess = { playable ->
                     if (playable.url.isBlank()) {
@@ -1245,6 +1247,7 @@ class DetailViewModel(
             !isActionOwnerCurrent(actionOwner) ||
             !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
         ) {
+            result.getOrNull()?.playbackLease?.close()
             return Result.failure(IllegalStateException(OWNER_CHANGED_MESSAGE))
         }
         return result.mapCatching { resolved ->
@@ -1349,6 +1352,7 @@ class DetailViewModel(
                 !isActionOwnerCurrent(actionOwner) ||
                 !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
             ) {
+                result.getOrNull()?.playbackLease?.close()
                 return@withEpisodeSwitchCancellationRollback Result.failure(
                     IllegalStateException(OWNER_CHANGED_MESSAGE),
                 )
@@ -1556,6 +1560,7 @@ class DetailViewModel(
             // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
             val winner = resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
             if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
+                winner?.ref?.progressiveSession?.close()
                 publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
                 return@launch
             }
@@ -1576,7 +1581,9 @@ class DetailViewModel(
             // 3) Fall back to the single-source resolve of the labeled best (direct / media-server / single
             //    debrid, or the confirmed-cached best the gate insisted on).
             val resolved = resolveForOwner(best, episode, actionOwner)
-            if (!canPublishPlaybackResolve(resolveLease)) return@launch
+            if (!canPublishPlaybackResolve(resolveLease)) {
+                resolved.getOrNull()?.playbackLease?.close(); return@launch
+            }
             publishPlaybackResolve(resolveLease, resolved.fold(
                 onSuccess = { playable ->
                     Playback.Ready(

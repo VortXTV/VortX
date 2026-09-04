@@ -149,7 +149,7 @@ internal object UsenetProgressiveLoopback {
                 val session = request[1].removePrefix("/nzb/").takeIf { it.matches(Regex("[0-9a-f-]{36}")) }?.let(sessions::get) ?: return@runCatching send(client, 404)
                 val total = session.totalBytes()
                 val explicitRange = lines.firstOrNull { it.startsWith("Range:", true) }
-                val range = parseRange(explicitRange, total) ?: return@runCatching send(client, 416)
+                val range = parseRange(explicitRange, total) ?: return@runCatching send(client, 416, total)
                 val (start, end) = range
                 val length = end - start + 1
                 val out = client.getOutputStream()
@@ -162,14 +162,16 @@ internal object UsenetProgressiveLoopback {
         }
     }
 
-    private fun send(client: Socket, code: Int) {
-        client.getOutputStream().write("HTTP/1.1 $code Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+    private fun send(client: Socket, code: Int, total: Long? = null) {
+        val range = total?.let { "Content-Range: bytes */$it\r\n" }.orEmpty()
+        client.getOutputStream().write("HTTP/1.1 $code Error\r\n${range}Content-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
     }
 
     private fun parseRange(rangeLine: String?, total: Long): Pair<Long, Long>? {
-        val raw = rangeLine?.substringAfter('=' )?.trim()
+        val raw = rangeLine?.substringAfter("Range:", "")?.trim()
         if (raw.isNullOrEmpty()) return 0L to (total - 1)
-        val bounds = raw.removePrefix("bytes=").split('-', limit = 2)
+        if (!raw.startsWith("bytes=", ignoreCase = true)) return null
+        val bounds = raw.substringAfter('=').split('-', limit = 2)
         if (bounds.firstOrNull().isNullOrEmpty()) {
             val suffix = bounds.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0 } ?: return null
             return maxOf(0L, total - suffix) to (total - 1)

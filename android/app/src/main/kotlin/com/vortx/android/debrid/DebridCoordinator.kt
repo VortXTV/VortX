@@ -531,6 +531,7 @@ internal class DebridCoordinator(
             val src = candidate.source ?: return true // no source to rank: never refuse
             return StreamRanking.resolutionRank(src) >= bestRank
         }
+        fun discard(ref: DebridPlaybackRef?) { runCatching { ref?.progressiveSession?.close() } }
 
         // A single confirmed-cached candidate is just the existing single resolve (no group overhead). Still
         // honour the gate: a lone winner below a confirmed-cached label is refused so the caller resolves the
@@ -544,7 +545,7 @@ internal class DebridCoordinator(
                 cachedUsenetURLs,
                 owner,
             ) ?: return null
-            return PlayableWinner(ref, racing[0]).takeIf { keys.isCurrent(owner) }
+            return if (keys.isCurrent(owner)) PlayableWinner(ref, racing[0]) else null.also { discard(ref) }
         }
 
         return supervisorScope {
@@ -571,7 +572,7 @@ internal class DebridCoordinator(
                         // EXACTLY ONE emit per leg on EVERY exit path (success, Exception, a bare Error, or
                         // cancellation), so the fixed-count drain below can never block on a leg that died
                         // without reporting. trySend is non-suspending and safe during cancellation.
-                        results.trySend(result)
+                        if (results.trySend(result).isFailure) discard(result?.ref)
                     }
                 }
             }
@@ -588,11 +589,13 @@ internal class DebridCoordinator(
                     winner = result
                     break
                 }
+                discard(result?.ref)
             }
             // Cancel the remaining in-flight legs (idempotent on already-completed ones). The supervisorScope
             // then awaits their prompt, cancellation-honoring exit before returning.
             legs.forEach { it.cancel() }
-            winner.takeIf { keys.isCurrent(owner) }
+            while (!results.isEmpty) discard(results.tryReceive().getOrNull()?.ref)
+            if (!keys.isCurrent(owner)) { discard(winner?.ref); null } else winner
         }
     }
 

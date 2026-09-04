@@ -280,6 +280,9 @@ internal class UsenetLocalResolver(
         "webm" -> "video/webm"
         "ts", "m2ts" -> "video/mp2t"
         "avi" -> "video/x-msvideo"
+        "flv" -> "video/x-flv"
+        "mpg", "mpeg" -> "video/mpeg"
+        "m4a" -> "audio/mp4"
         else -> "video/x-matroska"
     }
 
