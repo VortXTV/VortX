@@ -126,6 +126,7 @@ object SettingsBackup {
     fun isSyncable(key: String): Boolean =
         isAppPref(key) &&
             !DEVICE_LOCAL_KEYS.contains(key) &&
+            key !in com.vortx.android.profile.ProfileDiscoveryPreferencesStore.activeProjectionKeys &&
             DEVICE_LOCAL_KEY_PREFIXES.none { key.startsWith(it) } &&
             SECRET_KEY_PREFIXES.none { key.startsWith(it) }
 
@@ -405,13 +406,6 @@ object SettingsBackup {
         "vortx.detail.spoilerSafe" to SettingType.BOOL,
         "vortx.spoilerBlur" to SettingType.BOOL,
         "vortx.collections.refreshCadence" to SettingType.STRING,
-        "vortx.discover.regionPreference" to SettingType.STRING,
-        "vortx.discover.hiddenCategories" to SettingType.STRING_SET,
-        // Tabs
-        "vortx.tabs.hide.discover" to SettingType.BOOL,
-        "vortx.tabs.hide.live" to SettingType.BOOL,
-        "vortx.tabs.hide.library" to SettingType.BOOL,
-        "vortx.tabs.hide.search" to SettingType.BOOL,
         // Sync mirror flags + language
         "stremiox.sync.mirror.addons" to SettingType.BOOL,
         "stremiox.sync.mirror.library" to SettingType.BOOL,

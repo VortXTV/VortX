@@ -39,6 +39,7 @@ import java.util.Locale
 internal const val SHOW_COLLECTIONS_HUB_KEY = "vortx.home.showCollectionsHub"
 internal const val COLLECTIONS_REFRESH_CADENCE_KEY = "vortx.collections.refreshCadence"
 internal const val COLLECTIONS_SELECTED_PROVIDERS_KEY = "vortx.collections.selectedProviders"
+internal const val COLLECTIONS_PROVIDER_ORDER_KEY = "vortx.collections.providerOrder"
 // Discover region override (Apple `vortx.discover.regionPreference`, uppercased): forces the hub's TMDB
 // watch_region so an out-of-region user can browse another market. Blank/absent => the device locale region.
 internal const val DISCOVER_REGION_PREFERENCE_KEY = "vortx.discover.regionPreference"
@@ -238,6 +239,8 @@ internal interface CollectionsHubPreferences {
      * doubles need not implement it; the services picker writes it and the change listener reloads the hub.
      */
     fun saveSelectedProviders(value: String) {}
+    /** Preferred order for automatic regional results only. Explicit selections retain their own order. */
+    fun providerOrder(): String = ""
     /** The uppercased 2-letter Discover region override, or null to use the device locale region. */
     fun regionOverride(): String? = null
 
@@ -273,7 +276,10 @@ private class AndroidCollectionsHubPreferences(context: Context) : CollectionsHu
 
     override fun saveSelectedProviders(value: String) {
         prefs.edit().putString(COLLECTIONS_SELECTED_PROVIDERS_KEY, value).apply()
+        ProfileStore.sharedOrNull()?.captureDiscovery()
     }
+
+    override fun providerOrder(): String = prefs.getString(COLLECTIONS_PROVIDER_ORDER_KEY, "").orEmpty()
 
     override fun regionOverride(): String? =
         prefs.getString(DISCOVER_REGION_PREFERENCE_KEY, null)
@@ -373,6 +379,7 @@ internal class CollectionsHubModel internal constructor(
         if (key == SHOW_COLLECTIONS_HUB_KEY ||
             key == COLLECTIONS_REFRESH_CADENCE_KEY ||
             key == COLLECTIONS_SELECTED_PROVIDERS_KEY ||
+            key == COLLECTIONS_PROVIDER_ORDER_KEY ||
             key == DISCOVER_REGION_PREFERENCE_KEY ||
             key == DISCOVER_HIDDEN_CATEGORIES_KEY
         ) {
@@ -690,7 +697,13 @@ internal class CollectionsHubModel internal constructor(
                     )
                 }
             },
-            streaming = if (HubCategoryKey.SECTION_STREAMING in hidden) emptyList() else providers,
+            streaming = if (HubCategoryKey.SECTION_STREAMING in hidden) {
+                emptyList()
+            } else if (selectedProviderIds().isEmpty()) {
+                CollectionsHubProviderPolicy.orderAutomaticProviders(providers, preferences.providerOrder())
+            } else {
+                providers
+            },
             genres = if (HubCategoryKey.SECTION_GENRES in hidden) {
                 emptyList()
             } else {
@@ -947,6 +960,21 @@ internal object CollectionsHubProviderPolicy {
             val id = token.trim().toIntOrNull()?.takeIf { it > 0 } ?: return@mapNotNull null
             canonicalId(id).takeIf(seen::add)
         }.take(limit.coerceAtLeast(0))
+    }
+
+    /** Reorder only automatic regional results. Explicit service selection is already its own user order. */
+    fun orderAutomaticProviders(
+        providers: List<CollectionsHubTile>,
+        rawOrder: String,
+    ): List<CollectionsHubTile> {
+        val preferredRank = selectedProviderIds(rawOrder).withIndex().associate { it.value to it.index }
+        if (preferredRank.isEmpty()) return providers
+        return providers.withIndex().sortedWith(
+            compareBy<IndexedValue<CollectionsHubTile>> { indexed ->
+                val id = (indexed.value.target as? CollectionsHubTarget.Service)?.providerId
+                preferredRank[id] ?: Int.MAX_VALUE
+            }.thenBy { it.index },
+        ).map { it.value }
     }
 
     fun serviceRegions(base: String, carried: List<String>, maxExtra: Int = 3): List<String> = buildList {

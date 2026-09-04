@@ -47,6 +47,7 @@ class CatalogPreferencesStore internal constructor(
         if (_filters.value == filters) return
         _filters.value = filters
         persistence.write(if (filters.isActive) encode(filters) else null)
+        ProfileStore.sharedOrNull()?.captureDiscovery()
     }
 
     fun clearFilters() = setFilters(AdvancedDiscoverFilters.EMPTY)
@@ -65,7 +66,10 @@ class CatalogPreferencesStore internal constructor(
                 SharedPreferencesCatalogPersistence(
                     context.applicationContext.getSharedPreferences(ProfileStore.PREFS_FILE, Context.MODE_PRIVATE),
                 ),
-            ).also { instance = it }
+            ).also { store ->
+                ProfileStore.sharedOrNull()?.addSwitchListener(store::reload)
+                instance = store
+            }
         }
 
         internal fun inMemory(initial: AdvancedDiscoverFilters = AdvancedDiscoverFilters.EMPTY): CatalogPreferencesStore =

@@ -108,6 +108,7 @@ class ProfileStore private constructor(context: Context) {
 
     private val switchListeners = mutableListOf<() -> Unit>()
     private val homeTransitionListeners = mutableListOf<() -> Unit>()
+    private var applyingDiscoveryProjection = false
 
     // ---- Derived reads ----
 
@@ -238,6 +239,12 @@ class ProfileStore private constructor(context: Context) {
             transitionHome = ::notifyHomeTransitionListeners,
             applyPlayback = {
                 applyPlayback(profile, resetUnset = resetUnset, rebuildBoard = false)
+                applyingDiscoveryProjection = true
+                try {
+                    ProfileDiscoveryPreferencesStore.apply(profile.discovery, resetUnset, prefs)
+                } finally {
+                    applyingDiscoveryProjection = false
+                }
             },
             activateOverlay = { overlay.activate(profile.id, profile.usesEngineHistory) },
             reloadDependants = ::notifySwitchListeners,
@@ -272,6 +279,9 @@ class ProfileStore private constructor(context: Context) {
                 profiles = profiles.map { if (it.playback == null) it.copy(playback = seed) else it }
                 persist(touch = false)
             }
+            // Pre-feature data has one flat Discover projection. Capture it only for the selected viewer;
+            // inactive legacy profiles remain clean when first selected.
+            captureDiscoveryLocked()
             overlay.activate(active?.id, activeUsesEngineHistory)
             publishActiveProfile()
         }
@@ -296,7 +306,10 @@ class ProfileStore private constructor(context: Context) {
         // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile, so a
         // viewer's Settings filter edits (which bind straight to the flat keys) are not overwritten by the
         // resetUnset apply below. The equality guard keeps this a no-op when the roster already matches.
-        if (captureOutgoingPlayback) capturePlaybackLocked()
+        if (captureOutgoingPlayback) {
+            capturePlaybackLocked()
+            captureDiscoveryLocked()
+        }
         activeID = profile.id
         pickedThisLaunch = true
         persist(touch = false)   // selection is per-device, not a roster edit
@@ -536,12 +549,33 @@ class ProfileStore private constructor(context: Context) {
         capturePlaybackLocked()
     }
 
+    /** Called by active Discover/catalog setting writers after their flat-key mutation commits. */
+    fun captureDiscovery() = ContinueWatchingOwnerGate.serialized {
+        if (shouldCaptureDiscovery(applyingDiscoveryProjection)) captureDiscoveryLocked()
+    }
+
     private fun capturePlaybackLocked() {
         val profile = active ?: return
         val now = currentPlaybackPrefs(profile.playback)
         if (samePlayback(profile.playback, now)) return
         val idx = profiles.indexOfFirst { it.id == profile.id }
         if (idx >= 0) updateLocked(profile.copy(playback = now), idx, reactivateOverlay = false)
+    }
+
+    /** Capture live catalog/discovery keys before a profile switch advances [activeID]. */
+    private fun captureDiscoveryLocked() {
+        val profile = active ?: return
+        val now = ProfileDiscoveryPreferencesStore.capture(prefs)
+        val idx = profiles.indexOfFirst { it.id == profile.id }
+        if (idx < 0) return
+        // Do not call updateLocked here. Its active-profile path reapplies playback and can overwrite
+        // live playback keys while a user only changed a Discover preference.
+        applyDiscoveryCaptureTransition(
+            profile = profile,
+            snapshot = now,
+            replace = { updated -> profiles = profiles.toMutableList().also { it[idx] = updated } },
+            persistAndPush = { persist() },
+        )
     }
 
     /**
@@ -1012,3 +1046,23 @@ internal fun applyRosterPullMergeTransition(
     adoptWatermark(transition.effectiveModified)
     if (transition.pushRequired) schedulePush()
 }
+
+/** Pure discovery-only roster mutation used by capture and executable JVM tests. */
+internal fun UserProfile.withDiscoverySnapshot(snapshot: ProfileDiscoveryPreferences): UserProfile? =
+    if (discovery == snapshot) null else copy(discovery = snapshot)
+
+/** Persist a changed discovery capture exactly once, without invoking any playback projection path. */
+internal fun applyDiscoveryCaptureTransition(
+    profile: UserProfile,
+    snapshot: ProfileDiscoveryPreferences,
+    replace: (UserProfile) -> Unit,
+    persistAndPush: () -> Unit,
+): Boolean {
+    val updated = profile.withDiscoverySnapshot(snapshot) ?: return false
+    replace(updated)
+    persistAndPush()
+    return true
+}
+
+/** Incoming projection writes are not user edits and therefore must not create a roster echo. */
+internal fun shouldCaptureDiscovery(applyingProjection: Boolean): Boolean = !applyingProjection

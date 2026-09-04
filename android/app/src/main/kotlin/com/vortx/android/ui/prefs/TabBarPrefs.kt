@@ -36,6 +36,7 @@ class TabBarPrefs(context: Context) {
     private fun setHidden(key: String, hidden: Boolean) {
         prefs.edit().putBoolean(key, hidden).apply()
         _state.value = readState()
+        ProfileStore.sharedOrNull()?.captureDiscovery()
     }
 
     private fun readState() = State(

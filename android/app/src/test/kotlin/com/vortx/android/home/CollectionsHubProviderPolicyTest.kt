@@ -42,6 +42,23 @@ class CollectionsHubProviderPolicyTest {
     }
 
     @Test
+    fun `automatic provider order reorders known services without filtering regional results`() {
+        val providers = listOf(232, 9, 2336).map { id ->
+            CollectionsHubTile(
+                id = "service:$id",
+                title = CollectionsHubLabel.Literal("$id"),
+                target = CollectionsHubTarget.Service(id, "$id"),
+            )
+        }
+
+        assertEquals(
+            listOf(2336, 9, 232),
+            CollectionsHubProviderPolicy.orderAutomaticProviders(providers, "970,119")
+                .map { (it.target as CollectionsHubTarget.Service).providerId },
+        )
+    }
+
+    @Test
     fun `service regions keep viewer first then bounded carried markets`() {
         assertEquals(
             listOf("GB", "IN", "US", "CA"),
@@ -72,6 +89,7 @@ class CollectionsHubProviderPolicyTest {
         assertEquals("vortx.home.showCollectionsHub", SHOW_COLLECTIONS_HUB_KEY)
         assertEquals("vortx.collections.refreshCadence", COLLECTIONS_REFRESH_CADENCE_KEY)
         assertEquals("vortx.collections.selectedProviders", COLLECTIONS_SELECTED_PROVIDERS_KEY)
+        assertEquals("vortx.collections.providerOrder", COLLECTIONS_PROVIDER_ORDER_KEY)
         assertTrue(COLLECTIONS_HUB_ENABLED_DEFAULT)
         assertEquals("daily", COLLECTIONS_REFRESH_CADENCE_DEFAULT)
         assertEquals("", COLLECTIONS_SELECTED_PROVIDERS_DEFAULT)

@@ -53,6 +53,8 @@ data class UserProfile(
      * null = never customized (pre-feature roster); seeded from the flat values on first load.
      */
     val playback: PlaybackPrefs? = null,
+    /** Profile-owned catalog, Discover, services and tab-visibility choices. */
+    val discovery: ProfileDiscoveryPreferences? = null,
     /**
      * Add-on transport URLs this profile has turned OFF. A per-profile, local overlay: the add-on
      * stays installed on the account, it is just hidden from THIS profile. null/empty = every
@@ -151,6 +153,7 @@ data class UserProfile(
             put("isOwner", p.isOwner)
             put("familyEdit", p.familyEdit)
             p.playback?.let { put("playback", PlaybackPrefs.encode(it)) }   // encodeIfPresent
+            p.discovery?.let { put("discovery", encodeDiscovery(it)) }
             p.disabledAddons?.let { put("disabledAddons", JSONArray(it)) }  // encodeIfPresent
             put("isKids", p.isKids)
         }
@@ -169,8 +172,43 @@ data class UserProfile(
             isOwner = o.optBoolean("isOwner", false),
             familyEdit = o.optBoolean("familyEdit", false),
             playback = o.optJSONObject("playback")?.let { PlaybackPrefs.decode(it) },
+            discovery = o.optJSONObject("discovery")?.let(::decodeDiscovery),
             disabledAddons = o.optJSONArray("disabledAddons")?.toStringList(),
             isKids = o.optBoolean("isKids", false),
+        )
+
+        private fun encodeDiscovery(p: ProfileDiscoveryPreferences): JSONObject = JSONObject().apply {
+            p.hiddenCatalogs?.let { put("hiddenCatalogs", JSONArray(it)) }
+            p.catalogOrder?.let { put("catalogOrder", JSONArray(it)) }
+            p.hiddenHubCategories?.let { put("hiddenHubCategories", JSONArray(it)) }
+            p.regionOverrideCaptured?.let { put("regionOverrideCaptured", it) }
+            p.regionOverride?.let { put("regionOverride", it) }
+            p.filtersCaptured?.let { put("filtersCaptured", it) }
+            p.filtersData?.let { put("filtersData", it) }
+            p.selectedProviders?.let { put("selectedProviders", JSONArray(it)) }
+            p.providerOrder?.let { put("providerOrder", JSONArray(it)) }
+            p.tabVisibilityCaptured?.let { put("tabVisibilityCaptured", it) }
+            p.hideLiveTab?.let { put("hideLiveTab", it) }
+            p.hideDiscoverTab?.let { put("hideDiscoverTab", it) }
+            p.hideLibraryTab?.let { put("hideLibraryTab", it) }
+            p.hideSearchTab?.let { put("hideSearchTab", it) }
+        }
+
+        private fun decodeDiscovery(o: JSONObject): ProfileDiscoveryPreferences = ProfileDiscoveryPreferences(
+            hiddenCatalogs = o.optJSONArray("hiddenCatalogs")?.toStringList(),
+            catalogOrder = o.optJSONArray("catalogOrder")?.toStringList(),
+            hiddenHubCategories = o.optJSONArray("hiddenHubCategories")?.toStringList(),
+            regionOverrideCaptured = o.optBooleanOrNull("regionOverrideCaptured"),
+            regionOverride = o.optStringOrNull("regionOverride"),
+            filtersCaptured = o.optBooleanOrNull("filtersCaptured"),
+            filtersData = o.optStringOrNull("filtersData"),
+            selectedProviders = o.optJSONArray("selectedProviders")?.toIntList(),
+            providerOrder = o.optJSONArray("providerOrder")?.toIntList(),
+            tabVisibilityCaptured = o.optBooleanOrNull("tabVisibilityCaptured"),
+            hideLiveTab = o.optBooleanOrNull("hideLiveTab"),
+            hideDiscoverTab = o.optBooleanOrNull("hideDiscoverTab"),
+            hideLibraryTab = o.optBooleanOrNull("hideLibraryTab"),
+            hideSearchTab = o.optBooleanOrNull("hideSearchTab"),
         )
     }
 }
@@ -293,3 +331,12 @@ internal fun JSONObject.optDoubleOrNull(key: String): Double? =
 
 internal fun JSONArray.toStringList(): List<String> =
     (0 until length()).map { getString(it) }
+
+internal fun JSONArray.toIntList(): List<Int> =
+    (0 until length()).mapNotNull { index ->
+        when (val value = opt(index)) {
+            is Number -> value.toInt()
+            is String -> value.toIntOrNull()
+            else -> null
+        }
+    }

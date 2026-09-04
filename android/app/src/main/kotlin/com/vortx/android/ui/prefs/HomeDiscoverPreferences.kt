@@ -3,6 +3,7 @@ package com.vortx.android.ui.prefs
 import android.content.Context
 import com.vortx.android.config.RemoteConfig
 import com.vortx.android.config.RemoteConfigDefaults
+import com.vortx.android.profile.ProfileStore
 import java.util.Locale
 
 /**
@@ -87,6 +88,7 @@ class HomeDiscoverPreferences(context: Context) {
         set(value) {
             val normalized = value.trim().uppercase(Locale.ROOT).filter(Char::isLetter).take(2)
             prefs.edit().putString(KEY_REGION_PREFERENCE, normalized).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery()
         }
 
     /**
@@ -97,7 +99,10 @@ class HomeDiscoverPreferences(context: Context) {
      */
     var hiddenCategories: Set<String>
         get() = prefs.getStringSet(KEY_HIDDEN_CATEGORIES, emptySet()).orEmpty()
-        set(value) { prefs.edit().putStringSet(KEY_HIDDEN_CATEGORIES, value.toSet()).apply() }
+        set(value) {
+            prefs.edit().putStringSet(KEY_HIDDEN_CATEGORIES, value.toSet()).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery()
+        }
 
     companion object {
         // MUST equal com.vortx.android.profile.ProfileStore.PREFS_FILE so CollectionsHubModel sees writes.
