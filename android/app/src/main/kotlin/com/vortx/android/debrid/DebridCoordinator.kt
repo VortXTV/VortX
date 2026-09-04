@@ -577,6 +577,7 @@ internal class DebridCoordinator(
                 }
             }
 
+            try {
             // First leg to produce a real ref that PASSES the label-authoritative gate wins; a leg that
             // fails/fast-fails sends null, and a leg that resolves but is a lower resolution than a
             // confirmed-cached label is skipped (never a silent lower-quality substitute). We keep draining
@@ -591,13 +592,14 @@ internal class DebridCoordinator(
                 }
                 discard(result?.ref)
             }
-            // Cancel the remaining in-flight legs (idempotent on already-completed ones). The supervisorScope
-            // then awaits their prompt, cancellation-honoring exit before returning.
-            // Close first: a late finally cannot enqueue an unobserved progressive ref after the one-time drain.
-            results.close()
-            while (!results.isEmpty) discard(results.tryReceive().getOrNull()?.ref)
-            legs.forEach { it.cancel() }
             if (!keys.isCurrent(owner)) { discard(winner?.ref); null } else winner
+            } finally {
+                // This also runs when the caller cancels while suspended in receive(). Close first so a
+                // child finally cannot enqueue a detached ref, then cancel and drain every already-buffered ref.
+                results.close()
+                legs.forEach { it.cancel() }
+                while (!results.isEmpty) discard(results.tryReceive().getOrNull()?.ref)
+            }
         }
     }
 
