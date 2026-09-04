@@ -2,10 +2,7 @@
 //
 // Run from the repository root:
 //
-//   xcrun swiftc -warnings-as-errors \
-//     -o /tmp/profile-invariant-contract \
-//     app/Tests/ProfileInvariantContractTests.swift &&
-//   /tmp/profile-invariant-contract
+//   xcrun swift app/Tests/ProfileInvariantContractTests.swift
 //
 // Profile mutations have multiple UI entry points, so the shared ProfileStore boundary must reject
 // deletion of the stored owner record. Playback progress similarly crosses both Apple player views,
@@ -97,17 +94,30 @@ private func overlayProgressViolations(in source: String) -> [String] {
     }
 
     var found: [String] = []
-    guard let overlayGate = body.range(of: "if !ProfileStore.shared.activeUsesEngineHistory"),
+    guard let capturedTarget = body.range(of: "let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)"),
+          let contextFence = body.range(of: "guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }"),
+          let overlayGate = body.range(of: "if let profileID = target.overlayProfileID"),
           let overlayWrite = body.range(of: "ProfileStore.shared.recordProgress"),
           let accountGate = body.range(of: "guard ProfileSync.alsoSyncToStremio") else {
         return ["overlay progress is not diverted at the shared account boundary"]
     }
-    if overlayGate.lowerBound >= overlayWrite.lowerBound || overlayWrite.lowerBound >= accountGate.lowerBound {
-        found.append("overlay routing does not precede account persistence")
+    if !(capturedTarget.lowerBound < contextFence.lowerBound &&
+         contextFence.lowerBound < overlayGate.lowerBound &&
+         overlayGate.lowerBound < overlayWrite.lowerBound &&
+         overlayWrite.lowerBound < accountGate.lowerBound) {
+        found.append("captured overlay routing does not precede account persistence")
     }
-    let betweenOverlayAndAccount = body[overlayWrite.upperBound..<accountGate.lowerBound]
-    if !betweenOverlayAndAccount.contains("return") {
-        found.append("overlay progress can fall through to account persistence")
+    if !body.contains("durationSeconds: durationSeconds, profileID: profileID)\n            return") {
+        found.append("overlay progress does not unconditionally return after its captured-profile write")
+    }
+    if !body.contains("durationSeconds: durationSeconds, profileID: profileID)") {
+        found.append("overlay progress is not written to the captured overlay profile")
+    }
+    if !body.contains("guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }\n        await datastorePut") {
+        found.append("account persistence is not re-fenced after asynchronous preparation")
+    }
+    if body.contains("if !ProfileStore.shared.activeUsesEngineHistory") {
+        found.append("live-profile routing replaced captured playback ownership")
     }
     return found
 }
@@ -182,6 +192,45 @@ func saveProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSecon
 check(
     !overlayProgressViolations(in: accountFallthroughFixture).isEmpty,
     "gate rejects account progress without an overlay diversion"
+)
+
+let capturedOverlayFallthroughFixture = """
+func saveProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double,
+                  target: PlaybackMutationTarget? = nil) async {
+    let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)
+    guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
+    if let profileID = target.overlayProfileID {
+        ProfileStore.shared.recordProgress(meta: meta, positionSeconds: positionSeconds,
+                                           durationSeconds: durationSeconds, profileID: profileID)
+    }
+    guard ProfileSync.alsoSyncToStremio else { return }
+    guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
+    await datastorePut(authKey: key, change: item)
+}
+"""
+check(
+    !overlayProgressViolations(in: capturedOverlayFallthroughFixture).isEmpty,
+    "gate rejects a captured overlay write that falls through to account persistence"
+)
+
+let conditionalOverlayReturnFixture = """
+func saveProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double,
+                  target: PlaybackMutationTarget? = nil) async {
+    let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)
+    guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
+    if let profileID = target.overlayProfileID {
+        ProfileStore.shared.recordProgress(meta: meta, positionSeconds: positionSeconds,
+                                           durationSeconds: durationSeconds, profileID: profileID)
+        if positionSeconds < 0 { return }
+    }
+    guard ProfileSync.alsoSyncToStremio else { return }
+    guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
+    await datastorePut(authKey: key, change: item)
+}
+"""
+check(
+    !overlayProgressViolations(in: conditionalOverlayReturnFixture).isEmpty,
+    "gate rejects a conditional overlay return before account persistence"
 )
 
 if failures == 0 {

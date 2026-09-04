@@ -9,7 +9,7 @@
 // compiled with the system toolchain, with the REAL source compiled in and only the app type the file extends
 // (MirrorSettings) stubbed so it links standalone.
 //
-//     xcrun swiftc -o /tmp/cwmirrortest \
+//     xcrun swiftc -parse-as-library -o /tmp/cwmirrortest \
 //         app/SourcesShared/ContinueWatchingMirror.swift \
 //         app/Tests/ContinueWatchingMirrorTests.swift && /tmp/cwmirrortest
 //
@@ -87,20 +87,49 @@ func sourceSection(_ source: String, from start: String, until end: String) -> S
     return String(source[startRange.lowerBound..<endRange.lowerBound])
 }
 
-func hasOrderedSyncDownContinueWatchingPublication(_ syncDown: String) -> Bool {
-    guard let refresh = syncDown.range(of: "refreshOwnerResumeCache(from: doc)"),
-          let suppressionEnd = syncDown.range(of: "}   // end withRemoteApplySuppressed"),
-          refresh.lowerBound < suppressionEnd.lowerBound else { return false }
-    let executableTail = syncDown[suppressionEnd.upperBound...]
-        .components(separatedBy: .newlines)
-        .filter {
-            let trimmed = $0.trimmingCharacters(in: .whitespaces)
-            return !trimmed.isEmpty && !trimmed.hasPrefix("//")
+func closingBrace(in source: String, after openingBrace: String.Index) -> String.Index? {
+    var depth = 0
+    var cursor = openingBrace
+    while cursor < source.endIndex {
+        switch source[cursor] {
+        case "{": depth += 1
+        case "}":
+            depth -= 1
+            if depth == 0 { return cursor }
+        default: break
         }
-    return executableTail.prefix(2) == [
-        "        CoreBridge.shared.rebuildContinueWatching()",
-        "        return restored",
-    ]
+        cursor = source.index(after: cursor)
+    }
+    return nil
+}
+
+func isInsideRemoteApplySuppression(_ source: String, at position: String.Index) -> Bool {
+    var searchStart = source.startIndex
+    while let range = source.range(of: "withRemoteApplySuppressed", range: searchStart..<source.endIndex) {
+        guard let openingBrace = source[range.upperBound...].firstIndex(of: "{"),
+              let closing = closingBrace(in: source, after: openingBrace) else { return true }
+        if openingBrace < position && position < closing { return true }
+        searchStart = range.upperBound
+    }
+    return false
+}
+
+func hasOrderedSyncDownContinueWatchingPublication(_ syncDown: String) -> Bool {
+    guard syncDown.contains("func syncDown(force: Bool = false, credentialCapture suppliedCapture:"),
+          let refresh = syncDown.range(of: "refreshOwnerResumeCache(from: doc)"),
+          let suppressionEnd = syncDown.range(of: "}   // end withRemoteApplySuppressed"),
+          let rebuild = syncDown.range(of: "        CoreBridge.shared.rebuildContinueWatching()"),
+          let returned = syncDown.range(of: "        return restored", range: rebuild.upperBound..<syncDown.endIndex),
+          refresh.lowerBound < suppressionEnd.lowerBound else { return false }
+    let precedingLines = syncDown[..<rebuild.lowerBound]
+        .components(separatedBy: .newlines)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty && !$0.hasPrefix("//") }
+    guard let preceding = precedingLines.last else { return false }
+    return suppressionEnd.upperBound < rebuild.lowerBound &&
+        rebuild.upperBound < returned.lowerBound &&
+        !preceding.hasSuffix("{") &&
+        !isInsideRemoteApplySuppression(syncDown, at: rebuild.lowerBound)
 }
 
 // MARK: - 1. The gate: what the toggle actually controls, and what the DEFAULT preserves
@@ -291,7 +320,7 @@ func testSyncDownPublishesOwnerResumeCache() {
     let manager = sharedSource("VortXSyncManager.swift")
     let syncDown = sourceSection(
         manager,
-        from: "func syncDown(force: Bool = false) async -> Bool {",
+        from: "func syncDown(force: Bool = false, credentialCapture suppliedCapture:",
         until: "// MARK: - Account owns everything"
     )
     expect(
@@ -315,6 +344,36 @@ func testSyncDownPublishesOwnerResumeCache() {
     expect(
         !hasOrderedSyncDownContinueWatchingPublication(conditionalRebuild),
         "gating the post-sync rebuild on restored fails the unconditional publication contract"
+    )
+
+    let multilineConditionalRebuild = syncDown.replacingOccurrences(
+        of: "        CoreBridge.shared.rebuildContinueWatching()",
+        with: "        if restored {\n            CoreBridge.shared.rebuildContinueWatching()\n        }"
+    )
+    expect(
+        !hasOrderedSyncDownContinueWatchingPublication(multilineConditionalRebuild),
+        "a multiline restored gate fails the unconditional publication contract"
+    )
+
+    let rebuildBeforeSuppressionExit = syncDown.replacingOccurrences(
+        of: "        }   // end withRemoteApplySuppressed\n        guard isCurrent(capture), pendingDebridServices.isEmpty else { return false }",
+        with: "        CoreBridge.shared.rebuildContinueWatching()\n        }   // end withRemoteApplySuppressed\n        guard isCurrent(capture), pendingDebridServices.isEmpty else { return false }"
+    ).replacingOccurrences(
+        of: "        CoreBridge.shared.rebuildContinueWatching()\n        return restored",
+        with: "        return restored"
+    )
+    expect(
+        !hasOrderedSyncDownContinueWatchingPublication(rebuildBeforeSuppressionExit),
+        "moving the rebuild inside remote-apply suppression fails the publication contract"
+    )
+
+    let rebuildInsideLaterSuppression = syncDown.replacingOccurrences(
+        of: "        CoreBridge.shared.rebuildContinueWatching()\n        return restored",
+        with: "        withRemoteApplySuppressed {\n            CoreBridge.shared.rebuildContinueWatching()\n        }\n        return restored"
+    )
+    expect(
+        !hasOrderedSyncDownContinueWatchingPublication(rebuildInsideLaterSuppression),
+        "moving the rebuild into a later suppression block fails the publication contract"
     )
 }
 
