@@ -77,8 +77,10 @@ private struct TVDetailEpisodeListFocusContractTests {
                "first-row directional routing is decided by the production policy")
         expect(detailView.contains("focusedEpisode = episodes[targetIndex].id"),
                "first-row Down targets the second row through its stable CoreVideo id")
-        expect(detailView.contains("onEpisodeMove: { direction in"),
-               "series detail supplies the optional hero-focus bridge")
+        expect(detailView.contains("onEpisodeMove: {\n                                                 focusDetailRegion(.top, using: proxy)\n                                             }"),
+               "series detail maps the first-episode hero escape directly to its visible top focus anchor")
+        expect(!detailView.contains("onEpisodeMove: { direction in\n                                                 handleDetailMove(direction, from: .lower, using: proxy)\n                                             }"),
+               "adversarial regression: the hero escape cannot be reclassified as lower content and land on Library")
         expect(!detailView.contains(".id(\"detailContent\")\n                            .onMoveCommand"),
                "the episode panel no longer intercepts every Up command at its parent")
 

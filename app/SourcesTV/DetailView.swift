@@ -919,8 +919,8 @@ struct DetailView: View {
                                              orderedEpisodes: ordered,
                                              watched: watched,
                                              initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season,
-                                             onEpisodeMove: { direction in
-                                                 handleDetailMove(direction, from: .lower, using: proxy)
+                                             onEpisodeMove: {
+                                                 focusDetailRegion(.top, using: proxy)
                                              })
                             .id("detailContent")
                         castSection
@@ -1700,7 +1700,7 @@ struct CoreSeasonedEpisodes: View {
     var initialSeason: Int?
     /// Optional bridge to the mounting detail page's hero focus graph. It is invoked only for the first
     /// episode row's Up boundary; all deeper episode rows keep native tvOS list navigation.
-    var onEpisodeMove: ((MoveCommandDirection) -> Void)?
+    var onEpisodeMove: (() -> Void)?
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // observed so a Settings toggle redraws; effective value via SpoilerBlurSetting (user wins over the RemoteConfig fleet default)
     // Spoiler-safe mode (SourcePreferences.spoilerSafeKey): veil an UNWATCHED episode's art + synopsis until it
     // is revealed. On tvOS the reveal is FOCUS: the focused row (focusedEpisode == v.id) un-blurs + shows its
@@ -1960,7 +1960,7 @@ struct CoreSeasonedEpisodes: View {
                 episodeCount: episodes.count
             ) {
             case .hero:
-                onEpisodeMove(direction)
+                onEpisodeMove()
             case .episode(let targetIndex):
                 guard episodes.indices.contains(targetIndex) else { return }
                 focusedEpisode = episodes[targetIndex].id
