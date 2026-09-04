@@ -271,7 +271,7 @@ struct VortXiOSApp: App {
                 // opens as a postage-stamp window; pin a sensible minimum so it can't collapse. (iOS /
                 // iPadOS ignore this; their windows are managed by the system, not content size.)
                 #if os(macOS)
-                .frame(minWidth: 980, minHeight: 640)
+                .frame(minWidth: 900, minHeight: 600)
                 // Resolve the single shared NSToolbar as hidden so updateLocations has nothing to
                 // insert into. Combined with .windowStyle(.hiddenTitleBar) below this removes the
                 // toolbar OBJECT the NSToolbar-insert crash requires, not just each item source.
@@ -300,53 +300,29 @@ struct VortXiOSApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) { }
+            // Settings remains an in-window destination on Mac. Replacing the system command keeps
+            // Cmd-, on the floating navigation route instead of opening a second SwiftUI Settings
+            // scene with its own window chrome.
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { MacCommands.go(.settings) }
+                    .keyboardShortcut(",", modifiers: .command)
+            }
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates...") { UpdateChecker.shared.checkNow() }
             }
-            CommandMenu("Navigate") {
+            CommandMenu("Go") {
                 Button("Home")     { MacCommands.go(.home) }.keyboardShortcut("1", modifiers: .command)
                 Button("Discover") { MacCommands.go(.discover) }.keyboardShortcut("2", modifiers: .command)
-                Button("Search")   { MacCommands.go(.search) }.keyboardShortcut("3", modifiers: .command)
+                Button("Live TV")  { MacCommands.go(.live) }.keyboardShortcut("3", modifiers: .command)
                 Button("Library")  { MacCommands.go(.library) }.keyboardShortcut("4", modifiers: .command)
+                Button("Add-ons")  { MacCommands.go(.addons) }.keyboardShortcut("5", modifiers: .command)
                 Divider()
-                Button("Settings") { MacCommands.go(.settings) }.keyboardShortcut("5", modifiers: .command)
+                Button("Search")   { MacCommands.go(.search) }.keyboardShortcut("f", modifiers: .command)
             }
         }
         #endif
-
-        #if os(macOS)
-        Settings {
-            MacSettingsSurface()
-                .environmentObject(account)
-                .environmentObject(core)
-                .environmentObject(ThemeManager.shared)
-                .environmentObject(ProfileStore.shared)
-                .environmentObject(VortXSyncManager.shared)
-                .preferredColorScheme(.dark)
-                .tint(Theme.Palette.accent)
-        }
-        .defaultSize(width: 820, height: 700)
-        #endif
     }
 }
-
-#if os(macOS)
-private struct MacSettingsSurface: View {
-    var body: some View {
-        TabView {
-            iOSSettingsView()
-                .tabItem { Label("General", systemImage: "gearshape") }
-            iOSSettingsView()
-                .tabItem { Label("Playback", systemImage: "play.rectangle") }
-            iOSSettingsView()
-                .tabItem { Label("Subtitles", systemImage: "captions.bubble") }
-            iOSSettingsView()
-                .tabItem { Label("Sources", systemImage: "square.stack.3d.up") }
-        }
-        .frame(minWidth: 760, minHeight: 620)
-    }
-}
-#endif
 
 /// macOS menu-bar command bridge. The menu commands live at the SwiftUI `Scene` level, outside the
 /// view tree, so they cannot touch iOSRootView's `@State tab` directly; they post a notification the
