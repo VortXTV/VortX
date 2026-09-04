@@ -3,6 +3,7 @@ package com.vortx.android.player.extras
 import android.content.Context
 import androidx.compose.animation.core.withInfiniteAnimationFrameMillis
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.focusable
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
@@ -26,6 +27,12 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.max
@@ -127,6 +134,11 @@ fun StyledScrubber(
     onScrubStart: () -> Unit,
     onScrub: (Float) -> Unit,
     onScrubEnd: (Float) -> Unit,
+    /// Non-null only for the TV player. A Canvas has semantics but is not inherently remote-focusable,
+    /// so the host provides this small, explicit D-pad seek seam instead of making every phone scrubber
+    /// a keyboard target.
+    tvSeekStepMs: Long = 0L,
+    onTvSeekBy: ((Long) -> Unit)? = null,
     modifier: Modifier = Modifier,
     trackColor: Color = Color.White.copy(alpha = 0.22f),
 ) {
@@ -177,8 +189,33 @@ fun StyledScrubber(
     // know where playback stands. Expose it as a progress node announcing "X of Y".
     val announcedCurrent = (progress * durationSeconds).toLong()
     val announcedTotal = durationSeconds.toLong()
+    val remoteFocus = if (enabled && onTvSeekBy != null && tvSeekStepMs > 0L) {
+        Modifier
+            .focusable()
+            .onKeyEvent { event: KeyEvent ->
+                // Holding Left/Right deliberately repeats relative seeks: Android sends repeat presses as
+                // additional KeyDown events, matching the transport buttons' normal remote behavior.
+                if (event.type != KeyEventType.KeyDown) return@onKeyEvent false
+                when (event.key) {
+                    Key.DirectionLeft -> {
+                        onTvSeekBy(-tvSeekStepMs)
+                        true
+                    }
+                    Key.DirectionRight -> {
+                        onTvSeekBy(tvSeekStepMs)
+                        true
+                    }
+                    else -> false
+                }
+            }
+    } else {
+        Modifier
+    }
     Canvas(
         modifier = modifier
+            // Caller-owned focus properties stay outside this focusable target, so TransportBar's Up
+            // route to the header applies when the TV scrubber itself owns focus.
+            .then(remoteFocus)
             .then(gesture)
             .semantics {
                 contentDescription = "Playback position"

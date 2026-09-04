@@ -69,7 +69,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
@@ -2337,6 +2336,18 @@ private fun TransportBar(
                 chapterStartsSeconds = chapters.map { it.startMs / 1000.0 },
                 skipBands = skipBands,
                 enabled = duration > 0L,
+                // The scrubber is a Canvas, so semantic progress alone does not make it a D-pad target.
+                // Supply an explicit TV-only remote seam; its modifier remains inside the caller's
+                // transport focus properties, preserving the deterministic Up exit to the header.
+                tvSeekStepMs = seekStepMs,
+                onTvSeekBy = if (isTvPlayer) {
+                    { delta ->
+                        onInteraction()
+                        onSeekBy(delta)
+                    }
+                } else {
+                    null
+                },
                 onScrubStart = {
                     onInteraction()
                     scrubbing = true
@@ -2401,17 +2412,16 @@ private fun tvTransportControlModifier(
         .focusProperties { up = tvHeaderFocus }
 }
 
-/// Compose's legacy [FocusProperties.exit] hook remains experimental in the app's Compose 1.9 line. Keep
-/// that opt-in in one small TV-only modifier rather than leaking it across the shared phone/player surface.
-@OptIn(ExperimentalComposeUiApi::class)
+/// The focus properties must sit OUTSIDE the focus group. In Compose 1.9.2, placing them after the group
+/// configures the group node rather than its descendant exit path, allowing D-pad navigation through a scrim.
 private fun tvOverlayFocusExitModifier(isTvPlayer: Boolean): Modifier = if (isTvPlayer) {
-    Modifier.focusProperties { exit = { FocusRequester.Cancel } }
+    Modifier.focusProperties { onExit = { cancelFocusChange() } }
 } else {
     Modifier
 }
 
 private fun tvOverlayFocusTrapModifier(isTvPlayer: Boolean): Modifier =
-    if (isTvPlayer) Modifier.focusGroup().then(tvOverlayFocusExitModifier(true)) else Modifier
+    if (isTvPlayer) tvOverlayFocusExitModifier(true).focusGroup() else Modifier
 
 /// One control-cluster icon button (white, or [tint]-highlighted when its state is active).
 @Composable

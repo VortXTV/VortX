@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.io.File
 
@@ -37,15 +38,41 @@ class PlayerTvFocusContractTest {
         assertTrue(chrome.contains("private val LocalPlayerChromeIsTv = staticCompositionLocalOf { false }"))
         assertTrue(chrome.contains("CompositionLocalProvider(LocalPlayerChromeIsTv provides isTvPlayer)"))
         assertTrue(chrome.contains("private fun tvOverlayFocusExitModifier(isTvPlayer: Boolean)"))
-        assertTrue(chrome.contains("@OptIn(ExperimentalComposeUiApi::class)"))
-        assertTrue(chrome.contains("Modifier.focusProperties { exit = { FocusRequester.Cancel } }"))
-        assertTrue(chrome.contains("if (isTvPlayer) Modifier.focusGroup().then(tvOverlayFocusExitModifier(true)) else Modifier"))
+        assertTrue(chrome.contains("Modifier.focusProperties { onExit = { cancelFocusChange() } }"))
+        assertTrue(chrome.contains("if (isTvPlayer) tvOverlayFocusExitModifier(true).focusGroup() else Modifier"))
+        assertTrue(!chrome.contains("Modifier.focusGroup().then(tvOverlayFocusExitModifier(true))"))
         assertTrue(chrome.contains("if (isTvPlayer && firstEnabledIndex < 0)"))
         assertTrue(chrome.contains("text = \"Close\""))
         assertTrue(chrome.contains("LaunchedEffect(title, firstEnabledIndex, options.size)"))
         assertTrue(chrome.contains(".focusRequester(muteFocus)"))
         assertTrue(chrome.contains(".focusRequester(recoveryFocus)"))
         assertTrue(chrome.contains("PlayerErrorOverlay(\n                emberAccent = emberAccent,\n                isTvPlayer = isTvPlayer,"))
+    }
+
+    @Test
+    fun `TV scrubber is a real focus target and consumes directional seek keys`() {
+        val chrome = source("src/main/kotlin/com/vortx/android/player/PlayerChrome.kt")
+        val scrubber = source("src/main/kotlin/com/vortx/android/player/extras/SeekBarStyle.kt")
+        val chromeScrubberCall = chrome.substringAfter("StyledScrubber(").substringBefore("            Text(\n                text = formatTime(duration)")
+        val remoteFocusBlock = scrubber.substringAfter("val remoteFocus = if").substringBefore("    Canvas(")
+
+        assertTrue(chromeScrubberCall.contains("tvSeekStepMs = seekStepMs"))
+        assertTrue(chromeScrubberCall.contains("onTvSeekBy = if (isTvPlayer)"))
+        assertTrue(chromeScrubberCall.contains("onInteraction()"))
+        assertTrue(chromeScrubberCall.contains("onSeekBy(delta)"))
+        assertTrue(chromeScrubberCall.contains("else {\n                    null"))
+        assertTrue(chromeScrubberCall.contains(".then(tvTransportControlModifier(isTvPlayer, tvHeaderFocus))"))
+        assertTrue(scrubber.contains("onTvSeekBy: ((Long) -> Unit)? = null"))
+        assertTrue(remoteFocusBlock.contains(".focusable()"))
+        assertTrue(remoteFocusBlock.contains("if (event.type != KeyEventType.KeyDown) return@onKeyEvent false"))
+        assertTrue(remoteFocusBlock.contains("Holding Left/Right deliberately repeats relative seeks"))
+        // A repeat KeyDown is intentionally another relative seek. Reject a future native repeat-count
+        // suppression branch, which would make held remote presses silently stop after one tick.
+        assertFalse(remoteFocusBlock.contains("repeatCount"))
+        assertTrue(remoteFocusBlock.contains("Key.DirectionLeft -> {\n                        onTvSeekBy(-tvSeekStepMs)\n                        true"))
+        assertTrue(remoteFocusBlock.contains("Key.DirectionRight -> {\n                        onTvSeekBy(tvSeekStepMs)\n                        true"))
+        assertTrue(remoteFocusBlock.contains("else -> false"))
+        assertTrue(scrubber.contains(".then(remoteFocus)"))
     }
 
     private fun source(relativePath: String): String {
