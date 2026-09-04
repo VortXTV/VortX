@@ -12,6 +12,7 @@
 //
 //     xcrun swiftc -o /tmp/slwtest \
 //         app/SourcesShared/SettingsDirtyKeys.swift \
+//         app/SourcesShared/TabBarPrefs.swift \
 //         app/SourcesShared/ProfileDiscoveryPreferences.swift \
 //         app/SourcesShared/SettingsBackup.swift \
 //         app/SourcesShared/CredentialScope.swift \

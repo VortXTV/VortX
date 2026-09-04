@@ -21,6 +21,13 @@ struct ProfileDiscoveryPreferences: Codable, Equatable {
     var filtersData: Data? = nil
     var selectedProviders: [Int]? = nil
     var providerOrder: [Int]? = nil
+    /// Tab visibility is deliberately captured as a group: false is a meaningful choice, so the
+    /// marker distinguishes an explicit visible tab from a pre-feature roster that has no opinion.
+    var tabVisibilityCaptured: Bool? = nil
+    var hideLiveTab: Bool? = nil
+    var hideDiscoverTab: Bool? = nil
+    var hideLibraryTab: Bool? = nil
+    var hideSearchTab: Bool? = nil
 }
 
 /// The one persistence bridge for profile-owned catalog and Discover values. Existing UI and
@@ -35,6 +42,10 @@ enum ProfileDiscoveryPreferencesStore {
         static let filters = "vortx.discover.filters"
         static let selectedProviders = "vortx.collections.selectedProviders"
         static let providerOrder = "vortx.collections.providerOrder"
+        static let hideLiveTab = TabBarPrefs.hideLive
+        static let hideDiscoverTab = TabBarPrefs.hideDiscover
+        static let hideLibraryTab = TabBarPrefs.hideLibrary
+        static let hideSearchTab = TabBarPrefs.hideSearch
     }
 
     /// The legacy keys are a projection of whichever profile is active on THIS device. They remain
@@ -49,6 +60,10 @@ enum ProfileDiscoveryPreferencesStore {
         Key.filters,
         Key.selectedProviders,
         Key.providerOrder,
+        Key.hideLiveTab,
+        Key.hideDiscoverTab,
+        Key.hideLibraryTab,
+        Key.hideSearchTab,
     ]
 
     static func capture(from defaults: UserDefaults = .standard) -> ProfileDiscoveryPreferences {
@@ -61,7 +76,12 @@ enum ProfileDiscoveryPreferencesStore {
             filtersCaptured: true,
             filtersData: defaults.data(forKey: Key.filters),
             selectedProviders: selectedProviders(from: defaults),
-            providerOrder: defaults.array(forKey: Key.providerOrder) as? [Int] ?? [])
+            providerOrder: defaults.array(forKey: Key.providerOrder) as? [Int] ?? [],
+            tabVisibilityCaptured: true,
+            hideLiveTab: defaults.bool(forKey: Key.hideLiveTab),
+            hideDiscoverTab: defaults.bool(forKey: Key.hideDiscoverTab),
+            hideLibraryTab: defaults.bool(forKey: Key.hideLibraryTab),
+            hideSearchTab: defaults.bool(forKey: Key.hideSearchTab))
     }
 
     /// Apply one profile's snapshot to the legacy keys. `resetUnset` is true only for an actual
@@ -100,6 +120,7 @@ enum ProfileDiscoveryPreferencesStore {
         } else if resetUnset {
             defaults.removeObject(forKey: Key.providerOrder)
         }
+        applyTabVisibility(prefs, resetUnset: resetUnset, to: defaults)
     }
 
     static func hiddenCatalogs(from defaults: UserDefaults = .standard) -> [String] {
@@ -154,5 +175,25 @@ enum ProfileDiscoveryPreferencesStore {
                                      to defaults: UserDefaults) {
         if let value { defaults.set(value, forKey: key) }
         else if resetUnset { defaults.removeObject(forKey: key) }
+    }
+
+    private static func applyTabVisibility(_ prefs: ProfileDiscoveryPreferences?, resetUnset: Bool,
+                                           to defaults: UserDefaults) {
+        let captured = prefs?.tabVisibilityCaptured == true
+        let values: [(Bool?, String)] = [
+            (prefs?.hideLiveTab, Key.hideLiveTab),
+            (prefs?.hideDiscoverTab, Key.hideDiscoverTab),
+            (prefs?.hideLibraryTab, Key.hideLibraryTab),
+            (prefs?.hideSearchTab, Key.hideSearchTab),
+        ]
+        for (value, key) in values {
+            if captured || value != nil {
+                defaults.set(value ?? false, forKey: key)
+            } else if resetUnset {
+                // Legacy and newly created profiles have no tab snapshot. A real switch must make
+                // each tab visible rather than inheriting the prior profile's hidden state.
+                defaults.set(false, forKey: key)
+            }
+        }
     }
 }

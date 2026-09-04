@@ -3,6 +3,7 @@
 // Run from the repository root:
 //
 //   xcrun swiftc -warnings-as-errors \
+//     app/SourcesShared/TabBarPrefs.swift \
 //     app/SourcesShared/ProfileDiscoveryPreferences.swift \
 //     app/Tests/ProfileDiscoveryIsolationContractTests.swift \
 //     -o /tmp/profile-discovery-isolation-contract && \
@@ -31,7 +32,7 @@ private func suite() -> UserDefaults {
     return defaults
 }
 
-private let allKeys = [
+private let allDiscoveryKeys = [
     ProfileDiscoveryPreferencesStore.Key.hiddenCatalogs,
     ProfileDiscoveryPreferencesStore.Key.catalogOrder,
     ProfileDiscoveryPreferencesStore.Key.hiddenHubCategories,
@@ -39,6 +40,13 @@ private let allKeys = [
     ProfileDiscoveryPreferencesStore.Key.filters,
     ProfileDiscoveryPreferencesStore.Key.selectedProviders,
     ProfileDiscoveryPreferencesStore.Key.providerOrder,
+]
+
+private let tabKeys = [
+    ProfileDiscoveryPreferencesStore.Key.hideLiveTab,
+    ProfileDiscoveryPreferencesStore.Key.hideDiscoverTab,
+    ProfileDiscoveryPreferencesStore.Key.hideLibraryTab,
+    ProfileDiscoveryPreferencesStore.Key.hideSearchTab,
 ]
 
 private let profileA = ProfileDiscoveryPreferences(
@@ -50,7 +58,12 @@ private let profileA = ProfileDiscoveryPreferences(
     filtersCaptured: true,
     filtersData: Data("{\"includedGenres\":[\"Drama\"],\"upcomingOnly\":true}".utf8),
     selectedProviders: [9, 8],
-    providerOrder: [8, 9])
+    providerOrder: [8, 9],
+    tabVisibilityCaptured: true,
+    hideLiveTab: true,
+    hideDiscoverTab: false,
+    hideLibraryTab: true,
+    hideSearchTab: false)
 
 @main
 private enum ProfileDiscoveryIsolationContract {
@@ -61,11 +74,13 @@ do {
     ProfileDiscoveryPreferencesStore.apply(profileA, resetUnset: true, to: defaults)
     let capturedA = ProfileDiscoveryPreferencesStore.capture(from: defaults)
     ProfileDiscoveryPreferencesStore.apply(nil, resetUnset: true, to: defaults)
-    check(allKeys.allSatisfy { defaults.object(forKey: $0) == nil },
+    check(allDiscoveryKeys.allSatisfy { defaults.object(forKey: $0) == nil },
           "a fresh profile clears every discovery and provider flat key")
+    check(tabKeys.allSatisfy { defaults.object(forKey: $0) as? Bool == false },
+          "a fresh profile makes every optional tab visible instead of inheriting A")
     ProfileDiscoveryPreferencesStore.apply(capturedA, resetUnset: true, to: defaults)
     check(ProfileDiscoveryPreferencesStore.capture(from: defaults) == capturedA,
-          "switching back restores profile A without inheriting profile B defaults")
+          "A -> clean B -> A restores every discovery and tab choice exactly")
 }
 
 // A synced explicit clear is different from a legacy missing field. It must clear the active
@@ -78,7 +93,12 @@ do {
         regionOverrideCaptured: true,
         regionOverride: nil,
         filtersCaptured: true,
-        filtersData: nil)
+        filtersData: nil,
+        tabVisibilityCaptured: true,
+        hideLiveTab: false,
+        hideDiscoverTab: false,
+        hideLibraryTab: false,
+        hideSearchTab: false)
     ProfileDiscoveryPreferencesStore.apply(remoteClear, resetUnset: false, to: defaults)
     check(defaults.object(forKey: ProfileDiscoveryPreferencesStore.Key.regionOverride) == nil &&
           defaults.object(forKey: ProfileDiscoveryPreferencesStore.Key.filters) == nil,
@@ -88,6 +108,11 @@ do {
     check(recaptured.regionOverrideCaptured == true && recaptured.regionOverride == nil &&
           recaptured.filtersCaptured == true && recaptured.filtersData == nil,
           "a later discovery edit cannot recapture stale cleared region or filters")
+    check(tabKeys.allSatisfy { defaults.object(forKey: $0) as? Bool == false } &&
+          recaptured.tabVisibilityCaptured == true && recaptured.hideLiveTab == false &&
+          recaptured.hideDiscoverTab == false && recaptured.hideLibraryTab == false &&
+          recaptured.hideSearchTab == false,
+          "an explicit synced tab clear makes every tab visible and remains authoritative")
 }
 
 // Upgrade migration belongs to the stored active profile only. Inactive old records deliberately
@@ -101,7 +126,8 @@ do {
           "active pre-upgrade profile receives the existing flat snapshot")
     check(oldRoster[1] == nil, "inactive pre-upgrade profile is not cloned from the active viewer")
     ProfileDiscoveryPreferencesStore.apply(oldRoster[1], resetUnset: true, to: defaults)
-    check(allKeys.allSatisfy { defaults.object(forKey: $0) == nil },
+    check(allDiscoveryKeys.allSatisfy { defaults.object(forKey: $0) == nil } &&
+          tabKeys.allSatisfy { defaults.object(forKey: $0) as? Bool == false },
           "inactive legacy profile starts from clean defaults on first switch")
 }
 
@@ -113,8 +139,10 @@ do {
     let partial = ProfileDiscoveryPreferences(hiddenCatalogs: ["other|catalog"])
     ProfileDiscoveryPreferencesStore.apply(partial, resetUnset: false, to: defaults)
     check(ProfileDiscoveryPreferencesStore.regionOverride(from: defaults) == "GB" &&
-          ProfileDiscoveryPreferencesStore.filtersData(from: defaults) == profileA.filtersData,
-          "partial sync snapshot leaves absent region and filters live until selection")
+          ProfileDiscoveryPreferencesStore.filtersData(from: defaults) == profileA.filtersData &&
+          defaults.object(forKey: ProfileDiscoveryPreferencesStore.Key.hideLiveTab) as? Bool == true &&
+          defaults.object(forKey: ProfileDiscoveryPreferencesStore.Key.hideLibraryTab) as? Bool == true,
+          "partial sync snapshot leaves absent region, filters, and tabs live until selection")
     ProfileDiscoveryPreferencesStore.apply(partial, resetUnset: true, to: defaults)
     check(defaults.object(forKey: ProfileDiscoveryPreferencesStore.Key.regionOverride) == nil &&
           defaults.object(forKey: ProfileDiscoveryPreferencesStore.Key.filters) == nil,
@@ -128,6 +156,25 @@ do {
     let decoded = try? JSONDecoder().decode(LegacyCompatibleProfile.self, from: oldPayload)
     check(decoded?.name == "Legacy" && decoded?.discovery == nil,
           "old roster payloads decode with an absent discovery snapshot")
+}
+
+// A roster already carrying discovery from before tab isolation must still decode, and the five
+// new wire fields must retain their exact additive names for Android parity.
+do {
+    let legacyDiscovery = "{\"hiddenCatalogs\":[\"old\"]}".data(using: .utf8)!
+    let decoded = try? JSONDecoder().decode(ProfileDiscoveryPreferences.self, from: legacyDiscovery)
+    check(decoded?.hiddenCatalogs == ["old"] && decoded?.tabVisibilityCaptured == nil &&
+          decoded?.hideLiveTab == nil && decoded?.hideDiscoverTab == nil &&
+          decoded?.hideLibraryTab == nil && decoded?.hideSearchTab == nil,
+          "legacy discovery snapshots decode with absent tab fields")
+
+    let encoded = try? JSONEncoder().encode(profileA)
+    let object = encoded.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+    let fields = ["tabVisibilityCaptured", "hideLiveTab", "hideDiscoverTab", "hideLibraryTab", "hideSearchTab"]
+    check(fields.allSatisfy { object?[$0] != nil } && object?["tabVisibilityCaptured"] as? Bool == true &&
+          object?["hideLiveTab"] as? Bool == true && object?["hideDiscoverTab"] as? Bool == false &&
+          object?["hideLibraryTab"] as? Bool == true && object?["hideSearchTab"] as? Bool == false,
+          "tab snapshot JSON uses the exact cross-platform field names and booleans")
 }
 
 if failures == 0 {
