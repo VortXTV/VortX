@@ -2556,21 +2556,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // sizeless/chunked debrid link going quiet right after the probe read-ahead, rw_timeout x reconnect
         // in play). That input-side stall is otherwise invisible in a device export; log the FIRST live read
         // that takes pathologically long so the next diagnostics export separates "source went quiet"
-        // (network) from "muxer wedged" (code) in one line. Date() twice per read until it fires, then free.
+        // (network) from "muxer wedged" (code) in one line. Keep monotonic timing for every read because a
+        // later source-error receipt must never claim a false zero duration after this one-shot log fires.
         var slowReadLogged = false
         // Do not proactively interrupt a quiet read. FFmpeg's HTTP protocol owns stall recovery through
         // rw_timeout + reconnect. Returning AVERROR_EXIT from our callback bypasses that reconnect path and
         // leaves the AVIOContext's error sticky, so only hard cancellation may trip the callback.
         readLoop: while !isCancelled {
             if let starve = hlsInitStarved() { buffer.fail(starve); return }
-            let readBegan = slowReadLogged ? nil : Date()
+            let readBegan = ProcessInfo.processInfo.systemUptime
             let rf = av_read_frame(inCtx, pkt)
-            if let readBegan {
-                let took = Date().timeIntervalSince(readBegan)
-                if took > 3.0 {
-                    slowReadLogged = true
-                    DiagnosticsLog.log("dv", "live source read stalled \(String(format: "%.1f", took))s (rc=\(rf), produced=\(buffer.producedCount)B)")
-                }
+            let took = ProcessInfo.processInfo.systemUptime - readBegan
+            if !slowReadLogged, took > 3.0 {
+                slowReadLogged = true
+                DiagnosticsLog.log("dv", "live source read stalled \(String(format: "%.1f", took))s (rc=\(rf), produced=\(buffer.producedCount)B)")
             }
             if rf < 0 {
                 switch VortXRemuxReadFailurePolicy.classify(
@@ -2596,7 +2595,30 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // early (8 MB, or 0 bytes). A genuinely dead link errors every retry and then demotes to libmpv.
                 readRetries += 1
                 if readRetries <= maxReadRetries {
-                    VXProbe.log("dv", "mid-stream read rc=\(rf), retry \(readRetries)/\(maxReadRetries)")
+                    let backoff = VortXRemuxReadRetryPolicy.backoffSeconds(readRetries: readRetries)
+                    let inputBytes = inCtx.pointee.pb.map { $0.pointee.bytes_read }
+                    let bytesReceipt = inputBytes.map { String($0) } ?? "unavailable"
+                    let contextID = UInt(bitPattern: inCtx)
+                    let readElapsed = ProcessInfo.processInfo.systemUptime - readBegan
+                    VXProbe.log(
+                        "dv",
+                        "mid-stream read rc=\(rf) retry=\(readRetries)/\(maxReadRetries) "
+                            + "readElapsedMs=\(Int(readElapsed * 1_000)) backoffMs=\(Int(backoff * 1_000)) "
+                            + "inputBytes=\(bytesReceipt) "
+                            + "context=0x\(String(contextID, radix: 16)) cancelled=\(isCancelled)"
+                    )
+                    let completedBackoff = VortXRemuxReadRetryPolicy.sleepAbortableSlices(
+                        seconds: backoff,
+                        isCancelled: { self.isCancelled }
+                    )
+                    if !completedBackoff {
+                        VXProbe.log(
+                            "dv",
+                            "mid-stream retry cancelled rc=\(rf) retry=\(readRetries)/\(maxReadRetries) "
+                                + "context=0x\(String(contextID, radix: 16)) cancelled=\(isCancelled)"
+                        )
+                        break readLoop
+                    }
                     continue
                 }
                 buffer.fail("source read failed mid-stream (rc=\(rf)) after \(maxReadRetries) retries")
