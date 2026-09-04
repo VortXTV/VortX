@@ -85,8 +85,10 @@ struct VortXRemuxReadFailurePolicyTests {
         check(
             source.contains("av_dict_set(&openOpts, \"rw_timeout\", \"10000000\", 0)")
                 && source.contains("av_dict_set(&opts, \"reconnect\", \"1\", 0)")
-                && source.contains("av_dict_set(&opts, \"reconnect_streamed\", \"1\", 0)"),
-            "production keeps bounded FFmpeg timeout and HTTP reconnect wiring"
+                && source.contains("av_dict_set(&opts, \"reconnect_streamed\", \"1\", 0)")
+                && source.contains("av_dict_set(&opts, \"reconnect_max_retries\", \"1\", 0)")
+                && source.contains("av_dict_set(&opts, \"reconnect_delay_total_max\", \"5\", 0)"),
+            "production keeps bounded FFmpeg timeout and aggregate HTTP reconnect wiring"
         )
 
         print("ALL TESTS PASSED (\(passed) checks)")

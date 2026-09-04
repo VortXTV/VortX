@@ -54,6 +54,9 @@ struct RemuxReadRetryPolicyTests {
         check(source.contains("case .sourceError:") && source.contains("VortXRemuxReadRetryPolicy.sleepAbortableSlices"), "only source errors enter retry backoff")
         check(source.contains("case .unexpectedInterrupt:") && source.contains("source read interrupted unexpectedly"), "unexpected AVERROR_EXIT remains terminal")
         check(source.contains("return VortXRemuxInputProbeIsCancelled(probe) ? 1 : 0"), "AVIO interrupt remains hard-cancel-only")
+        check(source.contains("\"reconnect_max_retries\", \"1\"")
+                && source.contains("\"reconnect_delay_total_max\", \"5\""),
+              "the bundled HTTP transport bounds retries and aggregate reconnect delay in the live AVIO context")
 
         print("ALL TESTS PASSED (\(passed) checks)")
     }

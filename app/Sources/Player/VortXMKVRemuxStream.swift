@@ -4912,6 +4912,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         av_dict_set(&opts, "reconnect", "1", 0)
         av_dict_set(&opts, "reconnect_streamed", "1", 0)
         av_dict_set(&opts, "reconnect_on_network_error", "1", 0)
+        // The bundled FFmpeg 9 HTTP protocol exposes both aggregate controls.  Keep recovery inside the one
+        // valid AVIO context, but do not let a dead upstream multiply the 10-second rw_timeout through an
+        // unbounded reconnect ladder while the local HLS item waits at its published tail.
+        av_dict_set(&opts, "reconnect_max_retries", "1", 0)
+        av_dict_set(&opts, "reconnect_delay_total_max", "5", 0) // seconds across one reconnect episode
         av_dict_set(&opts, "reconnect_delay_max", "5", 0)          // seconds
         av_dict_set(&opts, "multiple_requests", "1", 0)            // persistent connection across redirect+range
     }
