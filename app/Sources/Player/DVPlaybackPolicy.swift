@@ -360,20 +360,87 @@ enum DVPlaybackPolicy {
         let errorLogEvents: [HDRFallbackErrorLogEvent]
     }
 
-    /// True only for the one known compatibility edge: CoreMedia rejected this remux's primary `init.mp4`
-    /// before it ever rendered a video frame. Error-log URI provenance prevents ordinary playlist, segment,
-    /// audio and subtitle transport failures from being misrepresented as Dolby Vision incompatibility.
-    static func hasPrimaryDVInitFailure(_ evidence: HDRFallbackAdmissionEvidence) -> Bool {
+    /// Derive the primary init route from this exact item's primary remux master. The error log can retain
+    /// events from an earlier item, so the terminal filename alone is never sufficient provenance.
+    static func primaryInitURL(from primaryURL: URL) -> URL? {
+        guard var components = URLComponents(url: primaryURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        let suffix = "/master.m3u8"
+        guard components.path.hasSuffix(suffix) else { return nil }
+        components.path.removeLast(suffix.count)
+        components.path += "/init.mp4"
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
+    private struct HDRFallbackRouteIdentity: Equatable {
+        let scheme: String
+        let host: String
+        let port: Int
+        let path: String
+    }
+
+    /// Normalize only URL syntax that resolves to the same HTTP route. Queries and fragments do not name a
+    /// remux resource; unreserved percent escapes and default ports are equivalent spellings of one route.
+    private static func canonicalHDRFallbackRoute(_ url: URL) -> HDRFallbackRouteIdentity? {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              let host = components.host?.lowercased(),
+              components.user == nil,
+              components.password == nil,
+              let path = canonicalPercentEncodedPath(components.percentEncodedPath) else {
+            return nil
+        }
+        let port = components.port ?? (scheme == "http" ? 80 : 443)
+        return HDRFallbackRouteIdentity(scheme: scheme, host: host, port: port, path: path)
+    }
+
+    private static func canonicalPercentEncodedPath(_ path: String) -> String? {
+        var result = ""
+        var index = path.startIndex
+        while index < path.endIndex {
+            let character = path[index]
+            guard character == "%" else {
+                result.append(character)
+                index = path.index(after: index)
+                continue
+            }
+            let first = path.index(after: index)
+            guard first < path.endIndex else { return nil }
+            let second = path.index(after: first)
+            guard second < path.endIndex,
+                  let byte = UInt8(String(path[first...second]), radix: 16) else {
+                return nil
+            }
+            guard let scalar = UnicodeScalar(Int(byte)) else { return nil }
+            if CharacterSet.alphanumerics.contains(scalar) || "-._~".unicodeScalars.contains(scalar) {
+                result.unicodeScalars.append(scalar)
+            } else {
+                result += String(format: "%%%02X", byte)
+            }
+            index = path.index(after: second)
+        }
+        return result
+    }
+
+    /// True only for the one known compatibility edge: CoreMedia rejected this item's exact primary `init.mp4`
+    /// route before it ever rendered a video frame. Error-log URI provenance prevents ordinary playlist,
+    /// segment, audio, subtitle, prior-item, and other-mount failures from being misrepresented as Dolby
+    /// Vision incompatibility.
+    static func hasPrimaryDVInitFailure(_ evidence: HDRFallbackAdmissionEvidence,
+                                        primaryInitURL: URL) -> Bool {
         guard !evidence.videoFrameEverProduced else { return false }
+        guard let expectedRoute = canonicalHDRFallbackRoute(primaryInitURL) else { return false }
         return evidence.errorLogEvents.contains { event in
             guard event.errorDomain == "CoreMediaErrorDomain",
                   event.errorStatusCode == -12927,
                   let uri = event.uri,
-                  let components = URLComponents(string: uri),
-                  components.scheme != nil,
-                  components.host != nil,
-                  let url = components.url else { return false }
-            return url.lastPathComponent == "init.mp4"
+                  let url = URL(string: uri),
+                  let eventRoute = canonicalHDRFallbackRoute(url) else { return false }
+            return eventRoute == expectedRoute
         }
     }
 
@@ -386,7 +453,8 @@ enum DVPlaybackPolicy {
                                          alreadyAttempted: Bool,
                                          errorDomain: String?,
                                          errorCode: Int,
-                                         evidence: HDRFallbackAdmissionEvidence) -> Bool {
+                                         evidence: HDRFallbackAdmissionEvidence,
+                                         primaryInitURL: URL) -> Bool {
         dolbyVision
             && remuxMounted
             && mountHealthy
@@ -394,7 +462,7 @@ enum DVPlaybackPolicy {
             && !alreadyAttempted
             && errorDomain == "CoreMediaErrorDomain"
             && errorCode == -12927
-            && hasPrimaryDVInitFailure(evidence)
+            && hasPrimaryDVInitFailure(evidence, primaryInitURL: primaryInitURL)
     }
 
     /// A recovery capability exists only after byte surgery settled successfully. Profile 5 remains excluded

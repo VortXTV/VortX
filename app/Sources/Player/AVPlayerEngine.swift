@@ -1686,6 +1686,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func hdrFallbackAdmissionEvidence(for item: AVPlayerItem) -> DVPlaybackPolicy.HDRFallbackAdmissionEvidence {
+        // A failure can arrive between the 250 ms observer ticks. Sample all existing display evidence on the
+        // exact failed item at this irreversible edge, so a picture that already reached the layer, track, or
+        // video output permanently closes the fallback gate before we inspect the error log.
+        let seconds = item.currentTime().seconds
+        _ = latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
         let errorLogEvents = item.errorLog()?.events.map {
             DVPlaybackPolicy.HDRFallbackErrorLogEvent(
                 errorDomain: $0.errorDomain,
@@ -1713,7 +1718,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             ?? remuxRemoteMount?.isMountHealthy ?? false
         let fallbackAvailable = remuxHLSServer?.supportsHDRFallback
             ?? remuxRemoteMount?.supportsHDRFallback ?? false
-        guard let failedItem = item else { return false }
+        guard let failedItem = item,
+              player.currentItem === failedItem,
+              let primaryURL = (failedItem.asset as? AVURLAsset)?.url,
+              let primaryInitURL = DVPlaybackPolicy.primaryInitURL(from: primaryURL) else { return false }
         let admissionEvidence = hdrFallbackAdmissionEvidence(for: failedItem)
         guard DVPlaybackPolicy.shouldAttemptHDRFallback(
             dolbyVision: contentIsDolbyVision,
@@ -1725,7 +1733,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             alreadyAttempted: hdrFallbackRetried,
             errorDomain: trigger?.domain,
             errorCode: trigger?.code ?? 0,
-            evidence: admissionEvidence
+            evidence: admissionEvidence,
+            primaryInitURL: primaryInitURL
         ) else {
             if contentIsDolbyVision,
                isRemuxMounted,
@@ -1785,8 +1794,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         hdrFallbackCapabilityRefreshTask?.cancel()
         hdrFallbackCapabilityRefreshTask = nil
         let currentItem = failedItem
-        guard let primaryURL = (currentItem.asset as? AVURLAsset)?.url,
-           let fallbackURL = DVPlaybackPolicy.hdrFallbackMasterURL(from: primaryURL),
+        guard let fallbackURL = DVPlaybackPolicy.hdrFallbackMasterURL(from: primaryURL),
            let loadToken = activeLoadToken else { return false }
         if remountPendingSeekIfOutsideWindow() {
             return true

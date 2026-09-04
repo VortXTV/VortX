@@ -221,6 +221,29 @@ private struct StartupWiringRule {
             mutationTarget: "freshItem.preferredForwardBufferDuration =",
             mutationReplacement: "_ ="),
         StartupWiringRule(
+            name: "HDR failure edge synchronously latches display proof", usesServer: false,
+            start: "private func hdrFallbackAdmissionEvidence(for item: AVPlayerItem) -> DVPlaybackPolicy.HDRFallbackAdmissionEvidence {",
+            end: "/// Replace a rejected DV item with one explicit HDR-only item on the same healthy remux mount.",
+            exactSection: """
+            private func hdrFallbackAdmissionEvidence(for item: AVPlayerItem) -> DVPlaybackPolicy.HDRFallbackAdmissionEvidence {
+                let seconds = item.currentTime().seconds
+                _ = latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
+                let errorLogEvents = item.errorLog()?.events.map {
+                    DVPlaybackPolicy.HDRFallbackErrorLogEvent(
+                        errorDomain: $0.errorDomain,
+                        errorStatusCode: $0.errorStatusCode,
+                        uri: $0.uri
+                    )
+                } ?? []
+                return DVPlaybackPolicy.HDRFallbackAdmissionEvidence(
+                    videoFrameEverProduced: videoFrameEverProduced,
+                    errorLogEvents: errorLogEvents
+                )
+            }
+            """,
+            mutationTarget: "_ = latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)",
+            mutationReplacement: "_ = false"),
+        StartupWiringRule(
             name: "memory-warning non-increasing mutation", usesServer: false,
             start: "@objc private func handleMemoryWarningNote() {",
             end: "DiagnosticsLog.log(",
@@ -1632,6 +1655,12 @@ check("artifact: Profile 8.4 recovery is a separate exact-HLG single-variant mas
         streamInfAttributes: "",
         videoVariant: .hdrFallback) == p84RecoveryArtifact)
 
+let primaryDVMasterURL = URL(string: "http://127.0.0.1:43123/r/capability/master.m3u8")!
+let primaryDVInitURL = DVPlaybackPolicy.primaryInitURL(from: primaryDVMasterURL)!
+check("HDR recovery: current master derives its own exact init route without inheriting query or fragment",
+      DVPlaybackPolicy.primaryInitURL(
+        from: URL(string: "https://HOST.example:443/r/current%2Dmount/master.m3u8?token=current#master")!)
+        == URL(string: "https://HOST.example:443/r/current-mount/init.mp4")!)
 let primaryDVInitFailure = DVPlaybackPolicy.HDRFallbackAdmissionEvidence(
     videoFrameEverProduced: false,
     errorLogEvents: [
@@ -1651,7 +1680,8 @@ check("HDR recovery: exact healthy pre-frame primary init CoreMedia -12927 failu
         alreadyAttempted: false,
         errorDomain: "CoreMediaErrorDomain",
         errorCode: -12927,
-        evidence: primaryDVInitFailure))
+        evidence: primaryDVInitFailure,
+        primaryInitURL: primaryDVInitURL))
 check("HDR recovery: an already attempted fallback cannot loop",
       !DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
@@ -1661,7 +1691,8 @@ check("HDR recovery: an already attempted fallback cannot loop",
         alreadyAttempted: true,
         errorDomain: "CoreMediaErrorDomain",
         errorCode: -12927,
-        evidence: primaryDVInitFailure))
+        evidence: primaryDVInitFailure,
+        primaryInitURL: primaryDVInitURL))
 check("HDR recovery: Profile 5 or another no-base-layer source cannot claim HDR recovery",
       !DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
@@ -1671,7 +1702,8 @@ check("HDR recovery: Profile 5 or another no-base-layer source cannot claim HDR 
         alreadyAttempted: false,
         errorDomain: "CoreMediaErrorDomain",
         errorCode: -12927,
-        evidence: primaryDVInitFailure))
+        evidence: primaryDVInitFailure,
+        primaryInitURL: primaryDVInitURL))
 check("HDR recovery: unrelated failures keep their existing fail-soft path",
       !DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
@@ -1681,55 +1713,75 @@ check("HDR recovery: unrelated failures keep their existing fail-soft path",
         alreadyAttempted: false,
         errorDomain: "AVFoundationErrorDomain",
         errorCode: -11828,
-        evidence: primaryDVInitFailure))
+        evidence: primaryDVInitFailure,
+        primaryInitURL: primaryDVInitURL))
 check("HDR recovery: a rendered DV frame cannot be replaced by HDR fallback",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: true,
-        errorLogEvents: primaryDVInitFailure.errorLogEvents)))
+        errorLogEvents: primaryDVInitFailure.errorLogEvents), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: recovery init must not be mistaken for the primary init",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
-                               uri: "http://127.0.0.1:43123/r/capability/init-hdr.mp4")])))
+                               uri: "http://127.0.0.1:43123/r/capability/init-hdr.mp4")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: playlists cannot be mistaken for the primary init",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
-                               uri: "http://127.0.0.1:43123/r/capability/media.m3u8")])))
+                               uri: "http://127.0.0.1:43123/r/capability/media.m3u8")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: video segments cannot be mistaken for the primary init",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
-                               uri: "http://127.0.0.1:43123/r/capability/segment-00001.m4s")])))
+                               uri: "http://127.0.0.1:43123/r/capability/segment-00001.m4s")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: audio resources cannot be mistaken for the primary init",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
-                               uri: "http://127.0.0.1:43123/r/capability/audio.m3u8")])))
+                               uri: "http://127.0.0.1:43123/r/capability/audio.m3u8")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: subtitle resources cannot be mistaken for the primary init",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
-                               uri: "http://127.0.0.1:43123/r/capability/subtitles.m3u8")])))
+                               uri: "http://127.0.0.1:43123/r/capability/subtitles.m3u8")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: missing error-log URI cannot prove primary init incompatibility",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
-        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927, uri: nil)])))
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927, uri: nil)]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: relative or malformed URI cannot prove primary init incompatibility",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
-                               uri: "init.mp4")])))
+                               uri: "init.mp4")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: mismatched error-log domain cannot prove primary init incompatibility",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "AVFoundationErrorDomain", errorStatusCode: -12927,
-                               uri: "http://127.0.0.1:43123/r/capability/init.mp4")])))
+                               uri: "http://127.0.0.1:43123/r/capability/init.mp4")]), primaryInitURL: primaryDVInitURL))
 check("HDR recovery: mismatched error-log status cannot prove primary init incompatibility",
       !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
         videoFrameEverProduced: false,
         errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -1008,
-                               uri: "http://127.0.0.1:43123/r/capability/init.mp4")])))
+                               uri: "http://127.0.0.1:43123/r/capability/init.mp4")]), primaryInitURL: primaryDVInitURL))
+check("HDR recovery: another host, port, or mount route cannot inherit this item's init proof",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "http://other-host:43123/r/capability/init.mp4")]), primaryInitURL: primaryDVInitURL)
+        && !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+            videoFrameEverProduced: false,
+            errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                                   uri: "http://127.0.0.1:43124/r/capability/init.mp4")]), primaryInitURL: primaryDVInitURL)
+        && !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+            videoFrameEverProduced: false,
+            errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                                   uri: "http://127.0.0.1:43123/r/old-mount/init.mp4")]), primaryInitURL: primaryDVInitURL))
+check("HDR recovery: exact route accepts harmless query fragment default-port and unreserved encoding",
+      DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "HTTP://127.0.0.1:80/r/c%61pability/init%2Emp4?trace=old#event")]),
+          primaryInitURL: URL(string: "http://127.0.0.1/r/capability/init.mp4")!))
 check("HDR recovery: a pre-ready replacement may cross the mount ready edge itself",
       DVPlaybackPolicy.acceptsRemuxReady(
         transitionAccepted: true,
