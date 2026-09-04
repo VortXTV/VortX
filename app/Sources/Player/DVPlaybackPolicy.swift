@@ -1723,48 +1723,83 @@ enum VortXHLSTargetPolicy {
 /// Selects a coherent, settled subtitle generation independently of the primary video's newest tail. Subtitle
 /// OCR may settle a segment after video has already published it, so requiring identical complete windows would
 /// either stall the primary playlist or keep this optional route permanently frozen. The selected interval never
-/// exceeds the current video tail and can bridge from a retained subtitle generation when the video window has
-/// slid more than one segment ahead, preventing a same-rendition gap before its next safe slide.
+/// exceeds the current video tail. It chooses the latest settled suffix that still meets the live floor and
+/// overlaps the previous generation, so a lagging route advances as soon as a legal rolling window exists.
 enum VortXHLSSubtitlePublicationPolicy {
+    /// RFC 8216's live-window removal floor: after removing an old media segment, retain at least three target
+    /// durations. Keep this arithmetic pure and overflow-checked because its result controls both playlist
+    /// shape and durable-spool retention.
+    static func liveRemovalFloorMilliseconds(frozenTargetSeconds: Int) -> Int? {
+        guard frozenTargetSeconds > 0 else { return nil }
+        let (threeTargets, targetOverflow) = frozenTargetSeconds.multipliedReportingOverflow(by: 3)
+        guard !targetOverflow else { return nil }
+        let (milliseconds, millisecondOverflow) = threeTargets.multipliedReportingOverflow(by: 1_000)
+        guard !millisecondOverflow else { return nil }
+        return milliseconds
+    }
+
     static func coherentWindow(settledWindow: VortXHLSWindow,
                                videoWindow: VortXHLSWindow,
-                               previousWindow: VortXHLSWindow?) -> VortXHLSWindow? {
+                               previousWindow: VortXHLSWindow?,
+                               minimumSegmentCount: Int,
+                               minimumRenderedDurationMilliseconds: Int,
+                               terminal: Bool) -> VortXHLSWindow? {
         guard let videoStart = videoWindow.segments.first?.id,
               let videoTail = videoWindow.segments.last?.id,
               videoStart >= 0,
-              videoTail >= videoStart else { return nil }
+              videoTail >= videoStart,
+              minimumSegmentCount > 0,
+              minimumRenderedDurationMilliseconds >= 0 else { return nil }
 
-        let start: Int
-        if let previousWindow,
-           let previousTail = previousWindow.segments.last?.id,
-           videoStart > previousTail,
-           previousTail < Int.max,
-           previousTail + 1 < videoStart {
-            // The current video playlist has already slid past subtitle IDs that this route has not published.
-            // Retain its prior start for one append generation, then the next reload may slide over the overlap.
-            start = previousWindow.mediaSequence
+        let lowerBound = previousWindow?.mediaSequence ?? videoStart
+        let maximumStart: Int
+        if let previousTail = previousWindow?.segments.last?.id, previousTail < Int.max {
+            // A new generation may start at most one ID after the prior tail. This is both the continuity
+            // fence and the bridge for a video playlist that has slid farther than subtitle settlement.
+            maximumStart = min(videoStart, previousTail + 1)
         } else {
-            start = videoStart
+            maximumStart = videoStart
         }
-        guard start >= 0, start <= videoTail else { return nil }
+        guard lowerBound >= 0, lowerBound <= maximumStart, maximumStart <= videoTail else { return nil }
 
-        let selected = settledWindow.segments.filter { $0.id >= start && $0.id <= videoTail }
-        guard let first = selected.first, first.id == start else { return nil }
-        var expected = start
-        for segment in selected {
+        let available = settledWindow.segments.filter { $0.id >= lowerBound && $0.id <= videoTail }
+        guard let availableFirst = available.first, availableFirst.id == lowerBound,
+              let tail = available.last, tail.id <= videoTail else { return nil }
+        var expected = lowerBound
+        for segment in available {
             guard segment.id == expected else { return nil }
             if expected == Int.max { break }
             expected += 1
         }
-        guard let tail = selected.last, tail.id <= videoTail else { return nil }
+        // `terminal` is also the permission to relax the live floor, so it must describe a complete subtitle
+        // route rather than merely a producer that stopped while settlement still trails the video playlist.
+        guard !terminal || tail.id == videoTail else { return nil }
         if let previousWindow,
            let previousTail = previousWindow.segments.last?.id,
-           first.id > previousTail,
-           previousTail < Int.max,
-           previousTail + 1 < first.id {
+           tail.id < previousTail {
             return nil
         }
-        return VortXHLSWindow(segments: selected)
+
+        // Scan backward to keep retention bounded at the latest legal start. A short startup generation already
+        // advertised by the master may grow at that same head, but removing its head must retain the live floor.
+        // A short removed suffix violates the live-window contract and AVPlayer may stop polling it. Only
+        // complete terminal settlement may relax the floor, because it proves no late cue can fill the interval.
+        for index in available.indices.reversed() where available[index].id <= maximumStart {
+            let selected = Array(available[index...])
+            let headAdvances = previousWindow.map {
+                selected.first?.id != $0.mediaSequence
+            } ?? true
+            guard terminal
+                    || !headAdvances
+                    || (selected.count >= minimumSegmentCount
+                        && (DVPlaybackPolicy.renderedDurationMilliseconds(
+                            of: VortXHLSWindow(segments: selected)) ?? -1)
+                            >= minimumRenderedDurationMilliseconds) else {
+                continue
+            }
+            return VortXHLSWindow(segments: selected)
+        }
+        return nil
     }
 }
 

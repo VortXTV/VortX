@@ -1697,10 +1697,20 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             // just that optional route rather than converting a subtitle defect into a video 410 / HDR demotion.
             selectedSubtitles = lastPublishedSubtitleWindow
         } else if let settledWindow = snapshot.subtitleWindow,
+                  let liveRemovalFloor = VortXHLSSubtitlePublicationPolicy.liveRemovalFloorMilliseconds(
+                    frozenTargetSeconds: startupReadiness.frozenTarget.seconds),
                   let candidate = VortXHLSSubtitlePublicationPolicy.coherentWindow(
                     settledWindow: settledWindow,
                     videoWindow: selectedVideo,
-                    previousWindow: lastPublishedSubtitleWindow) {
+                    previousWindow: lastPublishedSubtitleWindow,
+                    minimumSegmentCount: startupReadiness.minimumSegmentCount,
+                    minimumRenderedDurationMilliseconds: max(
+                        startupReadiness.minimumRenderedDurationMilliseconds,
+                        liveRemovalFloor),
+                    // Floor relaxation and ENDLIST must use the same route-complete edge. A stopped producer
+                    // whose settled subtitle tail still trails the selected video window remains live.
+                    terminal: ended
+                        && settledWindow.segments.last?.id == selectedVideo.segments.last?.id) {
             let outcome: VortXMKVRemuxStream.SubtitleBackingOutcome
             if advertisedSubtitles.allSatisfy({
                 $0.id >= 0 && $0.id < snapshot.subtitleCues.count

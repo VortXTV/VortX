@@ -2357,36 +2357,157 @@ enum PlayerLiveContractTests {
                   && frozenRoute.spillOutcome([.init(
                     key: subtitle1, data: fiveBytes, durationMilliseconds: 1_000)]) == .committed)
 
-        func window(_ ids: ClosedRange<Int>) -> VortXHLSWindow {
+        func window(_ ids: ClosedRange<Int>, duration: Double = 1) -> VortXHLSWindow {
             VortXHLSWindow(segments: ids.map {
                 VortXHLSSegment(
                     id: $0,
                     byteOffset: $0 * 10,
                     byteLength: 10,
-                    start: Double($0),
-                    duration: 1)
+                    start: Double($0) * duration,
+                    duration: duration)
             })
         }
         let initialSubtitle = window(0...8)
         let laggingSubtitle = VortXHLSSubtitlePublicationPolicy.coherentWindow(
             settledWindow: window(0...9),
             videoWindow: window(0...10),
-            previousWindow: initialSubtitle)
+            previousWindow: initialSubtitle,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 1,
+            terminal: false)
         check("optional subtitle lag: settled prefix grows while video publishes an unblocked newer tail",
               laggingSubtitle?.segments.map(\.id) == Array(0...9))
         let bridgeSubtitle = VortXHLSSubtitlePublicationPolicy.coherentWindow(
             settledWindow: window(0...12),
             videoWindow: window(12...13),
-            previousWindow: laggingSubtitle)
+            previousWindow: laggingSubtitle,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 1,
+            terminal: false)
         let slidSubtitle = bridgeSubtitle.flatMap {
             VortXHLSSubtitlePublicationPolicy.coherentWindow(
                 settledWindow: window(0...13),
                 videoWindow: window(12...14),
-                previousWindow: $0)
+                previousWindow: $0,
+                minimumSegmentCount: 1,
+                minimumRenderedDurationMilliseconds: 1,
+                terminal: false)
         }
         check("optional subtitle lag: a retained route bridges missed video starts, then slides only over overlap",
-              bridgeSubtitle?.segments.map(\.id) == Array(0...12)
+              bridgeSubtitle?.segments.map(\.id) == Array(10...12)
                   && slidSubtitle?.segments.map(\.id) == Array(12...13))
+        let floorRetained = window(0...11)
+        let belowLiveFloor = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...12),
+            videoWindow: window(10...21),
+            previousWindow: floorRetained,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 12_000,
+            terminal: false)
+        let conformingLag = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...21),
+            videoWindow: window(10...21),
+            previousWindow: floorRetained,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 12_000,
+            terminal: false)
+        let regressingTail = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...15),
+            videoWindow: window(0...30),
+            previousWindow: window(0...20),
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 1,
+            terminal: false)
+        let terminalShortTail = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...2),
+            videoWindow: window(0...2),
+            previousWindow: nil,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 12_000,
+            terminal: true)
+        let incompleteTerminal = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...2),
+            videoWindow: window(0...3),
+            previousWindow: nil,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 12_000,
+            terminal: true)
+        check("optional subtitle lag: live candidates choose the earliest needed overlap to meet their own floor",
+              belowLiveFloor?.segments.map(\.id) == Array(1...12)
+                  && conformingLag?.segments.map(\.id) == Array(10...21))
+        check("optional subtitle lag: a shorter settled tail cannot regress the published route, except at complete terminal",
+              regressingTail == nil
+                  && terminalShortTail?.segments.map(\.id) == Array(0...2)
+                  && incompleteTerminal == nil)
+        let rollingStart = window(0...2, duration: 6)
+        let rollingOne = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...2, duration: 6),
+            videoWindow: window(1...3, duration: 6),
+            previousWindow: rollingStart,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: 18_000,
+            terminal: false)
+        let rollingTwo = rollingOne.flatMap {
+            VortXHLSSubtitlePublicationPolicy.coherentWindow(
+                settledWindow: window(0...3, duration: 6),
+                videoWindow: window(2...4, duration: 6),
+                previousWindow: $0,
+                minimumSegmentCount: 1,
+                minimumRenderedDurationMilliseconds: 18_000,
+                terminal: false)
+        }
+        let rollingThree = rollingTwo.flatMap {
+            VortXHLSSubtitlePublicationPolicy.coherentWindow(
+                settledWindow: window(0...4, duration: 6),
+                videoWindow: window(3...5, duration: 6),
+                previousWindow: $0,
+                minimumSegmentCount: 1,
+                minimumRenderedDurationMilliseconds: 18_000,
+                terminal: false)
+        }
+        check("optional subtitle lag: a one-segment settle delay keeps advancing through floor-conforming overlap",
+              rollingOne?.segments.map(\.id) == Array(0...2)
+                  && rollingTwo?.segments.map(\.id) == Array(1...3)
+                  && rollingThree?.segments.map(\.id) == Array(2...4))
+        let liveRemovalFloor = VortXHLSSubtitlePublicationPolicy.liveRemovalFloorMilliseconds(
+            frozenTargetSeconds: 12)
+        let shortStartup = window(0...1, duration: 6)
+        let shortAppend = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...3, duration: 6),
+            videoWindow: window(1...3, duration: 6),
+            previousWindow: shortStartup,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: liveRemovalFloor ?? Int.max,
+            terminal: false)
+        let firstLegalSlide = shortAppend.flatMap {
+            VortXHLSSubtitlePublicationPolicy.coherentWindow(
+                settledWindow: window(0...6, duration: 6),
+                videoWindow: window(2...6, duration: 6),
+                previousWindow: $0,
+                minimumSegmentCount: 1,
+                minimumRenderedDurationMilliseconds: liveRemovalFloor ?? Int.max,
+                terminal: false)
+        }
+        let initialShortLive = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...1, duration: 6),
+            videoWindow: window(0...1, duration: 6),
+            previousWindow: nil,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: liveRemovalFloor ?? Int.max,
+            terminal: false)
+        let initialShortTerminal = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...1, duration: 6),
+            videoWindow: window(0...1, duration: 6),
+            previousWindow: nil,
+            minimumSegmentCount: 1,
+            minimumRenderedDurationMilliseconds: liveRemovalFloor ?? Int.max,
+            terminal: true)
+        check("optional subtitle live floor: short startup appends at its old head, then slides only with three targets",
+              liveRemovalFloor == 36_000
+                  && shortAppend?.segments.map(\.id) == Array(0...3)
+                  && firstLegalSlide?.segments.map(\.id) == Array(1...6)
+                  && initialShortLive == nil
+                  && initialShortTerminal?.segments.map(\.id) == Array(0...1))
 
         guard let broken = VortXHLSSessionSpool(
             parentDirectory: root,
@@ -2985,6 +3106,10 @@ enum PlayerLiveContractTests {
             engine, from: "private func externalSubtitleTracks()", to: "func setAudioTrack(")
         let externalSubtitleSelection = sourceSection(
             engine, from: "func setSubtitleTrack(_ id: Int) {", to: "/// Select option `id`")
+        let nativeSubtitleSelection = sourceSection(
+            engine,
+            from: "private func selectNativeSubtitle(",
+            to: "private func setExternalSubtitleActive(")
         let externalSubtitleLoad = sourceSection(
             engine, from: "func addExternalSubtitle(url: String",
             to: "/// Stop rendering the external overlay subtitle")
@@ -3281,6 +3406,12 @@ enum PlayerLiveContractTests {
               rollingPublication?.contains("var subtitleTerminated = subtitleDegraded(snapshot)") == true
                   && rollingPublication?.contains("ensureSubtitleBackings(window: candidate") == true
                   && rollingPublication?.contains("VortXHLSSubtitlePublicationPolicy.coherentWindow(") == true
+                  && rollingPublication?.contains("liveRemovalFloorMilliseconds(") == true
+                  && rollingPublication?.contains("minimumRenderedDurationMilliseconds:") == true
+                  && rollingPublication?.contains("max(") == true
+                  && rollingPublication?.contains("terminal: ended") == true
+                  && rollingPublication?.contains(
+                    "settledWindow.segments.last?.id == selectedVideo.segments.last?.id") == true
                   && rollingPublication?.contains("selectedSubtitles = lastPublishedSubtitleWindow") == true
                   && rollingPublication?.contains("subtitleRouteTerminated = true") == true
                   && rollingPublication?.contains("let subtitleEnded = subtitleTerminated") == true
@@ -3880,9 +4011,24 @@ enum PlayerLiveContractTests {
                   && engine?.contains("case \"sub\":   return subTracks + externalSubtitleTracks()") == true
                   && externalSubtitleRow?.contains("selected: externalSubActive") == true)
         check("wiring: an external subtitle load and its re-selection both republish the track list",
-              externalSubtitleSelection?.contains("publishSelectionTracks()") == true
+              externalSubtitleSelection?.contains(
+                "selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)") == true
                   && externalSubtitleLoad?.contains("self.externalSubLabel = (title: title, lang: lang)") == true
-                  && externalSubtitleLoad?.contains("self.publishSelectionTracks()") == true)
+                  && externalSubtitleLoad?.contains(
+                    "self.selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)") == true
+                  && sourceContainsInOrder(nativeSubtitleSelection, [
+                    "subtitleSelectionRevision &+= 1",
+                    "let revision = subtitleSelectionRevision",
+                    "let generation = itemGeneration",
+                    "setExternalSubtitleActive(false)",
+                    "item.select(requested, in: group)",
+                    "refreshSelectionTracks(for: item)",
+                    "self.subtitleSelectionRevision == revision",
+                    "selectionContextIsCurrent(",
+                    "item.currentMediaSelection.selectedMediaOption(in: group) == requested",
+                    "self.setExternalSubtitleActive(activatingExternalAfterSettlement)",
+                    "self.refreshSelectionTracks(for: item)",
+                  ]))
         check("wiring: the ticked-row identity includes the external subtitle",
               sourceContainsInOrder(selectionRefresh, [
                   "let nativeSubtitleID =",
@@ -4223,17 +4369,17 @@ enum PlayerLiveContractTests {
         check("wiring: an external overlay excludes a late-discovered native subtitle group",
               sourceContainsInOrder(groupLoad, [
                   "player.appliesMediaSelectionCriteriaAutomatically = false",
-                  "if externalSubActive {",
-                  "select(-1, in: sg)",
+                  "if externalSubActive || pendingExternalSubtitleActivation {",
+                  "selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)",
               ]))
         check("wiring: immediate external subtitle activation uses the authoritative deselect helper",
               sourceContainsInOrder(externalSubtitleLoad, [
-                  "self.externalSubActive = true",
                   "self.externalSubLabel = (title: title, lang: lang)",
-                  "self.select(-1, in: self.subGroup)",
-                  "self.publishSelectionTracks()",
+                  "self.selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)",
+                  "finish(true)",
               ])
-                  && externalSubtitleLoad?.contains("item.select(nil, in: group)") == false)
+                  && externalSubtitleLoad?.contains("self.externalSubActive = true") == false
+                  && nativeSubtitleSelection?.contains("setExternalSubtitleActive(false)") == true)
         check("wiring: AVPlayer status clears stale cache state when playback resumes",
               sourceContainsInOrder(avTimeControl, [
                   "let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate",
