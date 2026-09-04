@@ -583,7 +583,7 @@ func subtitleBackingRepeatScenario() {
     var snapshot: VortXMKVRemuxStream.HLSWindowSnapshot?
     while Date() < deadline {
         let candidate = stream.hlsWindowSnapshot()
-        if candidate.subtitleWindow != nil,
+        if candidate.subtitleWindow?.segments.isEmpty == false,
            !candidate.subtitleRenditions.isEmpty,
            candidate.subtitleCues.contains(where: { !$0.isEmpty }) {
             snapshot = candidate
@@ -592,24 +592,39 @@ func subtitleBackingRepeatScenario() {
         Thread.sleep(forTimeInterval: 0.1)
     }
     guard let snapshot,
-          let window = snapshot.subtitleWindow,
-          let rendition = snapshot.subtitleRenditions.first,
-          rendition.id < snapshot.subtitleCues.count else {
+          let settledWindow = snapshot.subtitleWindow,
+          !settledWindow.segments.isEmpty,
+          !snapshot.subtitleRenditions.isEmpty,
+          snapshot.subtitleRenditions.allSatisfy({
+              $0.id >= 0 && $0.id < snapshot.subtitleCues.count
+          }) else {
         check("subtitle backing repeat: settled cohort exists", red: true, detail: "no settled subtitle window")
         return
     }
-    let outcome1 = stream.ensureSubtitleBackings(
-        window: window, renditions: [(id: rendition.id, cues: snapshot.subtitleCues[rendition.id])])
-    let outcome2 = stream.ensureSubtitleBackings(
-        window: window, renditions: [(id: rendition.id, cues: snapshot.subtitleCues[rendition.id])])
-    let keys = window.segments.map { VortXHLSSessionSpool.ResourceKey.subtitle(
-        renditionID: rendition.id, segmentID: $0.id) }
+    let window = VortXHLSWindow(segments: Array(settledWindow.segments.prefix(2)))
+    let renditions = snapshot.subtitleRenditions.map {
+        (id: $0.id, cues: snapshot.subtitleCues[$0.id])
+    }
+    let outcome1 = stream.ensureSubtitleBackings(window: window, renditions: renditions)
+    let outcome2 = stream.ensureSubtitleBackings(window: window, renditions: renditions)
+    let keys = renditions.flatMap { rendition in
+        window.segments.map { VortXHLSSessionSpool.ResourceKey.subtitle(
+            renditionID: rendition.id, segmentID: $0.id) }
+    }
     check("subtitle backing repeat: first cohort ready", red: outcome1 != .ready, detail: "outcome=\(outcome1)")
     check("subtitle backing repeat: second cohort ready", red: outcome2 != .ready, detail: "outcome=\(outcome2)")
+    let openable = keys.allSatisfy { key in
+        guard let lease = stream.openHLSResource(key) else { return false }
+        lease.close()
+        return true
+    }
     check("subtitle backing repeat: every backing remains openable",
-          red: !keys.allSatisfy(stream.hasHLSResource), detail: "resources=\(keys.count)")
-    check("subtitle backing repeat: no subtitle failure", red: snapshot.subtitleFailureReason != nil,
-          detail: "failure=\(String(describing: snapshot.subtitleFailureReason))")
+          red: !openable, detail: "resources=\(keys.count)")
+    let subtitleFailure = stream.hlsWindowSnapshot().subtitleFailureReason
+    let videoFailure = stream.buffer.status().failure
+    check("subtitle backing repeat: live stream remains healthy after both calls",
+          red: subtitleFailure != nil || videoFailure != nil,
+          detail: "subtitle=\(String(describing: subtitleFailure)) video=\(String(describing: videoFailure))")
 }
 
 /// Serve the fixture over the conformance range server at a PACED byte rate, so the producer and the player
