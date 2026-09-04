@@ -145,6 +145,7 @@ struct FocusedHero: Codable, Equatable, Hashable, Identifiable {
     let overview: String?
     var genreLine: String?    // "Drama · Fantasy · Adventure" (optional so older caches decode)
     var logo: String?         // clearlogo URL (add-on meta.logo or metahub); optional so older caches decode
+    var allowsUltraHD: Bool?  // optional so older cached heroes decode conservatively
 }
 
 /// The standard Stremio background art for an IMDB-identified title: real 16:9 backdrop art at
@@ -171,7 +172,8 @@ extension CoreMeta {
         return FocusedHero(id: id, type: type, title: name,
                            backdrop: background ?? metahubBackground(for: id) ?? poster,
                            metaLine: parts.joined(separator: "  ·  "), overview: description,
-                           genreLine: genreLine, logo: logo ?? metahubLogo(for: id))
+                           genreLine: genreLine, logo: logo ?? metahubLogo(for: id),
+                           allowsUltraHD: background != nil || metahubBackground(for: id) != nil)
     }
 }
 
@@ -183,7 +185,8 @@ extension CoreCWItem {
         let line = pct > 0 ? "\(type.capitalized)  ·  \(pct)% watched" : type.capitalized
         return FocusedHero(id: id, type: type, title: name,
                            backdrop: metahubBackground(for: id) ?? poster,
-                           metaLine: line, overview: nil, genreLine: nil, logo: metahubLogo(for: id))
+                           metaLine: line, overview: nil, genreLine: nil, logo: metahubLogo(for: id),
+                           allowsUltraHD: metahubBackground(for: id) != nil)
     }
 }
 
@@ -239,12 +242,13 @@ extension CoreCWItem {
                            backdrop: cached.backdrop ?? hero.backdrop,
                            metaLine: line, overview: cached.overview ?? hero.overview,
                            genreLine: cached.genreLine ?? hero.genreLine,
-                           logo: cached.logo ?? hero.logo)
+                           logo: cached.logo ?? hero.logo,
+                           allowsUltraHD: cached.allowsUltraHD ?? hero.allowsUltraHD)
     }
 
     /// Capture what the detail page knows (the engine resolves EVERY id scheme, tmdb: included), so
     /// any title you have opened shows its real backdrop, rating, and synopsis in the hero forever.
-    static func noteMeta(id: String, type: String, title: String, backdrop: String?,
+    static func noteMeta(id: String, type: String, title: String, backdrop: String?, allowsUltraHD: Bool,
                          releaseInfo: String?, imdbRating: String?, runtime: String?,
                          overview: String?, genres: [String]?) {
         loadCacheIfNeeded()
@@ -256,7 +260,7 @@ extension CoreCWItem {
         let genreLine = (genres?.isEmpty == false) ? genres!.prefix(3).joined(separator: " · ") : nil
         let hero = FocusedHero(id: id, type: type, title: title, backdrop: backdrop,
                                metaLine: parts.joined(separator: "  ·  "), overview: overview,
-                               genreLine: genreLine, logo: metahubLogo(for: id))
+                               genreLine: genreLine, logo: metahubLogo(for: id), allowsUltraHD: allowsUltraHD)
         guard enrichmentCache[id] != hero else { return }
         storeEnrichment(id, hero)
         saveCache()
@@ -366,7 +370,8 @@ extension CoreCWItem {
                                            backdrop: meta.background ?? hero.backdrop,
                                            metaLine: parts.joined(separator: "  ·  "),
                                            overview: meta.description, genreLine: genreLine,
-                                           logo: meta.logo ?? hero.logo)
+                                           logo: meta.logo ?? hero.logo,
+                                           allowsUltraHD: meta.background != nil || hero.allowsUltraHD == true)
                 await MainActor.run {
                     Self.storeEnrichment(hero.id, enriched)
                     Self.saveCache()
@@ -463,7 +468,7 @@ struct BrowseHeroBackdrop<TrailerLayer: View>: View {
         ZStack(alignment: .topLeading) {
             Theme.Palette.canvas.ignoresSafeArea()
             if let hero = model.hero {
-                FullBleedBackdrop(url: hero.backdrop)
+                FullBleedBackdrop(url: hero.backdrop, allowsUltraHD: hero.allowsUltraHD ?? false)
                     .id(hero.id)
                     .transition(.opacity)
                 // The muted trailer clip sits OVER the still backdrop but UNDER the details, so a

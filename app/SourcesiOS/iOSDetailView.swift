@@ -5422,7 +5422,7 @@ private struct iOSEpisodeThumbImage: View {
 
     private var warmCache: VXPosterImage? {
         guard let url, let parsed = URL(string: url) else { return nil }
-        return PosterImageLoader.cached(parsed)
+        return PosterImageLoader.cached(parsed, maxPixel: Self.maxPixel)
     }
 
     @State private var image: VXPosterImage?

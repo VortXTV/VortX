@@ -150,6 +150,74 @@ actor PosterImageNegativeCache {
     }
 }
 
+/// A synchronous, explicit LRU for decoded images. `NSCache` is intentionally not used here: its limits are
+/// eviction hints, while decoded 4K images need hard count and byte ceilings alongside playback buffers.
+///
+/// `@unchecked Sendable` is safe because every mutable field below is accessed only while `lock` is held.
+/// Stored values are returned as the platform image objects the caller already owns; the cache never mutates
+/// a value after insertion.
+final class DecodedImageLRU<Value>: @unchecked Sendable {
+    private struct Entry {
+        let value: Value
+        let cost: Int
+        var tick: UInt64
+    }
+
+    private let lock = NSLock()
+    private let countCapacity: Int
+    private let byteCapacity: Int
+    private var entries: [String: Entry] = [:]
+    private var totalCost = 0
+    private var nextTick: UInt64 = 0
+
+    init(countCapacity: Int, byteCapacity: Int) {
+        self.countCapacity = max(1, countCapacity)
+        self.byteCapacity = max(1, byteCapacity)
+    }
+
+    func value(forKey key: String) -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = entries[key] else { return nil }
+        entry.tick = nextTick
+        nextTick &+= 1
+        entries[key] = entry
+        return entry.value
+    }
+
+    /// Inserts only when the actual decoded cost fits. A replacement first releases its old cost, then least
+    /// recently used entries are evicted until both hard limits permit the new image.
+    @discardableResult
+    func insert(_ value: Value, forKey key: String, cost: Int) -> Bool {
+        guard cost > 0, cost <= byteCapacity else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        if let old = entries.removeValue(forKey: key) { totalCost -= old.cost }
+        while entries.count >= countCapacity || totalCost > byteCapacity - cost {
+            guard let oldest = entries.min(by: { $0.value.tick < $1.value.tick })?.key,
+                  let evicted = entries.removeValue(forKey: oldest) else { break }
+            totalCost -= evicted.cost
+        }
+        guard entries.count < countCapacity, totalCost <= byteCapacity - cost else { return false }
+        entries[key] = Entry(value: value, cost: cost, tick: nextTick)
+        nextTick &+= 1
+        totalCost += cost
+        return true
+    }
+
+    func residentCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries.count
+    }
+
+    func residentCost() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return totalCost
+    }
+}
+
 #if !POSTER_NEGATIVE_CACHE_POLICY_TESTING
 /// The single poster / catalog-art byte loader shared by every native Apple surface (iPhone, iPad, Mac,
 /// tvOS). It exists because the app was decoding poster bytes ON the main actor and fetching every poster
@@ -167,7 +235,7 @@ actor PosterImageNegativeCache {
 ///      time, never hundreds at once (which is what starved individual posters into coming back empty).
 ///   3. OFF-MAIN decode + downsample via ImageIO, so the main thread never decodes a poster while scrolling.
 ///
-/// A decoded in-memory `NSCache` sits on top so a poster shown in several rails decodes once. Every miss is
+/// A decoded in-memory LRU sits on top so a poster shown in several rails decodes once. Every miss is
 /// retried on the next appear (a scroll-away cancel is not a failure), so a transient miss never latches a
 /// permanently blank card. Callers keep their own frame / crop / clip; this only returns the decoded image.
 enum PosterImageLoader {
@@ -328,41 +396,49 @@ enum PosterImageLoader {
         }
     }
     private static let gate = ConcurrencyGate(limit: 6)
+    /// A single large ImageIO decode at a time avoids a hero transition competing with another 4K decode for
+    /// CPU and transient bitmap memory. Normal poster work retains the six-request pipeline above.
+    private static let ultraHDGate = ConcurrencyGate(limit: 1)
 
     // MARK: decoded-image memory cache
 
-    /// In-memory decoded cache on top of the URLCache (bytes). Keyed by the resolved URL so a poster shown in
-    /// several rails decodes once; evicted under memory pressure by `NSCache`.
+    /// In-memory decoded cache on top of the URLCache (bytes). A key includes the decode ceiling, so a warm
+    /// 1280 px backdrop cannot satisfy a later 4K hero request. The LRU enforces hard count and byte limits.
     ///
     /// Bounded by BOTH count and bytes, because a count alone bounds nothing that matters. 500 entries of
     /// decoded bitmap is a memory figure only if every entry is the same size, and they are not: `maxPixel`
     /// is per-call (a hero backdrop is far larger than a rail card), so the same 500 entries can be tens of
-    /// MB or, at the largest sizes this loader hands out, on the order of a gigabyte. A cache whose worst
-    /// case is that far from its typical case is not a bound. `totalCostLimit` makes the byte figure the
-    /// real ceiling and leaves `countLimit` as the cheap guard on tiny images.
+    /// MB or, at the largest sizes this loader hands out, on the order of a gigabyte. The explicit LRU makes
+    /// the byte figure the real ceiling and keeps the entry count as a separate hard guard on tiny images.
     ///
-    /// NSCache's own memory-pressure eviction is not a substitute: it reacts after the fact, and a jetsam
-    /// kill does not wait for it.
-    private static let memory: NSCache<NSURL, VXPosterImage> = {
-        let c = NSCache<NSURL, VXPosterImage>()
-        c.countLimit = 500
-        c.totalCostLimit = 256 * 1024 * 1024
-        return c
-    }()
+    private static let memory = DecodedImageLRU<VXPosterImage>(
+        countCapacity: 500,
+        byteCapacity: HeroArtworkQualityPolicy.standardDecodedCacheBytes
+    )
 
-    /// Bytes one decoded poster occupies: 4 bytes per pixel of the backing bitmap. Read from the CGImage
-    /// (the true decoded dimensions) and not from `size`, which is in points and would undercount a Retina
-    /// image by its scale squared. Falls back to the point size scaled up when no CGImage is reachable, and
-    /// never returns 0: a 0 cost is exempt from `totalCostLimit`, which would silently reopen the hole this
-    /// bound exists to close.
+    /// 4K is a property of the active hero, not of the catalog. Keep it isolated from card artwork and cap it
+    /// to the current hero plus one immediate replacement, avoiding a carousel-wide decoded 4K residency.
+    private static let ultraHDMemory = DecodedImageLRU<VXPosterImage>(
+        countCapacity: HeroArtworkQualityPolicy.maximumResident4KImages,
+        byteCapacity: HeroArtworkQualityPolicy.ultraHDDecodedCacheBytes
+    )
+
+    private static func decodedMemory(maxPixel: Int) -> DecodedImageLRU<VXPosterImage> {
+        maxPixel >= HeroArtworkQualityPolicy.ultraHDLongEdge ? ultraHDMemory : memory
+    }
+
+    /// Bytes one decoded poster occupies, measured from the backing bitmap's `bytesPerRow * height`. This is
+    /// more accurate than assuming four bytes per pixel because Core Graphics may align rows. Falls back to a
+    /// conservative point-size estimate when no CGImage is reachable, and never returns 0 so LRU accounting
+    /// cannot admit an uncounted image.
     private static func decodedCost(_ image: VXPosterImage) -> Int {
         #if canImport(UIKit)
-        if let cg = image.cgImage { return max(1, cg.width * cg.height * 4) }
+        if let cg = image.cgImage { return decodedCost(bytesPerRow: cg.bytesPerRow, height: cg.height) }
         let scale = image.scale
         return pointCost(width: image.size.width * scale, height: image.size.height * scale)
         #elseif canImport(AppKit)
         if let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-            return max(1, cg.width * cg.height * 4)
+            return decodedCost(bytesPerRow: cg.bytesPerRow, height: cg.height)
         }
         return pointCost(width: image.size.width, height: image.size.height)
         #else
@@ -370,10 +446,14 @@ enum PosterImageLoader {
         #endif
     }
 
+    private static func decodedCost(bytesPerRow: Int, height: Int) -> Int {
+        guard bytesPerRow > 0, height > 0, bytesPerRow <= Int.max / height else { return Int.max }
+        return bytesPerRow * height
+    }
+
     /// The point-size fallback, guarded. `Int(Double)` TRAPS on a non-finite or out-of-range value, and this
     /// path runs only when no CGImage was reachable - exactly the degenerate-image case where a NaN or infinite
-    /// `size` is plausible. Falling back to the floor of 1 keeps the entry countable (a 0 cost would be exempt
-    /// from `totalCostLimit`, reopening the hole this bound exists to close) instead of crashing on it.
+    /// `size` is plausible. Falling back to the floor of 1 keeps the entry countable instead of crashing on it.
     private static func pointCost(width: Double, height: Double) -> Int {
         guard width.isFinite, height.isFinite, width > 0, height > 0 else { return 1 }
         // Clamp before converting: the product (and its 4-byte multiply) must not overflow either. A million
@@ -384,7 +464,12 @@ enum PosterImageLoader {
     }
 
     /// A synchronous decoded-cache peek so a view can paint instantly on a cache hit without a task hop.
-    static func cached(_ url: URL) -> VXPosterImage? { memory.object(forKey: url as NSURL) }
+    static func cached(_ url: URL, maxPixel: CGFloat = 900) -> VXPosterImage? {
+        let pixel = Int(maxPixel)
+        return decodedMemory(maxPixel: pixel).value(
+            forKey: HeroArtworkQualityPolicy.decodedCacheIdentity(url: url, maxPixel: pixel)
+        )
+    }
 
     // MARK: load
 
@@ -396,18 +481,27 @@ enum PosterImageLoader {
             VXProbe.log("poster", "load BAIL bad/empty host=\(probeHost(urlString)) -> nil")
             return nil
         }
-        if let hit = memory.object(forKey: url as NSURL) {
+        let pixel = Int(maxPixel)
+        let cacheKey = HeroArtworkQualityPolicy.decodedCacheIdentity(url: url, maxPixel: pixel)
+        let imageMemory = decodedMemory(maxPixel: pixel)
+        if let hit = imageMemory.value(forKey: cacheKey) {
             return hit
         }
         let key = PosterImageNegativeCacheKey(
             url: url,
             variant: .poster,
-            maxPixel: Int(maxPixel)
+            maxPixel: pixel
         )
         if await negativeCache.shouldSuppress(key) {
             return nil
         }
 
+        // Serialize large decodes before taking one of the six normal image permits. Otherwise several 4K
+        // waiters could occupy the normal pipeline while queued behind the one large-decode slot.
+        if pixel >= HeroArtworkQualityPolicy.ultraHDLongEdge {
+            guard await ultraHDGate.acquire() else { return nil }
+            defer { Task { await ultraHDGate.release() } }
+        }
         // A cancelled acquire holds NO permit, so return without releasing (releasing here would free a permit
         // we never took and let `active` drift below zero, over-admitting loads). Only release when granted.
         guard await gate.acquire() else {
@@ -420,7 +514,7 @@ enum PosterImageLoader {
         }
         // A queued request may have waited behind an identical failure or success. Recheck after acquiring
         // so the queue does not immediately repeat work that completed while this task was suspended.
-        if let hit = memory.object(forKey: url as NSURL) {
+        if let hit = imageMemory.value(forKey: cacheKey) {
             return hit
         }
         if await negativeCache.shouldSuppress(key) {
@@ -439,14 +533,17 @@ enum PosterImageLoader {
             return nil
         }
         // Decode + downsample OFF the main thread so scrolling never blocks on a poster decode.
+        guard !Task.isCancelled else { return nil }
         guard let image = decode(data, maxPixel: maxPixel) else {
             cache.removeCachedResponse(for: req)
             await negativeCache.record(key, failure: .terminal)
             VXProbe.log("poster", "decode FAILED host=\(probeHost(raw)) bytes=\(data.count) -> nil-because-failed")
             return nil
         }
+        guard !Task.isCancelled else { return nil }
         await negativeCache.clear(key)
-        memory.setObject(image, forKey: url as NSURL, cost: decodedCost(image))
+        guard !Task.isCancelled else { return nil }
+        imageMemory.insert(image, forKey: cacheKey, cost: decodedCost(image))
         return image
     }
 

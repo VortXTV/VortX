@@ -349,7 +349,7 @@ struct AddonsView: View {
 
         private var warmCache: VXPosterImage? {
             guard let logo, let u = URL(string: logo) else { return nil }
-            return PosterImageLoader.cached(u)
+            return PosterImageLoader.cached(u, maxPixel: 168)
         }
 
         var body: some View {

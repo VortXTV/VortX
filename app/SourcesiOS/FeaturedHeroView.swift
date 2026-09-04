@@ -558,9 +558,6 @@ private enum KenBurnsPan {
     static let offsetY: CGFloat = 8
     static let duration: CFTimeInterval = 18
     static let animationKey = "vortxKenBurns"
-    /// Backdrops are wider than portrait posters, so the shared loader's larger 16:9 downsample ceiling
-    /// (the same 1280 the landscape backdrop cache uses) keeps the hero art crisp.
-    static let maxPixel: CGFloat = 1280
 
     /// A scale about the centre (anchorPoint .5,.5) plus an UN-scaled translate, matching SwiftUI's
     /// `.scaleEffect(anchor: .center)` then `.offset(...)` (the offset is applied after, not multiplied by,
@@ -633,11 +630,16 @@ private enum KenBurnsPan {
 /// representable's coordinator so a host torn down mid-load (the per-title rotation) cancels cleanly.
 private final class KenBurnsLoader {
     private var task: Task<Void, Never>?
+    private var requestID = ""
 
-    func load(backdrop: String?, poster: String?, into layer: CALayer) {
+    func load(backdrop: String?, poster: String?, maxPixel: Int, into layer: CALayer) {
+        let backdropURL = HeroArtworkQualityPolicy.preferredURL(backdrop, maxPixel: maxPixel)
+        let requestID = "\(backdropURL ?? poster ?? "")#\(maxPixel)"
+        guard self.requestID != requestID else { return }
+        self.requestID = requestID
         task?.cancel()
         task = Task { [weak layer] in
-            let cg = await Self.bestArt(backdrop: backdrop, poster: poster)
+            let cg = await Self.bestArt(backdrop: backdropURL, poster: poster, maxPixel: maxPixel)
             guard let cg, !Task.isCancelled, let layer else { return }
             let width = cg.width, height = cg.height
             await MainActor.run {
@@ -660,10 +662,13 @@ private final class KenBurnsLoader {
         NSLog("[kenburns] contents set %dx%d", width, height)
     }
 
-    private static func bestArt(backdrop: String?, poster: String?) async -> CGImage? {
-        if let img = await PosterImageLoader.load(backdrop, maxPixel: KenBurnsPan.maxPixel),
+    private static func bestArt(backdrop: String?, poster: String?, maxPixel: Int) async -> CGImage? {
+        if let img = await PosterImageLoader.load(backdrop, maxPixel: CGFloat(maxPixel)),
            let cg = img.kenBurnsCGImage { return cg }
-        if let img = await PosterImageLoader.load(poster, maxPixel: KenBurnsPan.maxPixel),
+        if let img = await PosterImageLoader.load(
+            poster,
+            maxPixel: CGFloat(HeroArtworkQualityPolicy.mobileLongEdge)
+        ),
            let cg = img.kenBurnsCGImage { return cg }
         return nil
     }
@@ -716,21 +721,31 @@ private struct KenBurnsLayerHost: UIViewRepresentable {
     func makeUIView(context: Context) -> KenBurnsBackingView {
         let view = KenBurnsBackingView(frame: .zero)
         KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, into: view.artLayer)
+        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
         return view
     }
 
     func updateUIView(_ view: KenBurnsBackingView, context: Context) {
         KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
+        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
     }
 
     static func dismantleUIView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         coordinator.cancel()
     }
+
+    private func heroMaxPixel(for view: UIView) -> Int {
+        let bounds = view.window?.screen.nativeBounds ?? UIScreen.main.nativeBounds
+        return HeroArtworkQualityPolicy.maxPixel(
+            for: .mobile,
+            displayLongEdge: Int(max(bounds.width, bounds.height))
+        )
+    }
 }
 #elseif canImport(AppKit)
 private final class KenBurnsBackingView: NSView {
     let artLayer = CALayer()
+    var screenChanged: (() -> Void)?
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -739,6 +754,14 @@ private final class KenBurnsBackingView: NSView {
         layer?.addSublayer(artLayer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        screenChanged?()
+    }
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        screenChanged?()
+    }
     override func layout() {
         super.layout()
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -759,16 +782,34 @@ private struct KenBurnsLayerHost: NSViewRepresentable {
     func makeNSView(context: Context) -> KenBurnsBackingView {
         let view = KenBurnsBackingView(frame: .zero)
         KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, into: view.artLayer)
+        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        installScreenChangeHandler(on: view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: KenBurnsBackingView, context: Context) {
         KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
+        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        installScreenChangeHandler(on: view, coordinator: context.coordinator)
     }
 
     static func dismantleNSView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         coordinator.cancel()
+    }
+
+    private func heroMaxPixel(for view: NSView) -> Int {
+        let screen = view.window?.screen ?? NSScreen.main
+        let longEdge = max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor
+        return HeroArtworkQualityPolicy.maxPixel(for: .macOS, displayLongEdge: Int(longEdge))
+    }
+
+    /// SwiftUI reuses the representable's coordinator while replacing its value. Refresh this closure on every
+    /// update so a later screen move reloads the current hero rather than the artwork captured at first mount.
+    private func installScreenChangeHandler(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        view.screenChanged = { [weak view, weak coordinator] in
+            guard let view, let coordinator else { return }
+            coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        }
     }
 }
 #endif

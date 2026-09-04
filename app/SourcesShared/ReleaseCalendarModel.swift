@@ -610,7 +610,7 @@ private struct UpcomingPosterThumb: View {
     private var url: String? { PosterArtwork.poster(id: id, fallback: fallback) }
     private var warmCache: VXPosterImage? {
         guard let url, let parsed = URL(string: url) else { return nil }
-        return PosterImageLoader.cached(parsed)
+        return PosterImageLoader.cached(parsed, maxPixel: 132)
     }
 
     var body: some View {

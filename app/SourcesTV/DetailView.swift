@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Stable ids shared by movie, series, and episode detail scroll views. The anchor is non-focusable; the
 /// adjacent visible metadata target owns focus after an upward escape.
@@ -810,6 +811,7 @@ struct DetailView: View {
         guard let m = fencedMeta else { return }
         FocusedItemModel.noteMeta(id: m.id, type: type, title: m.name,
                                   backdrop: m.background ?? m.poster,
+                                  allowsUltraHD: m.background != nil,
                                   releaseInfo: m.releaseInfo, imdbRating: m.imdbRating,
                                   runtime: m.runtime, overview: m.description, genres: m.genres)
     }
@@ -898,7 +900,8 @@ struct DetailView: View {
                 // common case, full-bleed, never pillarboxed); .fit only when a series falls back to its
                 // portrait poster (no landscape background), to avoid cropping the tall art.
                 FullBleedBackdrop(url: meta.background ?? meta.poster,
-                                  contentMode: (meta.type == "series" && meta.background == nil) ? .fit : .fill)
+                                  contentMode: (meta.type == "series" && meta.background == nil) ? .fit : .fill,
+                                  allowsUltraHD: meta.background != nil)
                 heroTrailerLayer(meta).ignoresSafeArea()
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.xl) {
@@ -975,7 +978,7 @@ struct DetailView: View {
     /// upward) stays fixed. Still non-focusable, so the focus engine is untouched.
     private func moviePage(_ m: CoreMetaItem) -> some View {
         ZStack {
-            FullBleedBackdrop(url: m.background ?? m.poster)
+            FullBleedBackdrop(url: m.background ?? m.poster, allowsUltraHD: m.background != nil)
             // #44: the muted, looping trailer fades in OVER the still backdrop (full-bleed, behind the
             // scrolling content). Non-focusable + no hit-testing, so the focus engine is untouched.
             heroTrailerLayer(m).ignoresSafeArea()
@@ -1108,7 +1111,7 @@ struct DetailView: View {
 
     private func livePage(_ m: CoreMetaItem) -> some View {
         ZStack {
-            FullBleedBackdrop(url: m.background ?? m.poster)
+            FullBleedBackdrop(url: m.background ?? m.poster, allowsUltraHD: m.background != nil)
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     Spacer().frame(height: 380)
@@ -2088,7 +2091,7 @@ private struct EpisodeThumbImage: View {
 
     private var warmCache: VXPosterImage? {
         guard let url, let parsed = URL(string: url) else { return nil }
-        return PosterImageLoader.cached(parsed)
+        return PosterImageLoader.cached(parsed, maxPixel: Self.maxPixel)
     }
 
     @State private var image: VXPosterImage?
@@ -2198,7 +2201,8 @@ struct CoreEpisodeStreams: View {
 
     var body: some View {
         ZStack {
-            FullBleedBackdrop(url: currentVideo.thumbnail ?? meta.background ?? meta.poster)
+            FullBleedBackdrop(url: currentVideo.thumbnail ?? meta.background ?? meta.poster,
+                              allowsUltraHD: currentVideo.thumbnail != nil || meta.background != nil)
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.lg) {
@@ -2344,16 +2348,30 @@ struct FullBleedBackdrop: View {
     // tall image inside the wide hero band, so the series hero passes .fit. Defaults to .fill (movies + all
     // other call sites have a 16:9 backdrop and want it edge-to-edge), keeping those paths unchanged.
     var contentMode: ContentMode = .fill
+    var allowsUltraHD = true
     @EnvironmentObject private var theme: ThemeManager
+    @State private var image: UIImage?
+
+    private var maxPixel: Int {
+        let bounds = UIScreen.main.nativeBounds
+        let requested = HeroArtworkQualityPolicy.maxPixel(
+            for: .tvOS,
+            displayLongEdge: Int(max(bounds.width, bounds.height))
+        )
+        return allowsUltraHD ? requested : min(requested, HeroArtworkQualityPolicy.fullHDLongEdge)
+    }
+
+    private var preferredURL: String? {
+        HeroArtworkQualityPolicy.preferredURL(url, maxPixel: maxPixel)
+    }
 
     var body: some View {
         Color.clear
             .overlay {
-                AsyncImage(url: URL(string: url ?? "")) { phase in
-                    switch phase {
-                    case .success(let img): img.resizable().aspectRatio(contentMode: contentMode)
-                    default: Theme.Palette.surface1
-                    }
+                if let image {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+                } else {
+                    Theme.Palette.surface1
                 }
             }
             .clipped()
@@ -2370,6 +2388,15 @@ struct FullBleedBackdrop: View {
                 LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                                startPoint: .leading, endPoint: .center))
             .ignoresSafeArea()
+            .task(id: "\(preferredURL ?? "")#\(maxPixel)") {
+                guard let preferredURL else {
+                    image = nil
+                    return
+                }
+                guard let loaded = await PosterImageLoader.load(preferredURL, maxPixel: CGFloat(maxPixel)),
+                      !Task.isCancelled else { return }
+                image = loaded
+            }
     }
 }
 

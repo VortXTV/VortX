@@ -161,7 +161,7 @@ private struct iOSTileImage<Placeholder: View>: View {
 
     private var synchronousCache: VXPosterImage? {
         guard let raw = url, let u = URL(string: raw) else { return nil }
-        return PosterImageLoader.cached(u)
+        return PosterImageLoader.cached(u, maxPixel: maxPixel)
     }
 
     var body: some View {
