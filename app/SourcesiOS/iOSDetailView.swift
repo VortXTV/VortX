@@ -2246,8 +2246,8 @@ struct iOSDetailView: View {
     // MARK: Movie Watch Now + sources
 
     /// The movie hero action row, the touch/Mac twin of the tvOS detail action set: a **Watch**
-    /// button (best ranked source), a **Quality** picker (resolution tier → flavour variants), a
-    /// **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
+    /// button (best ranked source), **Quality** and session **Audio** pickers, a one-launch **Player**
+    /// picker, a **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
     @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
         let groups = rankedMovie().groups
@@ -2318,6 +2318,7 @@ struct iOSDetailView: View {
             // drops overflow onto the next line under the hero's hard width cap.
             FlowLayout(spacing: Theme.Space.sm) {
                 qualityMenu(groups)
+                movieAudioLanguageMenu
                 launchPlayerMenu
 
                 #if !os(tvOS)
@@ -2376,6 +2377,30 @@ struct iOSDetailView: View {
             }
             .buttonStyle(ChipButtonStyle())
         }
+    }
+
+    /// Movie-hero counterpart to `iOSSourceList.audioLanguageMenu`. The movie source list deliberately
+    /// hides its primary control bar because the hero owns those actions, so the same session-only filter
+    /// must be reachable here. This mutates only `SourceListModel.sessionAudioLanguages`: ranking refreshes
+    /// for the current detail session, while the profile's preferred-audio setting remains untouched.
+    @ViewBuilder private var movieAudioLanguageMenu: some View {
+        let selected = sourceList.sessionAudioLanguages?.first
+        let selectedLabel = selected.flatMap { code in
+            TrackPreferences.commonLanguages.first(where: { $0.id == code })?.label
+        }
+        Menu {
+            Button("Auto") { sourceList.sessionAudioLanguages = nil }
+            ForEach(TrackPreferences.commonLanguages, id: \.id) { lang in
+                Button(lang.label) { sourceList.sessionAudioLanguages = [lang.id] }
+            }
+        } label: {
+            Label(selectedLabel ?? "Audio",
+                  systemImage: "captions.bubble")
+        }
+        .buttonStyle(ChipButtonStyle(selected: selected != nil))
+        .accessibilityLabel("Audio")
+        .accessibilityValue(selectedLabel ?? "Auto")
+        .accessibilityHint("Changes source ranking for this title without changing your saved audio preference.")
     }
 
     private var launchPlayerLabel: String {

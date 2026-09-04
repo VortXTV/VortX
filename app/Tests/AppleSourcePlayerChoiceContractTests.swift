@@ -55,6 +55,22 @@ private func ordered(_ needles: [String], in source: String) -> Bool {
     return true
 }
 
+/// The movie hero may update its ephemeral source-ranking state, but must never write an audio preference
+/// or any persistence store from a Menu action. Kept as a source contract because the production view is
+/// SwiftUI-only and this executable suite deliberately does not link the app target.
+private func hasOnlySessionAudioMenuWrites(_ menu: String) -> Bool {
+    let actions = section(menu, from: "Menu {", to: "} label:")
+    guard actions.contains("sourceList.sessionAudioLanguages = nil"),
+          actions.contains("sourceList.sessionAudioLanguages = [lang.id]") else { return false }
+    return ![
+        "TrackPreferences.$audioLanguages",
+        "TrackPreferences.audioLanguages",
+        "UserDefaults",
+        ".save(",
+        ".set("
+    ].contains(where: actions.contains)
+}
+
 /// Small executable mirror of the tvOS watchdog ownership boundary. The production assertion below proves the
 /// first-frame callback calls the real helper; this model makes the normal source/episode replacement sequence
 /// fail if a future edit leaves the watchdog holding the retired item's generation.
@@ -325,6 +341,48 @@ private enum AppleSourcePlayerChoiceContractTests {
               tvTrickplay.contains("player is AVPlayerEngineController")
                 && tvTrickplay.contains(".avPlayerVideoOutput")
                 && tvTrickplay.contains(".libmpvInlineDrawable"))
+
+        let movieHeroActions = section(iosDetail, from: "@ViewBuilder private func watchNow", to: "/// Two-level Quality picker")
+        let movieAudioMenu = section(iosDetail, from: "@ViewBuilder private var movieAudioLanguageMenu", to: "private var launchPlayerLabel")
+        let sourceControlBar = section(iosDetail, from: "@ViewBuilder private var controlBar", to: "/// The visible quality dropdown")
+        let inPlayerSources = section(player, from: "private func sourceRows()", to: "private func sourceLabel")
+        check("movie hero exposes session Audio between Quality and Player before Sources",
+              ordered([
+                "qualityMenu(groups)",
+                "movieAudioLanguageMenu",
+                "launchPlayerMenu",
+                "Button { scrollToSources() }"
+              ], in: movieHeroActions))
+        check("movie hero audio writes only the source-list session filter",
+              movieAudioMenu.contains("sourceList.sessionAudioLanguages")
+                && movieAudioMenu.contains("TrackPreferences.commonLanguages")
+                && hasOnlySessionAudioMenuWrites(movieAudioMenu))
+        check("movie hero Audio exposes stable control name and dynamic session value",
+              movieAudioMenu.contains(".accessibilityLabel(\"Audio\")")
+                && movieAudioMenu.contains(".accessibilityValue(selectedLabel ?? \"Auto\")"))
+        let preferenceMutation = movieAudioMenu.replacingOccurrences(
+            of: "sourceList.sessionAudioLanguages = [lang.id]",
+            with: "sourceList.sessionAudioLanguages = [lang.id]; TrackPreferences.$audioLanguages.withValue([lang.id])"
+        )
+        let defaultsMutation = movieAudioMenu.replacingOccurrences(
+            of: "sourceList.sessionAudioLanguages = nil",
+            with: "sourceList.sessionAudioLanguages = nil; UserDefaults.standard.set([lang.id], forKey: \"audio\")"
+        )
+        let saveMutation = movieAudioMenu.replacingOccurrences(
+            of: "sourceList.sessionAudioLanguages = [lang.id]",
+            with: "sourceList.sessionAudioLanguages = [lang.id]; profile.save(audioLanguages: [lang.id])"
+        )
+        check("movie hero audio persistence guard rejects preference, defaults, and save mutations",
+              !hasOnlySessionAudioMenuWrites(preferenceMutation)
+                && !hasOnlySessionAudioMenuWrites(defaultsMutation)
+                && !hasOnlySessionAudioMenuWrites(saveMutation))
+        check("movie source list stays free of duplicate primary controls",
+              iosDetail.contains("showsPrimaryControls: false"))
+        check("episode/live source control bars and in-player source audio remain available",
+              iosDetail.contains("private var liveSourceSection")
+                && iosDetail.components(separatedBy: "sessionAudioLanguages: sourceList.sessionAudioLanguages").count >= 3
+                && sourceControlBar.contains("audioLanguageMenu")
+                && inPlayerSources.contains("Row(label: \"Audio\", detail: \"›\""))
 
         check("long episode lists publish a stable top anchor",
               iosDetail.contains("private static let episodesTopAnchor")
