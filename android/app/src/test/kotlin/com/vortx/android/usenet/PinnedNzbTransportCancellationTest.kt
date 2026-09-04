@@ -44,14 +44,21 @@ class PinnedNzbTransportCancellationTest {
                 listOf(InetAddress.getByName("127.0.0.1")),
             )
             val transport = PinnedNzbTransport(
-                timeoutMs = 5_000,
+                // The assertion proves cancel, not expiry: this timeout is intentionally much longer than
+                // the measured cancellation budget.
+                timeoutMs = 60_000,
                 client = OkHttpClient.Builder().build(),
             )
             val fetch = async(Dispatchers.IO) { transport.execute(request) }
             assertTrue("server never received the OkHttp request", accepted.await(2, TimeUnit.SECONDS))
+            val cancelledAt = System.nanoTime()
             fetch.cancel()
             fetch.join()
             assertTrue("cancellation did not close the stalled OkHttp body", peerClosed.await(2, TimeUnit.SECONDS))
+            assertTrue(
+                "cancellation waited for the configured 60-second timeout",
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cancelledAt) < 2_000,
+            )
             serverThread.join(2_000)
         }
     }

@@ -14,6 +14,7 @@ import java.net.Proxy
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.ensureActive
 import kotlin.coroutines.coroutineContext
 
@@ -95,6 +96,7 @@ internal class PinnedNzbTransport(
 ) {
     data class Response(val code: Int, val location: String?, val body: String?)
 
+    @OptIn(InternalCoroutinesApi::class)
     suspend fun execute(request: NzbFetchPolicy.CheckedRequest): Response {
         val pinnedDns = dnsFor(request)
         val call = client.newBuilder()
@@ -104,7 +106,12 @@ internal class PinnedNzbTransport(
             .callTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
             .build()
             .newCall(Request.Builder().url(request.url).get().build())
-        val cancellationCancel = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+        // `invokeOnCompletion {}` runs after all children have completed, which is too late when this
+        // synchronous OkHttp call is the child holding the socket open. Run at cancellation *start*.
+        val cancellationCancel = coroutineContext[Job]?.invokeOnCompletion(
+            onCancelling = true,
+            invokeImmediately = true,
+        ) { call.cancel() }
         try {
             return call.execute().use { response ->
                 Response(

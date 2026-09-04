@@ -5,6 +5,7 @@ import com.vortx.android.debrid.DebridResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -13,6 +14,8 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlin.coroutines.coroutineContext
 
 /// Turns a bare-NZB source into a LOCAL playable file by driving the native NNTP path (the Android
@@ -45,15 +48,44 @@ internal class UsenetLocalResolver(
         val pick = pickFile(files, fileMustInclude, fileIdx, episode)
             ?: throw ResolveException("no matching file in the NZB")
 
-        val target = assemble(pick)
+        // Return a loopback range URL as soon as the producer is scheduled.  The session exposes only
+        // committed ordered bytes, so a media probe can open now but never sees a fictitious complete file.
+        val session = startProgressiveAssembly(pick)
         NzbResult(
-            file = target,
+            file = session.file,
             subject = pick.name,
-            sizeBytes = target.length(),
+            sizeBytes = pick.declaredBytes,
+            progressiveSession = session,
         )
     }
 
-    private suspend fun assemble(file: NzbFile): File = withContext(Dispatchers.IO) {
+    private fun startProgressiveAssembly(file: NzbFile): UsenetProgressiveSession {
+        val declaredBytes = file.declaredBytes
+        if (file.segments.isEmpty() || declaredBytes !in 1..MAX_TITLE_BYTES) {
+            throw ResolveException("NZB declared size is invalid")
+        }
+        val target = cacheFile(declaredBytes)
+        val session = UsenetProgressiveSession(target, declaredBytes)
+        try {
+            session.url // register before the worker can make progress or fail
+        } catch (error: Throwable) {
+            target.delete()
+            throw error
+        }
+        val producer = CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                assemble(file, target, session)
+                session.finish()
+            } catch (error: Throwable) {
+                session.fail(error)
+                target.delete()
+            }
+        }
+        session.attachProducer(producer)
+        return session
+    }
+
+    private suspend fun assemble(file: NzbFile, target: File, session: UsenetProgressiveSession) = withContext(Dispatchers.IO) {
         val segments = file.segments
         if (segments.isEmpty()) throw ResolveException("file has no segments")
         val declaredBytes = file.declaredBytes
@@ -63,7 +95,6 @@ internal class UsenetLocalResolver(
         val slotCount = minOf(window, segments.size)
         val workDir = File(context.cacheDir, "usenet/work-${System.nanoTime()}")
         if (!workDir.mkdirs()) throw ResolveException("cache work dir unavailable")
-        val target = cacheFile()
         val requiredSpace = declaredBytes + minOf(
             declaredBytes,
             MAX_SEGMENT_BYTES.toLong() * slotCount.toLong(),
@@ -110,6 +141,10 @@ internal class UsenetLocalResolver(
                             }
                             next.file.inputStream().use { input -> input.copyTo(out, SEGMENT_COPY_BUFFER_BYTES) }
                             assembledBytes += next.decodedBytes
+                            // Make the complete ordered part visible before waking a range reader. The reader
+                            // never observes a half-written part, which keeps its file reads deterministic.
+                            out.flush()
+                            session.appendCommitted(next.decodedBytes)
                             if (!next.file.delete()) throw ResolveException("segment cache cleanup failed")
                             expected += 1
                             if (nextToSchedule < segments.size) jobs.send(nextToSchedule++)
@@ -119,7 +154,6 @@ internal class UsenetLocalResolver(
                 jobs.close()
                 workers.forEach { it.join() }
             }
-            return@withContext target
         } catch (error: Throwable) {
             target.delete()
             throw error
@@ -129,6 +163,7 @@ internal class UsenetLocalResolver(
         }
     }
 
+    @OptIn(InternalCoroutinesApi::class)
     private suspend fun fetchSegmentTo(segment: NzbSegment, destination: File): Long = withContext(Dispatchers.IO) {
         if (segment.article.isEmpty()) throw ResolveException("segment has no article id")
         val client = NntpClient(
@@ -141,7 +176,12 @@ internal class UsenetLocalResolver(
         )
         // `withContext(IO)` does not itself interrupt a blocking socket read. Couple cancellation to close
         // so a cancelled resolve immediately tears down the transport rather than waiting for readTimeout.
-        val cancellationClose = coroutineContext[Job]?.invokeOnCompletion { client.close() }
+        // A normal completion handler waits for this blocked child. The cancellation-start hook closes the
+        // published socket immediately, even with the deliberately long provider read timeout below.
+        val cancellationClose = coroutineContext[Job]?.invokeOnCompletion(
+            onCancelling = true,
+            invokeImmediately = true,
+        ) { client.close() }
         try {
             client.connect()
             FileOutputStream(destination).use { output ->
@@ -226,9 +266,11 @@ internal class UsenetLocalResolver(
             ),
         )
 
-    private fun cacheFile(): File {
+    private fun cacheFile(reservationBytes: Long): File {
         val home = File(context.cacheDir, "usenet")
-        if (!home.exists() && !home.mkdirs()) throw ResolveException("cache dir unavailable")
+        if (!UsenetCachePolicy.reserve(home, reservationBytes)) {
+            throw ResolveException("insufficient bounded Usenet cache storage")
+        }
         return File(home, "vortx-nzb-${System.nanoTime()}.mkv")
     }
 
@@ -260,6 +302,8 @@ internal data class NzbResult(
     val file: File,
     val subject: String,
     val sizeBytes: Long,
+    private val progressiveSession: UsenetProgressiveSession? = null,
 ) {
-    val url: String get() = "file://" + file.absolutePath
+    val url: String get() = progressiveSession?.url ?: "file://" + file.absolutePath
+    fun cancel() = progressiveSession?.close()
 }

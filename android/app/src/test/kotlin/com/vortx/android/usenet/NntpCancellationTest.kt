@@ -28,8 +28,13 @@ class NntpCancellationTest {
                 try { client.connect() } catch (error: Throwable) { result.set(error) } finally { finished.countDown() }
             }.also { it.start() }
             assertTrue("TLS peer was never connected", accepted.await(2, TimeUnit.SECONDS))
+            val cancelledAt = System.nanoTime()
             client.close()
             assertTrue("closing the client did not interrupt TLS handshake", finished.await(2, TimeUnit.SECONDS))
+            assertTrue(
+                "close waited for the configured 60-second timeout",
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cancelledAt) < 2_000,
+            )
             assertTrue("interrupted TLS handshake should report an IO failure", result.get() is IOException)
             holdPeer.countDown()
             connectThread.join(2_000)

@@ -173,16 +173,26 @@ fun DebridKeysScreen(
                     },
                 )
             }
-            UsenetProviderSection(usenetStore, keys.ownerToken() != null)
+            UsenetProviderSection(
+                store = usenetStore,
+                ownerKnown = keys.ownerToken() != null,
+                accountIdentity = accountIdentity,
+            )
         }
     }
 }
 
 @Composable
-private fun UsenetProviderSection(store: UsenetProviderStore, ownerKnown: Boolean) {
-    var host by remember { mutableStateOf("") }; var port by remember { mutableStateOf("563") }
-    var username by remember { mutableStateOf("") }; var password by remember { mutableStateOf("") }
-    var connections by remember { mutableStateOf("4") }; var status by remember(ownerKnown) {
+private fun UsenetProviderSection(
+    store: UsenetProviderStore,
+    ownerKnown: Boolean,
+    accountIdentity: String,
+) {
+    // A settings host can switch profiles in place. Every transient credential field is keyed by the exact
+    // account identity, so even unsaved text from A is discarded before B's editor becomes visible.
+    var host by remember(accountIdentity) { mutableStateOf("") }; var port by remember(accountIdentity) { mutableStateOf("563") }
+    var username by remember(accountIdentity) { mutableStateOf("") }; var password by remember(accountIdentity) { mutableStateOf("") }
+    var connections by remember(accountIdentity) { mutableStateOf("4") }; var status by remember(ownerKnown, accountIdentity) {
         mutableStateOf(if (ownerKnown && store.isConfigured()) "Configured (credentials redacted)" else "Not configured")
     }
     fun save() {

@@ -14,6 +14,15 @@ import org.junit.Test
 class DebridKeysScreenContractTest {
 
     @Test
+    fun `Usenet transient credentials are keyed to the active account`() {
+        val source = readSource()
+        assertTrue(source.contains("accountIdentity = accountIdentity"))
+        assertTrue(source.contains("fun UsenetProviderSection("))
+        assertTrue(source.contains("remember(accountIdentity) { mutableStateOf(\"\") }"))
+        assertTrue(source.contains("remember(ownerKnown, accountIdentity)"))
+    }
+
+    @Test
     fun storageFailureUsesTheExactSecurityCopy() {
         val state = DebridKeyEditorState.from(
             DebridKeyStatus(
