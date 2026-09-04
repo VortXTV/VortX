@@ -2,16 +2,16 @@ package com.vortx.android.usenet
 
 import android.content.Context
 import com.vortx.android.debrid.DebridResolver
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.ensureActive
 import kotlin.coroutines.coroutineContext
 
@@ -56,43 +56,71 @@ internal class UsenetLocalResolver(
     private suspend fun assemble(file: NzbFile): File = withContext(Dispatchers.IO) {
         val segments = file.segments
         if (segments.isEmpty()) throw ResolveException("file has no segments")
+        val declaredBytes = file.declaredBytes
+        if (declaredBytes !in 1..MAX_TITLE_BYTES) throw ResolveException("NZB declared size is invalid")
 
         val window = credentials.maxConnections.coerceIn(1, MAX_SEGMENT_WORKERS)
-        val index = AtomicInteger(0)
         val slotCount = minOf(window, segments.size)
         val workDir = File(context.cacheDir, "usenet/work-${System.nanoTime()}")
         if (!workDir.mkdirs()) throw ResolveException("cache work dir unavailable")
         val target = cacheFile()
+        val requiredSpace = declaredBytes + minOf(
+            declaredBytes,
+            MAX_SEGMENT_BYTES.toLong() * slotCount.toLong(),
+        )
+        if (target.parentFile?.usableSpace ?: 0L < requiredSpace) {
+            workDir.delete()
+            throw ResolveException("insufficient cache storage for NZB")
+        }
 
         try {
-            // The window bounds decoded bytes retained at once: each worker commits its segment to a private
-            // disk part before pulling another job. The final writer consumes parts by index, so playback
-            // file order is deterministic even though NNTP completions are not.
-            val workers = (0 until slotCount).map {
-                async(Dispatchers.IO) {
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val seg = index.getAndIncrement()
-                        if (seg >= segments.size) break
-                        val bytes = fetchSegment(segments[seg])
-                        if (bytes.size > MAX_SEGMENT_BYTES) throw ResolveException("NZB segment exceeds memory limit")
-                        coroutineContext.ensureActive()
-                        FileOutputStream(File(workDir, "$seg.part")).use { it.write(bytes) }
+            coroutineScope {
+                // The writer releases the next index only after committing its predecessor. Thus there can
+                // never be more than [slotCount] private parts in-flight/reordered, even if segment zero is
+                // slow while later NNTP workers finish immediately.
+                val jobs = Channel<Int>(slotCount)
+                val completed = Channel<CompletedPart>(slotCount)
+                repeat(slotCount) { jobs.trySend(it) }
+                val workers = List(slotCount) {
+                    launch(Dispatchers.IO) {
+                        for (seg in jobs) {
+                            coroutineContext.ensureActive()
+                            val part = File(workDir, "$seg.part")
+                            val decodedBytes = fetchSegmentTo(segments[seg], part)
+                            completed.send(CompletedPart(seg, part, decodedBytes))
+                        }
                     }
                 }
-            }
-            workers.awaitAll()
-            BufferedOutputStream(FileOutputStream(target)).use { out ->
-                for (segment in segments.indices) {
-                    coroutineContext.ensureActive()
-                    val part = File(workDir, "$segment.part")
-                    if (!part.isFile) throw ResolveException("segment assembly gap")
-                    part.inputStream().use { input -> input.copyTo(out, SEGMENT_COPY_BUFFER_BYTES) }
-                    if (!part.delete()) throw ResolveException("segment cache cleanup failed")
+
+                var expected = 0
+                var nextToSchedule = slotCount
+                var assembledBytes = 0L
+                val reordered = HashMap<Int, CompletedPart>(slotCount)
+                BufferedOutputStream(FileOutputStream(target)).use { out ->
+                    while (expected < segments.size) {
+                        coroutineContext.ensureActive()
+                        val finished = completed.receive()
+                        if (reordered.put(finished.index, finished) != null) {
+                            throw ResolveException("duplicate NZB segment completion")
+                        }
+                        while (true) {
+                            val next = reordered.remove(expected) ?: break
+                            if (!NzbAssemblyLimits.permitsAppend(assembledBytes, next.decodedBytes, declaredBytes)) {
+                                throw ResolveException("NZB decoded size exceeds declared title size")
+                            }
+                            next.file.inputStream().use { input -> input.copyTo(out, SEGMENT_COPY_BUFFER_BYTES) }
+                            assembledBytes += next.decodedBytes
+                            if (!next.file.delete()) throw ResolveException("segment cache cleanup failed")
+                            expected += 1
+                            if (nextToSchedule < segments.size) jobs.send(nextToSchedule++)
+                        }
+                    }
                 }
+                jobs.close()
+                workers.forEach { it.join() }
             }
             return@withContext target
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
             target.delete()
             throw error
         } finally {
@@ -101,7 +129,8 @@ internal class UsenetLocalResolver(
         }
     }
 
-    private suspend fun fetchSegment(segment: NzbSegment): ByteArray = withContext(Dispatchers.IO) {
+    private suspend fun fetchSegmentTo(segment: NzbSegment, destination: File): Long = withContext(Dispatchers.IO) {
+        if (segment.article.isEmpty()) throw ResolveException("segment has no article id")
         val client = NntpClient(
             host = credentials.host,
             port = credentials.port,
@@ -110,44 +139,46 @@ internal class UsenetLocalResolver(
             useSSL = credentials.useSSL,
             timeoutMs = timeoutMs,
         )
+        // `withContext(IO)` does not itself interrupt a blocking socket read. Couple cancellation to close
+        // so a cancelled resolve immediately tears down the transport rather than waiting for readTimeout.
+        val cancellationClose = coroutineContext[Job]?.invokeOnCompletion { client.close() }
         try {
             client.connect()
-            if (segment.article.isNotEmpty()) {
-                val body = client.body(segment.article)
-                YencDecoder.decode(body)
-            } else {
-                throw ResolveException("segment has no article id")
+            FileOutputStream(destination).use { output ->
+                client.bodyTo(
+                    article = segment.article,
+                    output = output,
+                    encodedLimit = MAX_ENCODED_SEGMENT_BYTES.toLong(),
+                    decodedLimit = MAX_SEGMENT_BYTES.toLong(),
+                )
             }
+        } catch (error: java.io.IOException) {
+            // Socket close is how coroutine cancellation interrupts connect/TLS/read. Do not turn that into
+            // a normal resolver failure after the caller has abandoned playback.
+            coroutineContext.ensureActive()
+            throw error
         } finally {
+            cancellationClose?.dispose()
             client.close()
         }
     }
 
     private suspend fun fetchNzb(nzbUrl: String): String = withContext(Dispatchers.IO) {
-        var url = NzbFetchPolicy.checkedUrl(nzbUrl)
+        var request = NzbFetchPolicy.checkedRequest(nzbUrl)
+        val transport = PinnedNzbTransport(NZB_TIMEOUT_MS)
         repeat(MAX_NZB_REDIRECTS + 1) {
-            val connection = (url.openConnection() as? HttpURLConnection)
-                ?: throw ResolveException("NZB URL is not HTTP")
-            connection.instanceFollowRedirects = false
-            connection.requestMethod = "GET"
-            connection.connectTimeout = NZB_TIMEOUT_MS
-            connection.readTimeout = NZB_TIMEOUT_MS
-            try {
-                when (val code = connection.responseCode) {
-                    in 200..299 -> {
-                        val text = NzbFetchPolicy.readBoundedUtf8(connection.inputStream)
-                        if (text.isBlank()) throw ResolveException("NZB fetch was empty")
-                        return@withContext text
-                    }
-                    301, 302, 303, 307, 308 -> {
-                        val location = connection.getHeaderField("Location")
-                            ?: throw ResolveException("NZB redirect missing location")
-                        url = NzbFetchPolicy.redirect(url, location)
-                    }
-                    else -> throw ResolveException("NZB fetch rejected: $code")
+            val response = transport.execute(request)
+            when (response.code) {
+                in 200..299 -> {
+                    val text = response.body ?: throw ResolveException("NZB fetch was empty")
+                    if (text.isBlank()) throw ResolveException("NZB fetch was empty")
+                    return@withContext text
                 }
-            } finally {
-                connection.disconnect()
+                301, 302, 303, 307, 308 -> {
+                    val location = response.location ?: throw ResolveException("NZB redirect missing location")
+                    request = NzbFetchPolicy.redirect(request, location)
+                }
+                else -> throw ResolveException("NZB fetch rejected: ${response.code}")
             }
         }
         throw ResolveException("NZB redirect limit exceeded")
@@ -207,7 +238,21 @@ internal class UsenetLocalResolver(
         const val SEGMENT_COPY_BUFFER_BYTES = 64 * 1024
         const val MAX_SEGMENT_WORKERS = 4
         const val MAX_SEGMENT_BYTES = 64 * 1024 * 1024
+        const val MAX_ENCODED_SEGMENT_BYTES = 96 * 1024 * 1024
+        const val MAX_TITLE_BYTES = 100L * 1024 * 1024 * 1024
     }
+
+    private data class CompletedPart(val index: Int, val file: File, val decodedBytes: Long)
+}
+
+/** The aggregate assembly boundary. It is checked before copying every ordered part to the playable file. */
+internal object NzbAssemblyLimits {
+    private const val MAX_TITLE_BYTES = 100L * 1024 * 1024 * 1024
+
+    fun permitsAppend(assembledBytes: Long, nextPartBytes: Long, declaredBytes: Long): Boolean =
+        assembledBytes >= 0 && nextPartBytes >= 0 && declaredBytes in 1..MAX_TITLE_BYTES &&
+            nextPartBytes <= MAX_TITLE_BYTES - assembledBytes &&
+            nextPartBytes <= declaredBytes - assembledBytes
 }
 
 /// The result of a native usenet resolve: a playable LOCAL file the player opens directly.

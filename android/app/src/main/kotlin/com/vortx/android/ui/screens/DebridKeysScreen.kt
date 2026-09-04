@@ -27,6 +27,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.error
@@ -41,6 +42,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridKeyStatus
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.usenet.UsenetProviderCredentials
+import com.vortx.android.usenet.UsenetProviderStore
 import com.vortx.android.ui.components.PrimaryButton
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
@@ -125,6 +128,8 @@ fun DebridKeysScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current.applicationContext
+    val usenetStore = remember(keys) { UsenetProviderStore(context, keys::ownerToken, keys::mutateCurrentOwner) }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -167,6 +172,34 @@ fun DebridKeysScreen(
                         debridMutationStatus(cleared, keys.status(service))
                     },
                 )
+            }
+            UsenetProviderSection(usenetStore, keys.ownerToken() != null)
+        }
+    }
+}
+
+@Composable
+private fun UsenetProviderSection(store: UsenetProviderStore, ownerKnown: Boolean) {
+    var host by remember { mutableStateOf("") }; var port by remember { mutableStateOf("563") }
+    var username by remember { mutableStateOf("") }; var password by remember { mutableStateOf("") }
+    var connections by remember { mutableStateOf("4") }; var status by remember(ownerKnown) {
+        mutableStateOf(if (ownerKnown && store.isConfigured()) "Configured (credentials redacted)" else "Not configured")
+    }
+    fun save() {
+        val credentials = UsenetProviderCredentials(host, port.toIntOrNull() ?: 0, username, password, connections.toIntOrNull() ?: 0, true)
+        status = if (ownerKnown && credentials.isValid && store.save(credentials)) "Configured (credentials redacted)" else "Unable to save secure Usenet provider"
+        if (status.startsWith("Configured")) { password = ""; username = "" }
+    }
+    SurfaceCard {
+        Column(Modifier.padding(VortXTheme.spacing.md), verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+            Text("Usenet provider", style = VortXTheme.type.cardTitle)
+            Text(status, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary))
+            listOf("Host" to host, "Port" to port, "Username" to username, "Password" to password, "Connections" to connections).forEach { (label, value) ->
+                OutlinedTextField(value, { next -> when (label) { "Host" -> host=next; "Port" -> port=next; "Username" -> username=next; "Password" -> password=next; else -> connections=next } }, Modifier.fillMaxWidth(), label={Text(label)}, singleLine=true, visualTransformation=if(label=="Password") PasswordVisualTransformation() else VisualTransformation.None)
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                PrimaryButton("Save provider", { save() }, Modifier.weight(1f), enabled = ownerKnown)
+                TextButton(onClick = { if (ownerKnown && store.clear()) status="Not configured" }, enabled=ownerKnown) { Text("Clear", color=VortXTheme.colors.danger) }
             }
         }
     }

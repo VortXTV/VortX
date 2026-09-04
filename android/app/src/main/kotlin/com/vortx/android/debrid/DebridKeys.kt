@@ -499,6 +499,17 @@ class DebridKeys private constructor(
         }
     }
 
+    /**
+     * Runs a short credential mutation while the owner generation is validated by the same transition lock
+     * used for debrid-key state. Consumers storing adjacent account credentials must not check A1, release
+     * the lock, and then persist after an A1 -> A2 transition.
+     */
+    internal fun mutateCurrentOwner(owner: DebridOwnerToken, mutation: () -> Boolean): Boolean =
+        synchronized(CREDENTIAL_STATE_LOCK) {
+            if (currentOwner() != owner) return@synchronized false
+            mutation()
+        }
+
     internal fun isCurrent(owner: DebridOwnerToken): Boolean = currentOwner() == owner
 
     internal fun isCurrent(ownerIdentity: String, ownerGeneration: Long): Boolean =

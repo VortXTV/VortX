@@ -2,7 +2,9 @@ package com.vortx.android.usenet
 
 import java.io.ByteArrayInputStream
 import java.net.InetAddress
+import java.net.UnknownHostException
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
@@ -26,6 +28,20 @@ class NzbFetchPolicyTest {
 
     @Test fun `bounded read rejects oversized input`() {
         rejected { NzbFetchPolicy.readBoundedUtf8(ByteArrayInputStream(ByteArray(5)), limit = 4) }
+    }
+
+    @Test fun `validated DNS answers are pinned at transport lookup despite a later rebind`() {
+        var lookups = 0
+        val checked = NzbFetchPolicy.checkedRequest("https://indexer.test/a") {
+            lookups += 1
+            listOf(InetAddress.getByName("8.8.8.8"))
+        }
+        val dns = PinnedNzbTransport(timeoutMs = 1_000).dnsFor(checked)
+
+        assertEquals("policy resolves exactly once for this hop", 1, lookups)
+        assertEquals(listOf(InetAddress.getByName("8.8.8.8")), dns.lookup("indexer.test"))
+        assertEquals("transport uses the admitted result instead of resolving again", 1, lookups)
+        assertTrue(runCatching { dns.lookup("rebound-private.test") }.exceptionOrNull() is UnknownHostException)
     }
 
     private fun rejected(block: () -> Unit) {

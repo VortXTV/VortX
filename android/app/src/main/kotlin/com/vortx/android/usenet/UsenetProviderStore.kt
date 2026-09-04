@@ -16,6 +16,9 @@ import org.json.JSONObject
 internal class UsenetProviderStore(
     context: Context,
     private val currentOwner: () -> DebridOwnerToken?,
+    private val mutateCurrentOwner: (DebridOwnerToken, () -> Boolean) -> Boolean = { owner, mutation ->
+        if (UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) mutation() else false
+    },
 ) {
 
     private val store = FailClosedCredentialStore(
@@ -45,17 +48,16 @@ internal class UsenetProviderStore(
     fun save(credentials: UsenetProviderCredentials, owner: DebridOwnerToken? = currentOwner()): Boolean {
         owner ?: return false
         if (!credentials.isValid) return false
-        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return false
-        val saved = store.set(mapOf(storageKey(owner) to credentials.toJson().toString()))
-        return saved && UsenetCredentialOwnerPolicy.permits(owner, currentOwner())
+        // Check owner generation and perform the encrypted mutation in one owner-transition critical section.
+        return mutateCurrentOwner(owner) {
+            store.set(mapOf(storageKey(owner) to credentials.toJson().toString()))
+        }
     }
 
     /// Remove the current owner's credentials.
     fun clear(owner: DebridOwnerToken? = currentOwner()): Boolean {
         owner ?: return false
-        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return false
-        val cleared = store.clear(storageKey(owner))
-        return cleared && UsenetCredentialOwnerPolicy.permits(owner, currentOwner())
+        return mutateCurrentOwner(owner) { store.clear(storageKey(owner)) }
     }
 
     private fun storageKey(owner: DebridOwnerToken): String = UsenetCredentialOwnerPolicy.storageKey(PREFIX, owner)

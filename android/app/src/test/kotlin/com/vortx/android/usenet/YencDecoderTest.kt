@@ -1,5 +1,6 @@
 package com.vortx.android.usenet
 
+import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -34,14 +35,14 @@ class YencDecoderTest {
     fun `round-trips every byte value including all escape collisions`() {
         // All 256 byte values: exercises NUL, LF, CR, '=' escapes AND high/wrap-around bytes.
         val allBytes = ByteArray(256) { it.toByte() }
-        val decoded = YencDecoder.decode(wrapBody(allBytes))
+        val decoded = decode(wrapBody(allBytes))
         assertArrayEqualsBytes(allBytes, decoded)
     }
 
     @Test
     fun `decodes plain unescaped payload`() {
         val payload = "Hello VortX usenet!".toByteArray(Charsets.ISO_8859_1)
-        val decoded = YencDecoder.decode(wrapBody(payload))
+        val decoded = decode(wrapBody(payload))
         assertArrayEqualsBytes(payload, decoded)
     }
 
@@ -49,16 +50,34 @@ class YencDecoderTest {
     fun `size mismatch against yend throws`() {
         val payload = byteArrayOf(1, 2, 3)
         val exception = assertThrows(YencDecoder.DecodeException::class.java) {
-            YencDecoder.decode(wrapBody(payload, declaredSize = 99))
+            decode(wrapBody(payload, declaredSize = 99))
         }
         assertEquals(true, exception.message!!.contains("size mismatch"))
     }
 
     @Test
     fun `empty body outside ybegin-yend contributes nothing`() {
-        val decoded = YencDecoder.decode("garbage before\r\n=ybegin size=0 name=x\r\n=yend size=0\r\n")
+        val decoded = decode("garbage before\r\n=ybegin size=0 name=x\r\n=yend size=0\r\n")
         assertEquals(0, decoded.size)
     }
+
+    @Test
+    fun `decoded size limit accepts its exact boundary and rejects the next byte before writing it`() {
+        val boundary = byteArrayOf(10, 20, 30)
+        val accepted = ByteArrayOutputStream()
+        assertEquals(3L, YencDecoder.decodeTextTo(wrapBody(boundary), accepted, decodedLimit = 3))
+        assertArrayEqualsBytes(boundary, accepted.toByteArray())
+
+        val rejected = ByteArrayOutputStream()
+        assertThrows(YencDecoder.DecodeException::class.java) {
+            YencDecoder.decodeTextTo(wrapBody(boundary), rejected, decodedLimit = 2)
+        }
+        assertEquals("only bounded bytes reached the private output", 2, rejected.size())
+    }
+
+    private fun decode(body: String): ByteArray = ByteArrayOutputStream().also { output ->
+        YencDecoder.decodeTextTo(body, output, decodedLimit = Long.MAX_VALUE)
+    }.toByteArray()
 
     private fun assertArrayEqualsBytes(expected: ByteArray, actual: ByteArray) {
         assertEquals("length differs", expected.size, actual.size)

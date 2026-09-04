@@ -120,9 +120,10 @@ class DebridPlaybackProvenanceTest {
         assertTrue(usenetBranch.contains("debridCoordinator.resolvePlaybackRef("))
         assertTrue(usenetBranch.contains("DebridCoordinator.DebridCandidate("))
         assertFalse(usenetBranch.contains("debridResolver.resolveUsenet("))
-        assertTrue(usenetBranch.contains("?: throw usenetPlaybackFailure(DebridResolver.DebridException.NoKey)"))
+        assertTrue(usenetBranch.contains("} catch (cancel: CancellationException)"))
+        assertTrue(usenetBranch.contains("throw usenetPlaybackFailure(error)"))
         assertTrue(repository.contains("appContext = appContext"))
-        assertTrue(repository.contains("usenetProviderStore = UsenetProviderStore(appContext)"))
+        assertTrue(repository.contains("debridKeys::mutateCurrentOwner"))
         assertFalse(repository.contains("DebridResolver(DebridKeys(appContext))"))
     }
 
@@ -133,10 +134,12 @@ class DebridPlaybackProvenanceTest {
             .substringBefore("// Raw torrent only:")
 
         val torBox = usenetBranch.indexOf("keys.isConfigured(DebridService.TOR_BOX, owner)")
-        val native = usenetBranch.indexOf("usenetProviderStore?.load()")
+        val native = usenetBranch.indexOf("usenetProviderStore?.load(owner)")
         assertTrue("TorBox must be attempted before the native provider", torBox >= 0 && torBox < native)
-        assertTrue(usenetBranch.contains("catch (cancel: CancellationException) {\n                        throw cancel"))
-        assertTrue(usenetBranch.contains("if (!keys.isCurrent(owner)) return@withTimeoutOrNull null"))
+        assertTrue(usenetBranch.contains("catch (cancel: CancellationException)"))
+        assertTrue(usenetBranch.contains("throw cancel"))
+        assertTrue(usenetBranch.contains("withTimeoutOrNull(RESOLVE_TIMEOUT_MS)"))
+        assertTrue(usenetBranch.contains("It intentionally has no direct-link deadline."))
         assertTrue(usenetBranch.contains("isNativeFile = true"))
     }
 

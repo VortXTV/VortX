@@ -1,5 +1,7 @@
 package com.vortx.android.usenet
 
+import java.io.OutputStream
+
 /// A pure yEnc decoder for one NNTP segment body. yEnc is the encoding NNTP binaries are distributed in:
 /// each line begins with `=ybegin`, `=ypart`, or `=yend`; payload bytes are offset by 42 (mod 256) and
 /// encoded as `=` + two hex digits when the offset byte would collide with `=` (0x3D), CR, LF, or the dot
@@ -11,59 +13,92 @@ internal object YencDecoder {
 
     class DecodeException(message: String) : Exception(message)
 
-    fun decode(segment: String): ByteArray {
-        val lines = segment.split("\n")
-        val body = arrayListOf<Byte>()
+    /**
+     * Incremental yEnc decoder for one NNTP article. It writes directly to the caller's private segment
+     * file and checks the decoded limit before each byte write, so an attacker-controlled article never
+     * becomes a String/boxed-byte/ByteArray representation of an entire media segment.
+     */
+    class StreamingDecoder(
+        private val output: OutputStream,
+        private val decodedLimit: Long,
+    ) {
         var inPart = false
-        var declaredDecodedBytes = -1L
+            private set
+        private var declaredDecodedBytes = -1L
+        private var decodedBytes = 0L
 
-        for (rawLine in lines) {
-            val line = rawLine.trimEnd('\r')
-            if (line.startsWith("=ybegin") || line.startsWith("=ypart")) {
+        fun consumeLine(rawLine: String) {
+            consumeLine(rawLine.toByteArray(Charsets.ISO_8859_1), rawLine.length)
+        }
+
+        /** Production path: consumes one bounded NNTP wire line without allocating a String. */
+        fun consumeLine(line: ByteArray, length: Int, offset: Int = 0) {
+            if (startsWith(line, length, offset, "=ybegin") || startsWith(line, length, offset, "=ypart")) {
                 inPart = true
-                continue
+                return
             }
-            if (line.startsWith("=yend")) {
+            if (startsWith(line, length, offset, "=yend")) {
                 inPart = false
-                declaredDecodedBytes = parseSize(line) ?: declaredDecodedBytes
-                continue
+                declaredDecodedBytes = parseSize(line, length, offset) ?: declaredDecodedBytes
+                return
             }
-            if (!inPart) continue
+            if (!inPart) return
             // A body line that begins with "=ybegin"/"=ypart"/"=yend" after the part started is a
             // continuation payload that happens to start with '=' (a decoded '=' output is "="). Only
             // treat the ACTUAL start-of-part headers as control.
-            decodeLine(line, body)
+            decodeLine(line, length, offset)
         }
 
-        if (declaredDecodedBytes >= 0 && declaredDecodedBytes != body.size.toLong()) {
-            throw DecodeException(
-                "yEnc size mismatch: declared=$declaredDecodedBytes decoded=${body.size}",
-            )
+        fun finish(): Long {
+            if (declaredDecodedBytes >= 0 && declaredDecodedBytes != decodedBytes) {
+                throw DecodeException(
+                    "yEnc size mismatch: declared=$declaredDecodedBytes decoded=$decodedBytes",
+                )
+            }
+            return decodedBytes
         }
-        return body.toByteArray()
-    }
 
-    private fun decodeLine(line: String, out: MutableList<Byte>) {
-        if (line.isEmpty()) return
-        var index = 0
-        while (index < line.length) {
-            val char = line[index]
-            if (char == '=' && index + 1 < line.length) {
-                // yEnc escape (per spec): '=' followed by (encodedValue + 64) mod 256 for any encoded value
-                // that would collide with NUL / LF / CR / '='. Undo BOTH shifts in one mask step.
-                val escaped = line[index + 1]
-                out.add(((escaped.code - 64 - 42) and 0xFF).toByte())
-                index += 2
-            } else {
-                out.add(((char.code - 42) and 0xFF).toByte())
-                index += 1
+        private fun decodeLine(line: ByteArray, length: Int, offset: Int) {
+            var index = offset
+            while (index < length) {
+                val char = line[index]
+                val decoded = if (char == '='.code.toByte() && index + 1 < length) {
+                    index += 2
+                    ((line[index - 1].toInt() and 0xff) - 64 - 42) and 0xFF
+                } else {
+                    index += 1
+                    ((char.toInt() and 0xff) - 42) and 0xFF
+                }
+                if (decodedBytes == decodedLimit) throw DecodeException("yEnc decoded size exceeds limit")
+                output.write(decoded)
+                decodedBytes += 1
             }
         }
     }
 
-    private fun parseSize(line: String): Long? {
-        val marker = "size="
-        val start = line.indexOf(marker)
-        return if (start < 0) null else line.substring(start + marker.length).toLongOrNull()
+    /** Pure-JVM test seam; production NNTP uses [StreamingDecoder] directly. */
+    fun decodeTextTo(segment: String, output: OutputStream, decodedLimit: Long): Long {
+        val decoder = StreamingDecoder(output, decodedLimit)
+        segment.lineSequence().forEach(decoder::consumeLine)
+        return decoder.finish()
+    }
+
+    private fun startsWith(line: ByteArray, length: Int, offset: Int, token: String): Boolean =
+        length - offset >= token.length && token.indices.all { line[offset + it] == token[it].code.toByte() }
+
+    private fun parseSize(line: ByteArray, length: Int, offset: Int): Long? {
+        val marker = "size=".toByteArray()
+        var start = offset
+        while (start + marker.size <= length && !marker.indices.all { line[start + it] == marker[it] }) start++
+        if (start + marker.size > length) return null
+        var value = 0L
+        var found = false
+        for (index in start + marker.size until length) {
+            val byte = line[index].toInt() and 0xff
+            if (byte !in '0'.code..'9'.code) break
+            found = true
+            value = value * 10 + (byte - '0'.code)
+        }
+        return value.takeIf { found }
     }
 }

@@ -33,6 +33,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
@@ -54,6 +55,8 @@ import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
+import com.vortx.android.usenet.UsenetProviderCredentials
+import com.vortx.android.usenet.UsenetProviderStore
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -66,6 +69,10 @@ internal fun TvDebridKeysScreen(
     modifier: Modifier = Modifier,
 ) {
     val access = remember(keys) { DebridKeysTvAccess(keys) }
+    val context = LocalContext.current.applicationContext
+    val usenetStore = remember(keys) {
+        UsenetProviderStore(context, keys::ownerToken, keys::mutateCurrentOwner)
+    }
     val backFocus = remember { FocusRequester() }
 
     LazyColumn(
@@ -112,6 +119,13 @@ internal fun TvDebridKeysScreen(
                 )
             }
         }
+        item(key = "usenet-provider") {
+            TvUsenetProviderSection(
+                store = usenetStore,
+                ownerKnown = keys.ownerToken() != null,
+                accountIdentity = accountIdentity,
+            )
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -125,6 +139,129 @@ internal fun TvDebridKeysScreen(
             }
         }
     }
+}
+
+@Composable
+private fun TvUsenetProviderSection(
+    store: UsenetProviderStore,
+    ownerKnown: Boolean,
+    accountIdentity: String,
+) {
+    val colors = VortXTheme.colors
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val hostFocus = remember { FocusRequester() }
+    val saveFocus = remember { FocusRequester() }
+    val clearFocus = remember { FocusRequester() }
+    var host by remember(accountIdentity) { mutableStateOf("") }
+    var port by remember(accountIdentity) { mutableStateOf("563") }
+    var username by remember(accountIdentity) { mutableStateOf("") }
+    var password by remember(accountIdentity) { mutableStateOf("") }
+    var connections by remember(accountIdentity) { mutableStateOf("4") }
+    var status by remember(store, ownerKnown, accountIdentity) {
+        mutableStateOf(if (ownerKnown && store.isConfigured()) "Configured (credentials redacted)" else "Not configured")
+    }
+
+    fun request(requester: FocusRequester) = runCatching { requester.requestFocus() }
+    fun save() {
+        val credentials = UsenetProviderCredentials(
+            host = host,
+            port = port.toIntOrNull() ?: 0,
+            username = username,
+            password = password,
+            maxConnections = connections.toIntOrNull() ?: 0,
+            useSSL = true,
+        )
+        val saved = ownerKnown && credentials.isValid && store.save(credentials)
+        status = if (saved && store.isConfigured()) "Configured (credentials redacted)" else "Unable to save secure Usenet provider"
+        if (saved) {
+            username = ""
+            password = ""
+            keyboardController?.hide()
+            request(hostFocus)
+        } else {
+            request(saveFocus)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(colors.surface1, RoundedCornerShape(18.dp))
+            .semantics { isTraversalGroup = true }
+            .padding(VortXTheme.spacing.md),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+    ) {
+        Text("Usenet provider", style = VortXTheme.type.cardTitle)
+        Text(
+            status,
+            style = VortXTheme.type.label.copy(color = if (status.startsWith("Configured")) colors.accentBright else colors.textSecondary),
+            modifier = Modifier.semantics {
+                liveRegion = LiveRegionMode.Polite
+                stateDescription = "Usenet provider: $status"
+            },
+        )
+        Text("TLS is required. Credentials are encrypted and never displayed after saving.", style = VortXTheme.type.label.copy(color = colors.textSecondary))
+        TvUsenetField("Host", host, { host = it }, hostFocus, KeyboardType.Uri)
+        TvUsenetField("Port", port, { port = it }, null, KeyboardType.Number)
+        TvUsenetField("Username", username, { username = it }, null, KeyboardType.Text)
+        TvUsenetField("Password", password, { password = it }, null, KeyboardType.Password, password = true)
+        TvUsenetField("Connections", connections, { connections = it }, null, KeyboardType.Number)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+            TvDebridAction(
+                label = "Save provider",
+                accessibilityLabel = "Usenet provider: Save TLS credentials",
+                onClick = ::save,
+                enabled = ownerKnown && host.isNotBlank() && username.isNotBlank() && password.isNotBlank(),
+                modifier = Modifier.weight(1f),
+                focusRequester = saveFocus,
+            )
+            TvDebridAction(
+                label = "Clear",
+                accessibilityLabel = "Usenet provider: Clear credentials",
+                onClick = {
+                    if (ownerKnown && store.clear()) {
+                        host = ""; username = ""; password = ""
+                        status = "Not configured"
+                        request(hostFocus)
+                    } else {
+                        status = "Unable to clear secure Usenet provider"
+                        request(clearFocus)
+                    }
+                },
+                enabled = ownerKnown && store.isConfigured(),
+                modifier = Modifier.weight(1f),
+                focusRequester = clearFocus,
+                danger = true,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TvUsenetField(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    focusRequester: FocusRequester?,
+    keyboardType: KeyboardType,
+    password: Boolean = false,
+) {
+    val colors = VortXTheme.colors
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = Modifier.fillMaxWidth().then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
+            .semantics { contentDescription = "Usenet provider: $label" },
+        label = { Text(label) },
+        singleLine = true,
+        visualTransformation = if (password) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType, imeAction = ImeAction.Next),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = colors.accent,
+            unfocusedBorderColor = colors.hairline,
+            cursorColor = colors.accent,
+        ),
+    )
 }
 
 internal enum class TvDebridMutation {

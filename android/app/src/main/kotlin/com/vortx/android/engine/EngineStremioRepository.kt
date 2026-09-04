@@ -795,7 +795,11 @@ class EngineStremioRepository(
             resolver = debridResolver,
             keys = debridKeys,
             appContext = appContext,
-            usenetProviderStore = UsenetProviderStore(appContext, debridKeys::ownerToken),
+            usenetProviderStore = UsenetProviderStore(
+                appContext,
+                debridKeys::ownerToken,
+                debridKeys::mutateCurrentOwner,
+            ),
         )
     }
 
@@ -2253,7 +2257,7 @@ class EngineStremioRepository(
     override suspend fun resolve(
         source: StreamSource,
         episode: Episode?,
-    ): Result<Playable> = runCatching {
+    ): Result<Playable> = runCatchingPreservingCancellation {
         // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
         // url/externalUrl/infoHash). Direct URLs are playable as-is. A raw torrent (handle = infoHash)
         // resolves through the user's own debrid account when a key is configured (native in-client
@@ -2269,15 +2273,21 @@ class EngineStremioRepository(
         val isAtmos = StreamRanking.isAtmos(source)
         if (source.isUsenet) {
             val target = source.usenetResolveTarget(episode)
-            val resolved = debridCoordinator.resolvePlaybackRef(
-                candidate = DebridCoordinator.DebridCandidate(
-                    nzbUrl = target.nzbUrl,
-                    usenetKnownHash = target.knownHash,
-                    fileMustInclude = target.fileMustInclude,
-                    fileIdx = target.fileIdx,
-                ),
-                episode = target.episode,
-            ) ?: throw usenetPlaybackFailure(DebridResolver.DebridException.NoKey)
+            val resolved = try {
+                debridCoordinator.resolvePlaybackRef(
+                    candidate = DebridCoordinator.DebridCandidate(
+                        nzbUrl = target.nzbUrl,
+                        usenetKnownHash = target.knownHash,
+                        fileMustInclude = target.fileMustInclude,
+                        fileIdx = target.fileIdx,
+                    ),
+                    episode = target.episode,
+                )
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Throwable) {
+                throw usenetPlaybackFailure(error)
+            } ?: throw usenetPlaybackFailure(DebridResolver.DebridException.NoKey)
             Playable(
                 url = resolved.url,
                 title = source.title,

@@ -69,7 +69,9 @@ internal class DebridCoordinator(
         pair.first,
         pair.second,
         context,
-        context?.let { UsenetProviderStore(it, pair.second::ownerToken) },
+        context?.let {
+            UsenetProviderStore(it, pair.second::ownerToken, pair.second::mutateCurrentOwner)
+        },
     )
 
     private fun nativeResolver(credentials: UsenetProviderCredentials): UsenetLocalResolver {
@@ -336,16 +338,19 @@ internal class DebridCoordinator(
         // file (TorBox is the preferred path when both exist, mirroring Apple's TorBox-first usenet ladder).
         if (!candidate.hasDirectUrl && !candidate.nzbUrl.isNullOrBlank()) {
             if (confirmedUsenetURLs != null && candidate.nzbUrl !in confirmedUsenetURLs) return null
-            return withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
-                // 1. TorBox when configured.
-                if (keys.isConfigured(DebridService.TOR_BOX, owner)) {
-                    try {
+            // TorBox links are expected to mint quickly. Native NNTP is a progressive, file-backed title
+            // transfer and must not inherit this five-second direct-link budget; its socket reads remain
+            // independently cancellable and bounded by the provider read timeout.
+            var torBoxFailure: Throwable? = null
+            if (keys.isConfigured(DebridService.TOR_BOX, owner)) {
+                val torBoxResult = try {
+                    withTimeoutOrNull(RESOLVE_TIMEOUT_MS) {
                         val url = resolver.resolveUsenet(
                             candidate.nzbUrl, candidate.usenetKnownHash, candidate.fileMustInclude, candidate.fileIdx, episode,
                             owner,
                         )
                         if (!keys.isCurrent(owner)) return@withTimeoutOrNull null
-                        return@withTimeoutOrNull DebridPlaybackRef(
+                        DebridPlaybackRef(
                             url = url,
                             service = DebridService.TOR_BOX,
                             owner = owner,
@@ -355,43 +360,47 @@ internal class DebridCoordinator(
                             fileIdx = candidate.fileIdx,
                             episode = episode,
                         )
-                    } catch (cancel: CancellationException) {
-                        throw cancel
-                    } catch (_: Exception) {
-                        // fall through to the native provider path
                     }
-                }
-
-                // 2. Native NNTP provider as the fallback (own usenet account, no TorBox needed).
-                val credentials = usenetProviderStore?.load(owner)
-                if (credentials != null) {
-                    try {
-                        val result = nativeResolver(credentials).resolve(
-                            nzbUrl = candidate.nzbUrl,
-                            fileMustInclude = candidate.fileMustInclude,
-                            fileIdx = candidate.fileIdx,
-                            episode = episode,
-                        )
-                        if (!keys.isCurrent(owner)) return@withTimeoutOrNull null
-                        return@withTimeoutOrNull DebridPlaybackRef(
-                            url = result.url,
-                            service = DebridService.TOR_BOX,
-                            owner = owner,
-                            infoHash = "",
-                            torrentId = null,
-                            fileId = null,
-                            fileIdx = candidate.fileIdx,
-                            episode = episode,
-                            isNativeFile = true,
-                        )
-                    } catch (cancel: CancellationException) {
-                        throw cancel
-                    } catch (_: Exception) {
-                        null
-                    }
-                } else {
+                } catch (cancel: CancellationException) {
+                    throw cancel
+                } catch (error: Exception) {
+                    torBoxFailure = error
                     null
                 }
+                if (torBoxResult != null) return torBoxResult
+                if (torBoxFailure == null) torBoxFailure = DebridResolver.DebridException.NotReady
+            }
+
+            // 2. Native NNTP provider as the fallback. It intentionally has no direct-link deadline.
+            val credentials = usenetProviderStore?.load(owner)
+            if (credentials == null) {
+                torBoxFailure?.let { throw it }
+                return null
+            }
+            try {
+                val result = nativeResolver(credentials).resolve(
+                    nzbUrl = candidate.nzbUrl,
+                    fileMustInclude = candidate.fileMustInclude,
+                    fileIdx = candidate.fileIdx,
+                    episode = episode,
+                )
+                if (!keys.isCurrent(owner)) return null
+                return DebridPlaybackRef(
+                    url = result.url,
+                    service = DebridService.TOR_BOX,
+                    owner = owner,
+                    infoHash = "",
+                    torrentId = null,
+                    fileId = null,
+                    fileIdx = candidate.fileIdx,
+                    episode = episode,
+                    isNativeFile = true,
+                )
+            } catch (cancel: CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                // Do not erase the provider's typed TorBox error merely because native fallback also failed.
+                throw (torBoxFailure ?: error)
             }
         }
 
