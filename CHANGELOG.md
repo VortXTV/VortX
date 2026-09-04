@@ -12,15 +12,21 @@ This Apple-only beta carries the playback, subtitle, navigation, library, and Ma
 
 **Playback recovery is less likely to mistake waiting for failure.** AVPlayer and the remux path now keep recovery tied to the current item, producer, and playback generation. Recovery work from an older item cannot take over a newer one, and bounded reconnect handling avoids turning cleanup into a false successful end. Apple TV, iPhone, iPad, and Mac.
 
-**Dolby Vision stays on the intended path through recovery.** A healthy Dolby Vision playback path is not demoted merely because a recovery callback or temporary stall arrives late. Physical Apple TV long-run Dolby Vision and HDR continuity testing is still useful, especially on long and high-bitrate titles. Apple TV.
+**A recovery item cannot forget that Dolby Vision already worked.** Once the current stream has produced a Dolby Vision picture, replacing its AVPlayer item no longer resets that evidence and reopens the HDR10 fallback path. Unsupported Dolby Vision can still use the guarded initial fallback before any DV picture has appeared. Apple TV, iPhone, iPad, and Mac.
 
-**Subtitles retain the right identity, timing, and full cue mapping.** Distinct subtitle events no longer collapse merely because their timestamps match. Native subtitle settlement maps a complete cue to the correct rendition, keeps a cue that spans a segment boundary at its original absolute start time, and isolates an optional subtitle failure from video playback. Please report any repeated, missing, or shifted cues. Apple platforms.
+**Built-in subtitles keep one consistent interval across segment boundaries.** A cue spanning two HLS segments now carries its complete original start and end in both segments, with the same timeline mapping and identity. Previously the second copy could be clipped to a different start, giving AVPlayer overlapping but different cues. Proven duplicate ASS render records are also removed without deleting distinct dialogue that shares a timestamp. Apple platforms.
+
+**A subtitle failure no longer turns healthy video into a failed stream.** If an already-advertised subtitle track becomes unavailable, its last valid playlist remains fetchable and only that subtitle route ends. Temporarily delayed subtitle preparation retains the prior valid subtitle window while video continues advancing, instead of starving the video playlist and triggering a restart or fallback. Apple platforms.
+
+**External and built-in subtitles do not compete during selection.** The external subtitle overlay waits for native subtitle deselection to settle, including when the native track list arrives late. Selection retries and refreshes belong to the current item, so an old selection cannot activate a second renderer on its replacement. Apple platforms.
 
 **Pausing no longer invites an unwanted recovery or episode change.** A paused item stays paused while delayed playback and end notifications settle, and the selected playback intent remains attached to the current session. Apple TV, iPhone, iPad, and Mac.
 
 **Continue Watching resumes the title you selected.** Episode handoff and library state stay tied to the loaded title and account, including after a profile transition or a delayed refresh. Apple platforms.
 
-**Continue Watching recovers when a saved source has gone stale.** Failed resume attempts can retry the title's sources, while a manual Next action from Continue Watching and the normal next-episode preload use the right episode and source. Apple TV, iPhone, iPad, and Mac.
+**A failed resume seek does not leave a false playback position behind.** Resume state is reconciled with the active player, a successful seek cancels its old watchdog, and a failed seek retains the guard against overwriting saved progress with an unintended start position. Continue Watching also hands the selected episode and current saved progress to the player instead of reusing an older cached position. Apple platforms.
+
+**Manual Next works when playback starts from Continue Watching.** A next-episode request waits for the episode metadata it needs and completes for the current series, rather than becoming a dead button until the first automatic transition. Next-episode preparation and cancellation remain tied to the active playback session. Apple TV, iPhone, iPad, and Mac.
 
 **Episode navigation keeps its focus.** Up from an episode remains in the episode list until the defined boundary, and the next-episode handoff retains the expected focus instead of jumping to an unrelated action. Apple TV.
 
@@ -30,11 +36,11 @@ This Apple-only beta carries the playback, subtitle, navigation, library, and Ma
 
 **TorBox sources get a fair retry.** A temporary provider response can recover without discarding the selected title or making you start over. Apple platforms.
 
-**More title details respect your preferences.** Movie source lists can be filtered by language, and tabs on the Mac stay with the profile that opened them. Apple platforms.
+**More title details respect your preferences.** Movie source lists can be filtered by audio language. Tab visibility and discovery preferences stay with their profile through profile changes, backup, import, and sync. Apple platforms.
 
-**Plex sign-in handles a PIN step.** Plex accounts that require a PIN can complete the connection from the app instead of stopping at the first sign-in screen. Apple platforms.
+**Plex linking displays the right kind of code.** The app requests the short code accepted by plex.tv/link instead of a long authorization PIN that the link page cannot accept. Apple platforms.
 
-**Mac settings and hero screens are restored.** The floating Settings shell is back, and the Mac hero uses a safe fallback when optional artwork is unavailable. Apple silicon Mac.
+**Mac settings return to the in-window floating design.** The floating Settings shell is back. Hero artwork sizing also falls back safely when a Mac window has not yet acquired a display. Mac.
 
 **Apple artwork scales up only where it helps.** 4K-capable Apple TV and high-resolution Mac can use adaptive 4K hero artwork while mobile and lower-resolution surfaces keep conservative image sizes and bounded decoded memory. Apple TV and Mac.
 
