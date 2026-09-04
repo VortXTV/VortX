@@ -53,7 +53,7 @@ class ProfileDiscoveryPreferencesCodecTest {
             filtersCaptured = true,
             tabVisibilityCaptured = true,
         )
-        val decoded = UserProfile.decodeProfile(UserProfile.encodeProfile(UserProfile("Viewer", "🍿", discovery = clear))).discovery
+        val decoded = UserProfile.decodeProfile(UserProfile.encodeProfile(UserProfile(name = "Viewer", avatar = "🍿", discovery = clear))).discovery
         requireNotNull(decoded)
         assertTrue(decoded.regionOverrideCaptured == true)
         assertNull(decoded.regionOverride)
