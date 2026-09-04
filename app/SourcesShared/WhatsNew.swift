@@ -5,14 +5,15 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.3.16"
+    static let version = "0.4.0-beta.2"
     static let highlights: [String] = [
-        "A pause stays paused. Internal cache flushes and delayed end notifications can no longer impersonate episode completion, resume playback, or advance a series while you are paused.",
-        "Continue Watching, watched marks, and Library actions now stay attached to the real title, profile, and account that owns them. Duplicate series rows, stale account work, and cross-title mutations are fenced across Apple, Android, and web.",
-        "Playback recovery is calmer on both platforms. Apple keeps a healthy AVPlayer or remux session and preserves audio choices, while Android serializes mpv startup, teardown, buffering recovery, audio fallback, and terminal events.",
-        "Android source loading, Community JavaScript providers, subtitle sidecars, TV focus, and player controls are hardened against stale requests, unsafe destinations, oversized payloads, and dead player instances.",
-        "Apple update notices and diagnostic exports are dependable again, and Apple TV listener, audio-route, source-column, HDR, and trickplay recovery paths report and recover more truthfully.",
-        "Apple and Android now ship through one verified release transaction. Production-signed Android artifacts attach first, then the Apple coordinator validates every package, checksum, feed entry, tag, and source commit before publishing."
+        "Dolby Vision recovery remembers a successful DV picture across replacement player items, so a same-stream recovery cannot reset that evidence and reopen HDR10 fallback.",
+        "Built-in subtitle cues retain their full timing and identity across HLS segment boundaries. Proven duplicate ASS render records are removed while distinct dialogue is preserved, and external subtitles wait for native deselection before rendering.",
+        "A failed optional subtitle track no longer fails healthy video. Its last valid playlist remains available, while delayed subtitle preparation does not hold back video playback.",
+        "Pause and resume, saved Continue Watching positions, manual Next from Continue Watching, episode focus, and current Library and watched-state updates receive further Apple fixes. Old callbacks remain fenced to the playback session that created them.",
+        "Mac returns to its floating in-window Settings design. Apple TV and high-resolution Mac displays can use adaptive 4K hero artwork, with bounded image memory and a safe display fallback.",
+        "Movie sources can be filtered by audio language, tabs and discovery choices stay with their profile, TorBox retries retain the selected title, and Plex linking requests the short code accepted by plex.tv/link.",
+        "This beta contains Apple packages only. Android playback and interface parity continue separately. Physical Apple TV long-run Dolby Vision, subtitle, and extended-pause testing remains important."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses
