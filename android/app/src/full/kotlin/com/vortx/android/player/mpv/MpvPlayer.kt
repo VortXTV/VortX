@@ -176,6 +176,11 @@ class MpvPlayer private constructor(
     private var audioHealthJob: Job? = null
     @Volatile private var audioRecoveryAttempted = false
     @Volatile private var audioFileLoadedGeneration = 0L
+    // `FILE_LOADED` can arrive before mpv has published the file's track-list. Keep the observation
+    // separate from PlayerState's currently visible tracks so an early empty snapshot cannot silently
+    // declare a real audio-bearing stream healthy. Access is serialized with audio-health scheduling.
+    private var audioTrackListObservedGeneration = 0L
+    private var audioTrackListHasAudio = false
     private var pausedClampJob: Job? = null
     private var memoryRecoveryJob: Job? = null
     private var normalReadAheadBytes: Long? = null
@@ -266,7 +271,11 @@ class MpvPlayer private constructor(
                     scheduleAudioOutputHealthCheck()
                 }
                 MPVLib.Event.FILE_LOADED -> {
-                    audioFileLoadedGeneration = subtitleLoadGeneration.get()
+                    synchronized(audioHealthLock) {
+                        audioFileLoadedGeneration = subtitleLoadGeneration.get()
+                        audioTrackListObservedGeneration = 0L
+                        audioTrackListHasAudio = false
+                    }
                     refreshTracks()
                     scheduleAudioOutputHealthCheck(replaceExisting = true)
                 }
@@ -361,6 +370,8 @@ class MpvPlayer private constructor(
             audioHealthJob = null
             audioRecoveryAttempted = false
             audioFileLoadedGeneration = 0L
+            audioTrackListObservedGeneration = 0L
+            audioTrackListHasAudio = false
         }
         // For a replacement the gate above armed its suppression window: mpv queues the OLD source's
         // END_FILE before the NEW source's START_FILE on this client's event queue, so exactly that span
@@ -953,8 +964,16 @@ class MpvPlayer private constructor(
             delay(AUDIO_OUTPUT_SETTLE_MS)
             if (!audioOutputCheckActive(generation)) return
 
+            var trackListAction = audioTrackListHealthAction(generation, timedOut = false)
+            if (trackListAction == MpvAudioTrackListHealthAction.PENDING_TRACK_LIST) {
+                delay(AUDIO_TRACK_LIST_WAIT_MS)
+                if (!audioOutputCheckActive(generation)) return
+                trackListAction = audioTrackListHealthAction(generation, timedOut = true)
+            }
+            if (trackListAction != MpvAudioTrackListHealthAction.CHECK_AUDIO_OUTPUT) return
+
             val initialAction = mpvAudioOutputHealthAction(
-                hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
+                hasAudioTrack = true,
                 currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
                 outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
                 recoveryAttempted = audioRecoveryAttempted,
@@ -977,8 +996,11 @@ class MpvPlayer private constructor(
 
             delay(AUDIO_OUTPUT_RECOVERY_MS)
             if (!audioOutputCheckActive(generation)) return
+            if (audioTrackListHealthAction(generation, timedOut = true) !=
+                MpvAudioTrackListHealthAction.CHECK_AUDIO_OUTPUT
+            ) return
             val recoveredAction = mpvAudioOutputHealthAction(
-                hasAudioTrack = _state.value.audioTracks.isNotEmpty(),
+                hasAudioTrack = true,
                 currentAo = mpv.getPropertyString(PROP_CURRENT_AO),
                 outputChannelCount = mpv.getPropertyInt(PROP_AUDIO_OUTPUT_CHANNEL_COUNT),
                 recoveryAttempted = true,
@@ -1000,16 +1022,36 @@ class MpvPlayer private constructor(
             !state.hasError && !state.hasEnded
     }
 
+    private fun audioTrackListHealthAction(
+        generation: Long,
+        timedOut: Boolean,
+    ): MpvAudioTrackListHealthAction = synchronized(audioHealthLock) {
+        val observed = audioTrackListObservedGeneration == generation
+        mpvAudioTrackListHealthAction(
+            trackListObserved = observed,
+            hasAudioTrack = observed && audioTrackListHasAudio,
+            timedOut = timedOut,
+        )
+    }
+
     override fun release() {
         if (!released.compareAndSet(false, true)) return
         synchronized(subtitleGenerationGate) {
             subtitleLoadGeneration.incrementAndGet()
         }
-        subtitleLoadScope.cancel()
-        // Close the terminal gate before unregistering so an already-dispatched native callback racing
-        // teardown cannot publish EOF and trigger watched/auto-advance.
+        // Retire every held terminal/opportunity before cancellation. A cancelled audio-health coroutine
+        // runs its `finally` and may complete its old opportunity immediately; after reset that completion
+        // is a no-op instead of publishing an EOF/error while teardown owns the player.
         terminalGate.release()
         failureCoordinator.reset()
+        synchronized(audioHealthLock) {
+            audioHealthJob?.cancel()
+            audioHealthJob = null
+            audioFileLoadedGeneration = 0L
+            audioTrackListObservedGeneration = 0L
+            audioTrackListHasAudio = false
+        }
+        subtitleLoadScope.cancel()
         runtimePolicyScope.cancel()
         mpv.removeObserver(observer)
         // Native destruction owns final cleanup of any still-attached surface. SurfaceHolder may deliver
@@ -1053,6 +1095,34 @@ class MpvPlayer private constructor(
             }
         }
         _state.update { it.copy(audioTracks = audio, subtitleTracks = subs) }
+        trackListUpdated(audio.isNotEmpty())
+    }
+
+    /**
+     * A valid track-list read is the boundary between "not available yet" and a real no-audio file.
+     * Only the first audio-bearing transition rearms health work, preventing repeated property changes
+     * from creating recovery loops. The generation fence drops a late old-source notification.
+     */
+    private fun trackListUpdated(hasAudioTrack: Boolean) {
+        val generation = subtitleLoadGeneration.get()
+        val shouldRearm = synchronized(audioHealthLock) {
+            if (released.get() || audioFileLoadedGeneration != generation) return
+            val firstObservation = audioTrackListObservedGeneration != generation
+            val hadAudioTrack = audioTrackListHasAudio
+            val rearm = shouldRearmMpvAudioHealthForTrackList(
+                loadedGeneration = audioFileLoadedGeneration,
+                callbackGeneration = generation,
+                trackListPreviouslyObserved = !firstObservation,
+                trackListPreviouslyHadAudio = hadAudioTrack,
+                hasAudioTrack = hasAudioTrack,
+            )
+            audioTrackListObservedGeneration = generation
+            audioTrackListHasAudio = audioTrackListHasAudio || hasAudioTrack
+            rearm
+        }
+        // An empty first snapshot resolves the pending state in the existing bounded check. A later
+        // audio-bearing update must rearm, even if that bounded check already accepted no audio.
+        if (shouldRearm) scheduleAudioOutputHealthCheck(replaceExisting = true)
     }
 
     @Composable
@@ -1167,6 +1237,7 @@ class MpvPlayer private constructor(
         /// stack artifacts. The file is deleted in the same call, so its size never matters on disk.
         private const val SCREENSHOT_INTERMEDIATE_QUALITY = "90"
         private const val AUDIO_OUTPUT_SETTLE_MS = 2_500L
+        private const val AUDIO_TRACK_LIST_WAIT_MS = 2_500L
         private const val AUDIO_OUTPUT_RECOVERY_MS = 2_500L
 
         /// Final tile quality, 0.7 == Apple's `kCGImageDestinationLossyCompressionQuality: 0.7` on both of

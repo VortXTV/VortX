@@ -7,6 +7,37 @@ internal enum class MpvAudioOutputHealthAction {
 }
 
 /**
+ * `FILE_LOADED` is allowed to precede mpv's first usable `track-list` property notification. Until a
+ * track list has actually arrived, an empty published track collection means "not known yet", not
+ * "this file has no audio". The caller waits for one bounded interval before accepting the latter.
+ */
+internal enum class MpvAudioTrackListHealthAction {
+    PENDING_TRACK_LIST,
+    NO_AUDIO_TRACK,
+    CHECK_AUDIO_OUTPUT,
+}
+
+internal fun mpvAudioTrackListHealthAction(
+    trackListObserved: Boolean,
+    hasAudioTrack: Boolean,
+    timedOut: Boolean,
+): MpvAudioTrackListHealthAction = when {
+    !trackListObserved && !timedOut -> MpvAudioTrackListHealthAction.PENDING_TRACK_LIST
+    !trackListObserved || !hasAudioTrack -> MpvAudioTrackListHealthAction.NO_AUDIO_TRACK
+    else -> MpvAudioTrackListHealthAction.CHECK_AUDIO_OUTPUT
+}
+
+/** A late property callback may only rearm health work for the active file generation, once per audio arrival. */
+internal fun shouldRearmMpvAudioHealthForTrackList(
+    loadedGeneration: Long,
+    callbackGeneration: Long,
+    trackListPreviouslyObserved: Boolean,
+    trackListPreviouslyHadAudio: Boolean,
+    hasAudioTrack: Boolean,
+): Boolean = loadedGeneration == callbackGeneration && hasAudioTrack &&
+    (!trackListPreviouslyObserved || !trackListPreviouslyHadAudio)
+
+/**
  * Decide whether an audio-bearing file has a real output, needs one bounded safe retry, or must be
  * handed to the existing source-failure ladder. A named AO or positive output channel count is proof
  * that mpv opened an output. Advancing video is deliberately not proof of working audio.

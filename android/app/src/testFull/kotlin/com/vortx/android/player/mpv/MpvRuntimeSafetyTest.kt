@@ -12,6 +12,89 @@ import org.junit.Test
 
 class MpvRuntimeSafetyTest {
     @Test
+    fun `audio health remains pending until an observed track list proves audio presence`() {
+        assertEquals(
+            MpvAudioTrackListHealthAction.PENDING_TRACK_LIST,
+            mpvAudioTrackListHealthAction(
+                trackListObserved = false,
+                hasAudioTrack = false,
+                timedOut = false,
+            ),
+        )
+        assertEquals(
+            MpvAudioTrackListHealthAction.CHECK_AUDIO_OUTPUT,
+            mpvAudioTrackListHealthAction(
+                trackListObserved = true,
+                hasAudioTrack = true,
+                timedOut = false,
+            ),
+        )
+    }
+
+    @Test
+    fun `audio health accepts no audio only after track list arrival or bounded timeout`() {
+        assertEquals(
+            MpvAudioTrackListHealthAction.NO_AUDIO_TRACK,
+            mpvAudioTrackListHealthAction(
+                trackListObserved = true,
+                hasAudioTrack = false,
+                timedOut = false,
+            ),
+        )
+        assertEquals(
+            MpvAudioTrackListHealthAction.NO_AUDIO_TRACK,
+            mpvAudioTrackListHealthAction(
+                trackListObserved = false,
+                hasAudioTrack = false,
+                timedOut = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `stale generation track list cannot rearm audio health`() {
+        assertFalse(
+            shouldRearmMpvAudioHealthForTrackList(
+                loadedGeneration = 9L,
+                callbackGeneration = 8L,
+                trackListPreviouslyObserved = false,
+                trackListPreviouslyHadAudio = false,
+                hasAudioTrack = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `audio arrival rearms once then preserves one recovery limit`() {
+        assertTrue(
+            shouldRearmMpvAudioHealthForTrackList(
+                loadedGeneration = 9L,
+                callbackGeneration = 9L,
+                trackListPreviouslyObserved = true,
+                trackListPreviouslyHadAudio = false,
+                hasAudioTrack = true,
+            ),
+        )
+        assertFalse(
+            shouldRearmMpvAudioHealthForTrackList(
+                loadedGeneration = 9L,
+                callbackGeneration = 9L,
+                trackListPreviouslyObserved = true,
+                trackListPreviouslyHadAudio = true,
+                hasAudioTrack = true,
+            ),
+        )
+        assertEquals(
+            MpvAudioOutputHealthAction.RETRY_DECODED_STEREO,
+            mpvAudioOutputHealthAction(true, null, null, recoveryAttempted = false),
+        )
+        assertEquals(
+            MpvAudioOutputHealthAction.FAIL_SOURCE,
+            mpvAudioOutputHealthAction(true, null, null, recoveryAttempted = true),
+        )
+    }
+
+    @Test
     fun `audio health ignores files without an audio track`() {
         assertEquals(
             MpvAudioOutputHealthAction.NONE,
@@ -75,6 +158,22 @@ class MpvRuntimeSafetyTest {
             EngineFailureResolution.None,
             coordinator.onTerminal(terminal.copy(positionMs = 38_000L)),
         )
+        assertEquals(
+            EngineFailureResolution.None,
+            coordinator.completeOpportunity(opportunity, EngineFallbackReason.AUDIO_OUTPUT_FAILED),
+        )
+    }
+
+    @Test
+    fun `teardown resets held audio opportunity before cancellation completion`() {
+        val coordinator = EngineFailureCoordinator<PlayerState>()
+        val opportunity = coordinator.beginOpportunity()
+        val terminal = PlayerState(positionMs = 42_000L, hasError = true)
+        assertEquals(EngineFailureResolution.None, coordinator.onTerminal(terminal))
+
+        // Mirrors release(): reset the coordinator before cancelling the coroutine whose finally block
+        // completes its held opportunity. That completion must not revive the pending terminal or demote.
+        coordinator.reset()
         assertEquals(
             EngineFailureResolution.None,
             coordinator.completeOpportunity(opportunity, EngineFallbackReason.AUDIO_OUTPUT_FAILED),
