@@ -23,6 +23,8 @@ private let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 private let app = tests.deletingLastPathComponent()
 private let player = try String(
     contentsOf: app.appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
+private let playerScreen = try String(
+    contentsOf: app.appendingPathComponent("Sources/PlayerScreen.swift"), encoding: .utf8)
 private let controller = try String(
     contentsOf: app.appendingPathComponent("Sources/Player/MPVMetalViewController.swift"), encoding: .utf8)
 private let crashReporter = try String(
@@ -48,6 +50,23 @@ if landedNearTarget { watchdogIsArmed = false }
 let laterUserPositionIsBehindOldResumeTarget = true
 let staleWatchdogCanAct = watchdogIsArmed && laterUserPositionIsBehindOldResumeTarget
 check("land then user backward-seek leaves no old watchdog able to act", !staleWatchdogCanAct)
+
+private let appleResumeSettlement = section(
+    playerScreen,
+    from: "lastRawTimePos = d",
+    to: "if d > 0, !hasStartedPlaying"
+) ?? ""
+
+check("Apple resume landing retires only its exact watchdog owner before later manual seeks",
+      appleResumeSettlement.contains("postFrameResumeSeekWatchdogOwner == event.loadToken")
+        && appleResumeSettlement.contains("abs(d - target) <= 5")
+        && appleResumeSettlement.contains("cancelPostFrameResumeSeekWatchdog()"))
+check("Apple watchdog retirement clears task target and owner together across load boundaries",
+      playerScreen.contains("postFrameResumeSeekWatchdog = nil")
+        && playerScreen.contains("postFrameResumeSeekWatchdogTarget = nil")
+        && playerScreen.contains("postFrameResumeSeekWatchdogOwner = nil")
+        && playerScreen.contains("firstFrameRenderedAt = nil; pendingLibmpvResumeSeek = nil")
+        && playerScreen.contains("cancelPostFrameResumeSeekWatchdog()"))
 
 private let enhancementProbe = section(
     controller,
