@@ -56,6 +56,16 @@ Physical Apple TV long-run testing remains useful for Dolby Vision continuity, H
 
 Android is not attached to this Apple-only beta. Android playback parity and the broader sync and provider work continue separately and will return in a later integrated release.
 
+### Install
+
+**Mac (.dmg, easiest, never expires).** Download `VortX-macOS-v0.4.0-beta.2-ci.dmg`, drag VortX into Applications, then clear Apple's one-time quarantine: open it once, click Done, then **System Settings > Privacy & Security > Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/VortX.app`). Full guide: **[Install on Mac](https://github.com/VortXTV/VortX/wiki/Install-on-Mac)**.
+
+**iPhone, iPad, Apple TV (sideload the IPA).** Download the matching `VortX-iOS-v0.4.0-beta.2-ci.ipa`, `VortX-tvOS-v0.4.0-beta.2-ci.ipa`, or `VortX-tvOS-lite-v0.4.0-beta.2-ci.ipa`. The IPAs are unsigned, because VortX is distributed outside the App Store with no Apple Developer ID yet, so you re-sign them yourself with Sideloadly, AltStore / SideStore, or Signulous. No jailbreak. For one-tap updates, add the VortX source to AltStore / SideStore or your sideloading service so new builds appear automatically: **`https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json`**. Full guide: **[Installing on iPhone, iPad, and Apple TV](https://github.com/VortXTV/VortX/wiki/Installing)**.
+
+The release also includes `SHA256SUMS-ci.txt` so you can confirm each download matches what the public [GitHub Actions workflow](https://github.com/VortXTV/VortX/tree/main/.github/workflows) built from this code. Android packages are intentionally not attached to this beta.
+
+<!-- vortx-build: 236 -->
+
 ## 0.4 Beta 1 (build 235)
 
 ### Playback and Dolby Vision
