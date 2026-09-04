@@ -37,6 +37,9 @@ internal fun shouldRearmMpvAudioHealthForTrackList(
 ): Boolean = loadedGeneration == callbackGeneration && hasAudioTrack &&
     (!trackListPreviouslyObserved || !trackListPreviouslyHadAudio)
 
+/** Teardown owns terminal state once release begins; late coroutine cleanup must not publish into the UI. */
+internal fun shouldPublishMpvFailureResolution(released: Boolean): Boolean = !released
+
 /**
  * Decide whether an audio-bearing file has a real output, needs one bounded safe retry, or must be
  * handed to the existing source-failure ladder. A named AO or positive output channel count is proof

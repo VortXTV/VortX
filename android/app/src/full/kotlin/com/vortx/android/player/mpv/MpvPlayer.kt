@@ -139,6 +139,10 @@ class MpvPlayer private constructor(
     }
 
     private fun applyFailureResolution(resolution: EngineFailureResolution<EngineTerminalVerdict>) {
+        // A naturally waking runtime-policy job can obtain its coordinator resolution after release's
+        // CAS but before its cancellation is observed. Teardown owns the terminal state from that CAS,
+        // so reject the late publication at this single shared sink.
+        if (!shouldPublishMpvFailureResolution(released.get())) return
         when (resolution) {
             EngineFailureResolution.None -> Unit
             is EngineFailureResolution.CommitTerminal -> _state.update {

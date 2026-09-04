@@ -181,6 +181,14 @@ class MpvRuntimeSafetyTest {
     }
 
     @Test
+    fun `failure resolution obtained during teardown is not published`() {
+        assertTrue(shouldPublishMpvFailureResolution(released = false))
+        // Models a health job which woke naturally after release's CAS and obtained a coordinator
+        // resolution before its cancellation was observed.
+        assertFalse(shouldPublishMpvFailureResolution(released = true))
+    }
+
+    @Test
     fun `healthy AO explicitly releases pending genuine terminal`() {
         val coordinator = EngineFailureCoordinator<PlayerState>()
         val opportunity = coordinator.beginOpportunity()
