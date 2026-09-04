@@ -710,6 +710,12 @@ struct PosterCard: View {
     /// a TMDB key: without one every backdrop falls back to the blurred-poster composite, so keyless
     /// users keep the clean portrait grid until they add a key (Settings > API keys).
     private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    /// A rendered catalog card retains the minimum engine preview needed for a menu action after the
+    /// backing board/discover/search page has been unloaded. CoreBridge still prefers its resident raw
+    /// engine preview and accepts this only after canonical id/type validation.
+    private var catalogPreview: LibraryWatchedMutationPolicy.MetaPreview {
+        .init(id: id, type: type, name: title, poster: poster)
+    }
     /// Landscape cards use one cinematic width (or the caller's explicit grid-cell width); portrait cards
     /// honor an EXPLICIT caller width (a fixed grid cell) when given, else the user's Poster Style width
     /// preset (#105). Self-sizing rails/surfaces pass nothing (`width == nil`), so the preset drives their
@@ -822,17 +828,17 @@ struct PosterCard: View {
             }
         case .catalog:
             Button {
-                CoreBridge.shared.addToLibrary(metaId: id)
+                CoreBridge.shared.addToLibrary(metaId: id, expectedType: type, fallbackPreview: catalogPreview)
             } label: {
                 Label("Add to Library", systemImage: "plus.circle")
             }
             Button {
-                CoreBridge.shared.setCatalogWatched(metaId: id, true)
+                CoreBridge.shared.setCatalogWatched(metaId: id, true, fallbackPreview: catalogPreview)
             } label: {
                 Label("Mark as Watched", systemImage: "checkmark.circle")
             }
             Button {
-                CoreBridge.shared.setCatalogWatched(metaId: id, false)
+                CoreBridge.shared.setCatalogWatched(metaId: id, false, fallbackPreview: catalogPreview)
             } label: {
                 Label("Mark as Unwatched", systemImage: "circle")
             }

@@ -4360,6 +4360,11 @@ struct PosterCardiOS: View {
     /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
     /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
     private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    /// Preserve this card's actual catalog identity for its context menu. CoreBridge uses it only if
+    /// board/discover/search no longer has the engine's resident raw preview, then validates id/type.
+    private var catalogPreview: LibraryWatchedMutationPolicy.MetaPreview {
+        .init(id: id, type: type, name: name, poster: poster)
+    }
     // Card WIDTH comes from the user's Poster Style preset (default `.balanced` = today's 224 / 116). The
     // grid derives its adaptive column width from the SAME preset (iOSPillMetrics.gridPosterWidth), so grid
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
@@ -4380,7 +4385,7 @@ struct PosterCardiOS: View {
     private var cornerRadius: CGFloat { catalogPrefs.posterRadius.radius }
 
     var body: some View {
-        card.modifier(PosterContextMenu(id: id, menu: menu, onDetails: onDetails))
+        card.modifier(PosterContextMenu(id: id, menu: menu, catalogPreview: catalogPreview, onDetails: onDetails))
     }
 
     private var card: some View {
@@ -4503,6 +4508,7 @@ struct PosterCardiOS: View {
 private struct PosterContextMenu: ViewModifier {
     let id: String
     let menu: iOSPosterMenu
+    let catalogPreview: LibraryWatchedMutationPolicy.MetaPreview
     /// Opens the title's detail page. On a Continue Watching card a tap RESUMES the remembered stream,
     /// so the menu offers "Details" to reach the detail page instead (to pick a different episode or
     /// source), the touch/Mac twin of what the user expects from a long-press on the tvOS row.
@@ -4533,17 +4539,18 @@ private struct PosterContextMenu: ViewModifier {
             }
         case .catalog:
             Button {
-                CoreBridge.shared.addToLibrary(metaId: id)
+                CoreBridge.shared.addToLibrary(metaId: id, expectedType: catalogPreview.type,
+                                               fallbackPreview: catalogPreview)
             } label: {
                 Label("Add to Library", systemImage: "plus.circle")
             }
             Button {
-                CoreBridge.shared.setCatalogWatched(metaId: id, true)
+                CoreBridge.shared.setCatalogWatched(metaId: id, true, fallbackPreview: catalogPreview)
             } label: {
                 Label("Mark as Watched", systemImage: "checkmark.circle")
             }
             Button {
-                CoreBridge.shared.setCatalogWatched(metaId: id, false)
+                CoreBridge.shared.setCatalogWatched(metaId: id, false, fallbackPreview: catalogPreview)
             } label: {
                 Label("Mark as Unwatched", systemImage: "circle")
             }

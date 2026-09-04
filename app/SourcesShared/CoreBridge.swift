@@ -184,6 +184,17 @@ final class CoreBridge: ObservableObject {
     // landing. Toggled from PlayerScreen (iOS/Mac) and TVPlayerView (tvOS) on appear/disappear.
     @Published private(set) var playerActive = false
     private var playerActiveDepth = 0
+    /// The Rust event callback must not read the SwiftUI-published `playerActive` directly. Keep a
+    /// lock-backed copy that is updated in the same main-queue transition and can be safely captured
+    /// once for a complete worker-thread library receipt.
+    private let playerActiveSnapshotLock = NSLock()
+    private var playerActiveSnapshotValue = false
+
+    private func playerActiveSnapshot() -> Bool {
+        playerActiveSnapshotLock.lock()
+        defer { playerActiveSnapshotLock.unlock() }
+        return playerActiveSnapshotValue
+    }
 
     /// Increment/decrement the player-active depth on the MAIN actor and publish `playerActive`.
     /// Balanced calls from each player host's onAppear (+1) and onDisappear (-1); the depth counter
@@ -194,6 +205,9 @@ final class CoreBridge: ObservableObject {
             self.playerActiveDepth = max(0, self.playerActiveDepth + (on ? 1 : -1))
             let active = self.playerActiveDepth > 0
             if self.playerActive != active { self.playerActive = active }
+            self.playerActiveSnapshotLock.lock()
+            self.playerActiveSnapshotValue = active
+            self.playerActiveSnapshotLock.unlock()
         }
     }
 
@@ -1897,7 +1911,8 @@ final class CoreBridge: ObservableObject {
     /// Library tab and poster menus). Resolved from whatever state already holds the
     /// title; nil means nothing knows it and the toggle is dropped rather than creating
     /// a nameless Continue Watching card.
-    private func overlayDisplayInfo(forId id: String) -> (name: String, type: String, poster: String?)? {
+    private func overlayDisplayInfo(forId id: String,
+                                    fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) -> (name: String, type: String, poster: String?)? {
         if let meta = metaDetails?.meta, meta.id == id { return (meta.name, meta.type, meta.poster) }
         if let item = continueWatching.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
         if let item = library?.catalog.first(where: { $0.id == id }) { return (item.name, item.type, item.poster) }
@@ -1908,14 +1923,21 @@ final class CoreBridge: ObservableObject {
            let name = raw["name"] as? String, let type = raw["type"] as? String {
             return (name, type, raw["poster"] as? String)
         }
+        if let fallbackPreview,
+           LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
+               metaID: id, expectedType: fallbackPreview.type,
+               previewID: fallbackPreview.id, previewType: fallbackPreview.type) {
+            return (fallbackPreview.name, fallbackPreview.type, fallbackPreview.poster)
+        }
         return nil
     }
 
     /// Id-only watched toggle into the overlay. Without an episode list the id itself is
     /// the marker (exactly how movies are tracked); unwatch clears everything recorded.
-    private func overlaySetWatchedById(_ id: String, _ isWatched: Bool) {
+    private func overlaySetWatchedById(_ id: String, _ isWatched: Bool,
+                                       fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) {
         if isWatched {
-            guard let info = overlayDisplayInfo(forId: id) else { return }
+            guard let info = overlayDisplayInfo(forId: id, fallbackPreview: fallbackPreview) else { return }
             ProfileStore.shared.setWatched(true, metaId: id, videoIds: [id],
                                            name: info.name, type: info.type, poster: info.poster)
         } else {
@@ -2435,24 +2457,26 @@ final class CoreBridge: ObservableObject {
     /// in whichever catalog field holds it) so the shape is exactly what the engine expects back.
     @discardableResult
     func addToLibrary(metaId: String, expectedType: String? = nil,
+                      fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil,
                       target: PlaybackMutationTarget? = nil) -> Bool {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
         guard target.stillOwnsCurrentContext(core: self) else { return false }
         guard target.overlayProfileID == nil else {
             // Overlay profile: save to the profile's private overlay, never the account library.
-            if let info = overlayDisplayInfo(forId: metaId) {
+            if let info = overlayDisplayInfo(forId: metaId, fallbackPreview: fallbackPreview) {
                 ProfileStore.shared.addLibraryEntry(metaId: metaId, name: info.name,
                                                     type: info.type, poster: info.poster)
             }
             return false
         }
         guard !logoutAccountMutationPending else { return false }
-        guard let raw = rawMetaPreview(forId: metaId),
+        let preview = rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary
+        guard let preview,
               LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
                 metaID: metaId, expectedType: expectedType,
-                previewID: raw["id"] as? String, previewType: raw["type"] as? String) else { return false }
+                previewID: preview["id"] as? String, previewType: preview["type"] as? String) else { return false }
         LibraryTombstones.forget(metaId)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
-        dispatchCtx(["action": "AddToLibrary", "args": raw])
+        dispatchCtx(["action": "AddToLibrary", "args": preview])
         return true
     }
 
@@ -2547,14 +2571,19 @@ final class CoreBridge: ObservableObject {
 
     /// Mark a catalog item watched / unwatched without opening its detail page first. `MetaItemMarkAsWatched`
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
-    func setCatalogWatched(metaId: String, _ isWatched: Bool) {
+    func setCatalogWatched(metaId: String, _ isWatched: Bool,
+                           fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) {
         guard ProfileStore.shared.activeUsesEngineHistory else {
-            overlaySetWatchedById(metaId, isWatched)   // overlay profile: private history only
+            overlaySetWatchedById(metaId, isWatched, fallbackPreview: fallbackPreview)   // overlay profile: private history only
             return
         }
         guard !logoutAccountMutationPending else { return }
-        guard let raw = rawMetaPreview(forId: metaId) else { return }
-        dispatchCtx(["action": "MetaItemMarkAsWatched", "args": ["meta_item": raw, "is_watched": isWatched]])
+        let preview = rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary
+        guard let preview,
+              LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
+                metaID: metaId, expectedType: fallbackPreview?.type,
+                previewID: preview["id"] as? String, previewType: preview["type"] as? String) else { return }
+        dispatchCtx(["action": "MetaItemMarkAsWatched", "args": ["meta_item": preview, "is_watched": isWatched]])
     }
 
     /// The raw `MetaItemPreview` JSON for a catalog item id, pulled verbatim from whichever catalog field
@@ -3424,6 +3453,10 @@ final class CoreBridge: ObservableObject {
             }
         }
         if fields.contains("library") {
+            // Capture once on the worker thread. Both library-derived refresh gates must make the
+            // same decision for this receipt, and this snapshot is lock-backed rather than reading
+            // the main-owned @Published playerActive value across threads.
+            let playerWasActive = playerActiveSnapshot()
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in
@@ -3437,7 +3470,7 @@ final class CoreBridge: ObservableObject {
             // UNION OwnerResumeStore. Skipped during playback: the rail is not visible then, and a real
             // progress save emits its own continue_watching_preview event (which rebuilds), so nothing is lost
             // while sparing the ~20s progress-save churn (#147).
-            if !playerActive { rebuildContinueWatching(capturedPublicationToken: publicationToken) }
+            if !playerWasActive { rebuildContinueWatching(capturedPublicationToken: publicationToken) }
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.
@@ -3447,25 +3480,27 @@ final class CoreBridge: ObservableObject {
             // also fires on every ~20s progress save and re-ranking a detail page that often
             // was its own performance bug.
             //
-            // SKIP entirely while a player is up: the In-Library button this feeds is not visible during
+            // Skip only this expensive detail refresh while a player is up: the In-Library button this feeds is not visible during
             // playback, and the full 1757-stream decode on every ~20s progress save was the main-thread
             // saturation that stalled the video. The detail page re-derives In-Library state from the
-            // coalesced meta_details republish when the player closes, so nothing is lost. Reading the
-            // @Published `playerActive` here is safe: it is written only on the main actor and a stale
-            // read at worst defers the In-Library refresh by one library emit, which the diff below
-            // (or the next meta_details republish) then catches.
-            guard !playerActive else { return }
-            let details = decode(CoreMetaDetails.self, field: "meta_details")
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken), let current = self.metaDetails else { return }
-                let changed = current.libraryItem?.id != details?.libraryItem?.id
-                    || current.libraryItem?.removed != details?.libraryItem?.removed
-                    || current.libraryItem?.temp != details?.libraryItem?.temp
-                    // An account/sync refresh can exchange one episode id for another while
-                    // preserving the count. Comparing the count made the open detail page retain
-                    // its old tick set until a reload, falsely appearing to undo a successful mark.
-                    || LibraryWatchedMutationPolicy.watchedMembershipChanged(current.watchedVideoIds, details?.watchedVideoIds)
-                if changed { self.metaDetails = details }
+            // coalesced meta_details republish when the player closes, so nothing is lost. The
+            // lock-backed receipt snapshot may be briefly old but cannot race SwiftUI state, and a
+            // later library/meta receipt catches any deferred refresh. Do not return from handleEvent here:
+            // the common tail must still publish changedFields/revision so WatchedIndex receives this
+            // library receipt while a player is active.
+            if !playerWasActive {
+                let details = decode(CoreMetaDetails.self, field: "meta_details")
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.publicationStillCurrent(publicationToken), let current = self.metaDetails else { return }
+                    let changed = current.libraryItem?.id != details?.libraryItem?.id
+                        || current.libraryItem?.removed != details?.libraryItem?.removed
+                        || current.libraryItem?.temp != details?.libraryItem?.temp
+                        // An account/sync refresh can exchange one episode id for another while
+                        // preserving the count. Comparing the count made the open detail page retain
+                        // its old tick set until a reload, falsely appearing to undo a successful mark.
+                        || LibraryWatchedMutationPolicy.watchedMembershipChanged(current.watchedVideoIds, details?.watchedVideoIds)
+                    if changed { self.metaDetails = details }
+                }
             }
         }
         if fields.contains("search") {

@@ -69,6 +69,19 @@ private struct LibraryWatchedMutationContractTests {
         check(Policy.canDispatchCatalogAdd(metaID: "tmdb:tv:1399", expectedType: "series",
                                            previewID: "tmdb:tv:1399", previewType: "tv"),
               "exact resolver response dispatches only after normalized type validation")
+        let unloadedCard = Policy.MetaPreview(id: "tt0137523", type: "movie", name: "Fight Club", poster: "poster")
+        check(unloadedCard.dictionary["id"] as? String == unloadedCard.id
+                && unloadedCard.dictionary["type"] as? String == unloadedCard.type
+                && unloadedCard.dictionary["name"] as? String == unloadedCard.name
+                && unloadedCard.dictionary["poster"] as? String == unloadedCard.poster,
+              "unloaded card fallback preserves the minimum engine preview fields")
+        check(Policy.canDispatchCatalogAdd(metaID: unloadedCard.id, expectedType: unloadedCard.type,
+                                           previewID: unloadedCard.id, previewType: unloadedCard.type),
+              "a canonical unloaded card fallback remains dispatchable")
+        let invalidCard = Policy.MetaPreview(id: "magnet:unsafe", type: "movie", name: "Unsafe", poster: nil)
+        check(!Policy.canDispatchCatalogAdd(metaID: invalidCard.id, expectedType: invalidCard.type,
+                                            previewID: invalidCard.id, previewType: invalidCard.type),
+              "a non-canonical unloaded card fallback is rejected")
 
         // Movie and series, watched and unwatched, produce deterministic engine action sequences.
         for watched in [false, true] {
