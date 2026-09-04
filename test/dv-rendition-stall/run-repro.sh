@@ -46,6 +46,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 REPO="$PWD"
+readonly SCRATCH_ROOT="${DV_HARNESS_SCRATCH_ROOT:-/tmp/dd-dvstall}"
 
 # INFRA exit code. It must not collide with a RED count: main.swift ends with
 # `exit(Int32(min(redCount, 125)))` over 27 runtime checks, so 0-27 are genuine
@@ -153,7 +154,7 @@ require_spm_root() {
     # Most RECENTLY MODIFIED wins. The old `ls -d ... | head -n 1` took the
     # alphabetically first of every VortX DerivedData directory on the machine,
     # which is arbitrary and frequently months stale.
-    SPM_ROOT="$(ls -dt "$HOME"/Library/Developer/Xcode/DerivedData/VortX-*/SourcePackages/artifacts/mpvkit 2>/dev/null | head -n 1)"
+    SPM_ROOT="$(ls -dt "$HOME"/Library/Developer/Xcode/DerivedData/VortX-*/SourcePackages/artifacts/mpvkit 2>/dev/null | head -n 1 || true)"
     SPM_ORIGIN="newest DerivedData VortX-*/SourcePackages/artifacts/mpvkit"
   fi
   [ -n "$SPM_ROOT" ] || infra "no SPM mpvkit artifact cache found under $HOME/Library/Developer/Xcode/DerivedData/VortX-*/SourcePackages/artifacts/mpvkit, and MPV_ROOT is unset. Build the app once so SPM resolves its binary targets, or set MPV_ROOT."
@@ -267,11 +268,11 @@ echo ""
 
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 
-test/dv-rendition-stall/make-fixture.sh "${FIXTURE_SECONDS:-240}"
+DV_HARNESS_SCRATCH_ROOT="$SCRATCH_ROOT" test/dv-rendition-stall/make-fixture.sh "${FIXTURE_SECONDS:-240}"
 for fixture in fixture-multiaudio.mkv fixture-mixedcodec.mkv fixture-manyaudio.mkv \
   fixture-shifted-timeline.mkv fixture-shifted-early-audio.mkv fixture-shifted-nodts.mkv; do
-  [ -s "/tmp/dd-dvstall/fixtures/$fixture" ] \
-    || infra "fixture generation completed without a readable /tmp/dd-dvstall/fixtures/$fixture."
+  [ -s "$SCRATCH_ROOT/fixtures/$fixture" ] \
+    || infra "fixture generation completed without a readable $SCRATCH_ROOT/fixtures/$fixture."
 done
 
 ENGINE_TRANSACTION_FLAGS=()
@@ -300,7 +301,7 @@ if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
   echo "  engine gate     ENABLED: actual AVPlayerEngine setAudioTrack success + rollback"
 fi
 
-mkdir -p /tmp/dd-dvstall
+mkdir -p "$SCRATCH_ROOT"
 # macOS ships Bash 3.2, whose `set -u` treats an empty `"${array[@]}"` as an unbound variable.
 # The `+` guard preserves zero arguments in stock mode and every discrete argument in engine mode.
 xcrun swiftc -sdk "$SDK_PATH" \
@@ -311,8 +312,9 @@ xcrun swiftc -sdk "$SDK_PATH" \
   -framework Foundation -framework IOKit -framework IOSurface -framework QuartzCore \
   -framework Network "${ENGINE_TRANSACTION_FRAMEWORKS[@]+"${ENGINE_TRANSACTION_FRAMEWORKS[@]}"}" \
   -lbz2 -liconv -lexpat -lresolv -lxml2 -lz -lc++ \
-  -o /tmp/dd-dvstall/repro-harness \
+  -o "$SCRATCH_ROOT/repro-harness" \
   test/dv-rendition-stall/Stubs.swift \
+  app/Sources/Player/VortXRemuxInputProbe.c \
   app/Sources/Player/DVPlaybackPolicy.swift \
   app/Sources/Player/VortXRemuxBuffer.swift \
   app/Sources/Player/AudioLanguagePolicy.swift \
@@ -320,10 +322,17 @@ xcrun swiftc -sdk "$SDK_PATH" \
   app/Sources/Player/SubtitleRenditionPolicy.swift \
   app/Sources/Player/RemuxResumePolicy.swift \
   app/Sources/Player/RemuxTimelineOriginPolicy.swift \
+  app/Sources/Player/VortXPreparedRemuxPolicy.swift \
+  app/Sources/Player/VortXRemuxProducerLeadPolicy.swift \
+  app/Sources/Player/RemuxFirstPacketFailurePolicy.swift \
+  app/Sources/Player/VortXRemuxReadFailurePolicy.swift \
+  app/Sources/Player/VortXRemuxReadRetryPolicy.swift \
+  app/Sources/Player/StreamRequestHeaderPolicy.swift \
   app/Sources/Player/AudioTranscodePolicy.swift \
   app/Sources/Player/VortXAudioTranscoder.swift \
   app/SourcesShared/VortXEngineProtocol.swift \
   app/Sources/Player/PGSOCRPolicy.swift \
+  app/Sources/Player/PGSOCRTextComposition.swift \
   app/Sources/Player/VortXPGSSubtitleOCR.swift \
   app/Sources/Player/VortXMKVRemuxStream.swift \
   app/SourcesShared/VortXEngineHostPolicy.swift \
@@ -333,4 +342,4 @@ xcrun swiftc -sdk "$SDK_PATH" \
   "${ENGINE_TRANSACTION_SOURCES[@]+"${ENGINE_TRANSACTION_SOURCES[@]}"}" \
   test/dv-rendition-stall/main.swift
 
-/tmp/dd-dvstall/repro-harness 9>&-
+"$SCRATCH_ROOT/repro-harness" 9>&-

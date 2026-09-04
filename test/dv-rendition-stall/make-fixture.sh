@@ -16,7 +16,7 @@
 # =============================================================================
 set -euo pipefail
 FFMPEG=/opt/homebrew/bin/ffmpeg
-OUT=/tmp/dd-dvstall/fixtures
+OUT="${DV_HARNESS_SCRATCH_ROOT:-/tmp/dd-dvstall}/fixtures"
 DUR="${1:-240}"
 mkdir -p "$OUT"
 

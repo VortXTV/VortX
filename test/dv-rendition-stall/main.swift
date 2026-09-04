@@ -35,7 +35,8 @@ extension VXProbe {
 
 // Golden init segments for FFmpeg-pin byte comparisons. VortX hand-parses and rewrites these boxes,
 // so their shape is a dependency on the pinned FFmpeg rather than an opaque implementation detail.
-let initDumpDir = "/tmp/dd-dvstall/init-golden"
+let scratchRoot = ProcessInfo.processInfo.environment["DV_HARNESS_SCRATCH_ROOT"] ?? "/tmp/dd-dvstall"
+let initDumpDir = scratchRoot + "/init-golden"
 
 func dumpInitSegment(_ body: Data, scenario: String, variant: String) {
     guard !body.isEmpty else { return }
@@ -293,7 +294,7 @@ extension VXProbe {
 }
 #endif
 
-let fixtureDir = "/tmp/dd-dvstall/fixtures"
+let fixtureDir = scratchRoot + "/fixtures"
 
 @discardableResult
 func fetch(_ base: String, _ path: String, timeout: TimeInterval = 45)
