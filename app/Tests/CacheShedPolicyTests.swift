@@ -125,23 +125,18 @@ check("rejects negatives", P.capBytes("-1") == nil && P.capBytes("-4MiB") == nil
 check("rejects other suffixes rather than misreading them",
       P.capBytes("48KiB") == nil && P.capBytes("1GiB") == nil && P.capBytes("") == nil)
 
-// MARK: - Internal cache-flush EOF ownership
+// MARK: - Internal cache-reanchor ownership
 
 for reason in [CacheFlushReason.pausedCacheClamp, .memoryWarning, .proactiveMemoryPressure] {
     var flight = CacheFlushSingleFlight<Int>()
     _ = flight.install(
-        owner: 7, reason: reason, target: 42, targetArgument: "42.000", startUptime: 1,
-        timeoutWorkItem: DispatchWorkItem {}
+        owner: 7, reason: reason, target: 42, targetArgument: "42.000",
+        startUptime: 1, timeoutWorkItem: DispatchWorkItem {}
     )
-    check("\(reason.rawValue): exact live owner suppresses synthetic EOF",
-          flight.suppressesEOF(owner: 7))
-    check("\(reason.rawValue): another load owner remains terminal",
-          !flight.suppressesEOF(owner: 8))
-    let consumed = flight.consumeSyntheticEOF(owner: 7)
-    check("\(reason.rawValue): exact EOF consumes its one-shot ownership",
-          consumed?.owner == 7 && consumed?.reason == reason)
-    check("\(reason.rawValue): later EOF after synthetic edge remains genuine",
-          !flight.suppressesEOF(owner: 7))
+    check("\(reason.rawValue): exact owner binds the transaction before command acceptance",
+          flight.current?.owner == 7 && flight.current?.phase == .seeking)
+    check("\(reason.rawValue): a seek command error finishes the exact flight immediately",
+          flight.seekCommandError(id: 1, owner: 7)?.reason == reason && flight.current == nil)
 }
 
 // MARK: - Proactive tvOS dirty-memory headroom policy (thresholds unchanged; floor now the raised floor)
@@ -420,7 +415,7 @@ for current in [96 * mib, 128 * mib, 192 * mib, 256 * mib, 384 * mib] {
           deferredBranch == true && drasticBranch == false && capAmple <= current && capLow <= current)
 }
 
-// MARK: - Single-flight cache-flush lifecycle (deterministic; no timers or sleeps)
+// MARK: - Single-flight cache-reanchor lifecycle (deterministic; no timers or sleeps)
 
 // The controller supplies the real PlayerLoadToken. This harness uses Int so the narrow value type stays
 // dependency-free and its ownership rules can be exercised without UIKit/libmpv.
@@ -428,246 +423,87 @@ let firstTimeout = DispatchWorkItem { }
 var flightGate = CacheFlushSingleFlight<Int>()
 check("single-flight: an idle gate admits the first owner", flightGate.admit(owner: 1) == .started)
 let firstFlight = flightGate.install(
-    owner: 1,
-    reason: .memoryWarning,
-    target: 1604,
-    targetArgument: "1604.000",
-    startUptime: 10,
-    timeoutWorkItem: firstTimeout
+    owner: 1, reason: .memoryWarning, target: 1604, targetArgument: "1604.000",
+    startUptime: 10, timeoutWorkItem: firstTimeout
 )
-check("single-flight: first flight has monotonic id, exact owner, finite target, and one formatted argument",
+check("single-flight: immutable target is recorded before command acceptance",
       firstFlight.id == 1 && firstFlight.owner == 1 && firstFlight.target == 1604
-        && firstFlight.targetArgument == "1604.000" && firstFlight.startUptime == 10
-        && firstFlight.phase == .dropping && firstFlight.result == .pending)
-check("single-flight: duplicate and triple warnings coalesce without changing reason or target",
-      flightGate.admit(owner: 1) == .coalesced
-        && flightGate.admit(owner: 1) == .coalesced
-        && flightGate.current?.id == firstFlight.id
-        && flightGate.current?.coalescedCount == 2
-        && flightGate.current?.reason == .memoryWarning
-        && flightGate.current?.targetArgument == "1604.000")
-check("single-flight: drop success enters seeking only for the exact owner",
-      flightGate.markDropSucceeded(id: firstFlight.id, owner: 2) == false
-        && flightGate.markDropSucceeded(id: firstFlight.id, owner: 1)
-        && flightGate.current?.phase == .seeking)
-check("single-flight: exact seek acceptance enters settling and wrong identity is ignored",
+        && firstFlight.targetArgument == "1604.000"
+        && firstFlight.phase == .seeking && firstFlight.result == .pending)
+check("single-flight: duplicate warnings coalesce without replacing the target",
+      flightGate.admit(owner: 1) == .coalesced && flightGate.admit(owner: 1) == .coalesced
+        && flightGate.current?.coalescedCount == 2 && flightGate.current?.id == firstFlight.id)
+check("single-flight: accepted exact seek waits for a libmpv seek event",
       flightGate.markSeekCommandAccepted(id: firstFlight.id + 1, owner: 1) == false
         && flightGate.markSeekCommandAccepted(id: firstFlight.id, owner: 2) == false
         && flightGate.markSeekCommandAccepted(id: firstFlight.id, owner: 1)
-        && flightGate.current?.phase == .settling
-        && flightGate.markSeekCommandAccepted(id: firstFlight.id, owner: 1) == false)
-check("single-flight: same-owner warnings coalesce for the full settle window",
-      flightGate.admit(owner: 1) == .coalesced
-        && flightGate.current?.coalescedCount == 3
+        && flightGate.current?.phase == .awaitingSeekEvent)
+check("single-flight: queued old progress and restart cannot restore cache seeking before seek evidence",
+      flightGate.completeOnProgress(owner: 1, observedPosition: 1605, progressEpsilon: 0.25) == nil
+        && flightGate.completeOnPlaybackRestart(owner: 1) == nil
+        && flightGate.current?.phase == .awaitingSeekEvent)
+check("single-flight: only the exact owner observes the seek boundary",
+      !flightGate.markSeekEventObserved(owner: 2)
+        && flightGate.markSeekEventObserved(owner: 1)
         && flightGate.current?.phase == .settling)
-check("single-flight: exact settle produces command-accepted and cancels the deadline once",
-      flightGate.settle(id: firstFlight.id, owner: 1)?.result == .commandAccepted
-        && flightGate.current == nil
-        && firstTimeout.isCancelled
-        && flightGate.settle(id: firstFlight.id, owner: 1) == nil)
+check("single-flight: restart settles after the seek boundary and cancels timeout once",
+      flightGate.completeOnPlaybackRestart(owner: 1)?.result == .commandAccepted
+        && flightGate.current == nil && firstTimeout.isCancelled)
 
-check("single-flight: completion permits a later flight with a newer id",
-      flightGate.admit(owner: 1) == .started)
-let secondFlight = flightGate.install(
-    owner: 1,
-    reason: .pausedCacheClamp,
-    target: 1404,
-    targetArgument: "1404.000",
-    startUptime: 20,
-    timeoutWorkItem: DispatchWorkItem { }
+var progressGate = CacheFlushSingleFlight<Int>()
+let progressFlight = progressGate.install(
+    owner: 32, reason: .proactiveMemoryPressure, target: 320, targetArgument: "320.000",
+    startUptime: 32, timeoutWorkItem: DispatchWorkItem { }
 )
-check("single-flight: an old same-owner settle cannot clear a newer flight",
-      flightGate.settle(id: firstFlight.id, owner: 1) == nil
-        && flightGate.current?.id == secondFlight.id
-        && flightGate.current?.phase == .dropping
-        && flightGate.settle(id: secondFlight.id, owner: 1) == nil)
-check("single-flight: stale or wrong-owner settle cannot clear the current flight",
-      flightGate.settle(id: secondFlight.id - 1, owner: 2) == nil
-        && flightGate.settle(id: secondFlight.id, owner: 2) == nil
-        && flightGate.current?.id == secondFlight.id
-        && flightGate.current?.owner == 1)
-check("single-flight: exact settle clears the current flight once",
-      flightGate.markDropSucceeded(id: secondFlight.id, owner: 1)
-        && flightGate.markSeekCommandAccepted(id: secondFlight.id, owner: 1)
-        && flightGate.settle(id: secondFlight.id, owner: 1)?.result == .commandAccepted
-        && flightGate.current == nil
-        && flightGate.settle(id: secondFlight.id, owner: 1) == nil)
-
-var eofBeforeProgressGate = CacheFlushSingleFlight<Int>()
-let eofBeforeProgressFlight = eofBeforeProgressGate.install(
-    owner: 31,
-    reason: .memoryWarning,
-    target: 310,
-    targetArgument: "310.000",
-    startUptime: 31,
-    timeoutWorkItem: DispatchWorkItem { }
-)
-_ = eofBeforeProgressGate.markDropSucceeded(id: eofBeforeProgressFlight.id, owner: 31)
-_ = eofBeforeProgressGate.markSeekCommandAccepted(id: eofBeforeProgressFlight.id, owner: 31)
-check("single-flight: exact synthetic EOF before observed progress is suppressed once",
-      eofBeforeProgressGate.consumeSyntheticEOF(owner: 31)?.result == .commandAccepted
-        && eofBeforeProgressGate.current == nil
-        && eofBeforeProgressGate.consumeSyntheticEOF(owner: 31) == nil)
-
-var progressCompletionGate = CacheFlushSingleFlight<Int>()
-let progressCompletionFlight = progressCompletionGate.install(
-    owner: 32,
-    reason: .proactiveMemoryPressure,
-    target: 320,
-    targetArgument: "320.000",
-    startUptime: 32,
-    timeoutWorkItem: DispatchWorkItem { }
-)
-_ = progressCompletionGate.markDropSucceeded(id: progressCompletionFlight.id, owner: 32)
-_ = progressCompletionGate.markSeekCommandAccepted(id: progressCompletionFlight.id, owner: 32)
-check("single-flight: only exact-owner positive progress retires EOF ownership before timeout",
-      progressCompletionGate.completeOnProgress(owner: 33, observedPosition: 321, progressEpsilon: 0.25) == nil
-        && progressCompletionGate.completeOnProgress(owner: 32, observedPosition: 320, progressEpsilon: 0.25) == nil
-        && progressCompletionGate.completeOnProgress(owner: 32, observedPosition: 320.25, progressEpsilon: 0.25)?.result == .commandAccepted
-        && progressCompletionGate.current == nil
-        && progressCompletionGate.consumeSyntheticEOF(owner: 32) == nil)
+_ = progressGate.markSeekCommandAccepted(id: progressFlight.id, owner: 32)
+_ = progressGate.markSeekEventObserved(owner: 32)
+check("single-flight: post-seek progress settles only for the exact owner and target",
+      progressGate.completeOnProgress(owner: 33, observedPosition: 321, progressEpsilon: 0.25) == nil
+        && progressGate.completeOnProgress(owner: 32, observedPosition: 320, progressEpsilon: 0.25) == nil
+        && progressGate.completeOnProgress(owner: 32, observedPosition: 320.25, progressEpsilon: 0.25)?.result == .commandAccepted
+        && progressGate.current == nil)
 
 var errorGate = CacheFlushSingleFlight<Int>()
-let dropErrorFlight = errorGate.install(
-    owner: 11,
-    reason: .memoryWarning,
-    target: 11,
-    targetArgument: "11.000",
-    startUptime: 60,
-    timeoutWorkItem: DispatchWorkItem { }
+let errorFlight = errorGate.install(
+    owner: 11, reason: .memoryWarning, target: 11, targetArgument: "11.000",
+    startUptime: 60, timeoutWorkItem: DispatchWorkItem { }
 )
-check("single-flight: drop command error clears without a seek or settle window",
-      errorGate.dropCommandError(id: dropErrorFlight.id, owner: 11)?.result == .dropCommandError
+check("single-flight: exact seek command error finishes immediately without a terminal EOF exception",
+      errorGate.seekCommandError(id: errorFlight.id, owner: 12) == nil
+        && errorGate.seekCommandError(id: errorFlight.id, owner: 11)?.result == .seekCommandError
         && errorGate.current == nil)
-let seekErrorFlight = errorGate.install(
-    owner: 11,
-    reason: .memoryWarning,
-    target: 12,
-    targetArgument: "12.000",
-    startUptime: 61,
-    timeoutWorkItem: DispatchWorkItem { }
-)
-check("single-flight: seek command error enters settling and latches the outcome",
-      errorGate.markDropSucceeded(id: seekErrorFlight.id, owner: 11)
-        && errorGate.seekCommandError(id: seekErrorFlight.id, owner: 12) == false
-        && errorGate.seekCommandError(id: seekErrorFlight.id, owner: 11)
-        && errorGate.current?.result == .seekCommandError
-        && errorGate.current?.phase == .settling
-        && errorGate.seekCommandError(id: seekErrorFlight.id, owner: 11) == false
-        && errorGate.admit(owner: 11) == .coalesced
-        && errorGate.current?.result == .seekCommandError)
-check("single-flight: settle preserves seekCommandError and clears only the exact flight",
-      errorGate.settle(id: seekErrorFlight.id, owner: 12) == nil
-        && errorGate.settle(id: seekErrorFlight.id, owner: 11)?.result == .seekCommandError
-        && errorGate.current == nil
-        && errorGate.settle(id: seekErrorFlight.id, owner: 11) == nil)
 
-var lateDeadlineGate = CacheFlushSingleFlight<Int>()
-let lateDeadlineFlight = lateDeadlineGate.install(
-    owner: 13,
-    reason: .memoryWarning,
-    target: 14,
-    targetArgument: "14.000",
-    startUptime: 63,
-    timeoutWorkItem: DispatchWorkItem { }
+var timeoutGate = CacheFlushSingleFlight<Int>()
+let timeoutFlight = timeoutGate.install(
+    owner: 13, reason: .memoryWarning, target: 14, targetArgument: "14.000",
+    startUptime: 63, timeoutWorkItem: DispatchWorkItem { }
 )
-check("single-flight: reset before settle makes a late deadline a no-op",
-      lateDeadlineGate.reset()?.result == .canceled
-        && lateDeadlineGate.settle(id: lateDeadlineFlight.id, owner: 13) == nil
-        && lateDeadlineGate.current == nil)
+_ = timeoutGate.markSeekCommandAccepted(id: timeoutFlight.id, owner: 13)
+check("single-flight: bounded timeout restores after command acceptance even if the seek event never arrives",
+      timeoutGate.settle(id: timeoutFlight.id, owner: 13)?.result == .commandAccepted && timeoutGate.current == nil)
 
 var replacementGate = CacheFlushSingleFlight<Int>()
 let replacementFlight = replacementGate.install(
-    owner: 7,
-    reason: .memoryWarning,
-    target: 7,
-    targetArgument: "7.000",
-    startUptime: 30,
-    timeoutWorkItem: DispatchWorkItem { }
+    owner: 7, reason: .memoryWarning, target: 7, targetArgument: "7.000",
+    startUptime: 30, timeoutWorkItem: DispatchWorkItem { }
 )
-check("single-flight: accepted replacement reset cancels the old flight",
+check("single-flight: a replacement cancels the old owner-bound transaction",
       replacementGate.reset()?.id == replacementFlight.id && replacementGate.current == nil)
 let retainedFlight = replacementGate.install(
-    owner: 8,
-    reason: .memoryWarning,
-    target: 8,
-    targetArgument: "8.000",
-    startUptime: 31,
-    timeoutWorkItem: DispatchWorkItem { }
+    owner: 8, reason: .pausedCacheClamp, target: 8, targetArgument: "8.000",
+    startUptime: 31, timeoutWorkItem: DispatchWorkItem { }
 )
-check("single-flight: rejected replacement identity retains the current flight",
-      replacementGate.reset(owner: 7) == nil
-        && replacementGate.current?.id == retainedFlight.id
-        && replacementGate.current?.owner == 8)
+check("single-flight: a stale owner cannot cancel another source's cache option restore",
+      replacementGate.reset(owner: 7) == nil && replacementGate.current?.id == retainedFlight.id)
 
-var pauseGate = CacheFlushSingleFlight<Int>()
-_ = pauseGate.install(
-    owner: 9,
-    reason: .pausedCacheClamp,
-    target: 90,
-    targetArgument: "90.000",
-    startUptime: 40,
-    timeoutWorkItem: DispatchWorkItem { }
-)
-check("single-flight: proactive and pause callbacks coalesce on the same owner",
-      pauseGate.admit(owner: 9) == .coalesced
-        && pauseGate.current?.reason == .pausedCacheClamp
-        && pauseGate.current?.coalescedCount == 1)
 var independentA = CacheFlushSingleFlight<Int>()
 var independentB = CacheFlushSingleFlight<Int>()
 _ = independentA.install(
-    owner: 10,
-    reason: .memoryWarning,
-    target: 10,
-    targetArgument: "10.000",
-    startUptime: 50,
-    timeoutWorkItem: DispatchWorkItem { }
+    owner: 10, reason: .memoryWarning, target: 10, targetArgument: "10.000",
+    startUptime: 50, timeoutWorkItem: DispatchWorkItem { }
 )
 check("single-flight: two helper instances have independent gates",
-      independentA.current != nil && independentB.current == nil
-        && independentB.admit(owner: 10) == .started)
-
-// MARK: - Paused cache park (deterministic; the destructive drop must defer its seek)
-
-var pausedPark = PausedCachePark<Int>()
-let parked = pausedPark.install(owner: 21, target: 721.125, targetArgument: "721.125")
-check("paused park: installs one finite, owner-bound recovery target",
-      parked?.owner == 21 && parked?.target == 721.125
-        && parked?.targetArgument == "721.125" && parked?.syntheticEOFAvailable == true)
-check("paused park: a same-owner coalesced clamp cannot replace the saved target",
-      pausedPark.install(owner: 21, target: 900, targetArgument: "900.000") == nil
-        && pausedPark.current?.targetArgument == "721.125")
-check("paused park: the parked target retains its one-shot synthetic EOF fence before resume",
-      pausedPark.current?.syntheticEOFAvailable == true
-        && pausedPark.current?.targetArgument == "721.125")
-check("paused park: wrong owner cannot consume, begin recovery, or clear another file's target",
-      !pausedPark.consumeSyntheticEOF(owner: 22)
-        && pausedPark.beginRecovery(owner: 22) == nil
-        && pausedPark.reset(owner: 22) == nil
-        && pausedPark.current?.owner == 21)
-check("paused park: observed resume begins exact-owner recovery without discarding the EOF fence",
-      pausedPark.beginRecovery(owner: 21)?.targetArgument == "721.125"
-        && pausedPark.current?.phase == .recovering
-        && pausedPark.completeRecovery(owner: 21, observedPosition: 721.125, progressEpsilon: 0.25) == nil)
-check("paused park: late first synthetic EOF after resume is suppressed, later EOF is genuine",
-      pausedPark.consumeSyntheticEOF(owner: 21)
-        && !pausedPark.consumeSyntheticEOF(owner: 21)
-        && pausedPark.current?.targetArgument == "721.125")
-check("paused park: only positive position progress after the parked target completes recovery",
-      pausedPark.completeRecovery(owner: 21, observedPosition: 721.375, progressEpsilon: 0.25)?.targetArgument == "721.125"
-        && pausedPark.current == nil)
-check("paused park: replacement/invalidation clears only its exact owner",
-      pausedPark.install(owner: 23, target: 23, targetArgument: "23.000") != nil
-        && pausedPark.reset(owner: 23)?.owner == 23
-        && pausedPark.current == nil)
-check("paused park eligibility: the final two known seconds never arm a destructive drop or EOF fence",
-      !P.shouldParkPausedCache(target: 998, knownDuration: 1_000)
-        && !P.shouldParkPausedCache(target: 999.999, knownDuration: 1_000)
-        && !P.shouldParkPausedCache(target: 1_000, knownDuration: 1_000))
-check("paused park eligibility: ordinary mid-file remains eligible, unknown duration fails closed",
-      P.shouldParkPausedCache(target: 997.999, knownDuration: 1_000)
-        && !P.shouldParkPausedCache(target: 720, knownDuration: nil)
-        && !P.shouldParkPausedCache(target: 720, knownDuration: .infinity))
+      independentA.current != nil && independentB.current == nil && independentB.admit(owner: 10) == .started)
 
 // Source contracts here are intentionally small and semantic: they keep this executable harness useful even
 // when the controller cannot be compiled outside the Apple target. The full command/lifecycle mutants live in
@@ -680,10 +516,12 @@ if let policySource = try? String(contentsOf: policyURL, encoding: .utf8) {
     check("single-flight: policy source declares a finite reason and narrow value gate",
           policySource.contains("enum CacheFlushReason: String, Equatable")
             && policySource.contains("struct CacheFlushSingleFlight<Owner: Equatable>"))
-    check("single-flight: correction pass 2 uses the synchronous settle-window phase model",
-          policySource.contains("case settling")
+    check("single-flight: reanchor waits for an observed seek before accepting progress or restart",
+          policySource.contains("case awaitingSeekEvent")
+            && policySource.contains("case settling")
             && policySource.contains("case commandAccepted = \"command-accepted\"")
             && policySource.contains("markSeekCommandAccepted")
+            && policySource.contains("markSeekEventObserved")
             && policySource.contains("mutating func settle(id: UInt64, owner: Owner)")
             && !policySource.contains("awaitingSeekReply")
             && !policySource.contains("awaitingRestart")
@@ -695,12 +533,14 @@ if let policySource = try? String(contentsOf: policyURL, encoding: .utf8) {
             && policySource.contains("var phase: Phase")
             && policySource.contains("var result: Result")
             && policySource.contains("var timeoutWorkItem: DispatchWorkItem?"))
-    check("single-flight: phase model has no generic seek latch",
-          policySource.contains("case settling")
+    check("single-flight: phase model has no generic completion latch or paused cache park",
+          policySource.contains("case awaitingSeekEvent")
+            && policySource.contains("case settling")
             && !policySource.contains("case awaitingSeekReply")
             && !policySource.contains("case awaitingRestart")
             && !policySource.contains("sawSeek")
-            && !policySource.contains("mutating func markSeek(id:"))
+            && !policySource.contains("mutating func markSeek(id:")
+            && !policySource.contains("PausedCachePark"))
 }
 
 // MARK: - Beta 26 stutter fix: the in-band flush is edge-triggered (one per headroom episode)

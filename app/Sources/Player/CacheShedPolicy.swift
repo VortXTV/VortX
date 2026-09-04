@@ -1,6 +1,6 @@
 import Foundation
 
-/// The only finite sources allowed to request the destructive cache drop. Keeping this beside the value gate
+/// The only finite sources allowed to request the bounded cache re-anchor. Keeping this beside the value gate
 /// makes the gate dependency-free while preventing an arbitrary diagnostic string from becoming ownership data.
 enum CacheFlushReason: String, Equatable {
     case pausedCacheClamp = "paused-cache-clamp"
@@ -8,8 +8,8 @@ enum CacheFlushReason: String, Equatable {
     case proactiveMemoryPressure = "proactive-memory-pressure"
 }
 
-/// Result returned by the controller's destructive-cache admission point. A started flight may still terminate
-/// with a command error, settle-window acceptance, or cancellation; those outcomes are recorded by the
+/// Result returned by the controller's cache-reanchor admission point. A started flight may still terminate
+/// with a command error, observed-seek settlement, or cancellation; those outcomes are recorded by the
 /// controller's bounded receipts rather than added to this finite admission surface.
 enum CacheFlushDisposition: Equatable {
     case started
@@ -17,100 +17,12 @@ enum CacheFlushDisposition: Equatable {
     case skipped
 }
 
-/// A paused-file cache drop must not issue its recovery seek until libmpv has observed `pause=false`.
-/// `drop-buffers` is still needed to release the resident forward payload while a viewer is away, but an
-/// exact seek submitted against a paused demuxer can leave the resumed range request stranded. This tiny,
-/// owner-bound receipt keeps the one position that must be recovered and consumes only the EOF caused by that
-/// exact internal drop. It deliberately has no timer: a long pause is valid, and a replacement/invalidation
-/// is the only authority allowed to discard its target before resume.
-struct PausedCachePark<Owner: Equatable> {
-    struct Receipt: Equatable {
-        enum Phase: Equatable {
-            case parked
-            case recovering
-        }
-
-        let owner: Owner
-        let target: Double
-        let targetArgument: String
-        var syntheticEOFAvailable: Bool
-        var phase: Phase
-    }
-
-    private(set) var current: Receipt?
-
-    mutating func install(owner: Owner, target: Double, targetArgument: String) -> Receipt? {
-        guard target.isFinite, target > 0, !targetArgument.isEmpty, current == nil else { return nil }
-        let receipt = Receipt(
-            owner: owner,
-            target: target,
-            targetArgument: targetArgument,
-            syntheticEOFAvailable: true,
-            phase: .parked
-        )
-        current = receipt
-        return receipt
-    }
-
-    func owns(_ owner: Owner) -> Bool { current?.owner == owner }
-
-    /// Consume only the one EOF that `drop-buffers` may synthesize. Keep the position parked: it is still the
-    /// recovery target when the viewer eventually resumes.
-    mutating func consumeSyntheticEOF(owner: Owner) -> Bool {
-        guard var receipt = current,
-              receipt.owner == owner,
-              receipt.syntheticEOFAvailable else { return false }
-        receipt.syntheticEOFAvailable = false
-        current = receipt
-        return true
-    }
-
-    /// The pause=false edge begins recovery but deliberately retains ownership until libmpv proves it reached
-    /// the parked target. A delayed EOF from the earlier `drop-buffers` may arrive after this edge.
-    mutating func beginRecovery(owner: Owner) -> Receipt? {
-        guard var receipt = current,
-              receipt.owner == owner,
-              receipt.phase == .parked else { return nil }
-        receipt.phase = .recovering
-        current = receipt
-        return receipt
-    }
-
-    /// Positive position progress after the re-anchor is the recovery completion edge. Do not use command
-    /// acceptance, nor merely a repeat sample at the old paused position: neither proves the resumed demuxer
-    /// has consumed the target range after the internal seek.
-    @discardableResult
-    mutating func completeRecovery(
-        owner: Owner,
-        observedPosition: Double,
-        progressEpsilon: Double
-    ) -> Receipt? {
-        guard let receipt = current,
-              receipt.owner == owner,
-              receipt.phase == .recovering,
-              observedPosition.isFinite,
-              progressEpsilon.isFinite,
-              progressEpsilon >= 0,
-              observedPosition >= receipt.target + progressEpsilon else { return nil }
-        current = nil
-        return receipt
-    }
-
-    @discardableResult
-    mutating func reset(owner: Owner? = nil) -> Receipt? {
-        guard let receipt = current else { return nil }
-        guard owner == nil || owner == receipt.owner else { return nil }
-        current = nil
-        return receipt
-    }
-}
-
-/// One controller-local destructive cache operation. `Owner` is the exact loaded-file token in production; the
+/// One controller-local forced-low-level-seek operation. `Owner` is the exact loaded-file token in production; the
 /// standalone policy harness uses an integer so these lifecycle rules remain testable without libmpv/UIKit.
 struct CacheFlushFlight<Owner: Equatable> {
     enum Phase: String, Equatable {
-        case dropping
         case seeking
+        case awaitingSeekEvent
         case settling
         case terminal
     }
@@ -118,7 +30,6 @@ struct CacheFlushFlight<Owner: Equatable> {
     enum Result: String, Equatable {
         case pending
         case commandAccepted = "command-accepted"
-        case dropCommandError = "drop-command-error"
         case seekCommandError = "seek-command-error"
         case canceled
     }
@@ -130,12 +41,12 @@ struct CacheFlushFlight<Owner: Equatable> {
     let targetArgument: String
     let startUptime: TimeInterval
     var coalescedCount = 0
-    var phase: Phase = .dropping
+    var phase: Phase = .seeking
     var result: Result = .pending
     var timeoutWorkItem: DispatchWorkItem?
 }
 
-/// Main-queue-owned single flight for the destructive cache drop plus exact re-anchor seek. This is a value
+/// Main-queue-owned single flight for a forced-low-level exact seek. This is a value
 /// type, not a reusable operation framework: one instance belongs to one MPVMetalViewController.
 struct CacheFlushSingleFlight<Owner: Equatable> {
     private(set) var nextFlightID: UInt64 = 0
@@ -188,80 +99,44 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
         current?.id == id && current?.owner == owner
     }
 
-    /// `drop-buffers` can make libmpv publish an EOF while the exact-position recovery seek is still owned by
-    /// this internal operation. That EOF is cache-maintenance noise, not media completion. Keep the decision
-    /// owner-bound and reason-agnostic so paused, memory-warning, and proactive flushes receive the same rule.
-    func suppressesEOF(owner: Owner) -> Bool {
-        guard let current else { return false }
-        return current.owner == owner && current.phase != .terminal
-    }
-
-    /// Consume exactly one cache-owned EOF. Retiring ownership here keeps suppression one-shot: if the media
-    /// genuinely reaches its end after the recovery seek, that later EOF is terminal even inside the former
-    /// settle window.
-    @discardableResult
-    mutating func consumeSyntheticEOF(owner: Owner) -> CacheFlushFlight<Owner>? {
-        guard let flight = current, suppressesEOF(owner: owner) else { return nil }
-        let result: CacheFlushFlight<Owner>.Result
-        if flight.result == .seekCommandError {
-            result = .seekCommandError
-        } else if flight.phase == .settling {
-            result = .commandAccepted
-        } else {
-            result = .canceled
-        }
-        return finish(result: result)
-    }
-
-    mutating func markDropSucceeded(id: UInt64, owner: Owner) -> Bool {
-        guard var flight = current, flight.id == id, flight.owner == owner else { return false }
-        guard flight.phase == .dropping, flight.result == .pending else { return false }
-        flight.phase = .seeking
-        current = flight
-        return true
-    }
-
     mutating func markSeekCommandAccepted(id: UInt64, owner: Owner) -> Bool {
         guard var flight = current, flight.id == id, flight.owner == owner else { return false }
         guard flight.phase == .seeking, flight.result == .pending else { return false }
-        flight.phase = .settling
+        flight.phase = .awaitingSeekEvent
         current = flight
         return true
     }
 
     @discardableResult
-    mutating func dropCommandError(id: UInt64, owner: Owner) -> CacheFlushFlight<Owner>? {
-        finishIfExact(id: id, owner: owner, phase: .dropping, result: .dropCommandError)
+    mutating func seekCommandError(id: UInt64, owner: Owner) -> CacheFlushFlight<Owner>? {
+        finishIfExact(id: id, owner: owner, phase: .seeking, result: .seekCommandError)
     }
 
-    /// A seek command error is latched in the settling phase, not retried or resampled. The settle window remains
-    /// the one bounded exit.
-    mutating func seekCommandError(id: UInt64, owner: Owner) -> Bool {
-        guard var flight = current, flight.id == id, flight.owner == owner else { return false }
-        guard flight.phase == .seeking, flight.result == .pending else { return false }
+    /// A libmpv seek event, observed for the exact active source, proves that the queued command crossed from
+    /// command acceptance into the demuxer's seek path. Old time-pos samples are not sufficient for this edge.
+    mutating func markSeekEventObserved(owner: Owner) -> Bool {
+        guard var flight = current,
+              flight.owner == owner,
+              flight.phase == .awaitingSeekEvent,
+              flight.result == .pending else { return false }
         flight.phase = .settling
-        flight.result = .seekCommandError
         current = flight
         return true
     }
 
-    /// The single 15-second settle-window edge accepts a successful seek or preserves its latched error. It
+    /// The single bounded settle-window edge accepts a successful seek. It
     /// requires the exact flight identity and never consults a replacement's current ID.
     @discardableResult
     mutating func settle(id: UInt64, owner: Owner) -> CacheFlushFlight<Owner>? {
         guard let flight = current,
               flight.id == id,
               flight.owner == owner,
-              flight.phase == .settling,
-              flight.result == .pending || flight.result == .seekCommandError else { return nil }
-        let result: CacheFlushFlight<Owner>.Result =
-            flight.result == .seekCommandError ? .seekCommandError : .commandAccepted
-        return finish(result: result)
+              flight.phase == .awaitingSeekEvent || flight.phase == .settling,
+              flight.result == .pending else { return nil }
+        return finish(result: .commandAccepted)
     }
 
-    /// A token-fenced positive position sample proves the exact recovery seek has actually resumed playback.
-    /// Retire the flight before its fallback deadline so a later natural EOF is not misclassified as the
-    /// `drop-buffers` synthetic edge. A latched seek error still belongs to the timeout receipt instead.
+    /// A token-fenced recovery edge proves the forced seek has crossed mpv's transport restart boundary.
     @discardableResult
     mutating func completeOnProgress(
         owner: Owner,
@@ -276,6 +151,15 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
               progressEpsilon.isFinite,
               progressEpsilon >= 0,
               observedPosition >= flight.target + progressEpsilon else { return nil }
+        return finish(result: .commandAccepted)
+    }
+
+    @discardableResult
+    mutating func completeOnPlaybackRestart(owner: Owner) -> CacheFlushFlight<Owner>? {
+        guard let flight = current,
+              flight.owner == owner,
+              flight.phase == .settling,
+              flight.result == .pending else { return nil }
         return finish(result: .commandAccepted)
     }
 
@@ -335,20 +219,6 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
 /// the 2 GB Apple TV HD (`PerformanceMode.reduced`). Shedding under GENUINE low headroom is therefore
 /// preserved unchanged: the guard only removes the FALSE positives.
 enum VortXCacheShedPolicy {
-
-    /// Do not create a paused cache park when a known VOD duration says the playhead is effectively at EOF.
-    /// There is then no meaningful post-seek progress edge to retire the one-shot synthetic-EOF fence, so the
-    /// genuine terminal event could be hidden. Unknown/non-finite duration fails closed: callers may still
-    /// reduce the cap, but must not drop/fence because terminal proximity cannot be proven.
-    static let pausedCacheTerminalGuardSeconds = 2.0
-
-    static func shouldParkPausedCache(target: Double, knownDuration: Double?) -> Bool {
-        guard target.isFinite, target > 0 else { return false }
-        guard let knownDuration,
-              knownDuration.isFinite,
-              knownDuration > 0 else { return false }
-        return target < knownDuration - pausedCacheTerminalGuardSeconds
-    }
 
     /// The pinned MPVKit build does not move the forward demuxer payload out of process RAM when
     /// `cache-on-disk` is enabled. Keep this as the single capability authority for both setup and per-load
@@ -448,7 +318,7 @@ enum VortXCacheShedPolicy {
     }
 
     /// diag-23 FIX-C: should a memory warning SKIP the immediate buffer flush the shed otherwise performs
-    /// (`flushDemuxerCachePreservingPosition`, a drop-buffers plus an exact re-anchor seek)?
+    /// (`flushDemuxerCachePreservingPosition`, a forced low-level exact seek)?
     ///
     /// That flush is the JETSAM tool: it frees the resident forward buffer NOW, the last line of defence
     /// before tvOS/iOS kills the app. It is also the source of a visible frame-drop burst. Return true (defer
@@ -495,7 +365,7 @@ enum VortXCacheShedPolicy {
     /// The level-triggered gate above was correct for occasional warnings, but field logs from beta 25/26 show a
     /// different regime on the Apple TV 4K: headroom PARKS at roughly 400-420 MiB - permanently inside the
     /// [pressure, restore) band - and tvOS keeps posting advisory warnings every minute or two. Each one re-ran
-    /// the destructive drop-buffers + exact-re-anchor-seek flush (~15 s of main-thread IPC and a documented
+    /// the forced low-level exact-reanchor seek (~15 s of main-thread IPC and a documented
     /// frame-drop burst), so the viewer saw a visible stutter on a metronome. Flushing repeatedly at a stable
     /// in-band headroom frees nothing durable (the cache refills to the same held cap), so every repetition is
     /// pure cost with no jetsam benefit.
