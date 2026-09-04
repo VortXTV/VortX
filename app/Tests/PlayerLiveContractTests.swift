@@ -2312,6 +2312,82 @@ enum PlayerLiveContractTests {
                   data: Data("WEBVTT\n\n".utf8),
                   durationMilliseconds: 1_000)]) == .committed)
 
+        guard let frozenRoute = VortXHLSSessionSpool(
+            parentDirectory: root,
+            capacityBytes: 16,
+            chunkSize: 2,
+            scavengeStaleSessions: false) else {
+            check("optional subtitle freeze: fixture is creatable", false)
+            return
+        }
+        let video0 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 10)
+        let video1 = VortXHLSSessionSpool.ResourceKey.video(segmentID: 11)
+        let subtitle0 = VortXHLSSessionSpool.ResourceKey.subtitle(renditionID: 2, segmentID: 10)
+        let subtitle1 = VortXHLSSessionSpool.ResourceKey.subtitle(renditionID: 2, segmentID: 11)
+        let fourBytes = Data(repeating: 0xA5, count: 4)
+        let fiveBytes = Data(repeating: 0x5A, count: 5)
+        let frozenSetup = frozenRoute.spill([
+            .init(key: video0, data: fourBytes, durationMilliseconds: 1_000),
+            .init(key: subtitle0, data: fourBytes, durationMilliseconds: 1_000),
+        ])
+            && frozenRoute.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: [video0], now: 0) != nil
+            && frozenRoute.recordPlaylistGeneration(
+                playlistID: "subs-2", resourceKeys: [subtitle0], now: 0) != nil
+            && frozenRoute.spill([
+                .init(key: video1, data: fourBytes, durationMilliseconds: 1_000),
+            ])
+            && frozenRoute.recordPlaylistGeneration(
+                playlistID: "video", resourceKeys: [video1], now: 1) != nil
+        let advancedVideoLease = frozenRoute.openResource(video1, now: 1)
+        let frozenSubtitleLease = frozenRoute.openResource(subtitle0, now: 1)
+        check("optional subtitle freeze: video may advance while the last recorded subtitle route stays durable",
+              frozenSetup
+                  && frozenRoute.spillOutcome([.init(
+                    key: subtitle1, data: fiveBytes, durationMilliseconds: 1_000)]) == .pendingAdmission
+                  && advancedVideoLease != nil
+                  && frozenSubtitleLease != nil)
+        advancedVideoLease?.close(now: 1)
+        frozenSubtitleLease?.close(now: 1)
+        frozenRoute.collectExpired(now: 3.001)
+        check("optional subtitle freeze: expiry reclaims departed video while the frozen subtitle receipt remains",
+              !frozenRoute.contains(video0)
+                  && frozenRoute.contains(video1)
+                  && frozenRoute.contains(subtitle0)
+                  && frozenRoute.spillOutcome([.init(
+                    key: subtitle1, data: fiveBytes, durationMilliseconds: 1_000)]) == .committed)
+
+        func window(_ ids: ClosedRange<Int>) -> VortXHLSWindow {
+            VortXHLSWindow(segments: ids.map {
+                VortXHLSSegment(
+                    id: $0,
+                    byteOffset: $0 * 10,
+                    byteLength: 10,
+                    start: Double($0),
+                    duration: 1)
+            })
+        }
+        let initialSubtitle = window(0...8)
+        let laggingSubtitle = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...9),
+            videoWindow: window(0...10),
+            previousWindow: initialSubtitle)
+        check("optional subtitle lag: settled prefix grows while video publishes an unblocked newer tail",
+              laggingSubtitle?.segments.map(\.id) == Array(0...9))
+        let bridgeSubtitle = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+            settledWindow: window(0...12),
+            videoWindow: window(12...13),
+            previousWindow: laggingSubtitle)
+        let slidSubtitle = bridgeSubtitle.flatMap {
+            VortXHLSSubtitlePublicationPolicy.coherentWindow(
+                settledWindow: window(0...13),
+                videoWindow: window(12...14),
+                previousWindow: $0)
+        }
+        check("optional subtitle lag: a retained route bridges missed video starts, then slides only over overlap",
+              bridgeSubtitle?.segments.map(\.id) == Array(0...12)
+                  && slidSubtitle?.segments.map(\.id) == Array(12...13))
+
         guard let broken = VortXHLSSessionSpool(
             parentDirectory: root,
             capacityBytes: 8,
@@ -2988,6 +3064,18 @@ enum PlayerLiveContractTests {
             server,
             from: "private func currentPublication()",
             to: "private func topologyMatches(")
+        let renditionTopology = sourceSection(
+            server,
+            from: "private func topologyMatches(",
+            to: "private func audioDegraded(")
+        let subtitleDegradation = sourceSection(
+            server,
+            from: "private func subtitleDegraded(",
+            to: "private func windowConformsToFrozenTarget(")
+        let subtitleBacking = sourceSection(
+            stream,
+            from: "func ensureSubtitleBackings(",
+            to: "/// `SubtitleRenditionPolicy.normalizedCues`")
         let mediaPublication = sourceSection(
             server,
             from: "private func serveMedia(",
@@ -3184,11 +3272,27 @@ enum PlayerLiveContractTests {
                       "guard let startupReadiness = VortXHLSStartupReadiness(") == true
                   && server?.contains("stream.cancel()") == true
                   && server?.contains("stream.listenerDidRetire()") == true)
-        check("wiring: post-ready reloads advance only one common contiguous rendition frontier",
+        check("wiring: post-ready reloads advance only the required video/audio frontier",
               rollingPublication?.contains("greatestCommonContiguousWindow(") == true
                   && rollingPublication?.contains("DVPlaybackPolicy.minimumConformingSuffix(") == true
                   && rollingPublication?.contains(
                     "HLS publication frontier lost a previously advertised segment") == true)
+        check("wiring: advertised subtitle invalidation freezes the optional route instead of failing video topology",
+              rollingPublication?.contains("var subtitleTerminated = subtitleDegraded(snapshot)") == true
+                  && rollingPublication?.contains("ensureSubtitleBackings(window: candidate") == true
+                  && rollingPublication?.contains("VortXHLSSubtitlePublicationPolicy.coherentWindow(") == true
+                  && rollingPublication?.contains("selectedSubtitles = lastPublishedSubtitleWindow") == true
+                  && rollingPublication?.contains("subtitleRouteTerminated = true") == true
+                  && rollingPublication?.contains("let subtitleEnded = subtitleTerminated") == true
+                  && rollingPublication?.contains("selectedSubtitles?.segments.last?.id == selectedVideo.segments.last?.id") == true
+                  && renditionTopology?.contains("subtitleDegraded(snapshot)") == true
+                  && renditionTopology?.contains("snapshot.subtitleFailureReason == nil") == true
+                  && subtitleDegradation?.contains("!advertisedSubtitles.allSatisfy") == true
+                  && subtitlePlaylist?.contains("publication.subtitleEnded") == true
+                  && masterPublication?.contains("recordPublication(") == true
+                  && masterPublication?.contains("ensureSubtitleBackings(window: subtitleWindow") == true
+                  && masterPublication?.contains("lastPublishedSubtitleWindow = finalSubtitleWindow") == true
+                  && subtitleBacking?.contains("guard !resources.isEmpty else { return .ready }") == true)
         check("wiring: every logical playlist receipt is committed before a publication body is returned",
               sourceContainsInOrder(rollingPublication, [
                 "recordPublication(",

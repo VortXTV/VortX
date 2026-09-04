@@ -1720,6 +1720,54 @@ enum VortXHLSTargetPolicy {
     }
 }
 
+/// Selects a coherent, settled subtitle generation independently of the primary video's newest tail. Subtitle
+/// OCR may settle a segment after video has already published it, so requiring identical complete windows would
+/// either stall the primary playlist or keep this optional route permanently frozen. The selected interval never
+/// exceeds the current video tail and can bridge from a retained subtitle generation when the video window has
+/// slid more than one segment ahead, preventing a same-rendition gap before its next safe slide.
+enum VortXHLSSubtitlePublicationPolicy {
+    static func coherentWindow(settledWindow: VortXHLSWindow,
+                               videoWindow: VortXHLSWindow,
+                               previousWindow: VortXHLSWindow?) -> VortXHLSWindow? {
+        guard let videoStart = videoWindow.segments.first?.id,
+              let videoTail = videoWindow.segments.last?.id,
+              videoStart >= 0,
+              videoTail >= videoStart else { return nil }
+
+        let start: Int
+        if let previousWindow,
+           let previousTail = previousWindow.segments.last?.id,
+           videoStart > previousTail,
+           previousTail < Int.max,
+           previousTail + 1 < videoStart {
+            // The current video playlist has already slid past subtitle IDs that this route has not published.
+            // Retain its prior start for one append generation, then the next reload may slide over the overlap.
+            start = previousWindow.mediaSequence
+        } else {
+            start = videoStart
+        }
+        guard start >= 0, start <= videoTail else { return nil }
+
+        let selected = settledWindow.segments.filter { $0.id >= start && $0.id <= videoTail }
+        guard let first = selected.first, first.id == start else { return nil }
+        var expected = start
+        for segment in selected {
+            guard segment.id == expected else { return nil }
+            if expected == Int.max { break }
+            expected += 1
+        }
+        guard let tail = selected.last, tail.id <= videoTail else { return nil }
+        if let previousWindow,
+           let previousTail = previousWindow.segments.last?.id,
+           first.id > previousTail,
+           previousTail < Int.max,
+           previousTail + 1 < first.id {
+            return nil
+        }
+        return VortXHLSWindow(segments: selected)
+    }
+}
+
 /// Pure monotonic state machine for the one mount-to-ready deadline. Production supplies system uptime; tests
 /// supply exact timestamps so sequential waits, the exact expiry edge, and ready/timeout races are executable.
 struct VortXHLSMountDeadlineState: Equatable, Sendable {

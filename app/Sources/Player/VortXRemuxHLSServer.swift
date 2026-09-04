@@ -94,6 +94,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// that later fails can freeze at this terminal window (ENDLIST) instead of killing the whole session.
     private var lastPublishedAudioWindow: VortXHLSWindow?
     private var advertisedAudioInitData: Data?
+    /// Last subtitle window actually named by the master/publication coordinator.  Subtitles are optional after
+    /// that advertisement edge: a later invalidation must freeze this durable route instead of withdrawing the
+    /// URI from a live master and poisoning healthy video.
+    private var lastPublishedSubtitleWindow: VortXHLSWindow?
+    /// A durable subtitle backing fault is terminal only for the optional subtitle routes.  Stream-side
+    /// settlement invalidation also enters this state through `subtitleDegraded(_:)`.
+    private var subtitleRouteTerminated = false
     /// Highest video segment requested. This is only the startup receipt that releases the tiny unconsumed
     /// cohort. It is not playback proof and must never authorize eviction because AVPlayer reads far ahead.
     /// Guarded by `publicationLock`.
@@ -171,6 +178,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let ended: Bool
         /// The advertised alternate failed after publication; its route serves the frozen terminal window.
         let audioTerminated: Bool
+        /// The advertised subtitle routes failed after publication; they serve their last durable window with
+        /// ENDLIST while the primary video and optional audio routes continue.
+        let subtitleTerminated: Bool
+        /// A valid subtitle route reaches ENDLIST only once its settled tail reaches the video EOF. A lagging
+        /// OCR/settlement prefix remains reloadable after video bytes finish so it can publish its real tail.
+        let subtitleEnded: Bool
     }
 
     private struct MasterPublication {
@@ -1379,7 +1392,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
               !snapshot.window.segments.isEmpty else { return nil }
         let audioPlan = snapshot.audioPlan
         var subtitles = snapshot.subtitleRenditions
-        var withdrawnSubtitleIDs: Set<Int> = []
         var requiredWindows = [snapshot.window]
         if audioPlan != nil {
             guard snapshot.audioInitData != nil, let audioWindow = snapshot.audioWindow else { return nil }
@@ -1409,22 +1421,18 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             guard let subtitleWindow = snapshot.subtitleWindow.flatMap({ exactWindow($0, ids: ids) }) else {
                 return nil
             }
-            for rendition in subtitles {
-                guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count else { return nil }
-                switch stream.ensureSubtitleBacking(
-                    renditionID: rendition.id,
-                    window: subtitleWindow,
-                    cues: snapshot.subtitleCues[rendition.id]) {
-                case .ready: break
-                case .pendingAdmission: return nil
-                case .fatal(let reason):
-                    withdrawnSubtitleIDs.insert(rendition.id)
-                    subtitles = SubtitleRenditionPolicy.survivors(
-                        snapshot.subtitleRenditions,
-                        withdrawing: withdrawnSubtitleIDs)
-                    DiagnosticsLog.log(
-                        "dv", "subtitle rendition \(rendition.id) withdrawn before master: \(reason)")
-                }
+            guard subtitles.allSatisfy({
+                $0.id >= 0 && $0.id < snapshot.subtitleCues.count
+            }) else { return nil }
+            let subtitleInputs = subtitles.map { (id: $0.id, cues: snapshot.subtitleCues[$0.id]) }
+            switch stream.ensureSubtitleBackings(window: subtitleWindow, renditions: subtitleInputs) {
+            case .ready: break
+            case .pendingAdmission: return nil
+            case .fatal(let reason):
+                // No master has exposed these routes yet.  Omit the whole optional cohort rather than risking
+                // a master that names a rendition whose atomic backing could not be made durable.
+                subtitles.removeAll()
+                DiagnosticsLog.log("dv", "subtitle routes omitted before master: \(reason)")
             }
         }
 
@@ -1432,9 +1440,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         // stale files are harmless session-local artifacts, while a stale advertised topology would not be.
         snapshot = stream.hlsWindowSnapshot()
         guard snapshot.audioPlan == audioPlan,
-              SubtitleRenditionPolicy.survivors(
-                  snapshot.subtitleRenditions,
-                  withdrawing: withdrawnSubtitleIDs) == subtitles,
+              (subtitles.isEmpty || snapshot.subtitleRenditions == subtitles),
               snapshot.subtitleFailureReason == nil || subtitles.isEmpty,
               let finalVideoWindow = exactWindow(snapshot.window, ids: ids),
               ids.allSatisfy({ stream.hasHLSResource(.video(segmentID: $0)) }) else { return nil }
@@ -1446,11 +1452,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                       renditionID: audioPlan.alternate.id, segmentID: $0)) }) else { return nil }
             finalAudioWindow = window
         }
+        let finalSubtitleWindow: VortXHLSWindow?
         if !subtitles.isEmpty {
-            guard snapshot.subtitleWindow.flatMap({ exactWindow($0, ids: ids) }) != nil else { return nil }
+            guard let window = snapshot.subtitleWindow.flatMap({ exactWindow($0, ids: ids) }) else {
+                return nil
+            }
             for rendition in subtitles where !ids.allSatisfy({
                 stream.hasHLSResource(.subtitle(renditionID: rendition.id, segmentID: $0))
             }) { return nil }
+            finalSubtitleWindow = window
+        } else {
+            finalSubtitleWindow = nil
         }
 
         let ended = cohort.ended
@@ -1463,8 +1475,20 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         advertisedPrimaryAudioTag = audioPlan == nil ? snapshot.primaryAudioTag : nil
         advertisedAudioInitData = audioPlan == nil ? nil : snapshot.audioInitData
         lastPublishedAudioWindow = finalAudioWindow
+        lastPublishedSubtitleWindow = finalSubtitleWindow
+        subtitleRouteTerminated = false
         advertisedSubtitles = subtitles
         advertisedDolbyVision = snapshot.signaling?.dolbyVision == true
+        // The master is the route-advertisement edge.  Record every initial route before its URI can reach
+        // AVPlayer, so a later optional subtitle failure has an actual durable generation to freeze and retain.
+        guard recordPublication(
+            videoWindow: finalVideoWindow,
+            audioWindow: finalAudioWindow,
+            subtitleWindow: finalSubtitleWindow
+        ) else {
+            stream.failHLS("HLS initial playlist receipt could not be recorded")
+            return nil
+        }
         return MasterPublication(
             audioPlan: audioPlan,
             primaryAudioTag: advertisedPrimaryAudioTag,
@@ -1517,6 +1541,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         }
 
         let audioTerminated = audioDegraded(snapshot)
+        var subtitleTerminated = subtitleDegraded(snapshot)
         var selectedVideo: VortXHLSWindow
         let ended: Bool
         // Pre-ready and post-ready share ONE window rule now (the 187 EVENT-playlist shape): the START is
@@ -1535,34 +1560,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 guard let audioWindow = snapshot.audioWindow else { return nil }
                 requiredWindows.append(audioWindow)
             }
-            if !advertisedSubtitles.isEmpty {
-                guard let subtitleWindow = snapshot.subtitleWindow else { return nil }
-                for rendition in advertisedSubtitles {
-                    guard rendition.id >= 0, rendition.id < snapshot.subtitleCues.count else {
-                        advertisedSubtitles.removeAll { $0.id == rendition.id }
-                        continue
-                    }
-                    switch stream.ensureSubtitleBacking(
-                        renditionID: rendition.id,
-                        window: subtitleWindow,
-                        cues: snapshot.subtitleCues[rendition.id]) {
-                    case .ready:
-                        break
-                    case .pendingAdmission:
-                        // Optional WebVTT materialization can temporarily lose spool admission while the
-                        // producer's atomic video close owns its transient-copy reservation. Keep this
-                        // publication pending so `waitForResource` retries it after that transaction drains.
-                        // Poisoning the producer here turned a recoverable optional-rendition miss into a 410
-                        // on the healthy video playlist and forced true Dolby Vision down to libmpv/HDR10.
-                        return nil
-                    case .fatal(let reason):
-                        advertisedSubtitles.removeAll { $0.id == rendition.id }
-                        DiagnosticsLog.log(
-                            "dv", "subtitle rendition \(rendition.id) withdrawn mid-play: \(reason)")
-                    }
-                }
-                if !advertisedSubtitles.isEmpty { requiredWindows.append(subtitleWindow) }
-            }
             guard requiredWindows.allSatisfy(windowConformsToFrozenTarget) else {
                 stream.failHLS("HLS rendition interval exceeded the frozen target before playlist publication")
                 return nil
@@ -1579,8 +1576,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 && common.segments.last?.id == snapshot.window.segments.last?.id
                 && (snapshot.audioWindow == nil
                     || common.segments.last?.id == snapshot.audioWindow?.segments.last?.id)
-                && (snapshot.subtitleWindow == nil
-                    || common.segments.last?.id == snapshot.subtitleWindow?.segments.last?.id)
             if retainsFullTimeline {
                 // FULL-TIMELINE RETENTION (hosted sessions only). The window START never advances: the playlist
                 // always begins at the first segment and only grows at the tail, which is exactly the EVENT
@@ -1694,8 +1689,50 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             guard selectedAudio != nil else { return nil }
             lastPublishedAudioWindow = selectedAudio
         }
-        let selectedSubtitles = advertisedSubtitles.isEmpty
-            ? nil : snapshot.subtitleWindow.flatMap { exactWindow($0, ids: ids) }
+        let selectedSubtitles: VortXHLSWindow?
+        if advertisedSubtitles.isEmpty {
+            selectedSubtitles = nil
+        } else if subtitleTerminated {
+            // A master already named these URIs. Keep their last durably recorded window fetchable, but terminate
+            // just that optional route rather than converting a subtitle defect into a video 410 / HDR demotion.
+            selectedSubtitles = lastPublishedSubtitleWindow
+        } else if let settledWindow = snapshot.subtitleWindow,
+                  let candidate = VortXHLSSubtitlePublicationPolicy.coherentWindow(
+                    settledWindow: settledWindow,
+                    videoWindow: selectedVideo,
+                    previousWindow: lastPublishedSubtitleWindow) {
+            let outcome: VortXMKVRemuxStream.SubtitleBackingOutcome
+            if advertisedSubtitles.allSatisfy({
+                $0.id >= 0 && $0.id < snapshot.subtitleCues.count
+            }) {
+                let subtitleInputs = advertisedSubtitles.map {
+                    (id: $0.id, cues: snapshot.subtitleCues[$0.id])
+                }
+                outcome = stream.ensureSubtitleBackings(window: candidate, renditions: subtitleInputs)
+            } else {
+                outcome = .fatal("subtitle rendition state became unavailable")
+            }
+            switch outcome {
+            case .ready:
+                selectedSubtitles = candidate
+                lastPublishedSubtitleWindow = candidate
+            case .pendingAdmission:
+                // Admission can be temporarily full while a video close holds its atomic-copy reservation. Do
+                // not make the primary playlist wait for it: retaining the last coherent subtitle generation
+                // lets video receipts advance and expired video backing reclaim before the next retry.
+                selectedSubtitles = lastPublishedSubtitleWindow
+            case .fatal(let reason):
+                subtitleRouteTerminated = true
+                subtitleTerminated = true
+                selectedSubtitles = lastPublishedSubtitleWindow
+                DiagnosticsLog.log("dv", "subtitle routes frozen mid-play: \(reason)")
+            }
+        } else {
+            // The settlement frontier has not reached the newly selected video interval.  Do not invent empty
+            // cues or hold video at an old segment; serve the last coordinator-recorded subtitle generation and
+            // retry when the real settled prefix catches up.
+            selectedSubtitles = lastPublishedSubtitleWindow
+        }
         guard advertisedSubtitles.isEmpty || selectedSubtitles != nil else { return nil }
         guard recordPublication(
             videoWindow: selectedVideo,
@@ -1704,6 +1741,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             stream.failHLS("HLS playlist receipt could not be recorded")
             return nil
         }
+        let subtitleEnded = subtitleTerminated
+            || (ended && selectedSubtitles?.segments.last?.id == selectedVideo.segments.last?.id)
         return Publication(
             videoWindow: selectedVideo,
             audioWindow: selectedAudio,
@@ -1711,7 +1750,9 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             audioPlan: advertisedAudioPlan,
             subtitles: advertisedSubtitles,
             ended: ended,
-            audioTerminated: audioTerminated)
+            audioTerminated: audioTerminated,
+            subtitleTerminated: subtitleTerminated,
+            subtitleEnded: subtitleEnded)
     }
 
     private func topologyMatches(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
@@ -1728,8 +1769,13 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 return false
             }
         }
-        guard snapshot.subtitleFailureReason == nil || advertisedSubtitles.isEmpty,
-              advertisedSubtitles.allSatisfy({ snapshot.subtitleRenditions.contains($0) }) else {
+        // Like an advertised alternate-audio route, a subtitle route must remain stable once the master has
+        // exposed it. Stream settlement invalidation and a durable WebVTT write fault both freeze the last
+        // recorded subtitle generation instead of declaring healthy video topology unavailable.
+        guard advertisedSubtitles.isEmpty
+                || subtitleDegraded(snapshot)
+                || (snapshot.subtitleFailureReason == nil
+                    && advertisedSubtitles.allSatisfy({ snapshot.subtitleRenditions.contains($0) })) else {
             return false
         }
         return true
@@ -1738,6 +1784,17 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// True when an advertised alternate has failed after publication (the degraded, freeze-and-continue state).
     private func audioDegraded(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
         advertisedAudioPlan != nil && snapshot.audioState == .failed
+    }
+
+    /// True once an advertised subtitle route has permanently lost its source settlement or backing.  The
+    /// retained route stays valid only because `lastPublishedSubtitleWindow` was committed before the master
+    /// response; pre-master failures are still omitted by `prepareMasterPublication()`.
+    private func subtitleDegraded(_ snapshot: VortXMKVRemuxStream.HLSWindowSnapshot) -> Bool {
+        !advertisedSubtitles.isEmpty
+            && lastPublishedSubtitleWindow != nil
+            && (subtitleRouteTerminated
+                || snapshot.subtitleFailureReason != nil
+                || !advertisedSubtitles.allSatisfy({ snapshot.subtitleRenditions.contains($0) }))
     }
 
     private func windowConformsToFrozenTarget(_ window: VortXHLSWindow) -> Bool {
@@ -1980,7 +2037,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let lines = SubtitleRenditionPolicy.mediaPlaylist(
             renditionID: renditionID,
             window: window,
-            ended: publication.ended,
+            ended: publication.subtitleEnded,
             targetDuration: startupReadiness.frozenTarget.seconds,
             isEvent: retainsFullTimeline)
         let body = Data(lines.joined(separator: "\n").utf8)
@@ -1992,7 +2049,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         DiagnosticsLog.log(
             "dv",
             "hls resp /\(SubtitleRenditionPolicy.playlistURI(renditionID: renditionID)) "
-                + "seq=\(window.mediaSequence) segs=\(window.segments.count) ended=\(publication.ended)")
+                + "seq=\(window.mediaSequence) segs=\(window.segments.count) ended=\(publication.subtitleEnded)\(publication.subtitleTerminated ? " [terminated]" : "")")
         countServeResponse("/" + SubtitleRenditionPolicy.playlistURI(renditionID: renditionID),
                            bytes: body.count)
         respond(connection,

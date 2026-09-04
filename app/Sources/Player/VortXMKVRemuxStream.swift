@@ -603,36 +603,60 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     func ensureSubtitleBacking(renditionID: Int,
                                window: VortXHLSWindow,
                                cues: [SubtitleRenditionPolicy.Cue]) -> SubtitleBackingOutcome {
-        guard renditionID >= 0, let hlsSpool, !window.segments.isEmpty else {
+        ensureSubtitleBackings(window: window, renditions: [(renditionID, cues)])
+    }
+
+    /// Atomically materialize one coordinator-selected subtitle publication. A pending spool admission must not
+    /// leave the earlier rendition's newly written files unreferenced while a later rendition could not fit: the
+    /// caller either receives a complete durable cohort it can record, or no new subtitle backing at all.
+    func ensureSubtitleBackings(window: VortXHLSWindow,
+                                renditions: [(id: Int, cues: [SubtitleRenditionPolicy.Cue])])
+        -> SubtitleBackingOutcome {
+        guard let hlsSpool,
+              !window.segments.isEmpty,
+              !renditions.isEmpty,
+              Set(renditions.map(\.id)).count == renditions.count,
+              renditions.allSatisfy({ $0.id >= 0 }) else {
             return .fatal("invalid subtitle backing request")
         }
-        // Normalize ONCE for this array, not once per segment (FAIL-260804-06). The pure normalization is a
-        // sort plus two copies of everything the collector has stored, and this runs on the producer thread for
-        // every segment of every published window; memoizing it turns a per-segment, per-publication cost into
-        // one pass per distinct cue array. `cues(_:overlapping:end:)` is the same two steps, in the same order.
-        let normalized = normalizedSubtitleCues(renditionID: renditionID, cues: cues)
-        for segment in window.segments {
-            let key = VortXHLSSessionSpool.ResourceKey.subtitle(
-                renditionID: renditionID, segmentID: segment.id)
-            if hlsSpool.contains(key) { continue }
-            guard let duration = DVPlaybackPolicy.renderedDurationMilliseconds(
-                of: VortXHLSWindow(segments: [segment])) else {
-                return .fatal("invalid subtitle segment duration")
-            }
-            let selected = SubtitleRenditionPolicy.normalizedCues(
-                normalized, overlapping: segment.start, end: segment.end)
-            let data = Data(SubtitleRenditionPolicy.webVTTDocument(
-                cues: selected,
-                segmentStart: segment.start,
-                segmentEnd: segment.end).utf8)
-            switch hlsSpool.spillOutcome([.init(
-                key: key, data: data, durationMilliseconds: duration)]) {
-            case .committed: break
-            case .pendingAdmission: return .pendingAdmission
-            case .fatal: return .fatal("subtitle backing durable write failed")
+        // Reclaim only entries whose prior playlist deadline has elapsed before examining this all-rendition
+        // cohort. A retained subtitle generation remains protected by its receipt; departed video generations
+        // are then free to make room for a later subtitle retry. This must precede the `contains` scan, since a
+        // stale existing key could otherwise be collected between that scan and its next receipt.
+        hlsSpool.collectExpired(now: ProcessInfo.processInfo.systemUptime)
+        var resources: [VortXHLSSessionSpool.SpillResource] = []
+        for rendition in renditions {
+            // Normalize ONCE for this array, not once per segment (FAIL-260804-06). The pure normalization is a
+            // sort plus two copies of everything the collector has stored, and this runs on the producer thread
+            // for every segment of every published window; memoizing it turns a per-segment, per-publication
+            // cost into one pass per distinct cue array. `cues(_:overlapping:end:)` is the same two steps.
+            let normalized = normalizedSubtitleCues(renditionID: rendition.id, cues: rendition.cues)
+            for segment in window.segments {
+                let key = VortXHLSSessionSpool.ResourceKey.subtitle(
+                    renditionID: rendition.id, segmentID: segment.id)
+                if hlsSpool.contains(key) { continue }
+                guard let duration = DVPlaybackPolicy.renderedDurationMilliseconds(
+                    of: VortXHLSWindow(segments: [segment])) else {
+                    return .fatal("invalid subtitle segment duration")
+                }
+                let selected = SubtitleRenditionPolicy.normalizedCues(
+                    normalized, overlapping: segment.start, end: segment.end)
+                let data = Data(SubtitleRenditionPolicy.webVTTDocument(
+                    cues: selected,
+                    segmentStart: segment.start,
+                    segmentEnd: segment.end).utf8)
+                resources.append(.init(key: key, data: data, durationMilliseconds: duration))
             }
         }
-        return .ready
+        // Repeated playlist reads normally find every URI already durable. `spillOutcome([])` correctly
+        // rejects an invalid producer cohort, but this caller has already proved its nonempty requested cohort
+        // and only needs the idempotent no-write result.
+        guard !resources.isEmpty else { return .ready }
+        switch hlsSpool.spillOutcome(resources) {
+        case .committed: return .ready
+        case .pendingAdmission: return .pendingAdmission
+        case .fatal: return .fatal("subtitle backing durable write failed")
+        }
     }
 
     /// `SubtitleRenditionPolicy.normalizedCues` for one rendition, computed at most once per distinct cue array.
