@@ -798,7 +798,9 @@ private struct KenBurnsLayerHost: NSViewRepresentable {
     }
 
     private func heroMaxPixel(for view: NSView) -> Int {
-        let screen = view.window?.screen ?? NSScreen.main
+        guard let screen = view.window?.screen ?? NSScreen.main else {
+            return HeroArtworkQualityPolicy.fullHDLongEdge
+        }
         let longEdge = max(screen.frame.width, screen.frame.height) * screen.backingScaleFactor
         return HeroArtworkQualityPolicy.maxPixel(for: .macOS, displayLongEdge: Int(longEdge))
     }
