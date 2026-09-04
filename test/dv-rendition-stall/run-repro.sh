@@ -302,11 +302,14 @@ if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
 fi
 
 mkdir -p "$SCRATCH_ROOT"
+ xcrun clang -std=c11 -isysroot "$SDK_PATH" -c app/Sources/Player/VortXRemuxInputProbe.c \
+  -o "$SCRATCH_ROOT/VortXRemuxInputProbe.o"
 # macOS ships Bash 3.2, whose `set -u` treats an empty `"${array[@]}"` as an unbound variable.
 # The `+` guard preserves zero arguments in stock mode and every discrete argument in engine mode.
 xcrun swiftc -sdk "$SDK_PATH" \
+  -import-objc-header app/Sources/Player/VortXRemuxInputProbe.h \
   "${ENGINE_TRANSACTION_FLAGS[@]+"${ENGINE_TRANSACTION_FLAGS[@]}"}" \
-  "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" \
+  "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" "$SCRATCH_ROOT/VortXRemuxInputProbe.o" \
   -framework AVFoundation -framework CoreAudio -framework AudioToolbox -framework CoreVideo \
   -framework CoreFoundation -framework CoreMedia -framework Metal -framework VideoToolbox \
   -framework Foundation -framework IOKit -framework IOSurface -framework QuartzCore \
@@ -314,7 +317,6 @@ xcrun swiftc -sdk "$SDK_PATH" \
   -lbz2 -liconv -lexpat -lresolv -lxml2 -lz -lc++ \
   -o "$SCRATCH_ROOT/repro-harness" \
   test/dv-rendition-stall/Stubs.swift \
-  app/Sources/Player/VortXRemuxInputProbe.c \
   app/Sources/Player/DVPlaybackPolicy.swift \
   app/Sources/Player/VortXRemuxBuffer.swift \
   app/Sources/Player/AudioLanguagePolicy.swift \
