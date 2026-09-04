@@ -90,10 +90,10 @@ enum MediaServerAuth {
          "Accept": "application/json"]
     }
 
-    /// Step 1: request a strong PIN. Returns the pin id + the code to display.
+    /// Step 1: request the short PIN accepted by `plex.tv/link`. Returns the pin id + the code to display.
     static func plexRequestPin() async throws -> PlexPin {
         guard var comps = URLComponents(string: plexPinsURL) else { throw MediaServerAuthError.badURL }
-        comps.queryItems = [URLQueryItem(name: "strong", value: "true")]
+        comps.queryItems = [URLQueryItem(name: "strong", value: "false")]
         guard let url = comps.url else { throw MediaServerAuthError.badURL }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
