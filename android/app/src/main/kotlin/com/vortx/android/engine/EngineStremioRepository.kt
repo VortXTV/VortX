@@ -2295,6 +2295,7 @@ class EngineStremioRepository(
                 isTorrent = false,
                 isDolbyVision = isDolbyVision,
                 isAtmos = isAtmos,
+                playbackLease = resolved.progressiveSession,
             )
         } else if (!source.isTorrent && source.directPlaybackUrl(handle) != null) {
             // The stream's declared proxyHeaders ride onto the Playable so a header-gated CDN (a

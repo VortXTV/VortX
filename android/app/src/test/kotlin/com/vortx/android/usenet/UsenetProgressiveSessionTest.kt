@@ -64,6 +64,8 @@ class UsenetProgressiveSessionTest {
             assertEquals(416, wrongUnit.responseCode); assertEquals("bytes */6", wrongUnit.getHeaderField("Content-Range"))
             val beyond = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "bytes=9-") }
             assertEquals(416, beyond.responseCode); assertEquals("bytes */6", beyond.getHeaderField("Content-Range"))
+            val mixed = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("rAnGe", "bytes=1-2") }
+            assertEquals(206, mixed.responseCode); assertEquals("bc", mixed.inputStream.readBytes().toString(Charsets.UTF_8))
         } finally { session.close(); home.deleteRecursively() }
     }
 

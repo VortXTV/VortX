@@ -593,8 +593,10 @@ internal class DebridCoordinator(
             }
             // Cancel the remaining in-flight legs (idempotent on already-completed ones). The supervisorScope
             // then awaits their prompt, cancellation-honoring exit before returning.
-            legs.forEach { it.cancel() }
+            // Close first: a late finally cannot enqueue an unobserved progressive ref after the one-time drain.
+            results.close()
             while (!results.isEmpty) discard(results.tryReceive().getOrNull()?.ref)
+            legs.forEach { it.cancel() }
             if (!keys.isCurrent(owner)) { discard(winner?.ref); null } else winner
         }
     }

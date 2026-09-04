@@ -168,7 +168,7 @@ internal object UsenetProgressiveLoopback {
     }
 
     private fun parseRange(rangeLine: String?, total: Long): Pair<Long, Long>? {
-        val raw = rangeLine?.substringAfter("Range:", "")?.trim()
+        val raw = rangeLine?.substringAfter(':', "")?.trim()
         if (raw.isNullOrEmpty()) return 0L to (total - 1)
         if (!raw.startsWith("bytes=", ignoreCase = true)) return null
         val bounds = raw.substringAfter('=').split('-', limit = 2)
