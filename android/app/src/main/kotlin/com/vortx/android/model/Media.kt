@@ -666,6 +666,8 @@ data class Playable(
     /// then play downloaded B, and A's row moved. Consumers of local sessions must read THIS, never
     /// ambient engine state; see [PlaybackContext].
     val playbackContext: PlaybackContext? = null,
+    /** Ephemeral producer ownership for a progressive local source. Never serialized or logged. */
+    val playbackLease: AutoCloseable? = null,
 ) {
     override fun toString(): String =
         "Playable(url=${redactedTransportUrl(url)}, title=$title, viaStreamingServer=$viaStreamingServer, " +

@@ -42,6 +42,19 @@ class UsenetProgressiveSessionTest {
         }
     }
 
+    @Test fun `suffix range and ordinary GET have RFC status and container type`() {
+        val home = createTempDirectory("usenet-progressive").toFile()
+        val file = java.io.File(home, "title.mp4"); file.writeBytes("abcdef".toByteArray())
+        val session = UsenetProgressiveSession(file, 6, "video/mp4")
+        try {
+            session.appendCommitted(6); session.finish()
+            val suffix = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "bytes=-2") }
+            assertEquals(206, suffix.responseCode); assertEquals("bytes 4-5/6", suffix.getHeaderField("Content-Range")); assertEquals("ef", suffix.inputStream.readBytes().toString(Charsets.UTF_8))
+            val plain = URL(session.url).openConnection() as HttpURLConnection
+            assertEquals(200, plain.responseCode); assertEquals("video/mp4", plain.contentType); assertEquals("abcdef", plain.inputStream.readBytes().toString(Charsets.UTF_8))
+        } finally { session.close(); home.deleteRecursively() }
+    }
+
     @Test
     fun `HEAD describes the bounded loopback resource without downloading`() {
         val home = createTempDirectory("usenet-progressive").toFile()

@@ -64,12 +64,13 @@ internal class UsenetLocalResolver(
         if (file.segments.isEmpty() || declaredBytes !in 1..MAX_TITLE_BYTES) {
             throw ResolveException("NZB declared size is invalid")
         }
-        val target = cacheFile(declaredBytes)
-        val session = UsenetProgressiveSession(target, declaredBytes)
+        val allocation = cacheFile(declaredBytes)
+        val target = allocation.file
+        val session = UsenetProgressiveSession(target, declaredBytes, mediaTypeFor(file.name), allocation)
         try {
             session.url // register before the worker can make progress or fail
         } catch (error: Throwable) {
-            target.delete()
+            allocation.abandon(); target.delete()
             throw error
         }
         val producer = CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
@@ -266,12 +267,20 @@ internal class UsenetLocalResolver(
             ),
         )
 
-    private fun cacheFile(reservationBytes: Long): File {
+    private fun cacheFile(reservationBytes: Long): UsenetCachePolicy.Allocation {
         val home = File(context.cacheDir, "usenet")
-        if (!UsenetCachePolicy.reserve(home, reservationBytes)) {
+        return UsenetCachePolicy.allocate(home, "vortx-nzb-${System.nanoTime()}.mkv", reservationBytes)
+            ?: run {
             throw ResolveException("insufficient bounded Usenet cache storage")
         }
-        return File(home, "vortx-nzb-${System.nanoTime()}.mkv")
+    }
+
+    private fun mediaTypeFor(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
+        "mp4", "m4v", "mov" -> "video/mp4"
+        "webm" -> "video/webm"
+        "ts", "m2ts" -> "video/mp2t"
+        "avi" -> "video/x-msvideo"
+        else -> "video/x-matroska"
     }
 
     private companion object {
@@ -302,7 +311,7 @@ internal data class NzbResult(
     val file: File,
     val subject: String,
     val sizeBytes: Long,
-    private val progressiveSession: UsenetProgressiveSession? = null,
+    internal val progressiveSession: UsenetProgressiveSession? = null,
 ) {
     val url: String get() = progressiveSession?.url ?: "file://" + file.absolutePath
     fun cancel() = progressiveSession?.close()

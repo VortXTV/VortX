@@ -1214,6 +1214,10 @@ fun PlayerScreen(
     DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
     }
+    // A replacement, back navigation, profile change, or composition teardown releases a native NZB producer.
+    DisposableEffect(currentPlayable.playbackLease) {
+        onDispose { runCatching { currentPlayable.playbackLease?.close() } }
+    }
 
     // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
     // Next auto-advance for a series episode with a successor, or a plain return to the detail page

@@ -9,7 +9,8 @@ import java.net.Socket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.ArrayBlockingQueue
 import kotlinx.coroutines.Job
 
 /**
@@ -21,6 +22,8 @@ import kotlinx.coroutines.Job
 internal class UsenetProgressiveSession(
     val file: File,
     private val declaredBytes: Long,
+    internal val mediaType: String = "video/x-matroska",
+    private val allocation: UsenetCachePolicy.Allocation? = null,
 ) : AutoCloseable {
     private val monitor = Object()
     private var availableBytes = 0L
@@ -40,6 +43,7 @@ internal class UsenetProgressiveSession(
 
     fun finish() = synchronized(monitor) {
         completed = true
+        allocation?.complete()
         monitor.notifyAll()
     }
 
@@ -47,6 +51,8 @@ internal class UsenetProgressiveSession(
         failure = error
         completed = true
         monitor.notifyAll()
+        allocation?.abandon()
+        UsenetProgressiveLoopback.unregister(id)
     }
 
     internal fun attachProducer(job: Job) { producer = job }
@@ -92,6 +98,7 @@ internal class UsenetProgressiveSession(
         // Cancelling the assembly job starts each NNTP transport's cancellation hook, which closes its
         // currently published socket instead of leaving a background download behind after player teardown.
         producer?.cancel()
+        allocation?.abandon()
         if (delete) file.delete()
     }
 
@@ -101,7 +108,7 @@ internal class UsenetProgressiveSession(
 /** One private 127.0.0.1 listener shared by progressive NZB sessions. */
 internal object UsenetProgressiveLoopback {
     private val sessions = ConcurrentHashMap<String, UsenetProgressiveSession>()
-    private val workers: ExecutorService = Executors.newCachedThreadPool()
+    private val workers: ExecutorService = ThreadPoolExecutor(2, 4, 30, java.util.concurrent.TimeUnit.SECONDS, ArrayBlockingQueue(8))
     private val lock = Any()
     @Volatile private var server: ServerSocket? = null
     @Volatile private var port = 0
@@ -127,7 +134,7 @@ internal object UsenetProgressiveLoopback {
 
     private fun acceptLoop(listener: ServerSocket) {
         while (!listener.isClosed) runCatching { listener.accept() }.getOrNull()?.let { socket ->
-            workers.execute { handle(socket) }
+            runCatching { workers.execute { handle(socket) } }.onFailure { socket.close() }
         } ?: return
     }
 
@@ -137,15 +144,18 @@ internal object UsenetProgressiveLoopback {
                 client.soTimeout = 15_000
                 val lines = client.getInputStream().bufferedReader(Charsets.ISO_8859_1).readLinesUntilBlank(64 * 1024)
                     ?: return@runCatching
-                val request = lines.firstOrNull()?.split(' ') ?: return@runCatching
-                val session = request.getOrNull(1)?.removePrefix("/nzb/")?.let(sessions::get) ?: return@runCatching send(client, 404)
+                val request = lines.firstOrNull()?.split(' ') ?: return@runCatching send(client, 400)
+                if (request.size != 3 || request[0] !in setOf("GET", "HEAD") || !request[1].startsWith("/nzb/") || request[2] != "HTTP/1.1") return@runCatching send(client, 400)
+                val session = request[1].removePrefix("/nzb/").takeIf { it.matches(Regex("[0-9a-f-]{36}")) }?.let(sessions::get) ?: return@runCatching send(client, 404)
                 val total = session.totalBytes()
-                val range = parseRange(lines, total) ?: return@runCatching send(client, 416)
+                val explicitRange = lines.firstOrNull { it.startsWith("Range:", true) }
+                val range = parseRange(explicitRange, total) ?: return@runCatching send(client, 416)
                 val (start, end) = range
                 val length = end - start + 1
                 val out = client.getOutputStream()
-                val head = if (request.firstOrNull() == "HEAD") "HTTP/1.1 200 OK" else "HTTP/1.1 206 Partial Content"
-                out.write(("$head\r\nAccept-Ranges: bytes\r\nContent-Type: video/x-matroska\r\nContent-Length: $length\r\nContent-Range: bytes $start-$end/$total\r\nConnection: close\r\n\r\n").toByteArray())
+                val status = if (explicitRange == null) "HTTP/1.1 200 OK" else "HTTP/1.1 206 Partial Content"
+                val contentRange = if (explicitRange == null) "" else "Content-Range: bytes $start-$end/$total\r\n"
+                out.write(("$status\r\nAccept-Ranges: bytes\r\nContent-Type: ${session.mediaType}\r\nContent-Length: $length\r\n${contentRange}Connection: close\r\n\r\n").toByteArray())
                 out.flush()
                 if (request.firstOrNull() != "HEAD") session.copyRange(start, end, out)
             }
@@ -156,10 +166,14 @@ internal object UsenetProgressiveLoopback {
         client.getOutputStream().write("HTTP/1.1 $code Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
     }
 
-    private fun parseRange(lines: List<String>, total: Long): Pair<Long, Long>? {
-        val raw = lines.firstOrNull { it.startsWith("Range:", true) }?.substringAfter('=' )?.trim()
+    private fun parseRange(rangeLine: String?, total: Long): Pair<Long, Long>? {
+        val raw = rangeLine?.substringAfter('=' )?.trim()
         if (raw.isNullOrEmpty()) return 0L to (total - 1)
         val bounds = raw.removePrefix("bytes=").split('-', limit = 2)
+        if (bounds.firstOrNull().isNullOrEmpty()) {
+            val suffix = bounds.getOrNull(1)?.toLongOrNull()?.takeIf { it > 0 } ?: return null
+            return maxOf(0L, total - suffix) to (total - 1)
+        }
         val start = bounds.firstOrNull()?.toLongOrNull() ?: return null
         val end = bounds.getOrNull(1)?.toLongOrNull()?.coerceAtMost(total - 1) ?: total - 1
         return if (start in 0..end && end < total) start to end else null

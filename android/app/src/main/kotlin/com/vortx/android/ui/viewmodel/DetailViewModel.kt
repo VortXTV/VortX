@@ -259,6 +259,7 @@ internal data class NativeDebridResumeRef(
         startPositionMs = resumeMs,
         mediaRef = mediaRef,
         expectedDurationMs = expectedDurationMs,
+        playbackLease = ref.progressiveSession,
     )
 }
 

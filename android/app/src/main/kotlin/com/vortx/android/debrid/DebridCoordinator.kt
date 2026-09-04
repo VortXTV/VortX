@@ -7,6 +7,7 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.usenet.UsenetLocalResolver
 import com.vortx.android.usenet.UsenetProviderCredentials
 import com.vortx.android.usenet.UsenetProviderStore
+import com.vortx.android.usenet.UsenetProgressiveSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -101,6 +102,8 @@ internal class DebridCoordinator(
         /// True when [url] is a LOCAL file produced by the native NNTP provider (not a debrid HTTPS link).
         /// The player opens it directly as a local file; it carries no provider reresolve id.
         val isNativeFile: Boolean = false,
+        /** Live native NNTP producer. This is intentionally non-persisted and must be closed on stale/drop. */
+        val progressiveSession: UsenetProgressiveSession? = null,
     )
 
     /// A resolvable source the failover race operates on. The source-list assembly wave maps each ranked
@@ -384,7 +387,7 @@ internal class DebridCoordinator(
                     fileIdx = candidate.fileIdx,
                     episode = episode,
                 )
-                if (!keys.isCurrent(owner)) return null
+                if (!keys.isCurrent(owner)) { result.cancel(); return null }
                 return DebridPlaybackRef(
                     url = result.url,
                     service = DebridService.TOR_BOX,
@@ -395,6 +398,7 @@ internal class DebridCoordinator(
                     fileIdx = candidate.fileIdx,
                     episode = episode,
                     isNativeFile = true,
+                    progressiveSession = result.progressiveSession,
                 )
             } catch (cancel: CancellationException) {
                 throw cancel

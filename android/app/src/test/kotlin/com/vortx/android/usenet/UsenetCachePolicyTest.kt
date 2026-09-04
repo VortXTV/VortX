@@ -11,7 +11,7 @@ class UsenetCachePolicyTest {
     fun `reservation rejects a title larger than the bounded cache`() {
         val home = createTempDirectory("usenet-cache").toFile()
         try {
-            assertFalse(UsenetCachePolicy.reserve(home, UsenetCachePolicy.MAX_CACHE_BYTES + 1))
+            assertFalse(UsenetCachePolicy.allocate(home, "too-big", UsenetCachePolicy.MAX_CACHE_BYTES + 1) != null)
         } finally { home.deleteRecursively() }
     }
 
@@ -20,8 +20,17 @@ class UsenetCachePolicyTest {
         val home = createTempDirectory("usenet-cache").toFile()
         try {
             val stale = File(home, "vortx-nzb-stale.mkv").apply { writeBytes(ByteArray(4)); setLastModified(1) }
-            assertTrue(UsenetCachePolicy.reserve(home, incomingBytes = 4, maxBytes = 4))
+            assertTrue(UsenetCachePolicy.allocate(home, "fresh", incomingBytes = 4, maxBytes = 4) != null)
             assertFalse("oldest completed title is evicted before a new reservation", stale.exists())
+        } finally { home.deleteRecursively() }
+    }
+
+    @Test fun `active reservation is never evicted by a concurrent allocation`() {
+        val home = createTempDirectory("usenet-cache").toFile()
+        try {
+            val active = requireNotNull(UsenetCachePolicy.allocate(home, "live", 4, 4))
+            assertFalse(UsenetCachePolicy.allocate(home, "other", 1, 4) != null)
+            active.abandon()
         } finally { home.deleteRecursively() }
     }
 }
