@@ -1999,8 +1999,14 @@ struct TVPlayerView: View {
                         play: { coordinator.player?.play() },
                         pause: { coordinator.player?.pause() },
                         togglePause: { coordinator.player?.togglePause() },
-                        seekBy: { delta in coordinator.player?.seek(by: delta) },
-                        seekTo: { position in coordinator.player?.seek(to: position) },
+                        seekBy: { delta in
+                            cancelPendingLibmpvResumeForUserSeek()
+                            coordinator.player?.seek(by: delta)
+                        },
+                        seekTo: { position in
+                            cancelPendingLibmpvResumeForUserSeek()
+                            coordinator.player?.seek(to: position)
+                        },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: isCurrentLiveStream))
                     refreshNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
@@ -3302,6 +3308,7 @@ struct TVPlayerView: View {
             return chs.enumerated().map { i, ch in
                 OptionRow(label: ch.title.isEmpty ? "Chapter \(i + 1)" : ch.title,
                           detail: timeString(ch.start), isSelected: i == currentIdx) {
+                    cancelPendingLibmpvResumeForUserSeek()
                     coordinator.player?.seek(to: ch.start)
                 }
             }
@@ -3457,6 +3464,7 @@ struct TVPlayerView: View {
         skipEditError = nil
         // Preview the new boundary under the playhead so the user sees where it lands, like the scrubber.
         let target = field == .start ? skipEditStart : skipEditEnd
+        cancelPendingLibmpvResumeForUserSeek()
         coordinator.player?.seek(to: target)
         currentTime = target
         if showOptions { refreshPanelRowsPreservingAccessibilityFocus() }   // refresh the time readout in place
@@ -6316,6 +6324,22 @@ struct TVPlayerView: View {
         postFrameResumeSeekWatchdog = nil
         postFrameResumeSeekWatchdogTarget = nil
         postFrameResumeSeekWatchdogOwner = nil
+    }
+
+    /// A user seek supersedes a cold-start resume seek. Without clearing the deferred target, the first-frame
+    /// callback can apply the old library position after the viewer has explicitly moved elsewhere.
+    private func cancelPendingLibmpvResumeForUserSeek() {
+        let oldTarget = pendingLibmpvResumeSeek ?? postFrameResumeSeekWatchdogTarget
+        guard let oldTarget else { return }
+        pendingLibmpvResumeSeek = nil
+        libmpvResumeWatchdog?.cancel()
+        libmpvResumeWatchdog = nil
+        if postFrameResumeSeekWatchdogTarget == oldTarget {
+            clearPostFrameResumeSeekWatchdog()
+        }
+        // This marker belongs to the deferred resume seek, not to the user's new seek. The next real tick
+        // should therefore be authoritative for the explicit destination and must not be filtered as stale.
+        if inFlightSeekTarget == oldTarget { inFlightSeekTarget = nil }
     }
 
     private func settlePostFrameResumeSeekIfOwned(target: Double, loadToken: PlayerLoadToken) {
@@ -9941,6 +9965,7 @@ struct TVPlayerView: View {
     /// (an absolute `seek(to:)` arms the cache hold and empties the forward buffer, which a small hop must
     /// not), but they emit the same line for a complete trail. maybeResume logs its own resume line.
     private func issueSeek(to target: Double, reason: String) {
+        cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user seek")
         DiagnosticsLog.log(
             "playback",
@@ -9950,6 +9975,7 @@ struct TVPlayerView: View {
     }
 
     private func seek(_ delta: Double) {
+        cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user relative seek")
         DiagnosticsLog.log(
             "playback",

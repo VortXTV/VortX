@@ -1977,8 +1977,14 @@ struct PlayerScreen: View {
                         play: { coordinator.player?.play() },
                         pause: { coordinator.player?.pause() },
                         togglePause: { coordinator.player?.togglePause() },
-                        seekBy: { delta in coordinator.player?.seek(by: delta) },
-                        seekTo: { position in coordinator.player?.seek(to: position) },
+                        seekBy: { delta in
+                            cancelPendingResumeForUserSeek()
+                            coordinator.player?.seek(by: delta)
+                        },
+                        seekTo: { position in
+                            cancelPendingResumeForUserSeek()
+                            coordinator.player?.seek(to: position)
+                        },
                         stepSeconds: seekStepSeconds,
                         canScrub: NowPlayingPolicy.allowsScrubbing(duration: duration, isLive: effectivelyLive))
                     updateNowPlaying(at: d, force: true)   // publish the card immediately, not on the next tick
@@ -3823,6 +3829,16 @@ struct PlayerScreen: View {
         postFrameResumeSeekWatchdog = nil
         postFrameResumeSeekWatchdogTarget = nil
         postFrameResumeSeekWatchdogOwner = nil
+    }
+
+    /// A user seek supersedes either phase of the deferred resume transaction.
+    private func cancelPendingResumeForUserSeek() {
+        let oldTarget = pendingLibmpvResumeSeek ?? postFrameResumeSeekWatchdogTarget
+        guard let oldTarget else { return }
+        pendingLibmpvResumeSeek = nil
+        if postFrameResumeSeekWatchdogTarget == oldTarget {
+            cancelPostFrameResumeSeekWatchdog()
+        }
     }
 
     /// Watch for a hard stall after playback has started. Both a silent frozen surface and visible buffering
@@ -6247,6 +6263,7 @@ struct PlayerScreen: View {
     /// A9: single logged choke point for a seek so the exportable trail shows every jump (reason, from, to,
     /// duration). maybeResume / nudgeResume and the automatic-skip path log their own dedicated lines.
     private func issueSeek(to target: Double, reason: String) {
+        cancelPendingResumeForUserSeek()
         DiagnosticsLog.log(
             "playback",
             String(format: "seek reason=%@ from=%.3f to=%.3f duration=%.3f", reason, currentTime, target, duration)

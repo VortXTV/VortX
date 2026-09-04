@@ -71,6 +71,44 @@ check("tvOS resume seek bypasses the manual absolute-seek cache hold",
         && controller.contains("func seekForResume(to seconds: Double)")
         && !section(controller, from: "func seekForResume(to seconds: Double)", to: "func seek(by seconds: Double)")!.contains("armSeekCacheHold()"))
 
+check("tvOS explicit seeks cancel a deferred cold-start resume before issuing the user target",
+      player.contains("private func cancelPendingLibmpvResumeForUserSeek()")
+        && player.contains("pendingLibmpvResumeSeek = nil")
+        && player.contains("inFlightSeekTarget = nil")
+        && section(player, from: "private func issueSeek(to target: Double", to: "private func seek(_ delta: Double)")?.contains("cancelPendingLibmpvResumeForUserSeek()") == true
+        && section(player, from: "private func seek(_ delta: Double)", to: "private func restart()")?.contains("cancelPendingLibmpvResumeForUserSeek()") == true)
+
+check("Now Playing seek closures cancel deferred resume on both Apple surfaces",
+      section(player, from: "NowPlayingCenter.wireCommands(", to: "refreshNowPlaying(at: d")?.contains("cancelPendingLibmpvResumeForUserSeek()") == true
+        && section(playerScreen, from: "NowPlayingCenter.wireCommands(", to: "stepSeconds:")?.contains("cancelPendingResumeForUserSeek()") == true)
+
+struct DeferredResumeSeekCancellationModel {
+    var pending: Double?
+    var postFrame: Double?
+    var preFrameWatchdog = false
+    var inFlight: Double?
+    mutating func cancelUserSeek() {
+        let old = pending ?? postFrame
+        guard let old else { return }
+        pending = nil
+        preFrameWatchdog = false
+        if postFrame == old { postFrame = nil }
+        if inFlight == old { inFlight = nil }
+    }
+}
+var preFrameModel = DeferredResumeSeekCancellationModel(pending: 900, postFrame: nil, preFrameWatchdog: true, inFlight: 900)
+preFrameModel.cancelUserSeek()
+check("model: pre-first-frame user seek cancels pending target and watchdog",
+      preFrameModel.pending == nil && !preFrameModel.preFrameWatchdog && preFrameModel.inFlight == nil)
+var postFrameModel = DeferredResumeSeekCancellationModel(pending: nil, postFrame: 900, preFrameWatchdog: false, inFlight: 900)
+postFrameModel.cancelUserSeek()
+check("model: post-first-frame user seek cancels owned target and watchdog",
+      postFrameModel.postFrame == nil && postFrameModel.inFlight == nil)
+var newerSeekModel = DeferredResumeSeekCancellationModel(pending: 900, postFrame: nil, preFrameWatchdog: true, inFlight: 1200)
+newerSeekModel.cancelUserSeek()
+check("model: newer explicit in-flight seek is preserved",
+      newerSeekModel.inFlight == 1200 && newerSeekModel.pending == nil && !newerSeekModel.preFrameWatchdog)
+
 check("an unresolved source replacement carries raw decoder time while retaining the old resume floor",
       player.contains("let confirmedCarry = lastRawTimePos.isFinite && lastRawTimePos >= 0 ? lastRawTimePos : nil")
         && player.contains("let carryFloor = unresolvedResumeTarget.map")
