@@ -2938,6 +2938,17 @@ final class MPVMetalViewController: PlatformViewController {
         command("seek", args: [String(seconds), "absolute"])
     }
 
+    /// Apply a saved Continue Watching offset after the player has produced its first frame.
+    ///
+    /// This is intentionally not a viewer scrub.  The ordinary absolute-seek route marks a user seek,
+    /// and, on tvOS, may empty the forward cache and park output until a cold mid-file range refill
+    /// completes.  A stored resume must be allowed to fail independently of presentation, so it issues
+    /// the same mpv command without adopting that manual-scrub cache hold/watchdog transaction.
+    func seekForResume(to seconds: Double) {
+        cancelPausedCacheParkForExplicitSeek()
+        command("seek", args: [String(seconds), "absolute"])
+    }
+
     /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Small hops usually stay
     /// inside the buffered window, so no cache hold is armed for these.
     func seek(by seconds: Double) {

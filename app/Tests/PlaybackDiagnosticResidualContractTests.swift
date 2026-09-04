@@ -19,6 +19,30 @@ private func section(_ source: String, from start: String, to end: String) -> St
     return String(source[startRange.lowerBound..<endRange.lowerBound])
 }
 
+private struct ResumeWatchdogModel {
+    var target: Int?
+    var owner: String?
+    var isArmed = false
+
+    mutating func arm(target: Int, owner: String) {
+        self.target = target
+        self.owner = owner
+        isArmed = true
+    }
+
+    mutating func clear() {
+        target = nil
+        owner = nil
+        isArmed = false
+    }
+
+    mutating func settle(target: Int, owner: String) -> Bool {
+        guard isArmed, self.target == target, self.owner == owner else { return false }
+        clear()
+        return true
+    }
+}
+
 private let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 private let app = tests.deletingLastPathComponent()
 private let player = try String(
@@ -39,8 +63,51 @@ check("resume settlement computes positive landing evidence",
       seekSettlement.contains("let landedNearTarget = abs(d - target) <= inFlightSeekSnapRadius"))
 check("a proven landing cancels and releases the resume watchdog",
       seekSettlement.contains("if landedNearTarget {")
-        && seekSettlement.contains("postFrameResumeSeekWatchdog?.cancel()")
-        && seekSettlement.contains("postFrameResumeSeekWatchdog = nil"))
+        && seekSettlement.contains("settlePostFrameResumeSeekIfOwned(")
+        && seekSettlement.contains("loadToken: event.loadToken"))
+
+check("tvOS resume seek bypasses the manual absolute-seek cache hold",
+      player.contains("coordinator.player?.seekForResume(to: t)")
+        && controller.contains("func seekForResume(to seconds: Double)")
+        && !section(controller, from: "func seekForResume(to seconds: Double)", to: "func seek(by seconds: Double)")!.contains("armSeekCacheHold()"))
+
+check("an unresolved source replacement carries raw decoder time while retaining the old resume floor",
+      player.contains("let confirmedCarry = lastRawTimePos.isFinite && lastRawTimePos >= 0 ? lastRawTimePos : nil")
+        && player.contains("let carryFloor = unresolvedResumeTarget.map")
+        && player.contains("? (confirmedCarry ?? 0)")
+        && player.contains("if let carryFloor {")
+        && player.contains("suppressedResumeFloor = carryFloor"))
+
+check("tvOS watchdog ownership includes target and exact load token, and cleanup clears all three fields",
+      player.contains("postFrameResumeSeekWatchdogTarget == target")
+        && player.contains("postFrameResumeSeekWatchdogOwner == owner")
+        && player.contains("postFrameResumeSeekWatchdogTarget = nil")
+        && player.contains("postFrameResumeSeekWatchdogOwner = nil"))
+
+for (name, boundary, end) in [
+    ("episode reset", "private func resetRuntimeForIssuedEpisode()", "/// Device-local resume"),
+    ("retry", "private func retryLoad(resetAutoRetries", "/// Live HLS providers"),
+    ("explicit exit", "private func leavePlayback()", "private func maybeResume()")
+] {
+    let body = section(player, from: boundary, to: end) ?? ""
+    check("tvOS \(name) clears deferred resume watchdog before token lifecycle work",
+          body.contains("clearPostFrameResumeSeekWatchdog()"))
+}
+
+check("every load issuer centrally retires the old watchdog before a new token",
+      section(player, from: "private func loadIntoPlayer(", to: "// Keep the yt-direct audio")
+        .map { $0.contains("clearPostFrameResumeSeekWatchdog()") } ?? false)
+
+private var ownership = ResumeWatchdogModel()
+ownership.arm(target: 900, owner: "A")
+ownership.clear() // close/retry/episode reset must make old A inert before B gets a token
+let staleACanActAfterBoundary = ownership.settle(target: 900, owner: "A")
+ownership.arm(target: 900, owner: "B")
+let staleACanSettleB = ownership.settle(target: 900, owner: "A")
+let matchingBCanSettle = ownership.settle(target: 900, owner: "B")
+check("boundary clear makes stale A inert; only B's near-target tick settles B",
+      !staleACanActAfterBoundary && !staleACanSettleB && matchingBCanSettle
+        && !ownership.isArmed && ownership.target == nil && ownership.owner == nil)
 
 // Exercise the lifetime sequence that regressed: after a landing the old watchdog reference must be
 // gone, therefore a later user seek cannot provide a receiver for the old resume deadline.

@@ -80,6 +80,9 @@ protocol PlayerEngine: AnyObject {
     func pause()
     func togglePause()
     func seek(to seconds: Double)
+    /// A stored resume offset is not a viewer scrub. libmpv overrides this to avoid the tvOS
+    /// out-of-window user-seek cache-hold transaction; engines without that distinction use seek(to:).
+    func seekForResume(to seconds: Double)
     func seek(by seconds: Double)
     func setSpeed(_ speed: Double)
     func stop()
@@ -141,6 +144,8 @@ protocol PlayerEngine: AnyObject {
 }
 
 extension PlayerEngine {
+    func seekForResume(to seconds: Double) { seek(to: seconds) }
+
     /// libmpv already receives its resume as an ordinary post-load seek. Only the AVPlayer remux lane needs a
     /// pre-mount origin, so other engines intentionally ignore this one-shot configuration call.
     func configureResumeOrigin(seconds: Double) {}

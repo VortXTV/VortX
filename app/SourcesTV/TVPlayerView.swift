@@ -1044,6 +1044,10 @@ struct TVPlayerView: View {
     /// stall ladder answers that with a same-source reload at the SAME offset, wedging again and re-arming
     /// the DV->HDR10 display switch every cycle (the Harry Potter stall loop).
     @State private var postFrameResumeSeekWatchdog: Task<Void, Never>?
+    /// The exact deferred-resume obligation owned by the current libmpv mount.  A plain task is not
+    /// enough: a late tick from an old source must not settle, or cancel, a newer source's watchdog.
+    @State private var postFrameResumeSeekWatchdogTarget: Double?
+    @State private var postFrameResumeSeekWatchdogOwner: PlayerLoadToken?
     private let postFrameResumeSeekWatchdogSeconds: Double = 12
     /// Wall-clock when settled playback first ticked inside the last-10% "watched" zone, nil while
     /// outside it (or while scrubbing). The watched marker requires a few seconds of dwell here, so a
@@ -1304,7 +1308,7 @@ struct TVPlayerView: View {
             invalidateNextEpisodePreparation(reason: "player view disappeared")
             invalidateLocalTrickplayCapture()
             cancelAssetSanityObservationDeadline()
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); avPostReplacementFirstFrameDeadline?.cancel(); libmpvResumeWatchdog?.cancel(); postFrameResumeSeekWatchdog?.cancel(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); avPostReplacementFirstFrameDeadline?.cancel(); libmpvResumeWatchdog?.cancel(); clearPostFrameResumeSeekWatchdog(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
             cancelTerminalFinalityRefresh()
             cancelDirectResumeInventoryRefresh()
             invalidateEpisodeResolution()
@@ -1939,8 +1943,8 @@ struct TVPlayerView: View {
                     // AVPlayer never stashes one (its resume is a pre-mount remux origin), so this is a no-op there.
                     if let t = pendingLibmpvResumeSeek {
                         pendingLibmpvResumeSeek = nil
-                        coordinator.player?.seek(to: t)
-                        armPostFrameResumeSeekWatchdog(target: t)
+                        coordinator.player?.seekForResume(to: t)
+                        armPostFrameResumeSeekWatchdog(target: t, owner: event.loadToken)
                     }
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually rendered,
                     // so publish the advance NOW, before anything below (the LastStreamStore record, the
@@ -2022,8 +2026,10 @@ struct TVPlayerView: View {
                             // The deferred resume obligation is complete. Retire its watchdog now, while
                             // the landed tick still proves the target, so a later user seek backward cannot
                             // make the old target look failed when the 12-second task wakes.
-                            postFrameResumeSeekWatchdog?.cancel()
-                            postFrameResumeSeekWatchdog = nil
+                            settlePostFrameResumeSeekIfOwned(
+                                target: target,
+                                loadToken: event.loadToken
+                            )
                         }
                     } else {
                         return
@@ -3881,6 +3887,10 @@ struct TVPlayerView: View {
                                 resumeOrigin: Double? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
+        // A load command supersedes any deferred-resume watchdog before it can issue a new token.  Keep
+        // this central guard in addition to the named lifecycle exits below: foreground reconcile and
+        // prepared episode admission also issue loads without passing through the ordinary retry path.
+        clearPostFrameResumeSeekWatchdog()
         // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
         // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
         let sidecar = (url == self.url) ? audioSidecarURL : nil
@@ -4086,6 +4096,7 @@ struct TVPlayerView: View {
         pendingAudioReapply = preservingAudioChoice
         suppressedResumeFloor = nil
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
+        clearPostFrameResumeSeekWatchdog()
         watchedZoneSince = nil
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
@@ -4132,8 +4143,15 @@ struct TVPlayerView: View {
         // engines never pile up on the embedded server (the regression that bloated its RSS and
         // took it offline). A hop into another torrent is fine now that the old one is closed.
         let oldHash = currentTorrentHash
-        let resume = resumeOverride
-            ?? (hasStartedPlaying ? currentTime : (resumeSeconds ?? 0))
+        // `currentTime` is deliberately optimistic while a Continue Watching seek is unresolved.  A fresh
+        // source must start from decoder-confirmed media, not repeat a speculative 15-minute cold-range
+        // request.  Preserve that requested offset only as the persistence floor until real playback catches up.
+        let unresolvedResumeTarget = inFlightSeekTarget
+        let confirmedCarry = lastRawTimePos.isFinite && lastRawTimePos >= 0 ? lastRawTimePos : nil
+        let carryFloor = unresolvedResumeTarget.map { max(suppressedResumeFloor ?? 0, $0) }
+        let resume = unresolvedResumeTarget != nil
+            ? (confirmedCarry ?? 0)
+            : (resumeOverride ?? (hasStartedPlaying ? currentTime : (resumeSeconds ?? 0)))
         // Is `resume` a LIVE PLAY HEAD rather than a stored library offset? Captured HERE, before the reset
         // below clears both inputs. True for a mid-title switch (currentTime) and for the hop a mid-play
         // failure spawns (which cleared `hasStartedPlaying` before calling, so only the marker still says so).
@@ -4191,6 +4209,10 @@ struct TVPlayerView: View {
             preservingSubtitleChoice: preservingSubtitleChoice,
             preservingAudioChoice: preservingAudioChoice
         )
+        if let carryFloor {
+            suppressedResumeFloor = carryFloor
+            lastSaved = max(lastSaved, carryFloor)
+        }
         curURL = newURL
         curDebridRef = debridRef
         curSourceStream = stream
@@ -5806,7 +5828,7 @@ struct TVPlayerView: View {
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         loadTimeout?.cancel(); loadTimeout = nil
         libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil   // fresh mount incoming: retire any deferred-resume safety net
-        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
+        clearPostFrameResumeSeekWatchdog()
         let engineRequestedResume =
             retiringAVPlayer.pendingRequestedSourcePositionSeconds
         // Real DV-profile evidence from the outgoing AVPlayer's own remux parse (#148), captured for the
@@ -6031,7 +6053,7 @@ struct TVPlayerView: View {
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil   // fresh mount incoming: retire any deferred-resume safety net
-        postFrameResumeSeekWatchdog?.cancel(); postFrameResumeSeekWatchdog = nil
+        clearPostFrameResumeSeekWatchdog()
         // Carry the HIGHER of the live position and any suppressed resume floor. A DV-remux session that
         // started at 0 (its resume seek was dropped, forward-only) holds the REAL resume point ONLY in
         // suppressedResumeFloor, so carrying currentTime alone would regress the account resume to ~0 when the
@@ -6289,17 +6311,33 @@ struct TVPlayerView: View {
     /// +0.1s nudge (the same proven wedge release as the cold-start nudge) resumes playback from wherever the
     /// source actually is. Presentation reconciles to the first proven engine position while persistence retains
     /// the valid resume floor, because one source's failed seek must not erase Continue Watching progress.
-    private func armPostFrameResumeSeekWatchdog(target: Double) {
+    private func clearPostFrameResumeSeekWatchdog() {
         postFrameResumeSeekWatchdog?.cancel()
-        let armedToken = coordinator.player?.activeLoadToken
+        postFrameResumeSeekWatchdog = nil
+        postFrameResumeSeekWatchdogTarget = nil
+        postFrameResumeSeekWatchdogOwner = nil
+    }
+
+    private func settlePostFrameResumeSeekIfOwned(target: Double, loadToken: PlayerLoadToken) {
+        guard postFrameResumeSeekWatchdogTarget == target,
+              postFrameResumeSeekWatchdogOwner == loadToken else { return }
+        clearPostFrameResumeSeekWatchdog()
+    }
+
+    private func armPostFrameResumeSeekWatchdog(target: Double, owner: PlayerLoadToken) {
+        clearPostFrameResumeSeekWatchdog()
+        postFrameResumeSeekWatchdogTarget = target
+        postFrameResumeSeekWatchdogOwner = owner
         postFrameResumeSeekWatchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
             guard !Task.isCancelled,
+                  postFrameResumeSeekWatchdogTarget == target,
+                  postFrameResumeSeekWatchdogOwner == owner,
                   let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
                     targetSeconds: target,
                     actualPositionSeconds: lastRawTimePos,
                     landingToleranceSeconds: inFlightSeekSnapRadius,
-                    watchdogStillOwnsGeneration: coordinator.player?.activeLoadToken == armedToken
+                    watchdogStillOwnsGeneration: coordinator.player?.activeLoadToken == owner
                   ) else { return }
             DiagnosticsLog.log(
                 "playback",
@@ -6308,7 +6346,7 @@ struct TVPlayerView: View {
             )
             inFlightSeekTarget = nil
             pendingLibmpvResumeSeek = nil
-            postFrameResumeSeekWatchdog = nil
+            clearPostFrameResumeSeekWatchdog()
             currentTime = reconciliation.presentationSeconds
             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
             lastSaved = max(lastSaved, reconciliation.persistenceFloorSeconds)
@@ -6902,6 +6940,7 @@ struct TVPlayerView: View {
     private func retryLoad(resetAutoRetries: Bool = true) {
         if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; recoveryDeadline?.cancel(); recoveryDeadline = nil }
         autoRetryTask?.cancel()
+        clearPostFrameResumeSeekWatchdog()
         captureRecoverySelections()
         let resume = hasStartedPlaying ? currentTime : (resumeSeconds ?? 0)
         avToMPVHandoffBlocked = false
@@ -8344,6 +8383,7 @@ struct TVPlayerView: View {
     /// remain intact for its callbacks, engine routing, persistence, and subtitle publication fences.
     private func resetRuntimeForIssuedEpisode() {
         clearCachedAudioOutputTruth()
+        clearPostFrameResumeSeekWatchdog()
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; resumeSeconds = nil
         // A DIFFERENT episode resumes from ITS stored offset, so the near-end guard applies again.
@@ -9683,6 +9723,7 @@ struct TVPlayerView: View {
     /// engine is leaked.
     private func leavePlayback() {
         resetRapidBufferingRecovery(reason: "playback exit")
+        clearPostFrameResumeSeekWatchdog()
         let exitLoadToken = coordinator.player?.activeLoadToken
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
