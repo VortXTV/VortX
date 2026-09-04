@@ -589,13 +589,28 @@ check("normalize: visual records from one explicit ASS event collapse after flat
 check("normalize: explicit ASS event identity is retained without changing visible cue text",
       sameASSEvent.first?.provenance != nil && sameASSEvent.first?.text == "Listen  now")
 let separateASSEvents = [
-    Policy.cue(payload: data("42,0,Default,,0,0,0,,{\\pos(10,20)}Listen  now"), format: .ass,
+    Policy.cue(payload: data("42,0,Default,,0,0,0,,{\\pos(10,20)}Listen now"), format: .ass,
                startSeconds: 10, durationSeconds: 2)!,
-    Policy.cue(payload: data("43,0,Default,,0,0,0,,{\\pos(10,20)}Listen now"), format: .ass,
+    Policy.cue(payload: data("43,1,Other,,20,30,40,scroll up,{\\pos(20,30)}Listen now"), format: .ass,
                startSeconds: 10.04, durationSeconds: 2)!,
 ]
-check("normalize: separate ASS events with same flattened text, style, layer, and position stay distinct",
-      Policy.normalizedCues(separateASSEvents).count == 2)
+check("normalize: distinct proven ASS events with identical post-strip text stay distinct",
+      Policy.normalizedCues(separateASSEvents).count == 2
+        && Policy.normalizedCues(separateASSEvents).allSatisfy { $0.provenance != nil })
+check("normalize: distinct proven ASS events stay distinct and stable in every overlapping segment",
+      Policy.cues(separateASSEvents, overlapping: 9, end: 11).count == 2
+        && Policy.cues(separateASSEvents, overlapping: 10.5, end: 12).count == 2
+        && Policy.normalizedCues(Policy.normalizedCues(separateASSEvents))
+            == Policy.normalizedCues(separateASSEvents))
+let separateASSCueIDs = Policy.normalizedCues(separateASSEvents).map {
+    Policy.cueIdentifier(startSeconds: $0.start, endSeconds: $0.end, text: $0.text)
+}
+check("normalize: distinct ASS events retain stable distinct cue IDs across segment copies",
+      Set(separateASSCueIDs).count == 2
+        && Policy.webVTTDocument(cues: Policy.cues(separateASSEvents, overlapping: 9, end: 11),
+                                 segmentStart: 9).contains(separateASSCueIDs[0])
+        && Policy.webVTTDocument(cues: Policy.cues(separateASSEvents, overlapping: 10.5, end: 12),
+                                 segmentStart: 10.5).contains(separateASSCueIDs[0]))
 let anonymousASSEvents = [
     Policy.cue(payload: data("0,0,Default,,0,0,0,,Listen  now"), format: .ass,
                startSeconds: 10, durationSeconds: 2)!,
@@ -605,6 +620,36 @@ let anonymousASSEvents = [
 check("normalize: anonymous ASS ReadOrder zero never authorizes semantic dedupe",
       Policy.normalizedCues(anonymousASSEvents).count == 2
         && anonymousASSEvents.allSatisfy { $0.provenance == nil })
+check("normalize: zero ASS ReadOrder retains legacy exact-text coalescing",
+      Policy.normalizedCues([
+          Policy.cue(payload: data("0,0,Default,,0,0,0,,Listen now"), format: .ass,
+                     startSeconds: 10, durationSeconds: 2)!,
+          Policy.cue(payload: data("0,1,Other,,20,30,40,scroll up,Listen now"), format: .ass,
+                     startSeconds: 10.04, durationSeconds: 2)!,
+      ]).count == 1)
+let malformedASSEvents = [
+    Policy.cue(payload: data("not-an-id,0,Default,,0,0,0,,Listen now"), format: .ass,
+               startSeconds: 10, durationSeconds: 2)!,
+    Policy.cue(payload: data("not-an-id,1,Other,,20,30,40,scroll up,Listen now"), format: .ass,
+               startSeconds: 10.04, durationSeconds: 2)!,
+]
+check("normalize: malformed ASS ReadOrder retains legacy exact-text coalescing",
+      Policy.normalizedCues(malformedASSEvents).count == 1
+        && malformedASSEvents.allSatisfy { $0.provenance == nil })
+check("normalize: same ASS event exactly at the 150ms timing boundary coalesces",
+      Policy.normalizedCues([
+          Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen  now"), format: .ass,
+                     startSeconds: 10, durationSeconds: 2)!,
+          Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen now"), format: .ass,
+                     startSeconds: 10.15, durationSeconds: 2)!,
+      ]).count == 1)
+check("normalize: same ASS event just beyond the 150ms timing boundary stays distinct",
+      Policy.normalizedCues([
+          Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen  now"), format: .ass,
+                     startSeconds: 10, durationSeconds: 2)!,
+          Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen now"), format: .ass,
+                     startSeconds: 10.150_001, durationSeconds: 2)!,
+      ]).count == 2)
 check("normalize: same ASS event outside the duplicate timing boundary stays distinct",
       Policy.normalizedCues([
           Policy.cue(payload: data("42,0,Default,,0,0,0,,Listen  now"), format: .ass,
@@ -649,6 +694,16 @@ check("normalize: the same fixture really was over the cap before normalization"
 check("normalize: each further overlap clips the next oldest in turn",
       Policy.normalizedCues(stack + [Cue(start: 4, end: 20, text: "five")]).map(\.end)
         == [3, 4, 20, 20, 20])
+let provenanceBeforeCap = Policy.cue(payload: data("42,0,Default,,0,0,0,,Provenance"), format: .ass,
+                                     startSeconds: 0, durationSeconds: 20)!
+let provenanceAfterCap = Policy.normalizedCues([
+    provenanceBeforeCap,
+    Cue(start: 1, end: 20, text: "two"),
+    Cue(start: 2, end: 20, text: "three"),
+    Cue(start: 3, end: 20, text: "four"),
+]).first
+check("normalize: pass-two truncation preserves ASS provenance",
+      provenanceAfterCap?.end == 3 && provenanceAfterCap?.provenance == provenanceBeforeCap.provenance)
 
 let simultaneous = (0..<4).map { Cue(start: 0, end: 5, text: "layer\($0)") }
 let survivors = Policy.normalizedCues(simultaneous)

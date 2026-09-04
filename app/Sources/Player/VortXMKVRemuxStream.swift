@@ -4583,7 +4583,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Merge BEFORE the count/byte bounds: a continuation of the run stores nothing new, so a rendition that
         // has hit its cue cap can still extend its last cue rather than dropping the continuation outright.
         if let last = _subtitleCues[renditionID].last,
-           last.text == cue.text,
+           SubtitleRenditionPolicy.canCoalesce(last, cue),
            cue.start >= last.start,
            cue.start <= last.end,
            cue.end > last.end {
@@ -4595,7 +4595,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // An exact duplicate (identical text, no later end) adds nothing to show; count it as a valid cue and
         // store nothing. Same fail-soft direction as the merge: never a rejection, never a new charge.
         if let last = _subtitleCues[renditionID].last,
-           last.text == cue.text,
+           SubtitleRenditionPolicy.canCoalesce(last, cue),
            cue.start >= last.start,
            cue.start <= last.end {
             return .appended(recoveredUnavailableRow: observeValidSubtitleCueLocked(sourceIndex: sourceIndex))

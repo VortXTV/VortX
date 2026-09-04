@@ -681,9 +681,7 @@ enum SubtitleRenditionPolicy {
         var open: [Int] = []
         for cue in ordered {
             open.removeAll { merged[$0].end < cue.start }
-            if let slot = open.first(where: {
-                merged[$0].text == cue.text || isDuplicateASSRenderRecord(merged[$0], cue)
-            }) {
+            if let slot = open.first(where: { canCoalesce(merged[$0], cue) }) {
                 merged[slot] = Cue(start: merged[slot].start,
                                    end: max(merged[slot].end, cue.end),
                                    text: merged[slot].text,
@@ -707,7 +705,10 @@ enum SubtitleRenditionPolicy {
                     if start - merged[slot].start < minCueDuration {
                         dropped.insert(slot)
                     } else {
-                        merged[slot] = Cue(start: merged[slot].start, end: start, text: merged[slot].text)
+                        merged[slot] = Cue(start: merged[slot].start,
+                                           end: start,
+                                           text: merged[slot].text,
+                                           provenance: merged[slot].provenance)
                     }
                 }
                 active.removeFirst(excess)
@@ -718,6 +719,21 @@ enum SubtitleRenditionPolicy {
         return merged.indices.filter { !dropped.contains($0) }.map { merged[$0] }
     }
 
+    /// The legacy literal-text merge remains valid unless both cues carry explicit, conflicting ASS event
+    /// identities. Once ASS markup has been stripped, two different source dialogue events can render to
+    /// exactly the same visible text, so visible equality alone is not enough to collapse proven events.
+    /// Unproven and non-ASS cues retain the established literal-text behavior.
+    static func canCoalesce(_ lhs: Cue, _ rhs: Cue) -> Bool {
+        if lhs.text == rhs.text {
+            if case let .assEvent(lhsEvent)? = lhs.provenance,
+               case let .assEvent(rhsEvent)? = rhs.provenance {
+                return lhsEvent == rhsEvent
+            }
+            return true
+        }
+        return isDuplicateASSRenderRecord(lhs, rhs)
+    }
+
     /// Coalesce only an ASS duplicate record whose originating event is explicitly identical. Text is compared
     /// after whitespace flattening because ASS override blocks and hard spaces have already lost their visual
     /// semantics before this policy sees them. Nothing based only on visible text, styling, or timing qualifies.
@@ -726,12 +742,20 @@ enum SubtitleRenditionPolicy {
               case let .assEvent(lhsEvent)? = lhs.provenance,
               case let .assEvent(rhsEvent)? = rhs.provenance,
               lhsEvent == rhsEvent,
-              abs(lhs.start - rhs.start) <= assEventDuplicateTimingTolerance,
-              abs(lhs.end - rhs.end) <= assEventDuplicateTimingTolerance,
+              withinASSDuplicateTimingTolerance(lhs.start, rhs.start),
+              withinASSDuplicateTimingTolerance(lhs.end, rhs.end),
               let lhsText = assFlattenedTextKey(lhs.text),
               let rhsText = assFlattenedTextKey(rhs.text),
               lhsText == rhsText else { return false }
         return true
+    }
+
+    /// Decimal packet times such as `10.15` cannot always subtract to the exact mathematical 150 ms boundary.
+    /// Admit only the few ULPs required by that representation error, while retaining the inclusive 150 ms rule.
+    private static func withinASSDuplicateTimingTolerance(_ lhs: Double, _ rhs: Double) -> Bool {
+        let scale = max(abs(lhs), abs(rhs), assEventDuplicateTimingTolerance)
+        let roundingAllowance = scale * Double.ulpOfOne * 8
+        return abs(lhs - rhs) <= assEventDuplicateTimingTolerance + roundingAllowance
     }
 
     /// A deliberately literal ASS comparison key: only whitespace is flattened. Punctuation, words, markup,
