@@ -16,12 +16,13 @@ private enum PauseEpisodeRegressionContractTests {
         let player = try String(contentsOf: app.appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
         let root = try String(contentsOf: app.appendingPathComponent("SourcesTV/RootTabView.swift"), encoding: .utf8)
 
-        check("cache-owned EOF is decided before any UI terminal callback",
-              controller.contains("if let suppressed = self.cacheFlushFlight.consumeSyntheticEOF(owner: loadToken)")
-                && controller.contains("internal-cache-flush synthetic EOF suppressed")
+        check("cache clearing and exact reanchor share one player command",
+              controller.contains("let commandResult = mpv_command_string(")
+                && controller.contains("no-osd drop-buffers; no-osd seek \\(flight.targetArgument) absolute+exact"))
+        check("real EOF reaches the UI instead of being hidden as cache recovery",
+              !controller.contains("consumeSyntheticEOF")
+                && !controller.contains("synthetic EOF suppressed")
                 && controller.contains("self.emitEndFileEOF(loadToken: loadToken)"))
-        check("EOF event loop no longer resets a cache flight before ownership classification",
-              !controller.contains("ef.reason == MPV_END_FILE_REASON_ERROR || ef.reason == MPV_END_FILE_REASON_EOF"))
 
         check("exact pending episode reentry preserves the active resolution",
               player.contains("pending.meta.videoId == v.id")

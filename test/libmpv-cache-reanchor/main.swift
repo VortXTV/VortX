@@ -141,7 +141,7 @@ private func loadAndBuffer(_ h: OpaquePointer, _ fixture: String, events: inout 
 }
 
 private func parked(_ h: OpaquePointer, _ at: Double, events: inout Events) -> Bool {
-    guard command(h, ["seek", String(format: "%.3f", at), "absolute+exact"]) >= 0,
+    guard command(h, ["seek", String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), at), "absolute+exact"]) >= 0,
           command(h, ["set", "pause", "yes"]) >= 0 else { return false }
     return waitUntil(h, 12, events: &events) { abs((number(h, "time-pos") ?? -999) - at) < 1.0 && flag(h, "pause") == true }
 }
@@ -157,7 +157,7 @@ private struct ReanchorReceipt {
 
 private func atomicDropAndReanchor(_ h: OpaquePointer, at position: Double, events: inout Events) -> ReanchorReceipt? {
     guard position.isFinite, let wasPaused = flag(h, "pause") else { return nil }
-    let target = String(format: "%.3f", position)
+    let target = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), position)
     let lowLevelBefore = cacheInteger(h, "debug-low-level-seeks")
     let seekCount = events.seeks
     let restartCount = events.restarts
@@ -188,7 +188,7 @@ private func reanchor(_ h: OpaquePointer, at position: Double, events: inout Eve
     let appliedNo = string(h, "options/demuxer-seekable-cache")
     let lowLevelBefore = cacheInteger(h, "debug-low-level-seeks")
     guard appliedNo == "no",
-          command(h, ["seek", String(format: "%.3f", position), "absolute+exact"]) >= 0 else { return nil }
+          command(h, ["seek", String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), position), "absolute+exact"]) >= 0 else { return nil }
     events.minimumForwardBytes = nil
     let seekCount = events.seeks
     let restartCount = events.restarts
@@ -304,7 +304,7 @@ if let h = newPlayer() {
     guard command(h, ["loadfile", fixture, "replace"]) >= 0 else { exit(2) }
     _ = waitUntil(h, 12, events: &events) { number(h, "duration") != nil }
     let duration = number(h, "duration") ?? 0
-    guard command(h, ["seek", String(format: "%.3f", max(0, duration - 0.25)), "absolute+exact"]) >= 0 else { exit(2) }
+    guard command(h, ["seek", String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), max(0, duration - 0.25)), "absolute+exact"]) >= 0 else { exit(2) }
     poll(h, 2, events: &events)
     checks.require(events.eof && events.naturalEOF, "genuine end delivers EOF naturally", "duration=\(duration) natural=\(events.naturalEOF)")
 } else { exit(2) }

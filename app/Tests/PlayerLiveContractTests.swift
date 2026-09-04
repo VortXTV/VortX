@@ -3810,10 +3810,16 @@ enum PlayerLiveContractTests {
                 "reconcileResume = max(currentTime, suppressedResumeFloor ?? 0)",
             ])
         check("wiring: backward MediaRemote targets survive failure demotion on both Apple surfaces",
-              playerScreenNowPlaying?.contains(
-                "seekTo: { position in coordinator.player?.seek(to: position) }") == true
-                  && tvPlayerNowPlaying?.contains(
-                    "seekTo: { position in coordinator.player?.seek(to: position) }") == true
+              sourceContainsInOrder(playerScreenNowPlaying, [
+                "seekTo: { position in",
+                "cancelPendingResumeForUserSeek()",
+                "coordinator.player?.seek(to: position)",
+              ])
+                  && sourceContainsInOrder(tvPlayerNowPlaying, [
+                    "seekTo: { position in",
+                    "cancelPendingLibmpvResumeForUserSeek()",
+                    "coordinator.player?.seek(to: position)",
+                  ])
                   && playerScreenDemotionUsesNewestEngineTarget
                   && tvPlayerDemotionUsesNewestEngineTarget)
         check("wiring: chapter and skip targets survive failure demotion on both Apple surfaces",

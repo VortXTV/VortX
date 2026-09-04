@@ -34,5 +34,5 @@ FFMPEG="${VORTX_FFMPEG:-/opt/homebrew/bin/ffmpeg}"
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 BIN="$SCRATCH/libmpv-cache-reanchor"
-xcrun swiftc -sdk "$SDK" "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" -framework AppKit -framework AVFoundation -framework CoreAudio -framework AudioToolbox -framework CoreVideo -framework CoreFoundation -framework CoreMedia -framework Metal -framework VideoToolbox -framework Foundation -framework IOKit -framework IOSurface -framework QuartzCore -framework CoreGraphics -framework Network -lbz2 -liconv -lexpat -lresolv -lxml2 -lz -lc++ -o "$BIN" test/libmpv-cache-reanchor/main.swift
+xcrun swiftc -sdk "$SDK" -module-cache-path "$SCRATCH/ModuleCache" "${LINK_FLAGS[@]}" "$MOLTEN_ARCHIVE" -framework AppKit -framework AVFoundation -framework CoreAudio -framework AudioToolbox -framework CoreVideo -framework CoreFoundation -framework CoreMedia -framework Metal -framework VideoToolbox -framework Foundation -framework IOKit -framework IOSurface -framework QuartzCore -framework CoreGraphics -framework Network -lbz2 -liconv -lexpat -lresolv -lxml2 -lz -lc++ -o "$BIN" test/libmpv-cache-reanchor/main.swift
 /usr/bin/perl -e 'alarm 120; exec @ARGV' "$BIN" "$FIXTURE"
