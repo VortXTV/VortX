@@ -126,6 +126,8 @@ struct SettingsBackupSecretsTests {
             "stremiox.diskCacheBytes": 12_345,
             "vortx.pgsSubtitleOCR": false,
             "vortx.sync.lastSyncedVersion.acct_1": 42,
+            "vortx.owner.resumeCache.v2.11111111-1111-1111-1111-111111111111": ["tt-a": ["t": 123]],
+            "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
         ]
         UserDefaults.standard.setPersistentDomain(seeded, forName: bundleID)
 
@@ -141,6 +143,7 @@ struct SettingsBackupSecretsTests {
         check("T1.4 ordinary pref still present (not over-filtering)",
               backupRaw["stremiox.accentColor"] as? String == "blue")
         check("T1.5 device-local invalidation absent from backup", backupRaw[invalidationKey] == nil)
+        check("T1.6 owner resume cache absent from backup", backupRaw.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
 
         print("\n=== T2: decodeDomain() must not APPLY a secret (restore + pull-apply read side) ===")
         // Encode a POISONED blob directly, bypassing the write-side filter. This is an account doc or backup
@@ -149,6 +152,7 @@ struct SettingsBackupSecretsTests {
             domain: [
                 leakedKey: sessionBlob,
                 invalidationKey: true,
+                "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
                 "stremiox.accentColor": "red",
             ],
             bundleID: bundleID,
@@ -161,6 +165,7 @@ struct SettingsBackupSecretsTests {
               "found: \(String(describing: decoded[leakedKey]))")
         check("T2.2 ordinary pref still applied", decoded["stremiox.accentColor"] as? String == "red")
         check("T2.3 incoming invalidation cannot cross devices", decoded[invalidationKey] == nil)
+        check("T2.4 incoming owner resume receipt cannot cross accounts", decoded.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
 
         print("\n=== T3: mergedSyncBlob() scrubs a secret already in the account doc (self-heal) ===")
         guard let merged = SettingsBackup.mergedSyncBlob(onto: poisoned.base64EncodedString()) else {
@@ -172,6 +177,7 @@ struct SettingsBackupSecretsTests {
         check("T3.2 account's own pref preserved by the merge", mergedRaw["stremiox.accentColor"] != nil)
         check("T3.3 secret bytes absent from pushed blob", !containsSecret(merged))
         check("T3.4 stale invalidation not carried into pushed blob", mergedRaw[invalidationKey] == nil)
+        check("T3.5 stale owner resume state not carried into pushed blob", mergedRaw.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
 
         print("\n=== T4: device-local download keys (manager item A) ===")
         check("T4.1 queueOrder excluded", !SettingsBackup.isSyncable("vortx.downloads.queueOrder"))

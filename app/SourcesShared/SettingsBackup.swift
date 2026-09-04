@@ -86,6 +86,9 @@ enum SettingsBackup {
     /// VortXSyncManager writes on push and applies on pull. The blob was never its transport.
     static let deviceLocalKeyPrefixes: [String] = [
         "vortx.sync.",
+        // Owner resume caches and re-add receipts are account-scoped local reconciliation state, never
+        // portable settings. Exporting them could both leak A's resume into B and manufacture a stale receipt.
+        "vortx.owner.resumeCache.",
         Keychain.invalidationKeyPrefix, // non-secret record of an unconfirmed Keychain mutation on this device
         // Per-profile exact played-link memory (E3, Beta 26): a ~45KB dictionary rewritten on every
         // play and engine/source switch, carried through every sync push for zero cross-device value.

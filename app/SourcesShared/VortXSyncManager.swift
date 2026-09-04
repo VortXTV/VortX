@@ -784,6 +784,7 @@ final class VortXSyncManager: ObservableObject {
         cancelProviderLegacyMigration(except: capture)
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
+        OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
         return capture
     }
 
@@ -798,6 +799,7 @@ final class VortXSyncManager: ObservableObject {
         cancelProviderLegacyMigration(except: capture)
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
+        OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
         return capture
     }
 
@@ -1653,7 +1655,7 @@ final class VortXSyncManager: ObservableObject {
             .map { item in
                 ["id": item.id, "name": item.name, "type": item.type, "poster": item.poster ?? "",
                  "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000),
-                 "v": item.state.videoId ?? ""]
+                 "v": item.state.videoId ?? "", "lastWatched": item.state.lastWatched ?? ""]
             }
         // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle. FLOOR (OFF,
         // default) = UNION the account's already-owned `doc.vortx.library` with the engine library, so a
@@ -2391,6 +2393,7 @@ final class VortXSyncManager: ObservableObject {
         // stale web entry can never beat a recent reinstall, and the minted stamp publishes in deletedAddonsTs next push.
         var incomingAddonRemovals: [String] = []
         var incomingAddonRemovalsTs: [String: Any] = [:]
+        var libraryAdvance = LibraryTombstoneAdvance()
         if let vortx = doc["vortx"] as? [String: Any] {
             if let removed = vortx["deletedAddons"] as? [String] { incomingAddonRemovals += removed }
             if let ts = vortx["deletedAddonsTs"] as? [String: Any] { incomingAddonRemovalsTs = ts }
@@ -2434,14 +2437,26 @@ final class VortXSyncManager: ObservableObject {
         if let vortx = doc["vortx"] as? [String: Any] {
             let removedLib = (vortx["deletedLibrary"] as? [String]) ?? []
             let removedLibTs = (vortx["deletedLibraryTs"] as? [String: Any]) ?? [:]
+            libraryAdvance = Self.libraryTombstoneIDsAdvancing(
+                legacyIDs: removedLib, stampsRaw: removedLibTs)
             if !removedLib.isEmpty || !removedLibTs.isEmpty {
                 if LibraryTombstones.merge(legacyIDs: removedLib, stampsRaw: removedLibTs) { restored = true }
             }
+            // A newer `addedAt` can make an id present again before this response carries that re-added
+            // library row. Evict only an ADVANCING incoming stamp id: waiting for the next upsert is safe,
+            // whereas retaining a prior episode/offset would synthesize stale Continue Watching for the re-add.
+            OwnerResumeStore.evict(libraryIDs: LibraryTombstones.all().union(libraryAdvance.invalidatingIDs))
+        } else {
+            OwnerResumeStore.evict(libraryIDs: LibraryTombstones.all())
         }
+        // A library page cannot prove absence, so cache omission is never destructive. The tombstone fold above
+        // is the authoritative removal receipt instead. Eviction happens before refresh/rebuild so an old series
+        // episode or offset cannot briefly synthesize Continue Watching after a remote removal or re-add stamp.
         // Wave 4 (Finding D): refresh the local owner-resume cache from the pulled owner library, so a WARM
         // device (non-empty engine, which skips recoverOwnerLibraryIfEmpty) converges its resume offsets to the
         // account truth without a cold relaunch. Runs after the tombstone fold above so a removed title is
         // excluded. Inside the withRemoteApplySuppressed region, so the cache write does not arm a self-echo push.
+        OwnerResumeStore.recordReadds(libraryAdvance.readdedAddedAt)
         refreshOwnerResumeCache(from: doc)
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
@@ -2655,6 +2670,11 @@ final class VortXSyncManager: ObservableObject {
         guard isSignedIn, isCurrent(capture) else { return }
         guard case let .doc(doc) = await pullSyncDocResult(credentialCapture: capture) else { return }   // .failed/.empty: do nothing
         guard isCurrent(capture) else { return }
+        let coldVortx = doc["vortx"] as? [String: Any]
+        let coldReaddAdvance = Self.libraryTombstoneIDsAdvancing(
+            legacyIDs: (coldVortx?["deletedLibrary"] as? [String]) ?? [],
+            stampsRaw: (coldVortx?["deletedLibraryTs"] as? [String: Any]) ?? [:]
+        )
         // Fold the doc's tombstone stamps into the local stores BEFORE computing the hydrate + recovery sets,
         // so a cold launch (no prior syncDown) honors the removals the doc already carries: ownedAddons(from:)
         // reads AddonTombstones.all() and recoverOwnerLibraryIfEmpty reads LibraryTombstones.all(), both of
@@ -2665,9 +2685,13 @@ final class VortXSyncManager: ObservableObject {
         if !owned.isEmpty {
             CoreBridge.shared.hydrateAddonsFromAccount(owned)
         }
+        // The tombstone fold above is the authoritative removal receipt on a cold launch too. Evict before
+        // recoverOwnerLibraryIfEmpty refreshes/upserts document positions and before the final CW rebuild.
+        OwnerResumeStore.evict(libraryIDs: LibraryTombstones.all())
         // The engine now holds the hydrated add-ons, so baseline-stamp them once (a no-op once syncDown or a
         // prior hydrate already did it, or while the installed set is still empty).
         baselineInstalledAddonsOnce()
+        OwnerResumeStore.recordReadds(coldReaddAdvance.readdedAddedAt)
         await recoverOwnerLibraryIfEmpty(from: doc, credentialCapture: capture)
         guard isCurrent(capture) else { return }
         // recoverOwnerLibraryIfEmpty just refreshed OwnerResumeStore (and, on a cold device, re-added the owner
@@ -2733,7 +2757,9 @@ final class VortXSyncManager: ObservableObject {
     /// `AddToLibrary`/`addCatalogItemToAccount` path (real Cinemeta meta = schema-safe). NEVER writes app
     /// data into a libraryItem doc (the poisoned-account incident). Owner-profile semantics only: items
     /// land in the account library, which is the owner profile's history.
-    private func recoverOwnerLibraryIfEmpty(from doc: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async {
+    private func recoverOwnerLibraryIfEmpty(
+        from doc: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil
+    ) async {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture) else { return }
         guard let vortx = doc["vortx"] as? [String: Any] else { return }
@@ -2806,9 +2832,15 @@ final class VortXSyncManager: ObservableObject {
         }
         let libIDs = (vortx?["deletedLibrary"] as? [String]) ?? []
         let libTs = (vortx?["deletedLibraryTs"] as? [String: Any]) ?? [:]
+        let libraryAdvance = Self.libraryTombstoneIDsAdvancing(legacyIDs: libIDs, stampsRaw: libTs)
+        OwnerResumeStore.recordReadds(libraryAdvance.readdedAddedAt)
         if !libIDs.isEmpty || !libTs.isEmpty {
             LibraryTombstones.merge(legacyIDs: libIDs, stampsRaw: libTs)
         }
+        // A tombstone is the only authoritative absence receipt available to a paged owner-library response.
+        // Do this inside the same suppression window as the fold so every caller, including syncUp's read-merge,
+        // cannot retain an old episode/offset after it learned a peer's removal.
+        OwnerResumeStore.evict(libraryIDs: LibraryTombstones.all().union(libraryAdvance.invalidatingIDs))
         let addonIDs = (vortx?["deletedAddons"] as? [String]) ?? []
         let addonTs = (vortx?["deletedAddonsTs"] as? [String: Any]) ?? [:]
         if !addonIDs.isEmpty || !addonTs.isEmpty {
@@ -2898,6 +2930,54 @@ final class VortXSyncManager: ObservableObject {
         return 0
     }
 
+    /// Return only incoming tombstone identities whose wire stamp advances what this device already knows.
+    /// `timestampsForSync` retains historical removedAt *and* addedAt records, so evicting every key from every
+    /// pull would repeatedly erase a valid re-added resume whenever a later paged library response omitted it.
+    /// The result is computed before `LibraryTombstones.merge`; callers merge, then evict effective removals plus
+    /// these newly advanced ids. A legacy id without a valid stamp advances only when it is previously unknown.
+    private struct LibraryTombstoneAdvance {
+        var invalidatingIDs = Set<String>()
+        var readdedAddedAt = [String: Double]()
+    }
+
+    private static func libraryTombstoneIDsAdvancing(
+        legacyIDs: [String], stampsRaw: [String: Any]
+    ) -> LibraryTombstoneAdvance {
+        let prior = LibraryTombstones.timestampsForSync()
+        var result = LibraryTombstoneAdvance()
+        var validStamped = Set<String>()
+        for (rawID, rawValue) in stampsRaw {
+            let id = LibraryTombstones.normalize(rawID)
+            guard !id.isEmpty, let raw = rawValue as? [String: Any] else { continue }
+            let previous = prior[id] ?? [:]
+            var valid = false
+            var nextRemovedAt = previous["removedAt"] ?? 0
+            var nextAddedAt = previous["addedAt"] ?? 0
+            if let removedAt = (raw["removedAt"] as? NSNumber)?.doubleValue, removedAt.isFinite {
+                valid = true
+                nextRemovedAt = max(nextRemovedAt, removedAt)
+            }
+            if let addedAt = (raw["addedAt"] as? NSNumber)?.doubleValue, addedAt.isFinite {
+                valid = true
+                nextAddedAt = max(nextAddedAt, addedAt)
+            }
+            if nextRemovedAt > nextAddedAt {
+                result.invalidatingIDs.insert(id)
+            } else if nextRemovedAt > 0, nextAddedAt > nextRemovedAt,
+                      (prior[id] == nil || (previous["removedAt"] ?? 0) > (previous["addedAt"] ?? 0)) {
+                result.invalidatingIDs.insert(id)
+                result.readdedAddedAt[id] = nextAddedAt
+            }
+            if valid { validStamped.insert(id) }
+        }
+        for rawID in legacyIDs {
+            let id = LibraryTombstones.normalize(rawID)
+            guard !id.isEmpty, !validStamped.contains(id), prior[id] == nil else { continue }
+            result.invalidatingIDs.insert(id)
+        }
+        return result
+    }
+
     /// True when the VortX account doc is currently pullable (a decryptable `.doc`). Used as a pre-flight gate
     /// before the post-import engine Logout so we NEVER unload the engine's Stremio session (which resets the
     /// engine profile, wiping its local library) unless we can immediately rebuild the owner library from the
@@ -2912,21 +2992,23 @@ final class VortXSyncManager: ObservableObject {
     /// stremio-core re-adds owner titles at time 0 (it has no action to inject a saved offset), so this cache is
     /// the VortX-owned resume source. Called BOTH from recoverOwnerLibraryIfEmpty (cold device) AND from syncDown
     /// (so a WARM device with a non-empty engine, which skips the re-add, still converges its resume offsets to
-    /// the account truth without a cold relaunch). Non-destructive: it only records offsets, and honors removal
-    /// tombstones so a removed title is never cached. A doc t==0 (a finished / rewound title) caches 0, which the
-    /// resume reads treat as "no resume", so a finish propagates correctly.
+    /// the account truth without a cold relaunch). A library response is not proven complete, so it only UPSERTS
+    /// known ids. Explicit local/remote library tombstones evict removed ids before this method and before any
+    /// CW rebuild. A doc t==0 (a finished / rewound title) caches 0, which the resume reads treat as "no resume",
+    /// so a finish propagates correctly.
     private func refreshOwnerResumeCache(from doc: [String: Any]) {
         let vortx = doc["vortx"] as? [String: Any]
         let ownedLibrary = (vortx?["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
         guard !ownedLibrary.isEmpty else { return }
         let removed = LibraryTombstones.all()
-        let entries: [(id: String, t: Double, d: Double, v: String?)] = ownedLibrary.compactMap { item in
+        let entries: [(id: String, t: Double, d: Double, v: String?, lastWatched: String?)] = ownedLibrary.compactMap { item in
             guard let id = item["id"] as? String, !id.isEmpty,
                   !removed.contains(LibraryTombstones.normalize(id)) else { return nil }
             return (id: id,
                     t: Double(Self.libSeconds(item["t"])),
                     d: Double(Self.libSeconds(item["d"])),
-                    v: item["v"] as? String)
+                    v: item["v"] as? String,
+                    lastWatched: item["lastWatched"] as? String)
         }
         OwnerResumeStore.merge(entries)
     }

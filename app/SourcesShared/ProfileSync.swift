@@ -13,26 +13,115 @@ import os
 /// Read-only convenience for playback: it never gates library membership and never deletes a title. Entries are
 /// refreshed from the authoritative doc on every cold recovery, so a stale value self-heals on the next sync.
 enum OwnerResumeStore {
-    private static let key = "vortx.owner.resumeCache.v1"
+    private static let keyPrefix = "vortx.owner.resumeCache.v2."
+    private static let receiptKeyPrefix = "vortx.owner.resumeCache.readdReceipt.v2."
+    /// Process-local ownership prevents the previous VortX account's UserDefaults rows from being readable
+    /// during startup, sign-out, or an account transition. The rows themselves remain account-namespaced so
+    /// returning to the same account can still use its own cache after a fresh authoritative refresh.
+    private static var ownerID: String?
+
+    static func bind(ownerID rawOwnerID: String?) {
+        guard let rawOwnerID, let scope = CredentialScope(canonicalRemoteAccountID: rawOwnerID) else {
+            ownerID = nil
+            return
+        }
+        ownerID = scope.keychainOwnerID
+    }
+
+    private static var storageKeys: (cache: String, receipt: String)? {
+        guard let ownerID else { return nil }
+        return (keyPrefix + ownerID, receiptKeyPrefix + ownerID)
+    }
 
     /// A cached resume position: `t`/`d` in whole seconds, `v` = the resume video id (episode) for a series.
     struct Entry { let t: Double; let d: Double; let v: String? }
 
-    /// Merge owner-library resume entries (from `doc.vortx.library`) into the cache. `t`/`d` are in SECONDS.
-    /// Last write wins per id: the caller passes the authoritative doc set, so this tracks the account truth.
-    static func merge(_ entries: [(id: String, t: Double, d: Double, v: String?)]) {
-        guard !entries.isEmpty else { return }
-        var map = (UserDefaults.standard.dictionary(forKey: key)) ?? [:]
+    /// Upsert owner-library resume entries from a pulled document. `t`/`d` are in SECONDS. A library page is
+    /// not a complete snapshot, so omission must never delete another title's cached resume. Explicit library
+    /// tombstones evict removed entries through `evict(libraryIDs:)` instead.
+    static func merge(_ entries: [(id: String, t: Double, d: Double, v: String?, lastWatched: String?)]) {
+        guard !entries.isEmpty, let keys = storageKeys else { return }
+        var map = (UserDefaults.standard.dictionary(forKey: keys.cache)) ?? [:]
+        var receipts = (UserDefaults.standard.dictionary(forKey: keys.receipt)) ?? [:]
         for e in entries where !e.id.isEmpty {
-            map[e.id] = ["t": e.t, "d": e.d, "v": e.v ?? ""]
+            let id = LibraryTombstones.normalize(e.id)
+            guard !id.isEmpty else { continue }
+            if let addedAt = (receipts[id] as? NSNumber)?.doubleValue ?? (receipts[id] as? Double),
+               !(lastWatchedMilliseconds(e.lastWatched) > addedAt) {
+                continue // Legacy/missing/older row cannot prove it post-dates the re-add.
+            }
+            receipts.removeValue(forKey: id)
+            map[id] = ["t": e.t, "d": e.d, "v": e.v ?? ""]
         }
-        UserDefaults.standard.set(map, forKey: key)
+        UserDefaults.standard.set(map, forKey: keys.cache)
+        if receipts.isEmpty { UserDefaults.standard.removeObject(forKey: keys.receipt) }
+        else { UserDefaults.standard.set(receipts, forKey: keys.receipt) }
     }
+
+    /// A removed-to-present transition invalidates prior progress even when its page omits the title. The
+    /// receipt survives that omission and admits a later row only with the engine's causal lastWatched clock.
+    static func recordReadds(_ addedAtByID: [String: Double]) {
+        guard !addedAtByID.isEmpty, let keys = storageKeys else { return }
+        var receipts = (UserDefaults.standard.dictionary(forKey: keys.receipt)) ?? [:]
+        for (rawID, addedAt) in addedAtByID where addedAt.isFinite {
+            let id = LibraryTombstones.normalize(rawID)
+            if !id.isEmpty { receipts[id] = addedAt }
+        }
+        UserDefaults.standard.set(receipts, forKey: keys.receipt)
+    }
+
+    /// Evict cached positions for explicitly tombstoned owner-library ids. Tombstones use normalized identity,
+    /// while the cache preserves the source id for playback, so compare normalized forms rather than assuming
+    /// casing stays identical across a remove and a later document pull.
+    static func evict(libraryIDs: Set<String>, clearingFence: Bool = false) {
+        guard !libraryIDs.isEmpty, let keys = storageKeys else { return }
+        let normalizedIDs = Set(libraryIDs.map(LibraryTombstones.normalize)).subtracting([""])
+        guard !normalizedIDs.isEmpty else { return }
+        if var map = UserDefaults.standard.dictionary(forKey: keys.cache) {
+            let evicted = map.keys.filter { normalizedIDs.contains(LibraryTombstones.normalize($0)) }
+            for id in evicted {
+                map.removeValue(forKey: id)
+            }
+            if !evicted.isEmpty { UserDefaults.standard.set(map, forKey: keys.cache) }
+        }
+        guard clearingFence, var receipts = UserDefaults.standard.dictionary(forKey: keys.receipt) else { return }
+        for id in receipts.keys.filter({ normalizedIDs.contains(LibraryTombstones.normalize($0)) }) {
+            receipts.removeValue(forKey: id)
+        }
+        if receipts.isEmpty { UserDefaults.standard.removeObject(forKey: keys.receipt) }
+        else { UserDefaults.standard.set(receipts, forKey: keys.receipt) }
+    }
+
+    private static func lastWatchedMilliseconds(_ value: String?) -> Double {
+        guard let value, !value.isEmpty else { return 0 }
+        if let date = fractionalISO8601.date(from: value) ?? plainISO8601.date(from: value) {
+            return date.timeIntervalSince1970 * 1000
+        }
+        let base = value.split(separator: ".", maxSplits: 1).first.map(String.init) ?? value
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return (formatter.date(from: base.replacingOccurrences(of: "Z", with: ""))?.timeIntervalSince1970 ?? 0) * 1000
+    }
+
+    private static let fractionalISO8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let plainISO8601: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
 
     /// The cached resume entry for an owner-library id, or nil when the cache has none.
     static func entry(forId id: String) -> Entry? {
-        guard let map = UserDefaults.standard.dictionary(forKey: key),
-              let raw = map[id] as? [String: Any] else { return nil }
+        guard let keys = storageKeys,
+              let map = UserDefaults.standard.dictionary(forKey: keys.cache),
+              let raw = map[LibraryTombstones.normalize(id)] as? [String: Any] else { return nil }
         func seconds(_ v: Any?) -> Double {
             if let d = v as? Double { return d }
             if let n = v as? NSNumber { return n.doubleValue }

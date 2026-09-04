@@ -89,6 +89,7 @@ struct CoreLibState: Decodable {
     let timeOffset: Double
     let duration: Double
     let videoId: String?
+    let lastWatched: String?
     /// Engine watched-bookkeeping. `flaggedWatched` (movies) flips to 1 when a movie is marked/played
     /// to the end; `timesWatched` counts finished plays (movies) or watched episodes (series). Both are
     /// camelCase in the engine's serialization and default to 0 for older/sparser entries that omit them.
@@ -96,7 +97,7 @@ struct CoreLibState: Decodable {
     let timesWatched: Int
 
     enum CodingKeys: String, CodingKey {
-        case timeOffset, duration, videoId = "video_id", flaggedWatched, timesWatched
+        case timeOffset, duration, videoId = "video_id", lastWatched, flaggedWatched, timesWatched
     }
 
     init(from decoder: Decoder) throws {
@@ -104,6 +105,7 @@ struct CoreLibState: Decodable {
         timeOffset = (try c.decodeIfPresent(Double.self, forKey: .timeOffset)) ?? 0
         duration = (try c.decodeIfPresent(Double.self, forKey: .duration)) ?? 0
         videoId = try c.decodeIfPresent(String.self, forKey: .videoId)
+        lastWatched = try c.decodeIfPresent(String.self, forKey: .lastWatched)
         flaggedWatched = (try c.decodeIfPresent(Int.self, forKey: .flaggedWatched)) ?? 0
         timesWatched = (try c.decodeIfPresent(Int.self, forKey: .timesWatched)) ?? 0
     }
@@ -112,11 +114,12 @@ struct CoreLibState: Decodable {
     /// overlay-profile builders in Profiles.swift construct states by hand. The two watched-count fields
     /// default to 0 (the overlay rail does its own finished-movie pruning), so those call sites are
     /// unchanged. `nil` videoId keeps the movie case working.
-    init(timeOffset: Double, duration: Double, videoId: String?,
+    init(timeOffset: Double, duration: Double, videoId: String?, lastWatched: String? = nil,
          flaggedWatched: Int = 0, timesWatched: Int = 0) {
         self.timeOffset = timeOffset
         self.duration = duration
         self.videoId = videoId
+        self.lastWatched = lastWatched
         self.flaggedWatched = flaggedWatched
         self.timesWatched = timesWatched
     }

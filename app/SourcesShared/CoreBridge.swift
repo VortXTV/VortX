@@ -2131,6 +2131,9 @@ final class CoreBridge: ObservableObject {
         // it on peers, so a title removed here can never be resurrected by a peer's union hydrate or the
         // cold-device library recovery (the Continue-Watching resurrection fix).
         LibraryTombstones.tombstone(id)
+        // A removal is authoritative immediately, unlike a possibly paged library response. Evict before the
+        // engine's next library/CW event so its time-zero re-add path cannot synthesize the old episode/offset.
+        OwnerResumeStore.evict(libraryIDs: [LibraryTombstones.normalize(id)])
         dispatchCtx(["action": "RemoveFromLibrary", "args": id])
         // Propagate the removal to your other devices PROMPTLY. A bare background push can be lost if a
         // sideload UPDATE kills the process before the unextended background Task's 2-round-trip push
@@ -2162,6 +2165,7 @@ final class CoreBridge: ObservableObject {
         guard !ids.isEmpty else { return }
         for id in ids {
             LibraryTombstones.tombstone(id)
+            OwnerResumeStore.evict(libraryIDs: [LibraryTombstones.normalize(id)])
             dispatchCtx(["action": "RemoveFromLibrary", "args": id])
         }
         // The engine re-emits continue_watching_preview + library, so the rail empties on its own.
@@ -2397,7 +2401,11 @@ final class CoreBridge: ObservableObject {
         // An explicit add supersedes any prior removal tombstone for this id, so the freshly-added
         // title is not later suppressed by the recovery skip / union subtract and the next push stops
         // carrying the stale removal. Mirrors installAddon's AddonTombstones.forget on a fresh install.
-        if let addedId = meta["id"] as? String { LibraryTombstones.forget(addedId) }
+        if let addedId = meta["id"] as? String {
+            if LibraryTombstones.forget(addedId) {
+                OwnerResumeStore.evict(libraryIDs: [LibraryTombstones.normalize(addedId)], clearingFence: true)
+            }
+        }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
         NSLog("[CoreBridge] AddToLibrary dispatched for %@", (meta["id"] as? String) ?? "?")
     }
@@ -2475,7 +2483,9 @@ final class CoreBridge: ObservableObject {
               LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
                 metaID: metaId, expectedType: expectedType,
                 previewID: preview["id"] as? String, previewType: preview["type"] as? String) else { return false }
-        LibraryTombstones.forget(metaId)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
+        if LibraryTombstones.forget(metaId) {   // only a real removed->present transition resets resume state
+            OwnerResumeStore.evict(libraryIDs: [LibraryTombstones.normalize(metaId)], clearingFence: true)
+        }
         dispatchCtx(["action": "AddToLibrary", "args": preview])
         return true
     }
@@ -2494,7 +2504,9 @@ final class CoreBridge: ObservableObject {
             return
         }
         guard !logoutAccountMutationPending else { return }
-        LibraryTombstones.forget(id)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
+        if LibraryTombstones.forget(id) {
+            OwnerResumeStore.evict(libraryIDs: [LibraryTombstones.normalize(id)], clearingFence: true)
+        }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
     }
 
@@ -2532,7 +2544,11 @@ final class CoreBridge: ObservableObject {
         // stampIntent: false: recovery is a machine re-add of account-owned titles, and stamping an addedAt
         // there could mint a machine timestamp that beats a real removal this device has not folded yet,
         // durably resurrecting a removed title.
-        if stampIntent { LibraryTombstones.forget(id) }
+        if stampIntent {
+            if LibraryTombstones.forget(id) {
+                OwnerResumeStore.evict(libraryIDs: [LibraryTombstones.normalize(id)], clearingFence: true)
+            }
+        }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
         return true
     }
