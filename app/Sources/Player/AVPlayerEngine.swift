@@ -313,6 +313,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// One identity for each source/remux mount. HDR recovery advances the item generation while deliberately
     /// keeping this identity; a source-audio remount or hosted-to-local recovery advances both.
     private var playbackMountIdentity: UInt64 = 0
+    /// The exact loopback HLS master published by the current local remux mount. A CoreMedia -1008 callback
+    /// may replace an item only when it still points at this URL; it must never turn a stale item failure into
+    /// a same-token `loadFile` remount.
+    private var localRemuxPlaylistURL: URL?
     /// The only remount-spanning snapshot. Audio replacement, HDR recovery and host loss update and rebind this
     /// same value, and `loadSelectionGroups` is the one restore/consume point.
     private var pendingPlaybackIntent: PlaybackIntentPolicy.Intent?
@@ -1045,6 +1049,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         #endif
         teardownObservers()
         teardownRemux()
+        localRemuxPlaylistURL = nil
         remuxTimelineOrigin = 0
         // Native-DV criteria loading is asynchronous. Normally retire the old item now so it cannot keep
         // playing behind the new title's preflight. Active/transitioning PiP is the exception: its controller
@@ -1190,6 +1195,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         }
         if let adopted = adoptedPrepared {
             remuxHLSServer = adopted.server
+            localRemuxPlaylistURL = adopted.playlistURL
             newAsset = AVURLAsset(url: adopted.playlistURL)
             let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
             DiagnosticsLog.log(
@@ -1207,6 +1213,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                                                   audioRejectTerms: remuxAudioRejectTerms,
                                                   onStartupTimeout: startupTimeout) {
             remuxHLSServer = mounted.server
+            localRemuxPlaylistURL = mounted.playlistURL
             mounted.server.start()
             newAsset = AVURLAsset(url: mounted.playlistURL)
             let lane = wantsPlainRemux ? "plain-remux" : "dv-remux"
@@ -1837,11 +1844,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private func retryFreshItemOnHealthyMount(reason: String,
                                                claimsPublishedTailRetry: Bool) -> Bool {
         guard (!claimsPublishedTailRetry || !publishedTailItemRecoveryRetried),
+              remuxHLSServer?.isMountHealthy == true || remuxRemoteMount?.isMountHealthy == true,
               let progress = remuxMountProgress,
               progress.initPublished,
               !progress.ended,
               !progress.failed,
               let currentItem = item,
+              player.currentItem === currentItem,
               let playlistURL = (currentItem.asset as? AVURLAsset)?.url,
               let loadToken = activeLoadToken else { return false }
 
@@ -1895,6 +1904,39 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         player.replaceCurrentItem(with: freshItem)
         observe(freshItem, loadToken: loadToken)
         if freshItem.status != .unknown { handleStatus(freshItem, loadToken: loadToken) }
+        return true
+    }
+
+    /// CoreMedia's `-1008` is recoverable only when the exact failed item is still attached to a live local
+    /// HLS producer. This proves an AVPlayer consumer hiccup without restarting the remux. Every other case
+    /// deliberately returns false so the ordinary exact-item terminal/source-hop path owns it.
+    private func retryFreshItemForCoreMediaResourceUnavailable(
+        failedItem: AVPlayerItem,
+        loadToken: PlayerLoadToken
+    ) -> Bool {
+        let failedGeneration = itemGeneration
+        let failedMountIdentity = playbackMountIdentity
+        guard activeLoadToken == loadToken,
+              item === failedItem,
+              player.currentItem === failedItem,
+              remuxHLSServer?.isMountHealthy == true,
+              let progress = remuxMountProgress,
+              progress.initPublished,
+              !progress.ended,
+              !progress.failed,
+              let publishedURL = localRemuxPlaylistURL,
+              let failedURL = (failedItem.asset as? AVURLAsset)?.url,
+              failedURL == publishedURL else {
+            return false
+        }
+        guard retryFreshItemOnHealthyMount(
+            reason: "CoreMedia resource-unavailable",
+            claimsPublishedTailRetry: false),
+              activeLoadToken == loadToken,
+              playbackMountIdentity == failedMountIdentity,
+              itemGeneration == failedGeneration + 1 else {
+            return false
+        }
         return true
     }
 
@@ -3799,18 +3841,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if videoFrameEverProduced,
                ns?.code == NSURLErrorResourceUnavailable,
                underlying.hasPrefix("CoreMediaErrorDomain"),
-               !coreMediaReloadRetried,
-               let failedURL = lastLoadURL {
+               !coreMediaReloadRetried {
                 coreMediaReloadRetried = true
                 let interruptedPosition = player.currentTime().seconds
-                DiagnosticsLog.log("avplayer", "mid-play resource-unavailable over CoreMedia -> ONE same-engine playlist reload at \(Int(interruptedPosition))s")
-                VXProbe.log("avplayer", "CoreMedia -1008 mid-play -> same-engine playlist reload")
-                loadFile(
-                    failedURL, headers: lastLoadHeaders, live: lastLoadLive,
-                    audioSidecar: nil, reusing: loadToken
-                )
-                if interruptedPosition.isFinite, interruptedPosition > 0 { seek(to: interruptedPosition) }
-                return
+                if retryFreshItemForCoreMediaResourceUnavailable(
+                    failedItem: item,
+                    loadToken: loadToken) {
+                    DiagnosticsLog.log("avplayer", "mid-play resource-unavailable over CoreMedia -> ONE proven same-mount item replacement at \(Int(interruptedPosition))s")
+                    VXProbe.log("avplayer", "CoreMedia -1008 mid-play -> same-mount fresh item")
+                    return
+                }
+                DiagnosticsLog.log("avplayer", "mid-play CoreMedia -1008 lacked healthy local-HLS ownership proof -> terminal/source-hop path")
             }
             if recoverAudioReplacementIfNeeded(
                 generation: itemGeneration,

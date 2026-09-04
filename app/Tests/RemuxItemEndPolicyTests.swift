@@ -482,6 +482,68 @@ enum RemuxItemEndPolicyTests {
                     "retryFreshItemOnHealthyMount(",
                 ]))
 
+        let coreMediaRecovery = sourceSection(
+            engine,
+            from: "private func retryFreshItemForCoreMediaResourceUnavailable",
+            to: "private func refreshPendingIntentTransport")
+        let coreMediaFailure = sourceSection(
+            statusFailure,
+            from: "if videoFrameEverProduced,",
+            to: "if recoverAudioReplacementIfNeeded")
+        let coreMediaProofFailure = sourceSection(
+            engine,
+            from: "CoreMedia -1008 lacked healthy local-HLS ownership proof -> terminal/source-hop path",
+            to: "if recoverAudioReplacementIfNeeded")
+        let coreMediaFailureChain = sourceSection(
+            engine,
+            from: "CoreMedia -1008 lacked healthy local-HLS ownership proof -> terminal/source-hop path",
+            to: "finishFailure()")
+        check(
+            "wiring: CoreMedia -1008 consumes its one-shot budget before a current healthy local-HLS replacement",
+            containsInOrder(coreMediaFailure, [
+                "!coreMediaReloadRetried",
+                "coreMediaReloadRetried = true",
+                "retryFreshItemForCoreMediaResourceUnavailable(",
+            ]))
+        check(
+            "wiring: CoreMedia -1008 replacement requires current local-HLS proof and the transitive callee cannot remount",
+            containsInOrder(coreMediaRecovery, [
+                "activeLoadToken == loadToken",
+                "item === failedItem",
+                "player.currentItem === failedItem",
+                "remuxHLSServer?.isMountHealthy == true",
+                "progress.initPublished",
+                "!progress.ended",
+                "!progress.failed",
+                "let publishedURL = localRemuxPlaylistURL",
+                "failedURL == publishedURL",
+                "retryFreshItemOnHealthyMount(",
+                "playbackMountIdentity == failedMountIdentity",
+                "itemGeneration == failedGeneration + 1",
+            ])
+                && coreMediaRecovery?.contains("loadFile(") == false
+                && coreMediaRecovery?.contains("teardownRemux(") == false
+                && tailRecovery?.contains("loadFile(") == false
+                && tailRecovery?.contains("teardownRemux(") == false
+                && tailRecovery?.contains("remuxHLSServer?.invalidate()") == false
+                && tailRecovery?.contains("remuxRemoteMount?.invalidate()") == false)
+        check(
+            "wiring: a CoreMedia -1008 without ownership proof falls through the existing bounded audio-HDR-terminal chain",
+            containsInOrder(coreMediaFailure, [
+                "retryFreshItemForCoreMediaResourceUnavailable(",
+                "CoreMedia -1008 lacked healthy local-HLS ownership proof -> terminal/source-hop path",
+            ])
+                && coreMediaFailure?.contains("loadFile(") == false
+                && coreMediaProofFailure?.contains("return") == false
+                && containsInOrder(coreMediaFailureChain, [
+                    "if recoverAudioReplacementIfNeeded(",
+                    "let finishFailure:",
+                    "if retryFreshHDRItemOnHealthyMount(",
+                ])
+                && engine?.contains("if retryFreshHDRItemOnHealthyMount(\n                error: ns,\n                onUnavailable: finishFailure) {\n                return\n            }\n            finishFailure()") == true
+                && engine?.contains("localRemuxPlaylistURL = mounted.playlistURL") == true
+                && engine?.contains("localRemuxPlaylistURL = adopted.playlistURL") == true)
+
         print("")
         if failures == 0 {
             print("ALL PASS")
