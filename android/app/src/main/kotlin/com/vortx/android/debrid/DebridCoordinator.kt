@@ -69,7 +69,7 @@ internal class DebridCoordinator(
         pair.first,
         pair.second,
         context,
-        context?.let { UsenetProviderStore(it) },
+        context?.let { UsenetProviderStore(it, pair.second::ownerToken) },
     )
 
     private fun nativeResolver(credentials: UsenetProviderCredentials): UsenetLocalResolver {
@@ -150,7 +150,10 @@ internal class DebridCoordinator(
     /// True when a usenet resolve is possible: a TorBox key OR the user's own NNTP provider is configured.
     /// With neither, every usenet path is inert (fail-soft), mirroring Apple's availability gate.
     val hasUsenetResolver: Boolean
-        get() = keys.isConfigured(DebridService.TOR_BOX) || (usenetProviderStore?.isConfigured() == true)
+        get() {
+            val owner = keys.ownerToken() ?: return false
+            return keys.isConfigured(DebridService.TOR_BOX, owner) || usenetProviderStore?.isConfigured(owner) == true
+        }
 
     // ------------------------------------------------------------------------------------------------
     // Cache-check (concurrent fan-out)
@@ -360,7 +363,7 @@ internal class DebridCoordinator(
                 }
 
                 // 2. Native NNTP provider as the fallback (own usenet account, no TorBox needed).
-                val credentials = usenetProviderStore?.load()
+                val credentials = usenetProviderStore?.load(owner)
                 if (credentials != null) {
                     try {
                         val result = nativeResolver(credentials).resolve(

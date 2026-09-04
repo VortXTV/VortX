@@ -1,6 +1,7 @@
 package com.vortx.android.usenet
 
 import android.content.Context
+import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.security.FailClosedCredentialStore
 import org.json.JSONObject
 
@@ -12,7 +13,10 @@ import org.json.JSONObject
 /// The credentials are JSON-encoded into a SINGLE encrypted entry keyed by the current owner scope so a
 /// different account signing in on the same device can never inherit the previous account's password
 /// (the same owner-scoping rule as [DebridKeys]).
-internal class UsenetProviderStore(context: Context) {
+internal class UsenetProviderStore(
+    context: Context,
+    private val currentOwner: () -> DebridOwnerToken?,
+) {
 
     private val store = FailClosedCredentialStore(
         context = context,
@@ -22,8 +26,11 @@ internal class UsenetProviderStore(context: Context) {
     )
 
     /// Load and decode the current owner's credentials; nil when none are set or a value is malformed.
-    fun load(): UsenetProviderCredentials? {
-        val json = store.string(storageKey) ?: return null
+    fun load(owner: DebridOwnerToken? = currentOwner()): UsenetProviderCredentials? {
+        owner ?: return null
+        if (currentOwner() != owner) return null
+        val json = store.string(storageKey(owner)) ?: return null
+        if (currentOwner() != owner) return null
         return try {
             UsenetProviderCredentials.fromJson(JSONObject(json))?.takeIf { it.isValid }
         } catch (_: Exception) {
@@ -32,20 +39,26 @@ internal class UsenetProviderStore(context: Context) {
     }
 
     /// True when a valid provider is configured for the current owner scope.
-    fun isConfigured(): Boolean = load() != null
+    fun isConfigured(owner: DebridOwnerToken? = currentOwner()): Boolean = load(owner) != null
 
     /// Persist credentials. Returns false on an invalid value or a write failure.
-    fun save(credentials: UsenetProviderCredentials): Boolean {
+    fun save(credentials: UsenetProviderCredentials, owner: DebridOwnerToken? = currentOwner()): Boolean {
+        owner ?: return false
         if (!credentials.isValid) return false
-        return store.set(mapOf(storageKey to credentials.toJson().toString()))
+        if (currentOwner() != owner) return false
+        val saved = store.set(mapOf(storageKey(owner) to credentials.toJson().toString()))
+        return saved && currentOwner() == owner
     }
 
     /// Remove the current owner's credentials.
-    fun clear(): Boolean = store.clear(storageKey)
+    fun clear(owner: DebridOwnerToken? = currentOwner()): Boolean {
+        owner ?: return false
+        if (currentOwner() != owner) return false
+        val cleared = store.clear(storageKey(owner))
+        return cleared && currentOwner() == owner
+    }
 
-    private val storageKey: String get() = "${PREFIX}${ownerScope()}"
-
-    private fun ownerScope(): String = "current" // owner scoping is wired in a later lane; kept minimal now
+    private fun storageKey(owner: DebridOwnerToken): String = "${PREFIX}${owner.scope.storageSuffix}"
 
     companion object {
         const val TAG = "UsenetProviderStore"

@@ -22,29 +22,21 @@ internal data class UsenetProviderCredentials(
             username.isNotEmpty() &&
             password.isNotEmpty() &&
             port in 1..65535 &&
-            maxConnections in 1..100
+            maxConnections in 1..100 &&
+            useSSL
 
-    /// The `nntp(s)://user:pass@host:port/connections` server URL the NNTP client parses. The user and
-    /// pass are percent-encoded down to alphanumerics so no `:` `@` `/` survives inside a segment; the
-    /// connection count rides the final path segment exactly like the Apple nntpServerURL.
-    val nntpServerURL: String
+    /// A display-safe endpoint. Credentials must never be materialized into a URL because URLs regularly
+    /// escape through diagnostics, exceptions, and library `toString` implementations.
+    val nntpEndpoint: String
         get() {
             val scheme = if (useSSL) "nntps" else "nntp"
-            val user = encodeComponent(username)
-            val pass = encodeComponent(password)
             val cleanHost = host.trim()
             val boundedPort = port.coerceIn(1, 65535)
             val boundedConns = maxConnections.coerceIn(1, 100)
-            return "$scheme://$user:$pass@$cleanHost:$boundedPort/$boundedConns"
+            return "$scheme://$cleanHost:$boundedPort/$boundedConns"
         }
 
-    private fun encodeComponent(value: String): String =
-        value.map { char ->
-            when {
-                char.isLetterOrDigit() -> char.toString()
-                else -> "%" + "%02X".format(char.code)
-            }
-        }.joinToString("")
+    override fun toString(): String = "UsenetProviderCredentials(host=${host.trim()}, port=$port, username=<redacted>, password=<redacted>, maxConnections=$maxConnections, useSSL=$useSSL)"
 
     fun toJson(): org.json.JSONObject =
         org.json.JSONObject().put("host", host)

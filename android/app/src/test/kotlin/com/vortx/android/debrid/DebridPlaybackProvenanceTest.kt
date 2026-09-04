@@ -21,6 +21,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 class DebridPlaybackProvenanceTest {
 
@@ -97,7 +98,7 @@ class DebridPlaybackProvenanceTest {
     @Test
     fun usenetResolveErrorsDescribeTheUsenetFailure() {
         assertEquals(
-            "Usenet playback needs a TorBox debrid key.",
+            "Usenet playback needs a TorBox debrid key or configured native NNTP provider.",
             usenetPlaybackFailure(DebridResolver.DebridException.NoKey).message,
         )
         assertEquals(
@@ -108,6 +109,35 @@ class DebridPlaybackProvenanceTest {
             "This Usenet source is still preparing in TorBox.",
             usenetPlaybackFailure(DebridResolver.DebridException.NotReady).message,
         )
+    }
+
+    @Test
+    fun normalUsenetPlaybackUsesCoordinatorNativeFallbackInsteadOfTorBoxOnlyResolver() {
+        val repository = source("src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt")
+        val usenetBranch = repository.substringAfter("if (source.isUsenet) {")
+            .substringBefore("} else if (!source.isTorrent")
+
+        assertTrue(usenetBranch.contains("debridCoordinator.resolvePlaybackRef("))
+        assertTrue(usenetBranch.contains("DebridCoordinator.DebridCandidate("))
+        assertFalse(usenetBranch.contains("debridResolver.resolveUsenet("))
+        assertTrue(usenetBranch.contains("?: throw usenetPlaybackFailure(DebridResolver.DebridException.NoKey)"))
+        assertTrue(repository.contains("appContext = appContext"))
+        assertTrue(repository.contains("usenetProviderStore = UsenetProviderStore(appContext)"))
+        assertFalse(repository.contains("DebridResolver(DebridKeys(appContext))"))
+    }
+
+    @Test
+    fun coordinatorKeepsTorBoxPrecedenceThenNativeFallbackAndDoesNotSwallowCancellation() {
+        val coordinator = source("src/main/kotlin/com/vortx/android/debrid/DebridCoordinator.kt")
+        val usenetBranch = coordinator.substringAfter("// USENET first:")
+            .substringBefore("// Raw torrent only:")
+
+        val torBox = usenetBranch.indexOf("keys.isConfigured(DebridService.TOR_BOX, owner)")
+        val native = usenetBranch.indexOf("usenetProviderStore?.load()")
+        assertTrue("TorBox must be attempted before the native provider", torBox >= 0 && torBox < native)
+        assertTrue(usenetBranch.contains("catch (cancel: CancellationException) {\n                        throw cancel"))
+        assertTrue(usenetBranch.contains("if (!keys.isCurrent(owner)) return@withTimeoutOrNull null"))
+        assertTrue(usenetBranch.contains("isNativeFile = true"))
     }
 
     @Test
@@ -457,5 +487,15 @@ class DebridPlaybackProvenanceTest {
             claim = LegacyOwnerReservation.Claimed(owner)
             return true
         }
+    }
+
+    private fun source(relativePath: String): String {
+        val candidates = listOf(
+            File(relativePath),
+            File("app/$relativePath"),
+            File("android/app/$relativePath"),
+        )
+        return candidates.firstOrNull(File::isFile)?.readText()
+            ?: error("Could not locate $relativePath from ${File(".").absolutePath}")
     }
 }

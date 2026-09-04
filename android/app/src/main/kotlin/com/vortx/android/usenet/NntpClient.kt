@@ -9,6 +9,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.SSLParameters
 
 /// A minimal, synchronous NNTP client over a single connection. The resolve runs the bounded
 /// [maxConnections] window on [kotlinx.coroutines.Dispatchers.IO]; this class is the raw protocol
@@ -33,6 +34,7 @@ internal class NntpClient(
         require(it.isNotEmpty()) { "NNTP host cannot be empty" }
         InetSocketAddress(it, port.coerceIn(1, 65535))
     }
+    private val originalHost = host.trim()
 
     private var socket: Socket? = null
     private var reader: BufferedReader? = null
@@ -50,10 +52,15 @@ internal class NntpClient(
             throw error
         }
 
+        if (!useSSL) {
+            baseSocket.close()
+            throw IOException("NNTP credentials require TLS")
+        }
         val chosen = if (useSSL) {
             val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-            val ssl = factory.createSocket(baseSocket, address.hostName, address.port, true) as SSLSocket
+            val ssl = factory.createSocket(baseSocket, originalHost, address.port, true) as SSLSocket
             ssl.soTimeout = timeoutMs
+            ssl.sslParameters = SSLParameters().also { it.endpointIdentificationAlgorithm = "HTTPS" }
             ssl.startHandshake()
             ssl
         } else {

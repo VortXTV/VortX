@@ -16,8 +16,10 @@ import com.vortx.android.data.HomeUpdate
 import com.vortx.android.data.PlaybackSessionToken
 import com.vortx.android.data.StreamLoadUpdate
 import com.vortx.android.model.AddonOrder
+import com.vortx.android.debrid.DebridCoordinator
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridResolver
+import com.vortx.android.usenet.UsenetProviderStore
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.CoreLocalSearchState
@@ -279,7 +281,7 @@ private fun isHttpPlaybackUrl(value: String): Boolean =
 
 internal fun usenetPlaybackFailure(error: Throwable): Throwable = when (error) {
     DebridResolver.DebridException.NoKey ->
-        UnsupportedOperationException("Usenet playback needs a TorBox debrid key.", error)
+        UnsupportedOperationException("Usenet playback needs a TorBox debrid key or configured native NNTP provider.", error)
     DebridResolver.DebridException.InvalidKey ->
         IllegalStateException("TorBox rejected the configured debrid key.", error)
     DebridResolver.DebridException.NoMatchingFile ->
@@ -782,7 +784,20 @@ class EngineStremioRepository(
     /// through the user's own debrid account (keys in EncryptedSharedPreferences). Built lazily so no
     /// key store is opened until a torrent is actually resolved; with no key configured it is a no-op
     /// and torrents keep today's behavior (a clear error the player layer surfaces).
-    private val debridResolver by lazy { DebridResolver(DebridKeys(appContext)) }
+    private val debridKeys by lazy { DebridKeys(appContext) }
+    private val debridResolver by lazy { DebridResolver(debridKeys) }
+
+    /// The normal source-resolve path shares the torrent resolver/key snapshot while supplying an
+    /// application context for the native NNTP fallback. The coordinator owns the TorBox-first,
+    /// native-provider-second policy so this repository does not maintain a second resolver ladder.
+    private val debridCoordinator by lazy {
+        DebridCoordinator(
+            resolver = debridResolver,
+            keys = debridKeys,
+            appContext = appContext,
+            usenetProviderStore = UsenetProviderStore(appContext, debridKeys::ownerToken),
+        )
+    }
 
     /// The Keystore-backed "who was last signed in" display cache (ANDROID-PLAN.md §0 invariant #5);
     /// the engine's own persisted `ctx.profile.auth` remains the actual source of truth, see
@@ -2254,19 +2269,17 @@ class EngineStremioRepository(
         val isAtmos = StreamRanking.isAtmos(source)
         if (source.isUsenet) {
             val target = source.usenetResolveTarget(episode)
-            val resolved = try {
-                debridResolver.resolveUsenet(
+            val resolved = debridCoordinator.resolvePlaybackRef(
+                candidate = DebridCoordinator.DebridCandidate(
                     nzbUrl = target.nzbUrl,
-                    knownHash = target.knownHash,
+                    usenetKnownHash = target.knownHash,
                     fileMustInclude = target.fileMustInclude,
                     fileIdx = target.fileIdx,
-                    episode = target.episode,
-                )
-            } catch (error: Throwable) {
-                throw usenetPlaybackFailure(error)
-            }
+                ),
+                episode = target.episode,
+            ) ?: throw usenetPlaybackFailure(DebridResolver.DebridException.NoKey)
             Playable(
-                url = resolved,
+                url = resolved.url,
                 title = source.title,
                 viaStreamingServer = false,
                 isTorrent = false,
