@@ -22,6 +22,10 @@ This Apple-only beta carries the playback, subtitle, navigation, library, and Ma
 
 **Pausing no longer invites an unwanted recovery or episode change.** A paused item stays paused while delayed playback and end notifications settle, and the selected playback intent remains attached to the current session. Apple TV, iPhone, iPad, and Mac.
 
+**VortX Player can resume after its long-pause cache cleanup.** The old cleanup could empty a fully downloaded buffer, then let Play turn that empty buffer into a real end-of-file. The app hid that event, leaving a frozen picture and a player that could no longer seek. Cache clearing and the position-preserving recovery seek now run as one player command, retaining the user's pause state without leaving a gap for that false ending. The same correction covers memory-pressure cleanup during playback. Apple TV, iPhone, and iPad.
+
+**Your seek takes precedence over an old resume request.** Seeking backward, forward, or to a chosen position cancels the superseded Continue Watching resume work, including its delayed watchdog and system media-control paths. A prior refill watchdog cannot keep seeking to an old target or issue recovery seeks while manually paused. Apple platforms, with the refill watchdog correction on Apple TV.
+
 **Continue Watching resumes the title you selected.** Episode handoff and library state stay tied to the loaded title and account, including after a profile transition or a delayed refresh. Apple platforms.
 
 **A failed resume seek does not leave a false playback position behind.** Resume state is reconciled with the active player, a successful seek cancels its old watchdog, and a failed seek retains the guard against overwriting saved progress with an unintended start position. Continue Watching also hands the selected episode and current saved progress to the player instead of reusing an older cached position. Apple platforms.
