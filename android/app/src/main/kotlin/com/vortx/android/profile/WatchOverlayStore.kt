@@ -163,22 +163,41 @@ class WatchOverlayStore(
         poster: String?,
     ) {
         if (!overlayActive() || videoIds.isEmpty()) return
-        val prev = watch[metaId] ?: WatchEntry(lastWatched = isoNow(), name = name, type = type, poster = poster)
+        val prev = watch[metaId] ?: WatchEntry(name = name, type = type, poster = poster)
         val ids = prev.watchedVideoIds.toMutableList()
         if (isWatched) {
             for (id in videoIds) if (!ids.contains(id)) ids.add(id)
         } else {
             ids.removeAll(videoIds.toSet())
         }
-        mutate(metaId, prev.copy(watchedVideoIds = ids))
+        if (ids.toSet() == prev.watchedVideoIds.toSet()) return
+        mutate(
+            metaId,
+            prev.copy(
+                lastWatched = isoNow(),
+                name = name.ifEmpty { prev.name },
+                type = type.ifEmpty { prev.type },
+                poster = poster ?: prev.poster,
+                watchedVideoIds = ids,
+            ),
+        )
     }
 
     /** Mark a single video watched. Mirrors Apple `markWatched`. */
     fun markWatched(metaId: String, videoId: String, name: String, type: String, poster: String?) {
         if (!overlayActive()) return
-        val prev = watch[metaId] ?: WatchEntry(videoId = videoId, lastWatched = isoNow(), name = name, type = type, poster = poster)
+        val prev = watch[metaId] ?: WatchEntry(videoId = videoId, name = name, type = type, poster = poster)
         if (prev.watchedVideoIds.contains(videoId)) return
-        mutate(metaId, prev.copy(watchedVideoIds = prev.watchedVideoIds + videoId))
+        mutate(
+            metaId,
+            prev.copy(
+                lastWatched = isoNow(),
+                name = name.ifEmpty { prev.name },
+                type = type.ifEmpty { prev.type },
+                poster = poster ?: prev.poster,
+                watchedVideoIds = prev.watchedVideoIds + videoId,
+            ),
+        )
     }
 
     /**

@@ -4,9 +4,56 @@ import android.content.SharedPreferences
 import java.lang.reflect.Proxy
 import kotlinx.coroutines.test.TestScope
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Test
 
 class WatchOverlayStoreContinueWatchingTest {
+    @Test
+    fun watchedMutationRefreshesExistingRowClockButAnUnchangedMarkDoesNotChurnIt() {
+        val prefs = preferences()
+        val profileId = "overlay"
+        val key = WatchOverlayStore.cacheKey(UserProfile.normalizeId(profileId))
+        prefs.edit().putString(
+            key,
+            WatchEntry.encodeMap(
+                mapOf(
+                    "tt1" to WatchEntry(
+                        lastWatched = "2020-01-01T00:00:00.000Z",
+                        name = "Old title",
+                        type = "movie",
+                        watchedVideoIds = listOf("old-video"),
+                    ),
+                ),
+            ),
+        ).commit()
+
+        val store = WatchOverlayStore(prefs, scope = TestScope())
+        store.activate(profileId, usesEngineHistory = false)
+        store.markWatched("tt1", "new-video", "Fresh title", "movie", "fresh-poster")
+        val changed = WatchEntry.decodeMap(prefs.getString(key, null)!!)?.get("tt1")!!
+        assertNotEquals("2020-01-01T00:00:00.000Z", changed.lastWatched)
+        assertEquals("Fresh title", changed.name)
+        assertEquals("fresh-poster", changed.poster)
+
+        store.markWatched("tt1", "new-video", "Ignored title", "movie", "ignored-poster")
+        val unchanged = WatchEntry.decodeMap(prefs.getString(key, null)!!)?.get("tt1")!!
+        assertEquals(changed.lastWatched, unchanged.lastWatched)
+        assertEquals(changed.name, unchanged.name)
+        assertEquals(changed.poster, unchanged.poster)
+
+        store.setWatched(false, "tt1", listOf("old-video"), "", "", null)
+        val unmarked = WatchEntry.decodeMap(prefs.getString(key, null)!!)?.get("tt1")!!
+        assertEquals("Fresh title", unmarked.name)
+        assertEquals("movie", unmarked.type)
+        assertEquals("fresh-poster", unmarked.poster)
+
+        store.markWatched("tt1", "later-video", "", "", null)
+        val completionMarked = WatchEntry.decodeMap(prefs.getString(key, null)!!)?.get("tt1")!!
+        assertEquals("Fresh title", completionMarked.name)
+        assertEquals("movie", completionMarked.type)
+        assertEquals("fresh-poster", completionMarked.poster)
+    }
+
     @Test
     fun aliasBridgeUsesSourceOrderForBadClocksAndAcceptsNewerRewatch() {
         val prefs = preferences()

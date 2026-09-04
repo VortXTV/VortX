@@ -1525,10 +1525,19 @@ final class ProfileStore: ObservableObject {
     /// Apply a player callback to the profile that started playback. The normal public methods below
     /// intentionally use the active in-memory overlay; player callbacks cannot, because a profile switch
     /// may happen while an AV/mpv callback or account request is still in flight.
-    private func mutateOverlayWatch(profileID: UUID, _ body: (inout [String: WatchEntry]) -> Void) {
+    private func mutateOverlayWatch(
+        profileID: UUID,
+        clearingRemovalForExplicitAdd metaID: String? = nil,
+        _ body: (inout [String: WatchEntry]) -> Void
+    ) {
         guard let profile = profiles.first(where: { $0.id == profileID }), !profile.usesEngineHistory else { return }
         if activeID == profileID {
+            let before = watch
             body(&watch)
+            let tombstoneChanged = metaID.map {
+                clearWatchRemovalForExplicitAdd(metaID: $0, profileID: profileID, entries: watch)
+            } ?? false
+            guard watch != before || tombstoneChanged else { return }
             reconcileWatchRemovals(profileID: profileID, entries: &watch)
             saveWatchCache()
             schedulePushWatch()
@@ -1538,6 +1547,10 @@ final class ProfileStore: ObservableObject {
             from: UserDefaults.standard.data(forKey: Self.watchCacheKey(profileID)), as: WatchEntry.self)
         var entries = initialEntries
         body(&entries)
+        let tombstoneChanged = metaID.map {
+            clearWatchRemovalForExplicitAdd(metaID: $0, profileID: profileID, entries: entries)
+        } ?? false
+        guard entries != initialEntries || tombstoneChanged else { return }
         reconcileWatchRemovals(profileID: profileID, entries: &entries)
         guard let encoded = try? JSONEncoder().encode(entries) else { return }
         UserDefaults.standard.set(encoded, forKey: Self.watchCacheKey(profileID))
@@ -1586,38 +1599,41 @@ final class ProfileStore: ObservableObject {
     /// menus on overlay profiles. Engine profiles never come through here.
     func setWatched(_ isWatched: Bool, metaId: String, videoIds: [String],
                     name: String, type: String, poster: String?) {
-        guard !videoIds.isEmpty else { return }
-        var entry = watch[metaId] ?? WatchEntry(
-            videoId: nil, timeOffsetMs: 0, durationMs: 0, lastWatched: Self.isoNow(),
-            name: name, type: type, poster: poster)
-        if isWatched {
-            for id in videoIds where !entry.watchedVideoIds.contains(id) {
-                entry.watchedVideoIds.append(id)
+        guard !videoIds.isEmpty, let profileID = activeID else { return }
+        mutateOverlayWatch(profileID: profileID) { entries in
+            var entry = entries[metaId] ?? WatchEntry(
+                videoId: nil, timeOffsetMs: 0, durationMs: 0, lastWatched: "",
+                name: name, type: type, poster: poster)
+            let previous = Set(entry.watchedVideoIds)
+            if isWatched {
+                for id in videoIds where !entry.watchedVideoIds.contains(id) { entry.watchedVideoIds.append(id) }
             }
-        } else {
-            entry.watchedVideoIds.removeAll { videoIds.contains($0) }
+            else { entry.watchedVideoIds.removeAll { videoIds.contains($0) } }
+            guard Set(entry.watchedVideoIds) != previous else { return }
+            entry.lastWatched = Self.isoNow()
+            if !name.isEmpty { entry.name = name }
+            if !type.isEmpty { entry.type = type }
+            entry.poster = poster ?? entry.poster
+            entries[metaId] = entry
         }
-        watch[metaId] = entry
-        saveWatchCache()
-        schedulePushWatch()
     }
 
     func markWatched(meta: PlaybackMeta) {
-        var entry = watch[meta.libraryId] ?? WatchEntry(
-            videoId: meta.videoId, timeOffsetMs: 0, durationMs: 0, lastWatched: Self.isoNow(),
-            name: meta.name, type: meta.type, poster: meta.poster)
-        if !entry.watchedVideoIds.contains(meta.videoId) { entry.watchedVideoIds.append(meta.videoId) }
-        watch[meta.libraryId] = entry
-        saveWatchCache()
-        schedulePushWatch()
+        guard let profileID = activeID else { return }
+        markWatched(meta: meta, profileID: profileID)
     }
 
     func markWatched(meta: PlaybackMeta, profileID: UUID) {
         mutateOverlayWatch(profileID: profileID) { entries in
             var entry = entries[meta.libraryId] ?? WatchEntry(
-                videoId: meta.videoId, timeOffsetMs: 0, durationMs: 0, lastWatched: Self.isoNow(),
+                videoId: meta.videoId, timeOffsetMs: 0, durationMs: 0, lastWatched: "",
                 name: meta.name, type: meta.type, poster: meta.poster)
-            if !entry.watchedVideoIds.contains(meta.videoId) { entry.watchedVideoIds.append(meta.videoId) }
+            guard !entry.watchedVideoIds.contains(meta.videoId) else { return }
+            entry.watchedVideoIds.append(meta.videoId)
+            entry.lastWatched = Self.isoNow()
+            entry.name = meta.name
+            entry.type = meta.type
+            entry.poster = meta.poster ?? entry.poster
             entries[meta.libraryId] = entry
         }
     }
@@ -1627,15 +1643,12 @@ final class ProfileStore: ObservableObject {
     /// cwItems correctly skips it (no progress, no watched episodes) until it is actually played.
     /// A no-op when the title is already tracked, so an add never clobbers existing progress.
     func addLibraryEntry(metaId: String, name: String, type: String, poster: String?) {
-        guard watch[metaId] == nil else { return }
-        watch[metaId] = WatchEntry(videoId: nil, timeOffsetMs: 0, durationMs: 0,
-                                   lastWatched: Self.isoNow(), name: name, type: type, poster: poster)
-        saveWatchCache()
-        schedulePushWatch()
+        guard let profileID = activeID else { return }
+        addLibraryEntry(metaId: metaId, name: name, type: type, poster: poster, profileID: profileID)
     }
 
     func addLibraryEntry(metaId: String, name: String, type: String, poster: String?, profileID: UUID) {
-        mutateOverlayWatch(profileID: profileID) { entries in
+        mutateOverlayWatch(profileID: profileID, clearingRemovalForExplicitAdd: metaId) { entries in
             guard entries[metaId] == nil else { return }
             entries[metaId] = WatchEntry(videoId: nil, timeOffsetMs: 0, durationMs: 0,
                                          lastWatched: Self.isoNow(), name: name, type: type, poster: poster)
@@ -1894,6 +1907,27 @@ final class ProfileStore: ObservableObject {
         } else if let data = try? JSONEncoder().encode(Array(removals.prefix(120))) {
             UserDefaults.standard.set(data, forKey: Self.watchRemovalKey(profileID))
         }
+    }
+
+    /// A local Add-to-Library action is explicit user intent to restore this title, even before it
+    /// has playable progress. It therefore retracts only the matching dismissal tombstone before
+    /// ordinary reconciliation runs. Incoming rows do not use this path and still need newer valid
+    /// progress to beat a tombstone in `OverlayWatchRemovalPolicy.resolve`.
+    @discardableResult
+    private func clearWatchRemovalForExplicitAdd(
+        metaID: String,
+        profileID: UUID,
+        entries: [String: WatchEntry]
+    ) -> Bool {
+        guard let entry = entries[metaID] else { return false }
+        let keys = OverlayWatchRemovalPolicy.componentKeys(
+            seedID: metaID, seed: entry, entries: entries, identity: Self.watchIdentity
+        )
+        let existing = watchRemovals(for: profileID)
+        let retained = existing.filter { Set($0.keys).isDisjoint(with: keys) }
+        guard retained.count != existing.count else { return false }
+        saveWatchRemovals(retained, for: profileID)
+        return true
     }
 
     private func reconcileWatchRemovals(profileID: UUID?, entries: inout [String: WatchEntry]) {

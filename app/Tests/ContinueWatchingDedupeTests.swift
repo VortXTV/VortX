@@ -120,6 +120,41 @@ private enum ContinueWatchingDedupeTests {
         expect(newerMerge.entries == newerPeer && newerMerge.removals.isEmpty,
                "strictly newer valid rewatch restores the overlay and clears its tombstone")
 
+        // An explicit local Add-to-Library is different from a stale sync row: it intentionally
+        // re-adds a zero-progress entry and retracts the matching local dismissal tombstone before
+        // the normal (progress-gated) resolver gets to inspect it.
+        let explicitAdd = [
+            "tmdb:1396": OverlayRow(type: "series", alias: "tt0903747:5:16", freshness: 201, valid: false)
+        ]
+        let explicitAddKeys = OverlayWatchRemovalPolicy.componentKeys(
+            seedID: "tmdb:1396", seed: explicitAdd["tmdb:1396"]!, entries: explicitAdd, identity: overlayIdentity
+        )
+        let retracted = dismissed.removals.filter { Set($0.keys).isDisjoint(with: explicitAddKeys) }
+        let restored = OverlayWatchRemovalPolicy.resolve(
+            entries: explicitAdd, removals: retracted, identity: overlayIdentity
+        )
+        expect(restored.entries == explicitAdd && restored.removals.isEmpty,
+               "explicit zero-progress add retracts its dismissal tombstone and survives reload")
+
+        let unrelatedRemoval = OverlayWatchRemoval(keys: ["title:unrelated"], removedAt: 300)
+        let selectivelyRetracted = (dismissed.removals + [unrelatedRemoval]).filter {
+            Set($0.keys).isDisjoint(with: explicitAddKeys)
+        }
+        let selectivelyRestored = OverlayWatchRemovalPolicy.resolve(
+            entries: explicitAdd, removals: selectivelyRetracted, identity: overlayIdentity
+        )
+        expect(selectivelyRestored.entries == explicitAdd && selectivelyRestored.removals == [unrelatedRemoval],
+               "explicit add clears only its matching dismissal tombstone")
+
+        let newerButInvalid = [
+            "imdb:tt0903747": OverlayRow(type: "series", alias: "tt0903747:5:18", freshness: 999, valid: false)
+        ]
+        let invalidMerge = OverlayWatchRemovalPolicy.resolve(
+            entries: newerButInvalid, removals: dismissed.removals, identity: overlayIdentity
+        )
+        expect(invalidMerge.entries.isEmpty && invalidMerge.removals == dismissed.removals,
+               "newer remote row without valid progress cannot resurrect a dismissal")
+
         let largeRemoval = OverlayWatchRemoval(keys: removedKeys.sorted(), removedAt: 1_000)
         let decoys = (0..<130).map { index in
             OverlayWatchInboundPolicy.Row(
