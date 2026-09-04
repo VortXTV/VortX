@@ -572,6 +572,46 @@ struct ConsumerResult {
     var remuxFailed = false
 }
 
+/// Direct regression coverage for the atomic subtitle cohort admission path. This intentionally uses the
+/// production stream and spool, then repeats the exact same settled cohort so a second read must be a no-op.
+func subtitleBackingRepeatScenario() {
+    let input = URL(fileURLWithPath: "\(fixtureDir)/fixture-multiaudio.mkv").absoluteString
+    let stream = VortXMKVRemuxStream(input: input, headers: nil, indexForHLS: true, mode: .plain)
+    defer { stream.cancel(); stream.listenerDidRetire() }
+    stream.start()
+    let deadline = Date().addingTimeInterval(20)
+    var snapshot: VortXMKVRemuxStream.HLSWindowSnapshot?
+    while Date() < deadline {
+        let candidate = stream.hlsWindowSnapshot()
+        if candidate.subtitleWindow != nil,
+           !candidate.subtitleRenditions.isEmpty,
+           candidate.subtitleCues.contains(where: { !$0.isEmpty }) {
+            snapshot = candidate
+            break
+        }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+    guard let snapshot,
+          let window = snapshot.subtitleWindow,
+          let rendition = snapshot.subtitleRenditions.first,
+          rendition.id < snapshot.subtitleCues.count else {
+        check("subtitle backing repeat: settled cohort exists", red: true, detail: "no settled subtitle window")
+        return
+    }
+    let outcome1 = stream.ensureSubtitleBackings(
+        window: window, renditions: [(id: rendition.id, cues: snapshot.subtitleCues[rendition.id])])
+    let outcome2 = stream.ensureSubtitleBackings(
+        window: window, renditions: [(id: rendition.id, cues: snapshot.subtitleCues[rendition.id])])
+    let keys = window.segments.map { VortXHLSSessionSpool.ResourceKey.subtitle(
+        renditionID: rendition.id, segmentID: $0.id) }
+    check("subtitle backing repeat: first cohort ready", red: outcome1 != .ready, detail: "outcome=\(outcome1)")
+    check("subtitle backing repeat: second cohort ready", red: outcome2 != .ready, detail: "outcome=\(outcome2)")
+    check("subtitle backing repeat: every backing remains openable",
+          red: !keys.allSatisfy(stream.hasHLSResource), detail: "resources=\(keys.count)")
+    check("subtitle backing repeat: no subtitle failure", red: snapshot.subtitleFailureReason != nil,
+          detail: "failure=\(String(describing: snapshot.subtitleFailureReason))")
+}
+
 /// Serve the fixture over the conformance range server at a PACED byte rate, so the producer and the player
 /// race the way they do against a real debrid link. Unpaced local input makes production instant, the live
 /// playlist covers the whole file before AVPlayer's first fetch, and the client starts at the live edge -
@@ -1559,5 +1599,6 @@ check("engine rollback: recovered playback advances without a terminal error",
         engineRollback.errors.description))
 #endif
 
+subtitleBackingRepeatScenario()
 print("=== REPRO SUMMARY: \(redCount) RED\(onlySelection ? " (SELECTION GATE ONLY)" : " (full run)") ===")
 exit(Int32(min(redCount, 125)))
