@@ -28,9 +28,9 @@ internal class UsenetProviderStore(
     /// Load and decode the current owner's credentials; nil when none are set or a value is malformed.
     fun load(owner: DebridOwnerToken? = currentOwner()): UsenetProviderCredentials? {
         owner ?: return null
-        if (currentOwner() != owner) return null
+        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return null
         val json = store.string(storageKey(owner)) ?: return null
-        if (currentOwner() != owner) return null
+        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return null
         return try {
             UsenetProviderCredentials.fromJson(JSONObject(json))?.takeIf { it.isValid }
         } catch (_: Exception) {
@@ -45,20 +45,20 @@ internal class UsenetProviderStore(
     fun save(credentials: UsenetProviderCredentials, owner: DebridOwnerToken? = currentOwner()): Boolean {
         owner ?: return false
         if (!credentials.isValid) return false
-        if (currentOwner() != owner) return false
+        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return false
         val saved = store.set(mapOf(storageKey(owner) to credentials.toJson().toString()))
-        return saved && currentOwner() == owner
+        return saved && UsenetCredentialOwnerPolicy.permits(owner, currentOwner())
     }
 
     /// Remove the current owner's credentials.
     fun clear(owner: DebridOwnerToken? = currentOwner()): Boolean {
         owner ?: return false
-        if (currentOwner() != owner) return false
+        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return false
         val cleared = store.clear(storageKey(owner))
-        return cleared && currentOwner() == owner
+        return cleared && UsenetCredentialOwnerPolicy.permits(owner, currentOwner())
     }
 
-    private fun storageKey(owner: DebridOwnerToken): String = "${PREFIX}${owner.scope.storageSuffix}"
+    private fun storageKey(owner: DebridOwnerToken): String = UsenetCredentialOwnerPolicy.storageKey(PREFIX, owner)
 
     companion object {
         const val TAG = "UsenetProviderStore"

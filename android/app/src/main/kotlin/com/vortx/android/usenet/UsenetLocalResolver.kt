@@ -9,11 +9,8 @@ import kotlinx.coroutines.withContext
 import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
-import java.net.InetAddress
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URI
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.ensureActive
 import kotlin.coroutines.coroutineContext
@@ -127,7 +124,7 @@ internal class UsenetLocalResolver(
     }
 
     private suspend fun fetchNzb(nzbUrl: String): String = withContext(Dispatchers.IO) {
-        var url = checkedNzbUrl(nzbUrl)
+        var url = NzbFetchPolicy.checkedUrl(nzbUrl)
         repeat(MAX_NZB_REDIRECTS + 1) {
             val connection = (url.openConnection() as? HttpURLConnection)
                 ?: throw ResolveException("NZB URL is not HTTP")
@@ -138,14 +135,14 @@ internal class UsenetLocalResolver(
             try {
                 when (val code = connection.responseCode) {
                     in 200..299 -> {
-                        val text = connection.inputStream.readBoundedUtf8(MAX_NZB_BYTES)
+                        val text = NzbFetchPolicy.readBoundedUtf8(connection.inputStream)
                         if (text.isBlank()) throw ResolveException("NZB fetch was empty")
                         return@withContext text
                     }
                     301, 302, 303, 307, 308 -> {
                         val location = connection.getHeaderField("Location")
                             ?: throw ResolveException("NZB redirect missing location")
-                        url = checkedNzbUrl(URL(url, location).toExternalForm())
+                        url = NzbFetchPolicy.redirect(url, location)
                     }
                     else -> throw ResolveException("NZB fetch rejected: $code")
                 }
@@ -156,36 +153,6 @@ internal class UsenetLocalResolver(
         throw ResolveException("NZB redirect limit exceeded")
     }
 
-    private fun checkedNzbUrl(raw: String): URL {
-        val uri = try { URI(raw) } catch (_: Exception) { throw ResolveException("invalid NZB URL") }
-        if (uri.scheme?.lowercase() != "https" || uri.userInfo != null || uri.host.isNullOrBlank()) {
-            throw ResolveException("NZB URL must be HTTPS without user info")
-        }
-        val addresses = try { InetAddress.getAllByName(uri.host) } catch (_: Exception) {
-            throw ResolveException("NZB host cannot be resolved")
-        }
-        if (addresses.isEmpty() || addresses.any(::isPrivateAddress)) throw ResolveException("NZB host is not public")
-        return uri.toURL()
-    }
-
-    private fun isPrivateAddress(address: InetAddress): Boolean =
-        address.isAnyLocalAddress || address.isLoopbackAddress || address.isLinkLocalAddress ||
-            address.isSiteLocalAddress || address.hostAddress.startsWith("fc", true) ||
-            address.hostAddress.startsWith("fd", true)
-
-    private fun InputStream.readBoundedUtf8(limit: Int): String {
-        val output = java.io.ByteArrayOutputStream(minOf(limit, 8 * 1024))
-        val buffer = ByteArray(8 * 1024)
-        var total = 0
-        while (true) {
-            val count = read(buffer)
-            if (count < 0) break
-            total += count
-            if (total > limit) throw ResolveException("NZB exceeds size limit")
-            output.write(buffer, 0, count)
-        }
-        return output.toString(Charsets.UTF_8.name())
-    }
 
     private fun pickFile(
         files: List<NzbFile>,
@@ -235,7 +202,6 @@ internal class UsenetLocalResolver(
     }
 
     private companion object {
-        const val MAX_NZB_BYTES = 4 * 1024 * 1024
         const val MAX_NZB_REDIRECTS = 3
         const val NZB_TIMEOUT_MS = 20_000
         const val SEGMENT_COPY_BUFFER_BYTES = 64 * 1024
