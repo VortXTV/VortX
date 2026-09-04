@@ -585,8 +585,8 @@ struct PlayerScreen: View {
     /// Safety net for the deferred resume seek issued at first frame. A slow / non-Range source can leave mpv
     /// parked at the pre-seek position indefinitely; the plain stall ladder then reloads at the real (low)
     /// playhead and silently drops the viewer's resume point. This abandons the offset instead and resumes
-    /// playback from wherever the source actually is, reconciling presentation and persistence to that proven
-    /// position so a stale requested target cannot govern later scrubs or saves.
+    /// playback from wherever the source actually is. Presentation reconciles to that proven position while a
+    /// persistence floor preserves the last valid resume against this source-specific seek failure.
     @State private var postFrameResumeSeekWatchdog: Task<Void, Never>?
     private let postFrameResumeSeekWatchdogSeconds: Double = 12
     /// Latest provenance-accepted engine tick, recorded before presentation gates. The deferred-resume watchdog
@@ -3762,7 +3762,8 @@ struct PlayerScreen: View {
     /// plain stall ladder then reloads at the real (low) playhead and silently drops the viewer's resume
     /// point. If the seek has not landed within 12s, abandon the offset instead: a relative +0.1s nudge (the
     /// proven wedge release) resumes playback from wherever the source actually is, and the floor armed at
-    /// issuance is retired at abandonment because the source has proven it cannot reach that offset.
+    /// issuance stays as the persistence floor at abandonment because this source failure cannot invalidate the
+    /// viewer's last valid Continue Watching position.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         postFrameResumeSeekWatchdog?.cancel()
         let armedToken = coordinator.player?.activeLoadToken
@@ -3777,14 +3778,14 @@ struct PlayerScreen: View {
                   ) else { return }
             DiagnosticsLog.log(
                 "playback",
-                String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation and persistence to the current position",
+                String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation while preserving the resume floor",
                        Int(postFrameResumeSeekWatchdogSeconds), target, reconciliation.presentationSeconds)
             )
             pendingLibmpvResumeSeek = nil
             postFrameResumeSeekWatchdog = nil
             currentTime = reconciliation.presentationSeconds
-            lastReported = reconciliation.persistenceSeconds
-            if reconciliation.retiresResumeFloor { suppressedResumeFloor = nil }
+            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
+            lastReported = max(lastReported, reconciliation.persistenceFloorSeconds)
             coordinator.player?.seek(by: 0.1)
         }
     }

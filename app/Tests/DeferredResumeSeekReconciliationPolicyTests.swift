@@ -11,9 +11,8 @@ private enum DeferredResumeSeekReconciliationPolicyTests {
         )
         precondition(
             abandoned?.presentationSeconds == 3
-                && abandoned?.persistenceSeconds == 3
-                && abandoned?.retiresResumeFloor == true,
-            "a failed deferred resume must reconcile UI and persistence to the first trustworthy low engine tick"
+                && abandoned?.persistenceFloorSeconds == 1_041,
+            "a failed deferred resume must reconcile UI to the low engine tick while retaining Continue Watching at the valid target"
         )
         precondition(
             DeferredResumeSeekReconciliationPolicy.abandonment(

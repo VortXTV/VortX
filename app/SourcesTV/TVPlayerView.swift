@@ -6274,7 +6274,8 @@ struct TVPlayerView: View {
     /// SAME OFFSET, which wedges again and re-arms the DV->HDR10 display switch every cycle (the observed
     /// Harry Potter stall loop). If the seek has not landed within 12s, abandon the offset instead: a relative
     /// +0.1s nudge (the same proven wedge release as the cold-start nudge) resumes playback from wherever the
-    /// source actually is, reconciling presentation and persistence to the first proven engine position.
+    /// source actually is. Presentation reconciles to the first proven engine position while persistence retains
+    /// the valid resume floor, because one source's failed seek must not erase Continue Watching progress.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         postFrameResumeSeekWatchdog?.cancel()
         let armedToken = coordinator.player?.activeLoadToken
@@ -6289,15 +6290,15 @@ struct TVPlayerView: View {
                   ) else { return }
             DiagnosticsLog.log(
                 "playback",
-                String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation and persistence to the current position",
+                String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation while preserving the resume floor",
                        Int(postFrameResumeSeekWatchdogSeconds), target, reconciliation.presentationSeconds)
             )
             inFlightSeekTarget = nil
             pendingLibmpvResumeSeek = nil
             postFrameResumeSeekWatchdog = nil
             currentTime = reconciliation.presentationSeconds
-            lastSaved = reconciliation.persistenceSeconds
-            if reconciliation.retiresResumeFloor { suppressedResumeFloor = nil }
+            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
+            lastSaved = max(lastSaved, reconciliation.persistenceFloorSeconds)
             coordinator.player?.seek(by: 0.1)
         }
     }

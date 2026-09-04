@@ -125,14 +125,13 @@ enum DeferredResumeFloorPolicy {
     }
 }
 
-/// A deferred resume seek is optimistic until an engine tick proves it landed. When its bounded watchdog
-/// gives up, presentation and persistence must move together to that proven position: keeping the requested
-/// target in either surface makes later scrubs or saves operate on a playhead the engine never reached.
+/// A deferred resume seek is optimistic until an engine tick proves it landed. When its bounded watchdog gives
+/// up, presentation must return to the proven engine position, but persistence retains the requested floor:
+/// one source's failed seek must not erase an otherwise valid Continue Watching position.
 enum DeferredResumeSeekReconciliationPolicy {
     struct Abandonment: Equatable, Sendable {
         let presentationSeconds: Double
-        let persistenceSeconds: Double
-        let retiresResumeFloor: Bool
+        let persistenceFloorSeconds: Double
     }
 
     /// Returns a reconciliation only for a finite, trustworthy engine position that is still materially below
@@ -155,8 +154,7 @@ enum DeferredResumeSeekReconciliationPolicy {
         }
         return Abandonment(
             presentationSeconds: actualPositionSeconds,
-            persistenceSeconds: actualPositionSeconds,
-            retiresResumeFloor: true
+            persistenceFloorSeconds: targetSeconds
         )
     }
 }
