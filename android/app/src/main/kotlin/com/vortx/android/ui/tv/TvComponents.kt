@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RectangleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
@@ -40,6 +42,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -47,6 +50,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.platform.LocalContext
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
@@ -57,9 +61,11 @@ import com.vortx.android.R
 import com.vortx.android.VortXApplication
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.StreamSource
+import com.vortx.android.metadata.PosterArtwork
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCardMenu
 import com.vortx.android.ui.components.PosterQuickActionMenu
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.ui.search.SearchResultSection
 import com.vortx.android.ui.search.searchResultItemKey
 import com.vortx.android.ui.search.searchResultSectionHeaderKey
@@ -77,7 +83,8 @@ import com.vortx.android.ui.theme.VortXTheme
 /// the Home screen drive its cinematic backdrop off whatever the viewer is pointing at. [focusRequester],
 /// when set, lets the screen seed initial focus on the first tile.
 /// [width] fixes the tile width for a horizontal browse row (the Home rails), or `null` to fill the parent
-/// cell so the SAME tile also tessellates a [TvPosterGrid] (Discover / Library / Search) without a second
+/// cell when [width] is null so the SAME tile also tessellates a [TvPosterGrid] (Discover / Library / Search)
+/// without a second
 /// poster component.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -87,16 +94,27 @@ fun TvPosterCard(
     onFocused: () -> Unit,
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
-    width: Dp? = TvDimens.posterWidth,
+    width: Dp? = Dp.Unspecified,
     menu: PosterCardMenu = PosterCardMenu.NONE,
     onDetails: (() -> Unit)? = null,
     onRemoveFromContinueWatching: (() -> Unit)? = null,
 ) {
     val colors = VortXTheme.colors
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val layout = TvPosterLayoutPolicy.layout(posterStyle)
+    val cardShape = if (layout.cornerRadius == 0.dp) RectangleShape else RoundedCornerShape(layout.cornerRadius)
     val appContext = LocalContext.current.applicationContext
     var focused by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
-    Column(modifier = modifier.then(if (width != null) Modifier.width(width) else Modifier.fillMaxWidth())) {
+    Column(
+        modifier = modifier.then(
+            when {
+                width == null -> Modifier.fillMaxWidth()
+                width == Dp.Unspecified -> Modifier.width(layout.width)
+                else -> Modifier.width(width)
+            },
+        ),
+    ) {
         if (menu != PosterCardMenu.NONE) {
             PosterQuickActionMenu(
                 item = item,
@@ -113,13 +131,14 @@ fun TvPosterCard(
             onLongClick = if (menu != PosterCardMenu.NONE) ({ menuOpen = true }) else null,
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(2f / 3f)
+                .aspectRatio(layout.aspectRatio)
+                .semantics { contentDescription = item.name }
                 .onFocusChanged {
                     focused = it.isFocused
                     if (it.isFocused) onFocused()
                 }
                 .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier),
-            shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.card),
+            shape = ClickableSurfaceDefaults.shape(shape = cardShape),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = colors.surface2,
                 contentColor = colors.textPrimary,
@@ -130,11 +149,11 @@ fun TvPosterCard(
             border = ClickableSurfaceDefaults.border(
                 focusedBorder = Border(
                     border = BorderStroke(TvDimens.focusBorder, colors.accentBright),
-                    shape = VortXShapes.card,
+                    shape = cardShape,
                 ),
             ),
         ) {
-            PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+            TvPosterArt(item = item, landscape = posterStyle.landscape)
             if (item.watched) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
                 Icon(
@@ -167,23 +186,25 @@ fun TvPosterCard(
                 }
             }
         }
-        Text(
-            text = item.name,
-            style = VortXTheme.type.cardTitle.copy(
-                color = if (focused) colors.textPrimary else colors.textPrimary.copy(alpha = 0.85f),
-            ),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(top = 8.dp),
-        )
-        val subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · ")
-        if (subtitle.isNotBlank()) {
+        if (layout.showLabels) {
             Text(
-                text = subtitle,
-                style = VortXTheme.type.label.copy(color = colors.textTertiary),
+                text = item.name,
+                style = VortXTheme.type.cardTitle.copy(
+                    color = if (focused) colors.textPrimary else colors.textPrimary.copy(alpha = 0.85f),
+                ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 8.dp),
             )
+            val subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · ")
+            if (subtitle.isNotBlank()) {
+                Text(
+                    text = subtitle,
+                    style = VortXTheme.type.label.copy(color = colors.textTertiary),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }
@@ -448,11 +469,13 @@ fun TvPosterGrid(
         return
     }
     val deduped = remember(items) { items.distinctBy(::searchResultItemKey) }
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val layout = TvPosterLayoutPolicy.layout(posterStyle)
     val sections = remember(deduped, sectioned) {
         if (sectioned) searchResultSections(deduped) else listOf(SearchResultSection(null, deduped))
     }
     LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = TvDimens.posterWidth),
+        columns = GridCells.Adaptive(minSize = layout.width),
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(TvDimens.edge),
         horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
@@ -477,6 +500,29 @@ fun TvPosterGrid(
         }
     }
 }
+
+/** Uses a supplied wide backdrop in landscape mode, falling back to a safe crop of poster art. */
+@Composable
+internal fun androidx.compose.foundation.layout.BoxScope.TvPosterArt(item: MetaItem, landscape: Boolean) {
+    val rawBackdrop = if (landscape) PosterArtwork.backdrop(item.id, item.background) else null
+    var backdropFailed by remember(rawBackdrop) { mutableStateOf(false) }
+    val backdrop = tvLandscapeBackdropUrl(rawBackdrop, backdropFailed)
+    if (backdrop.isNullOrBlank()) {
+        PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+    } else {
+        AsyncImage(
+            model = backdrop,
+            contentDescription = item.name,
+            contentScale = ContentScale.Crop,
+            onError = { backdropFailed = true },
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
+}
+
+/** A failed wide-art request falls through once to the existing poster renderer, never retried in a loop. */
+internal fun tvLandscapeBackdropUrl(rawBackdrop: String?, failed: Boolean): String? =
+    rawBackdrop?.trim()?.takeIf { it.isNotEmpty() && !failed }
 
 /// Centered idle/empty message for a browse surface (an empty catalog, an untyped Search). Non-focusable
 /// text, so a screen with nothing to show is a calm hint rather than a dead black panel.

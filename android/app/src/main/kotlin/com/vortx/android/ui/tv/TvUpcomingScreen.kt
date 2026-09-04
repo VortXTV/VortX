@@ -23,6 +23,7 @@ import com.vortx.android.home.UPCOMING_MOVIES_CATALOG_ID
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.HomeViewModel
 
@@ -41,6 +42,8 @@ fun TvUpcomingScreen(
 ) {
     BackHandler(onBack = onBack)
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val layout = TvPosterLayoutPolicy.layout(posterStyle)
 
     val catalogs = (state as? UiState.Success<List<Catalog>>)?.data.orEmpty()
     val episodes = catalogs.firstOrNull { it.id == UPCOMING_EPISODES_CATALOG_ID }?.items.orEmpty()
@@ -51,7 +54,7 @@ fun TvUpcomingScreen(
         episodes.isEmpty() && movies.isEmpty() ->
             TvEmpty(stringResource(R.string.tv_upcoming_empty), modifier.fillMaxSize())
         else -> LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = TvDimens.posterWidth),
+            columns = GridCells.Adaptive(minSize = layout.width),
             modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas),
             contentPadding = PaddingValues(TvDimens.edge),
             horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),

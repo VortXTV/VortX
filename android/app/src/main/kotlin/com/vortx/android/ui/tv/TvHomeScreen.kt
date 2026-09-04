@@ -62,6 +62,7 @@ import com.vortx.android.VortXApplication
 import com.vortx.android.player.warm.SourceWarmer
 import com.vortx.android.ui.components.PosterCardMenu
 import com.vortx.android.ui.components.posterMenuFor
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.HomeViewModel
 import kotlinx.coroutines.delay
@@ -390,13 +391,15 @@ private fun TvCatalogWall(
     firstCardFocus: FocusRequester,
     modifier: Modifier,
 ) {
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val layout = TvPosterLayoutPolicy.layout(posterStyle)
     val firstAction = remember(catalogs) {
         catalogs.firstNotNullOfOrNull { catalog ->
             tvHomeItems(catalog.items).firstOrNull()?.let { catalog.id to tvHomeItemKey(it) }
         }
     }
     LazyVerticalGrid(
-        columns = GridCells.Adaptive(TvDimens.posterWidth),
+        columns = GridCells.Adaptive(layout.width),
         modifier = modifier.focusGroup(),
         contentPadding = PaddingValues(
             start = TvDimens.edge,

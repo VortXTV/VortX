@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RectangleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
@@ -28,15 +30,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
 import com.vortx.android.model.MetaItem
-import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.theme.VortXIcons
-import com.vortx.android.ui.theme.VortXShapes
+import com.vortx.android.ui.prefs.PosterStylePreferences
 import com.vortx.android.ui.theme.VortXTheme
 
 /// A D-pad-focusable Library poster tile with a long-press quick-action menu, the 10-foot analogue of
@@ -60,6 +64,9 @@ internal fun TvLibraryPosterCard(
     focusRequester: FocusRequester? = null,
 ) {
     val colors = VortXTheme.colors
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val layout = TvPosterLayoutPolicy.layout(posterStyle)
+    val cardShape = if (layout.cornerRadius == 0.dp) RectangleShape else RoundedCornerShape(layout.cornerRadius)
     var focused by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     Column(modifier = modifier.fillMaxWidth()) {
@@ -91,13 +98,14 @@ internal fun TvLibraryPosterCard(
             onLongClick = { menuOpen = true },
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(2f / 3f)
+                .aspectRatio(layout.aspectRatio)
+                .semantics { contentDescription = item.name }
                 .onFocusChanged {
                     focused = it.isFocused
                     if (it.isFocused) onFocused()
                 }
                 .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier),
-            shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.card),
+            shape = ClickableSurfaceDefaults.shape(shape = cardShape),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = colors.surface2,
                 contentColor = colors.textPrimary,
@@ -108,11 +116,11 @@ internal fun TvLibraryPosterCard(
             border = ClickableSurfaceDefaults.border(
                 focusedBorder = Border(
                     border = BorderStroke(TvDimens.focusBorder, colors.accentBright),
-                    shape = VortXShapes.card,
+                    shape = cardShape,
                 ),
             ),
         ) {
-            PosterArt(item.poster, item.name)
+            TvPosterArt(item = item, landscape = posterStyle.landscape)
             if (item.watched) {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
                 Icon(
@@ -140,14 +148,16 @@ internal fun TvLibraryPosterCard(
                 }
             }
         }
-        Text(
-            text = item.name,
-            style = VortXTheme.type.cardTitle.copy(
-                color = if (focused) colors.textPrimary else colors.textPrimary.copy(alpha = 0.85f),
-            ),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.padding(top = 8.dp),
-        )
+        if (layout.showLabels) {
+            Text(
+                text = item.name,
+                style = VortXTheme.type.cardTitle.copy(
+                    color = if (focused) colors.textPrimary else colors.textPrimary.copy(alpha = 0.85f),
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
     }
 }

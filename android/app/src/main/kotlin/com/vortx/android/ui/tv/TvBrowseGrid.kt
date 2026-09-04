@@ -12,9 +12,11 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.search.searchResultItemKey
+import com.vortx.android.ui.prefs.PosterStylePreferences
 
 /// The focus-tracking poster grid shared by TV Discover and Library, the analogue of Apple's
 /// `BrowseGridView` grid: a dense D-pad `LazyVerticalGrid` that can carry full-span [header] content (a
@@ -41,9 +43,11 @@ internal fun TvBrowseGrid(
         return
     }
     val deduped = remember(items) { items.distinctBy(::searchResultItemKey) }
+    val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
+    val layout = TvPosterLayoutPolicy.layout(posterStyle)
     LazyVerticalGrid(
         state = gridState,
-        columns = GridCells.Adaptive(minSize = TvDimens.posterWidth),
+        columns = GridCells.Adaptive(minSize = layout.width),
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(TvDimens.edge),
         horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
