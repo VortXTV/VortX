@@ -105,10 +105,6 @@ fun TvApp(
         // recreate the same Search surface rather than a fresh HOME shell.
         var shellDestination by remember { mutableStateOf(TvDestination.HOME) }
         var searchFocusRestoreSignal by remember { mutableStateOf(0) }
-        fun returnToBrowse() {
-            playing = null
-            if (shellDestination == TvDestination.SEARCH) searchFocusRestoreSignal++
-        }
         val automaticEngineFor: (Playable) -> PlayerEngineRouter.Override = { candidate ->
             PlayerLaunchPolicy.effectivePreference(
                 requested = PlayerEngineRouter.Override.AUTO,
@@ -171,6 +167,13 @@ fun TvApp(
             )
         } else {
             null
+        }
+        fun returnToBrowse() {
+            // Revoke an unresolved attempt before hiding the player. Coroutine cancellation is cooperative,
+            // so the lease fence must lose authority before any late resolver callback can publish.
+            playerVm?.abandonPlaybackResolve()
+            playing = null
+            if (shellDestination == TvDestination.SEARCH) searchFocusRestoreSignal++
         }
         if (playable != null) {
             // The player is a separate early-return branch, so it must enter the TV Material scope here
@@ -312,7 +315,10 @@ fun TvApp(
                     TvDetailScreen(
                         viewModel = detailVm,
                         title = current.name,
-                        onBack = { detail = null },
+                        onBack = {
+                            detailVm.abandonPlaybackResolve()
+                            detail = null
+                        },
                         onPlay = { resolved, loadedMeta, requestedEngine ->
                             playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
                                 requested = requestedEngine,

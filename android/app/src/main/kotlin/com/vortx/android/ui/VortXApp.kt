@@ -514,10 +514,6 @@ fun VortXApp(
             // `autoAddedThisPlayback` being a per-playback @State.
             val autoAdd = remember(appContext) { LibraryAutoAdd(appContext) }
             val autoAddedThisPlayback = remember(playable) { booleanArrayOf(false) }
-            // Hardware/gesture back pops the player overlay instead of exiting the app (there was no
-            // BackHandler anywhere in the shell before; this is the minimum one, scoped to the player).
-            BackHandler { playing = null }
-
             // UP NEXT AUTO-ADVANCE + BAD-SOURCE RETRY. For ANY detail-launched play (never a trailer,
             // never a local download -- those reach the player with `detail == null`), grab the SAME
             // keyed DetailViewModel the detail layer below uses (identical key + factory args, so this
@@ -552,6 +548,12 @@ fun VortXApp(
                 } else {
                     null
                 }
+            // Hardware/gesture back pops the player overlay instead of exiting the app. It also
+            // revokes an Up Next or retry resolver that may still be running behind the player.
+            BackHandler {
+                advanceVm?.abandonPlaybackResolve()
+                playing = null
+            }
             DisposableEffect(historyIdentity, advanceVm) {
                 onDispose { advanceVm?.recordLastStreamProgress(lastProgress[0], force = true) }
             }
@@ -652,13 +654,22 @@ fun VortXApp(
                             preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
                         }
                     },
-                    onBack = { playing = null },
-                    onError = { playing = null },
+                    onBack = {
+                        advanceVm?.abandonPlaybackResolve()
+                        playing = null
+                    },
+                    onError = {
+                        advanceVm?.abandonPlaybackResolve()
+                        playing = null
+                    },
                     // Natural end of the stream: offer the next episode when the open series has one,
                     // otherwise keep the old exit back to the detail page.
                     onEnded = {
                         val next = advanceVm?.nextEpisode()
-                        if (next != null) upNext = next else playing = null
+                        if (next != null) upNext = next else {
+                            advanceVm?.abandonPlaybackResolve()
+                            playing = null
+                        }
                     },
                     // Bad source (dead link, stall, or a runtime-mismatch junk file): run the auto-retry
                     // ladder instead of bouncing to the detail page -- the next ranked source resolves
@@ -767,7 +778,11 @@ fun VortXApp(
                         // presence, so it resets the streak (Apple's `noteInteraction`). Both paths play.
                         onAutoAdvance = { autoAdvanceStreak[0]++; advanceVm.playNextEpisode() },
                         onPlayNow = { autoAdvanceStreak[0] = 0; advanceVm.playNextEpisode() },
-                        onCancel = { autoAdvanceStreak[0] = 0; playing = null },
+                        onCancel = {
+                            autoAdvanceStreak[0] = 0
+                            advanceVm.abandonPlaybackResolve()
+                            playing = null
+                        },
                     )
                 }
                 // The bad-source ladder's surfaces + their resolution collector. Like the Up Next
@@ -813,7 +828,10 @@ fun VortXApp(
                                 advanceVm.refreshSources()
                                 playing = null
                             },
-                            onClose = { playing = null },
+                            onClose = {
+                                advanceVm.abandonPlaybackResolve()
+                                playing = null
+                            },
                         )
                     } else {
                         RetryingSourceOverlay()
@@ -1089,11 +1107,17 @@ fun VortXApp(
                 // System Back closes the detail overlay back to the browse shell. Composed BEFORE
                 // DetailScreen so the screen's own nested overlay handlers (person page / nested title,
                 // DetailScreen.kt) register later and therefore take precedence while they are open.
-                BackHandler { openDetail(null) }
+                BackHandler {
+                    detailVm.abandonPlaybackResolve()
+                    openDetail(null)
+                }
                 DetailScreen(
                     viewModel = detailVm,
                     title = current.name,
-                    onBack = { openDetail(null) },
+                    onBack = {
+                        detailVm.abandonPlaybackResolve()
+                        openDetail(null)
+                    },
                     // DetailScreen supplies the successfully loaded MetaDetail, not the provisional
                     // deep-link MetaItem. This keeps auto-add title/poster truth tied to engine metadata.
                     onPlay = { playable, loadedMeta, requestedEngine ->

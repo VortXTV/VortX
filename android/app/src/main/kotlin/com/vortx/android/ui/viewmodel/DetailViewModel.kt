@@ -129,6 +129,37 @@ internal class DetailMutationFence {
             current.id == lease.id
 }
 
+/**
+ * Owns the permission for a detail-page playback resolver to publish. Coroutine cancellation is
+ * cooperative, so invalidating a source target must revoke publication *before* its source fence
+ * advances: a resolver which happens to return in that small window is still stale.
+ */
+internal class PlaybackResolveFence {
+    class Lease internal constructor(
+        val sourceRequest: SourceRequestFence.Token,
+        val attemptGeneration: Long,
+    )
+
+    private var nextAttemptGeneration = 0L
+    private var activeLease: Lease? = null
+
+    fun begin(request: SourceRequestFence.Token): Lease =
+        Lease(request, ++nextAttemptGeneration).also { activeLease = it }
+
+    fun accepts(lease: Lease): Boolean = activeLease == lease
+
+    /** Revokes the active attempt only when it belongs to the target about to be invalidated. */
+    fun invalidateForSourceRequest(request: SourceRequestFence.Token): Boolean {
+        if (activeLease?.sourceRequest != request) return false
+        activeLease = null
+        return true
+    }
+
+    fun finish(lease: Lease) {
+        if (activeLease == lease) activeLease = null
+    }
+}
+
 internal fun MetaDetail.episodeForResolve(selectedEpisodeId: String?): Episode? =
     videos.firstOrNull { it.id == selectedEpisodeId }
 
@@ -343,6 +374,7 @@ class DetailViewModel(
     private var cacheCheckJob: Job? = null
     private val cacheCheckGate = CacheCheckGenerationGate()
     private var playbackResolveJob: Job? = null
+    private val playbackResolveFence = PlaybackResolveFence()
     private var profileReloadJob: Job? = null
     private val watchlistStore = WatchlistStore.shared(app)
     val watchlisted: StateFlow<Boolean> = watchlistStore.items
@@ -630,6 +662,7 @@ class DetailViewModel(
         detailMutationFence.invalidate()
         profileReloadJob?.cancel()
         sourceLoadJob?.cancel()
+        cancelPlaybackResolveForSourceTargetInvalidation()
         metaRecoveryAttempted = false
         metaId = id
         _metaUnavailable.value = false
@@ -651,6 +684,7 @@ class DetailViewModel(
     }
 
     private fun startSourceLoad(episodeId: String?, forceRefresh: Boolean = false) {
+        cancelPlaybackResolveForSourceTargetInvalidation()
         val profileId = sourceSticky.currentProfileId()
         val token = if (forceRefresh) {
             sourceRequestFence.beginRefresh(profileId, episodeId) ?: return
@@ -660,6 +694,41 @@ class DetailViewModel(
         sourceLoadJob?.cancel()
         if (forceRefresh) torbox.reset(token.generation, clearCache = true)
         sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token, forceRefresh) }
+    }
+
+    /**
+     * Retire an in-flight detail resolver before changing this page's source target. A cancelled
+     * coroutine may still return normally, so [PlaybackResolveFence] revokes its publication lease
+     * before [SourceRequestFence] advances. Completed PlayerRoute playback stays intact: only the
+     * visible detail-page Resolving state belongs to this cancellation path.
+     */
+    private fun cancelPlaybackResolveForSourceTargetInvalidation() {
+        abandonPlaybackResolve()
+    }
+
+    /**
+     * Withdraw an unresolved detail play when its route is dismissed. This intentionally leaves a
+     * ready player alone: callers may discard their UI route without tearing down real playback.
+     */
+    fun abandonPlaybackResolve() {
+        val request = sourceRequestFence.currentToken() ?: return
+        if (!playbackResolveFence.invalidateForSourceRequest(request)) return
+        playbackResolveJob?.cancel()
+        playbackResolveJob = null
+        if (_playback.value is Playback.Resolving) {
+            _playback.value = Playback.Idle
+        }
+    }
+
+    private fun canPublishPlaybackResolve(lease: PlaybackResolveFence.Lease): Boolean =
+        playbackResolveFence.accepts(lease) &&
+            sourceRequestFence.accepts(lease.sourceRequest, sourceSticky.currentProfileId())
+
+    private fun publishPlaybackResolve(lease: PlaybackResolveFence.Lease, state: Playback): Boolean {
+        if (!canPublishPlaybackResolve(lease)) return false
+        _playback.value = state
+        playbackResolveFence.finish(lease)
+        return true
     }
 
     /// Re-find sources (viewer escape hatch on the detail screen + terminal playback-failure path): re-query
@@ -680,7 +749,7 @@ class DetailViewModel(
     private fun rebuildForProfile(profileId: String) {
         detailMutationFence.invalidate()
         sourceLoadJob?.cancel()
-        playbackResolveJob?.cancel()
+        cancelPlaybackResolveForSourceTargetInvalidation()
         profileReloadJob?.cancel()
         val invalidGeneration = sourceRequestFence.invalidate(profileId)
         sourceSticky.onProfileChanged()
@@ -1120,10 +1189,11 @@ class DetailViewModel(
         // which case playback simply doesn't scrobble.
         val ref = currentMediaRef()
         playbackResolveJob?.cancel()
+        val resolveLease = playbackResolveFence.begin(request)
         playbackResolveJob = viewModelScope.launch {
             val result = resolveForOwner(source, episode, actionOwner)
-            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
-            _playback.value = result.fold(
+            if (!canPublishPlaybackResolve(resolveLease)) return@launch
+            val nextPlayback = result.fold(
                 onSuccess = { playable ->
                     if (playable.url.isBlank()) {
                         Playback.Failed("Could not start this source.")
@@ -1142,9 +1212,10 @@ class DetailViewModel(
                 },
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
             )
+            if (!publishPlaybackResolve(resolveLease, nextPlayback)) return@launch
             // Persistence follows successful publication. A failed resolve, blank URL, superseded target, or
             // profile switch leaves the previous preference untouched.
-            if (_playback.value is Playback.Ready && stickyWrite != null) {
+            if (nextPlayback is Playback.Ready && stickyWrite != null) {
                 sourceSticky.record(stickyWrite, source.addon, source.bingeGroup)
             }
         }
@@ -1404,6 +1475,7 @@ class DetailViewModel(
         val ytId = detail.trailerYouTubeId ?: return
         _playback.value = Playback.Resolving
         playbackResolveJob?.cancel()
+        val resolveLease = playbackResolveFence.begin(request)
         playbackResolveJob = viewModelScope.launch {
             val playable = TrailerCoordinator.trailerPlayable(
                 context = app,
@@ -1413,10 +1485,11 @@ class DetailViewModel(
                 year = detail.releaseInfo?.take(4),
                 mediaType = if (type == MediaType.SERIES) "series" else "movie",
             )
-            if (sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
-                _playback.value = playable?.let { Playback.Ready(it) }
-                    ?: Playback.Failed("This trailer isn't available right now.")
-            }
+            publishPlaybackResolve(
+                resolveLease,
+                playable?.let { Playback.Ready(it) }
+                    ?: Playback.Failed("This trailer isn't available right now."),
+            )
         }
     }
 
@@ -1453,16 +1526,17 @@ class DetailViewModel(
         val debridEpisode = episode?.debridEpisodeForResolve()
         val actionOwner = debridKeys.ownerToken()
         playbackResolveJob?.cancel()
+        val resolveLease = playbackResolveFence.begin(request)
         playbackResolveJob = viewModelScope.launch {
-            if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
-                _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
+            if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
+                publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
                 return@launch
             }
             // 1) CW resume: replay the exact stored debrid source for this target if we have one.
             resumeRef?.takeIf { it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
                 val resumed = debrid.resumePlaybackURL(stored.ref, stored.url, stored.savedAtMs)
-                if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
-                    _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
+                if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
+                    publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
                     return@launch
                 }
                 if (resumed.refreshed && resumed.url.isNotEmpty()) {
@@ -1471,16 +1545,16 @@ class DetailViewModel(
                         savedAtMs = if (resumed.url != stored.url) System.currentTimeMillis() else stored.savedAtMs,
                     )
                     lastPlayedSource = stored.source
-                    _playback.value = Playback.Ready(
+                    publishPlaybackResolve(resolveLease, Playback.Ready(
                         stored.playable(resumed.url, resumeMs, ref, expectedRuntimeMs()),
-                    )
+                    ))
                     return@launch
                 }
             }
             // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
             val winner = resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
-            if (!isActionOwnerCurrent(actionOwner) || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
-                _playback.value = Playback.Failed(OWNER_CHANGED_MESSAGE)
+            if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
+                publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
                 return@launch
             }
             if (winner != null) {
@@ -1492,16 +1566,16 @@ class DetailViewModel(
                 )
                 resumeRef = stored
                 lastPlayedSource = stored.source
-                _playback.value = Playback.Ready(
+                publishPlaybackResolve(resolveLease, Playback.Ready(
                     stored.playable(winner.ref.url, resumeMs, ref, expectedRuntimeMs()),
-                )
+                ))
                 return@launch
             }
             // 3) Fall back to the single-source resolve of the labeled best (direct / media-server / single
             //    debrid, or the confirmed-cached best the gate insisted on).
             val resolved = resolveForOwner(best, episode, actionOwner)
-            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
-            _playback.value = resolved.fold(
+            if (!canPublishPlaybackResolve(resolveLease)) return@launch
+            publishPlaybackResolve(resolveLease, resolved.fold(
                 onSuccess = { playable ->
                     Playback.Ready(
                         playable.copy(
@@ -1515,7 +1589,7 @@ class DetailViewModel(
                     )
                 },
                 onFailure = { Playback.Failed(it.message ?: "Could not start this source.") },
-            )
+            ))
         }
     }
 
@@ -1696,6 +1770,7 @@ class DetailViewModel(
     }
 
     fun clearPlayback() {
+        abandonPlaybackResolve()
         _playback.value = Playback.Idle
     }
 
