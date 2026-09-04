@@ -395,6 +395,10 @@ fun DetailScreen(
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
+    val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
+        pendingLaunchEnginePreference = engine
+        action()
+    }
 
     // When a source resolves, hand the Playable up to navigation and reset, so returning from the
     // player lands back on detail rather than immediately re-launching.
@@ -505,6 +509,9 @@ fun DetailScreen(
                                 onPin = viewModel::pinSource,
                                 onUnpin = viewModel::unpinSource,
                                 onPlay = { source -> beginPlayback { viewModel.play(source) } },
+                                onPlayWithEngine = { source, engine ->
+                                    beginPlaybackWithEngine(engine) { viewModel.play(source) }
+                                },
                                 onDownload = viewModel::download,
                             )
                         }
@@ -1640,6 +1647,7 @@ private fun SourcesSection(
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
     onPlay: (StreamSource) -> Unit,
+    onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
     onDownload: (StreamSource) -> Unit,
 ) {
     // The row whose long-press opened the pin menu (null = closed). Keyed by the stream id so the menu
@@ -1858,6 +1866,7 @@ private fun SourcesSection(
                                 onOpenMenu = { pinMenuFor = source.id },
                                 onDismissMenu = { pinMenuFor = null },
                                 onPlay = onPlay,
+                                onPlayWithEngine = onPlayWithEngine,
                                 onDownload = onDownload,
                                 onPin = onPin,
                                 onUnpin = onUnpin,
@@ -1951,6 +1960,7 @@ private fun StreamRowWithPinMenu(
     onOpenMenu: () -> Unit,
     onDismissMenu: () -> Unit,
     onPlay: (StreamSource) -> Unit,
+    onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
     onDownload: (StreamSource) -> Unit,
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
@@ -1977,6 +1987,12 @@ private fun StreamRowWithPinMenu(
             onLongClick = onOpenMenu,
         )
         DropdownMenu(expanded = menuOpen, onDismissRequest = onDismissMenu) {
+            PlayerLaunchPolicy.sourceChoices(source, MpvEngineFactory.isBundled).forEach { choice ->
+                DropdownMenuItem(
+                    text = { Text("Play with ${choice.label}") },
+                    onClick = { onDismissMenu(); onPlayWithEngine(source, choice.preference) },
+                )
+            }
             // The download create-path entry point (DownloadManager.CREATE_PATH_WIRED): save this source
             // for offline viewing. First item because it is the reason the menu most often gets opened now.
             DropdownMenuItem(

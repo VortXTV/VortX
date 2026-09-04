@@ -135,6 +135,10 @@ fun TvDetailScreen(
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
+    val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
+        pendingLaunchEnginePreference = engine
+        action()
+    }
 
     BackHandler { onBack() }
 
@@ -163,6 +167,7 @@ fun TvDetailScreen(
                 launchEnginePreference = launchEnginePreference,
                 onSelectLaunchEngine = { launchEnginePreference = it },
                 beginPlayback = beginPlayback,
+                beginPlaybackWithEngine = beginPlaybackWithEngine,
                 onOpenTitle = onOpenTitle,
             )
         }
@@ -180,6 +185,7 @@ private fun TvDetailContent(
     launchEnginePreference: PlayerEngineRouter.Override,
     onSelectLaunchEngine: (PlayerEngineRouter.Override) -> Unit,
     beginPlayback: (() -> Unit) -> Unit,
+    beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit,
     onOpenTitle: (MetaItem) -> Unit,
 ) {
     val context = LocalContext.current
@@ -464,6 +470,9 @@ private fun TvDetailContent(
                     pin = pinUi,
                     entryNoun = viewModel.pinEntryNoun,
                     onPlay = { source -> beginPlayback { viewModel.play(source) } },
+                    onPlayWithEngine = { source, engine ->
+                        beginPlaybackWithEngine(engine) { viewModel.play(source) }
+                    },
                     onDownload = viewModel::download,
                     onPin = viewModel::pinSource,
                     onUnpin = viewModel::unpinSource,

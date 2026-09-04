@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import com.vortx.android.model.Playable
+import com.vortx.android.model.StreamSource
 
 /** One truthful, session-only player choice shown before a detail-page launch. */
 internal data class PlayerLaunchChoice(
@@ -44,6 +45,19 @@ internal object PlayerLaunchPolicy {
             ),
         )
     }
+
+    /**
+     * Explicit engines a viewer may request for one already-selected source. The main detail selector owns
+     * Automatic; a source-row action must name a concrete player. Full-flavor torrents stay mpv-only because
+     * their loopback warm-up contract cannot be handed to Media3. The resolved [Playable] is still checked by
+     * [effectivePreference] at the shell boundary, so this is an honest early menu gate rather than a second
+     * routing authority.
+     */
+    fun sourceChoices(source: StreamSource, mpvAvailable: Boolean): List<PlayerLaunchChoice> =
+        choices(mpvAvailable).filter { choice ->
+            choice.preference != PlayerEngineRouter.Override.AUTO &&
+                !(mpvAvailable && source.isTorrent && choice.preference == PlayerEngineRouter.Override.EXOPLAYER)
+        }
 
     fun defaultPreference(mpvAvailable: Boolean): PlayerEngineRouter.Override =
         if (mpvAvailable) PlayerEngineRouter.Override.AUTO else PlayerEngineRouter.Override.EXOPLAYER

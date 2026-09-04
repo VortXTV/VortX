@@ -37,6 +37,9 @@ import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferences
+import com.vortx.android.player.MpvEngineFactory
+import com.vortx.android.player.PlayerEngineRouter
+import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.ui.UiState
@@ -73,6 +76,7 @@ fun TvSourceList(
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPlay: (StreamSource) -> Unit,
+    onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
     onDownload: (StreamSource) -> Unit,
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
@@ -99,6 +103,7 @@ fun TvSourceList(
             pin = pin,
             entryNoun = entryNoun,
             onPlay = onPlay,
+            onPlayWithEngine = onPlayWithEngine,
             onDownload = onDownload,
             onPin = onPin,
             onUnpin = onUnpin,
@@ -127,6 +132,7 @@ private fun TvSourceListContent(
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPlay: (StreamSource) -> Unit,
+    onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
     onDownload: (StreamSource) -> Unit,
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
@@ -277,6 +283,7 @@ private fun TvSourceListContent(
                         onOpenMenu = { pinMenuFor = entry.source.id },
                         onDismissMenu = { pinMenuFor = null },
                         onPlay = onPlay,
+                        onPlayWithEngine = onPlayWithEngine,
                         onDownload = onDownload,
                         onPin = onPin,
                         onUnpin = onUnpin,
@@ -515,6 +522,7 @@ private fun TvSourceDepthRow(
     onOpenMenu: () -> Unit,
     onDismissMenu: () -> Unit,
     onPlay: (StreamSource) -> Unit,
+    onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
     onDownload: (StreamSource) -> Unit,
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
@@ -591,9 +599,15 @@ private fun TvSourceDepthRow(
                 }
             }
         }
-        // The long-press menu: offline download first (the create-path entry point), then pin-for-this /
-        // pin-everywhere / the applicable unpin actions, exactly as the phone row's DropdownMenu offers.
+        // The long-press menu starts with explicit, one-launch player choices for THIS source, then retains
+        // the existing offline-download and pin actions.
         DropdownMenu(expanded = menuOpen, onDismissRequest = onDismissMenu) {
+            PlayerLaunchPolicy.sourceChoices(source, MpvEngineFactory.isBundled).forEach { choice ->
+                DropdownMenuItem(
+                    text = { Text("Play with ${choice.label}") },
+                    onClick = { onDismissMenu(); onPlayWithEngine(source, choice.preference) },
+                )
+            }
             DropdownMenuItem(
                 text = { Text("Download for offline") },
                 onClick = { onDismissMenu(); onDownload(source) },

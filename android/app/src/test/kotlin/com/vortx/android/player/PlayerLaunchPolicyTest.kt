@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import com.vortx.android.model.Playable
+import com.vortx.android.model.StreamSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -42,5 +43,24 @@ class PlayerLaunchPolicyTest {
             PlayerLaunchPolicy.effectivePreference(PlayerEngineRouter.Override.EXOPLAYER, direct, mpvAvailable = true),
         )
         assertTrue(PlayerLaunchPolicy.choices(false).single().detail.contains("included in this edition"))
+    }
+
+    @Test
+    fun `source menu exposes only explicit eligible engines`() {
+        val direct = StreamSource(id = "direct", addon = "addon", title = "Direct", url = "https://cdn.example/movie.mkv")
+        val torrent = direct.copy(id = "torrent", isTorrent = true)
+
+        assertEquals(
+            listOf(PlayerEngineRouter.Override.MPV, PlayerEngineRouter.Override.EXOPLAYER),
+            PlayerLaunchPolicy.sourceChoices(direct, mpvAvailable = true).map { it.preference },
+        )
+        assertEquals(
+            listOf(PlayerEngineRouter.Override.MPV),
+            PlayerLaunchPolicy.sourceChoices(torrent, mpvAvailable = true).map { it.preference },
+        )
+        assertEquals(
+            listOf(PlayerEngineRouter.Override.EXOPLAYER),
+            PlayerLaunchPolicy.sourceChoices(torrent, mpvAvailable = false).map { it.preference },
+        )
     }
 }

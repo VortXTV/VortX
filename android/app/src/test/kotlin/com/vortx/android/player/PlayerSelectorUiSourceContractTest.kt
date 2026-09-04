@@ -26,11 +26,15 @@ class PlayerSelectorUiSourceContractTest {
         val phone = source("src/main/kotlin/com/vortx/android/ui/VortXApp.kt")
         val tvDetail = source("src/main/kotlin/com/vortx/android/ui/tv/TvDetailScreen.kt")
         val tv = source("src/main/kotlin/com/vortx/android/ui/tv/TvApp.kt")
+        val tvSources = source("src/main/kotlin/com/vortx/android/ui/tv/TvSourceList.kt")
 
         assertTrue(detail.contains("pendingLaunchEnginePreference = launchEnginePreference"))
+        assertTrue(detail.contains("beginPlaybackWithEngine(engine) { viewModel.play(source) }"))
         assertTrue(detail.contains("Applies to this launch only"))
         assertTrue(phone.contains("engineOverride = playingEngineOverride"))
         assertTrue(tvDetail.contains("pendingLaunchEnginePreference = launchEnginePreference"))
+        assertTrue(tvDetail.contains("beginPlaybackWithEngine(engine) { viewModel.play(source) }"))
+        assertTrue(tvSources.contains("onPlayWithEngine(source, choice.preference)"))
         assertTrue(tv.contains("engineOverride = playingEngineOverride"))
     }
 
