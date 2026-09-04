@@ -103,7 +103,7 @@ private enum MPVCacheFlushReceiptContractTests {
         guard let pausedClamp = section(
             source,
             from: "private func applyPausedCacheClamp(reason: String = \"long pause\")",
-            to: "    /// Free the demuxer cache"
+            to: "    /// Park a paused file's exact position"
         ), let memoryWarning = section(
             source,
             from: "private func shedForMemoryPressure()",
@@ -115,7 +115,7 @@ private enum MPVCacheFlushReceiptContractTests {
         ) else {
             return false
         }
-        return pausedClamp.contains("flushDemuxerCachePreservingPosition(reason: .pausedCacheClamp)")
+        return pausedClamp.contains("parkPausedCacheAtCurrentPosition()")
             && memoryWarning.contains("flushDemuxerCachePreservingPosition(reason: .memoryWarning)")
             && proactivePressure.contains(
                 "flushDemuxerCachePreservingPosition(reason: .proactiveMemoryPressure)"
@@ -126,7 +126,7 @@ private enum MPVCacheFlushReceiptContractTests {
         guard let pausedClamp = section(
             source,
             from: "private func applyPausedCacheClamp(reason: String = \"long pause\")",
-            to: "    /// Free the demuxer cache"
+            to: "    /// Park a paused file's exact position"
         ) else {
             return false
         }
@@ -309,6 +309,113 @@ private enum MPVCacheFlushReceiptContractTests {
         )
     }
 
+    private static func hasPausedParkContract(_ source: String, policy: String) -> Bool {
+        guard let pausedClamp = section(
+            source,
+            from: "private func applyPausedCacheClamp(reason: String = \"long pause\")",
+            to: "    /// Park a paused file's exact position"
+        ), let park = section(
+            source,
+            from: "private func parkPausedCacheAtCurrentPosition()",
+            to: "    /// Resume only after the mpv pause property reports false"
+        ), let resume = section(
+            source,
+            from: "private func resumePausedCachePark()",
+            to: "    /// Free the demuxer cache without moving the play head"
+        ), let pauseState = section(
+            source,
+            from: "private func pausedStateChanged(_ paused: Bool)",
+            to: "    private static let cacheFlushTimeoutSeconds"
+        ) else { return false }
+        return pausedClamp.contains("parkPausedCacheAtCurrentPosition()")
+            && ordered(
+                [
+                    "pausedCachePark.install(",
+                    "\"drop-buffers\"",
+                    "return .started",
+                ],
+                in: park
+            )
+            && !park.contains("\"seek\"")
+            && ordered(
+                [
+                    "setString(\"demuxer-max-bytes\", cap)",
+                    "resumePausedCachePark()",
+                ],
+                in: pauseState
+            )
+            && ordered(
+                [
+                    "callbackLoadToken(requiresLoadedFile: true)",
+                    "!getFlag(MPVProperty.pause)",
+                    "pausedCachePark.beginRecovery(owner: owner)",
+                    "armSeekCacheHold()",
+                    "lastOutOfWindowSeekTarget = park.target",
+                    "armSeekRefillWatchdog()",
+                    "\"seek\"",
+                    "park.targetArgument",
+                    "\"absolute+exact\"",
+                ],
+                in: resume
+            )
+            && policy.contains("struct PausedCachePark<Owner: Equatable>")
+            && policy.contains("mutating func consumeSyntheticEOF(owner: Owner) -> Bool")
+            && policy.contains("mutating func beginRecovery(owner: Owner) -> Receipt?")
+            && policy.contains("mutating func completeRecovery(")
+            && policy.contains("static func shouldParkPausedCache(target: Double, knownDuration: Double?) -> Bool")
+            && policy.contains("knownDuration > 0 else { return false }")
+            && source.contains("VortXCacheShedPolicy.shouldParkPausedCache(")
+            && source.contains("let rawDuration = getDouble(MPVProperty.duration)")
+            && source.contains("completePausedCacheParkRecovery(")
+            && !source.contains("flushDemuxerCachePreservingPosition(reason: .pausedCacheClamp)")
+    }
+
+    private static func hasPausedPressureRoutingAndProgressCompletion(
+        _ source: String,
+        policy: String
+    ) -> Bool {
+        guard let flush = cacheFlushSource(source),
+              let pauseState = section(
+                source,
+                from: "private func pausedStateChanged(_ paused: Bool)",
+                to: "    private static let cacheFlushTimeoutSeconds"
+              ), let absoluteSeek = section(
+                source,
+                from: "func seek(to seconds: Double)",
+                to: "    /// Relative seek"
+              ), let relativeSeek = section(
+                source,
+                from: "func seek(by seconds: Double)",
+                to: "    #if os(tvOS)"
+              ), let events = eventLoopSource(source) else { return false }
+        return ordered(
+            [
+                "callbackLoadToken(requiresLoadedFile: true)",
+                "getFlag(MPVProperty.pause)",
+                "parkPausedCacheAtCurrentPosition()",
+                "if cacheFlushFlight.current?.owner == owner",
+            ],
+            in: flush
+        )
+            && pauseState.contains("} else {")
+            && pauseState.contains("resumePausedCachePark()")
+            && pauseState.contains("if mpv != nil, let cap = activeReadAheadCap")
+            && !pauseState.contains("guard mpv != nil, let cap = activeReadAheadCap else { return }")
+            && absoluteSeek.contains("cancelPausedCacheParkForExplicitSeek()")
+            && relativeSeek.contains("cancelPausedCacheParkForExplicitSeek()")
+            && source.contains("private func cancelPausedCacheParkForExplicitSeek()")
+            && ordered(
+                [
+                    "completePausedCacheParkRecovery(",
+                    "completeCacheFlushFlightRecovery(",
+                ],
+                in: events
+            )
+            && policy.contains("mutating func completeOnProgress(")
+            && policy.contains("flight.phase == .settling")
+            && policy.contains("observedPosition >= flight.target + progressEpsilon")
+    }
+
     private static func hasLifecycleResetContract(_ source: String) -> Bool {
         guard let lifecycle = lifecycleSource(source),
               let stop = stopSource(source),
@@ -322,6 +429,7 @@ private enum MPVCacheFlushReceiptContractTests {
         return ordered(
             [
                 "cacheFlushFlight.reset()",
+                "pausedCachePark.reset()",
                 "loadProvenance.invalidate()",
             ],
             in: lifecycle
@@ -343,6 +451,9 @@ private enum MPVCacheFlushReceiptContractTests {
                 [
                     "cacheFlushFlight.consumeSyntheticEOF(owner: loadToken)",
                     "internal-cache-flush synthetic EOF suppressed",
+                    "pausedCachePark.consumeSyntheticEOF(owner: loadToken)",
+                    "paused-cache-park synthetic EOF suppressed",
+                    "pausedCachePark.reset(owner: loadToken)",
                     "cacheFlushFlight.reset(owner: loadToken)",
                     "propertyName: MPVProperty.endFileEof",
                 ],
@@ -367,6 +478,7 @@ private enum MPVCacheFlushReceiptContractTests {
                 "loadTokenLock.unlock()",
                 "if commandResult >= 0 {",
                 "finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)",
+                "pausedCachePark.reset()",
                 "mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)",
                 "activeReadAheadCap = appliedCap",
                 "baselineReadAheadCap = appliedCap",
@@ -421,6 +533,10 @@ private enum MPVCacheFlushReceiptContractTests {
               hasFiniteReceiptContract(controller))
         check("headroom/cache policy and seek-back cap remain outside the flight gate",
               hasPolicyOutsideGateContract(controller))
+        check("paused clamp parks its owner-bound target and reanchors only after observed resume",
+              hasPausedParkContract(controller, policy: policy))
+        check("pressure flushes park while paused and progress retires ordinary EOF ownership",
+              hasPausedPressureRoutingAndProgressCompletion(controller, policy: policy))
         check("load, invalidation, stop, EOF/error, and redirect lifecycle resets are exact",
               hasLifecycleResetContract(controller))
         check("accepted replacements finish old receipts before new-source bookkeeping",
@@ -613,8 +729,8 @@ private enum MPVCacheFlushReceiptContractTests {
               !hasLifecycleResetContract(redirectResetMutant))
 
         let replacementResetAfterCapMutant = replacingFirst(
-            "finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)\n            mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)",
-            with: "mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)\n            finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)",
+            "finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)\n            _ = pausedCachePark.reset()\n            mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)",
+            with: "mpv_set_property_string(mpv, \"demuxer-max-bytes\", appliedCap)\n            finishCacheFlushFlight(cacheFlushFlight.reset(), sampleLiveState: false)\n            _ = pausedCachePark.reset()",
             in: controller
         )
         check("hostile: accepted replacement finishes the old receipt before cap bookkeeping",

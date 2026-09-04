@@ -86,6 +86,18 @@ enum RemuxItemEndPolicyTests {
             "a real deferred failure remains an error when explicitly consumed",
             deferred.capture(.error("real failure"), generation: 12)
                 && deferred.consume(generation: 12) == .error("real failure"))
+        deferred.reset(generation: 13)
+        check(
+            "paused status failures defer one exact-generation error without claiming a terminal",
+            deferred.capture(.error("producer failed"), generation: 13)
+                && !deferred.capture(.error("duplicate"), generation: 13)
+                && deferred.consume(generation: 13) == .error("producer failed")
+                && deferred.consume(generation: 13) == nil)
+        deferred.reset(generation: 14)
+        check(
+            "paused status failure receipts cannot cross an item-generation replacement",
+            deferred.capture(.error("old item failed"), generation: 14)
+                && { deferred.reset(generation: 15); return deferred.consume(generation: 14) == nil }())
 
         check(
             "raw AVPlayer end remains content EOF",
@@ -382,6 +394,10 @@ enum RemuxItemEndPolicyTests {
             engine,
             from: "private func handleStatus(_ item: AVPlayerItem",
             to: "@objc private func didPlayToEnd")
+        let statusFailure = sourceSection(
+            engine,
+            from: "case .failed:",
+            to: "default:")
         check(
             "wiring: recovery ready cannot apply transport before async selection restoration",
             containsInOrder(readyHandler, [
@@ -438,6 +454,33 @@ enum RemuxItemEndPolicyTests {
                 && engine?.contains("case .error(let reason):") == true
                 && engine?.components(separatedBy:
                     "deferredTerminal.reset(generation: itemGeneration)").count == 5)
+        check(
+            "wiring: a paused AVPlayer status failure defers before every retry or demotion path",
+            containsInOrder(statusFailure, [
+                "if !playbackRequested {",
+                "switch currentRemuxItemEndDecision()",
+                "case .recoverablePublishedTail:",
+                "deferredPublishedTailRecoveryGeneration != itemGeneration",
+                "deferredPublishedTailRecoveryGeneration = itemGeneration",
+                "case .remuxFailure(let reason):",
+                "deferredTerminal.capture(.error(reason), generation: itemGeneration)",
+                "case .contentEOF:",
+                "deferredTerminal.capture(.error(reason), generation: itemGeneration)",
+                "return",
+                "if shouldRetryViaPlainRemux",
+            ]))
+        check(
+            "wiring: paused healthy status tail keeps the existing one-shot Play recovery generation fence",
+            containsInOrder(statusFailure, [
+                "case .recoverablePublishedTail:",
+                "guard deferredPublishedTailRecoveryGeneration != itemGeneration else { return }",
+                "deferredPublishedTailRecoveryGeneration = itemGeneration",
+            ])
+                && containsInOrder(engine, [
+                    "func play() {",
+                    "deferredPublishedTailRecoveryGeneration == itemGeneration",
+                    "retryFreshItemOnHealthyMount(",
+                ]))
 
         print("")
         if failures == 0 {

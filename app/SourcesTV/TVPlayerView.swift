@@ -915,6 +915,11 @@ struct TVPlayerView: View {
     @State private var terminalFinalityRefreshTarget: AppleCWTerminalRefreshTarget?
     @State private var terminalFinalityRefreshGeneration: Int?
     @State private var terminalFinalityRefreshTask: Task<Void, Never>?
+    /// Continue Watching can seed a direct-resume series with only the local/current-season rows. Keep a
+    /// separate request-owned refresh so manual Next can gain a later episode without waiting for EOF.
+    @State private var directResumeInventoryRefreshTarget: AppleCWTerminalRefreshTarget?
+    @State private var directResumeInventoryRefreshGeneration: Int?
+    @State private var directResumeInventoryRefreshTask: Task<Void, Never>?
     @State private var authoritativeSeriesEpisodes: [CoreVideo]?
     @State private var terminalRewindGate = AppleCWTerminalProgressGate()
     // "Still watching?" idle guard: after a long unattended stretch (no remote input for `idleWatchTimeout`,
@@ -1185,24 +1190,8 @@ struct TVPlayerView: View {
             }
             startStallWatchdog()
             scheduleHide(); startHideLoop(); noteInteraction()   // arm the "Still watching?" idle deadline at open
-            if episodes.isEmpty, let m = curMeta, loadedEpisodes.isEmpty {
-                // Direct resume launches with no meta loaded: fetch it behind playback
-                // so the sources panel shows THIS title (not whatever detail page was
-                // open last), and series get their episode list for Next/auto-advance.
-                Task { @MainActor in
-                    core.loadMeta(type: m.type, id: m.libraryId, streamType: m.type, streamId: m.videoId)
-                    guard m.usesSeriesLifecycle else { return }
-                    for _ in 0..<40 {
-                        if let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
-                           let vids = loaded.videos, !vids.isEmpty {
-                            loadedEpisodes = vids
-                            plog.info("episode list loaded behind direct resume: \(vids.count)")
-                            break
-                        }
-                        try? await Task.sleep(for: .milliseconds(250))
-                    }
-                }
-            }
+            hydrateDirectResumeMetadataForPlayerUI()
+            hydrateDirectResumeSeriesInventory()
             showInfo = true; selected = .play; scheduleHide()
             // The AV surface is intentionally withheld while an account resume lookup is unresolved, so its
             // synchronous `makeHostView` cannot mount a remux at zero before the real origin arrives.
@@ -1304,6 +1293,7 @@ struct TVPlayerView: View {
             cancelAssetSanityObservationDeadline()
             hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel(); avPostReplacementFirstFrameDeadline?.cancel(); libmpvResumeWatchdog?.cancel(); postFrameResumeSeekWatchdog?.cancel(); avToMPVHandoffTask?.cancel(); engineNoteTask?.cancel(); trickplayCaptureTimer?.cancel(); sleepTask?.cancel(); terminalAdvanceDeadlineTask?.cancel()
             cancelTerminalFinalityRefresh()
+            cancelDirectResumeInventoryRefresh()
             invalidateEpisodeResolution()
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Both engines
@@ -7786,6 +7776,87 @@ struct TVPlayerView: View {
         terminalFinalityRefreshTarget = nil
     }
 
+    /// A direct Continue Watching launch is allowed to upgrade its navigation inventory only from this
+    /// refresh's exact settled title response. In particular, `core.metaDetails` is a shared slot and may
+    /// still contain a covered detail page, so it is never read as authority here.
+    private func hydrateDirectResumeMetadataForPlayerUI() {
+        guard startedFromResume, let current = curMeta else { return }
+        // Sources and the in-player title panel retain their ordinary direct-resume hydration for movies
+        // and series. Episode inventory deliberately does not consume this shared slot; the fenced method
+        // below separately certifies a same-title response before changing Next/Prev navigation.
+        core.loadMeta(
+            type: current.type, id: current.libraryId,
+            streamType: current.type, streamId: current.videoId
+        )
+    }
+
+    private func hydrateDirectResumeSeriesInventory() {
+        guard startedFromResume, let launchMeta = curMeta, launchMeta.usesSeriesLifecycle else { return }
+        cancelDirectResumeInventoryRefresh()
+        directResumeInventoryRefreshTask = Task { @MainActor in
+            // The player surface may appear before its physical load token is published. Wait behind
+            // playback rather than delaying startup, then bind the request to that exact load.
+            for _ in 0..<40 {
+                guard !Task.isCancelled, !leftPlayback,
+                      let current = curMeta,
+                      current.libraryId == launchMeta.libraryId,
+                      current.videoId == launchMeta.videoId else { return }
+                guard let loadToken = coordinator.player?.activeLoadToken else {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    continue
+                }
+                let target = terminalRefreshTarget(for: current)
+                guard terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                directResumeInventoryRefreshTarget = target
+                let requestGeneration = core.beginAppleCWAuthoritativeMetaRefresh(
+                    type: current.type, id: current.libraryId,
+                    streamType: current.type, streamId: current.videoId
+                )
+                directResumeInventoryRefreshGeneration = requestGeneration
+                for attempt in 0..<16 {
+                    guard !Task.isCancelled,
+                          terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                    let receipt = AppleCWMetaRefreshReceipt(
+                        requestGeneration: core.appleCWMetaRefreshReceipt?.requestGeneration,
+                        selectedMetaID: core.appleCWMetaRefreshReceipt?.selectedMetaID,
+                        loadedMetaID: core.appleCWMetaRefreshReceipt?.loadedMetaID,
+                        settled: core.appleCWMetaRefreshReceipt?.settled == true,
+                        requestedStreamID: core.appleCWMetaRefreshReceipt?.requestedStreamID
+                    )
+                    if AppleCWMetaRefreshAuthorityPolicy.accepts(
+                        receipt, forRequestGeneration: requestGeneration,
+                        expectedLibraryID: current.libraryId, expectedStreamID: current.videoId
+                    ), let loaded = core.appleCWMetaRefreshDetails?.appleCWTerminalFullMeta(
+                        for: current.libraryId, streamID: current.videoId
+                    ), let candidate = EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+                        from: loaded.videos ?? [],
+                        replacing: episodes.isEmpty ? loadedEpisodes : episodes
+                    ) {
+                        guard !Task.isCancelled,
+                              terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+                        loadedEpisodes = candidate
+                        authoritativeSeriesEpisodes = candidate
+                        plog.info("episode inventory refreshed behind direct resume: \(candidate.count)")
+                        return
+                    }
+                    guard attempt < 15 else { return }
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                return
+            }
+        }
+    }
+
+    private func cancelDirectResumeInventoryRefresh() {
+        directResumeInventoryRefreshTask?.cancel()
+        directResumeInventoryRefreshTask = nil
+        if let generation = directResumeInventoryRefreshGeneration {
+            core.cancelAppleCWMetaRefresh(generation: generation)
+        }
+        directResumeInventoryRefreshGeneration = nil
+        directResumeInventoryRefreshTarget = nil
+    }
+
     private var terminalRefreshResult: AppleCWSeriesRefreshResult {
         if terminalInventoryAuthority == .authoritativeFullSeries,
            EpisodePlaybackIdentity.appleCWSeriesInventory(
@@ -7810,6 +7881,7 @@ struct TVPlayerView: View {
         guard let loadToken = coordinator.player?.activeLoadToken else { return }
         let target = terminalRefreshTarget(for: m)
         guard terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
+        cancelDirectResumeInventoryRefresh()
         cancelTerminalFinalityRefresh()
         terminalFinalityRefreshTarget = target
         let requestGeneration = core.beginAppleCWAuthoritativeMetaRefresh(
@@ -9479,6 +9551,7 @@ struct TVPlayerView: View {
         let exitLoadToken = coordinator.player?.activeLoadToken
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
+        cancelDirectResumeInventoryRefresh()
         exitAcceptedLoadToken = assetSanityAccepted ? exitLoadToken : nil
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
         refindTask?.cancel(); refindTask = nil; refinding = false   // a settling re-find must not retry into a left player

@@ -17,6 +17,94 @@ enum CacheFlushDisposition: Equatable {
     case skipped
 }
 
+/// A paused-file cache drop must not issue its recovery seek until libmpv has observed `pause=false`.
+/// `drop-buffers` is still needed to release the resident forward payload while a viewer is away, but an
+/// exact seek submitted against a paused demuxer can leave the resumed range request stranded. This tiny,
+/// owner-bound receipt keeps the one position that must be recovered and consumes only the EOF caused by that
+/// exact internal drop. It deliberately has no timer: a long pause is valid, and a replacement/invalidation
+/// is the only authority allowed to discard its target before resume.
+struct PausedCachePark<Owner: Equatable> {
+    struct Receipt: Equatable {
+        enum Phase: Equatable {
+            case parked
+            case recovering
+        }
+
+        let owner: Owner
+        let target: Double
+        let targetArgument: String
+        var syntheticEOFAvailable: Bool
+        var phase: Phase
+    }
+
+    private(set) var current: Receipt?
+
+    mutating func install(owner: Owner, target: Double, targetArgument: String) -> Receipt? {
+        guard target.isFinite, target > 0, !targetArgument.isEmpty, current == nil else { return nil }
+        let receipt = Receipt(
+            owner: owner,
+            target: target,
+            targetArgument: targetArgument,
+            syntheticEOFAvailable: true,
+            phase: .parked
+        )
+        current = receipt
+        return receipt
+    }
+
+    func owns(_ owner: Owner) -> Bool { current?.owner == owner }
+
+    /// Consume only the one EOF that `drop-buffers` may synthesize. Keep the position parked: it is still the
+    /// recovery target when the viewer eventually resumes.
+    mutating func consumeSyntheticEOF(owner: Owner) -> Bool {
+        guard var receipt = current,
+              receipt.owner == owner,
+              receipt.syntheticEOFAvailable else { return false }
+        receipt.syntheticEOFAvailable = false
+        current = receipt
+        return true
+    }
+
+    /// The pause=false edge begins recovery but deliberately retains ownership until libmpv proves it reached
+    /// the parked target. A delayed EOF from the earlier `drop-buffers` may arrive after this edge.
+    mutating func beginRecovery(owner: Owner) -> Receipt? {
+        guard var receipt = current,
+              receipt.owner == owner,
+              receipt.phase == .parked else { return nil }
+        receipt.phase = .recovering
+        current = receipt
+        return receipt
+    }
+
+    /// Positive position progress after the re-anchor is the recovery completion edge. Do not use command
+    /// acceptance, nor merely a repeat sample at the old paused position: neither proves the resumed demuxer
+    /// has consumed the target range after the internal seek.
+    @discardableResult
+    mutating func completeRecovery(
+        owner: Owner,
+        observedPosition: Double,
+        progressEpsilon: Double
+    ) -> Receipt? {
+        guard let receipt = current,
+              receipt.owner == owner,
+              receipt.phase == .recovering,
+              observedPosition.isFinite,
+              progressEpsilon.isFinite,
+              progressEpsilon >= 0,
+              observedPosition >= receipt.target + progressEpsilon else { return nil }
+        current = nil
+        return receipt
+    }
+
+    @discardableResult
+    mutating func reset(owner: Owner? = nil) -> Receipt? {
+        guard let receipt = current else { return nil }
+        guard owner == nil || owner == receipt.owner else { return nil }
+        current = nil
+        return receipt
+    }
+}
+
 /// One controller-local destructive cache operation. `Owner` is the exact loaded-file token in production; the
 /// standalone policy harness uses an integer so these lifecycle rules remain testable without libmpv/UIKit.
 struct CacheFlushFlight<Owner: Equatable> {
@@ -171,6 +259,26 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
         return finish(result: result)
     }
 
+    /// A token-fenced positive position sample proves the exact recovery seek has actually resumed playback.
+    /// Retire the flight before its fallback deadline so a later natural EOF is not misclassified as the
+    /// `drop-buffers` synthetic edge. A latched seek error still belongs to the timeout receipt instead.
+    @discardableResult
+    mutating func completeOnProgress(
+        owner: Owner,
+        observedPosition: Double,
+        progressEpsilon: Double
+    ) -> CacheFlushFlight<Owner>? {
+        guard let flight = current,
+              flight.owner == owner,
+              flight.phase == .settling,
+              flight.result == .pending,
+              observedPosition.isFinite,
+              progressEpsilon.isFinite,
+              progressEpsilon >= 0,
+              observedPosition >= flight.target + progressEpsilon else { return nil }
+        return finish(result: .commandAccepted)
+    }
+
     @discardableResult
     mutating func reset() -> CacheFlushFlight<Owner>? {
         guard current != nil else { return nil }
@@ -227,6 +335,20 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
 /// the 2 GB Apple TV HD (`PerformanceMode.reduced`). Shedding under GENUINE low headroom is therefore
 /// preserved unchanged: the guard only removes the FALSE positives.
 enum VortXCacheShedPolicy {
+
+    /// Do not create a paused cache park when a known VOD duration says the playhead is effectively at EOF.
+    /// There is then no meaningful post-seek progress edge to retire the one-shot synthetic-EOF fence, so the
+    /// genuine terminal event could be hidden. Unknown/non-finite duration fails closed: callers may still
+    /// reduce the cap, but must not drop/fence because terminal proximity cannot be proven.
+    static let pausedCacheTerminalGuardSeconds = 2.0
+
+    static func shouldParkPausedCache(target: Double, knownDuration: Double?) -> Bool {
+        guard target.isFinite, target > 0 else { return false }
+        guard let knownDuration,
+              knownDuration.isFinite,
+              knownDuration > 0 else { return false }
+        return target < knownDuration - pausedCacheTerminalGuardSeconds
+    }
 
     /// The pinned MPVKit build does not move the forward demuxer payload out of process RAM when
     /// `cache-on-disk` is enabled. Keep this as the single capability authority for both setup and per-load

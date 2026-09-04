@@ -2816,9 +2816,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 self.externalSubActive = true
                 self.externalSubLabel = (title: title, lang: lang)
                 // Turn off any embedded/HLS legible track so we don't render two subtitle streams at once.
-                if let group = self.subGroup, let item = self.player.currentItem {
-                    item.select(nil, in: group)
-                }
+                // Use the normal selection path rather than selecting the AVPlayerItem directly. Besides
+                // issuing the deselect, it refreshes the picker from AVFoundation's authoritative state and
+                // schedules bounded settle reads when a rendition has not switched synchronously.
+                self.select(-1, in: self.subGroup)
                 self.subtitleOverlay?.applyStyle()
                 self.updateSubtitleOverlay(atClock: self.player.currentTime().seconds)
                 // Publish unconditionally: the external row is now part of the track list, so the picker must
@@ -3679,6 +3680,34 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 }
             }
             VXProbe.event("player", "failed \(ns?.localizedDescription ?? "?")")
+            // AVFoundation may mark a live HLS item failed after the viewer explicitly paused it. Do not let
+            // that background status transition replace the item or demote engines: the end-notification paths
+            // already defer their exact terminal receipts until the next explicit Play. A healthy remux tail is
+            // special because its current playlist can be replaced once more media is published; preserve that
+            // one-shot recovery edge for play(), while real producer and direct-item failures remain deferred
+            // error receipts for this exact generation.
+            if !playbackRequested {
+                switch currentRemuxItemEndDecision() {
+                case .recoverablePublishedTail:
+                    guard deferredPublishedTailRecoveryGeneration != itemGeneration else { return }
+                    deferredPublishedTailRecoveryGeneration = itemGeneration
+                    DiagnosticsLog.log(
+                        "avplayer",
+                        "deferred healthy published-tail status recovery while committed transport intent is paused generation=\(itemGeneration)")
+                case .remuxFailure(let reason):
+                    guard deferredTerminal.capture(.error(reason), generation: itemGeneration) else { return }
+                    DiagnosticsLog.log(
+                        "avplayer",
+                        "deferred producer status failure while committed transport intent is paused generation=\(itemGeneration)")
+                case .contentEOF:
+                    let reason = ns?.localizedDescription ?? "item failed"
+                    guard deferredTerminal.capture(.error(reason), generation: itemGeneration) else { return }
+                    DiagnosticsLog.log(
+                        "avplayer",
+                        "deferred item status failure while committed transport intent is paused generation=\(itemGeneration)")
+                }
+                return
+            }
             // #147 reactive net: a RAW (non-remux) mount that failed because AVFoundation cannot demux the
             // container ("Cannot Open" - the raw-MKV signature, since AVFoundation has no Matroska demuxer)
             // gets ONE retry through the PLAIN remux lane BEFORE the libmpv demote, so an MKV the proactive
@@ -4198,6 +4227,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // source topology is the exception below: VortX must explicitly keep its selected source row and
             // audible in-band rendition aligned.
             player.appliesMediaSelectionCriteriaAutomatically = false
+            // An external subtitle fetch can finish while the legible group is still loading. The group then
+            // arrives after the immediate deselect above could do anything, so explicitly deselect it now.
+            // This intentionally runs only for the overlay-active state: native-only selection keeps the
+            // framework's current legible choice untouched.
+            if externalSubActive {
+                select(-1, in: sg)
+            }
             let sourceBackedAudio = !remuxSourceAudioTracks.isEmpty
             let selectedSourcePublished = selectedRemuxAudioSourceIndex.map { selected in
                 remuxSourceAudioTracks.contains(where: { $0.sourceIndex == selected })

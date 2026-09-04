@@ -64,6 +64,13 @@ enum StremioServer {
 
 enum PlaybackSettings { static let torrentsDisabled = false }
 
+// CoreModels routes community JavaScript streams through this production collaborator. The identity suite
+// does not exercise that transport, so keep the standalone compile focused on the model predicates.
+final class CommunityStreamGateway {
+    static let shared = CommunityStreamGateway()
+    func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { upstream }
+}
+
 // MARK: - Assertions
 
 private var failures = 0
@@ -138,9 +145,13 @@ private func usesGenerationOwnedRetryResume(_ playerSource: String) -> Bool {
         playerSource, from: "private func loadRetryIntoPlayer(",
         to: "/// A pre-playback failure"
     )
+    let recovery = slice(
+        playerSource, from: "private func recoverCurrentNativeDebridLink(",
+        to: "/// Compatibility entry for Continue Watching."
+    )
     let sameSource = slice(
         playerSource, from: "private func retryResumeSameSource()",
-        to: "private func handleLoadFailure("
+        to: "/// MID-PLAY libmpv FAILURE"
     )
     let retryLoad = slice(
         playerSource, from: "private func retryLoad(",
@@ -156,12 +167,17 @@ private func usesGenerationOwnedRetryResume(_ playerSource: String) -> Bool {
         "if !live && resumeTarget > 5",
         "nudgeResume(to: resumeTarget)",
     ])
-        && containsInOrder(sameSource, [
+        && containsInOrder(recovery, [
+            "resumeRetryGeneration &+= 1",
+            "let generation = resumeRetryGeneration",
             "guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }",
             "let retryResume = retryResumeTarget()",
+            "EpisodePlaybackIdentity.asyncMediaResultIsCurrent(",
+            "capturedGeneration: generation, currentGeneration: resumeRetryGeneration",
             "coordinator.player?.activeLoadToken == retryLoadToken",
             "loadRetryIntoPlayer(",
         ])
+        && sameSource.contains("recoverCurrentNativeDebridLink(reason: \"resume\")")
         && containsInOrder(retryLoad, [
             "let resume = retryResumeTarget()",
             "loadRetryIntoPlayer(",
@@ -490,6 +506,46 @@ private struct EpisodePlaybackIdentityTests {
             from: [s1e9, s1Finale, video(id: "tt-show:2:2", season: 2, episode: 2)],
             replacing: fullSeries
         ) == nil, "equal-count coordinate mismatch cannot certify the launch inventory")
+
+        // Continue Watching may enter at S1E2 with an apparently valid but partial local seed. A fresh,
+        // exact authoritative response must make manual Next immediately target S1E3, without waiting for
+        // EOF; an empty seed is also valid, while a different title is never allowed to replace it.
+        let directE1 = video(id: "direct-show:1:1", season: 1, episode: 1)
+        let directE2 = video(id: "direct-show:1:2", season: 1, episode: 2)
+        let directE3 = video(id: "direct-show:1:3", season: 1, episode: 3)
+        let partialDirectSeed = [directE1, directE2]
+        let refreshedDirectInventory = [directE1, directE2, directE3]
+        let partialDirectBackfill = EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+            from: refreshedDirectInventory, replacing: partialDirectSeed
+        )
+        let manualNextID = partialDirectBackfill.flatMap { inventory -> String? in
+            guard let current = inventory.firstIndex(where: { $0.id == directE2.id }),
+                  current + 1 < inventory.count else { return nil }
+            return inventory[current + 1].id
+        }
+        expect(manualNextID == directE3.id,
+               "partial direct-resume seed gains S1E3 for manual Next before EOF")
+        expect(EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+            from: refreshedDirectInventory, replacing: []
+        )?.map(\.id) == refreshedDirectInventory.map(\.id),
+               "empty direct-resume seed accepts the exact authoritative inventory")
+        expect(EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
+            from: [video(id: "other-show:1:1", season: 1, episode: 1), directE2, directE3],
+            replacing: partialDirectSeed
+        ) == nil, "unrelated title inventory cannot replace a direct-resume seed")
+
+        let tvPlayer = source("SourcesTV/TVPlayerView.swift")
+        let iosPlayer = source("Sources/PlayerScreen.swift")
+        expect(tvPlayer.contains("hydrateDirectResumeMetadataForPlayerUI()")
+               && tvPlayer.contains("hydrateDirectResumeSeriesInventory()")
+               && tvPlayer.contains("core.loadMeta(")
+               && tvPlayer.contains("beginAppleCWAuthoritativeMetaRefresh"),
+               "tvOS direct resume keeps source UI hydration and fences episode inventory separately")
+        expect(iosPlayer.contains("hydrateDirectResumeMetadataForPlayerUI()")
+               && iosPlayer.contains("hydrateDirectResumeSeriesInventory()")
+               && iosPlayer.contains("core.loadMeta(")
+               && iosPlayer.contains("loadedSeriesVideoMetadata = loaded.videos ?? []"),
+               "iOS direct resume keeps source UI hydration and uses exact metadata for episode routing")
 
         // Execute the real production async resolver-admission helper with CoreVideo values from the compiled
         // CoreModels.swift. The exact refreshed object must reach the metadata resolver directly for both empty

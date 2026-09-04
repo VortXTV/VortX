@@ -4111,6 +4111,25 @@ enum PlayerLiveContractTests {
         // DEFAULT=YES / AUTOSELECT rows, so leaving it set is a live fight with every explicit selection.
         check("wiring: VortX owns selection, so automatic media-selection criteria are cleared",
               groupLoad?.contains("player.appliesMediaSelectionCriteriaAutomatically = false") == true)
+        // The external overlay may finish downloading before AVFoundation asynchronously discovers the
+        // legible group. Once it does, the late group must be explicitly deselected after automatic criteria
+        // are disabled, otherwise its default rendition can render under the VortX-owned overlay. The normal
+        // external-load path must use the same selection helper so the picker receives its authoritative
+        // refresh and bounded settle reads immediately when the group was already loaded.
+        check("wiring: an external overlay excludes a late-discovered native subtitle group",
+              sourceContainsInOrder(groupLoad, [
+                  "player.appliesMediaSelectionCriteriaAutomatically = false",
+                  "if externalSubActive {",
+                  "select(-1, in: sg)",
+              ]))
+        check("wiring: immediate external subtitle activation uses the authoritative deselect helper",
+              sourceContainsInOrder(externalSubtitleLoad, [
+                  "self.externalSubActive = true",
+                  "self.externalSubLabel = (title: title, lang: lang)",
+                  "self.select(-1, in: self.subGroup)",
+                  "self.publishSelectionTracks()",
+              ])
+                  && externalSubtitleLoad?.contains("item.select(nil, in: group)") == false)
         check("wiring: AVPlayer status clears stale cache state when playback resumes",
               sourceContainsInOrder(avTimeControl, [
                   "let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate",

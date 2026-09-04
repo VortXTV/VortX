@@ -493,6 +493,40 @@ check("single-flight: exact settle clears the current flight once",
         && flightGate.current == nil
         && flightGate.settle(id: secondFlight.id, owner: 1) == nil)
 
+var eofBeforeProgressGate = CacheFlushSingleFlight<Int>()
+let eofBeforeProgressFlight = eofBeforeProgressGate.install(
+    owner: 31,
+    reason: .memoryWarning,
+    target: 310,
+    targetArgument: "310.000",
+    startUptime: 31,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+_ = eofBeforeProgressGate.markDropSucceeded(id: eofBeforeProgressFlight.id, owner: 31)
+_ = eofBeforeProgressGate.markSeekCommandAccepted(id: eofBeforeProgressFlight.id, owner: 31)
+check("single-flight: exact synthetic EOF before observed progress is suppressed once",
+      eofBeforeProgressGate.consumeSyntheticEOF(owner: 31)?.result == .commandAccepted
+        && eofBeforeProgressGate.current == nil
+        && eofBeforeProgressGate.consumeSyntheticEOF(owner: 31) == nil)
+
+var progressCompletionGate = CacheFlushSingleFlight<Int>()
+let progressCompletionFlight = progressCompletionGate.install(
+    owner: 32,
+    reason: .proactiveMemoryPressure,
+    target: 320,
+    targetArgument: "320.000",
+    startUptime: 32,
+    timeoutWorkItem: DispatchWorkItem { }
+)
+_ = progressCompletionGate.markDropSucceeded(id: progressCompletionFlight.id, owner: 32)
+_ = progressCompletionGate.markSeekCommandAccepted(id: progressCompletionFlight.id, owner: 32)
+check("single-flight: only exact-owner positive progress retires EOF ownership before timeout",
+      progressCompletionGate.completeOnProgress(owner: 33, observedPosition: 321, progressEpsilon: 0.25) == nil
+        && progressCompletionGate.completeOnProgress(owner: 32, observedPosition: 320, progressEpsilon: 0.25) == nil
+        && progressCompletionGate.completeOnProgress(owner: 32, observedPosition: 320.25, progressEpsilon: 0.25)?.result == .commandAccepted
+        && progressCompletionGate.current == nil
+        && progressCompletionGate.consumeSyntheticEOF(owner: 32) == nil)
+
 var errorGate = CacheFlushSingleFlight<Int>()
 let dropErrorFlight = errorGate.install(
     owner: 11,
@@ -592,6 +626,48 @@ _ = independentA.install(
 check("single-flight: two helper instances have independent gates",
       independentA.current != nil && independentB.current == nil
         && independentB.admit(owner: 10) == .started)
+
+// MARK: - Paused cache park (deterministic; the destructive drop must defer its seek)
+
+var pausedPark = PausedCachePark<Int>()
+let parked = pausedPark.install(owner: 21, target: 721.125, targetArgument: "721.125")
+check("paused park: installs one finite, owner-bound recovery target",
+      parked?.owner == 21 && parked?.target == 721.125
+        && parked?.targetArgument == "721.125" && parked?.syntheticEOFAvailable == true)
+check("paused park: a same-owner coalesced clamp cannot replace the saved target",
+      pausedPark.install(owner: 21, target: 900, targetArgument: "900.000") == nil
+        && pausedPark.current?.targetArgument == "721.125")
+check("paused park: the parked target retains its one-shot synthetic EOF fence before resume",
+      pausedPark.current?.syntheticEOFAvailable == true
+        && pausedPark.current?.targetArgument == "721.125")
+check("paused park: wrong owner cannot consume, begin recovery, or clear another file's target",
+      !pausedPark.consumeSyntheticEOF(owner: 22)
+        && pausedPark.beginRecovery(owner: 22) == nil
+        && pausedPark.reset(owner: 22) == nil
+        && pausedPark.current?.owner == 21)
+check("paused park: observed resume begins exact-owner recovery without discarding the EOF fence",
+      pausedPark.beginRecovery(owner: 21)?.targetArgument == "721.125"
+        && pausedPark.current?.phase == .recovering
+        && pausedPark.completeRecovery(owner: 21, observedPosition: 721.125, progressEpsilon: 0.25) == nil)
+check("paused park: late first synthetic EOF after resume is suppressed, later EOF is genuine",
+      pausedPark.consumeSyntheticEOF(owner: 21)
+        && !pausedPark.consumeSyntheticEOF(owner: 21)
+        && pausedPark.current?.targetArgument == "721.125")
+check("paused park: only positive position progress after the parked target completes recovery",
+      pausedPark.completeRecovery(owner: 21, observedPosition: 721.375, progressEpsilon: 0.25)?.targetArgument == "721.125"
+        && pausedPark.current == nil)
+check("paused park: replacement/invalidation clears only its exact owner",
+      pausedPark.install(owner: 23, target: 23, targetArgument: "23.000") != nil
+        && pausedPark.reset(owner: 23)?.owner == 23
+        && pausedPark.current == nil)
+check("paused park eligibility: the final two known seconds never arm a destructive drop or EOF fence",
+      !P.shouldParkPausedCache(target: 998, knownDuration: 1_000)
+        && !P.shouldParkPausedCache(target: 999.999, knownDuration: 1_000)
+        && !P.shouldParkPausedCache(target: 1_000, knownDuration: 1_000))
+check("paused park eligibility: ordinary mid-file remains eligible, unknown duration fails closed",
+      P.shouldParkPausedCache(target: 997.999, knownDuration: 1_000)
+        && !P.shouldParkPausedCache(target: 720, knownDuration: nil)
+        && !P.shouldParkPausedCache(target: 720, knownDuration: .infinity))
 
 // Source contracts here are intentionally small and semantic: they keep this executable harness useful even
 // when the controller cannot be compiled outside the Apple target. The full command/lifecycle mutants live in
