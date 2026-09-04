@@ -4154,6 +4154,7 @@ final class MPVMetalViewController: PlatformViewController {
                                                     callbackToken: loadToken,
                                                     activeToken: self.activeLoadToken
                                                   ) else { return }
+                                            #if canImport(UIKit)
                                             self.completePausedCacheParkRecovery(
                                                 owner: loadToken,
                                                 observedPosition: value
@@ -4162,6 +4163,7 @@ final class MPVMetalViewController: PlatformViewController {
                                                 owner: loadToken,
                                                 observedPosition: value
                                             )
+                                            #endif
                                         }
                                     }
                                 }
