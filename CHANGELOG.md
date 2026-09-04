@@ -6,23 +6,33 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.4.0-beta.2 (build 236)
 
-This Apple-only beta carries the post-Beta 1 playback, subtitle, navigation, library, and Mac fixes now on the canonical Apple branch. Android, sync projection, and the unfinished add-on and worker work are not attached to this build and remain in the next phase. Please test this beta on your own Apple devices, especially the Dolby Vision and subtitle cases below.
+This Apple-only beta carries the playback, subtitle, navigation, library, and Mac fixes collected since Beta 1. Android is not attached to this build. Please test this beta on your own Apple devices, especially the Dolby Vision and subtitle cases below.
 
 ### What's fixed
 
 **Playback recovery is less likely to mistake waiting for failure.** AVPlayer and the remux path now keep recovery tied to the current item, producer, and playback generation. Recovery work from an older item cannot take over a newer one, and bounded reconnect handling avoids turning cleanup into a false successful end. Apple TV, iPhone, iPad, and Mac.
 
-**Dolby Vision fallback is admitted more carefully.** The new fallback work keeps a healthy Dolby Vision path from being demoted merely because a recovery callback or temporary stall arrived late. The source and focused contracts are under review for this beta; physical Apple TV Dolby Vision and HDR continuity still need confirmation, so this is not a claim of universal device success. Apple TV.
+**Dolby Vision stays on the intended path through recovery.** A healthy Dolby Vision playback path is not demoted merely because a recovery callback or temporary stall arrives late. Physical Apple TV long-run Dolby Vision and HDR continuity testing is still useful, especially on long and high-bitrate titles. Apple TV.
 
-**Subtitles retain the right identity and timing.** Distinct subtitle events no longer collapse just because their timestamps match. The new WebVTT segment-window repair keeps a cue that spans a segment boundary at its original absolute start time instead of clipping it to the segment start. The implementation and parsed-timing tests are under review; please report any repeated or shifted cues. Apple platforms.
+**Subtitles retain the right identity, timing, and full cue mapping.** Distinct subtitle events no longer collapse merely because their timestamps match. Native subtitle settlement maps a complete cue to the correct rendition, keeps a cue that spans a segment boundary at its original absolute start time, and isolates an optional subtitle failure from video playback. Please report any repeated, missing, or shifted cues. Apple platforms.
 
 **Pausing no longer invites an unwanted recovery or episode change.** A paused item stays paused while delayed playback and end notifications settle, and the selected playback intent remains attached to the current session. Apple TV, iPhone, iPad, and Mac.
 
 **Continue Watching resumes the title you selected.** Episode handoff and library state stay tied to the loaded title and account, including after a profile transition or a delayed refresh. Apple platforms.
 
+**Continue Watching recovers when a saved source has gone stale.** Failed resume attempts can retry the title's sources, while a manual Next action from Continue Watching and the normal next-episode preload use the right episode and source. Apple TV, iPhone, iPad, and Mac.
+
 **Episode navigation keeps its focus.** Up from an episode remains in the episode list until the defined boundary, and the next-episode handoff retains the expected focus instead of jumping to an unrelated action. Apple TV.
 
+**Library and watched changes stay current.** Recent watched and library actions update the visible title promptly, and Continue Watching avoids duplicate entries for the same episode or movie. Apple platforms.
+
 **Source and audio choices survive supported recovery.** A source refresh or player replacement retains the selected identity and audio intent while stale callbacks are fenced out. Apple platforms.
+
+**TorBox sources get a fair retry.** A temporary provider response can recover without discarding the selected title or making you start over. Apple platforms.
+
+**More title details respect your preferences.** Movie source lists can be filtered by language, and tabs on the Mac stay with the profile that opened them. Apple platforms.
+
+**Plex sign-in handles a PIN step.** Plex accounts that require a PIN can complete the connection from the app instead of stopping at the first sign-in screen. Apple platforms.
 
 **Mac settings and hero screens are restored.** The floating Settings shell is back, and the Mac hero uses a safe fallback when optional artwork is unavailable. Apple silicon Mac.
 
@@ -30,11 +40,13 @@ This Apple-only beta carries the post-Beta 1 playback, subtitle, navigation, lib
 
 ### Still needs device testing
 
-The new Dolby Vision freeze/stall recovery, HDR fallback admission, and cross-segment subtitle timing repairs have source and focused-test evidence, but their final implementation review and physical Apple TV verification are still required. A passing build is not proof that every television preserves Dolby Vision or that every source produces correct subtitle timing.
+Physical Apple TV long-run testing remains useful for Dolby Vision continuity, HDR fallback, subtitle timing, and recovery after extended pauses or network reconnects. A passing build is not proof that every television, source, or provider behaves identically.
 
-### Android and next phase
+### Android
 
-Android playback parity, progressive Usenet, add-on projection, mirror-off core actions, relay deployment, and native credential-backup work are deliberately excluded from this Apple-only beta. They continue as the next phase and will return only as a separately reviewed, integrated release set.
+Android is not attached to this Apple-only beta. Android playback parity and the broader sync and provider work continue separately and will return in a later integrated release.
+
+## 0.4 Beta 1 (build 235)
 
 ### Playback and Dolby Vision
 
