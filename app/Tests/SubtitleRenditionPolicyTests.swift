@@ -56,18 +56,40 @@ func tx3g(_ text: String, trailing: [UInt8] = []) -> Data {
 /// Parse a WebVTT document back into cues, so assertions can be made about the DOCUMENT rather than about a
 /// substring of it. A body line that accidentally reads as timing, or a blank line inside a body, changes the
 /// parse and therefore fails a test even though every asserted substring is still present.
-func parseVTT(_ document: String) -> (header: String, cues: [(time: String, body: String)]) {
+func parseVTT(_ document: String) -> (header: String, cues: [(id: String?, time: String, body: String)]) {
     let blocks = document.components(separatedBy: "\n\n")
-    var cues: [(String, String)] = []
+    var cues: [(String?, String, String)] = []
     for block in blocks.dropFirst() {
         let lines = block.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
             .filter { !$0.isEmpty }
         // A cue may carry a stable identifier line before its timing line (cue-…); find the timing line
         // wherever it sits and treat everything after it as the body.
         guard let timeIndex = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
-        cues.append((lines[timeIndex], lines[(timeIndex + 1)...].joined(separator: "\n")))
+        let id = timeIndex > 0 && lines[timeIndex - 1].hasPrefix("cue-")
+            ? lines[timeIndex - 1] : nil
+        cues.append((id, lines[timeIndex], lines[(timeIndex + 1)...].joined(separator: "\n")))
     }
     return (blocks.first ?? "", cues)
+}
+
+func vttSeconds(_ timestamp: String) -> Double {
+    let components = timestamp.split(separator: ":")
+    guard components.count == 3,
+          let hours = Double(components[0]),
+          let minutes = Double(components[1]),
+          let seconds = Double(components[2]) else { return .nan }
+    return hours * 3_600 + minutes * 60 + seconds
+}
+
+func mappedInterval(_ cue: (id: String?, time: String, body: String), header: String) -> (start: Double, end: Double) {
+    let timestamps = cue.time.components(separatedBy: " --> ")
+    let mpegTicks = header.split(separator: "\n").first(where: { $0.hasPrefix("X-TIMESTAMP-MAP=") })
+        .flatMap { line in
+            line.split(separator: ",").first(where: { $0.contains("MPEGTS:") })
+                .flatMap { Int64($0.split(separator: ":").last ?? "") }
+        } ?? 0
+    let mapSeconds = Double(mpegTicks) / 90_000
+    return (vttSeconds(timestamps[0]) + mapSeconds, vttSeconds(timestamps[1]) + mapSeconds)
 }
 
 /// The largest number of cues that are on screen together at any instant of `cues`. Simultaneity can only rise
@@ -962,7 +984,12 @@ let nextLocalSegment = parseVTT(Policy.webVTTDocument(
     cues: [adjacentSegmentCue], segmentStart: 12.375, segmentEnd: 18.625))
 check("doc: adjacent segment copies retain the exact same absolute interval",
       nextLocalSegment.header == localSegment.header
-        && nextLocalSegment.cues.first?.time == "00:00:09.000 --> 00:00:14.000")
+        && nextLocalSegment.cues.first?.time == "00:00:09.000 --> 00:00:14.000"
+        && mappedInterval(localSegment.cues[0], header: localSegment.header).start == 9
+        && mappedInterval(localSegment.cues[0], header: localSegment.header).end == 14
+        && mappedInterval(nextLocalSegment.cues[0], header: nextLocalSegment.header).start == 9
+        && mappedInterval(nextLocalSegment.cues[0], header: nextLocalSegment.header).end == 14
+        && localSegment.cues[0].id == nextLocalSegment.cues[0].id)
 let firstBoundaryFragment = parseVTT(Policy.webVTTDocument(
     cues: [adjacentSegmentCue], segmentStart: 6, segmentEnd: 12))
 let secondBoundaryFragment = parseVTT(Policy.webVTTDocument(
@@ -989,13 +1016,28 @@ check("doc: distinct proven ASS events keep distinct IDs in the generated docume
       provenanceDocument.cues.count == 2 && provenanceDocument.cues[0].body == "same"
         && provenanceDocument.cues[1].body == "same"
         && provenanceDocument.cues[0].time == provenanceDocument.cues[1].time)
+check("doc: generated IDs distinguish the two proven ASS events",
+      provenanceDocument.cues[0].id != nil
+        && provenanceDocument.cues[1].id != nil
+        && provenanceDocument.cues[0].id != provenanceDocument.cues[1].id)
+// The producer has already subtracted a 900s source origin before this policy sees the packet.
+let alreadyRebasedCue = Cue(start: 9, end: 14, text: "rebased")
+let rebasedDocument = parseVTT(Policy.webVTTDocument(
+    cues: [alreadyRebasedCue], segmentStart: 9, segmentEnd: 14))
+check("doc: a source-origin 900s cue already rebased to 9..14 is never offset twice",
+      mappedInterval(rebasedDocument.cues[0], header: rebasedDocument.header).start == 9
+        && mappedInterval(rebasedDocument.cues[0], header: rebasedDocument.header).end == 14)
 let wrappedSeconds = Double(8_589_934_592) / 90_000
 let wrappedTimestamp = Policy.webVTTDocument(
     cues: [Cue(start: wrappedSeconds, end: wrappedSeconds + 1, text: "wrap")],
     segmentStart: wrappedSeconds,
     segmentEnd: wrappedSeconds + 2)
 check("doc: MPEGTS timestamp map wraps at the 33-bit presentation timestamp boundary",
-      wrappedTimestamp.contains("MPEGTS:0,LOCAL:00:00:00.000"))
+      parseVTT(wrappedTimestamp).header.contains("MPEGTS:0,LOCAL:00:00:00.000")
+        && abs(mappedInterval(parseVTT(wrappedTimestamp).cues[0], header: parseVTT(wrappedTimestamp).header).start
+            - wrappedSeconds) < 0.001
+        && abs(mappedInterval(parseVTT(wrappedTimestamp).cues[0], header: parseVTT(wrappedTimestamp).header).end
+            - (wrappedSeconds + 1)) < 0.001)
 
 // MARK: - Served documents, end to end
 
