@@ -184,9 +184,19 @@ class DirectLinkDisplayGroupsTest {
         assertCallbackAbandonsBeforeRoute(phone, "// System Back closes the detail overlay", "BackHandler {", "DetailScreen(", "detailVm.abandonPlaybackResolve()")
         assertCallbackAbandonsBeforeRoute(phone, "DetailScreen(\n                    viewModel = detailVm,", "onBack = {", "// DetailScreen supplies", "detailVm.abandonPlaybackResolve()")
 
-        assertCallbackAbandonsBeforeRoute(tv, "// D-pad Back pops the player", "BackHandler {", "DisposableEffect(historyIdentity)", "playerVm?.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(tv, "PlayerScreen(\n                playable = playable,", "onBack = {", "onError = {", "playerVm?.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(tv, "PlayerScreen(\n                playable = playable,", "onError = {", "onSourceFailed =", "playerVm?.abandonPlaybackResolve()")
+        val tvReturnToBrowse = methodBody(tv, "fun returnToBrowse()", "if (playable != null)")
+        val tvRevoke = tvReturnToBrowse.indexOf("playerVm?.abandonPlaybackResolve()")
+        val tvDismiss = tvReturnToBrowse.indexOf("playing = null")
+        assertTrue("TV returnToBrowse must revoke the active resolver", tvRevoke >= 0)
+        assertTrue("TV returnToBrowse must dismiss the player", tvDismiss >= 0)
+        assertTrue("TV returnToBrowse must revoke before dismissal", tvRevoke < tvDismiss)
+
+        val tvPlayerRoutes = tv.substringAfter("// D-pad Back pops the player")
+            .substringBefore("onSourceFailed =")
+        assertTrue(tvPlayerRoutes.contains("BackHandler(onBack = ::returnToBrowse)"))
+        assertTrue(tvPlayerRoutes.contains("onBack = ::returnToBrowse"))
+        assertTrue(tvPlayerRoutes.contains("onError = ::returnToBrowse"))
+        assertEquals(3, tvPlayerRoutes.split("::returnToBrowse").size - 1)
         assertCallbackAbandonsBeforeRoute(tv, "TvDetailScreen(\n                        viewModel = detailVm,", "onBack = {", "onPlay =", "detailVm.abandonPlaybackResolve()")
     }
 

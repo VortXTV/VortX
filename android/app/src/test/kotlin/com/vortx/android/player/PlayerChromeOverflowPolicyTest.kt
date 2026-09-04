@@ -79,7 +79,7 @@ class PlayerChromeOverflowPolicyTest {
     @Test
     fun `compact header keeps spoken labels for every remote action`() {
         val chrome = source("src/main/kotlin/com/vortx/android/player/PlayerChrome.kt")
-        val header = chrome.substringAfter("Row(verticalAlignment = Alignment.CenterVertically) {")
+        val header = chrome.substringAfter("if (controlsVisible) Column(")
             .substringBefore("Row(horizontalArrangement")
 
         assertTrue(header.contains("contentDescription = \"Back\""))
