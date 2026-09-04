@@ -36,6 +36,51 @@ import kotlinx.coroutines.delay
 /// a rail catalog-to-catalog never fires an enrichment; only the tile the viewer lands on enriches.
 internal const val HERO_ENRICH_DWELL_MS = 150L
 
+/**
+ * The preview fields that determine both whether enrichment is needed and whether an existing enrichment
+ * still belongs to the focused preview.  A stable media id alone is not sufficient: catalog refreshes can
+ * replace the art, synopsis, or trailer for that id while the D-pad remains on the same tile.
+ */
+internal data class HeroPreviewKey(
+    val id: String,
+    val type: String,
+    val name: String,
+    val poster: String?,
+    val background: String?,
+    val logo: String?,
+    val description: String?,
+    val imdbRating: String?,
+    val genres: List<String>,
+    val year: String?,
+    val caption: String?,
+    val trailerYouTubeId: String?,
+)
+
+internal fun MetaItem.heroPreviewKey(): HeroPreviewKey = HeroPreviewKey(
+    id = id,
+    type = type.name,
+    name = name,
+    poster = poster,
+    background = background,
+    logo = logo,
+    description = description,
+    imdbRating = imdbRating,
+    genres = genres,
+    year = year,
+    caption = caption,
+    trailerYouTubeId = trailerYouTubeId,
+)
+
+/** A hero is complete only when every field its visual/trailer surface consumes is already supplied. */
+internal fun MetaItem.needsHeroEnrichment(): Boolean =
+    background.isNullOrBlank() ||
+        logo.isNullOrBlank() ||
+        description.isNullOrBlank() ||
+        imdbRating.isNullOrBlank() ||
+        genres.isEmpty() ||
+        year.isNullOrBlank() ||
+        trailerYouTubeId.isNullOrBlank()
+
 /// Metahub art base (mirrors Apple `SharedUI.metahubBackground` / [MetaDetail.placeholder]). Only `tt`
 /// (IMDb) ids resolve here; every other id scheme (tmdb:/kitsu:/...) is left to the meta enrichment.
 private const val METAHUB_BACKDROP_BASE = "https://images.metahub.space/background/big"
@@ -46,14 +91,15 @@ private const val METAHUB_BACKDROP_BASE = "https://images.metahub.space/backgrou
 @Composable
 internal fun rememberEnrichedHeroItem(item: MetaItem?): MetaItem? {
     val context = LocalContext.current
-    val seeded = remember(item?.id) { item?.let(::seedHeroBackdrop) }
-    var enriched by remember(item?.id) { mutableStateOf(seeded) }
-    LaunchedEffect(item?.id) {
+    val previewKey = item?.heroPreviewKey()
+    val seeded = remember(previewKey) { item?.let(::seedHeroBackdrop) }
+    var enriched by remember(previewKey) { mutableStateOf(seeded) }
+    LaunchedEffect(previewKey) {
         enriched = seeded
         val current = seeded ?: return@LaunchedEffect
-        // Only the full meta adds anything the preview lacks; skip the round-trip when the preview already
-        // carries a synopsis AND a trailer id (nothing left to enrich for the hero).
-        if (!current.description.isNullOrBlank() && !current.trailerYouTubeId.isNullOrEmpty()) return@LaunchedEffect
+        // Do not confuse a synopsis + trailer with a complete hero.  The screen also consumes art, logo,
+        // rating, genre, and year, and a catalog refresh can change any of them without changing the id.
+        if (!current.needsHeroEnrichment()) return@LaunchedEffect
         delay(HERO_ENRICH_DWELL_MS)
         val repo = (context.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
         val detail = try {

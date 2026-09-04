@@ -19,8 +19,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
@@ -70,7 +73,7 @@ internal fun TvAmbientHero(item: MetaItem?, modifier: Modifier = Modifier) {
     val colors = VortXTheme.colors
     val context = LocalContext.current
     val reducedMotion = rememberReducedMotion()
-    val autoplayTrailers = remember { TrackPreferencesStore(context.applicationContext).autoplayTrailers }
+    val autoplayTrailers = rememberAutoplayTrailers(context.applicationContext)
 
     // A crossfade for both the backdrop and the overlay, keyed on the focused item so art and text swap in
     // lockstep. Instant under reduced motion; the standard hero cross-fade otherwise.
@@ -103,6 +106,32 @@ internal fun TvAmbientHero(item: MetaItem?, modifier: Modifier = Modifier) {
             if (current != null) TvHeroOverlay(current)
         }
     }
+}
+
+/**
+ * Observe the exact shared preference used by Settings instead of taking a one-time snapshot in `remember`.
+ * This keeps an already-composed Home hero in sync when the viewer changes the setting and returns to TV
+ * Home, without changing trailer focus, reduced-motion, or player ownership semantics.
+ */
+@Composable
+private fun rememberAutoplayTrailers(context: android.content.Context): Boolean {
+    val appContext = context.applicationContext
+    val preferences = remember(appContext) {
+        appContext.getSharedPreferences(TrackPreferencesStore.PREFS_FILE, android.content.Context.MODE_PRIVATE)
+    }
+    var enabled by remember(preferences) {
+        mutableStateOf(preferences.getBoolean(TrackPreferencesStore.KEY_AUTOPLAY_TRAILERS, true))
+    }
+    DisposableEffect(preferences) {
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == TrackPreferencesStore.KEY_AUTOPLAY_TRAILERS) {
+                enabled = preferences.getBoolean(TrackPreferencesStore.KEY_AUTOPLAY_TRAILERS, true)
+            }
+        }
+        preferences.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { preferences.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+    return enabled
 }
 
 /// The still-art layer: the focused item's backdrop at full bleed under a slow Ken Burns transform, with a
