@@ -24,6 +24,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -36,6 +38,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.model.AuthState
@@ -43,6 +46,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
+import com.vortx.android.ui.screens.DebridLibraryScreen
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.AddonPairingViewModel
@@ -89,6 +93,10 @@ fun TvShell(
     repo: CatalogRepository,
     auth: AuthRepository,
     onItem: (MetaItem) -> Unit,
+    destination: TvDestination,
+    onDestinationChange: (TvDestination) -> Unit,
+    searchFocusRestoreSignal: Int,
+    onRestoreSearchFocus: () -> Unit,
     modifier: Modifier = Modifier,
     // A finished download plays straight into the shell's player slot (no detail page). Default no-op keeps
     // the shell usable in a @Preview / test.
@@ -96,11 +104,21 @@ fun TvShell(
     syncManager: VortXSyncManager? = null,
 ) {
     val appContext = LocalContext.current.applicationContext
-    var destination by remember { mutableStateOf(TvDestination.HOME) }
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
     // stack back to root; a browse surface (Home, Discover) scrolls its list back to the top -- the 10-foot
     // analogue of re-tapping a bottom-nav tab to pop to root / scroll to top (Apple `scrollToTopOnBump`).
     var reselectSignal by remember { mutableStateOf(0) }
+    var showPlayLinkSheet by remember { mutableStateOf(false) }
+    var showDebridLibrary by remember { mutableStateOf(false) }
+    val debridKeys = remember(appContext) { DebridKeys(appContext) }
+    val debridLibraryFocus = remember { FocusRequester() }
+    val modalVisible = showPlayLinkSheet || showDebridLibrary
+
+    fun dismissSearchOverlay() {
+        showPlayLinkSheet = false
+        showDebridLibrary = false
+        if (destination == TvDestination.SEARCH) onRestoreSearchFocus()
+    }
 
     // Every rail tab (except the always-present Home + Settings) honors the SAME cross-platform "Show <tab>"
     // preferences the phone shell reads (TabBarPrefs, keys `vortx.tabs.hide.discover|live|library|search`):
@@ -121,7 +139,7 @@ fun TvShell(
         }
     }
     LaunchedEffect(destinations) {
-        if (destination !in destinations) destination = TvDestination.HOME
+        if (destination !in destinations) onDestinationChange(TvDestination.HOME)
     }
 
     // SD-8: Discover and Search gate on a sign-in. On TV the available signal is the engine's Stremio
@@ -135,7 +153,7 @@ fun TvShell(
     // system default (leave the app) still applies there. When a detail/player overlay is up it is composed
     // ABOVE this shell with its own BackHandler, so this one is inert underneath it -- the existing
     // Home -> Detail -> Play back stack is unchanged.
-    BackHandler(enabled = destination != TvDestination.HOME) { destination = TvDestination.HOME }
+    BackHandler(enabled = destination != TvDestination.HOME) { onDestinationChange(TvDestination.HOME) }
 
     // One factory for the shell, carrying the app Context so SearchViewModel's history store resolves --
     // the same construction the phone shell uses at VortXApp.kt. Home/Discover/Library ignore the Context.
@@ -146,14 +164,19 @@ fun TvShell(
         homeSurface = HomeRailSurface.TV,
     )
 
-    Row(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
-        TvNavRail(
+    Box(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .focusProperties { canFocus = !modalVisible },
+        ) {
+            TvNavRail(
             destinations = destinations,
             selected = destination,
             // Re-selecting the active tab pops that tab's own stack to root (Add-ons); switching tabs moves.
-            onSelect = { dest -> if (dest == destination) reselectSignal++ else destination = dest },
-        )
-        Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            onSelect = { dest -> if (dest == destination) reselectSignal++ else onDestinationChange(dest) },
+            )
+            Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
             // Only the selected destination's ViewModel is instantiated (lazily inside the branch); each is
             // retained in the Activity's ViewModelStore by its default class key, so switching tabs keeps a
             // surface's state (Home's live stream, a Search query) exactly as the phone shell does.
@@ -174,12 +197,21 @@ fun TvShell(
                 TvDestination.DOWNLOADS ->
                     TvDownloadsScreen(onPlay = onPlayLocal)
                 TvDestination.SEARCH ->
-                    TvSearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, signedIn = signedIn)
+                    TvSearchScreen(
+                        viewModel = viewModel<SearchViewModel>(factory = factory),
+                        onItem = onItem,
+                        onPlayLinkClick = {
+                            showPlayLinkSheet = true
+                        },
+                        onDebridLibraryClick = { showDebridLibrary = true },
+                        signedIn = signedIn,
+                        restoreQuickActionsFocusSignal = searchFocusRestoreSignal,
+                    )
                 TvDestination.ADDONS ->
                     TvAddonsDestination(
                         repo = repo,
                         reselectSignal = reselectSignal,
-                        onExit = { destination = TvDestination.HOME },
+                        onExit = { onDestinationChange(TvDestination.HOME) },
                     )
                 TvDestination.SETTINGS ->
                     TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem)
@@ -195,6 +227,33 @@ fun TvShell(
                         .padding(bottom = TvDimens.edge),
                 )
             }
+            }
+        }
+
+        if (showPlayLinkSheet) {
+            TvPlayLinkSheet(
+                onPlay = {
+                    showPlayLinkSheet = false
+                    onPlayLocal(it)
+                },
+                onDismiss = ::dismissSearchOverlay,
+            )
+        }
+        if (showDebridLibrary) {
+            BackHandler(onBack = ::dismissSearchOverlay)
+            LaunchedEffect(showDebridLibrary) {
+                runCatching { debridLibraryFocus.requestFocus() }
+            }
+            DebridLibraryScreen(
+                keys = debridKeys,
+                onPlay = {
+                    showDebridLibrary = false
+                    onPlayLocal(it)
+                },
+                onBack = ::dismissSearchOverlay,
+                initialFocusRequester = debridLibraryFocus,
+                tvMode = true,
+            )
         }
     }
 }

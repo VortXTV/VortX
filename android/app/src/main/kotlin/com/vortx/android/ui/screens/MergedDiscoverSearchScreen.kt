@@ -34,6 +34,7 @@ fun MergedDiscoverSearchScreen(
     signedIn: Boolean = true,
     hideLive: Boolean = false,
     reselectSignal: Int = 0,
+    quickActions: (@Composable () -> Unit)? = null,
 ) {
     val searchState by searchViewModel.screenState.collectAsStateWithLifecycle()
     val query = searchState.query
@@ -42,7 +43,10 @@ fun MergedDiscoverSearchScreen(
     val hasQuery = query.trim().length >= 2
 
     if (!signedIn) {
-        SignedOutState(modifier = modifier.fillMaxSize())
+        Column(modifier = modifier.fillMaxSize()) {
+            quickActions?.invoke()
+            SignedOutState(modifier = Modifier.fillMaxSize())
+        }
         return
     }
 
@@ -52,6 +56,7 @@ fun MergedDiscoverSearchScreen(
     }
 
     Column(modifier = modifier.fillMaxSize()) {
+        quickActions?.invoke()
         SearchField(
             query = query,
             onQueryChange = searchViewModel::onQueryChange,

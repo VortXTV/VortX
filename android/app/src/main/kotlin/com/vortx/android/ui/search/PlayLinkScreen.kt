@@ -2,6 +2,7 @@ package com.vortx.android.ui.search
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -31,6 +32,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.model.Playable
 import com.vortx.android.player.PlaybackBehaviorSettings
@@ -272,16 +274,31 @@ private fun SavedLinkRow(
 /// The "Play a link" entry chip at the top of the Search tab (SD-1, Apple's `iOSSearchView` link chip).
 /// The label follows `PlaybackBehaviorSettings.directLinksOnly`, exactly like Apple's
 /// `directLinksOnly ? "Play a direct link" : "Play a link or magnet"`.
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun PlayLinkEntry(onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun PlayLinkEntry(
+    onClick: () -> Unit,
+    onDebridLibraryClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current.applicationContext
     val directLinksOnly = remember { PlaybackBehaviorSettings.directLinksOnly(context) }
-    Row(modifier = modifier.padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.xs)) {
+    FlowRow(
+        modifier = modifier.padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
         com.vortx.android.ui.components.Chip(
             label = if (directLinksOnly) "Play a direct link" else "Play a link or magnet",
             selected = false,
             leadingIcon = VortXIcons.link,
             onClick = onClick,
+        )
+        com.vortx.android.ui.components.Chip(
+            label = "Your cloud",
+            selected = false,
+            leadingIcon = VortXIcons.playCircle,
+            onClick = onDebridLibraryClick,
         )
     }
 }

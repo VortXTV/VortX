@@ -361,7 +361,12 @@ fun SearchScreen(
 
     // SD-8: a signed-out device sees a sign-in prompt, not empty add-on results. Gate on either account.
     if (!signedIn) {
-        SignedOutState(modifier = modifier.fillMaxSize())
+        Column(modifier = modifier.fillMaxSize()) {
+            // Direct links and the debrid cloud do not require an add-on catalog session, so keep their
+            // Search entry point available even when catalog results are correctly gated behind sign-in.
+            leadingSlot?.invoke()
+            SignedOutState(modifier = Modifier.fillMaxSize())
+        }
         return
     }
 
@@ -497,7 +502,6 @@ fun SettingsScreen(
     onPosterStyleClick: () -> Unit,
     onHomeDiscoverClick: () -> Unit,
     onDebridKeysScreenClick: () -> Unit,
-    onDebridLibraryClick: () -> Unit,
     onDownloadsClick: () -> Unit,
     onLibraryClick: () -> Unit,
     onBackupClick: () -> Unit,
@@ -606,9 +610,6 @@ fun SettingsScreen(
             onClick = onDebridKeysScreenClick,
             modifier = Modifier.focusRequester(debridServicesFocusRequester),
         )
-        // Browse-your-debrid-cloud: list + play what is already in the connected debrid accounts, no add-on
-        // needed. Mirrors the Apple Settings "Your cloud" entry (DebridLibraryView).
-        SettingRow(VortXIcons.playCircle, "Your cloud", "Play from debrid", onClick = onDebridLibraryClick)
         // The Downloads summary reads the live index, so the row can never disagree with the screen it opens
         // (the same rule the Playback row above follows). "None" rather than a byte count when empty: "0 B" reads
         // like a broken measurement, not like an empty list.

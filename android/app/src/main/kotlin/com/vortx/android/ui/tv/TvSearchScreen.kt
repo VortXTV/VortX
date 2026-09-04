@@ -1,6 +1,8 @@
 package com.vortx.android.ui.tv
 
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -9,8 +11,11 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaItem
@@ -34,8 +39,11 @@ import com.vortx.android.ui.viewmodel.SearchViewModel
 fun TvSearchScreen(
     viewModel: SearchViewModel,
     onItem: (MetaItem) -> Unit,
+    onPlayLinkClick: () -> Unit,
+    onDebridLibraryClick: () -> Unit,
     modifier: Modifier = Modifier,
     signedIn: Boolean = true,
+    restoreQuickActionsFocusSignal: Int = 0,
 ) {
     val searchState by viewModel.screenState.collectAsStateWithLifecycle()
     val history by viewModel.history.collectAsStateWithLifecycle()
@@ -46,7 +54,10 @@ fun TvSearchScreen(
 
     // SD-8: a signed-out set sees a sign-in prompt, not empty add-on results.
     if (!signedIn) {
-        TvSignedOut(modifier = modifier.fillMaxSize())
+        Column(modifier = modifier.fillMaxSize().padding(top = TvDimens.edge)) {
+            TvSearchQuickActions(onPlayLinkClick, onDebridLibraryClick, restoreQuickActionsFocusSignal)
+            TvSignedOut(modifier = Modifier.fillMaxSize())
+        }
         return
     }
 
@@ -57,6 +68,7 @@ fun TvSearchScreen(
     }
 
     Column(modifier = modifier.fillMaxSize().padding(top = TvDimens.edge)) {
+        TvSearchQuickActions(onPlayLinkClick, onDebridLibraryClick, restoreQuickActionsFocusSignal)
         OutlinedTextField(
             value = query,
             onValueChange = viewModel::onQueryChange,
@@ -107,5 +119,31 @@ fun TvSearchScreen(
                 sectioned = true,
             )
         }
+    }
+}
+
+/// Adjacent and ordered remote targets: Play a link -> Your cloud -> Search field. They stay available even
+/// while catalog search is gated behind sign-in because both routes are independent of add-on discovery.
+@Composable
+private fun TvSearchQuickActions(
+    onPlayLinkClick: () -> Unit,
+    onDebridLibraryClick: () -> Unit,
+    restoreFocusSignal: Int,
+) {
+    val playLinkFocus = androidx.compose.runtime.remember { FocusRequester() }
+    LaunchedEffect(restoreFocusSignal) {
+        if (restoreFocusSignal > 0) runCatching { playLinkFocus.requestFocus() }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = TvDimens.edge),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+    ) {
+        TvFilterChip(
+            label = "Play a link",
+            selected = false,
+            onClick = onPlayLinkClick,
+            modifier = Modifier.focusRequester(playLinkFocus),
+        )
+        TvFilterChip(label = "Your cloud", selected = false, onClick = onDebridLibraryClick)
     }
 }

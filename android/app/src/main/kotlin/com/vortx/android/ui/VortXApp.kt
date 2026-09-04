@@ -1190,6 +1190,12 @@ fun VortXApp(
                         signedIn = accountSignedIn,
                         hideLive = hiddenTabs.hideLive,
                         reselectSignal = discoverReselect,
+                        quickActions = {
+                            PlayLinkEntry(
+                                onClick = { showPlayLink = true },
+                                onDebridLibraryClick = { showDebridLibrary = true },
+                            )
+                        },
                     )
                 } else {
                     DiscoverScreen(
@@ -1209,7 +1215,12 @@ fun VortXApp(
                     content,
                     signedIn = accountSignedIn,
                     reselectSignal = searchReselect,
-                    leadingSlot = { PlayLinkEntry(onClick = { showPlayLink = true }) },
+                    leadingSlot = {
+                        PlayLinkEntry(
+                            onClick = { showPlayLink = true },
+                            onDebridLibraryClick = { showDebridLibrary = true },
+                        )
+                    },
                 )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
@@ -1252,7 +1263,6 @@ fun VortXApp(
                         restoreDebridServicesFocus = false
                         showDebridKeys = true
                     },
-                    onDebridLibraryClick = { showDebridLibrary = true },
                     onLibraryClick = { showLibraryTransfer = true },
                     onBackupClick = { showBackup = true },
                     onWatchStatsClick = { showWatchStats = true },

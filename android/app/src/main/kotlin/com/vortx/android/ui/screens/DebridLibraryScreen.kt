@@ -3,6 +3,8 @@ package com.vortx.android.ui.screens
 import android.text.format.DateUtils
 import android.text.format.Formatter
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,11 +30,18 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.foundation.focusGroup
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.draw.scale
+import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -43,6 +52,7 @@ import com.vortx.android.debrid.DebridService
 import com.vortx.android.model.Playable
 import com.vortx.android.ui.components.SurfaceCard
 import com.vortx.android.ui.theme.VortXIcons
+import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import kotlinx.coroutines.launch
 
@@ -61,13 +71,15 @@ import kotlinx.coroutines.launch
 ///
 /// Fail-soft throughout: a provider with no key is simply absent; a provider that errors or returns nothing
 /// hides its section; a resolve that fails shows an inline notice, never a crash.
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun DebridLibraryScreen(
     keys: DebridKeys,
     onPlay: (Playable) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    initialFocusRequester: FocusRequester? = null,
+    tvMode: Boolean = false,
 ) {
     val context = LocalContext.current.applicationContext
     val coordinator = remember(keys) { DebridCoordinator(DebridResolver(keys), keys) }
@@ -116,11 +128,23 @@ fun DebridLibraryScreen(
     }
 
     Scaffold(
+        modifier = if (tvMode) {
+            modifier.focusGroup().focusProperties { exit = { FocusRequester.Cancel } }
+        } else {
+            modifier
+        },
         topBar = {
             TopAppBar(
                 title = { Text("Your cloud", style = VortXTheme.type.cardTitle) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = if (initialFocusRequester != null) {
+                            Modifier.focusRequester(initialFocusRequester)
+                        } else {
+                            Modifier
+                        },
+                    ) {
                         Icon(VortXIcons.back, contentDescription = "Back")
                     }
                 },
@@ -136,7 +160,7 @@ fun DebridLibraryScreen(
         },
     ) { padding ->
         Column(
-            modifier = modifier
+            modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
                 .padding(VortXTheme.spacing.edge)
@@ -163,7 +187,7 @@ fun DebridLibraryScreen(
                 else -> {
                     resolveError?.let { InlineNotice(it) }
                     sections.forEach { section ->
-                        ProviderSection(section = section, resolvingId = resolvingId, onPlay = ::play)
+                        ProviderSection(section = section, resolvingId = resolvingId, onPlay = ::play, tvMode = tvMode)
                     }
                 }
             }
@@ -185,6 +209,7 @@ private fun ProviderSection(
     section: DebridLibrarySectionUi,
     resolvingId: String?,
     onPlay: (DebridResolver.DebridLibraryItem) -> Unit,
+    tvMode: Boolean,
 ) {
     val colors = VortXTheme.colors
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
@@ -200,7 +225,7 @@ private fun ProviderSection(
             Text("${section.items.size}", style = VortXTheme.type.eyebrow.copy(color = colors.textTertiary))
         }
         section.items.forEach { item ->
-            LibraryRow(item = item, resolvingId = resolvingId, onPlay = onPlay)
+            LibraryRow(item = item, resolvingId = resolvingId, onPlay = onPlay, tvMode = tvMode)
         }
     }
 }
@@ -210,14 +235,19 @@ private fun LibraryRow(
     item: DebridResolver.DebridLibraryItem,
     resolvingId: String?,
     onPlay: (DebridResolver.DebridLibraryItem) -> Unit,
+    tvMode: Boolean,
 ) {
     val colors = VortXTheme.colors
     val context = LocalContext.current
     val busy = resolvingId != null
     val meta = metaLine(context, item)
+    var focused by remember { mutableStateOf(false) }
     SurfaceCard(
         modifier = Modifier
             .fillMaxWidth()
+            .onFocusChanged { focused = it.isFocused }
+            .scale(if (tvMode && focused) 1.03f else 1f)
+            .then(if (tvMode && focused) Modifier.border(BorderStroke(2.dp, colors.accentBright), VortXShapes.control) else Modifier)
             .clickable(enabled = !busy) { onPlay(item) },
     ) {
         Row(

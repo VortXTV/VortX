@@ -22,6 +22,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -29,6 +30,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.foundation.focusGroup
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
@@ -151,16 +157,23 @@ fun TvDownloadsScreen(
 /// (or any non-HTTP input) is refused with a clear note rather than a silent dead player -- the honest minimal
 /// slice until the shared "play a link" path lands. Direct HTTP(S) links build a [Playable] and hand it to the
 /// shell's player slot. Back dismisses.
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
-private fun TvPlayLinkSheet(onPlay: (Playable) -> Unit, onDismiss: () -> Unit) {
+internal fun TvPlayLinkSheet(onPlay: (Playable) -> Unit, onDismiss: () -> Unit) {
     val colors = VortXTheme.colors
     var url by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     val trimmed = url.trim()
     val isHttp = trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)
+    val urlFocus = remember { FocusRequester() }
     BackHandler { onDismiss() }
+    LaunchedEffect(Unit) { runCatching { urlFocus.requestFocus() } }
     Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.78f)),
+        modifier = Modifier
+            .fillMaxSize()
+            .focusGroup()
+            .focusProperties { exit = { FocusRequester.Cancel } }
+            .background(Color.Black.copy(alpha = 0.78f)),
         contentAlignment = Alignment.Center,
     ) {
         Column(
@@ -182,7 +195,7 @@ private fun TvPlayLinkSheet(onPlay: (Playable) -> Unit, onDismiss: () -> Unit) {
                 value = url,
                 onValueChange = { url = it; error = null },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().focusRequester(urlFocus),
                 placeholder = { Text("https://…") },
             )
             error?.let { Text(it, style = VortXTheme.type.label.copy(color = colors.danger)) }

@@ -101,6 +101,14 @@ fun TvApp(
         var playingEngineOverride by remember {
             mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
         }
+        // The browse destination belongs above the player overlay. Returning from a cloud or link play must
+        // recreate the same Search surface rather than a fresh HOME shell.
+        var shellDestination by remember { mutableStateOf(TvDestination.HOME) }
+        var searchFocusRestoreSignal by remember { mutableStateOf(0) }
+        fun returnToBrowse() {
+            playing = null
+            if (shellDestination == TvDestination.SEARCH) searchFocusRestoreSignal++
+        }
         val automaticEngineFor: (Playable) -> PlayerEngineRouter.Override = { candidate ->
             PlayerLaunchPolicy.effectivePreference(
                 requested = PlayerEngineRouter.Override.AUTO,
@@ -218,7 +226,7 @@ fun TvApp(
                 }
             }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
-            BackHandler { playing = null }
+            BackHandler(onBack = ::returnToBrowse)
             DisposableEffect(historyIdentity) {
                 playbackHistory.begin()
                 onDispose {
@@ -245,8 +253,8 @@ fun TvApp(
                         acceptedRevision = acceptedRevision,
                     )
                 },
-                onBack = { playing = null },
-                onError = { playing = null },
+                onBack = ::returnToBrowse,
+                onError = ::returnToBrowse,
                 onSourceFailed = if (playerVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
                     { positionMs ->
                         retryResumePositionMs = positionMs
@@ -326,6 +334,10 @@ fun TvApp(
                 TvShell(
                     repo = repo,
                     auth = auth,
+                    destination = shellDestination,
+                    onDestinationChange = { shellDestination = it },
+                    searchFocusRestoreSignal = searchFocusRestoreSignal,
+                    onRestoreSearchFocus = { searchFocusRestoreSignal++ },
                     onItem = {
                         detailGeneration += 1
                         detail = it
