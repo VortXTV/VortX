@@ -624,6 +624,9 @@ struct PlayerScreen: View {
     @State private var episodeResolutionOwner: EpisodeResolutionOwner?
     @State private var episodeResolutionTargetVideoID: String?
     @State private var episodeResolutionAdmitted = false
+    /// A manual Next/Previous press can arrive while a Continue Watching player still has only a partial
+    /// series list. It is consumed once, only by the same physical playback after its inventory is accepted.
+    @State private var pendingManualEpisodeNavigation: AppleManualEpisodeNavigationIntent?
     private static let episodeResolutionDeadlineSeconds: Double = 30
     @State private var playbackExited = false
     @State private var terminalFinalityRefreshTarget: AppleCWTerminalRefreshTarget?
@@ -634,6 +637,9 @@ struct PlayerScreen: View {
     @State private var directResumeInventoryRefreshTarget: AppleCWTerminalRefreshTarget?
     @State private var directResumeInventoryRefreshGeneration: Int?
     @State private var directResumeInventoryRefreshTask: Task<Void, Never>?
+    /// True only after this player has issued its own direct-resume authoritative metadata request. A partial
+    /// launch list alone is not permission to retain manual navigation beyond a known boundary.
+    @State private var directResumeInventoryRefreshPending = false
     @State private var sourceSwitchGeneration = 0
     @State private var loadedSeriesEpisodes: [PlayerEpisodeRef] = []
     @State private var loadedSeriesVideoMetadata: [CoreVideo] = []
@@ -994,6 +1000,13 @@ struct PlayerScreen: View {
                 restoreSubtitleTimingOffsetIfReady()
                 applyCurrentSubtitleDelayIfReady(force: false)
             }
+        }
+        .onChange(of: allEpisodeRefs) { _ in
+            consumePendingManualEpisodeNavigationIfReady()
+        }
+        .onChange(of: sourceSwitchGeneration) { _ in
+            cancelDirectResumeInventoryRefresh()
+            clearPendingManualEpisodeNavigation(reason: "source replacement")
         }
         .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(); LoopbackPlaybackAssertion.end() }
     }
@@ -4983,6 +4996,12 @@ struct PlayerScreen: View {
                     streamType: current.type, streamId: current.videoId
                 )
                 directResumeInventoryRefreshGeneration = requestGeneration
+                directResumeInventoryRefreshPending = true
+                defer {
+                    if directResumeInventoryRefreshGeneration == requestGeneration {
+                        directResumeInventoryRefreshPending = false
+                    }
+                }
                 for attempt in 0..<16 {
                     guard !Task.isCancelled,
                           terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
@@ -5015,6 +5034,7 @@ struct PlayerScreen: View {
     }
 
     private func cancelDirectResumeInventoryRefresh() {
+        clearPendingManualEpisodeNavigation(reason: "inventory refresh cancelled")
         directResumeInventoryRefreshTask?.cancel()
         directResumeInventoryRefreshTask = nil
         if let generation = directResumeInventoryRefreshGeneration {
@@ -5022,6 +5042,7 @@ struct PlayerScreen: View {
         }
         directResumeInventoryRefreshGeneration = nil
         directResumeInventoryRefreshTarget = nil
+        directResumeInventoryRefreshPending = false
     }
 
     private var terminalRefreshResult: AppleCWSeriesRefreshResult {
@@ -5140,8 +5161,13 @@ struct PlayerScreen: View {
     }
 
     private var episodeIndex: Int? {
-        guard let id = curMeta?.videoId, !allEpisodeRefs.isEmpty else { return nil }
-        return allEpisodeRefs.firstIndex { $0.id == id }
+        guard let m = curMeta else { return nil }
+        return AppleManualEpisodeNavigationPolicy.currentIndex(
+            currentID: m.videoId,
+            currentSeason: m.season,
+            currentEpisode: m.episode,
+            inventory: manualEpisodeNavigationInventory
+        )
     }
     private var canNextEpisode: Bool { episodeIndex.map { $0 + 1 < allEpisodeRefs.count } ?? false }
 
@@ -5253,8 +5279,97 @@ struct PlayerScreen: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func goToNextEpisode() { if let i = episodeIndex, i + 1 < allEpisodeRefs.count { goToEpisode(allEpisodeRefs[i + 1].id) } }
-    private func goToPrevEpisode() { if let i = episodeIndex, i > 0 { goToEpisode(allEpisodeRefs[i - 1].id) } }
+    private var manualEpisodeNavigationInventory: [AppleManualEpisodeNavigationCandidate] {
+        allEpisodeRefs.map {
+            AppleManualEpisodeNavigationCandidate(id: $0.id, season: $0.season, episode: $0.episode)
+        }
+    }
+
+    private var showsPreviousEpisodeControl: Bool {
+        isEpisodePlaybackContext && (directResumeInventoryRefreshPending || canPrevEpisode)
+    }
+
+    private var showsNextEpisodeControl: Bool {
+        isEpisodePlaybackContext && (directResumeInventoryRefreshPending || canNextEpisode)
+    }
+
+    private func requestManualEpisodeNavigation(_ direction: AppleManualEpisodeNavigationIntent.Direction) {
+        guard isEpisodePlaybackContext, !playbackExited, let m = curMeta else { return }
+        let intent = AppleManualEpisodeNavigationIntent(
+            direction: direction,
+            sessionID: playbackSessionID,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            loadOwner: coordinator.player?.activeLoadToken.map { String(describing: $0) }
+        )
+        switch AppleManualEpisodeNavigationPolicy.decision(
+            intent: intent,
+            sessionID: playbackSessionID,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            loadOwner: coordinator.player?.activeLoadToken.map { String(describing: $0) },
+            currentID: m.videoId,
+            currentSeason: m.season,
+            currentEpisode: m.episode,
+            inventory: manualEpisodeNavigationInventory,
+            inventoryRefreshPending: directResumeInventoryRefreshPending
+        ) {
+        case .navigate(let target):
+            clearPendingManualEpisodeNavigation(reason: "manual target available")
+            _ = goToEpisode(target)
+            return
+        case .waitForInventory:
+            pendingManualEpisodeNavigation = intent
+            DiagnosticsLog.log("binge", "manual episode navigation queued direction=\(direction == .next ? "next" : "previous")")
+        case .unavailable:
+            clearPendingManualEpisodeNavigation(reason: "accepted episode boundary")
+        }
+    }
+
+    private func consumePendingManualEpisodeNavigationIfReady() {
+        guard let intent = pendingManualEpisodeNavigation, let m = curMeta else { return }
+        let activeLoadOwner = coordinator.player?.activeLoadToken.map { String(describing: $0) }
+        guard AppleManualEpisodeNavigationPolicy.owns(
+            intent,
+            sessionID: playbackSessionID,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            loadOwner: activeLoadOwner
+        ) else {
+            clearPendingManualEpisodeNavigation(reason: "newer playback load")
+            return
+        }
+        switch AppleManualEpisodeNavigationPolicy.decision(
+            intent: intent,
+            sessionID: playbackSessionID,
+            episodeGeneration: episodeSwitchGeneration,
+            sourceGeneration: sourceSwitchGeneration,
+            loadOwner: activeLoadOwner,
+            currentID: m.videoId,
+            currentSeason: m.season,
+            currentEpisode: m.episode,
+            inventory: manualEpisodeNavigationInventory,
+            inventoryRefreshPending: directResumeInventoryRefreshPending
+        ) {
+        case .navigate(let target):
+            pendingManualEpisodeNavigation = nil
+            DiagnosticsLog.log("binge", "manual episode navigation consumed target=\(VXProbeRedaction.identityToken(target))")
+            _ = goToEpisode(target)
+        case .waitForInventory:
+            return
+        case .unavailable:
+            clearPendingManualEpisodeNavigation(reason: "accepted episode boundary")
+        }
+    }
+
+    private func clearPendingManualEpisodeNavigation(reason: String) {
+        guard pendingManualEpisodeNavigation != nil else { return }
+        pendingManualEpisodeNavigation = nil
+        DiagnosticsLog.log("binge", "manual episode navigation cleared reason=\(reason)")
+    }
+
+    private func goToNextEpisode() { requestManualEpisodeNavigation(.next) }
+    private func goToPrevEpisode() { requestManualEpisodeNavigation(.previous) }
 
     /// Prepare the next episode through a bounded retry policy. Playback ticks may call this repeatedly,
     /// but only one active attempt, two delayed retries, and one final credits attempt can be admitted.
@@ -5455,6 +5570,7 @@ struct PlayerScreen: View {
     }
 
     private func invalidateEpisodeResolution() {
+        clearPendingManualEpisodeNavigation(reason: "episode resolution cancelled")
         episodeResolutionTask?.cancel()
         episodeResolutionDeadlineTask?.cancel()
         episodeResolutionTask = nil
@@ -5537,6 +5653,8 @@ struct PlayerScreen: View {
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
     @discardableResult
     private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) -> Bool {
+        cancelDirectResumeInventoryRefresh()
+        clearPendingManualEpisodeNavigation(reason: "episode replacement")
         let refreshedMetadata = loadedSeriesVideoMetadata.first { $0.id == videoId }
         let resolverRoute: AppleEpisodeResolverAdmission.Route<PlayerEpisodeStream>? =
             AppleEpisodeResolverAdmission.route(
@@ -5982,10 +6100,10 @@ struct PlayerScreen: View {
                 }
             }
             Spacer()
-            if canPrevEpisode {
+            if showsPreviousEpisodeControl {
                 iconButton("backward.end.fill", label: "Previous episode") { goToPrevEpisode() }
             }
-            if canNextEpisode {
+            if showsNextEpisodeControl {
                 iconButton("forward.end.fill", label: "Next episode") {
                     if duration > 0 { reportProgress(currentTime) }   // flush before advancing (floor-guarded)
                     goToNextEpisode()
