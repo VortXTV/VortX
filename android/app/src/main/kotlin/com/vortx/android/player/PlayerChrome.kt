@@ -8,6 +8,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -58,17 +59,21 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -111,6 +116,10 @@ import com.vortx.android.ui.theme.vortxGlassProminent
 import java.net.URI
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+
+/// Sheets are shared by the phone and TV hosts. Focus trapping is only valid for the couch host: a phone
+/// relies on touch/back and must not acquire synthetic remote focus when opening an overlay.
+private val LocalPlayerChromeIsTv = staticCompositionLocalOf { false }
 
 /// The VortX-specific chrome layered over whichever [PlayerEngine] is live. It is fully engine-agnostic:
 /// it renders the [PlayerState] snapshot and calls back through the transport + track lambdas, never
@@ -305,6 +314,7 @@ fun PlayerChrome(
     val tvAudioFocus = remember { FocusRequester() }
     val tvSubtitleFocus = remember { FocusRequester() }
     val tvMoreFocus = remember { FocusRequester() }
+    val tvTransportFocus = remember { FocusRequester() }
     // A sheet returns to the control that opened it. This must be per-open rather than a sticky boolean:
     // after a More drill-in closes, a later Sources sheet must return to Sources, not stale More.
     var focusReturnTarget by remember { mutableStateOf<FocusRequester?>(null) }
@@ -445,8 +455,26 @@ fun PlayerChrome(
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(horizontal = 8.dp, vertical = 8.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack, modifier = Modifier.focusRequester(tvChromeFocus)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                // The header is one bounded remote region. Without this, Compose's geometric search can
+                // jump from an icon to a scrubber or a background touch target on wide TV panels.
+                modifier = if (isTvPlayer) Modifier.focusGroup() else Modifier,
+            ) {
+                IconButton(
+                    onClick = onBack,
+                    modifier = if (isTvPlayer) {
+                        Modifier
+                            .focusRequester(tvChromeFocus)
+                            .focusProperties {
+                                right = tvSourcesFocus
+                                down = tvTransportFocus
+                            }
+                    } else {
+                        // Retain the phone modifier graph exactly as it was before the TV-specific edge map.
+                        Modifier.focusRequester(tvChromeFocus)
+                    },
+                ) {
                     Icon(
                         Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Back",
@@ -466,22 +494,57 @@ fun PlayerChrome(
                 // Keep the frequent source / track controls reachable in one remote move. Everything else
                 // lives behind More so the title does not collapse into an unclickable icon strip on narrow
                 // landscape phones or TV overscan layouts.
-                ChromeIcon(Icons.Filled.Tune, sourcesDescription, modifier = Modifier.focusRequester(tvSourcesFocus)) {
+                ChromeIcon(
+                    Icons.Filled.Tune,
+                    sourcesDescription,
+                    modifier = tvHeaderControlModifier(
+                        isTvPlayer = isTvPlayer,
+                        requester = tvSourcesFocus,
+                        left = tvChromeFocus,
+                        right = tvAudioFocus,
+                        down = tvTransportFocus,
+                    ),
+                ) {
                     onInteraction()
                     openSheetFromControl(ControlSheet.SOURCES, tvSourcesFocus)
                 }
-                ChromeIcon(Icons.Filled.Audiotrack, "Audio and output settings", modifier = Modifier.focusRequester(tvAudioFocus)) {
+                ChromeIcon(
+                    Icons.Filled.Audiotrack,
+                    "Audio and output settings",
+                    modifier = tvHeaderControlModifier(
+                        isTvPlayer = isTvPlayer,
+                        requester = tvAudioFocus,
+                        left = tvSourcesFocus,
+                        right = tvSubtitleFocus,
+                        down = tvTransportFocus,
+                    ),
+                ) {
                     onInteraction()
                     openSheetFromControl(ControlSheet.AUDIO, tvAudioFocus)
                 }
-                ChromeIcon(Icons.Filled.Subtitles, "Subtitles", modifier = Modifier.focusRequester(tvSubtitleFocus)) {
+                ChromeIcon(
+                    Icons.Filled.Subtitles,
+                    "Subtitles",
+                    modifier = tvHeaderControlModifier(
+                        isTvPlayer = isTvPlayer,
+                        requester = tvSubtitleFocus,
+                        left = tvAudioFocus,
+                        right = tvMoreFocus,
+                        down = tvTransportFocus,
+                    ),
+                ) {
                     onInteraction()
                     openSheetFromControl(ControlSheet.SUBTITLE, tvSubtitleFocus)
                 }
                 ChromeIcon(
                     Icons.Filled.MoreHoriz,
                     "More player controls",
-                    modifier = Modifier.focusRequester(tvMoreFocus),
+                    modifier = tvHeaderControlModifier(
+                        isTvPlayer = isTvPlayer,
+                        requester = tvMoreFocus,
+                        left = tvSubtitleFocus,
+                        down = tvTransportFocus,
+                    ),
                 ) {
                     onInteraction()
                     openSheetFromControl(ControlSheet.MORE, tvMoreFocus)
@@ -511,12 +574,16 @@ fun PlayerChrome(
             seekBarStyle = seekBarStyle,
             chapters = chapters,
             skipBands = skipBands,
+            isTvPlayer = isTvPlayer,
+            tvTransportFocus = tvTransportFocus,
+            tvHeaderFocus = tvChromeFocus,
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter),
         )
 
         // Selection sheets (audio / subtitle / speed) as a bottom overlay panel.
+        CompositionLocalProvider(LocalPlayerChromeIsTv provides isTvPlayer) {
         when (openSheet) {
             ControlSheet.SOURCES -> ControlSelectionSheet(
                 title = sourcesTitle,
@@ -1274,6 +1341,7 @@ fun PlayerChrome(
             }
             ControlSheet.NONE -> Unit
         }
+        }
 
         // Buffering / connecting indicator: a centered spinner whenever the engine reports no data
         // flowing -- the initial open (both engines publish isBuffering=true from load until the first
@@ -1304,6 +1372,7 @@ fun PlayerChrome(
         if (state.hasError && openSheet != ControlSheet.SOURCES && openSheet != ControlSheet.QUALITY) {
             PlayerErrorOverlay(
                 emberAccent = emberAccent,
+                isTvPlayer = isTvPlayer,
                 onRetry = if (sourceChoices.size > 1) {
                     { openSheet = ControlSheet.SOURCES }
                 } else {
@@ -1759,16 +1828,15 @@ private fun ControlSelectionSheet(
     accessory: (@Composable () -> Unit)? = null,
     onDismiss: () -> Unit,
 ) {
+    val isTvPlayer = LocalPlayerChromeIsTv.current
     // The active overlay owns Remote Back/Escape. Letting it fall through would exit the player instead
     // of closing the topmost sheet and restoring the compact chrome's expected focus target.
     BackHandler { onDismiss() }
     val firstEnabledIndex = options.indexOfFirst(SheetOption::enabled)
     val firstOptionFocus = remember(title) { FocusRequester() }
     LaunchedEffect(title, firstEnabledIndex, options.size) {
-        if (firstEnabledIndex >= 0) {
-            withFrameNanos { }
-            runCatching { firstOptionFocus.requestFocus() }
-        }
+        withFrameNanos { }
+        runCatching { firstOptionFocus.requestFocus() }
     }
     Box(
         modifier = Modifier
@@ -1786,7 +1854,12 @@ private fun ControlSelectionSheet(
                 // glass so track labels stay legible over bright video. Top-rounded, flush to the bottom.
                 .vortxGlassPanel(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                // Sheets are modal D-pad regions: their rows must exhaust locally before focus can
+                // search the still-composed player chrome beneath the scrim.
+                // A focus group only groups traversal. The TV-only exit cancellation is what stops a
+                // D-pad edge from falling through the translucent scrim into live player controls.
+                .then(tvOverlayFocusTrapModifier(isTvPlayer)),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(text = title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.padding(bottom = 4.dp))
@@ -1798,7 +1871,13 @@ private fun ControlSelectionSheet(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(8.dp))
-                        .then(if (index == firstEnabledIndex) Modifier.focusRequester(firstOptionFocus) else Modifier)
+                        .then(
+                            if (index == firstEnabledIndex) {
+                                Modifier.focusRequester(firstOptionFocus)
+                            } else {
+                                Modifier
+                            },
+                        )
                         .then(
                             if (option.isStatus) {
                                 Modifier.semantics { liveRegion = LiveRegionMode.Polite }
@@ -1865,6 +1944,28 @@ private fun ControlSelectionSheet(
                     }
                 }
             }
+            // Source switching deliberately disables every action while the replacement mounts. A TV still
+            // needs a real focus target in that interval, otherwise focus falls through to the video beneath.
+            if (isTvPlayer && firstEnabledIndex < 0) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .focusRequester(firstOptionFocus)
+                        .then(tvOverlayFocusExitModifier(isTvPlayer))
+                        .clickable(role = Role.Button, onClick = onDismiss)
+                        .heightIn(min = 48.dp)
+                        .padding(vertical = 10.dp, horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Close",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
             // Cast is supplied as a host-owned composable because it owns discovery and connection state.
             // Keeping that slot in More preserves its self-hiding availability contract without returning it
             // to the constrained top row.
@@ -1887,6 +1988,7 @@ private fun VolumeSheet(
     onToggleMute: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val isTvPlayer = LocalPlayerChromeIsTv.current
     // Unlike a phone touch target, a TV remote needs an explicit entry point when the overlay appears.
     // Start on the labeled mute control rather than relying on focus search to discover the slider.
     val muteFocus = remember { FocusRequester() }
@@ -1907,7 +2009,8 @@ private fun VolumeSheet(
                 .align(Alignment.BottomCenter)
                 .vortxGlassPanel(RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp))
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+                .then(tvOverlayFocusTrapModifier(isTvPlayer)),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Text(
@@ -1936,7 +2039,8 @@ private fun VolumeSheet(
                     ),
                     modifier = Modifier
                         .weight(1f)
-                        .padding(horizontal = 12.dp),
+                        .padding(horizontal = 12.dp)
+                        .then(tvOverlayFocusExitModifier(isTvPlayer)),
                 )
                 Text(
                     text = "${(volume).roundToInt()}%",
@@ -1950,6 +2054,7 @@ private fun VolumeSheet(
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
                     .focusRequester(muteFocus)
+                    .then(tvOverlayFocusExitModifier(isTvPlayer))
                     .clickable(role = Role.Button, onClick = onToggleMute)
                     .heightIn(min = 48.dp)
                     .padding(vertical = 10.dp, horizontal = 4.dp),
@@ -1978,7 +2083,12 @@ private fun VolumeSheet(
 /// The error fallback overlay: a centered message + a "Choose another source" action that returns to the
 /// ranked source list, plus a plain back. Shown when [PlayerState.hasError] is set.
 @Composable
-private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: () -> Unit) {
+private fun PlayerErrorOverlay(
+    emberAccent: Color,
+    isTvPlayer: Boolean,
+    onRetry: () -> Unit,
+    onBack: () -> Unit,
+) {
     val recoveryFocus = remember { FocusRequester() }
     LaunchedEffect(Unit) {
         withFrameNanos { }
@@ -2001,7 +2111,10 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                 color = Color.White.copy(alpha = 0.75f),
                 fontSize = 14.sp,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.then(tvOverlayFocusTrapModifier(isTvPlayer)),
+            ) {
                 Text(
                     text = "Choose another source",
                     color = Color.White,
@@ -2011,6 +2124,7 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                     modifier = Modifier
                         .vortxGlassProminent(shape = RoundedCornerShape(8.dp), tint = emberAccent)
                         .focusRequester(recoveryFocus)
+                        .then(tvOverlayFocusExitModifier(isTvPlayer))
                         .clickable(onClick = onRetry)
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )
@@ -2026,6 +2140,7 @@ private fun PlayerErrorOverlay(emberAccent: Color, onRetry: () -> Unit, onBack: 
                             shadow = VortXGlass.Shadow.flat,
                         )
                         .clickable(onClick = onBack)
+                        .then(tvOverlayFocusExitModifier(isTvPlayer))
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                 )
             }
@@ -2052,6 +2167,11 @@ private fun TransportBar(
     seekBarStyle: SeekBarStyle = SeekBarStyle.CLASSIC,
     chapters: List<PlayerChapter> = emptyList(),
     skipBands: List<SkipBand> = emptyList(),
+    /// The TV host owns explicit entry/exit focus for this transport region. Phone callers leave these
+    /// defaults intact, retaining their existing touch-first layout and focus behavior.
+    isTvPlayer: Boolean = false,
+    tvTransportFocus: FocusRequester? = null,
+    tvHeaderFocus: FocusRequester? = null,
     modifier: Modifier = Modifier,
 ) {
     var scrubbing by remember { mutableStateOf(false) }
@@ -2083,7 +2203,8 @@ private fun TransportBar(
                 )
             )
             .windowInsetsPadding(WindowInsets.safeDrawing)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+            .then(if (isTvPlayer) Modifier.focusGroup() else Modifier),
     ) {
         // Scrub preview, drawn ABOVE the transport row so it never covers the slider the finger is on.
         // Present only while dragging a title that actually has a community sheet; otherwise the row is
@@ -2118,9 +2239,17 @@ private fun TransportBar(
         ) {
             IconButton(
                 onClick = onTogglePause,
-                modifier = Modifier.semantics {
-                    stateDescription = if (state.isPaused) "Paused" else "Playing"
-                },
+                modifier = Modifier
+                    .then(
+                        tvTransportControlModifier(
+                            isTvPlayer = isTvPlayer,
+                            tvHeaderFocus = tvHeaderFocus,
+                            requester = tvTransportFocus,
+                        ),
+                    )
+                    .semantics {
+                        stateDescription = if (state.isPaused) "Paused" else "Playing"
+                    },
             ) {
                 Icon(
                     imageVector = if (state.isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause,
@@ -2134,14 +2263,22 @@ private fun TransportBar(
             // slider on a known duration.
             val backIcon = if (seekStepSeconds >= 30) Icons.Filled.Replay30 else Icons.Filled.Replay10
             val forwardIcon = if (seekStepSeconds >= 30) Icons.Filled.Forward30 else Icons.Filled.Forward10
-            IconButton(onClick = { onSeekBy(-seekStepMs) }, enabled = duration > 0L) {
+            IconButton(
+                onClick = { onSeekBy(-seekStepMs) },
+                enabled = duration > 0L,
+                modifier = tvTransportControlModifier(isTvPlayer, tvHeaderFocus),
+            ) {
                 Icon(
                     imageVector = backIcon,
                     contentDescription = "Back $seekStepSeconds seconds",
                     tint = if (duration > 0L) Color.White else Color.White.copy(alpha = 0.4f),
                 )
             }
-            IconButton(onClick = { onSeekBy(seekStepMs) }, enabled = duration > 0L) {
+            IconButton(
+                onClick = { onSeekBy(seekStepMs) },
+                enabled = duration > 0L,
+                modifier = tvTransportControlModifier(isTvPlayer, tvHeaderFocus),
+            ) {
                 Icon(
                     imageVector = forwardIcon,
                     contentDescription = "Forward $seekStepSeconds seconds",
@@ -2155,14 +2292,22 @@ private fun TransportBar(
             if (chapters.size >= 2) {
                 val prevTarget = prevChapterTargetMs(chapters, position)
                 val nextTarget = nextChapterTargetMs(chapters, position)
-                IconButton(onClick = { prevTarget?.let(onSeek) }, enabled = prevTarget != null) {
+                IconButton(
+                    onClick = { prevTarget?.let(onSeek) },
+                    enabled = prevTarget != null,
+                    modifier = tvTransportControlModifier(isTvPlayer, tvHeaderFocus),
+                ) {
                     Icon(
                         imageVector = Icons.Filled.SkipPrevious,
                         contentDescription = "Previous chapter",
                         tint = if (prevTarget != null) Color.White else Color.White.copy(alpha = 0.4f),
                     )
                 }
-                IconButton(onClick = { nextTarget?.let(onSeek) }, enabled = nextTarget != null) {
+                IconButton(
+                    onClick = { nextTarget?.let(onSeek) },
+                    enabled = nextTarget != null,
+                    modifier = tvTransportControlModifier(isTvPlayer, tvHeaderFocus),
+                ) {
                     Icon(
                         imageVector = Icons.Filled.SkipNext,
                         contentDescription = "Next chapter",
@@ -2207,7 +2352,8 @@ private fun TransportBar(
                 },
                 modifier = Modifier
                     .weight(1f)
-                    .height(30.dp),
+                    .height(30.dp)
+                    .then(tvTransportControlModifier(isTvPlayer, tvHeaderFocus)),
             )
             Text(
                 text = formatTime(duration),
@@ -2218,6 +2364,54 @@ private fun TransportBar(
         }
     }
 }
+
+/// One explicit TV header control owner. The phone chrome deliberately receives a plain [Modifier], while
+/// the couch layout makes each horizontal neighbor and the shared transport destination unambiguous.
+private fun tvHeaderControlModifier(
+    isTvPlayer: Boolean,
+    requester: FocusRequester,
+    left: FocusRequester? = null,
+    right: FocusRequester? = null,
+    down: FocusRequester,
+): Modifier = if (!isTvPlayer) {
+    // Phone calls historically carried this requester (without requesting it). Keep that no-op topology
+    // intact so the TV focus map is a strictly TV-only behavior change.
+    Modifier.focusRequester(requester)
+} else {
+    Modifier
+        .focusRequester(requester)
+        .focusProperties {
+            left?.let { this.left = it }
+            right?.let { this.right = it }
+            this.down = down
+        }
+}
+
+/// Every focusable transport descendant uses this modifier, not just Play/Pause. That makes Up deterministic
+/// from seeks, chapter jumps, and the scrubber alike. The optional requester is only the region's entry point.
+private fun tvTransportControlModifier(
+    isTvPlayer: Boolean,
+    tvHeaderFocus: FocusRequester?,
+    requester: FocusRequester? = null,
+): Modifier = if (!isTvPlayer || tvHeaderFocus == null) {
+    Modifier
+} else {
+    Modifier
+        .then(if (requester != null) Modifier.focusRequester(requester) else Modifier)
+        .focusProperties { up = tvHeaderFocus }
+}
+
+/// Compose's legacy [FocusProperties.exit] hook remains experimental in the app's Compose 1.9 line. Keep
+/// that opt-in in one small TV-only modifier rather than leaking it across the shared phone/player surface.
+@OptIn(ExperimentalComposeUiApi::class)
+private fun tvOverlayFocusExitModifier(isTvPlayer: Boolean): Modifier = if (isTvPlayer) {
+    Modifier.focusProperties { exit = { FocusRequester.Cancel } }
+} else {
+    Modifier
+}
+
+private fun tvOverlayFocusTrapModifier(isTvPlayer: Boolean): Modifier =
+    if (isTvPlayer) Modifier.focusGroup().then(tvOverlayFocusExitModifier(true)) else Modifier
 
 /// One control-cluster icon button (white, or [tint]-highlighted when its state is active).
 @Composable

@@ -173,6 +173,10 @@ fun TvApp(
             null
         }
         if (playable != null) {
+            // The player is a separate early-return branch, so it must enter the TV Material scope here
+            // rather than inheriting the browse shell's scope below. This keeps TV focus surfaces and their
+            // pressed/selected locals available without changing the phone PlayerScreen host.
+            TvMaterialTheme(colorScheme = tvDarkColorScheme()) {
             // History identity for the engine playback session; an in-player episode switch advances it so
             // the finished episode's history session ends and the new episode's begins.
             var historyIdentity by remember(playable) {
@@ -272,6 +276,7 @@ fun TvApp(
                 shareLink = tvStreamShareLink(playable),
                 isTvPlayer = true,
             )
+            }
             return@VortXTheme
         }
 
