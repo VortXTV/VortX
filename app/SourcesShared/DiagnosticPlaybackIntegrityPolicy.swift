@@ -125,6 +125,42 @@ enum DeferredResumeFloorPolicy {
     }
 }
 
+/// A deferred resume seek is optimistic until an engine tick proves it landed. When its bounded watchdog
+/// gives up, presentation and persistence must move together to that proven position: keeping the requested
+/// target in either surface makes later scrubs or saves operate on a playhead the engine never reached.
+enum DeferredResumeSeekReconciliationPolicy {
+    struct Abandonment: Equatable, Sendable {
+        let presentationSeconds: Double
+        let persistenceSeconds: Double
+        let retiresResumeFloor: Bool
+    }
+
+    /// Returns a reconciliation only for a finite, trustworthy engine position that is still materially below
+    /// the requested target. A near-target tick is proof the seek landed; an absent/invalid raw position is not
+    /// evidence strong enough to replace the UI or persistence state.
+    static func abandonment(
+        targetSeconds: Double,
+        actualPositionSeconds: Double,
+        landingToleranceSeconds: Double,
+        watchdogStillOwnsGeneration: Bool
+    ) -> Abandonment? {
+        guard watchdogStillOwnsGeneration,
+              targetSeconds.isFinite,
+              actualPositionSeconds.isFinite,
+              actualPositionSeconds >= 0,
+              landingToleranceSeconds.isFinite,
+              landingToleranceSeconds >= 0,
+              targetSeconds - actualPositionSeconds > landingToleranceSeconds else {
+            return nil
+        }
+        return Abandonment(
+            presentationSeconds: actualPositionSeconds,
+            persistenceSeconds: actualPositionSeconds,
+            retiresResumeFloor: true
+        )
+    }
+}
+
 enum RetryResumeTargetPolicy {
     /// Select the requested origin only when its attempt has a provable owner. A native terminal failure
     /// retires the exact active token before presenting Retry, so that one recorded retirement remains valid

@@ -6274,25 +6274,30 @@ struct TVPlayerView: View {
     /// SAME OFFSET, which wedges again and re-arms the DV->HDR10 display switch every cycle (the observed
     /// Harry Potter stall loop). If the seek has not landed within 12s, abandon the offset instead: a relative
     /// +0.1s nudge (the same proven wedge release as the cold-start nudge) resumes playback from wherever the
-    /// source actually is, with a progress floor so the stored Continue Watching point is never regressed.
+    /// source actually is, reconciling presentation and persistence to the first proven engine position.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         postFrameResumeSeekWatchdog?.cancel()
         let armedToken = coordinator.player?.activeLoadToken
         postFrameResumeSeekWatchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
             guard !Task.isCancelled,
-                  coordinator.player?.activeLoadToken == armedToken,
-                  target - lastRawTimePos > inFlightSeekSnapRadius else { return }
+                  let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
+                    targetSeconds: target,
+                    actualPositionSeconds: lastRawTimePos,
+                    landingToleranceSeconds: inFlightSeekSnapRadius,
+                    watchdogStillOwnsGeneration: coordinator.player?.activeLoadToken == armedToken
+                  ) else { return }
             DiagnosticsLog.log(
                 "playback",
-                String(format: "deferred resume seek did not land in %ds (real pos %.1f): abandoning the offset and playing from the current position",
-                       Int(postFrameResumeSeekWatchdogSeconds), lastRawTimePos)
+                String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation and persistence to the current position",
+                       Int(postFrameResumeSeekWatchdogSeconds), target, reconciliation.presentationSeconds)
             )
             inFlightSeekTarget = nil
             pendingLibmpvResumeSeek = nil
-            let floor = min(max(0, target), max(0, duration - 5))
-            suppressedResumeFloor = floor
-            lastSaved = floor
+            postFrameResumeSeekWatchdog = nil
+            currentTime = reconciliation.presentationSeconds
+            lastSaved = reconciliation.persistenceSeconds
+            if reconciliation.retiresResumeFloor { suppressedResumeFloor = nil }
             coordinator.player?.seek(by: 0.1)
         }
     }

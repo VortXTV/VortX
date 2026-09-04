@@ -585,9 +585,13 @@ struct PlayerScreen: View {
     /// Safety net for the deferred resume seek issued at first frame. A slow / non-Range source can leave mpv
     /// parked at the pre-seek position indefinitely; the plain stall ladder then reloads at the real (low)
     /// playhead and silently drops the viewer's resume point. This abandons the offset instead and resumes
-    /// playback from wherever the source actually is, with the persistence floor keeping the stored position.
+    /// playback from wherever the source actually is, reconciling presentation and persistence to that proven
+    /// position so a stale requested target cannot govern later scrubs or saves.
     @State private var postFrameResumeSeekWatchdog: Task<Void, Never>?
     private let postFrameResumeSeekWatchdogSeconds: Double = 12
+    /// Latest provenance-accepted engine tick, recorded before presentation gates. The deferred-resume watchdog
+    /// must reconcile against the real engine position, never the optimistic resume target shown in the UI.
+    @State private var lastRawTimePos: Double = -1
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var preparingEpisodeID: String?
     @State private var preparedEpisode: PlayerEpisodeStream?
@@ -1842,6 +1846,7 @@ struct PlayerScreen: View {
                 activeToken: coordinator.player?.activeLoadToken
                ) {
                 let d = event.seconds
+                lastRawTimePos = d
                 if pendingAdvance?.issued != true, supersededAdvance == nil {
                     committedLoadToken = event.loadToken
                 }
@@ -3757,21 +3762,29 @@ struct PlayerScreen: View {
     /// plain stall ladder then reloads at the real (low) playhead and silently drops the viewer's resume
     /// point. If the seek has not landed within 12s, abandon the offset instead: a relative +0.1s nudge (the
     /// proven wedge release) resumes playback from wherever the source actually is, and the floor armed at
-    /// issuance keeps the stored Continue Watching position from regressing.
+    /// issuance is retired at abandonment because the source has proven it cannot reach that offset.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         postFrameResumeSeekWatchdog?.cancel()
         let armedToken = coordinator.player?.activeLoadToken
         postFrameResumeSeekWatchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
             guard !Task.isCancelled,
-                  coordinator.player?.activeLoadToken == armedToken,
-                  target - currentTime > 5 else { return }
+                  let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
+                    targetSeconds: target,
+                    actualPositionSeconds: lastRawTimePos,
+                    landingToleranceSeconds: 5,
+                    watchdogStillOwnsGeneration: coordinator.player?.activeLoadToken == armedToken
+                  ) else { return }
             DiagnosticsLog.log(
                 "playback",
-                String(format: "deferred resume seek did not land in %ds (real pos %.1f): abandoning the offset and playing from the current position",
-                       Int(postFrameResumeSeekWatchdogSeconds), currentTime)
+                String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation and persistence to the current position",
+                       Int(postFrameResumeSeekWatchdogSeconds), target, reconciliation.presentationSeconds)
             )
             pendingLibmpvResumeSeek = nil
+            postFrameResumeSeekWatchdog = nil
+            currentTime = reconciliation.presentationSeconds
+            lastReported = reconciliation.persistenceSeconds
+            if reconciliation.retiresResumeFloor { suppressedResumeFloor = nil }
             coordinator.player?.seek(by: 0.1)
         }
     }
