@@ -329,6 +329,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// One identity for each source/remux mount. HDR recovery advances the item generation while deliberately
     /// keeping this identity; a source-audio remount or hosted-to-local recovery advances both.
     private var playbackMountIdentity: UInt64 = 0
+    /// Mount-scoped proof survives same-mount item replacement, unlike the per-item startup watchdog latch.
+    private var mountDVPictureProof = DVPlaybackPolicy.MountDVPictureProof()
     /// The exact loopback HLS master published by the current local remux mount. A CoreMedia -1008 callback
     /// may replace an item only when it still points at this URL; it must never turn a stale item failure into
     /// a same-token `loadFile` remount.
@@ -430,6 +432,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if videoFrameEverProduced { return true }
         guard hasProducedPicture(atClock: seconds) else { return false }
         videoFrameEverProduced = true
+        mountDVPictureProof.notePicture(
+            mountIdentity: playbackMountIdentity,
+            itemGeneration: itemGeneration,
+            isPrimaryDVItem: contentIsDolbyVision && isRemuxMounted && !usingHDRFallbackItem,
+            pictureProduced: true)
         forwardBufferCouplingFirstFrameUptime = (
             generation: itemGeneration,
             uptime: ProcessInfo.processInfo.systemUptime
@@ -1052,6 +1059,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         deferredEventOwnedRecovery = nil
         playbackMountIdentity &+= 1
         let issuedGeneration = itemGeneration
+        mountDVPictureProof.reset(
+            mountIdentity: playbackMountIdentity,
+            itemGeneration: issuedGeneration)
         midPlaybackRecoveryBudget.reset(for: playbackMountIdentity)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = nil
@@ -1725,7 +1735,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             )
         } ?? []
         return DVPlaybackPolicy.HDRFallbackAdmissionEvidence(
-            videoFrameEverProduced: videoFrameEverProduced,
+            videoFrameEverProduced: videoFrameEverProduced
+                || mountDVPictureProof.hasProof(for: playbackMountIdentity),
             errorLogEvents: errorLogEvents
         )
     }
@@ -1757,6 +1768,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // client's cached status predates init surgery, which is resolved below by one authoritative poll.
             fallbackAvailable: true,
             alreadyAttempted: hdrFallbackRetried,
+            mountHasProducedDVPicture: mountDVPictureProof.hasProof(for: playbackMountIdentity),
             errorDomain: trigger?.domain,
             errorCode: trigger?.code ?? 0,
             evidence: admissionEvidence,
@@ -1863,6 +1875,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if remuxRemoteMount != nil {
             remuxRemoteItemGeneration = itemGeneration
         }
+        mountDVPictureProof.beginItem(
+            mountIdentity: playbackMountIdentity,
+            itemGeneration: itemGeneration)
         audioReplacement?.bind(to: itemGeneration)
         pendingPlaybackIntent?.bind(
             generation: itemGeneration,
@@ -1939,6 +1954,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         let freshItem = AVPlayerItem(asset: AVURLAsset(url: playlistURL))
         itemGeneration &+= 1
+        mountDVPictureProof.beginItem(
+            mountIdentity: playbackMountIdentity,
+            itemGeneration: itemGeneration)
         midPlaybackRecoveryBudget.reset(for: playbackMountIdentity)
         lastMidPlaybackRecoveryProgress = nil
         midPlaybackRecoveryProgressGeneration = nil
@@ -2612,6 +2630,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         currentLoadResumeOrigin = 0
         remuxTimelineOrigin = 0
         itemGeneration &+= 1
+        mountDVPictureProof = DVPlaybackPolicy.MountDVPictureProof()
         terminalLatch.reset(generation: itemGeneration)
         deferredTerminal.reset(generation: itemGeneration)
         deferredEventOwnedRecovery = nil

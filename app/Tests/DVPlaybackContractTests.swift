@@ -194,6 +194,11 @@ private struct StartupWiringRule {
             end: "if let server = remuxHLSServer {",
             exactSection: """
             videoFrameEverProduced = true
+            mountDVPictureProof.notePicture(
+                mountIdentity: playbackMountIdentity,
+                itemGeneration: itemGeneration,
+                isPrimaryDVItem: contentIsDolbyVision && isRemuxMounted && !usingHDRFallbackItem,
+                pictureProduced: true)
             forwardBufferCouplingFirstFrameUptime = (
                 generation: itemGeneration,
                 uptime: ProcessInfo.processInfo.systemUptime
@@ -236,7 +241,8 @@ private struct StartupWiringRule {
                     )
                 } ?? []
                 return DVPlaybackPolicy.HDRFallbackAdmissionEvidence(
-                    videoFrameEverProduced: videoFrameEverProduced,
+                    videoFrameEverProduced: videoFrameEverProduced
+                        || mountDVPictureProof.hasProof(for: playbackMountIdentity),
                     errorLogEvents: errorLogEvents
                 )
             }
@@ -1657,6 +1663,65 @@ check("artifact: Profile 8.4 recovery is a separate exact-HLG single-variant mas
 
 let primaryDVMasterURL = URL(string: "http://127.0.0.1:43123/r/capability/master.m3u8")!
 let primaryDVInitURL = DVPlaybackPolicy.primaryInitURL(from: primaryDVMasterURL)!
+var mountDVProof = DVPlaybackPolicy.MountDVPictureProof()
+mountDVProof.reset(mountIdentity: 41, itemGeneration: 100)
+mountDVProof.notePicture(
+    mountIdentity: 41,
+    itemGeneration: 100,
+    isPrimaryDVItem: true,
+    pictureProduced: true)
+mountDVProof.beginItem(mountIdentity: 41, itemGeneration: 101)
+check("HDR recovery: a DV picture receipt sticks across same-mount item replacement",
+      mountDVProof.hasProof(for: 41))
+check("HDR recovery: mount-scoped DV proof closes fallback after same-mount replacement",
+      !DVPlaybackPolicy.shouldAttemptHDRFallback(
+          dolbyVision: true,
+          remuxMounted: true,
+          mountHealthy: true,
+          fallbackAvailable: true,
+          alreadyAttempted: false,
+          mountHasProducedDVPicture: mountDVProof.hasProof(for: 41),
+          errorDomain: "CoreMediaErrorDomain",
+          errorCode: -12927,
+          evidence: .init(videoFrameEverProduced: false, errorLogEvents: []),
+          primaryInitURL: primaryDVInitURL))
+mountDVProof.reset(mountIdentity: 42, itemGeneration: 200)
+mountDVProof.notePicture(
+    mountIdentity: 41,
+    itemGeneration: 101,
+    isPrimaryDVItem: true,
+    pictureProduced: true)
+mountDVProof.notePicture(
+    mountIdentity: 42,
+    itemGeneration: 199,
+    isPrimaryDVItem: true,
+    pictureProduced: true)
+check("HDR recovery: stale generation or prior mount cannot establish new-mount proof",
+      !mountDVProof.hasProof(for: 42))
+check("HDR recovery: a new mount with no picture keeps exact init rejection eligible",
+      DVPlaybackPolicy.shouldAttemptHDRFallback(
+          dolbyVision: true,
+          remuxMounted: true,
+          mountHealthy: true,
+          fallbackAvailable: true,
+          alreadyAttempted: false,
+          mountHasProducedDVPicture: mountDVProof.hasProof(for: 42),
+          errorDomain: "CoreMediaErrorDomain",
+          errorCode: -12927,
+          evidence: .init(
+              videoFrameEverProduced: false,
+              errorLogEvents: [.init(
+                  errorDomain: "CoreMediaErrorDomain",
+                  errorStatusCode: -12927,
+                  uri: "http://127.0.0.1:43123/r/capability/init.mp4")]),
+          primaryInitURL: primaryDVInitURL))
+mountDVProof.notePicture(
+    mountIdentity: 42,
+    itemGeneration: 200,
+    isPrimaryDVItem: false,
+    pictureProduced: true)
+check("HDR recovery: deliberate HDR fallback picture does not establish DV proof",
+      !mountDVProof.hasProof(for: 42))
 check("HDR recovery: current master derives its own exact init route without inheriting query or fragment",
       DVPlaybackPolicy.primaryInitURL(
         from: URL(string: "https://HOST.example:443/r/current%2Dmount/master.m3u8?token=current#master")!)

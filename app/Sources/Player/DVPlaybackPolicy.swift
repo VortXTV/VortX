@@ -11,6 +11,43 @@ import Foundation
 /// and a semantic break fails it.
 enum DVPlaybackPolicy {
 
+    /// Mount-scoped proof that a primary Dolby Vision item actually rendered a picture. Item replacement
+    /// advances the active generation without clearing this receipt; a new mount clears it. Generation
+    /// ownership prevents a late callback from a retired item from establishing proof.
+    struct MountDVPictureProof: Equatable, Sendable {
+        private(set) var mountIdentity: UInt64?
+        private(set) var activeItemGeneration: UInt64?
+        private(set) var didProducePicture = false
+
+        mutating func reset(mountIdentity: UInt64, itemGeneration: UInt64) {
+            self.mountIdentity = mountIdentity
+            activeItemGeneration = itemGeneration
+            didProducePicture = false
+        }
+
+        mutating func beginItem(mountIdentity: UInt64, itemGeneration: UInt64) {
+            guard self.mountIdentity == mountIdentity else { return }
+            activeItemGeneration = itemGeneration
+        }
+
+        mutating func notePicture(
+            mountIdentity: UInt64,
+            itemGeneration: UInt64,
+            isPrimaryDVItem: Bool,
+            pictureProduced: Bool
+        ) {
+            guard isPrimaryDVItem,
+                  pictureProduced,
+                  self.mountIdentity == mountIdentity,
+                  activeItemGeneration == itemGeneration else { return }
+            didProducePicture = true
+        }
+
+        func hasProof(for mountIdentity: UInt64) -> Bool {
+            self.mountIdentity == mountIdentity && didProducePicture
+        }
+    }
+
     /// Prefix carried unchanged from remux classification to the player source-failover edge. Keeping one
     /// typed prefix prevents a mislabeled preview asset from being reduced to a generic AVPlayer URL error.
     static let sourceCapabilityMismatchPrefix = "source capability mismatch:"
@@ -451,6 +488,7 @@ enum DVPlaybackPolicy {
                                          mountHealthy: Bool,
                                          fallbackAvailable: Bool,
                                          alreadyAttempted: Bool,
+                                         mountHasProducedDVPicture: Bool = false,
                                          errorDomain: String?,
                                          errorCode: Int,
                                          evidence: HDRFallbackAdmissionEvidence,
@@ -460,6 +498,7 @@ enum DVPlaybackPolicy {
             && mountHealthy
             && fallbackAvailable
             && !alreadyAttempted
+            && !mountHasProducedDVPicture
             && errorDomain == "CoreMediaErrorDomain"
             && errorCode == -12927
             && hasPrimaryDVInitFailure(evidence, primaryInitURL: primaryInitURL)
