@@ -712,11 +712,12 @@ class DetailViewModel(
      */
     fun abandonPlaybackResolve() {
         val request = sourceRequestFence.currentToken() ?: return
-        if (!playbackResolveFence.invalidateForSourceRequest(request)) return
-        playbackResolveJob?.cancel()
-        playbackResolveJob = null
-        if (_playback.value is Playback.Resolving) {
-            _playback.value = Playback.Idle
+        if (playbackResolveFence.invalidateForSourceRequest(request)) {
+            playbackResolveJob?.cancel()
+            playbackResolveJob = null
+            if (_playback.value is Playback.Resolving) {
+                _playback.value = Playback.Idle
+            }
         }
     }
 

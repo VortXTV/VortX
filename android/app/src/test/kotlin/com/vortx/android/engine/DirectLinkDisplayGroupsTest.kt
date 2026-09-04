@@ -122,19 +122,48 @@ class DirectLinkDisplayGroupsTest {
         val startLoad = source.substringAfter("private fun startSourceLoad")
             .substringBefore("/**\n     * Retire an in-flight detail resolver")
 
-        val revoke = helper.indexOf("playbackResolveFence.invalidateForSourceRequest(request)")
-        val cancel = helper.indexOf("playbackResolveJob?.cancel()")
+        val acceptedGuard = helper.indexOf("if (playbackResolveFence.invalidateForSourceRequest(request)) {")
+        val acceptedResolve = bracedBlock(helper, acceptedGuard)
+        val cancel = acceptedResolve.content.indexOf("playbackResolveJob?.cancel()")
         val targetCancel = startLoad.indexOf("cancelPlaybackResolveForSourceTargetInvalidation()")
         val targetAdvance = startLoad.indexOf("sourceRequestFence.begin")
 
-        assertTrue(revoke >= 0)
+        assertTrue(acceptedGuard >= 0)
         assertTrue(cancel >= 0)
         assertTrue(targetCancel >= 0)
         assertTrue(targetAdvance >= 0)
-        assertTrue(revoke < cancel)
+        assertTrue("Cancellation must be owned by the token-matching lease invalidation", cancel >= 0)
+        assertTrue("Idle must stay inside the nested Resolving mutation block", resolvingGuardOwnsIdle(helper))
         assertTrue(targetCancel < targetAdvance)
-        assertTrue(helper.contains("if (_playback.value is Playback.Resolving)"))
-        assertTrue(helper.contains("_playback.value = Playback.Idle"))
+        assertFalse(
+            "Idle must not escape the token-matching lease guard",
+            helper.removeRange(acceptedGuard, acceptedResolve.endExclusive)
+                .contains("_playback.value = Playback.Idle"),
+        )
+    }
+
+    @Test
+    fun `abandon contract rejects idle moved after resolving guard`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
+        val helper = source.substringAfter("fun abandonPlaybackResolve()")
+            .substringBefore("private fun canPublishPlaybackResolve")
+        val acceptedResolve = bracedBlock(
+            helper,
+            helper.indexOf("if (playbackResolveFence.invalidateForSourceRequest(request)) {"),
+        )
+        val resolvingGuard = acceptedResolve.content.indexOf("if (_playback.value is Playback.Resolving) {")
+        val resolving = bracedBlock(acceptedResolve.content, resolvingGuard)
+        val resolvingSource = acceptedResolve.content.substring(resolvingGuard, resolving.endExclusive)
+        val idleOutsideResolving = helper.replace(
+            resolvingSource,
+            resolvingSource.replace("_playback.value = Playback.Idle", "") +
+                "\n        _playback.value = Playback.Idle",
+        )
+
+        assertFalse(
+            "A later Idle inside the outer token guard is still an escaped Resolving mutation",
+            resolvingGuardOwnsIdle(idleOutsideResolving),
+        )
     }
 
     @Test
@@ -163,6 +192,37 @@ class DirectLinkDisplayGroupsTest {
 
     private fun methodBody(source: String, start: String, end: String): String =
         source.substringAfter(start).substringBefore(end)
+
+    private fun resolvingGuardOwnsIdle(helper: String): Boolean {
+        val acceptedGuard = helper.indexOf("if (playbackResolveFence.invalidateForSourceRequest(request)) {")
+        if (acceptedGuard < 0) return false
+        val acceptedResolve = bracedBlock(helper, acceptedGuard)
+        val resolvingGuard = acceptedResolve.content.indexOf("if (_playback.value is Playback.Resolving) {")
+        if (resolvingGuard < 0) return false
+        val resolving = bracedBlock(acceptedResolve.content, resolvingGuard)
+        return resolving.content.contains("_playback.value = Playback.Idle") &&
+            !acceptedResolve.content.removeRange(resolvingGuard, resolving.endExclusive)
+                .contains("_playback.value = Playback.Idle")
+    }
+
+    private fun bracedBlock(source: String, guardStart: Int): BracedBlock {
+        assertTrue("Missing accepted-resolve guard", guardStart >= 0)
+        val openBrace = source.indexOf('{', guardStart)
+        assertTrue("Accepted-resolve guard must open a block", openBrace >= 0)
+        var depth = 0
+        for (index in openBrace until source.length) {
+            when (source[index]) {
+                '{' -> depth += 1
+                '}' -> {
+                    depth -= 1
+                    if (depth == 0) return BracedBlock(source.substring(openBrace + 1, index), index + 1)
+                }
+            }
+        }
+        error("Accepted-resolve guard has no closing brace")
+    }
+
+    private data class BracedBlock(val content: String, val endExclusive: Int)
 
     private fun assertCallbackAbandonsBeforeRoute(
         source: String,
