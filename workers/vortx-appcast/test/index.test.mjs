@@ -541,6 +541,87 @@ test("Android augmentation creates a content-addressed split feed while preservi
   assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 409);
 });
 
+test("consecutive Apple-only promotions retain only the last verified Android split feed", async () => {
+  const env = environment(new MemoryKV());
+  const beta1 = makeReceipt({ releaseId: "235", build: 235, tag: "v0.4.0-beta.1" });
+  const beta2 = makeReceipt({ releaseId: "236", build: 236, tag: "v0.4.0-beta.2" });
+  const beta3 = makeReceipt({ releaseId: "237", build: 237, tag: "v0.4.0-beta.3" });
+  for (const receipt of [beta1, beta2, beta3]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  const promote = (receipt, expected, operationId) => worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId, releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: expected,
+  }), env);
+
+  assert.equal((await promote(beta1, null, "promote-beta1")).status, 200);
+  const beta1BeforeAndroid = structuredClone(await env.__state.storage.get("active"));
+  const augmentation = androidAugmentation(beta1, "augment-beta1");
+  augmentation.expectedReceiptSha256 = beta1BeforeAndroid.receiptSha256;
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 200);
+  const beta1Android = structuredClone(await env.__state.storage.get("active"));
+  const expectedAndroid = JSON.parse(beta1Android.appcastText).android;
+
+  const ownAndroid = await worker.fetch(new Request("https://vortx.tv/appcast.json"), env);
+  assert.equal(ownAndroid.headers.get("etag"), `"${beta1Android.manifest.generation}"`);
+  assert.deepEqual((await ownAndroid.json()).android, expectedAndroid);
+
+  assert.equal((await promote(beta2, beta1Android.manifest.generation, "promote-beta2")).status, 200);
+  assert.equal((await promote(beta3, beta2.manifest.generation, "promote-beta3")).status, 200);
+  const first = await worker.fetch(new Request("https://vortx.tv/appcast.json"), env);
+  const second = await worker.fetch(new Request("https://vortx.tv/appcast.json"), env);
+  assert.equal(first.headers.get("etag"), `"${beta3.manifest.generation}"`);
+  assert.equal(first.headers.get("etag"), second.headers.get("etag"));
+  const firstText = await first.text();
+  assert.equal(firstText, await second.text());
+  const publicAppcast = JSON.parse(firstText);
+  assert.equal(publicAppcast._generatedFromTag, beta3.manifest.tag);
+  assert.equal(publicAppcast.ios.tag, beta3.manifest.tag);
+  assert.deepEqual(publicAppcast.android, expectedAndroid);
+
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback", expectedCurrentGeneration: beta3.manifest.generation, restoreGeneration: beta2.manifest.generation,
+  }), env)).status, 200);
+  assert.equal((await env.__state.storage.get("active")).manifest.generation, beta2.manifest.generation);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "rollback", expectedCurrentGeneration: beta2.manifest.generation, restoreGeneration: beta1Android.manifest.generation,
+  }), env)).status, 200);
+  assert.equal((await env.__state.storage.get("active")).manifest.generation, beta1Android.manifest.generation);
+});
+
+test("Apple-only appcast fails closed to null Android for missing, cyclic, or malformed predecessors", async () => {
+  const setup = async () => {
+    const env = environment(new MemoryKV());
+    const beta1 = makeReceipt({ releaseId: "235", build: 235, tag: "v0.4.0-beta.1" });
+    const beta2 = makeReceipt({ releaseId: "236", build: 236, tag: "v0.4.0-beta.2" });
+    for (const receipt of [beta1, beta2]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+    const promote = (receipt, expected, operationId) => worker.fetch(signedRequest("/__release/receipt", {
+      action: "promote", operationId, releaseId: receipt.manifest.releaseId, generation: receipt.manifest.generation, expectedActiveGeneration: expected,
+    }), env);
+    assert.equal((await promote(beta1, null, "promote-beta1")).status, 200);
+    const active = structuredClone(await env.__state.storage.get("active"));
+    const augmentation = androidAugmentation(beta1, "augment-beta1");
+    augmentation.expectedReceiptSha256 = active.receiptSha256;
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 200);
+    const androidPredecessor = structuredClone(await env.__state.storage.get("active"));
+    assert.equal((await promote(beta2, androidPredecessor.manifest.generation, "promote-beta2")).status, 200);
+    return { env, beta2 };
+  };
+  for (const corrupt of [
+    async ({ env, beta2 }) => env.__state.storage.delete(`rollback:${beta2.manifest.generation}`),
+    async ({ env, beta2 }) => env.__state.storage.put(`rollback:${beta2.manifest.generation}`, await env.__state.storage.get("active")),
+    async ({ env, beta2 }) => {
+      const predecessor = await env.__state.storage.get(`rollback:${beta2.manifest.generation}`);
+      predecessor.manifest.android = { full: predecessor.manifest.android.full };
+      predecessor.appcastText = `${JSON.stringify({ ...JSON.parse(predecessor.appcastText), android: predecessor.manifest.android }, null, 2)}\n`;
+      await env.__state.storage.put(`rollback:${beta2.manifest.generation}`, predecessor);
+    },
+  ]) {
+    const fixture = await setup();
+    await corrupt(fixture);
+    const response = await worker.fetch(new Request("https://vortx.tv/appcast.json"), fixture.env);
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).android, null);
+  }
+});
+
 test("Android augmentation rejects stale CAS, wrong signer provenance, and non-null Android state", async () => {
   const setupAugmentation = async () => {
     const env = environment(new MemoryKV());

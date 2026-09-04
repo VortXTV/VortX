@@ -18,6 +18,7 @@ readonly ROOT_GRADLE_BUILD="$REPO_ROOT/android/build.gradle.kts"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly MPV_SEAM_BUILD="$REPO_ROOT/android/mpv-seam/build.gradle.kts"
 readonly ARTIFACTS_DOC="$REPO_ROOT/docs/RELEASE-ARTIFACTS.md"
+readonly CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -496,8 +497,60 @@ require_grep "Android lane refuses partial publication" \
     'Refuse Android-only publication' "$RELEASE_WF"
 require_grep "Android checksum lists downloadable basenames" \
     "sed 's#  dist/#  #' > dist/SHA256SUMS-android.txt" "$RELEASE_WF"
-require_grep "Apple coordinator requires the complete Android set before publish" \
+require_grep "Apple coordinator exposes an Apple-only dispatch boolean" \
+    '^      apple_only:$' "$APPLE_RELEASE_WF"
+apple_only_input_block="$(awk '
+    /^      apple_only:$/ { capture=1 }
+    capture && /^      [A-Za-z_][A-Za-z_]*:$/ && !/^      apple_only:$/ { exit }
+    capture { print }
+' "$APPLE_RELEASE_WF")"
+grep -Eq '^        type: boolean$' <<<"$apple_only_input_block" \
+    && grep -Eq '^        default: false$' <<<"$apple_only_input_block" \
+    || fail "Apple-only dispatch must be a default-false boolean"
+ok "Apple-only dispatch defaults to the full-platform path"
+require_grep "Apple-only changelog declares the same platform contract" \
+    'vortx-platforms:[[:space:]]*apple' "$CHANGELOG"
+apple_only_tag_regexes="$(awk -F"'" '/^[[:space:]]*APPLE_ONLY_TAG_RE=/{ print $2 }' "$APPLE_RELEASE_WF")"
+apple_only_marker_regexes="$(awk -F"'" '/^[[:space:]]*APPLE_ONLY_MARKER_RE=/{ print $2 }' "$APPLE_RELEASE_WF")"
+[[ "$(sed '/^$/d' <<<"$apple_only_tag_regexes" | wc -l | tr -d ' ')" -eq 2 ]] \
+    && [[ "$(sed '/^$/d' <<<"$apple_only_tag_regexes" | sort -u | wc -l | tr -d ' ')" -eq 1 ]] \
+    || fail "Apple-only tag regex must be declared identically for dispatch and publication verification"
+[[ "$(sed '/^$/d' <<<"$apple_only_marker_regexes" | wc -l | tr -d ' ')" -eq 2 ]] \
+    && [[ "$(sed '/^$/d' <<<"$apple_only_marker_regexes" | sort -u | wc -l | tr -d ' ')" -eq 1 ]] \
+    || fail "Apple-only marker regex must be declared identically for dispatch and publication verification"
+apple_only_tag_re="$(head -n 1 <<<"$apple_only_tag_regexes")"
+apple_only_marker_re="$(head -n 1 <<<"$apple_only_marker_regexes")"
+for accepted_tag in v0.4.0-beta.2; do
+    [[ "$accepted_tag" =~ $apple_only_tag_re ]] || fail "Apple-only beta tag regex rejected $accepted_tag"
+done
+for rejected_tag in v0.4.0 v0.4.0-rc.1 v0.4.0-alpha.1; do
+    [[ ! "$rejected_tag" =~ $apple_only_tag_re ]] || fail "Apple-only beta tag regex accepted $rejected_tag"
+done
+for valid_marker in 'vortx-platforms: apple' '<!-- vortx-platforms: apple -->'; do
+    grep -Eq "$apple_only_marker_re" <<<"$valid_marker" || fail "Apple-only marker regex rejected a valid declaration: $valid_marker"
+done
+for malformed_marker in '<!-- vortx-platforms: apple' 'vortx-platforms: apple -->'; do
+    grep -Eq "$apple_only_marker_re" <<<"$malformed_marker" && fail "Apple-only marker regex accepted malformed declaration: $malformed_marker"
+done
+ok "Apple-only release mode accepts only beta tags and complete bare or paired markers"
+require_grep "Apple-only dispatch is rejected for non-beta tags" \
+    'Apple-only publication is allowed only for beta tags' "$APPLE_RELEASE_WF"
+require_grep "Apple coordinator keeps the full Android checksum gate" \
     'Android checksum asset is missing' "$APPLE_RELEASE_WF"
+require_grep "Apple coordinator skips Android only through its explicit Apple-only branch" \
+    'if \[ "\$APPLE_ONLY" != true \]; then' "$APPLE_RELEASE_WF"
+require_grep "published verifier derives Apple-only state from the release body" \
+    'PLATFORM_APPLE=false' "$APPLE_RELEASE_WF"
+require_grep "published verifier reads the release-body platform declaration" \
+    'RELEASE_BODY=.*\.body' "$APPLE_RELEASE_WF"
+require_grep "published verifier rejects Apple-only declarations on non-beta tags" \
+    'Apple-only release declaration is valid only on a beta tag' "$APPLE_RELEASE_WF"
+require_grep "published verifier checks the actual Android feed before downloading it" \
+    'HAS_ANDROID=false' "$APPLE_RELEASE_WF"
+require_grep "published verifier rejects partial Android feeds" \
+    'appcast Android feed is partial or malformed' "$APPLE_RELEASE_WF"
+require_grep "published verifier retains byte proof for a present inherited Android feed" \
+    'if \[ "\$HAS_ANDROID" = true \]; then' "$APPLE_RELEASE_WF"
 require_grep "Stable publish sends GitHub's string-valued latest mode" \
     'gh api --method PATCH -f draft=false -f make_latest=true' "$APPLE_RELEASE_WF"
 require_absent "Stable publish must not encode make_latest as a JSON boolean" \

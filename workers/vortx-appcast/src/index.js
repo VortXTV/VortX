@@ -19,6 +19,7 @@ const COMMIT_RE = /^[0-9a-f]{40}$/i;
 const REPOSITORY = "VortXTV/VortX";
 const CANONICAL_ALTSTORE = "https://vortx.tv/altstore.json";
 const ANDROID_SIGNER_SHA256 = "FC22B87ECD9E4FA26930A1C3E227D8F7D918C646B216032B5DA820EF1AC218CA";
+const MAX_ANDROID_PREDECESSOR_HOPS = 32;
 
 function jsonText(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
@@ -291,6 +292,32 @@ function validateAndroidArtifact(android, manifest) {
   return android;
 }
 
+function inheritedAndroid(appcastText, manifest) {
+  const appcast = parseJSON(appcastText, "predecessor appcast");
+  if (!appcast || Number(appcast.schemaVersion) !== ARTIFACT_SCHEMA || appcast._generatedFromTag !== manifest?.tag || appcast._generatedFromCommit !== manifest?.sourceCommit) {
+    throw new Error("predecessor appcast identity does not match its verified manifest");
+  }
+  if (appcast.android === null || manifest?.android === null) {
+    if (appcast.android === null && manifest?.android === null) return null;
+    throw new Error("predecessor Android presence differs from its verified manifest");
+  }
+  const android = appcast.android;
+  if (!android || JSON.stringify(canonicalValue(android)) !== JSON.stringify(canonicalValue(manifest.android))) {
+    throw new Error("predecessor Android metadata differs from its verified manifest");
+  }
+  const requirements = {
+    full: { engine: "mpv", name: `VortX-${manifest.version}-full-mpv-universal.apk` },
+    play: { engine: "media3", name: `VortX-${manifest.version}-play-media3-universal.apk` },
+  };
+  for (const [flavor, requirement] of Object.entries(requirements)) {
+    const entry = android[flavor];
+    if (!entry || entry.flavor !== flavor || entry.engine !== requirement.engine || entry.applicationId !== "com.vortx.android" || entry.artifactType !== "apk" || entry.signed !== true || entry.tag !== manifest.tag || entry.version !== manifest.version || Number(entry.build) !== Number(manifest.build) || entry.name !== manifest.name || entry.notes !== manifest.notes || Boolean(entry.prerelease) !== Boolean(manifest.prerelease) || entry.url !== releaseAssetURL(manifest.tag, requirement.name) || !Number.isInteger(Number(entry.size)) || Number(entry.size) <= 0 || digest(entry.sha256, `predecessor Android ${flavor} sha256`) !== entry.sha256 || entry.signer !== ANDROID_SIGNER_SHA256) {
+      throw new Error(`predecessor Android ${flavor} metadata is invalid`);
+    }
+  }
+  return android;
+}
+
 function validateAppcast(appcast, manifest) {
   if (!appcast || Number(appcast.schemaVersion) !== ARTIFACT_SCHEMA || appcast._generatedFromTag !== manifest.tag || appcast._generatedFromCommit !== manifest.sourceCommit) {
     throw new Error("appcast identity does not match the staged receipt");
@@ -402,7 +429,27 @@ export class FeedCoordinator {
     const payload = await request.json();
     if (payload.action === "read-active") {
       const active = await this.state.storage.get(ACTIVE_KEY);
-      return jsonResponse({ active: active || null });
+      if (active?.manifest?.android != null) return jsonResponse({ active, predecessors: [] });
+      const predecessors = [];
+      const seen = new Set();
+      let candidate = active;
+      for (let hop = 0; candidate && hop < MAX_ANDROID_PREDECESSOR_HOPS; hop += 1) {
+        const generation = candidate.manifest?.generation;
+        if (typeof generation !== "string" || seen.has(generation)) {
+          return jsonResponse({ active: active || null, predecessors: [] });
+        }
+        seen.add(generation);
+        const predecessor = await this.state.storage.get(`${ROLLBACK_PREFIX}${generation}`);
+        if (!predecessor) break;
+        const predecessorGeneration = predecessor.manifest?.generation;
+        if (typeof predecessorGeneration !== "string" || seen.has(predecessorGeneration)) {
+          return jsonResponse({ active: active || null, predecessors: [] });
+        }
+        predecessors.push(predecessor);
+        if (predecessor.manifest?.android != null) return jsonResponse({ active: active || null, predecessors });
+        candidate = predecessor;
+      }
+      return jsonResponse({ active: active || null, predecessors: [] });
     }
     // LEGACY_LASTGOOD is immutable fallback state.  Capture it outside the
     // Durable Object transaction so release serialization never waits on KV.
@@ -625,11 +672,27 @@ async function handleReceipt(request, env) {
 async function handlePublic(request, pathname, env) {
   const response = await coordinatorRequest(new Request("https://coordinator.internal/"), env, { action: "read-active" });
   if (!response.ok) return response;
-  const { active } = await response.json();
+  const { active, predecessors = [] } = await response.json();
   const frozen = !active || !active.manifest?.generation ? await env.LEGACY_LASTGOOD?.get("feed:active", { type: "json" }) : null;
   const selected = active || frozen;
   if (!selected || !selected.manifest?.generation) return failure(503, "feed-unavailable", "no verified feed generation is active");
-  const body = pathname === "/appcast.json" ? selected.appcastText : selected.sourceText;
+  let body = selected.sourceText;
+  if (pathname === "/appcast.json") {
+    const appcast = parseJSON(selected.appcastText, "active appcast");
+    let android = appcast.android;
+    if (android === null) {
+      for (const predecessor of predecessors) {
+        try {
+          android = inheritedAndroid(predecessor.appcastText, predecessor.manifest);
+        } catch {
+          android = null;
+          break;
+        }
+        if (android !== null) break;
+      }
+    }
+    body = android === appcast.android ? selected.appcastText : jsonText({ ...appcast, android });
+  }
   const generation = selected.manifest.generation;
   const headers = {
       "content-type": "application/json; charset=utf-8",

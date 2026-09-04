@@ -44,6 +44,11 @@ on:
         required: false
         type: boolean
         default: false
+      apple_only:
+        description: "Permit an Apple-only prerelease when the draft release body explicitly declares `vortx-platforms: apple`."
+        required: false
+        type: boolean
+        default: false
       release_id:
         description: "Optional numeric draft-release ID. When set, CI resolves the draft by ID directly instead of by tag lookup (GITHUB_TOKEN tag lookup can miss drafts)."
         required: false
@@ -982,6 +987,7 @@ jobs:
     needs: [build-tvos]
     outputs:
       release_id: ${{ steps.identity.outputs.release_id }}
+      apple_only: ${{ steps.identity.outputs.apple_only }}
     if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag)
     concurrency:
       group: vortx-release-${{ inputs.release_tag }}
@@ -1011,6 +1017,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.release_tag }}
           RELEASE_ID_INPUT: ${{ inputs.release_id }}
+          APPLE_ONLY_INPUT: ${{ inputs.apple_only }}
         run: |
           set -euo pipefail
           TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
@@ -1032,6 +1039,15 @@ jobs:
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
           jq -e --arg id "$RELEASE_ID" '(.releaseId | tostring) == $id' "$MANIFEST" >/dev/null || { echo "::error::draft release identity differs from the immutable feed artifact"; exit 1; }
           [ "$(jq -r '.draft' <<<"$RELEASE_JSON")" = true ] || { echo "::error::release $RELEASE_ID is not a draft; refusing asset writes"; exit 1; }
+          APPLE_ONLY=false
+          APPLE_ONLY_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$'
+          APPLE_ONLY_MARKER_RE='^[[:space:]]*(vortx-platforms:[[:space:]]*apple|<!--[[:space:]]*vortx-platforms:[[:space:]]*apple[[:space:]]*-->)[[:space:]]*$'
+          if [ "$APPLE_ONLY_INPUT" = true ]; then
+            [[ "$TAG" =~ $APPLE_ONLY_TAG_RE ]] || { echo "::error::Apple-only publication is allowed only for beta tags"; exit 1; }
+            RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
+            grep -Eq "$APPLE_ONLY_MARKER_RE" <<<"$RELEASE_BODY" || { echo "::error::Apple-only publication requires the exact release-body declaration vortx-platforms: apple"; exit 1; }
+            APPLE_ONLY=true
+          fi
           REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$TAG")"
           TAG_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"
           TAG_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
@@ -1081,6 +1097,7 @@ jobs:
           {
             echo "release_id=$RELEASE_ID"
             echo "build=$BUILD"
+            echo "apple_only=$APPLE_ONLY"
             echo "expected_active=$EXPECTED_ACTIVE"
             echo "main_head=$MAIN_HEAD"
             echo "previous_source_sha256=$PREVIOUS_SOURCE_SHA256"
@@ -1099,6 +1116,7 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           RELEASE_ID: ${{ steps.identity.outputs.release_id }}
           EXPECTED_ACTIVE: ${{ steps.identity.outputs.expected_active }}
+          APPLE_ONLY: ${{ steps.identity.outputs.apple_only }}
           RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
         run: |
           set -euo pipefail
@@ -1154,20 +1172,22 @@ jobs:
           register_asset "$LITE_NAME" "out/$LITE_NAME" "$LITE_SIZE" "$LITE_SHA"; LITE_ID="$REGISTERED_ID"
           register_asset "$MAC_NAME" "out/$MAC_NAME" "$MAC_SIZE" "$MAC_SHA"; MAC_ID="$REGISTERED_ID"
           register_asset "SHA256SUMS-ci.txt" out/SHA256SUMS-ci.txt "$(wc -c <out/SHA256SUMS-ci.txt | tr -d ' ')" "$(shasum -a 256 out/SHA256SUMS-ci.txt | awk '{print $1}')"; CHECKSUM_ID="$REGISTERED_ID"
-          # Android must already have attached its complete, signed flavor set. This gate does not
-          # build Android, but it prevents the Apple coordinator from publishing a partial release.
-          # Apple artifact URLs retain the complete tag (including `-beta.N`), but Android staging
-          # names packages from Gradle's numeric versionName. Normalize the tag here before looking
-          # up the Android checksum entries, so v0.4.0-beta.1 correctly requires VortX-0.4.0-*.apk.
-          VERSION="${TAG#v}"
-          VERSION="${VERSION%%-*}"
-          ANDROID_SUMS_ID="$(jq -er '.assets[] | select(.name == "SHA256SUMS-android.txt" and .state == "uploaded") | .id' <<<"$RELEASE_JSON")" || { echo "::error::Android checksum asset is missing; attach the Android draft artifacts before this coordinator"; exit 1; }
-          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$ANDROID_SUMS_ID" > "$RUNNER_TEMP/SHA256SUMS-android.txt"
-          for NAME in "VortX-$VERSION-full-mpv-universal.apk" "VortX-$VERSION-play-media3-universal.apk" "VortX-$VERSION-play-media3.aab"; do
-            EXPECTED_SHA="$(awk -v name="$NAME" '$2 == name {print $1}' "$RUNNER_TEMP/SHA256SUMS-android.txt")"
-            [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Android checksum is missing or malformed for downloadable asset $NAME"; exit 1; }
-            jq -e --arg name "$NAME" --arg sha "$EXPECTED_SHA" '.assets | map(select(.name == $name and .state == "uploaded" and ((.digest // "") | sub("^sha256:"; "") | ascii_downcase) == $sha)) | length == 1' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::Android release asset does not match its checksum: $NAME"; exit 1; }
-          done
+          if [ "$APPLE_ONLY" != true ]; then
+            # Android must already have attached its complete, signed flavor set. This gate does not
+            # build Android, but it prevents the Apple coordinator from publishing a partial release.
+            # Apple artifact URLs retain the complete tag (including `-beta.N`), but Android staging
+            # names packages from Gradle's numeric versionName. Normalize the tag here before looking
+            # up the Android checksum entries, so v0.4.0-beta.1 correctly requires VortX-0.4.0-*.apk.
+            VERSION="${TAG#v}"
+            VERSION="${VERSION%%-*}"
+            ANDROID_SUMS_ID="$(jq -er '.assets[] | select(.name == "SHA256SUMS-android.txt" and .state == "uploaded") | .id' <<<"$RELEASE_JSON")" || { echo "::error::Android checksum asset is missing; attach the Android draft artifacts before this coordinator"; exit 1; }
+            gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$ANDROID_SUMS_ID" > "$RUNNER_TEMP/SHA256SUMS-android.txt"
+            for NAME in "VortX-$VERSION-full-mpv-universal.apk" "VortX-$VERSION-play-media3-universal.apk" "VortX-$VERSION-play-media3.aab"; do
+              EXPECTED_SHA="$(awk -v name="$NAME" '$2 == name {print $1}' "$RUNNER_TEMP/SHA256SUMS-android.txt")"
+              [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::Android checksum is missing or malformed for downloadable asset $NAME"; exit 1; }
+              jq -e --arg name "$NAME" --arg sha "$EXPECTED_SHA" '.assets | map(select(.name == $name and .state == "uploaded" and ((.digest // "") | sub("^sha256:"; "") | ascii_downcase) == $sha)) | length == 1' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::Android release asset does not match its checksum: $NAME"; exit 1; }
+            done
+          fi
           jq --arg rid "$RELEASE_ID" --arg iid "$IOS_ID" --arg tid "$TVOS_ID" --arg lid "$LITE_ID" --arg mid "$MAC_ID" \
             '.releaseId = $rid | .assets.ios.assetId = ($iid | tonumber) | .assets.tvos.assetId = ($tid | tonumber) | .assets.tvosLite.assetId = ($lid | tonumber) | .assets.mac.assetId = ($mid | tonumber) | .assets[] .state = "uploaded"' \
             feed-artifact/manifest.json > "$RUNNER_TEMP/receipt-manifest.json"
@@ -1474,6 +1494,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_ID: ${{ github.event.release.id || needs.attach-release.outputs.release_id }}
           EVENT_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          APPLE_ONLY_INPUT: ${{ inputs.apple_only }}
         run: |
           set -euo pipefail
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
@@ -1482,6 +1503,22 @@ jobs:
           LATEST_JSON='{}'
           if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest")"; fi
           jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag/latest identity changed or release was recreated"; exit 1; }
+          RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
+          PLATFORM_APPLE=false
+          APPLE_ONLY_TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$'
+          APPLE_ONLY_MARKER_RE='^[[:space:]]*(vortx-platforms:[[:space:]]*apple|<!--[[:space:]]*vortx-platforms:[[:space:]]*apple[[:space:]]*-->)[[:space:]]*$'
+          if grep -Eq "$APPLE_ONLY_MARKER_RE" <<<"$RELEASE_BODY"; then
+            [[ "$EVENT_TAG" =~ $APPLE_ONLY_TAG_RE ]] || { echo "::error::Apple-only release declaration is valid only on a beta tag"; exit 1; }
+            PLATFORM_APPLE=true
+          fi
+          if [ "$APPLE_ONLY_INPUT" = true ] && [ "$PLATFORM_APPLE" != true ]; then
+            echo "::error::workflow Apple-only input requires the exact release-body declaration vortx-platforms: apple"
+            exit 1
+          fi
+          if [ "$APPLE_ONLY_INPUT" = true ] && ! [[ "$EVENT_TAG" =~ $APPLE_ONLY_TAG_RE ]]; then
+            echo "::error::Apple-only workflow input is valid only on a beta tag"
+            exit 1
+          fi
           REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$EVENT_TAG")"
           TAG_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"; TAG_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"; HOPS=0
           while [ "$TAG_TYPE" = tag ]; do HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || exit 1; TAG_OBJECT="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"; TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"; TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"; done
@@ -1490,7 +1527,14 @@ jobs:
           grep -Eiq '^content-type: application/json' "$RUNNER_TEMP/appcast.headers" || exit 1
           grep -Eiq '^cache-control: public, max-age=120, s-maxage=120, must-revalidate' "$RUNNER_TEMP/appcast.headers" || exit 1
           grep -Eiq '^x-vortx-feed-generation: .+' "$RUNNER_TEMP/appcast.headers" || exit 1
-          jq -e --arg tag "$EVENT_TAG" '.schemaVersion == 2 and ._generatedFromTag == $tag and (.android.full.artifactType == "apk") and (.android.play.artifactType == "apk") and .ios.altstore == "https://vortx.tv/altstore.json" and .tvos.altstore == null and .mac.altstore == null and .ios.artifactType == "ipa" and .tvos.artifactType == "ipa" and .mac.artifactType == "dmg"' "$RUNNER_TEMP/appcast.json" >/dev/null
+          jq -e --arg tag "$EVENT_TAG" '.schemaVersion == 2 and ._generatedFromTag == $tag and .ios.altstore == "https://vortx.tv/altstore.json" and .tvos.altstore == null and .mac.altstore == null and .ios.artifactType == "ipa" and .tvos.artifactType == "ipa" and .mac.artifactType == "dmg"' "$RUNNER_TEMP/appcast.json" >/dev/null
+          HAS_ANDROID=false
+          if jq -e '.android == null' "$RUNNER_TEMP/appcast.json" >/dev/null; then
+            [ "$PLATFORM_APPLE" = true ] || { echo "::error::full-platform release appcast is missing Android"; exit 1; }
+          else
+            jq -e '(.android | type) == "object" and (.android.full | type) == "object" and (.android.play | type) == "object" and .android.full.artifactType == "apk" and .android.play.artifactType == "apk" and .android.full.flavor == "full" and .android.play.flavor == "play" and .android.full.engine == "mpv" and .android.play.engine == "media3"' "$RUNNER_TEMP/appcast.json" >/dev/null || { echo "::error::appcast Android feed is partial or malformed"; exit 1; }
+            HAS_ANDROID=true
+          fi
           curl --fail-with-body --connect-timeout 5 --max-time 15 -sS "https://vortx.tv/appcast.json?release-check=$RELEASE_ID" -o "$RUNNER_TEMP/appcast-query.json"
           cmp -s "$RUNNER_TEMP/appcast.json" "$RUNNER_TEMP/appcast-query.json" || { echo "::error::appcast query returned different bytes"; exit 1; }
           for KEY_URL in "ios:.ios" "tvos:.tvos" "mac:.mac"; do
@@ -1499,12 +1543,14 @@ jobs:
             [ "$(wc -c <"$RUNNER_TEMP/published-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::published $KEY size differs from appcast"; exit 1; }
             [ "$(shasum -a 256 "$RUNNER_TEMP/published-$KEY" | awk '{print $1}')" = "$SHA" ] || { echo "::error::published $KEY digest differs from appcast"; exit 1; }
           done
-          for KEY_URL in "android-full:.android.full" "android-play:.android.play"; do
-            KEY="${KEY_URL%%:*}"; SELECTOR="${KEY_URL#*:}"; URL="$(jq -er "$SELECTOR.url" "$RUNNER_TEMP/appcast.json")"; SIZE="$(jq -er "$SELECTOR.size" "$RUNNER_TEMP/appcast.json")"; SHA="$(jq -er "$SELECTOR.sha256" "$RUNNER_TEMP/appcast.json" | tr '[:upper:]' '[:lower:]')"
-            curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "$URL" -o "$RUNNER_TEMP/published-$KEY"
-            [ "$(wc -c <"$RUNNER_TEMP/published-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::published $KEY size differs from appcast"; exit 1; }
-            [ "$(shasum -a 256 "$RUNNER_TEMP/published-$KEY" | awk '{print $1}')" = "$SHA" ] || { echo "::error::published $KEY digest differs from appcast"; exit 1; }
-          done
+          if [ "$HAS_ANDROID" = true ]; then
+            for KEY_URL in "android-full:.android.full" "android-play:.android.play"; do
+              KEY="${KEY_URL%%:*}"; SELECTOR="${KEY_URL#*:}"; URL="$(jq -er "$SELECTOR.url" "$RUNNER_TEMP/appcast.json")"; SIZE="$(jq -er "$SELECTOR.size" "$RUNNER_TEMP/appcast.json")"; SHA="$(jq -er "$SELECTOR.sha256" "$RUNNER_TEMP/appcast.json" | tr '[:upper:]' '[:lower:]')"
+              curl --fail-with-body --connect-timeout 5 --max-time 30 --retry 2 --retry-delay 2 -sS -L "$URL" -o "$RUNNER_TEMP/published-$KEY"
+              [ "$(wc -c <"$RUNNER_TEMP/published-$KEY" | tr -d ' ')" = "$SIZE" ] || { echo "::error::published $KEY size differs from appcast"; exit 1; }
+              [ "$(shasum -a 256 "$RUNNER_TEMP/published-$KEY" | awk '{print $1}')" = "$SHA" ] || { echo "::error::published $KEY digest differs from appcast"; exit 1; }
+            done
+          fi
           curl --fail-with-body --connect-timeout 5 --max-time 15 -sS -D "$RUNNER_TEMP/source.headers" https://vortx.tv/altstore.json -o "$RUNNER_TEMP/source.json"
           curl --fail-with-body --connect-timeout 5 --max-time 15 -sS https://vortx.tv/vortx-altstore.json -o "$RUNNER_TEMP/compat.json"
           cmp -s "$RUNNER_TEMP/source.json" "$RUNNER_TEMP/compat.json" || { echo "::error::compatibility route differs from canonical route"; exit 1; }

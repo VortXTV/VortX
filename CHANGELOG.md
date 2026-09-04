@@ -65,6 +65,7 @@ Android is not attached to this Apple-only beta. Android playback parity and the
 The release also includes `SHA256SUMS-ci.txt` so you can confirm each download matches what the public [GitHub Actions workflow](https://github.com/VortXTV/VortX/tree/main/.github/workflows) built from this code. Android packages are intentionally not attached to this beta.
 
 <!-- vortx-build: 236 -->
+<!-- vortx-platforms: apple -->
 
 ## 0.4 Beta 1 (build 235)
 
