@@ -1632,7 +1632,17 @@ check("artifact: Profile 8.4 recovery is a separate exact-HLG single-variant mas
         streamInfAttributes: "",
         videoVariant: .hdrFallback) == p84RecoveryArtifact)
 
-check("HDR recovery: exact healthy DV CoreMedia -12927 failure gets one explicit fallback",
+let primaryDVInitFailure = DVPlaybackPolicy.HDRFallbackAdmissionEvidence(
+    videoFrameEverProduced: false,
+    errorLogEvents: [
+        .init(
+            errorDomain: "CoreMediaErrorDomain",
+            errorStatusCode: -12927,
+            uri: "http://127.0.0.1:43123/r/capability/init.mp4"
+        )
+    ]
+)
+check("HDR recovery: exact healthy pre-frame primary init CoreMedia -12927 failure gets one explicit fallback",
       DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
         remuxMounted: true,
@@ -1640,7 +1650,8 @@ check("HDR recovery: exact healthy DV CoreMedia -12927 failure gets one explicit
         fallbackAvailable: true,
         alreadyAttempted: false,
         errorDomain: "CoreMediaErrorDomain",
-        errorCode: -12927))
+        errorCode: -12927,
+        evidence: primaryDVInitFailure))
 check("HDR recovery: an already attempted fallback cannot loop",
       !DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
@@ -1649,7 +1660,8 @@ check("HDR recovery: an already attempted fallback cannot loop",
         fallbackAvailable: true,
         alreadyAttempted: true,
         errorDomain: "CoreMediaErrorDomain",
-        errorCode: -12927))
+        errorCode: -12927,
+        evidence: primaryDVInitFailure))
 check("HDR recovery: Profile 5 or another no-base-layer source cannot claim HDR recovery",
       !DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
@@ -1658,7 +1670,8 @@ check("HDR recovery: Profile 5 or another no-base-layer source cannot claim HDR 
         fallbackAvailable: false,
         alreadyAttempted: false,
         errorDomain: "CoreMediaErrorDomain",
-        errorCode: -12927))
+        errorCode: -12927,
+        evidence: primaryDVInitFailure))
 check("HDR recovery: unrelated failures keep their existing fail-soft path",
       !DVPlaybackPolicy.shouldAttemptHDRFallback(
         dolbyVision: true,
@@ -1667,7 +1680,56 @@ check("HDR recovery: unrelated failures keep their existing fail-soft path",
         fallbackAvailable: true,
         alreadyAttempted: false,
         errorDomain: "AVFoundationErrorDomain",
-        errorCode: -11828))
+        errorCode: -11828,
+        evidence: primaryDVInitFailure))
+check("HDR recovery: a rendered DV frame cannot be replaced by HDR fallback",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: true,
+        errorLogEvents: primaryDVInitFailure.errorLogEvents)))
+check("HDR recovery: recovery init must not be mistaken for the primary init",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "http://127.0.0.1:43123/r/capability/init-hdr.mp4")])))
+check("HDR recovery: playlists cannot be mistaken for the primary init",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "http://127.0.0.1:43123/r/capability/media.m3u8")])))
+check("HDR recovery: video segments cannot be mistaken for the primary init",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "http://127.0.0.1:43123/r/capability/segment-00001.m4s")])))
+check("HDR recovery: audio resources cannot be mistaken for the primary init",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "http://127.0.0.1:43123/r/capability/audio.m3u8")])))
+check("HDR recovery: subtitle resources cannot be mistaken for the primary init",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "http://127.0.0.1:43123/r/capability/subtitles.m3u8")])))
+check("HDR recovery: missing error-log URI cannot prove primary init incompatibility",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927, uri: nil)])))
+check("HDR recovery: relative or malformed URI cannot prove primary init incompatibility",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -12927,
+                               uri: "init.mp4")])))
+check("HDR recovery: mismatched error-log domain cannot prove primary init incompatibility",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "AVFoundationErrorDomain", errorStatusCode: -12927,
+                               uri: "http://127.0.0.1:43123/r/capability/init.mp4")])))
+check("HDR recovery: mismatched error-log status cannot prove primary init incompatibility",
+      !DVPlaybackPolicy.hasPrimaryDVInitFailure(.init(
+        videoFrameEverProduced: false,
+        errorLogEvents: [.init(errorDomain: "CoreMediaErrorDomain", errorStatusCode: -1008,
+                               uri: "http://127.0.0.1:43123/r/capability/init.mp4")])))
 check("HDR recovery: a pre-ready replacement may cross the mount ready edge itself",
       DVPlaybackPolicy.acceptsRemuxReady(
         transitionAccepted: true,

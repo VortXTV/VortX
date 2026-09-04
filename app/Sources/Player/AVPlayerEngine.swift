@@ -1685,6 +1685,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return error
     }
 
+    private func hdrFallbackAdmissionEvidence(for item: AVPlayerItem) -> DVPlaybackPolicy.HDRFallbackAdmissionEvidence {
+        let errorLogEvents = item.errorLog()?.events.map {
+            DVPlaybackPolicy.HDRFallbackErrorLogEvent(
+                errorDomain: $0.errorDomain,
+                errorStatusCode: $0.errorStatusCode,
+                uri: $0.uri
+            )
+        } ?? []
+        return DVPlaybackPolicy.HDRFallbackAdmissionEvidence(
+            videoFrameEverProduced: videoFrameEverProduced,
+            errorLogEvents: errorLogEvents
+        )
+    }
+
     /// Replace a rejected DV item with one explicit HDR-only item on the same healthy remux mount. The logical
     /// load token and remux stay alive; exact-item generation advances so late callbacks from the DV item are
     /// ignored. The playhead, requested rate and current media selections are restored on the replacement.
@@ -1699,6 +1713,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             ?? remuxRemoteMount?.isMountHealthy ?? false
         let fallbackAvailable = remuxHLSServer?.supportsHDRFallback
             ?? remuxRemoteMount?.supportsHDRFallback ?? false
+        guard let failedItem = item else { return false }
+        let admissionEvidence = hdrFallbackAdmissionEvidence(for: failedItem)
         guard DVPlaybackPolicy.shouldAttemptHDRFallback(
             dolbyVision: contentIsDolbyVision,
             remuxMounted: isRemuxMounted,
@@ -1708,14 +1724,26 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             fallbackAvailable: true,
             alreadyAttempted: hdrFallbackRetried,
             errorDomain: trigger?.domain,
-            errorCode: trigger?.code ?? 0
-        ) else { return false }
+            errorCode: trigger?.code ?? 0,
+            evidence: admissionEvidence
+        ) else {
+            if contentIsDolbyVision,
+               isRemuxMounted,
+               mountHealthy,
+               !hdrFallbackRetried,
+               trigger?.domain == "CoreMediaErrorDomain",
+               trigger?.code == -12927 {
+                DiagnosticsLog.log(
+                    "dv",
+                    "refused HDR fallback for CoreMedia -12927: no pre-frame primary init.mp4 error-log proof frames=\(admissionEvidence.videoFrameEverProduced) events=\(admissionEvidence.errorLogEvents.count)")
+            }
+            return false
+        }
 
         if !fallbackAvailable {
             guard allowRemoteCapabilityRefresh, let remote = remuxRemoteMount else { return false }
             if hdrFallbackCapabilityRefreshTask != nil { return true }
-            guard let failedItem = item,
-                  player.currentItem === failedItem,
+            guard player.currentItem === failedItem,
                   let loadToken = activeLoadToken else { return false }
             let failedGeneration = itemGeneration
             DiagnosticsLog.log(
@@ -1756,8 +1784,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         hdrFallbackCapabilityRefreshTask?.cancel()
         hdrFallbackCapabilityRefreshTask = nil
-        guard let currentItem = item,
-           let primaryURL = (currentItem.asset as? AVURLAsset)?.url,
+        let currentItem = failedItem
+        guard let primaryURL = (currentItem.asset as? AVURLAsset)?.url,
            let fallbackURL = DVPlaybackPolicy.hdrFallbackMasterURL(from: primaryURL),
            let loadToken = activeLoadToken else { return false }
         if remountPendingSeekIfOutsideWindow() {

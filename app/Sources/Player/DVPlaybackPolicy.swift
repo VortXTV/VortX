@@ -344,6 +344,39 @@ enum DVPlaybackPolicy {
         return Data("\(head)\n\(dvInf)\nmedia.m3u8\n".utf8)
     }
 
+    /// The error-log fields needed to prove that AVFoundation rejected the PRIMARY Dolby Vision initialization
+    /// resource. This intentionally contains no AVFoundation types so the admission rule stays executable in
+    /// the contract suite.
+    struct HDRFallbackErrorLogEvent: Equatable, Sendable {
+        let errorDomain: String?
+        let errorStatusCode: Int
+        let uri: String?
+    }
+
+    /// Evidence available at the instant a DV item fails. A mid-play failure must never replace an item with
+    /// an HDR variant because that replacement loses the user's active decoder, media selections and picture.
+    struct HDRFallbackAdmissionEvidence: Equatable, Sendable {
+        let videoFrameEverProduced: Bool
+        let errorLogEvents: [HDRFallbackErrorLogEvent]
+    }
+
+    /// True only for the one known compatibility edge: CoreMedia rejected this remux's primary `init.mp4`
+    /// before it ever rendered a video frame. Error-log URI provenance prevents ordinary playlist, segment,
+    /// audio and subtitle transport failures from being misrepresented as Dolby Vision incompatibility.
+    static func hasPrimaryDVInitFailure(_ evidence: HDRFallbackAdmissionEvidence) -> Bool {
+        guard !evidence.videoFrameEverProduced else { return false }
+        return evidence.errorLogEvents.contains { event in
+            guard event.errorDomain == "CoreMediaErrorDomain",
+                  event.errorStatusCode == -12927,
+                  let uri = event.uri,
+                  let components = URLComponents(string: uri),
+                  components.scheme != nil,
+                  components.host != nil,
+                  let url = components.url else { return false }
+            return url.lastPathComponent == "init.mp4"
+        }
+    }
+
     /// A CoreMedia rejection of a healthy DV item gets one explicit HDR-only item, never an in-item variant
     /// switch. A source with no compatible base layer, such as Profile 5, cannot truthfully enter this path.
     static func shouldAttemptHDRFallback(dolbyVision: Bool,
@@ -352,7 +385,8 @@ enum DVPlaybackPolicy {
                                          fallbackAvailable: Bool,
                                          alreadyAttempted: Bool,
                                          errorDomain: String?,
-                                         errorCode: Int) -> Bool {
+                                         errorCode: Int,
+                                         evidence: HDRFallbackAdmissionEvidence) -> Bool {
         dolbyVision
             && remuxMounted
             && mountHealthy
@@ -360,6 +394,7 @@ enum DVPlaybackPolicy {
             && !alreadyAttempted
             && errorDomain == "CoreMediaErrorDomain"
             && errorCode == -12927
+            && hasPrimaryDVInitFailure(evidence)
     }
 
     /// A recovery capability exists only after byte surgery settled successfully. Profile 5 remains excluded
