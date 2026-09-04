@@ -78,6 +78,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.TrackPreferences
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
@@ -162,6 +163,7 @@ fun DetailScreen(
     val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
+    val sourceAudioLanguageHint by viewModel.sourceAudioLanguageHint.collectAsStateWithLifecycle()
     val watchlisted by viewModel.watchlisted.collectAsStateWithLifecycle()
     // DET meta recovery: a non-`tt` catalog id nothing could resolve shows the terminal "Details
     // unavailable" page (with a working Try Again) instead of the old back-navigating error.
@@ -495,6 +497,8 @@ fun DetailScreen(
                                 downloadNotice = downloadNotice,
                                 sort = sourceSort,
                                 onSortChange = viewModel::setSourceSort,
+                                audioLanguageHint = sourceAudioLanguageHint,
+                                onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint,
                                 onRefresh = viewModel::refreshSources,
                                 pin = pinUi,
                                 entryNoun = viewModel.pinEntryNoun,
@@ -1628,6 +1632,8 @@ private fun SourcesSection(
     downloadNotice: String?,
     sort: String,
     onSortChange: (String) -> Unit,
+    audioLanguageHint: String?,
+    onAudioLanguageHintChange: (String?) -> Unit,
     onRefresh: () -> Unit,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
@@ -1646,6 +1652,7 @@ private fun SourcesSection(
     var renderLimit by remember { mutableStateOf(SOURCE_WINDOW_INITIAL) }
     var qualityOpen by remember { mutableStateOf(false) }
     var qualityTier by remember { mutableStateOf<String?>(null) }
+    var audioOpen by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     // Compact source rows (SET-10, Apple `vortx.streams.compactLabels`). Read live off SharedPreferences so
     // returning from the Sources settings screen recomposes this and reflects the new density immediately;
@@ -1758,6 +1765,38 @@ private fun SourcesSection(
                                             )
                                         }
                                     }
+                                }
+                            }
+                        }
+                        // This is deliberately a session-only source hint, not the persistent player-audio
+                        // setting. Selecting it re-ranks the groups already in memory through the ViewModel.
+                        Box {
+                            Chip(
+                                label = audioLanguageHint?.let { code ->
+                                    TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second ?: code
+                                } ?: "Audio",
+                                selected = audioOpen || audioLanguageHint != null,
+                                onClick = { audioOpen = true },
+                            )
+                            DropdownMenu(
+                                expanded = audioOpen,
+                                onDismissRequest = { audioOpen = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text(if (audioLanguageHint == null) "✓ Auto" else "Auto") },
+                                    onClick = {
+                                        audioOpen = false
+                                        onAudioLanguageHintChange(null)
+                                    },
+                                )
+                                TrackPreferences.commonLanguages.forEach { (code, name) ->
+                                    DropdownMenuItem(
+                                        text = { Text(if (audioLanguageHint == code) "✓ $name" else name) },
+                                        onClick = {
+                                            audioOpen = false
+                                            onAudioLanguageHintChange(code)
+                                        },
+                                    )
                                 }
                             }
                         }

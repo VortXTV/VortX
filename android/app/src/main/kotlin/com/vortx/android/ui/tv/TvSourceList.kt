@@ -36,6 +36,7 @@ import androidx.tv.material3.Surface
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.TrackPreferences
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.ui.UiState
@@ -67,6 +68,8 @@ fun TvSourceList(
     downloadNotice: String?,
     sort: String,
     onSortChange: (String) -> Unit,
+    audioLanguageHint: String?,
+    onAudioLanguageHintChange: (String?) -> Unit,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPlay: (StreamSource) -> Unit,
@@ -91,6 +94,8 @@ fun TvSourceList(
             downloadNotice = downloadNotice,
             sort = sort,
             onSortChange = onSortChange,
+            audioLanguageHint = audioLanguageHint,
+            onAudioLanguageHintChange = onAudioLanguageHintChange,
             pin = pin,
             entryNoun = entryNoun,
             onPlay = onPlay,
@@ -117,6 +122,8 @@ private fun TvSourceListContent(
     downloadNotice: String?,
     sort: String,
     onSortChange: (String) -> Unit,
+    audioLanguageHint: String?,
+    onAudioLanguageHintChange: (String?) -> Unit,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPlay: (StreamSource) -> Unit,
@@ -199,6 +206,8 @@ private fun TvSourceListContent(
                 groups = groups,
                 sort = sort,
                 onSortChange = onSortChange,
+                audioLanguageHint = audioLanguageHint,
+                onAudioLanguageHintChange = onAudioLanguageHintChange,
                 qualityOpen = qualityOpen,
                 onQualityOpenChange = { qualityOpen = it },
                 qualityTier = qualityTier,
@@ -353,12 +362,15 @@ private fun TvSourceControlsRow(
     groups: List<StreamGroup>,
     sort: String,
     onSortChange: (String) -> Unit,
+    audioLanguageHint: String?,
+    onAudioLanguageHintChange: (String?) -> Unit,
     qualityOpen: Boolean,
     onQualityOpenChange: (Boolean) -> Unit,
     qualityTier: String?,
     onQualityTierChange: (String?) -> Unit,
     onPlay: (StreamSource) -> Unit,
 ) {
+    var audioOpen by remember { mutableStateOf(false) }
     LazyRow(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
@@ -405,6 +417,38 @@ private fun TvSourceControlsRow(
                                 )
                             }
                         }
+                    }
+                }
+            }
+        }
+        item(key = "audio-picker") {
+            Box {
+                TvFilterChip(
+                    label = audioLanguageHint?.let { code ->
+                        TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second ?: code
+                    } ?: "Audio",
+                    selected = audioOpen || audioLanguageHint != null,
+                    onClick = { audioOpen = true },
+                )
+                DropdownMenu(
+                    expanded = audioOpen,
+                    onDismissRequest = { audioOpen = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(if (audioLanguageHint == null) "✓ Auto" else "Auto") },
+                        onClick = {
+                            audioOpen = false
+                            onAudioLanguageHintChange(null)
+                        },
+                    )
+                    TrackPreferences.commonLanguages.forEach { (code, name) ->
+                        DropdownMenuItem(
+                            text = { Text(if (audioLanguageHint == code) "✓ $name" else name) },
+                            onClick = {
+                                audioOpen = false
+                                onAudioLanguageHintChange(code)
+                            },
+                        )
                     }
                 }
             }

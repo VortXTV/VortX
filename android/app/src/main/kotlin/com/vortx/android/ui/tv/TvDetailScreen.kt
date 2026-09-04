@@ -150,7 +150,9 @@ fun TvDetailScreen(
     Box(modifier = modifier.fillMaxSize().background(colors.canvas)) {
         when (val meta = metaState) {
             is UiState.Loading -> TvDetailLoading(title)
-            is UiState.Error -> TvError(meta.message, onRetry = onBack)
+            // Retry must retain this detail route. Sending the remote Back here used to discard the title
+            // instead of retrying its failed metadata request.
+            is UiState.Error -> TvError(meta.message, onRetry = viewModel::retryMeta)
             is UiState.Success -> TvDetailContent(
                 viewModel = viewModel,
                 detail = meta.data,
@@ -202,6 +204,7 @@ private fun TvDetailContent(
     // these exactly as the phone SourcesSection does; there is no second copy of any of it.
     val pinUi by viewModel.pinUi.collectAsStateWithLifecycle()
     val sourceSort by viewModel.sourceSort.collectAsStateWithLifecycle()
+    val sourceAudioLanguageHint by viewModel.sourceAudioLanguageHint.collectAsStateWithLifecycle()
     val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
 
     // View-local Person overlay + TMDB cast enrichment, mirroring the phone [DetailScreen] (held in the view,
@@ -456,6 +459,8 @@ private fun TvDetailContent(
                     downloadNotice = downloadNotice,
                     sort = sourceSort,
                     onSortChange = viewModel::setSourceSort,
+                    audioLanguageHint = sourceAudioLanguageHint,
+                    onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint,
                     pin = pinUi,
                     entryNoun = viewModel.pinEntryNoun,
                     onPlay = { source -> beginPlayback { viewModel.play(source) } },

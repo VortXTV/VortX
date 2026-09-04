@@ -23,6 +23,7 @@ import com.vortx.android.model.MediaRef
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
+import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
@@ -262,6 +263,20 @@ internal suspend fun <T> ownerBoundResult(
     }
 }
 
+/**
+ * Detail's temporary source-language preference. A selected language replaces the saved chain for
+ * source ranking only, but the saved [TrackPreferencesStore] value remains untouched. This is
+ * deliberately pure so the source list can rerank without a fetch or a persistence write.
+ */
+internal fun detailSourceAudioLanguages(
+    sessionHint: String?,
+    savedLanguages: List<String>,
+): List<String> = if (sessionHint.isNullOrBlank()) {
+    savedLanguages
+} else {
+    LanguagePriority.normalized(listOf(sessionHint))
+}
+
 /// Detail page state: the meta (hero + metadata) and the sources list load independently, mirroring
 /// tvOS where the page renders the hero as soon as `meta_details.meta` is ready and the stream
 /// groups stream in behind it. Both are [UiState] so a meta-add-on failure and a stream-add-on
@@ -417,6 +432,11 @@ class DetailViewModel(
     /// user last left it (Apple iOSDetailView `SourceSort` + `defaultSourceSort`, iOSDetailView.swift:4400).
     private val _sourceSort = MutableStateFlow(sourcePrefs.defaultSourceSort)
     val sourceSort: StateFlow<String> = _sourceSort.asStateFlow()
+
+    /// A detail-screen-only source preference. It is cleared when this ViewModel is recreated and never
+    /// writes through to [trackPrefs], unlike the player track picker.
+    private val _sourceAudioLanguageHint = MutableStateFlow<String?>(null)
+    val sourceAudioLanguageHint: StateFlow<String?> = _sourceAudioLanguageHint.asStateFlow()
 
     /// Whether Smart Source Selection auto-pick is on (Settings > Sources). The screen reads it to open the
     /// sources section on an episode tap, so backing out of the auto-picked player reveals the full list
@@ -873,7 +893,7 @@ class DetailViewModel(
             // words always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
             // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
             prefs = sourcePrefs.snapshot(
-                trackPrefs.current.audioLanguages,
+                detailSourceAudioLanguages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
                 isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
             ),
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
@@ -1019,6 +1039,27 @@ class DetailViewModel(
         if (_sourceSort.value == key) return
         _sourceSort.value = key
         sourcePrefs.defaultSourceSort = key
+    }
+
+    /**
+     * Apply a temporary source-language preference to the already assembled source groups. Replacing
+     * only the frozen ranking snapshot preserves add-on order mode, source type/quality ordering, pins,
+     * sticky series continuity, and provider health penalties while avoiding any source refetch.
+     */
+    fun setSourceAudioLanguageHint(language: String?) {
+        val normalized = language?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (_sourceAudioLanguageHint.value == normalized) return
+        _sourceAudioLanguageHint.value = normalized
+        lastCtx?.let { ctx ->
+            val updated = ctx.copy(
+                prefs = sourcePrefs.snapshot(
+                    detailSourceAudioLanguages(normalized, trackPrefs.current.audioLanguages),
+                    isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
+                ),
+            )
+            lastCtx = updated
+            sourceModel.setContext(updated)
+        }
     }
 
     /// Whether the account is signed in, gating the community Singularity SERVE lane. Reads the engine's live
