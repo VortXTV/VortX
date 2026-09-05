@@ -499,10 +499,7 @@ actor TorBoxUsenetResolver {
             enum CodingKeys: String, CodingKey { case id, name, size, mimetype; case shortName = "short_name" }
         }
     }
-    private struct Created: Decodable {
-        let usenetId: Int?
-        enum CodingKeys: String, CodingKey { case usenetId = "usenetdownload_id" }
-    }
+    private typealias Created = TorBoxUsenetWire.Created
     private struct Item: Decodable {
         let id: Int; let hash: String?; let downloadFinished: Bool?; let downloadPresent: Bool?; let downloadState: String?
         let files: [Cached.File]?
@@ -545,10 +542,13 @@ actor TorBoxUsenetResolver {
     /// `knownHash` is the source's authoritative NZB md5 when the emitter had one (TorBox search results
     /// carry it); the md5-of-the-link fallback only matches when TorBox derived its key the same way.
     func resolve(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
-        // 1. Add the nzb (JSON body; post_processing default -1). Idempotent: TorBox returns the existing
+        // 1. Add the nzb using the endpoint's multipart contract. Idempotent: TorBox returns the existing
         //    download id if the same nzb is already in the user's usenet list.
-        let created: Envelope<Created> = try await postJSON("\(Self.base)/createusenetdownload",
-                                                            body: ["link": nzbUrl, "post_processing": -1])
+        guard let request = TorBoxUsenetWire.createRequest(base: Self.base, apiKey: apiKey, nzbURL: nzbUrl) else {
+            throw DebridError.providerError("Invalid Usenet create request")
+        }
+        let created: Envelope<Created> = try await send(request)
+        guard created.success else { throw DebridError.providerError("TorBox rejected the Usenet create request") }
         var usenetId = created.data?.usenetId
 
         // 2. Poll mylist until the download is finished + present (cached should be ~1 poll).
@@ -586,12 +586,13 @@ actor TorBoxUsenetResolver {
 
     /// The `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id.
     private func requestDL(usenetId: Int, fileId: Int) async throws -> URL {
-        // Auth rides the Authorization: Bearer header set by `get`; the key is not repeated in the query string.
-        guard let url = URL(string: "\(Self.base)/requestdl?usenet_id=\(usenetId)&file_id=\(fileId)&redirect=false") else {
+        guard let request = TorBoxUsenetWire.downloadRequest(
+            base: Self.base, apiKey: apiKey, usenetID: usenetId, fileID: fileId
+        ) else {
             throw DebridError.providerError("bad requestdl url")
         }
-        let link: Envelope<String> = try await get(url)
-        guard let s = link.data else { throw DebridError.notCached }
+        let link: Envelope<String> = try await send(request)
+        guard link.success, let s = link.data else { throw DebridError.notCached }
         return try await DebridPublicURLPolicy.playbackURL(from: s, failure: DebridError.notCached)
     }
 
@@ -629,16 +630,6 @@ actor TorBoxUsenetResolver {
     private func get<T: Decodable>(_ url: URL) async throws -> T {
         var req = URLRequest(url: url)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        return try await send(req)
-    }
-
-    private func postJSON<T: Decodable>(_ urlString: String, body: [String: Any]) async throws -> T {
-        guard let url = URL(string: urlString) else { throw DebridError.providerError("bad url") }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         return try await send(req)
     }
 
