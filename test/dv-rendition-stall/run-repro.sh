@@ -289,6 +289,7 @@ if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
   )
   ENGINE_TRANSACTION_SOURCES=(
     app/SourcesShared/CoreModels.swift
+    app/SourcesShared/UsenetStreamValidation.swift
     app/Sources/Player/MPVPlayerDelegate.swift
     app/Sources/Player/MPVTrack.swift
     app/Sources/Player/SkipSegments.swift
@@ -342,6 +343,7 @@ xcrun swiftc -sdk "$SDK_PATH" \
   app/Sources/Player/VortXHLSSeekAnchorState.swift \
   app/Sources/Player/VortXRemuxHLSServer.swift \
   "${ENGINE_TRANSACTION_SOURCES[@]+"${ENGINE_TRANSACTION_SOURCES[@]}"}" \
+  test/dv-rendition-stall/PacketStartup.swift \
   test/dv-rendition-stall/main.swift
 
 "$SCRATCH_ROOT/repro-harness" 9>&-

@@ -1266,6 +1266,9 @@ private func engineTransactionRollbackScenario(
 
 // Iteration affordance ONLY: `ONLY_SELECTION=1` runs just the selection gate while that gate is being
 // developed. Every reported run is a full run (the variable is unset), and the summary states which it was.
+if ProcessInfo.processInfo.environment["PACKET_STARTUP_REPRO"] == "1" {
+    exit(runPacketStartupRepro(scratchRoot: scratchRoot))
+}
 let onlySelection = ProcessInfo.processInfo.environment["ONLY_SELECTION"] == "1"
 // Focused red-before / green-after affordance for the nonzero fresh-source clock. The full reported gate leaves
 // this unset; keeping the focused run short makes it practical to prove the regression before changing production.

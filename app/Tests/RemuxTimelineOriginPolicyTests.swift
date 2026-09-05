@@ -30,6 +30,20 @@ enum RemuxTimelineOriginPolicyTests {
         resumeDTSStopsAndPublishesAchievedOrigin()
         resumePTSOnlyContinuesAndSelectsFallback()
         missingTimestampAtLimitRemainsNoneAndExhausted()
+        check("empty header reads beyond provisional first DTS",
+              RemuxTimelineOriginPolicy.headerRepairLookahead(videoDelay: 0) == 4)
+        check("header repair lookahead is bounded for hostile reorder depth",
+              RemuxTimelineOriginPolicy.headerRepairLookahead(videoDelay: Int.max) == 18)
+        check("fresh provisional zero plus missing DTS anchors to real successor",
+              RemuxTimelineOriginPolicy.leadingDTSAnchor([0, nil, nil, 42]) == 3)
+        check("resume missing leading DTS anchors to real successor",
+              RemuxTimelineOriginPolicy.leadingDTSAnchor([nil, nil, 42]) == 2)
+        check("valid DTS sequence is untouched",
+              RemuxTimelineOriginPolicy.leadingDTSAnchor([0, 42, 83, 125]) == nil)
+        check("established DTS sequence cannot be rewritten for a later gap",
+              RemuxTimelineOriginPolicy.leadingDTSAnchor([0, 42, nil, nil, 125]) == nil)
+        check("missing-only bounded prefix is not guessed",
+              RemuxTimelineOriginPolicy.leadingDTSAnchor([nil, nil, nil]) == nil)
 
         if failures != 0 {
             fatalError("\(failures) remux timeline-origin policy checks failed")

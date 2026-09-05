@@ -9,6 +9,18 @@ enum RemuxTimelineOriginPolicy {
 
     static let preScanPacketLimit = 240
 
+    // Empty HEVC CodecPrivate can make the demuxer stamp the first packet DTS=PTS before it learns
+    // the reorder depth from in-band SPS. Read beyond that provisional timestamp, still within the
+    // existing total-packet bound, so the missing-DTS prefix and its stable successor are both owned.
+    static func headerRepairLookahead(videoDelay: Int) -> Int {
+        min(16, max(2, videoDelay)) + 2
+    }
+
+    static func leadingDTSAnchor(_ timestamps: [Int64?]) -> Int? {
+        guard let missing = timestamps.firstIndex(where: { $0 == nil }), missing <= 1 else { return nil }
+        return timestamps.indices.dropFirst(missing + 1).first { timestamps[$0] != nil }
+    }
+
     enum Mode: String, Equatable, Sendable {
         case fresh
         case resume

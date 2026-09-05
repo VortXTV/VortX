@@ -2048,12 +2048,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     // (movenc.c:6851-6861), which would corrupt every sample. A failed walk just leaves the
                     // harvest nil; the setup loop then fails fast BEFORE write_header rather than mux a moov
                     // AVPlayer cannot open.
-                    if !hvc1Check.eligible {
+                    if !hvc1Check.eligible, hvc1Harvest == nil {
                         hvc1Harvest = Self.harvestParameterSets(p, nalLengthSize: scanNalLen)
                     }
                     // A timestamp-less first base packet cannot establish either the fresh or resume shift.
                     // Keep buffering until a real DTS arrives, bounded by maxScan like the DV/hvc1 probe.
-                    if RemuxTimelineOriginPolicy.shouldStopAfterMappedBasePacket(
+                    let headerTimelineReady = hvc1Check.eligible || (
+                        mappedBaseScanned >= RemuxTimelineOriginPolicy.headerRepairLookahead(
+                            videoDelay: Int(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar.pointee.video_delay ?? 0))
+                        && p.pointee.dts != AV_NOPTS_VALUE_CONST)
+                    if headerTimelineReady, RemuxTimelineOriginPolicy.shouldStopAfterMappedBasePacket(
                         isMappedBasePacket: isMappedBasePacket,
                         timelineRebaseRequired: timelineRebaseRequired,
                         originLatched: originShiftLatched) {
@@ -2111,43 +2115,42 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 : "fresh input produced no timestamped base-video packet")
             return
         }
-        // RESUME LEADING-DTS REPAIR: after the seek, the demuxer's per-stream dts generation restarts, so the
-        // landing IRAP and its leading pictures (up to video_delay packets) arrive with NO dts while the first
-        // real dts resumes a reorder-depth BELOW the IRAP's pts. libavformat's muxer-side auto-fill derives a
-        // dts from those packets' PTS values, which exceed the first real dts, and movenc kills the session
-        // with "non monotonically increasing dts" (rc=-22) - the build 189 field death on EVERY open-GOP
-        // resume. Repair at the source: give the dts-less head packets a synthetic, monotonic dts ramp ENDING
-        // one frame below the first real dts, and lower the session origin to that ramp's floor so the
-        // rebased output timeline still starts at zero. From-the-head mounts never enter this path.
-        if originSeekApplied, originShiftLatched, baseVideoIn >= 0,
+        // Missing startup DTS also occurs on a FRESH empty-hvcC source: the first provisional DTS is zero,
+        // followed by missing timestamps as the in-band SPS reveals B-frame ordering. Repair the entire
+        // leading prefix (including that provisional zero), anchored to the first DTS after the gap. Otherwise
+        // movenc synthesizes later DTS from PTS and rejects the next real DTS as non-monotonic (-22).
+        // Ordinary headers and established mid-stream timestamps are never rewritten.
+        if (originSeekApplied || !hvc1Check.eligible), originShiftLatched, baseVideoIn >= 0,
            let baseStream = inCtx.pointee.streams[baseVideoIn] {
-            var dtsLess: [UnsafeMutablePointer<AVPacket>] = []
-            var firstRealDts: Int64?
-            for p in prebuffered where Int(p.pointee.stream_index) == baseVideoIn {
-                if p.pointee.dts == AV_NOPTS_VALUE_CONST {
-                    if firstRealDts == nil { dtsLess.append(p) }
-                } else {
-                    firstRealDts = p.pointee.dts
-                    break
-                }
+            let videoPackets = prebuffered.filter { Int($0.pointee.stream_index) == baseVideoIn }
+            let timestamps = videoPackets.map { $0.pointee.dts == AV_NOPTS_VALUE_CONST ? nil : $0.pointee.dts }
+            if !hvc1Check.eligible, timestamps.contains(nil),
+               RemuxTimelineOriginPolicy.leadingDTSAnchor(timestamps) == nil {
+                buffer.fail("HEVC startup decode timestamps lacked a bounded leading-gap anchor")
+                return
             }
-            if let firstRealDts, !dtsLess.isEmpty {
+            if let anchor = RemuxTimelineOriginPolicy.leadingDTSAnchor(timestamps) {
+                let firstRealDts = videoPackets[anchor].pointee.dts
                 let tb = baseStream.pointee.time_base
-                let rate = baseStream.pointee.avg_frame_rate
-                var frameTicks: Int64 = 1
-                if rate.num > 0, rate.den > 0, tb.num > 0, tb.den > 0 {
-                    frameTicks = max(1, av_rescale_q(
-                        1, AVRational(num: rate.den, den: rate.num), tb))
+                let rate = av_guess_frame_rate(inCtx, baseStream, nil)
+                guard rate.num > 0, rate.den > 0, tb.num > 0, tb.den > 0 else {
+                    buffer.fail("startup decode timestamps missing and frame duration unavailable")
+                    return
                 }
-                for (index, packet) in dtsLess.enumerated() {
-                    packet.pointee.dts = firstRealDts
-                        - Int64(dtsLess.count - index) * frameTicks
+                let frameTimeBase = AVRational(num: rate.den, den: rate.num)
+                for index in 0..<anchor {
+                    let packet = videoPackets[index]
+                    let repaired = firstRealDts - av_rescale_q(Int64(anchor - index), frameTimeBase, tb)
+                    guard packet.pointee.pts == AV_NOPTS_VALUE_CONST || repaired <= packet.pointee.pts else {
+                        buffer.fail("startup decode timestamp repair would exceed presentation timestamp")
+                        return
+                    }
+                    packet.pointee.dts = repaired
                 }
-                let floorTicks = firstRealDts - Int64(dtsLess.count) * frameTicks
                 latchTimelineShift(
-                    timestamp: floorTicks,
+                    timestamp: videoPackets[0].pointee.dts,
                     timeBase: tb,
-                    basis: "dts-ramp floor k=\(dtsLess.count)")
+                    basis: "dts-ramp floor k=\(anchor)")
             }
         }
 
@@ -3684,7 +3687,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard hlsIndexingEnabled else { return nil }
         let dts = pkt.pointee.dts == AV_NOPTS_VALUE_CONST ? nil : pkt.pointee.dts
         let pts = pkt.pointee.pts == AV_NOPTS_VALUE_CONST ? nil : pkt.pointee.pts
-        guard let sec = VortXHLSBoundaryPolicy.timestampSeconds(
+        guard let decodeSeconds = VortXHLSBoundaryPolicy.timestampSeconds(
             dts: dts,
             pts: pts,
             timeBaseNumerator: timeBase.num,
@@ -3694,6 +3697,9 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 boundary: nil,
                 failure: "HLS base video packet had no finite decode or presentation timestamp")
         }
+        // Decode preroll may legitimately be negative after repairing the startup B-frame prefix. It stays
+        // unchanged in the muxed packet; only the public HLS timeline is clipped to playable time zero.
+        let sec = max(0, decodeSeconds)
         let den = Double(timeBase.den)
         hlsLastVideoSec = sec
         let packetDuration = pkt.pointee.duration > 0
