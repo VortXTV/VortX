@@ -300,12 +300,30 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
 /// natural size, so labels never wrap. iOS 16+ Layout protocol (the deployment target).
 struct FlowLayout: Layout {
     var spacing: CGFloat = 8
+    var constrainOversizedChildren = false
+
+    private func childSize(_ subview: LayoutSubview, maxWidth: CGFloat) -> CGSize {
+        let natural = subview.sizeThatFits(.unspecified)
+        #if os(iOS)
+        guard constrainOversizedChildren else { return natural }
+        let width = IOSDetailHeroLayout.constrainedControlWidth(
+            intrinsicWidth: natural.width, availableWidth: maxWidth
+        )
+        guard width > 0, width < natural.width else { return natural }
+        let constrained = subview.sizeThatFits(ProposedViewSize(width: width, height: nil))
+        return CGSize(width: width, height: constrained.height)
+        #else
+        // Keep the existing macOS/tvOS intrinsic layout contract untouched. The width-constrained policy
+        // is only needed by the iPhone/iPad wrapping controls that this follow-up changes.
+        return natural
+        #endif
+    }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
         let maxWidth = proposal.width ?? .greatestFiniteMagnitude
         var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, widest: CGFloat = 0
         for s in subviews {
-            let sz = s.sizeThatFits(.unspecified)
+            let sz = childSize(s, maxWidth: maxWidth)
             if x > 0, x + sz.width > maxWidth { x = 0; y += rowHeight + spacing; rowHeight = 0 }
             x += sz.width + spacing
             rowHeight = max(rowHeight, sz.height)
@@ -318,7 +336,7 @@ struct FlowLayout: Layout {
         let maxWidth = bounds.width
         var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
         for s in subviews {
-            let sz = s.sizeThatFits(.unspecified)
+            let sz = childSize(s, maxWidth: maxWidth)
             if x > bounds.minX, x + sz.width - bounds.minX > maxWidth { x = bounds.minX; y += rowHeight + spacing; rowHeight = 0 }
             s.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(sz))
             x += sz.width + spacing
@@ -797,11 +815,11 @@ struct iOSDetailView: View {
         #endif
     }
 
-    /// The cinematic VOD hero band: ~60% of the viewport on iPhone/iPad (a fixed 320 band read as a
-    /// ~20% strip on a modern phone) and ~58% of the Mac window, clamped so a short window still shows
-    /// the action row without scrolling. Kept a fixed-per-layout (not aspect-ratio) band because the
+    /// The cinematic VOD hero band: ~78% of a portrait iPhone/iPad viewport and ~58% of landscape, with
+    /// a short-window guard; macOS retains its independent ~72% pinned-hero policy, clamped so the inner
+    /// scroll region remains usable. Kept a fixed-per-layout (not aspect-ratio) band because the
     /// hero overlays a text block that an aspectRatio would fight on narrow windows.
-    private func heroBandHeight(viewport: CGFloat) -> CGFloat {
+    private func heroBandHeight(viewport: CGFloat, width: CGFloat = 0) -> CGFloat {
         #if os(macOS)
         // The Mac detail hero reads near-fullscreen so the page stops looking empty (owner ask): on a TALL
         // window the cinematic banner takes ~72% of the height. But because `macDetailBody` PINS this band
@@ -817,8 +835,7 @@ struct iOSDetailView: View {
         let band = min(1000, min(viewport * 0.72, viewport - reservedForContent))
         return max(280, band)
         #else
-        guard viewport > 0 else { return 420 }
-        return max(360, viewport * 0.60)
+        return IOSDetailHeroLayout.heroHeight(viewport: viewport, width: width)
         #endif
     }
 
@@ -1339,11 +1356,33 @@ struct iOSDetailView: View {
     }
     #endif
 
+    /// iOS overlays the detail's primary action at the lower image edge. macOS deliberately leaves this
+    /// empty because its pinned hero keeps the existing action surface in `heroBelow`.
+    @ViewBuilder private var detailHeroPrimaryAction: some View {
+        #if os(iOS)
+        if isEpisodic {
+            let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
+            let progress = primary.map { episodeProgress($0.video) } ?? 0
+            let resumeSeconds: Double? = primary.flatMap {
+                if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
+                    return validInitialResumeSeconds
+                }
+                return $0.isResume ? primaryEpisodeResumeSeconds : nil
+            }
+            if let primary {
+                seriesHeroPrimaryAction(primary: primary, progress: progress, resumeSeconds: resumeSeconds)
+            }
+        } else {
+            movieHeroPrimaryAction
+        }
+        #endif
+    }
+
     /// The pinnable cinematic banner: full-bleed backdrop (with the ambient trailer clip) plus the
     /// title / meta / ratings / clamped-synopsis overlay and the circular back/overflow chrome. On macOS
     /// this is the FIXED layer of the pinned-hero scroll model; on iOS it is the top of the single column.
     private func heroBanner(width: CGFloat, height: CGFloat) -> some View {
-        let band = heroBandHeight(viewport: height)
+        let band = heroBandHeight(viewport: height, width: width)
         return ZStack(alignment: .bottomLeading) {
             backdrop(height: band)
                 // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
@@ -1372,13 +1411,25 @@ struct iOSDetailView: View {
                 }
             }
             .padding(.horizontal, Theme.Space.md)
+            #if os(iOS)
+            .padding(.bottom, Theme.Space.xl + 56)
+            #else
             .padding(.bottom, Theme.Space.lg)
+            #endif
             .frame(width: width, alignment: .leading)
         }
         // Circular translucent chrome: back chevron top-left, overflow top-right. Overlaid on the ZStack
         // (NOT the backdrop) so it keeps the safe-area inset the backdrop now ignores; its own top padding
         // then insets the discs below the status bar / notch, so the hero reads like a cinematic media app.
         .overlay(alignment: .topLeading) { heroChrome }
+        #if os(iOS)
+        .overlay(alignment: .bottom) {
+            detailHeroPrimaryAction
+                .padding(.horizontal, Theme.Space.md)
+                .offset(y: 28)
+        }
+        .padding(.bottom, 28)
+        #endif
         .frame(width: width, alignment: .leading)
     }
 
@@ -1386,14 +1437,19 @@ struct iOSDetailView: View {
     /// synopsis, cast/crew, and language chips. On macOS this scrolls (with the episode/source list) under
     /// the pinned banner; on iOS it is the lower half of the single hero column.
     private func heroBelow(width: CGFloat, scrollToSources: @escaping () -> Void) -> some View {
+        #if os(iOS)
+        let includePrimary = false
+        #else
+        let includePrimary = true
+        #endif
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Branch on the SAME authoritative signal the body uses (episodeList vs sourceSection), not the
             // raw hub-guess `type`: a hub tile the hub mis-typed as "movie" that resolves to a series/
             // collection meta would otherwise show movie Play actions contradicting an episodic body (#102).
             if !isEpisodic {
-                watchNow(scrollToSources: scrollToSources)
+                watchNow(scrollToSources: scrollToSources, includePrimary: includePrimary)
             } else {
-                seriesHeroActions
+                seriesHeroActions(includePrimary: includePrimary)
             }
             // H2: only show the full description below when it is meaningfully longer than the hero's
             // 3-line excerpt, so a short synopsis is not printed twice on the same screen.
@@ -2024,7 +2080,34 @@ struct iOSDetailView: View {
     /// resume episode is partially watched), then the trailer + library chips, the touch/Mac twin
     /// of the tvOS series hero. Tapping it pushes that episode's source list (the same screen an
     /// episode-row tap opens), so the user still picks the source.
-    @ViewBuilder private var seriesHeroActions: some View {
+    @ViewBuilder private func seriesHeroPrimaryAction(
+        primary: (video: CoreVideo, isResume: Bool),
+        progress: Double,
+        resumeSeconds: Double?
+    ) -> some View {
+        if let m = meta {
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                NavigationLink {
+                    iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
+                          seasonEpisodes: sortedEpisodes(m.videos ?? []),
+                          initialStartAtSeconds: resumeSeconds,
+                          initialTraktSessionID: initialTraktSessionID)
+                } label: {
+                    Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume,
+                                              resumeSeconds: resumeSeconds),
+                          systemImage: "play.fill")
+                }
+                .buttonStyle(HeroPlayButtonStyle())
+                if primary.isResume, progress > 0.01 {
+                    iOSProgressStripe(value: progress)
+                        .frame(maxWidth: heroCtaMaxWidth)
+                }
+            }
+            .frame(maxWidth: heroCtaMaxWidth, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder private func seriesHeroActions(includePrimary: Bool = true) -> some View {
         let primary = meta?.videos.flatMap { seriesPrimaryEpisode($0) }
         let primaryProgress = primary.map { episodeProgress($0.video) } ?? 0
         let primaryResumeSeconds: Double? = primary.flatMap {
@@ -2036,30 +2119,12 @@ struct iOSDetailView: View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Full-width primary episode CTA on its own line (matches the movie Play button), with the
             // resume stripe just beneath it.
-            if let m = meta, let primary {
-                VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                    NavigationLink {
-                        iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
-                              seasonEpisodes: sortedEpisodes(m.videos ?? []),
-                              initialStartAtSeconds: primaryResumeSeconds,
-                              initialTraktSessionID: initialTraktSessionID)
-                    } label: {
-                        Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume,
-                                                  resumeSeconds: primaryResumeSeconds),
-                              systemImage: "play.fill")
-                    }
-                    .buttonStyle(HeroPlayButtonStyle())
-                    if primary.isResume, primaryProgress > 0.01 {
-                        iOSProgressStripe(value: primaryProgress)
-                            .frame(maxWidth: heroCtaMaxWidth)
-                    }
-                }
-                // Same per-platform CTA cap as the movie Play button (#6): comfortable on Mac, wide on touch.
-                .frame(maxWidth: heroCtaMaxWidth, alignment: .leading)
+            if includePrimary, let primary {
+                seriesHeroPrimaryAction(primary: primary, progress: primaryProgress, resumeSeconds: primaryResumeSeconds)
             }
             // Secondary actions wrap beneath. FlowLayout keeps each chip at its natural width and drops
             // overflow onto the next line under the hero's hard width cap (prevents "Tr / ail / er" slivers).
-            FlowLayout(spacing: Theme.Space.sm) {
+            FlowLayout(spacing: Theme.Space.sm, constrainOversizedChildren: true) {
                 #if !os(tvOS)
                 // Offline (#30): open the pre-download quality picker for the primary episode, the series twin
                 // of the movie Download chip. Gated on the primary episode resolving; the chip reflects state.
@@ -2245,44 +2310,44 @@ struct iOSDetailView: View {
 
     // MARK: Movie Watch Now + sources
 
+    /// The movie/show detail's single primary Play action. iOS overlays this on the hero's lower image edge;
+    /// macOS keeps it in the pinned heroBelow action surface. Playback and loading state stay shared with the
+    /// existing watch-now path through this view, so the relocation does not create a second play route.
+    @ViewBuilder private var movieHeroPrimaryAction: some View {
+        Button {
+            Task { await playMovie() }
+        } label: {
+            HStack(spacing: Theme.Space.sm) {
+                if preparing || movieLoadingSources { ProgressView().tint(Theme.Palette.onAccent) }
+                else { Image(systemName: "play.fill") }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(movieLabel)
+                    if movieReady, let s = movieBest, let detail = primarySourceDetail(s) {
+                        Text(detail)
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.onAccent.opacity(0.82))
+                            .lineLimit(1).truncationMode(.tail)
+                    }
+                }
+            }
+        }
+        .buttonStyle(HeroPlayButtonStyle())
+        .disabled(!movieReady || preparing)
+        .opacity(movieReady || preparing ? 1 : 0.55)
+        .frame(maxWidth: heroCtaMaxWidth, alignment: .leading)
+    }
+
     /// The movie hero action row, the touch/Mac twin of the tvOS detail action set: a **Watch**
     /// button (best ranked source), **Quality** and session **Audio** pickers, a one-launch **Player**
     /// picker, a **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
-    @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
+    @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void, includePrimary: Bool = true) -> some View {
         let groups = rankedMovie().groups
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            // The primary CTA is a big, high-contrast rounded Play button on its own line, the
-            // cinematic-media-app hero action, no longer one small chip lost in a wrapping row.
-            // Width-capped per platform (heroCtaMaxWidth) so it doesn't span the whole Mac window (#6).
-            Button {
-                Task { await playMovie() }
-            } label: {
-                HStack(spacing: Theme.Space.sm) {
-                    // Spin while resolving (preparing) AND while still waiting on add-ons, so the gated
-                    // "Finding best… X/Y" state reads as busy, matching the source-list control bar.
-                    if preparing || movieLoadingSources { ProgressView().tint(Theme.Palette.onAccent) }
-                    else { Image(systemName: "play.fill") }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(movieLabel)
-                        // #11: the selected source's spec line rides inside the CTA (resolution ·
-                        // DV/HDR · flavor · size), so one glance says WHAT Play will play.
-                        if movieReady, let s = movieBest, let detail = primarySourceDetail(s) {
-                            Text(detail)
-                                .font(Theme.Typography.label)
-                                .foregroundStyle(Theme.Palette.onAccent.opacity(0.82))
-                                .lineLimit(1).truncationMode(.tail)
-                        }
-                    }
-                }
-            }
-            .buttonStyle(HeroPlayButtonStyle())
-            .disabled(!movieReady || preparing)
-            .opacity(movieReady || preparing ? 1 : 0.55)
-            .frame(maxWidth: heroCtaMaxWidth, alignment: .leading)
+            if includePrimary { movieHeroPrimaryAction }
 
             // D10: a secondary "Play from start" beside the primary "Resume · 1:03", shown only when a saved
             // resume position exists. Plays the SAME best stream from 0:00 without clearing the stored resume
@@ -2316,7 +2381,7 @@ struct iOSDetailView: View {
 
             // Secondary actions wrap beneath the CTA. FlowLayout keeps each chip at its natural width and
             // drops overflow onto the next line under the hero's hard width cap.
-            FlowLayout(spacing: Theme.Space.sm) {
+            FlowLayout(spacing: Theme.Space.sm, constrainOversizedChildren: true) {
                 qualityMenu(groups)
                 movieAudioLanguageMenu
                 launchPlayerMenu
@@ -2374,6 +2439,7 @@ struct iOSDetailView: View {
                 Button { copyAllLinks(groups) } label: { Label("Copy all links", systemImage: "doc.on.doc") }
             } label: {
                 Label("Quality", systemImage: "chevron.up.chevron.down")
+                    .lineLimit(1)
             }
             .buttonStyle(ChipButtonStyle())
         }
@@ -2446,6 +2512,7 @@ struct iOSDetailView: View {
             // Hero already shows Watch + Quality + the "Sources" scroll button, so suppress this list's
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
+            showsSecondaryControls: false,
             play: { stream, url in Task { await playStream(stream, url: url) } },
             playWithEngine: { stream, url, preference in
                 Task { await playStream(stream, url: url, enginePreference: preference) }
@@ -4075,6 +4142,7 @@ struct iOSEpisodeStreams: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // engine-vs-overlay resume source for the binge re-anchor
+    @Environment(\.dismiss) private var dismiss
 
     // Binge-advance re-anchor (binge-desync fix #4, the iOS twin of tvOS CoreEpisodeStreams.currentVideo):
     // this page stays mounted UNDER the full-screen player cover, so after continuous play advanced past
@@ -4204,8 +4272,9 @@ struct iOSEpisodeStreams: View {
         #else
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                hero(width: geo.size.width)
+                hero(width: geo.size.width, height: geo.size.height)
                 sourceListView(width: geo.size.width)
+                episodeOverviewText
             }
             .padding(.bottom, Theme.Space.xl)
             .frame(width: geo.size.width, alignment: .leading)
@@ -4217,6 +4286,11 @@ struct iOSEpisodeStreams: View {
         #if os(iOS)
         .navigationTitle(shownVideo.episodeTitle)
         .inlineNavigationTitle()
+        // Match the parent detail's cinematic route: the title is already overlaid on the artwork, so the
+        // opaque native navigation bar must not consume the top of the episode hero or duplicate its title.
+        // Restore the interactive edge swipe because UIKit disables it when the bar is hidden.
+        .toolbar(.hidden, for: .navigationBar)
+        .background(RestoreSwipeBack().frame(width: 0, height: 0).allowsHitTesting(false))
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         // The engine loads per-episode streams on demand; trigger that load for THIS episode, but only
@@ -4363,15 +4437,32 @@ struct iOSEpisodeStreams: View {
         return DebridEpisode(season: targetSeason, episode: targetEpisode)
     }
 
+    /// The episode hero's one primary action, backed by the same source-list snapshot and playback closures
+    /// as the list control bar. `iOSSourceList` suppresses only its primary slot for this caller; its wrapped
+    /// secondary controls remain below the hero.
+    @ViewBuilder private var episodePrimaryControl: some View {
+        iOSSourcePrimaryControl(
+            groups: sourceList.groups,
+            progress: core.streamLoadProgress(forStreamId: shownVideo.id),
+            bestStream: sourceList.best,
+            isEpisode: true,
+            loading: !sourceList.isSettled,
+            play: { stream, url in Task { await play(stream, url: url) } },
+            playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
+            playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } }
+        )
+    }
+
     /// Episode backdrop + show eyebrow + episode title + S·E / air date / facts + overview, mirroring
     /// the tvOS `CoreEpisodeStreams` header block.
-    private func hero(width: CGFloat) -> some View {
+    private func hero(width: CGFloat, height: CGFloat) -> some View {
+        let band = IOSDetailHeroLayout.heroHeight(viewport: height, width: width)
         // Fixed backdrop banner (show eyebrow + episode title + meta overlaid) with the overview flowing
         // below on the canvas, same structure as iOSDetailView.hero, so a long episode synopsis can't push
         // the backdrop down behind the text.
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             ZStack(alignment: .bottomLeading) {
-                backdrop
+                backdrop(height: band)
                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     Text(meta.name.uppercased())
                         .font(Theme.Typography.eyebrow).tracking(1.5)
@@ -4385,20 +4476,28 @@ struct iOSEpisodeStreams: View {
                     metaRow
                 }
                 .padding(.horizontal, Theme.Space.md)
-                .padding(.bottom, Theme.Space.lg)
+                // Keep the title/facts at the lower image edge while reserving room for the shared primary
+                // action to straddle the image bottom. The CTA is rendered once here; the source list renders
+                // only its secondary controls below, so there is no duplicate Play row.
+                .padding(.bottom, Theme.Space.xl + 56)
                 .frame(width: width, alignment: .leading)
             }
             .frame(width: width, alignment: .leading)
-
-            if let overview = shownVideo.overview, !overview.isEmpty {
-                Text(overview)
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .lineSpacing(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+            .overlay(alignment: .bottom) {
+                episodePrimaryControl
                     .padding(.horizontal, Theme.Space.md)
+                    .offset(y: 28)
             }
+            #if os(iOS)
+            .overlay(alignment: .topLeading) {
+                CircleIconButton(systemName: "chevron.left", diameter: Theme.Control.circleChrome) { dismiss() }
+                    .accessibilityLabel("Back")
+                    .padding(.horizontal, Theme.Space.md)
+                    .padding(.top, Theme.Space.md)
+            }
+            #endif
+            .padding(.bottom, 28)
+
         }
         .frame(width: width, alignment: .leading)
     }
@@ -4424,7 +4523,16 @@ struct iOSEpisodeStreams: View {
     /// EXACT same list). While the episode's player / trailer cover is up, skip the rankedGroups pass (pass []
     /// + isSuspended) so this hidden episode list stops re-rendering behind the video; it restores on close.
     private func sourceListView(width: CGFloat) -> some View {
-        iOSSourceList(
+        #if os(iOS)
+        let showsPrimaryControls = false
+        let showsSecondaryControls = true
+        #else
+        // macOS keeps its existing source-list control bar because macEpisodeBanner intentionally has no
+        // hero CTA. The iOS-only hero owns the primary action and leaves secondary controls below.
+        let showsPrimaryControls = true
+        let showsSecondaryControls = true
+        #endif
+        return iOSSourceList(
             groups: presentation != nil ? [] : rankedEpisode(),
             progress: core.streamLoadProgress(forStreamId: shownVideo.id),
             playbackMeta: PlaybackMeta(
@@ -4439,6 +4547,8 @@ struct iOSEpisodeStreams: View {
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             isEpisode: true,
+            showsPrimaryControls: showsPrimaryControls,
+            showsSecondaryControls: showsSecondaryControls,
             play: { stream, url in Task { await play(stream, url: url) } },
             playWithEngine: { stream, url, preference in
                 Task { await play(stream, url: url, enginePreference: preference) }
@@ -4491,19 +4601,6 @@ struct iOSEpisodeStreams: View {
         .frame(width: width, alignment: .leading)
     }
 
-    /// The episode overview, rendered in the macOS inner scroll region (the iOS path keeps it inside `hero`).
-    @ViewBuilder private var episodeOverviewText: some View {
-        if let overview = shownVideo.overview, !overview.isEmpty {
-            Text(overview)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.Palette.textSecondary)
-                .lineSpacing(2)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
-                .padding(.horizontal, Theme.Space.md)
-        }
-    }
-
     /// Near-fullscreen episode band height (ports `iOSDetailView.heroBandHeight`'s macOS formula): ~72% of a
     /// tall window, always reserving ~320pt of inner-scroll room, floored at 280 and capped at 1000.
     private func episodeBandHeight(viewport: CGFloat) -> CGFloat {
@@ -4537,6 +4634,20 @@ struct iOSEpisodeStreams: View {
         .accessibilityHidden(true)
     }
     #endif
+
+    /// The episode overview follows the hero action surface on both platforms. macOS renders it in the
+    /// pinned inner scroll region; iOS renders it after the shared source controls/list.
+    @ViewBuilder private var episodeOverviewText: some View {
+        if let overview = shownVideo.overview, !overview.isEmpty {
+            Text(overview)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .lineSpacing(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: Theme.Space.readableColumn, alignment: .leading)
+                .padding(.horizontal, Theme.Space.md)
+        }
+    }
 
     private var backdrop: some View { backdrop(height: backdropHeight) }
 
@@ -5473,6 +5584,49 @@ private struct SourceRow: Identifiable { let id: String; let addon: String; let 
 /// shared render budget. A collapsed group carries an empty `rows` (its header still shows the full count).
 private struct WindowedGroup: Identifiable { let id: String; let group: CoreStreamSourceGroup; let rows: [SourceRow] }
 
+/// Shared primary source action. The episode hero and the ordinary source-list control bar use this exact
+/// view and closure set, so moving the CTA onto the hero cannot create a second playback implementation.
+private struct iOSSourcePrimaryControl: View {
+    let groups: [CoreStreamSourceGroup]
+    let progress: (loaded: Int, total: Int)
+    let bestStream: CoreStream?
+    let isEpisode: Bool
+    let loading: Bool
+    let play: (CoreStream, URL) -> Void
+    let playAuto: ((CoreStream, URL) -> Void)?
+    let playBest: (([CoreStream], CoreStream) -> Void)?
+
+    @ViewBuilder var body: some View {
+        if let best = bestStream, let url = best.playableURL(isEpisode: isEpisode) {
+            Button {
+                if let playBest {
+                    playBest(groups.flatMap(\.streams), best)
+                } else {
+                    (playAuto ?? play)(best, url)
+                }
+            } label: {
+                if loading {
+                    HStack(spacing: Theme.Space.sm) {
+                        ProgressView().tint(Theme.Palette.onAccent)
+                        Text(progress.total > 0
+                             ? "Finding best…  \(progress.loaded)/\(progress.total)"
+                             : "Finding best…")
+                            .lineLimit(1)
+                    }
+                } else {
+                    Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                }
+            }
+            .buttonStyle(PrimaryActionStyle())
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .disabled(loading)
+            .opacity(loading ? 0.55 : 1)
+        }
+    }
+}
+
 struct iOSSourceList: View {
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
@@ -5494,9 +5648,13 @@ struct iOSSourceList: View {
     var isEpisode = false
     /// When false, the primary Watch / Quality / All-sources control bar is hidden and the grouped list is
     /// shown directly. The MOVIE detail page passes false because its hero already shows Watch + Quality +
-    /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode + live pages
-    /// keep the default true; there the control bar is the only primary action.
+    /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode page owns the
+    /// primary slot in its hero and disables this slot while retaining secondary controls below; live keeps
+    /// the default true because its control bar remains the primary action.
     var showsPrimaryControls = true
+    /// Secondary source actions (All sources, Quality, Player, Audio) can remain below a hero-owned primary
+    /// action. This is false only for a caller that intentionally owns the whole control surface.
+    var showsSecondaryControls = true
     let play: (CoreStream, URL) -> Void
     /// Explicit one-launch engine route from a source-row context menu. Optional for compatibility with
     /// narrow callers; normal taps continue through `play` and inherit the visible session picker.
@@ -5754,14 +5912,15 @@ struct iOSSourceList: View {
                 // Singularity renders INLINE ONLY: its merged group flows through the ranked list like
                 // any add-on, sortable with the user's sort (owner decision; the old pinned duplicate
                 // section above the list was removed on both platforms).
-                if showsPrimaryControls { controlBar }
+                if showsPrimaryControls || showsSecondaryControls { controlBar }
                 if loading && progress.total > 0 {
                     Text("Still finding more · \(progress.loaded)/\(progress.total) add-ons")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
                 }
-                // Reveal the grouped list on demand (All-sources toggle) OR always when the control bar is
-                // hidden; otherwise the movie rail would be empty, since the toggle lives in that bar.
-                if showAllSources || !showsPrimaryControls {
+                // Reveal the grouped list on demand (All-sources toggle) OR always when the entire control
+                // bar is hidden. Episode secondary-only mode keeps this list collapsed beneath its wrapped
+                // controls, so the hero and synopsis are not separated by an unbounded source rail.
+                if showAllSources || (!showsPrimaryControls && !showsSecondaryControls) {
                     if groups.count > 1 { filterBar }
                     sortBar
                     groupedList
@@ -5789,45 +5948,28 @@ struct iOSSourceList: View {
     // MARK: Controls (Watch-in-X · Quality picker · All sources)
 
     @ViewBuilder private var controlBar: some View {
-        // The flow layout (HStack that wraps) is simulated with two rows so it stays tidy on a phone.
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            // Watch-in pick honors the remembered-quality continuity hint, so reopening a title lands
-            // on the same quality it last played (same-release-group biased), matching tvOS.
-            if let best = bestStream, let url = best.playableURL(isEpisode: isEpisode) {
-                HStack(spacing: Theme.Space.sm) {
-                    // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
-                    // press plays the best of ALL sources, not the best of whoever replied first, the tvOS
-                    // gate. The Quality picker stays live so a manual pick is always available immediately.
-                    // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
-                    // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
-                    Button { if let playBest { playBest(groups.flatMap(\.streams), best) } else { (playAuto ?? play)(best, url) } } label: {
-                        if loading {
-                            HStack(spacing: Theme.Space.sm) {
-                                ProgressView().tint(Theme.Palette.onAccent)
-                                Text(progress.total > 0 ? "Finding best…  \(progress.loaded)/\(progress.total)" : "Finding best…")
-                            }
-                        } else {
-                            // Restored 0.3.13 copy: the button names the quality of the source it plays, so
-                            // "Watch in 1080p · DV" is a truthful promise about what this press plays.
-                            Label("Watch in \(StreamRanking.watchLabel(best))", systemImage: "play.fill")
-                        }
+            if showsPrimaryControls {
+                iOSSourcePrimaryControl(
+                    groups: groups, progress: progress, bestStream: bestStream, isEpisode: isEpisode,
+                    loading: loading, play: play, playAuto: playAuto, playBest: playBest
+                )
+            }
+            if showsSecondaryControls {
+                // Intrinsic-width controls wrap as whole chips. The previous HStack squeezed long localized
+                // labels until they rendered one character per line on a 320pt phone.
+                FlowLayout(spacing: Theme.Space.sm, constrainOversizedChildren: true) {
+                    Button { withAnimation { showAllSources.toggle() } } label: {
+                        Label(showAllSources ? "Hide sources" : "All sources · \(streamCount)",
+                              systemImage: showAllSources ? "chevron.up" : "list.bullet")
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
-                    .buttonStyle(PrimaryActionStyle())
-                    .disabled(loading)
-                    .opacity(loading ? 0.55 : 1)
-
+                    .buttonStyle(ChipButtonStyle(selected: showAllSources))
                     qualityMenu
                     launchPlayerMenu
                     audioLanguageMenu
                 }
-            }
-            HStack(spacing: Theme.Space.sm) {
-                Button { withAnimation { showAllSources.toggle() } } label: {
-                    Label(showAllSources ? "Hide sources" : "All sources · \(streamCount)",
-                          systemImage: showAllSources ? "chevron.up" : "list.bullet")
-                }
-                .buttonStyle(ChipButtonStyle(selected: showAllSources))
-                Spacer(minLength: 0)
             }
         }
     }
@@ -5850,6 +5992,8 @@ struct iOSSourceList: View {
                 }
             } label: {
                 Label("Quality", systemImage: "chevron.up.chevron.down")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
             .buttonStyle(ChipButtonStyle())
         }
@@ -5868,6 +6012,8 @@ struct iOSSourceList: View {
         } label: {
             Label(selected.flatMap { code in TrackPreferences.commonLanguages.first(where: { $0.id == code })?.label } ?? "Audio",
                   systemImage: "captions.bubble")
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
         .buttonStyle(ChipButtonStyle(selected: selected != nil))
     }
@@ -5882,6 +6028,8 @@ struct iOSSourceList: View {
                 Button("AVPlayer when compatible") { onLaunchEnginePreferenceChange(.avfoundation) }
             } label: {
                 Label(launchPlayerLabel, systemImage: "play.rectangle")
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
             .buttonStyle(ChipButtonStyle(selected: launchEnginePreference != nil))
             .accessibilityLabel("Player for next launch")
@@ -6151,6 +6299,7 @@ extension iOSSourceList: Equatable {
             && lhs.isEpisode == rhs.isEpisode
             && lhs.sourcesSettled == rhs.sourcesSettled
             && lhs.showsPrimaryControls == rhs.showsPrimaryControls
+            && lhs.showsSecondaryControls == rhs.showsSecondaryControls
             && lhs.progress == rhs.progress
             && lhs.continuity == rhs.continuity
             && lhs.pinContext == rhs.pinContext
@@ -6165,12 +6314,9 @@ extension iOSSourceList: Equatable {
     }
 }
 
-/// A CLEAN source row, mirroring the tvOS stream list's parsed labelling instead of dumping the
-/// add-on's raw verbose blurb (e.g. "Stream Expression (308) / Included Reasons / Removal Reasons /
-/// digitalRelease Bypass"). It shows: a leading play/torrent icon, a quality badge (4K / 1080p / …)
-/// next to the add-on + TORRENT badges, the parsed flavour tags (Remux · HDR · Atmos · HEVC · Cached)
-/// + file size, and a single trimmed title line for human context, built from `StreamRanking.sourceDetail`
-/// and `StreamRanking.qualityLabel`, the same parse that powers the Watch / Quality affordances.
+/// A source row with the add-on-owned literal name and description in the default presentation, supplemented
+/// only by native state. Compact labels opt into parsed metadata; normal rows do not replace configured
+/// wording with a filename or collapse the add-on's formatting.
 private struct iOSStreamLabel: View {
     let addon: String
     let stream: CoreStream
@@ -6186,27 +6332,55 @@ private struct iOSStreamLabel: View {
 
     var body: some View {
         let quality = StreamRanking.qualityLabel(stream)        // "4K" / "1080p" / "Best"
-        // A row is cached when EITHER the native coordinator confirmed this raw torrent's hash
-        // (`debridCached`) OR the add-on's own text carries a cache marker (⚡ / [RD+] / "cached" / …).
-        // Owner's streams are pre-resolved debrid-ADDON links, so the native hash check collects nothing;
-        // the text-marker path is what actually lights the badge for him. `signature` is the public
-        // wrapper over the private `qualityText`, so it's the same text `isCached` parses internally.
-        let cached = debridCached || StreamRanking.isCached(stream, StreamRanking.signature(stream))
+        // Parsed badges are an explicit compact-label presentation. In the default view, only native
+        // confirmation and pin state supplement the add-on's literal formatter text, so quality/cache markers
+        // owned by that text are not duplicated above it.
+        let formatterCached = StreamRanking.isCached(stream, StreamRanking.signature(stream))
+        let compactCached = debridCached || formatterCached
         // Drop the plain "Cached" flavour chip when the row already shows the prominent "⚡ CACHED" badge,
         // so a cached row reads as one bolt badge, not a doubled bolt-plus-plain-"Cached".
-        let flavors = StreamRanking.flavorTags(stream).filter { !($0 == "Cached" && cached) }
+        let flavors = StreamRanking.flavorTags(stream).filter { !($0 == "Cached" && compactCached) }
         let size = StreamRanking.sizeText(stream)
         return HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
                 .font(.system(size: 26))
                 .foregroundStyle(enabled ? Theme.Palette.accent : Theme.Palette.textTertiary)
             VStack(alignment: .leading, spacing: 6) {
-                // On a narrow iPhone (below `Theme.Space.wideLayoutMinWidth`) the source column runs to
-                // `.infinity` and the badge row's only width guard is each badge's `fixedSize`, so a long
-                // add-on name plus the TORRENT / CACHED pills could run off-screen. A horizontal scroll keeps
-                // every badge at its intrinsic width and lets the row scroll instead of overflowing; on wide
-                // layouts they all fit, so nothing scrolls and the look is unchanged.
-                ScrollView(.horizontal, showsIndicators: false) {
+                if compactLabels {
+                    // Compact rows retain the parsed quality/flavour/size summary and add-on/torrent/cache
+                    // badges as an explicit opt-in. The intrinsic badge row remains horizontally scrollable.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            if pinned {
+                                Image(systemName: "pin.fill")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(Theme.Palette.accent)
+                                    .accessibilityLabel("Pinned source")
+                            }
+                            badge(quality, prominent: true)
+                            if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
+                            if stream.isTorrent { badge("TORRENT") }
+                            if compactCached { badge("⚡ CACHED", prominent: true) }
+                        }
+                    }
+                    if !flavors.isEmpty || size != nil {
+                        HStack(spacing: 8) {
+                            if !flavors.isEmpty {
+                                Text(flavors.joined(separator: " · "))
+                                    .font(Theme.Typography.label)
+                                    .foregroundStyle(enabled ? Theme.Palette.textPrimary : Theme.Palette.textTertiary)
+                                    .lineLimit(1)
+                            }
+                            if let size {
+                                Text(size)
+                                    .font(Theme.Typography.label)
+                                    .foregroundStyle(Theme.Palette.textTertiary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                } else if pinned || (debridCached && !formatterCached) {
+                    // These are native row-state signals, not a reformat of the add-on's own representation.
                     HStack(spacing: 8) {
                         if pinned {
                             Image(systemName: "pin.fill")
@@ -6214,71 +6388,36 @@ private struct iOSStreamLabel: View {
                                 .foregroundStyle(Theme.Palette.accent)
                                 .accessibilityLabel("Pinned source")
                         }
-                        badge(quality, prominent: true)
-                        // Skip the add-on badge when it only repeats the resolution: some add-on configs are
-                        // literally named "1080p" / "4K", which rendered as a second quality pill next to the
-                        // one above (the reported double tag). Real add-on names still show.
-                        if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
-                        if stream.isTorrent { badge("TORRENT") }
-                        // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
-                        // OR the add-on already advertises the source as cached. Reuses the prominent (accent)
-                        // badge style with a bolt glyph; only shows when cached.
-                        if cached { badge("⚡ CACHED", prominent: true) }
+                        if debridCached && !formatterCached { badge("⚡ CACHED", prominent: true) }
                     }
                 }
-                // Parsed flavour tags + size, the clean line tvOS shows, minus the resolution (it is
-                // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".
-                if !flavors.isEmpty || size != nil {
-                    HStack(spacing: 8) {
-                        if !flavors.isEmpty {
-                            Text(flavors.joined(separator: " · "))
-                                .font(Theme.Typography.label)
-                                .foregroundStyle(enabled ? Theme.Palette.textPrimary : Theme.Palette.textTertiary)
-                                .lineLimit(1)
-                        }
-                        if let size {
-                            Text(size)
-                                .font(Theme.Typography.label)
-                                .foregroundStyle(Theme.Palette.textTertiary)
-                                .lineLimit(1)
-                        }
+                // Default rows are add-on-owned presentation. Keep the configured name and description as
+                // literal text, including newlines, emoji, and intentional spacing. Compact rows (#117) remain
+                // an explicit opt-in parsed view and omit this raw formatter block entirely.
+                if !compactLabels {
+                    let presentation = IOSStreamPresentationData.make(
+                        name: stream.name,
+                        description: stream.description,
+                        filename: stream.behaviorHints?.filename
+                    )
+                    if let title = presentation.title {
+                        Text(title)
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                }
-                // The release title for human context. Allowed two lines so the fuller release name
-                // shows (people want the detail) while a verbose multi-line add-on blurb still can't
-                // run away; `cleanTitle` already keeps only the first line of the add-on's name.
-                // Compact rows (#117) drop this line entirely: the parsed badges + tags + size above
-                // are the whole row.
-                if !compactLabels, let title = cleanTitle {
-                    Text(title)
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                        .lineLimit(2).truncationMode(.tail)
+                    if let detail = presentation.detail {
+                        Text(detail)
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             Spacer(minLength: 0)
         }
         .padding(Theme.Space.md)
         .opacity(enabled ? 1 : 0.55)
-    }
-
-    /// A single trimmed context line: the actual RELEASE NAME. Prefer behaviorHints.filename; it is the
-    /// only field that distinguishes "...Deathly.Hallows.Part.1..." from "Part.2", which a short add-on
-    /// label / quality blurb in `name` drops. Fall back to the stream `name`, then the first line of
-    /// `description`. Newlines collapse to the first line and a trailing container extension is stripped;
-    /// never the full multi-line blurb (the row is lineLimit(2), tail-truncated).
-    private var cleanTitle: String? {
-        let candidates = [stream.behaviorHints?.filename, stream.name, stream.description]
-        guard let raw = candidates.compactMap({ $0 }).first(where: { !$0.isEmpty }) else { return nil }
-        let firstLine = raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? raw
-        var trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        if let dot = trimmed.lastIndex(of: "."), trimmed.distance(from: dot, to: trimmed.endIndex) <= 6 {
-            let ext = trimmed[trimmed.index(after: dot)...].lowercased()
-            if ["mkv", "mp4", "avi", "ts", "m2ts", "webm", "mov", "wmv"].contains(ext) {
-                trimmed = String(trimmed[..<dot]).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     @ViewBuilder private func badge(_ text: String, prominent: Bool = false) -> some View {
