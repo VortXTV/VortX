@@ -12,19 +12,6 @@ private struct AddonNZBFixture: Decodable {
     let servers: [String]?
     let fileMustInclude: String?
 
-    var nzbs: [String] {
-        ([nzbUrl].compactMap { $0 } + (nzbUrls ?? [])).filter { value in
-            guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
-            return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
-        }
-    }
-
-    var nntpServers: [String] {
-        (servers ?? []).filter { value in
-            guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
-            return (scheme == "nntp" || scheme == "nntps") && url.host?.isEmpty == false
-        }
-    }
 }
 
 @main @MainActor
@@ -44,11 +31,17 @@ private enum UsenetNodeRoutingContractTests {
         let resolver = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/UsenetProvider.swift"), encoding: .utf8)
         let coordinator = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/DebridResolver.swift"), encoding: .utf8)
 
-        let json = #"{"nzbUrl":"https://one.example/show.nzb","nzbUrls":["https://two.example/show.nzb","file:///not-an-nzb"],"servers":["nntps://user:secret@news.example:563/10","https://not-nntp.example"],"fileMustInclude":"S01E02"}"#
+        let json = #"{"nzbUrl":"https://one.example/show.nzb","nzbUrls":["https://two.example/show.nzb","https://user:secret@private.example/show.nzb","file:///not-an-nzb"],"servers":["nntps://user:secret@news.example:563/10","https://not-nntp.example"],"fileMustInclude":"S01E02"}"#
         let decoded = try JSONDecoder().decode(AddonNZBFixture.self, from: Data(json.utf8))
-        check("decodes singular and plural NZB fields", decoded.nzbUrl != nil && decoded.nzbUrls?.count == 2)
+        check("decodes singular and plural NZB fields", decoded.nzbUrl != nil && decoded.nzbUrls?.count == 3)
         check("keeps fileMustInclude as a string", decoded.fileMustInclude == "S01E02")
-        check("validates NZB mirrors and NNTP endpoints", decoded.nzbs.count == 2 && decoded.nntpServers.count == 1)
+        let nzbs = UsenetStreamValidation.nzbURLs(singular: decoded.nzbUrl, plural: decoded.nzbUrls)
+        let servers = UsenetStreamValidation.nntpServers(decoded.servers)
+        check("production validation rejects credential-bearing NZB URLs and keeps NNTP credentials", nzbs.count == 2 && servers.count == 1)
+        check("production validation preserves plural-only identity", UsenetStreamValidation.nzbURLs(singular: nil, plural: ["https://only.example/a.nzb"]) == ["https://only.example/a.nzb"])
+        check("plural-only NZB plus infohash is Usenet, never both Usenet and torrent", UsenetStreamValidation.isUsenet(url: nil, singular: nil, plural: ["https://only.example/a.nzb"])
+              && !UsenetStreamValidation.isTorrent(url: nil, infoHash: "abc", singular: nil, plural: ["https://only.example/a.nzb"]))
+        check("plural-only NZB has a stable non-placeholder identity", UsenetStreamValidation.streamIdentity(url: nil, externalURL: nil, infoHash: nil, singular: nil, plural: ["https://only.example/a.nzb"]) == "https://only.example/a.nzb")
 
         check("production stream preserves add-on fields", models.contains("let nzbUrls: [String]?")
               && models.contains("let servers: [String]?") && models.contains("let fileMustInclude: String?"))

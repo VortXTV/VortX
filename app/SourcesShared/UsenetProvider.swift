@@ -146,13 +146,15 @@ enum UsenetLocalResolver {
     /// Submit validated add-on mirrors and NNTP hints to Node's NZB control endpoint.  A saved VortX
     /// provider is appended when present; add-on credentials are never copied into preferences or logs.
     static func resolve(nzbURLs: [String], servers: [String],
-                        credentials: UsenetProviderCredentials? = nil) async throws -> URL {
+                        credentials: UsenetProviderCredentials? = nil,
+                        waitForNode: Bool = false) async throws -> URL {
         #if VORTX_NO_EMBEDDED_SERVER
         throw ResolveError.unavailable
         #else
         let validNZBs = nzbURLs.filter { value in
             guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
             return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
+                && url.user == nil && url.password == nil
         }
         var localServers = servers.filter { value in
             guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
@@ -163,8 +165,9 @@ enum UsenetLocalResolver {
         if localServers.isEmpty, let credentials, credentials.isValid {
             localServers.append(credentials.nntpServerURL)
         }
-        guard !validNZBs.isEmpty, !localServers.isEmpty,
-              let base = StremioServer.usenetNodeBase else { throw ResolveError.unavailable }
+        guard !validNZBs.isEmpty, !localServers.isEmpty else { throw ResolveError.unavailable }
+        let base = if waitForNode { await waitForNodeBase() } else { StremioServer.usenetNodeBase }
+        guard let base else { throw ResolveError.unavailable }
         guard let createURL = URL(string: "\(base)/nzb/create") else { throw ResolveError.unavailable }
 
         let body: [String: Any] = [
@@ -202,6 +205,17 @@ enum UsenetLocalResolver {
         }
         return streamURL
         #endif
+    }
+
+    /// Node and native can boot concurrently on mobile.  An explicit tap waits briefly for Node to publish
+    /// its actual port instead of guessing the native port; auto selection never calls this waiting path.
+    private static func waitForNodeBase() async -> String? {
+        for _ in 0..<10 {
+            if let base = StremioServer.usenetNodeBase { return base }
+            guard !Task.isCancelled else { return nil }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return StremioServer.usenetNodeBase
     }
 }
 

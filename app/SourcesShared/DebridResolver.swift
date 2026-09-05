@@ -1467,7 +1467,8 @@ extension DebridCoordinator {
         }
         if let ref = await resolvedPlaybackRef(for: stream, episode: episode,
                                                confirmedCachedHashes: nil,
-                                               confirmedUsenetURLs: nil) {
+                                               confirmedUsenetURLs: nil,
+                                               waitForLocalUsenetNode: true) {
             return .ready(ref)
         }
         return .failed("This NZB source could not be started. Check that the provider is available and try another source.")
@@ -1518,7 +1519,8 @@ extension DebridCoordinator {
     /// timeout → nil) is identical.
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
-                             confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
+                             confirmedUsenetURLs: Set<String>? = nil,
+                             waitForLocalUsenetNode: Bool = false) async -> DebridPlaybackRef? {
         let selectionEpisode = episode.map {
             DebridEpisode(
                 season: $0.season, episode: $0.episode,
@@ -1530,7 +1532,9 @@ extension DebridCoordinator {
         // returns nil here with no network (only the at-most-once lazy warm hop), so a usenet row behaves
         // exactly as today (no playable link). NOT a torrent: the minted URL is a plain direct stream (no
         // infoHash carried).
-        if stream.url == nil, let nzb = stream.usenetURLs.first {
+        if stream.url == nil,
+           let nzb = stream.usenetURLs.first(where: { confirmedUsenetURLs?.contains($0) == true })
+                ?? stream.usenetURLs.first {
             // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet provider, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
             // TorBox EXCEPT when TorBox already has this source confirmed-cached (an instant direct link that
@@ -1543,7 +1547,8 @@ extension DebridCoordinator {
             let usenetCreds = UsenetProviderStore.loadCredentials()
             if !torBoxHasItCached, (!stream.usenetServers.isEmpty || usenetCreds != nil) {
                 if let localURL = try? await UsenetLocalResolver.resolve(
-                    nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds
+                    nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds,
+                    waitForNode: waitForLocalUsenetNode
                 ) {
                     DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
                     // A loopback stream: no infoHash / torrentId to carry (no reresolve fast path), and the
@@ -1705,7 +1710,7 @@ extension DebridCoordinator {
         let cached = candidates.filter { s in
             guard s.url == nil else { return false }
             if let h = s.infoHash?.lowercased(), !h.isEmpty, cachedHashes.contains(h) { return true }
-            if let nzb = s.nzbUrl, !nzb.isEmpty, cachedUsenetURLs.contains(nzb) { return true }
+            if s.usenetURLs.contains(where: cachedUsenetURLs.contains) { return true }
             return false
         }
         guard !cached.isEmpty else { return nil }
@@ -1736,7 +1741,7 @@ extension DebridCoordinator {
             guard let best = labeledBest else { return false }
             if best.url != nil { return true }   // direct / debrid link resolves without an add-then-download
             if let h = best.infoHash?.lowercased(), !h.isEmpty, cachedHashes.contains(h) { return true }
-            if let nzb = best.nzbUrl, !nzb.isEmpty, cachedUsenetURLs.contains(nzb) { return true }
+            if best.usenetURLs.contains(where: cachedUsenetURLs.contains) { return true }
             return false
         }()
         // A winner is acceptable unless the label is a confirmed-cached HIGHER resolution than it (which we can
@@ -1895,8 +1900,12 @@ final class DebridCacheAwareness: ObservableObject {
         var byMD5: [String: String] = [:]   // md5 -> nzbUrl, so a cached md5 maps back to the row's raw link
         for group in groups {
             for stream in group.streams where stream.isUsenet {
-                guard let nzb = stream.nzbUrl, !nzb.isEmpty else { continue }
-                byMD5[stream.usenetKnownHash ?? TorBoxUsenetResolver.identifier(forNzbURL: nzb)] = nzb
+                if let knownHash = stream.usenetKnownHash, let first = stream.usenetURLs.first {
+                    byMD5[knownHash] = first
+                }
+                for nzb in stream.usenetURLs {
+                    byMD5[TorBoxUsenetResolver.identifier(forNzbURL: nzb)] = nzb
+                }
             }
         }
         guard !byMD5.isEmpty else { return }

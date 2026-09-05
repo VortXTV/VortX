@@ -6138,8 +6138,8 @@ struct iOSSourceList: View {
     /// torrent matches by infoHash; a USENET row matches its nzb link against the usenet-cached set. False
     /// for every stream when both sets are empty (no key / not yet checked), so no chips render.
     private func isDebridCached(_ stream: CoreStream) -> Bool {
-        if let nzb = stream.nzbUrl, !nzb.isEmpty {
-            return !cachedUsenetURLs.isEmpty && cachedUsenetURLs.contains(nzb)
+        if stream.isUsenet {
+            return !cachedUsenetURLs.isEmpty && stream.usenetURLs.contains(where: cachedUsenetURLs.contains)
         }
         guard !cachedHashes.isEmpty, let h = stream.infoHash?.lowercased() else { return false }
         return cachedHashes.contains(h)

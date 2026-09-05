@@ -2504,6 +2504,7 @@ struct CoreStreamList: View {
     @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
     @State private var showPlayerPicker = false
     @State private var usenetPlaybackMessage: String?
+    @State private var usenetResolutionInFlight = false
     @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
     /// Focus anchors are visible action controls: Watch/Resume owns `.primary`, and the first secondary action
     /// owns `.secondary`. Setting either target performs a real row transition; no dummy button is inserted.
@@ -3526,8 +3527,13 @@ struct CoreStreamList: View {
             Task { @MainActor in await playTrailerStream(stream) }
             return
         }
+        if stream.isUsenet {
+            guard !usenetResolutionInFlight else { return }
+            usenetResolutionInFlight = true
+        }
         let proposedStart = proposedInitialStart(fromStart: false)
         Task {
+            defer { if stream.isUsenet { usenetResolutionInFlight = false } }
             await playResolving(
                 stream,
                 explicit: true,
@@ -3909,8 +3915,9 @@ struct CoreStreamList: View {
     /// matches by infoHash; a USENET row matches its nzb link against the usenet-cached set. False for every
     /// stream when both sets are empty (no key / not yet checked), so no chips render.
     private func isDebridCached(_ stream: CoreStream) -> Bool {
-        if let nzb = stream.nzbUrl, !nzb.isEmpty {
-            return !debridCache.cachedUsenetURLs.isEmpty && debridCache.cachedUsenetURLs.contains(nzb)
+        if stream.isUsenet {
+            return !debridCache.cachedUsenetURLs.isEmpty
+                && stream.usenetURLs.contains(where: debridCache.cachedUsenetURLs.contains)
         }
         guard !debridCache.cachedHashes.isEmpty, let h = stream.infoHash?.lowercased() else { return false }
         return debridCache.cachedHashes.contains(h)

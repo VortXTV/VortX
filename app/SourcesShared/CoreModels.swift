@@ -1379,41 +1379,25 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// player, download, subtitle, or warm path. Other stream classes preserve their established routing.
     var isCommunityJavaScriptProvider: Bool { vortxProvider?.hasPrefix("jsplugin:") == true }
 
-    var id: String { (url ?? externalUrl ?? infoHash ?? nzbUrl ?? "?") + "#" + (name ?? "") + (description ?? "") }
-    var isTorrent: Bool { url == nil && infoHash != nil && nzbUrl == nil }
+    var id: String { UsenetStreamValidation.streamIdentity(url: url, externalURL: externalUrl, infoHash: infoHash, singular: nzbUrl, plural: nzbUrls) + "#" + (name ?? "") + (description ?? "") }
+    var isTorrent: Bool { UsenetStreamValidation.isTorrent(url: url, infoHash: infoHash, singular: nzbUrl, plural: nzbUrls) }
 
     /// A USENET stream: no direct `url` yet, but an `.nzb` link to resolve through a usenet-capable debrid
     /// account. Like a raw torrent, it needs resolution before it is playable, the usenet analogue of
     /// `isTorrent`. Kept mutually exclusive from `isTorrent` (which now also checks `nzbUrl == nil`) so a
     /// stream is classified as exactly one of torrent / usenet / direct.
-    var isUsenet: Bool { url == nil && !usenetURLs.isEmpty }
+    var isUsenet: Bool { UsenetStreamValidation.isUsenet(url: url, singular: nzbUrl, plural: nzbUrls) }
 
     /// Public HTTP(S) NZB descriptors only.  Reject malformed/non-web values before they can reach the
     /// local resolver; preserve order and de-duplicate so an add-on's preferred mirror remains first.
     var usenetURLs: [String] {
-        ([nzbUrl].compactMap { $0 } + (nzbUrls ?? [])).reduce(into: [String]()) { result, candidate in
-            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let parsed = URL(string: trimmed),
-                  let scheme = parsed.scheme?.lowercased(),
-                  (scheme == "http" || scheme == "https"),
-                  parsed.host?.isEmpty == false,
-                  !result.contains(trimmed) else { return }
-            result.append(trimmed)
-        }
+        UsenetStreamValidation.nzbURLs(singular: nzbUrl, plural: nzbUrls)
     }
 
     /// NNTP endpoints from an add-on are kept only when they are syntactically safe NNTP(S) URLs.  They
     /// can carry provider credentials, therefore they are never logged or persisted outside engine state.
     var usenetServers: [String] {
-        (servers ?? []).reduce(into: [String]()) { result, candidate in
-            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let parsed = URL(string: trimmed),
-                  let scheme = parsed.scheme?.lowercased(),
-                  (scheme == "nntp" || scheme == "nntps"),
-                  parsed.host?.isEmpty == false,
-                  !result.contains(trimmed) else { return }
-            result.append(trimmed)
-        }
+        UsenetStreamValidation.nntpServers(servers)
     }
 
     /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
