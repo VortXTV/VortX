@@ -35,6 +35,12 @@ enum UsenetStreamValidation {
                   let scheme = parsed.scheme?.lowercased(),
                   (scheme == "nntp" || scheme == "nntps"),
                   parsed.host?.isEmpty == false,
+                  let user = parsed.user, !user.isEmpty,
+                  let password = parsed.password, !password.isEmpty,
+                  let port = parsed.port, (1...65535).contains(port),
+                  parsed.query == nil, parsed.fragment == nil,
+                  let connections = Int(parsed.path.dropFirst()), (1...100).contains(connections),
+                  parsed.path == "/\(connections)",
                   !result.contains(trimmed) else { return }
             result.append(trimmed)
         }

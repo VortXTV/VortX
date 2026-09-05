@@ -136,6 +136,11 @@ enum UsenetLocalResolver {
     /// provider so a play tap can never hang.
     static let requestTimeout: TimeInterval = 20
 
+    struct RoutedStream: Sendable {
+        let url: URL
+        let route: DebridUsenetRoute
+    }
+
     /// Resolve `nzbUrl` to a loopback stream URL, or throw. The nntp URL (carrying the user's provider
     /// password) is POSTed ONLY to `StremioServer.usenetNodeBase` (the local Node server) - deliberately
     /// never `StremioServer.base` or the generic embedded/native endpoint - and is never logged.
@@ -148,6 +153,19 @@ enum UsenetLocalResolver {
     static func resolve(nzbURLs: [String], servers: [String],
                         credentials: UsenetProviderCredentials? = nil,
                         waitForNode: Bool = false) async throws -> URL {
+        guard let resolved = try await resolveRouted(nzbURLs: nzbURLs, servers: servers, credentials: credentials,
+                                                     waitForNode: waitForNode) else {
+            throw ResolveError.unavailable
+        }
+        return resolved.url
+    }
+
+    /// Sequentially creates an add-on route and then (only after a genuine create failure) the saved route.
+    /// Cancellation and a caller-selected exclusion are terminal: neither can quietly spend another account.
+    static func resolveRouted(nzbURLs: [String], servers: [String],
+                              credentials: UsenetProviderCredentials? = nil,
+                              waitForNode: Bool = false,
+                              excluding: Set<DebridUsenetRoute> = []) async throws -> RoutedStream? {
         #if VORTX_NO_EMBEDDED_SERVER
         throw ResolveError.unavailable
         #else
@@ -156,17 +174,12 @@ enum UsenetLocalResolver {
             return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
                 && url.user == nil && url.password == nil
         }
-        var localServers = servers.filter { value in
-            guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
-            return (scheme == "nntp" || scheme == "nntps") && url.host?.isEmpty == false
-        }
-        // An add-on's server list is an explicit routing choice.  Keep that ordering intact and use the
-        // Keychain provider only when the stream did not specify any server; do not silently mix accounts.
-        if localServers.isEmpty, let credentials, credentials.isValid {
-            localServers.append(credentials.nntpServerURL)
-        }
-        guard !validNZBs.isEmpty, !localServers.isEmpty else { throw ResolveError.unavailable }
-        let base = if waitForNode { await waitForNodeBase() } else { StremioServer.usenetNodeBase }
+        let addonServers = UsenetStreamValidation.nntpServers(servers)
+        let savedServer = credentials?.isValid == true ? credentials?.nntpServerURL : nil
+        let attempts = UsenetRoutingPolicy.localAttempts(addonServers: addonServers, savedServer: savedServer,
+                                                         excluding: excluding)
+        guard !validNZBs.isEmpty, !attempts.isEmpty else { throw ResolveError.unavailable }
+        let base = if waitForNode { try await waitForNodeBase() } else { StremioServer.usenetNodeBase }
         guard let base else { throw ResolveError.unavailable }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = requestTimeout
@@ -174,27 +187,42 @@ enum UsenetLocalResolver {
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
 
-        do {
-            return try await UsenetNodeClient.createStream(
-                base: base, nzbURLs: validNZBs, servers: localServers, session: session, timeout: requestTimeout
-            )
-        } catch let error as UsenetNodeClient.ClientError {
-            switch error {
-            case .createFailed(let code): throw ResolveError.createFailed(code)
-            case .badResponse: throw ResolveError.badResponse
+        var lastError: ResolveError = .unavailable
+        for attempt in attempts {
+            try Task.checkCancellation()
+            do {
+                let url = try await UsenetNodeClient.createStream(
+                    base: base, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout
+                )
+                try Task.checkCancellation()
+                return RoutedStream(url: url, route: attempt.route)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as UsenetNodeClient.ClientError {
+                switch error {
+                case .createFailed(let code): lastError = .createFailed(code)
+                case .badResponse: lastError = .badResponse
+                }
+            } catch {
+                // A local transport loss is a failed create too.  Check cancellation first so a superseded
+                // session can never convert a cancelled add-on request into a saved-account attempt.
+                try Task.checkCancellation()
+                lastError = .badResponse
             }
         }
+        throw lastError
         #endif
     }
 
     /// Node and native can boot concurrently on mobile.  An explicit tap waits briefly for Node to publish
     /// its actual port instead of guessing the native port; auto selection never calls this waiting path.
-    private static func waitForNodeBase() async -> String? {
-        for _ in 0..<10 {
+    private static func waitForNodeBase() async throws -> String? {
+        for _ in 0..<15 {
             if let base = StremioServer.usenetNodeBase { return base }
-            guard !Task.isCancelled else { return nil }
-            try? await Task.sleep(for: .milliseconds(100))
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(100))
         }
+        try Task.checkCancellation()
         return StremioServer.usenetNodeBase
     }
 }

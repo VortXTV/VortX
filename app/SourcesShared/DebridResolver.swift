@@ -93,6 +93,19 @@ struct DebridPlaybackRef: Sendable, Equatable {
     let torrentId: Int?
     let fileId: Int?
     let fileIdx: Int?
+    /// Usenet provenance for one-shot playback recovery. Nil preserves legacy/direct/torrent references.
+    let usenetRoute: DebridUsenetRoute?
+
+    init(url: URL, service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
+         usenetRoute: DebridUsenetRoute? = nil) {
+        self.url = url
+        self.service = service
+        self.infoHash = infoHash
+        self.torrentId = torrentId
+        self.fileId = fileId
+        self.fileIdx = fileIdx
+        self.usenetRoute = usenetRoute
+    }
 }
 
 /// One item ALREADY in the user's debrid cloud (a finished torrent / stored file), surfaced by the
@@ -1438,6 +1451,7 @@ extension DebridCoordinator {
     /// below so it can skip an unavailable row without spending time downloading every NZB candidate.
     enum ExplicitUsenetResolution: Sendable, Equatable {
         case ready(DebridPlaybackRef)
+        case notReady(String)
         case unsupported(String)
         case failed(String)
     }
@@ -1451,18 +1465,49 @@ extension DebridCoordinator {
             return .unsupported("This source is not an NZB stream.")
         }
         let remoteAvailable = DebridPlaybackAvailability.shared.canResolveUsenetRemotely
-        let localAvailable = StremioServer.usenetNodeBase != nil
-            && (UsenetProviderStore.isConfigured || !stream.usenetServers.isEmpty)
+        // Do not reject a just-published native server while its paired Node listener is still starting.
+        // `resolvedPlaybackRef` performs the bounded readiness wait before trying the cloud route.
+        let localAvailable = UsenetProviderStore.isConfigured || !stream.usenetServers.isEmpty
         guard remoteAvailable || localAvailable else {
             return .unsupported("NZB playback needs a Usenet provider, a supported add-on server, or a TorBox account. Native streaming and Lite builds cannot play NZB streams locally.")
         }
         if let ref = await resolvedPlaybackRef(for: stream, episode: episode,
                                                confirmedCachedHashes: nil,
                                                confirmedUsenetURLs: nil,
-                                               waitForLocalUsenetNode: true) {
+                                               waitForLocalUsenetNode: true,
+                                               usenetResolveTimeout: .seconds(35)) {
             return .ready(ref)
         }
         return .failed("This NZB source could not be started. Check that the provider is available and try another source.")
+    }
+
+    /// Mint one replacement URL after a player has proved that the previous Usenet route failed. Recovery is
+    /// intentionally monotonic: an add-on route can advance to saved NNTP/cloud, a saved route can advance to
+    /// cloud, and cloud (or a legacy ref with no provenance) never starts a new cycle.  The raw NZB descriptor
+    /// remains inside this coordinator; the player only receives a fresh opaque playback reference.
+    func recoverUsenetPlayback(for stream: CoreStream, previous: DebridPlaybackRef,
+                               episode: DebridEpisode? = nil) async throws -> DebridPlaybackRef? {
+        try Task.checkCancellation()
+        guard stream.isUsenet, stream.url == nil, let previousRoute = previous.usenetRoute else { return nil }
+        let excluded: Set<DebridUsenetRoute>
+        switch previousRoute {
+        case .addonNNTP:
+            excluded = [.addonNNTP]
+        case .savedNNTP:
+            // Replaying add-on here would restart the route that necessarily failed before saved NNTP won.
+            excluded = [.addonNNTP, .savedNNTP]
+        case .torBoxCloud:
+            // We do not retain a multi-hop route history in a persisted ref; a cloud failure must not guess
+            // that a local route has not already failed, so stop rather than cycling paid/provider attempts.
+            return nil
+        }
+        let result = await resolvedPlaybackRef(for: stream, episode: episode,
+                                               confirmedCachedHashes: nil, confirmedUsenetURLs: nil,
+                                               waitForLocalUsenetNode: true,
+                                               usenetResolveTimeout: .seconds(35),
+                                               excludingUsenetRoutes: excluded)
+        try Task.checkCancellation()
+        return result
     }
 
     /// Streaming-settle ceiling for an in-line resolve. A CONFIRMED-cached torrent resolves in ~1 round trip,
@@ -1511,7 +1556,9 @@ extension DebridCoordinator {
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil,
-                             waitForLocalUsenetNode: Bool = false) async -> DebridPlaybackRef? {
+                             waitForLocalUsenetNode: Bool = false,
+                             usenetResolveTimeout: Duration = DebridCoordinator.resolveTimeout,
+                             excludingUsenetRoutes: Set<DebridUsenetRoute> = []) async -> DebridPlaybackRef? {
         let selectionEpisode = episode.map {
             DebridEpisode(
                 season: $0.season, episode: $0.episode,
@@ -1537,20 +1584,25 @@ extension DebridCoordinator {
             let torBoxHasItCached = confirmedUsenetURLs?.contains(nzb) ?? false
             let usenetCreds = UsenetProviderStore.loadCredentials()
             if !torBoxHasItCached, (!stream.usenetServers.isEmpty || usenetCreds != nil) {
-                if let localURL = try? await UsenetLocalResolver.resolve(
-                    nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds,
-                    waitForNode: waitForLocalUsenetNode
-                ) {
+                do {
+                    if let local = try await UsenetLocalResolver.resolveRouted(
+                        nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds,
+                        waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes
+                    ) {
                     DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
                     // A loopback stream: no infoHash / torrentId to carry (no reresolve fast path), and the
                     // service tag is inert here (the url alone drives playback), matching the usenet ref shape.
-                    return DebridPlaybackRef(url: localURL, service: .torBox, infoHash: "",
-                                             torrentId: nil, fileId: nil, fileIdx: stream.fileIdx)
+                    return DebridPlaybackRef(url: local.url, service: .torBox, infoHash: "",
+                                             torrentId: nil, fileId: nil, fileIdx: stream.fileIdx,
+                                             usenetRoute: local.route)
+                    }
+                } catch is CancellationError {
+                    return nil
                 }
                 DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP unavailable -> trying TorBox usenet path")
             }
             #endif
-            guard await hasUsenetResolver else { return nil }
+            guard !excludingUsenetRoutes.contains(.torBoxCloud), await hasUsenetResolver else { return nil }
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
             // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
@@ -1564,17 +1616,20 @@ extension DebridCoordinator {
             let knownHash = stream.usenetKnownHash
             return await withTaskGroup(of: DebridPlaybackRef?.self) { group in
                 group.addTask {
-                    guard let url = try? await DebridCoordinator.shared.resolveUsenet(
-                        nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
-                        fileIdx: fileIdx, episode: selectionEpisode
-                    ) else { return nil }
+                    do {
+                        let url = try await DebridCoordinator.shared.resolveUsenet(
+                            nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
+                            fileIdx: fileIdx, episode: selectionEpisode
+                        )
                     // Usenet is a plain direct link: no infoHash / torrentId to carry (no reresolve fast
                     // path), so the ref's torrent fields are nil. The `url` alone lets the player open it.
-                    return DebridPlaybackRef(url: url, service: .torBox, infoHash: "",
-                                             torrentId: nil, fileId: nil, fileIdx: fileIdx)
+                        return DebridPlaybackRef(url: url, service: .torBox, infoHash: "",
+                                                 torrentId: nil, fileId: nil, fileIdx: fileIdx,
+                                                 usenetRoute: .torBoxCloud)
+                    } catch { return nil }
                 }
                 group.addTask {
-                    try? await Task.sleep(for: DebridCoordinator.resolveTimeout)
+                    try? await Task.sleep(for: usenetResolveTimeout)
                     return nil   // timeout sentinel
                 }
                 let first = await group.next() ?? nil

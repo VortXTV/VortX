@@ -40,6 +40,8 @@ private enum UsenetNodeRoutingContractTests {
         let nzbs = UsenetStreamValidation.nzbURLs(singular: decoded.nzbUrl, plural: decoded.nzbUrls)
         let servers = UsenetStreamValidation.nntpServers(decoded.servers)
         check("production validation rejects credential-bearing NZB URLs and keeps NNTP credentials", nzbs.count == 2 && servers.count == 1)
+        check("production validation rejects host-only or malformed Node NNTP hints",
+              UsenetStreamValidation.nntpServers(["nntps://news.example", "nntps://u:p@news.example:563", "nntps://u:p@news.example:563/0"]).isEmpty)
         check("production validation preserves plural-only identity", UsenetStreamValidation.nzbURLs(singular: nil, plural: ["https://only.example/a.nzb"]) == ["https://only.example/a.nzb"])
         check("plural-only NZB plus infohash is Usenet, never both Usenet and torrent", UsenetStreamValidation.isUsenet(url: nil, singular: nil, plural: ["https://only.example/a.nzb"])
               && !UsenetStreamValidation.isTorrent(url: nil, infoHash: "abc", singular: nil, plural: ["https://only.example/a.nzb"]))
@@ -58,7 +60,8 @@ private enum UsenetNodeRoutingContractTests {
         check("resolver posts the Node NZB contract and never generic embedded", resolver.contains("StremioServer.usenetNodeBase")
               && resolver.contains("UsenetNodeClient.createStream") && nodeClient.contains("\"nzbUrls\": nzbURLs")
               && !resolver.contains("let base = StremioServer.embedded"))
-        check("add-on server ordering does not silently mix saved credentials", resolver.contains("if localServers.isEmpty, let credentials, credentials.isValid"))
+        check("add-on server order is tried before a sequential saved-provider fallback",
+              resolver.contains("UsenetRoutingPolicy.localAttempts") && resolver.contains("for attempt in attempts"))
         check("resolver returns Node redirect endpoint rather than raw NZB", resolver.contains("/nzb/stream?key="))
         check("coordinator supplies add-on mirrors and servers", coordinator.contains("nzbURLs: stream.usenetURLs, servers: stream.usenetServers"))
         check("explicit NZB playback has a typed result while auto retains optional resolution", coordinator.contains("enum ExplicitUsenetResolution")
