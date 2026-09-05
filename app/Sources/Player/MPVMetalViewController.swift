@@ -1332,8 +1332,20 @@ final class MPVMetalViewController: PlatformViewController {
         headers: [String: String]? = nil,
         live: Bool = false,
         audioSidecar: URL? = nil,
+        reusing loadToken: PlayerLoadToken? = nil
+    ) -> PlayerLoadToken {
+        loadFile(url, headers: headers, live: live, audioSidecar: audioSidecar,
+                 reusing: loadToken, preservingSeekEOFRecovery: false)
+    }
+
+    @discardableResult
+    private func loadFile(
+        _ url: URL,
+        headers: [String: String]? = nil,
+        live: Bool = false,
+        audioSidecar: URL? = nil,
         reusing loadToken: PlayerLoadToken? = nil,
-        preservingSeekEOFRecovery: Bool = false
+        preservingSeekEOFRecovery: Bool
     ) -> PlayerLoadToken {
         // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
         // including internal reloads, so a queued callback can never become valid again through token reuse.

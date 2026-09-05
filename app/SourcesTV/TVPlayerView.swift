@@ -6549,7 +6549,7 @@ struct TVPlayerView: View {
                         DiagnosticsLog.log(
                             "dv",
                             "remux terminal failure -> source hop (\(terminal.producedBytes)B output, "
-                                + "input=\(terminal.inputBytesRead.map(String.init) ?? \"-\"))"
+                                + "input=\(terminal.inputBytesRead.map(String.init) ?? "-"))"
                         )
                         if hopToNextSource(reason: "remux terminal failure") { return }
                         DiagnosticsLog.log("dv", "remux terminal failure had no source hop; demoting engine")
