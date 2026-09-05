@@ -5093,7 +5093,11 @@ struct iOSEpisodeStreams: View {
         if best.url == nil, episodeHint == nil {
             ref = nil
         } else {
-            ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: episodeHint)
+            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+                for: best, episode: episodeHint,
+                waitForLocalUsenetNode: best.isUsenet,
+                usenetResolveTimeout: best.isUsenet ? .seconds(35) : .seconds(5)
+            )
             guard !Task.isCancelled else { return nil }
         }
         guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
@@ -5236,7 +5240,11 @@ struct iOSEpisodeStreams: View {
             ref = nil
         } else {
             ref = await BoundedPreloadWorkPool.valueBeforeDeadline(preparationDeadline) {
-                await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: hint)
+                await DebridCoordinator.shared.resolvedPlaybackRef(
+                    for: best, episode: hint,
+                    waitForLocalUsenetNode: best.isUsenet,
+                    usenetResolveTimeout: best.isUsenet ? .seconds(35) : .seconds(5)
+                )
             } ?? nil
             guard !Task.isCancelled else { return nil }
         }

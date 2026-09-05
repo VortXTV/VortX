@@ -77,6 +77,13 @@ struct NextEpisodePreloadPolicy: Equatable {
         NextEpisodePreparationBudget.requestTimeout(addon: addon, wantedAddon: wantedAddon)
     }
 
+    /// NZBs are resolved by NNTP/cloud, not by a torrent info-hash cache. The caller still owns the
+    /// absolute preparation deadline; admitting an NZB must not remove the uncached-torrent gate.
+    static func shouldResolveCandidate(hasDirectURL: Bool, isUsenet: Bool,
+                                       hasCachedEpisodeTorrent: Bool) -> Bool {
+        hasDirectURL || isUsenet || hasCachedEpisodeTorrent
+    }
+
     private(set) var target: Target?
     private(set) var activeAttempt: Attempt?
     private(set) var ready = false

@@ -24,6 +24,7 @@ struct NextEpisodePreloadPolicyTests {
         creditsPreemptAnInFlightAttempt()
         timedOutAttemptCannotOwnThePolicyForever()
         requestTimeoutMatchesThePoolLease()
+        usenetPreparationIsNotGatedOnTorrentHashes()
         stickyProviderBudgetCoversMeasuredSettlement()
         delayedTorrentPrepareHonorsInvalidation()
         admittedTorrentPrepareIsNotRemoved()
@@ -54,6 +55,29 @@ struct NextEpisodePreloadPolicyTests {
 
     private static func target(_ generation: Int = 1) -> NextEpisodePreloadPolicy.Target {
         .init(episodeID: "tt-test:1:2", generation: generation)
+    }
+
+    private static func usenetPreparationIsNotGatedOnTorrentHashes() {
+        expect(NextEpisodePreloadPolicy.shouldResolveCandidate(
+            hasDirectURL: false, isUsenet: true, hasCachedEpisodeTorrent: false
+        ), "raw NZB preparation reaches local NNTP and cloud fallback without a torrent hash")
+        expect(!NextEpisodePreloadPolicy.shouldResolveCandidate(
+            hasDirectURL: false, isUsenet: false, hasCachedEpisodeTorrent: false
+        ), "uncached raw torrents keep their existing no-cloud-preparation gate")
+        expect(NextEpisodePreloadPolicy.shouldResolveCandidate(
+            hasDirectURL: false, isUsenet: false, hasCachedEpisodeTorrent: true
+        ), "confirmed cached episode torrents remain eligible")
+        expect(NextEpisodePreloadPolicy.shouldResolveCandidate(
+            hasDirectURL: true, isUsenet: false, hasCachedEpisodeTorrent: false
+        ), "direct episode links remain eligible")
+        do {
+            let player = try String(contentsOfFile: "app/SourcesTV/TVPlayerView.swift", encoding: .utf8)
+            expect(player.contains("NextEpisodePreloadPolicy.shouldResolveCandidate(")
+                && player.contains("isUsenet: candidate.isUsenet, hasCachedEpisodeTorrent: canResolveCached"),
+                "production tvOS preparation uses the tested Usenet admission policy")
+        } catch {
+            expect(false, "production tvOS preparation source can be read")
+        }
     }
 
     private static func tickStormIsBounded() {

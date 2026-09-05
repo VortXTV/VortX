@@ -8844,7 +8844,9 @@ struct TVPlayerView: View {
                             ref = nil
                         } else {
                             ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-                                for: candidate, episode: hint
+                                for: candidate, episode: hint,
+                                waitForLocalUsenetNode: candidate.isUsenet,
+                                usenetResolveTimeout: candidate.isUsenet ? .seconds(35) : .seconds(5)
                             )
                             guard episodeSwitchIsCurrent(
                                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
@@ -9417,7 +9419,10 @@ struct TVPlayerView: View {
             let ref: DebridPlaybackRef?
             let hash = candidate.infoHash?.lowercased()
             let canResolveCached = episode != nil && hash.map(effectiveCachedHashes.contains) == true
-            if candidate.url == nil, !canResolveCached {
+            if !NextEpisodePreloadPolicy.shouldResolveCandidate(
+                hasDirectURL: candidate.url != nil,
+                isUsenet: candidate.isUsenet, hasCachedEpisodeTorrent: canResolveCached
+            ) {
                 ref = nil
             } else {
                 ref = await Self.valueBeforePreloadDeadline(
@@ -9426,7 +9431,9 @@ struct TVPlayerView: View {
                     await DebridCoordinator.shared.resolvedPlaybackRef(
                         for: candidate,
                         episode: episode,
-                        confirmedCachedHashes: effectiveCachedHashes
+                        confirmedCachedHashes: effectiveCachedHashes,
+                        waitForLocalUsenetNode: candidate.isUsenet,
+                        usenetResolveTimeout: candidate.isUsenet ? .seconds(35) : .seconds(5)
                     )
                 } ?? nil
                 guard !Task.isCancelled else { return nil }
