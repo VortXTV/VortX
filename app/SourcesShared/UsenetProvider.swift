@@ -168,42 +168,22 @@ enum UsenetLocalResolver {
         guard !validNZBs.isEmpty, !localServers.isEmpty else { throw ResolveError.unavailable }
         let base = if waitForNode { await waitForNodeBase() } else { StremioServer.usenetNodeBase }
         guard let base else { throw ResolveError.unavailable }
-        guard let createURL = URL(string: "\(base)/nzb/create") else { throw ResolveError.unavailable }
-
-        let body: [String: Any] = [
-            "servers": localServers,
-            "nzbUrls": validNZBs,
-        ]
-        guard let payload = try? JSONSerialization.data(withJSONObject: body) else {
-            throw ResolveError.badResponse
-        }
-
-        var request = URLRequest(url: createURL)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = payload
-        request.timeoutInterval = requestTimeout
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = requestTimeout
         configuration.timeoutIntervalForResource = requestTimeout
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
 
-        let (data, response) = try await session.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200...299).contains(code) else { throw ResolveError.createFailed(code) }
-
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let key = object["key"] as? String, !key.isEmpty else {
-            throw ResolveError.badResponse
+        do {
+            return try await UsenetNodeClient.createStream(
+                base: base, nzbURLs: validNZBs, servers: localServers, session: session, timeout: requestTimeout
+            )
+        } catch let error as UsenetNodeClient.ClientError {
+            switch error {
+            case .createFailed(let code): throw ResolveError.createFailed(code)
+            case .badResponse: throw ResolveError.badResponse
+            }
         }
-        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
-        guard let streamURL = URL(string: "\(base)/nzb/stream?key=\(encodedKey)") else {
-            throw ResolveError.badResponse
-        }
-        return streamURL
         #endif
     }
 

@@ -29,6 +29,7 @@ private enum UsenetNodeRoutingContractTests {
         let bridge = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/CoreBridge.swift"), encoding: .utf8)
         let server = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/StremioServer.swift"), encoding: .utf8)
         let resolver = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/UsenetProvider.swift"), encoding: .utf8)
+        let nodeClient = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/UsenetNodeClient.swift"), encoding: .utf8)
         let coordinator = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/DebridResolver.swift"), encoding: .utf8)
 
         let json = #"{"nzbUrl":"https://one.example/show.nzb","nzbUrls":["https://two.example/show.nzb","https://user:secret@private.example/show.nzb","file:///not-an-nzb"],"servers":["nntps://user:secret@news.example:563/10","https://not-nntp.example"],"fileMustInclude":"S01E02"}"#
@@ -53,7 +54,8 @@ private enum UsenetNodeRoutingContractTests {
               && server.contains("if let port = NodeServer.discoveredPort")
               && server.contains("never guess 11470 while native is active"))
         check("resolver posts the Node NZB contract and never generic embedded", resolver.contains("StremioServer.usenetNodeBase")
-              && resolver.contains("\"nzbUrls\": validNZBs") && !resolver.contains("let base = StremioServer.embedded"))
+              && resolver.contains("UsenetNodeClient.createStream") && nodeClient.contains("\"nzbUrls\": nzbURLs")
+              && !resolver.contains("let base = StremioServer.embedded"))
         check("add-on server ordering does not silently mix saved credentials", resolver.contains("if localServers.isEmpty, let credentials, credentials.isValid"))
         check("resolver returns Node redirect endpoint rather than raw NZB", resolver.contains("/nzb/stream?key="))
         check("coordinator supplies add-on mirrors and servers", coordinator.contains("nzbURLs: stream.usenetURLs, servers: stream.usenetServers"))
