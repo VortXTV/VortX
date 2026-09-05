@@ -1500,7 +1500,7 @@ extension DebridCoordinator {
         // returns nil here with no network (only the at-most-once lazy warm hop), so a usenet row behaves
         // exactly as today (no playable link). NOT a torrent: the minted URL is a plain direct stream (no
         // infoHash carried).
-        if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
+        if stream.url == nil, let nzb = stream.usenetURLs.first {
             // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet provider, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
             // TorBox EXCEPT when TorBox already has this source confirmed-cached (an instant direct link that
@@ -1510,8 +1510,11 @@ extension DebridCoordinator {
             // "no resolver" nil. Compiled out on Lite (no embedded server), which stays TorBox-only.
             #if !VORTX_NO_EMBEDDED_SERVER
             let torBoxHasItCached = confirmedUsenetURLs?.contains(nzb) ?? false
-            if !torBoxHasItCached, let usenetCreds = UsenetProviderStore.loadCredentials() {
-                if let localURL = try? await UsenetLocalResolver.resolve(nzbUrl: nzb, credentials: usenetCreds) {
+            let usenetCreds = UsenetProviderStore.loadCredentials()
+            if !torBoxHasItCached, (!stream.usenetServers.isEmpty || usenetCreds != nil) {
+                if let localURL = try? await UsenetLocalResolver.resolve(
+                    nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds
+                ) {
                     DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
                     // A loopback stream: no infoHash / torrentId to carry (no reresolve fast path), and the
                     // service tag is inert here (the url alone drives playback), matching the usenet ref shape.

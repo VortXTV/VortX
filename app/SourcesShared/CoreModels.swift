@@ -1362,6 +1362,10 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// torrent swarm. All optional so a stream without them (every torrent/direct/YouTube source) still
     /// decodes byte-identically to before.
     let nzbUrl: String?
+    /// Add-ons may provide several NZB mirrors and their own NNTP server hints.  Keep these raw fields so
+    /// a stream can round-trip through CoreBridge; the computed accessors below validate before use.
+    let nzbUrls: [String]?
+    let servers: [String]?
     let fileMustInclude: String?
 
     /// VortX provenance marker: the server UUID string on a synthetic MEDIA-SERVER stream (Plex/Jellyfin/Emby),
@@ -1382,7 +1386,35 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
     /// account. Like a raw torrent, it needs resolution before it is playable, the usenet analogue of
     /// `isTorrent`. Kept mutually exclusive from `isTorrent` (which now also checks `nzbUrl == nil`) so a
     /// stream is classified as exactly one of torrent / usenet / direct.
-    var isUsenet: Bool { url == nil && (nzbUrl.map { !$0.isEmpty } ?? false) }
+    var isUsenet: Bool { url == nil && !usenetURLs.isEmpty }
+
+    /// Public HTTP(S) NZB descriptors only.  Reject malformed/non-web values before they can reach the
+    /// local resolver; preserve order and de-duplicate so an add-on's preferred mirror remains first.
+    var usenetURLs: [String] {
+        ([nzbUrl].compactMap { $0 } + (nzbUrls ?? [])).reduce(into: [String]()) { result, candidate in
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let parsed = URL(string: trimmed),
+                  let scheme = parsed.scheme?.lowercased(),
+                  (scheme == "http" || scheme == "https"),
+                  parsed.host?.isEmpty == false,
+                  !result.contains(trimmed) else { return }
+            result.append(trimmed)
+        }
+    }
+
+    /// NNTP endpoints from an add-on are kept only when they are syntactically safe NNTP(S) URLs.  They
+    /// can carry provider credentials, therefore they are never logged or persisted outside engine state.
+    var usenetServers: [String] {
+        (servers ?? []).reduce(into: [String]()) { result, candidate in
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let parsed = URL(string: trimmed),
+                  let scheme = parsed.scheme?.lowercased(),
+                  (scheme == "nntp" || scheme == "nntps"),
+                  parsed.host?.isEmpty == false,
+                  !result.contains(trimmed) else { return }
+            result.append(trimmed)
+        }
+    }
 
     /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
     /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
@@ -1418,8 +1450,11 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
         // property). Neither configured -> nil, the pre-usenet behavior. Deliberately NOT behind the torrents
         // gate: the TorBox path resolves to a remote link (Lite plays it); the built-in path is full-target
         // only and gated inside `canResolveUsenet`.
-        if isUsenet, DebridPlaybackAvailability.shared.canResolveUsenet,
-           let nzb = nzbUrl, let parsed = URL(string: nzb) {
+        if isUsenet,
+           (DebridPlaybackAvailability.shared.canResolveUsenetRemotely
+                || (StremioServer.usenetNodeBase != nil
+                    && (UsenetProviderStore.isConfigured || !usenetServers.isEmpty))),
+           let nzb = usenetURLs.first, let parsed = URL(string: nzb) {
             return parsed
         }
         if let ytId, !ytId.isEmpty {

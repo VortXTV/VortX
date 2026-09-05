@@ -36,4 +36,11 @@ final class DebridPlaybackAvailability: @unchecked Sendable {
             #endif
         }
     }
+
+    /// TorBox is the only NZB path that remains usable without the local Node server (Lite and native-server
+    /// mode).  Surface it separately so a configured local provider never makes an NZB row look playable
+    /// when the Node-only `/nzb/create` route is unavailable.
+    var canResolveUsenetRemotely: Bool {
+        lock.withLock { torBoxConfigured }
+    }
 }

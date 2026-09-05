@@ -138,6 +138,10 @@ enum NodeServer {
     /// True when start/restart would spawn the native engine (flag ON and the binary bundled).
     private static var usingNativeServer: Bool { nativeServerEnabled && nativeServerBinary != nil }
 
+    /// Exposed only for protocol routing.  `/nzb/create` is implemented by bundled server.js, not the
+    /// native torrent server, so callers must fail locally rather than POST provider credentials to it.
+    static var isUsingNativeServer: Bool { usingNativeServer }
+
     /// Locate an ffmpeg/ffprobe pair the server can use for VideoToolbox transcoding. server.js
     /// searches a fixed set of paths but NOT Homebrew's Apple-silicon prefix (/opt/homebrew/bin),
     /// so on most Macs it finds nothing and transcoding silently no-ops. We probe the common

@@ -2786,6 +2786,8 @@ final class CoreBridge: ObservableObject {
         if let name = s.name { raw["name"] = name }
         if let desc = s.description { raw["description"] = desc }
         if let nzb = s.nzbUrl { raw["nzbUrl"] = nzb }
+        if let nzbs = s.nzbUrls { raw["nzbUrls"] = nzbs }
+        if let servers = s.servers { raw["servers"] = servers }
         if let include = s.fileMustInclude { raw["fileMustInclude"] = include }
         return raw
     }
@@ -2811,8 +2813,10 @@ final class CoreBridge: ObservableObject {
                 isEpisode: isEpisode
             )
         }
-        if let nzb = stream.nzbUrl {
-            guard raw["nzbUrl"] as? String == nzb else { return false }
+        if stream.isUsenet {
+            if let nzb = stream.nzbUrl, raw["nzbUrl"] as? String != nzb { return false }
+            if let nzbs = stream.nzbUrls, raw["nzbUrls"] as? [String] != nzbs { return false }
+            if let servers = stream.servers, raw["servers"] as? [String] != servers { return false }
             if let include = stream.fileMustInclude {
                 return raw["fileMustInclude"] as? String == include
             }

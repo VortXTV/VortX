@@ -23,6 +23,22 @@ enum StremioServer {
     }
     /// The on-device server base. Used unless the user points at a remote/dedicated server.
     static var embedded: String { "http://127.0.0.1:\(embeddedPort)" }
+
+    /// The Node-only loopback endpoint that implements the NZB control contract.  This is deliberately
+    /// separate from `embedded`: the optional native torrent server can publish an embedded port too, but
+    /// it does not implement `/nzb/create`.  NZB credentials must consequently never be posted through the
+    /// generic embedded endpoint.  The returned port follows nodejs-mobile's discovered port on iOS/tvOS.
+    static var usenetNodeBase: String? {
+        #if VORTX_NO_EMBEDDED_SERVER
+        return nil
+        #elseif os(macOS)
+        guard !NodeServer.isUsingNativeServer else { return nil }
+        return "http://127.0.0.1:11470"
+        #else
+        guard VortxNativeServer.publishedPort == nil else { return nil }
+        return "http://127.0.0.1:\(NodeServer.discoveredPort ?? 11470)"
+        #endif
+    }
     private static let urlKey = "stremiox.serverURL"
 
     /// The active streaming-server base, the user's custom URL if set, else the embedded one.

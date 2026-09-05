@@ -137,20 +137,35 @@ enum UsenetLocalResolver {
     static let requestTimeout: TimeInterval = 20
 
     /// Resolve `nzbUrl` to a loopback stream URL, or throw. The nntp URL (carrying the user's provider
-    /// password) is POSTed ONLY to `StremioServer.embedded` (127.0.0.1) - deliberately never
-    /// `StremioServer.base`, which can be a remote server the password must never reach - and is never logged.
+    /// password) is POSTed ONLY to `StremioServer.usenetNodeBase` (the local Node server) - deliberately
+    /// never `StremioServer.base` or the generic embedded/native endpoint - and is never logged.
     static func resolve(nzbUrl: String, credentials: UsenetProviderCredentials) async throws -> URL {
+        try await resolve(nzbURLs: [nzbUrl], servers: [], credentials: credentials)
+    }
+
+    /// Submit validated add-on mirrors and NNTP hints to Node's NZB control endpoint.  A saved VortX
+    /// provider is appended when present; add-on credentials are never copied into preferences or logs.
+    static func resolve(nzbURLs: [String], servers: [String],
+                        credentials: UsenetProviderCredentials? = nil) async throws -> URL {
         #if VORTX_NO_EMBEDDED_SERVER
         throw ResolveError.unavailable
         #else
-        guard credentials.isValid else { throw ResolveError.unavailable }
-        // 127.0.0.1 ONLY. Never StremioServer.base (may be a custom/remote server).
-        let base = StremioServer.embedded
+        let validNZBs = nzbURLs.filter { value in
+            guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
+            return (scheme == "http" || scheme == "https") && url.host?.isEmpty == false
+        }
+        var localServers = servers.filter { value in
+            guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
+            return (scheme == "nntp" || scheme == "nntps") && url.host?.isEmpty == false
+        }
+        if let credentials, credentials.isValid { localServers.append(credentials.nntpServerURL) }
+        guard !validNZBs.isEmpty, !localServers.isEmpty,
+              let base = StremioServer.usenetNodeBase else { throw ResolveError.unavailable }
         guard let createURL = URL(string: "\(base)/nzb/create") else { throw ResolveError.unavailable }
 
         let body: [String: Any] = [
-            "servers": [credentials.nntpServerURL],
-            "nzbUrl": nzbUrl,
+            "servers": localServers,
+            "nzbUrls": validNZBs,
         ]
         guard let payload = try? JSONSerialization.data(withJSONObject: body) else {
             throw ResolveError.badResponse
