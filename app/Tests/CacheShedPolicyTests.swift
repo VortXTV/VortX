@@ -556,6 +556,16 @@ rapidSameSource.begin(owner: 41, target: 631.53, wasPaused: true, duration: 1398
 check("seek EOF: a real source reset clears same-source ambiguity",
       rapidSameSource.current?.inheritedUnsettledSeekAmbiguity == false)
 
+var directReplacement = SeekEOFRecoveryPolicy<Int>()
+directReplacement.begin(owner: 40, target: 300, wasPaused: true, duration: 1398.08, origin: .viewer, now: 402)
+directReplacement.begin(owner: 40, target: 631.53, wasPaused: true, duration: 1398.08, origin: .cacheReanchor, now: 402.01)
+_ = directReplacement.observeSeek(owner: 40)
+directReplacement.observePosition(owner: 40, position: 300)
+check("seek EOF: direct cache begin cannot inherit an older viewer seek's callbacks",
+      directReplacement.current?.phase == .awaitingSeekEvent
+        && !directReplacement.shouldRecoverEOF(owner: 40, now: 402.02)
+        && directReplacement.shouldRejectUnprovenEOF(owner: 40, now: 402.02))
+
 var transportEOF = SeekEOFRecoveryPolicy<Int>()
 transportEOF.begin(owner: 10, target: 631.53, wasPaused: true, duration: 1398.08, origin: .viewer, now: 300)
 _ = transportEOF.observeSeek(owner: 10)

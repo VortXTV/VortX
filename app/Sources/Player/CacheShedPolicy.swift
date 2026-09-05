@@ -245,11 +245,12 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         guard target.isFinite, target >= 0, now.isFinite else { current = nil; return }
         precondition(nextTransportGeneration < UInt64.max)
         nextTransportGeneration += 1
+        let inheritedAmbiguity = pendingUnsettledSeekAmbiguity || current != nil
         current = Intent(owner: owner, target: target, wasPaused: wasPaused,
                          transportGeneration: nextTransportGeneration,
                          durationAtIssue: duration.isFinite && duration > 0 ? duration : nil,
                          positionAfterSeek: nil,
-                         inheritedUnsettledSeekAmbiguity: pendingUnsettledSeekAmbiguity,
+                         inheritedUnsettledSeekAmbiguity: inheritedAmbiguity,
                          issuedAt: now, origin: origin, phase: .awaitingSeekEvent)
         pendingUnsettledSeekAmbiguity = false
     }
