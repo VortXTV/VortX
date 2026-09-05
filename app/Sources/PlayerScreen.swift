@@ -3116,8 +3116,14 @@ struct PlayerScreen: View {
         }
         let retryRef = pendingAdvance?.debridRef ?? curDebridRef
         let retryMeta = pendingAdvance?.meta ?? curMeta
+        let retrySource = currentStream
         guard !nativeDebridFreshLinkRecovery.freshLinkUsed,
-              let ref = retryRef, !ref.infoHash.isEmpty else { return false }
+              let ref = retryRef else { return false }
+        let isUsenetRecovery = ref.usenetRoute != nil && retrySource?.isUsenet == true
+        guard !ref.infoHash.isEmpty || isUsenetRecovery else { return false }
+        // Only a route receipt for this exact mounted NZB may authorize same-source Usenet failover.
+        // A bare loopback URL or an unrelated old NZB descriptor is not recovery provenance.
+        if isUsenetRecovery, ref.url != curURL { return false }
         let episodeHint: DebridEpisode? = retryMeta.flatMap { meta -> DebridEpisode? in
             guard let season = meta.season, season >= 0,
                   let episode = meta.episode, episode > 0 else { return nil }
@@ -3132,7 +3138,6 @@ struct PlayerScreen: View {
         let generation = resumeRetryGeneration
         let targetVideoID = retryMeta?.videoId
         let retryURL = curURL
-        let retrySource = currentStream
         guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }
         let retryResume = retryResumeTarget()
         let pausedIntent = isPaused
@@ -3150,16 +3155,28 @@ struct PlayerScreen: View {
         // Fresh load state + in-place retry budget for a clean attempt at the SAME source; keep the resume offset.
         autoRetryCount = 0; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; bufferedTime = 0
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
-        reconnectMsg = "Reloading your source…"; withAnimation { reconnecting = true }
+        reconnectMsg = isUsenetRecovery ? "Trying another Usenet route…" : "Reloading your source…"
+        withAnimation { reconnecting = true }
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
             // Every exit, including task cancellation and a stale provider completion, retires only this
             // transaction. A later recovery has a distinct generation and is left untouched.
             defer { _ = nativeDebridFreshLinkRecovery.retireFreshLinkIfOwned(by: recoveryGeneration) }
-            let fresh = try? await DebridCoordinator.shared.reresolve(
-                service: ref.service, infoHash: ref.infoHash,
-                torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
-                episode: episodeHint, requiresSemanticSelection: retryRequiresSemanticSelection)
+            let resolvedRef: DebridPlaybackRef?
+            if isUsenetRecovery, let retrySource {
+                resolvedRef = try? await DebridCoordinator.shared.recoverUsenetPlayback(
+                    for: retrySource, previous: ref, episode: episodeHint
+                )
+            } else {
+                let fresh = try? await DebridCoordinator.shared.reresolve(
+                    service: ref.service, infoHash: ref.infoHash,
+                    torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
+                    episode: episodeHint, requiresSemanticSelection: retryRequiresSemanticSelection)
+                resolvedRef = fresh.map {
+                    DebridPlaybackRef(url: $0, service: ref.service, infoHash: ref.infoHash,
+                                      torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx)
+                }
+            }
             let activeMeta = pendingAdvance?.meta ?? curMeta
             let activeRef = pendingAdvance?.debridRef ?? curDebridRef
             guard !Task.isCancelled,
@@ -3175,17 +3192,14 @@ struct PlayerScreen: View {
                 ownedBy: recoveryGeneration
             ) else { return }
             let joinedEngine = completion.requestedEngine
-            if let fresh {
+            if let freshRef = resolvedRef {
+                let fresh = freshRef.url
                 srcProbe("native debrid: accepted fresh same-source link reason=\(reason)")
                 reconnecting = false
                 curURL = fresh
                 // A replacement comes from the debrid provider, not the original add-on host. Never send an
                 // add-on's origin-scoped credentials to that new provider URL.
                 curHeaders = nil
-                let freshRef = DebridPlaybackRef(
-                    url: fresh, service: ref.service, infoHash: ref.infoHash,
-                    torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx
-                )
                 if pendingAdvance != nil {
                     pendingAdvance?.url = fresh
                     pendingAdvance?.debridRef = freshRef

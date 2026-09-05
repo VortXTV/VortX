@@ -42,6 +42,11 @@ private enum UsenetNodeRoutingContractTests {
         check("production validation rejects credential-bearing NZB URLs and keeps NNTP credentials", nzbs.count == 2 && servers.count == 1)
         check("production validation rejects host-only or malformed Node NNTP hints",
               UsenetStreamValidation.nntpServers(["nntps://news.example", "nntps://u:p@news.example:563", "nntps://u:p@news.example:563/0"]).isEmpty)
+        check("Node TLS scheme and credential delimiters are canonicalized without changing credentials",
+              UsenetStreamValidation.nntpServers(["NNTPS://u:p%3Aa%40b@NEWS.example:563/4"])
+                == ["nntps://u:p%3Aa%40b@news.example:563/4"])
+        check("unsupported Node IPv6 host does not reach the parser",
+              UsenetStreamValidation.nntpServers(["nntps://u:p@[::1]:563/4"]).isEmpty)
         check("production validation preserves plural-only identity", UsenetStreamValidation.nzbURLs(singular: nil, plural: ["https://only.example/a.nzb"]) == ["https://only.example/a.nzb"])
         check("plural-only NZB plus infohash is Usenet, never both Usenet and torrent", UsenetStreamValidation.isUsenet(url: nil, singular: nil, plural: ["https://only.example/a.nzb"])
               && !UsenetStreamValidation.isTorrent(url: nil, infoHash: "abc", singular: nil, plural: ["https://only.example/a.nzb"]))
@@ -61,7 +66,17 @@ private enum UsenetNodeRoutingContractTests {
               && resolver.contains("UsenetNodeClient.createStream") && nodeClient.contains("\"nzbUrls\": nzbURLs")
               && !resolver.contains("let base = StremioServer.embedded"))
         check("add-on server order is tried before a sequential saved-provider fallback",
-              resolver.contains("UsenetRoutingPolicy.localAttempts") && resolver.contains("for attempt in attempts"))
+              resolver.contains("UsenetRoutingPolicy.localAttempts") && resolver.contains("UsenetRoutingPolicy.firstSuccessful(attempts"))
+        check("local Node work is leased to its credential authority", coordinator.contains("runProvider(capture: usenetCapture, revision: usenetRevision)")
+              && coordinator.contains("guard isCurrent(usenetCapture, revision: usenetRevision) else { return nil }"))
+        for path in ["app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift"] {
+            let player = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+            check("\(path) uses the current NZB route for bounded recovery",
+                  player.contains("ref.usenetRoute != nil && retrySource?.isUsenet == true")
+                    && player.contains("ref.url != curURL { return false }")
+                    && player.contains("DebridCoordinator.shared.recoverUsenetPlayback(")
+                    && player.contains("if let freshRef = resolvedRef"))
+        }
         check("resolver returns Node redirect endpoint rather than raw NZB", resolver.contains("/nzb/stream?key="))
         check("coordinator supplies add-on mirrors and servers", coordinator.contains("nzbURLs: stream.usenetURLs, servers: stream.usenetServers"))
         check("explicit NZB playback has a typed result while auto retains optional resolution", coordinator.contains("enum ExplicitUsenetResolution")

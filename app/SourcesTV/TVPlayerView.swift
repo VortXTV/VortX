@@ -6826,8 +6826,13 @@ struct TVPlayerView: View {
         }
         let retryRef = pendingAdvance?.debridRef ?? curDebridRef
         let retryMeta = pendingAdvance?.meta ?? curMeta
+        let retrySource = curSourceStream
         guard !nativeDebridFreshLinkRecovery.freshLinkUsed,
-              let ref = retryRef, !ref.infoHash.isEmpty else { return false }
+              let ref = retryRef else { return false }
+        let isUsenetRecovery = ref.usenetRoute != nil && retrySource?.isUsenet == true
+        guard !ref.infoHash.isEmpty || isUsenetRecovery else { return false }
+        // Do not infer NNTP provenance from a loopback hostname or reuse an outgoing episode's route.
+        if isUsenetRecovery, ref.url != curURL { return false }
         let hint = episodeHint(for: retryMeta)
         let retryRequiresSemanticSelection = isEpisodePlaybackContext
         let hasExactProviderIDs = ref.service == .torBox && ref.torrentId != nil && ref.fileId != nil
@@ -6838,7 +6843,6 @@ struct TVPlayerView: View {
         let generation = resumeRetryGeneration
         let targetVideoID = retryMeta?.videoId
         let retryURL = curURL
-        let retrySource = curSourceStream
         let retryToken = coordinator.player?.activeLoadToken
         let retryEpisodeGeneration = episodeSwitchGeneration
         let retrySourceGeneration = sourceSwitchGeneration
@@ -6857,10 +6861,21 @@ struct TVPlayerView: View {
             // must retire only THIS request. Otherwise a late first frame can cancel this task and strand the
             // source forever in an in-flight state that all later recovery/engine-switch attempts merely join.
             defer { _ = nativeDebridFreshLinkRecovery.retireFreshLink(ownedBy: recoveryID) }
-            let fresh = try? await DebridCoordinator.shared.reresolve(
-                service: ref.service, infoHash: ref.infoHash,
-                torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
-                episode: hint, requiresSemanticSelection: retryRequiresSemanticSelection)
+            let resolvedRef: DebridPlaybackRef?
+            if isUsenetRecovery, let retrySource {
+                resolvedRef = try? await DebridCoordinator.shared.recoverUsenetPlayback(
+                    for: retrySource, previous: ref, episode: hint
+                )
+            } else {
+                let fresh = try? await DebridCoordinator.shared.reresolve(
+                    service: ref.service, infoHash: ref.infoHash,
+                    torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx,
+                    episode: hint, requiresSemanticSelection: retryRequiresSemanticSelection)
+                resolvedRef = fresh.map {
+                    DebridPlaybackRef(url: $0, service: ref.service, infoHash: ref.infoHash,
+                                      torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx)
+                }
+            }
             let activeMeta = pendingAdvance?.meta ?? curMeta
             let activeRef = pendingAdvance?.debridRef ?? curDebridRef
             guard !Task.isCancelled, !leftPlayback,
@@ -6875,7 +6890,8 @@ struct TVPlayerView: View {
             guard let recoveryCompletion = nativeDebridFreshLinkRecovery.finishFreshLink(ownedBy: recoveryID) else {
                 return
             }
-            if let fresh {
+            if let freshRef = resolvedRef {
+                let fresh = freshRef.url
                 DiagnosticsLog.log("player", "native-debrid fresh-link accepted service=\(ref.service) reason=\(safeFailureClass(reason)) generation=\(generation)")
                 reconnecting = false
                 curURL = fresh
@@ -6883,10 +6899,6 @@ struct TVPlayerView: View {
                 // contain credentials scoped to a different origin, and DebridCoordinator currently returns no
                 // provider-scoped replacement headers. Never forward those credentials across this handoff.
                 curHeaders = nil
-                let freshRef = DebridPlaybackRef(
-                    url: fresh, service: ref.service, infoHash: ref.infoHash,
-                    torrentId: ref.torrentId, fileId: ref.fileId, fileIdx: ref.fileIdx
-                )
                 if pendingAdvance != nil {
                     pendingAdvance?.url = fresh
                     pendingAdvance?.debridRef = freshRef

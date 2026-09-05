@@ -175,7 +175,9 @@ enum UsenetLocalResolver {
                 && url.user == nil && url.password == nil
         }
         let addonServers = UsenetStreamValidation.nntpServers(servers)
-        let savedServer = credentials?.isValid == true ? credentials?.nntpServerURL : nil
+        let savedServer = credentials.flatMap { provider in
+            provider.isValid ? UsenetStreamValidation.nntpServers([provider.nntpServerURL]).first : nil
+        }
         let attempts = UsenetRoutingPolicy.localAttempts(addonServers: addonServers, savedServer: savedServer,
                                                          excluding: excluding)
         guard !validNZBs.isEmpty, !attempts.isEmpty else { throw ResolveError.unavailable }
@@ -187,30 +189,15 @@ enum UsenetLocalResolver {
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
 
-        var lastError: ResolveError = .unavailable
-        for attempt in attempts {
-            try Task.checkCancellation()
-            do {
-                let url = try await UsenetNodeClient.createStream(
-                    base: base, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout
-                )
-                try Task.checkCancellation()
-                return RoutedStream(url: url, route: attempt.route)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch let error as UsenetNodeClient.ClientError {
-                switch error {
-                case .createFailed(let code): lastError = .createFailed(code)
-                case .badResponse: lastError = .badResponse
-                }
-            } catch {
-                // A local transport loss is a failed create too.  Check cancellation first so a superseded
-                // session can never convert a cancelled add-on request into a saved-account attempt.
-                try Task.checkCancellation()
-                lastError = .badResponse
-            }
+        // This is the same serial/cancellation policy exercised by the injected transport regression test.
+        guard let (route, url) = try await UsenetRoutingPolicy.firstSuccessful(attempts, create: { attempt in
+            try await UsenetNodeClient.createStream(
+                base: base, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout
+            )
+        }) else {
+            throw ResolveError.badResponse
         }
-        throw lastError
+        return RoutedStream(url: url, route: route)
         #endif
     }
 

@@ -1573,6 +1573,9 @@ extension DebridCoordinator {
         if stream.url == nil,
            let nzb = stream.usenetURLs.first(where: { confirmedUsenetURLs?.contains($0) == true })
                 ?? stream.usenetURLs.first {
+            await warmIfNeeded()
+            guard !Task.isCancelled, let usenetCapture = currentAuthorityCapture() else { return nil }
+            let usenetRevision = latestCredentialRevision
             // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet provider, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
             // TorBox EXCEPT when TorBox already has this source confirmed-cached (an instant direct link that
@@ -1585,11 +1588,15 @@ extension DebridCoordinator {
             let usenetCreds = UsenetProviderStore.loadCredentials()
             if !torBoxHasItCached, (!stream.usenetServers.isEmpty || usenetCreds != nil) {
                 do {
-                    if let local = try await UsenetLocalResolver.resolveRouted(
-                        nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds,
-                        waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes
-                    ) {
-                    DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
+                    let local = try await runProvider(capture: usenetCapture, revision: usenetRevision) {
+                        try await UsenetLocalResolver.resolveRouted(
+                            nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds,
+                            waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes
+                        )
+                    }
+                    guard isCurrent(usenetCapture, revision: usenetRevision) else { return nil }
+                    if let local {
+                        DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
                     // A loopback stream: no infoHash / torrentId to carry (no reresolve fast path), and the
                     // service tag is inert here (the url alone drives playback), matching the usenet ref shape.
                     return DebridPlaybackRef(url: local.url, service: .torBox, infoHash: "",
@@ -1598,11 +1605,15 @@ extension DebridCoordinator {
                     }
                 } catch is CancellationError {
                     return nil
+                } catch {
+                    guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision),
+                          (error as? DebridError) != .sessionChanged else { return nil }
                 }
                 DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP unavailable -> trying TorBox usenet path")
             }
             #endif
-            guard !excludingUsenetRoutes.contains(.torBoxCloud), await hasUsenetResolver else { return nil }
+            guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision),
+                  !excludingUsenetRoutes.contains(.torBoxCloud), await hasUsenetResolver else { return nil }
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
             // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.

@@ -29,10 +29,6 @@ enum UsenetRoutingPolicy {
         return attempts
     }
 
-    static func remaining(after route: DebridUsenetRoute?) -> [DebridUsenetRoute] {
-        DebridUsenetRoute.allCases.filter { $0 != route }
-    }
-
     /// Testable sequential transport seam. A cancelled task is never converted into the next provider
     /// attempt; every other create failure is allowed to advance exactly one route.
     static func firstSuccessful<T: Sendable>(_ attempts: [LocalAttempt],
@@ -59,6 +55,5 @@ enum UsenetRoutingPolicy {
         return a.scheme?.lowercased() == b.scheme?.lowercased()
             && a.host?.lowercased() == b.host?.lowercased()
             && a.port == b.port && a.user == b.user && a.password == b.password
-            && a.path == b.path
     }
 }
