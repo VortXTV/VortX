@@ -216,18 +216,25 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     struct Intent: Equatable {
         var owner: Owner
         let target: Double
-        let wasPaused: Bool
+        /// Latest explicit viewer transport intent. The recovery itself temporarily parks output, but must
+        /// never overwrite a Play/Pause request made while the reopen is in flight.
+        var wasPaused: Bool
+        let transportGeneration: UInt64
         let issuedAt: TimeInterval
         let origin: Origin
         var phase: Phase
     }
 
     private(set) var current: Intent?
+    private var nextTransportGeneration: UInt64 = 0
 
     mutating func begin(owner: Owner, target: Double, wasPaused: Bool,
                         origin: Origin, now: TimeInterval) {
         guard target.isFinite, target >= 0, now.isFinite else { current = nil; return }
+        precondition(nextTransportGeneration < UInt64.max)
+        nextTransportGeneration += 1
         current = Intent(owner: owner, target: target, wasPaused: wasPaused,
+                         transportGeneration: nextTransportGeneration,
                          issuedAt: now, origin: origin, phase: .awaitingSeekEvent)
     }
 
@@ -248,17 +255,40 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         }
     }
 
-    /// Accept only the diagnosed shape: same source, observed seek, finite VOD, mid-file target, and
-    /// immediate adjacency. The duration/target guard preserves genuine EOF and leaves unknown-duration
-    /// sources entirely on the normal terminal path.
-    func shouldRecoverEOF(owner: Owner, duration: Double, now: TimeInterval,
+    /// Accept only the diagnosed shape: same source, observed seek, finite VOD, mid-file target, a fresh
+    /// readback at that target, and immediate adjacency. The target readback is essential because libmpv's
+    /// SEEK event contains no command id; an old queued seek event alone cannot nominate this command.
+    /// The duration/target guard preserves genuine EOF and leaves unknown-duration sources entirely normal.
+    func shouldRecoverEOF(owner: Owner, duration: Double, position: Double, now: TimeInterval,
                           minimumDistanceFromEnd: Double = 8,
+                          targetTolerance: Double = 2,
                           maximumAdjacency: TimeInterval = 5) -> Bool {
         guard let intent = current, intent.owner == owner, intent.phase == .seekObserved,
-              duration.isFinite, duration > 0, now.isFinite,
+              duration.isFinite, duration > 0, position.isFinite, now.isFinite,
               minimumDistanceFromEnd.isFinite, minimumDistanceFromEnd > 0,
+              targetTolerance.isFinite, targetTolerance >= 0,
               maximumAdjacency.isFinite, maximumAdjacency > 0 else { return false }
         return intent.target < duration - minimumDistanceFromEnd
+            && abs(position - intent.target) <= targetTolerance
+            && now >= intent.issuedAt
+            && now - intent.issuedAt <= maximumAdjacency
+    }
+
+    /// A command accepted for the exact current mid-file target is still not a successful seek. If libmpv
+    /// terminalizes before it emits SEEK, fail closed as a recoverable player error instead of forwarding EOF
+    /// to watched/advance. This deliberately does not retry: without the event boundary there is insufficient
+    /// evidence to reopen safely.
+    func shouldRejectUnprovenEOF(owner: Owner, duration: Double, position: Double, now: TimeInterval,
+                                 minimumDistanceFromEnd: Double = 8,
+                                 targetTolerance: Double = 2,
+                                 maximumAdjacency: TimeInterval = 5) -> Bool {
+        guard let intent = current, intent.owner == owner, intent.phase == .awaitingSeekEvent,
+              duration.isFinite, duration > 0, position.isFinite, now.isFinite,
+              minimumDistanceFromEnd.isFinite, minimumDistanceFromEnd > 0,
+              targetTolerance.isFinite, targetTolerance >= 0,
+              maximumAdjacency.isFinite, maximumAdjacency > 0 else { return false }
+        return intent.target < duration - minimumDistanceFromEnd
+            && abs(position - intent.target) <= targetTolerance
             && now >= intent.issuedAt
             && now - intent.issuedAt <= maximumAdjacency
     }
@@ -301,6 +331,34 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         switch intent.phase {
         case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition: return true
         default: return false
+        }
+    }
+
+    /// Accept a viewer transport action while recovery has intentionally forced mpv paused. The generation is
+    /// monotonic per recovery request, and the owner fence prevents a late control action from an old source
+    /// changing a newer reload's eventual completion state.
+    mutating func updateTransportIntent(owner: Owner, paused: Bool) -> UInt64? {
+        guard var intent = current, intent.owner == owner else { return nil }
+        switch intent.phase {
+        case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition:
+            intent.wasPaused = paused
+            current = intent
+            return intent.transportGeneration
+        default:
+            return nil
+        }
+    }
+
+    /// An explicit new seek supersedes a forced-pause recovery. Return its latest intent so the controller can
+    /// restore it before issuing the new seek; otherwise the new seek inherits the recovery's temporary pause.
+    mutating func supersedeReload() -> Intent? {
+        guard let intent = current else { return nil }
+        switch intent.phase {
+        case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition:
+            current = nil
+            return intent
+        default:
+            return nil
         }
     }
 

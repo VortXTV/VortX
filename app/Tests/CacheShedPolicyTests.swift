@@ -512,16 +512,21 @@ check("single-flight: two helper instances have independent gates",
 var seekEOF = SeekEOFRecoveryPolicy<Int>()
 seekEOF.begin(owner: 1, target: 631.53, wasPaused: true, origin: .viewer, now: 100)
 check("seek EOF: an accepted manual backseek alone cannot suppress EOF",
-      !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, now: 100.05))
+      !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, position: 631.53, now: 100.05))
+check("seek EOF: accepted current mid-file target without SEEK is recoverable error, never completion",
+      seekEOF.shouldRejectUnprovenEOF(owner: 1, duration: 1398.08, position: 631.53, now: 100.05)
+        && !seekEOF.shouldRejectUnprovenEOF(owner: 1, duration: 1398.08, position: 900, now: 100.05))
 check("seek EOF: only the same source can observe the seek boundary",
       seekEOF.observeSeek(owner: 2) == nil && seekEOF.current?.phase == .awaitingSeekEvent)
 check("seek EOF: observed manual backseek EOF is recoverable mid-file",
       seekEOF.observeSeek(owner: 1) == .seekObserved
-        && seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, now: 100.05))
+        && seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, position: 631.53, now: 100.05))
+check("seek EOF: an old queued seek event without this target's readback remains terminal",
+      !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, position: 900, now: 100.05))
 let manualIntent = seekEOF.consumeEOFForReload(owner: 1)
 check("seek EOF: one recovery consumes the original terminal candidate",
       manualIntent?.target == 631.53 && seekEOF.current?.phase == .awaitingReloadFile
-        && !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, now: 100.06))
+        && !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, position: 631.53, now: 100.06))
 check("seek EOF: reload owner is a fresh token and must restore target position before success",
       seekEOF.adoptReload(owner: 3)?.owner == 3
         && seekEOF.beginReloadSeek(owner: 3)?.phase == .awaitingReloadSeekEvent
@@ -530,24 +535,55 @@ check("seek EOF: reload owner is a fresh token and must restore target position 
         && seekEOF.completeReloadAtPosition(owner: 3, position: 631.53)?.wasPaused == true
         && seekEOF.current == nil)
 
+var transportEOF = SeekEOFRecoveryPolicy<Int>()
+transportEOF.begin(owner: 10, target: 631.53, wasPaused: true, origin: .viewer, now: 300)
+_ = transportEOF.observeSeek(owner: 10)
+_ = transportEOF.consumeEOFForReload(owner: 10)
+_ = transportEOF.adoptReload(owner: 11)
+check("seek EOF transport: Play during a paused recovery becomes the completion intent",
+      transportEOF.updateTransportIntent(owner: 11, paused: false) != nil
+        && transportEOF.beginReloadSeek(owner: 11) != nil
+        && transportEOF.observeSeek(owner: 11) == .awaitingReloadPosition
+        && transportEOF.completeReloadAtPosition(owner: 11, position: 631.53)?.wasPaused == false)
+
+transportEOF.begin(owner: 12, target: 631.53, wasPaused: false, origin: .viewer, now: 310)
+_ = transportEOF.observeSeek(owner: 12)
+_ = transportEOF.consumeEOFForReload(owner: 12)
+_ = transportEOF.adoptReload(owner: 13)
+check("seek EOF transport: Pause during a playing recovery becomes the completion intent",
+      transportEOF.updateTransportIntent(owner: 13, paused: true) != nil
+        && transportEOF.beginReloadSeek(owner: 13) != nil
+        && transportEOF.observeSeek(owner: 13) == .awaitingReloadPosition
+        && transportEOF.completeReloadAtPosition(owner: 13, position: 631.53)?.wasPaused == true)
+
+transportEOF.begin(owner: 14, target: 631.53, wasPaused: false, origin: .viewer, now: 320)
+_ = transportEOF.observeSeek(owner: 14)
+_ = transportEOF.consumeEOFForReload(owner: 14)
+_ = transportEOF.adoptReload(owner: 15)
+_ = transportEOF.updateTransportIntent(owner: 15, paused: false)
+check("seek EOF transport: a manual seek can supersede forced pause and stale completion is fenced",
+      transportEOF.supersedeReload()?.wasPaused == false
+        && transportEOF.current == nil
+        && transportEOF.completeReloadAtPosition(owner: 15, position: 631.53) == nil)
+
 var clampEOF = SeekEOFRecoveryPolicy<Int>()
 clampEOF.begin(owner: 7, target: 909.992, wasPaused: true, origin: .cacheReanchor, now: 200)
 _ = clampEOF.observeSeek(owner: 7)
 check("seek EOF: paused maintenance reanchor has the same source-fenced mid-file recovery",
-      clampEOF.shouldRecoverEOF(owner: 7, duration: 1398.08, now: 200.1))
+      clampEOF.shouldRecoverEOF(owner: 7, duration: 1398.08, position: 909.992, now: 200.1))
 check("seek EOF: true EOF near duration remains terminal",
-      !clampEOF.shouldRecoverEOF(owner: 7, duration: 915, now: 200.1))
+      !clampEOF.shouldRecoverEOF(owner: 7, duration: 915, position: 909.992, now: 200.1))
 check("seek EOF: unknown duration remains terminal",
-      !clampEOF.shouldRecoverEOF(owner: 7, duration: 0, now: 200.1))
+      !clampEOF.shouldRecoverEOF(owner: 7, duration: 0, position: 909.992, now: 200.1))
 check("seek EOF: stale source event cannot consume recovery",
       clampEOF.consumeEOFForReload(owner: 8) == nil && clampEOF.current?.owner == 7)
 check("seek EOF: an old observed seek expires rather than reclassifying a later genuine EOF",
-      !clampEOF.shouldRecoverEOF(owner: 7, duration: 1398.08, now: 206))
+      !clampEOF.shouldRecoverEOF(owner: 7, duration: 1398.08, position: 909.992, now: 206))
 _ = clampEOF.consumeEOFForReload(owner: 7)
 _ = clampEOF.adoptReload(owner: 9)
 check("seek EOF: second EOF during recovery is failure-only, never another completion candidate",
       clampEOF.reloadIsInFlight(owner: 9)
-        && !clampEOF.shouldRecoverEOF(owner: 9, duration: 1398.08, now: 200.2))
+        && !clampEOF.shouldRecoverEOF(owner: 9, duration: 1398.08, position: 909.992, now: 200.2))
 
 // Source contracts here are intentionally small and semantic: they keep this executable harness useful even
 // when the controller cannot be compiled outside the Apple target. The full command/lifecycle mutants live in

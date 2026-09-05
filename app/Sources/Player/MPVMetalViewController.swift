@@ -1788,6 +1788,13 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func togglePause() {
+        // During seek-EOF recovery mpv is deliberately forced paused to avoid presenting the reopened file
+        // at zero. Toggle the desired transport state, not that temporary implementation pause.
+        if let intent = seekEOFRecovery.current,
+           seekEOFRecovery.reloadIsInFlight(owner: intent.owner) {
+            intent.wasPaused ? play() : pause()
+            return
+        }
         getFlag(MPVProperty.pause) ? play() : pause()
     }
 
@@ -2790,11 +2797,30 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     func play() {
+        if let owner = activeLoadToken,
+           seekEOFRecovery.updateTransportIntent(owner: owner, paused: false) != nil {
+            return
+        }
         setFlag(MPVProperty.pause, false)
     }
     
     func pause() {
+        if let owner = activeLoadToken,
+           seekEOFRecovery.updateTransportIntent(owner: owner, paused: true) != nil {
+            return
+        }
         setFlag(MPVProperty.pause, true)
+    }
+
+    /// A new viewer seek cancels the recovery transaction, including its temporary forced pause. Restore the
+    /// latest Play/Pause action before issuing the new seek so it captures the real user intent and cannot hang.
+    private func supersedeSeekEOFRecoveryForExplicitSeek() {
+        seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
+        if let intent = seekEOFRecovery.supersedeReload() {
+            setFlag(MPVProperty.pause, intent.wasPaused)
+            DiagnosticsLog.log("player", "seek-eof-recovery superseded generation=\(intent.transportGeneration) loadToken=\(intent.owner.hashValue)")
+        }
+        seekEOFRecovery.cancel()
     }
 
     /// A viewer-controlled seek supersedes a cache-maintenance reanchor before it can reissue an old target.
@@ -2815,8 +2841,7 @@ final class MPVMetalViewController: PlatformViewController {
 
     func seek(to seconds: Double) {
         cancelCacheReanchorForExplicitSeek()
-        seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
-        seekEOFRecovery.cancel()
+        supersedeSeekEOFRecoveryForExplicitSeek()
         // Mark this as a USER seek so the disk-cache read-ahead ramp does not misread the keyframe re-decode drop
         // burst as fill starvation (#202). Marshalled on `queue` to serialize with the ramp step's read/clear.
         queue.async { [weak self] in self?.userSeekedSinceRampSample = true }
@@ -2850,8 +2875,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// the same mpv command without adopting that manual-scrub cache hold/watchdog transaction.
     func seekForResume(to seconds: Double) {
         cancelCacheReanchorForExplicitSeek()
-        seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
-        seekEOFRecovery.cancel()
+        supersedeSeekEOFRecoveryForExplicitSeek()
         command("seek", args: [String(seconds), "absolute"])
     }
 
@@ -2859,8 +2883,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// inside the buffered window, so no cache hold is armed for these.
     func seek(by seconds: Double) {
         cancelCacheReanchorForExplicitSeek()
-        seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
-        seekEOFRecovery.cancel()
+        supersedeSeekEOFRecoveryForExplicitSeek()
         // Mark this as a USER seek (the tvOS remote's directional hop routes here via hiddenSeek) so the disk-cache
         // read-ahead ramp does not misread the keyframe re-decode drop burst as fill starvation (#202). Marshalled
         // on `queue` to serialize with the ramp step's read/clear.
@@ -3849,9 +3872,21 @@ final class MPVMetalViewController: PlatformViewController {
             return
         }
         let duration = getDouble(MPVProperty.duration)
+        let position = getDouble(MPVProperty.timePos)
         let now = ProcessInfo.processInfo.systemUptime
+        if let source = seekEOFReloadSource, !source.live,
+           seekEOFRecovery.shouldRejectUnprovenEOF(
+            owner: loadToken, duration: duration, position: position, now: now
+           ) {
+            // The current source really is parked at the just-accepted target, but no command-correlated SEEK
+            // boundary exists. Do not convert that ambiguity into a retry or a terminal completion.
+            failSeekEOFRecovery(loadToken: loadToken, reason: "mid-file EOF before seek boundary")
+            return
+        }
         guard let source = seekEOFReloadSource, !source.live,
-              seekEOFRecovery.shouldRecoverEOF(owner: loadToken, duration: duration, now: now),
+              seekEOFRecovery.shouldRecoverEOF(
+                owner: loadToken, duration: duration, position: position, now: now
+              ),
               let intent = seekEOFRecovery.consumeEOFForReload(owner: loadToken) else {
             emitEndFileEOF(loadToken: loadToken)
             return
