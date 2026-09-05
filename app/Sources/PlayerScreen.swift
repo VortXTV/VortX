@@ -4376,6 +4376,31 @@ struct PlayerScreen: View {
                     if progressed, !cur.failed { lastProgressAt = now }
                     last = cur
                 }
+                // `failed=true` is a terminal producer receipt. Do not wait for the ordinary stall window:
+                // log13 had a failed, zero-output remux held as “progressing” for 15s. Keep the decision
+                // shared with tvOS and require the exact watchdog owner before mutating the player.
+                if let terminal = last {
+                    switch AppleRemuxRecoveryPolicy.terminalDecision(
+                        failed: terminal.failed,
+                        inputProvablyDead: terminal.inputProvablyDead,
+                        ownerCurrent: coordinator.player is AVPlayerEngineController,
+                        hasStartedPlaying: hasStartedPlaying
+                    ) {
+                    case .cancel:
+                        break
+                    case .hopSource:
+                        DiagnosticsLog.log("dv", "remux terminal failure -> source hop")
+                        if hopToNextSource(reason: "remux terminal failure") { return }
+                        DiagnosticsLog.log("dv", "remux terminal failure had no source hop; demoting engine")
+                        demoteFollowedDeadInput = true
+                        demoteAVPlayerToMPV(silent: true)
+                        return
+                    case .demoteEngine:
+                        DiagnosticsLog.log("dv", "remux terminal failure -> libmpv demote")
+                        demoteAVPlayerToMPV(silent: true)
+                        return
+                    }
+                }
                 let elapsed = now.timeIntervalSince(armed)
                 let stalled = now.timeIntervalSince(lastProgressAt)
                 // W2-A: the input-side receipts ride the same line as the output counters, so the exportable

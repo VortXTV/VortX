@@ -6506,6 +6506,36 @@ struct TVPlayerView: View {
                     if progressed, !cur.failed { lastProgressAt = now }
                     last = cur
                 }
+                // A producer failure is terminal evidence, not a stalled/progressing sample. Handle it on
+                // the first owned poll so a failed remux cannot sit in the old watchdog hold (log13 showed
+                // failed=true, produced=0 held for 15s). Dead input hops immediately; a remux/mux failure
+                // with input evidence keeps the existing same-source AV -> libmpv fallback.
+                if let terminal = last {
+                    switch AppleRemuxRecoveryPolicy.terminalDecision(
+                        failed: terminal.failed,
+                        inputProvablyDead: terminal.inputProvablyDead,
+                        ownerCurrent: ownerCurrent,
+                        hasStartedPlaying: hasStartedPlaying
+                    ) {
+                    case .cancel:
+                        break
+                    case .hopSource:
+                        DiagnosticsLog.log(
+                            "dv",
+                            "remux terminal failure -> source hop (\(terminal.producedBytes)B output, "
+                                + "input=\(terminal.inputBytesRead.map(String.init) ?? \"-\"))"
+                        )
+                        if hopToNextSource(reason: "remux terminal failure") { return }
+                        DiagnosticsLog.log("dv", "remux terminal failure had no source hop; demoting engine")
+                        demoteFollowedDeadInput = true
+                        demoteAVPlayerToMPV()
+                        return
+                    case .demoteEngine:
+                        DiagnosticsLog.log("dv", "remux terminal failure -> libmpv demote")
+                        demoteAVPlayerToMPV()
+                        return
+                    }
+                }
                 let stalled = now.timeIntervalSince(lastProgressAt)
                 // W2-A: the input-side receipts ride the same line as the output counters, so the exportable
                 // trail shows WHY a stall was called dead (or not) instead of only that it was called.
