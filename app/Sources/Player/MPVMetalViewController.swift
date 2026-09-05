@@ -2027,6 +2027,7 @@ final class MPVMetalViewController: PlatformViewController {
             seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
             seekEOFRecovery.begin(
                 owner: flight.owner, target: flight.target, wasPaused: getFlag(MPVProperty.pause),
+                duration: getDouble(MPVProperty.duration),
                 origin: .cacheReanchor, now: ProcessInfo.processInfo.systemUptime
             )
         } else if let ended = cacheFlushFlight.seekCommandError(id: flight.id, owner: flight.owner) {
@@ -2858,10 +2859,11 @@ final class MPVMetalViewController: PlatformViewController {
         #endif
         let owner = callbackLoadToken(requiresLoadedFile: true)
         let wasPaused = getFlag(MPVProperty.pause)
+        let duration = getDouble(MPVProperty.duration)
         command("seek", args: [String(seconds), "absolute"], returnValueCallback: { [weak self] status in
             guard let self, status >= 0, let owner else { return }
             self.seekEOFRecovery.begin(
-                owner: owner, target: seconds, wasPaused: wasPaused, origin: .viewer,
+                owner: owner, target: seconds, wasPaused: wasPaused, duration: duration, origin: .viewer,
                 now: ProcessInfo.processInfo.systemUptime
             )
         })
@@ -3871,22 +3873,17 @@ final class MPVMetalViewController: PlatformViewController {
             failSeekEOFRecovery(loadToken: loadToken, reason: "reopen reached EOF before the seek restored")
             return
         }
-        let duration = getDouble(MPVProperty.duration)
-        let position = getDouble(MPVProperty.timePos)
         let now = ProcessInfo.processInfo.systemUptime
         if let source = seekEOFReloadSource, !source.live,
-           seekEOFRecovery.shouldRejectUnprovenEOF(
-            owner: loadToken, duration: duration, position: position, now: now
-           ) {
+           (seekEOFRecovery.shouldRejectUnprovenEOF(owner: loadToken, now: now)
+             || seekEOFRecovery.shouldRejectUnsettledEOF(owner: loadToken, now: now)) {
             // The current source really is parked at the just-accepted target, but no command-correlated SEEK
             // boundary exists. Do not convert that ambiguity into a retry or a terminal completion.
             failSeekEOFRecovery(loadToken: loadToken, reason: "mid-file EOF before seek boundary")
             return
         }
         guard let source = seekEOFReloadSource, !source.live,
-              seekEOFRecovery.shouldRecoverEOF(
-                owner: loadToken, duration: duration, position: position, now: now
-              ),
+              seekEOFRecovery.shouldRecoverEOF(owner: loadToken, now: now),
               let intent = seekEOFRecovery.consumeEOFForReload(owner: loadToken) else {
             emitEndFileEOF(loadToken: loadToken)
             return
@@ -4164,6 +4161,9 @@ final class MPVMetalViewController: PlatformViewController {
                                                 observedPosition: value
                                             )
                                             #endif
+                                            self.seekEOFRecovery.observePosition(
+                                                owner: loadToken, position: value
+                                            )
                                             self.completeSeekEOFRecovery(
                                                 loadToken: loadToken, position: value
                                             )
