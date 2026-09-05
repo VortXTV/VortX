@@ -44,6 +44,22 @@ private enum TorBoxUsenetWireTests {
         precondition(parts.percentEncodedQuery?.contains("%2B") == true)
         precondition(parts.fragment == nil)
         precondition(TorBoxUsenetWire.downloadRequest(base: base, apiKey: key, usenetID: -1, fileID: 1) == nil)
+        let session = TorBoxUsenetWire.makeSession()
+        defer { session.invalidateAndCancel() }
+        guard let delegate = session.delegate as? TorBoxUsenetWire.RejectAPIRedirects else {
+            fatalError("credential-bearing API session must reject redirects")
+        }
+        let task = session.dataTask(with: download) // deliberately never resumed: no provider access
+        for target in ["https://api.torbox.app/redirected", "https://unrelated.example/redirected"] {
+            var proposed = URLRequest(url: URL(string: target)!)
+            proposed.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: nil,
+                                           headerFields: ["Location": target])!
+            delegate.urlSession(session, task: task, willPerformHTTPRedirection: response,
+                                newRequest: proposed) { redirected in
+                precondition(redirected == nil, "API credentials must not follow any redirect")
+            }
+        }
         print("PASS TorBox Usenet multipart create, string/numeric IDs, escaped query authentication")
     }
 }

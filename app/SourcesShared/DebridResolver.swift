@@ -492,7 +492,7 @@ actor TorBoxUsenetResolver {
 
     init(apiKey: String) {
         self.apiKey = apiKey
-        self.session = DebridHTTPSession.make()
+        self.session = TorBoxUsenetWire.makeSession()
     }
 
     /// md5 of an nzb link, TorBox's usenet cache identifier (the usenet twin of the torrent infohash).

@@ -3,6 +3,23 @@ import Foundation
 /// TorBox's Usenet endpoints have different wire contracts from ordinary JSON debrid requests.
 /// Keep credential-bearing requests internal; callers expose only the validated CDN response URL.
 enum TorBoxUsenetWire {
+    /// These fixed API endpoints return JSON, never media redirects. Reject even same-origin redirects:
+    /// neither Bearer headers nor the requestdl query token may be forwarded to a redirect destination.
+    final class RejectAPIRedirects: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
+    static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 20
+        return URLSession(configuration: configuration, delegate: RejectAPIRedirects(), delegateQueue: nil)
+    }
+
     struct Created: Decodable {
         let usenetId: Int?
         enum CodingKeys: String, CodingKey { case usenetId = "usenetdownload_id" }
