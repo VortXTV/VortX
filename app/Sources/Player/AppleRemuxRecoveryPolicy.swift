@@ -22,4 +22,14 @@ enum AppleRemuxRecoveryPolicy {
         guard ownerCurrent, !hasStartedPlaying, failed else { return .cancel }
         return inputProvablyDead ? .hopSource : .demoteEngine
     }
+
+    /// A delayed incomplete-evidence callback may only mutate state when it still names the parked advance.
+    /// An old committed token is not a valid owner once a pending advance exists.
+    static func canAcceptDeferredEvidence(
+        ownerCurrent: Bool,
+        pendingAdvanceExists: Bool,
+        callbackMatchesPending: Bool
+    ) -> Bool {
+        ownerCurrent && (!pendingAdvanceExists || callbackMatchesPending)
+    }
 }

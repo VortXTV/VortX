@@ -1727,6 +1727,21 @@ struct PlayerScreen: View {
         guard loadToken == coordinator.player?.activeLoadToken,
               (loadToken == committedLoadToken ||
                (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)) else { return false }
+        // Preflight the parked advance before accepting or mutating anything. The old committed token can
+        // still be current while a newer pending advance is unresolved; its delayed grace callback must not
+        // accept old-asset evidence and then fail the commit fence after changing start/watchdog state.
+        if let pending = pendingAdvance {
+            guard pending.generation == episodeSwitchGeneration,
+                  AppleRemuxRecoveryPolicy.canAcceptDeferredEvidence(
+                    ownerCurrent: PlayerLoadProvenanceState.canCommit(
+                    callbackToken: loadToken,
+                    activeToken: coordinator.player?.activeLoadToken,
+                    pendingToken: pending.loadToken
+                    ),
+                    pendingAdvanceExists: true,
+                    callbackMatchesPending: true
+                  ) else { return false }
+        }
         switch assetSanityAttempt.acceptIncompleteEvidence(owner: loadToken) {
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
@@ -4347,11 +4362,15 @@ struct PlayerScreen: View {
             // or absent controller reads remuxMounted=false and keeps today's fixed deadline, never a longer one.
             try? await Task.sleep(for: .seconds(1))
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
+            guard let watchedController = coordinator.player as? AVPlayerEngineController,
+                  let watchedLoadToken = watchedController.activeLoadToken else { return }
+            let remuxMounted = watchedController.isRemuxMounted
             if !remuxMounted {
                 try? await Task.sleep(for: .seconds(avStartWatchdogSeconds - 1))
                 guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-                guard coordinator.player is AVPlayerEngineController else { return }   // already on libmpv / torn down
+                guard let current = coordinator.player as? AVPlayerEngineController,
+                      current === watchedController,
+                      current.activeLoadToken == watchedLoadToken else { return }
                 NSLog("%@", "[Player] AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, demoting to libmpv in place")
                 srcProbe("AV start-watchdog FIRED (\(Int(avStartWatchdogSeconds))s, AVPlayer mounted but no frame) -> silent demote to libmpv")
                 demoteAVPlayerToMPV(silent: true)
@@ -4363,14 +4382,16 @@ struct PlayerScreen: View {
             // keeps its true-DV session instead of being demoted to HDR10 + PCM by a fixed wall.
             let armed = Date()
             var lastProgressAt = armed
-            var last = (coordinator.player as? AVPlayerEngineController)?.remuxMountProgress
+            var last = watchedController.remuxMountProgress
             var lastHoldLogAt = armed
             while true {
                 try? await Task.sleep(for: .seconds(1))
                 guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-                guard coordinator.player is AVPlayerEngineController else { return }   // already on libmpv / torn down
+                guard let current = coordinator.player as? AVPlayerEngineController,
+                      current === watchedController,
+                      current.activeLoadToken == watchedLoadToken else { return }
                 let now = Date()
-                if let cur = (coordinator.player as? AVPlayerEngineController)?.remuxMountProgress {
+                if let cur = current.remuxMountProgress {
                     // Progress = any monotonic counter moved since the last poll. A FAILED mount never counts;
                     // its demote belongs to the HLS-404 -> .failed path, and if that somehow never fires the
                     // stall window below still bounds it.

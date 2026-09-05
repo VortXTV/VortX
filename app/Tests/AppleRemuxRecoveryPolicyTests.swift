@@ -33,6 +33,18 @@ enum AppleRemuxRecoveryPolicyTests {
               AppleRemuxRecoveryPolicy.terminalDecision(
                 failed: true, inputProvablyDead: true,
                 ownerCurrent: true, hasStartedPlaying: true) == .cancel)
+        check("old committed grace cannot mutate unresolved pending advance",
+              !AppleRemuxRecoveryPolicy.canAcceptDeferredEvidence(
+                ownerCurrent: true, pendingAdvanceExists: true,
+                callbackMatchesPending: false))
+        check("pending grace accepts only its matching load token",
+              AppleRemuxRecoveryPolicy.canAcceptDeferredEvidence(
+                ownerCurrent: true, pendingAdvanceExists: true,
+                callbackMatchesPending: true))
+        check("stale grace cannot mutate even without a pending advance",
+              !AppleRemuxRecoveryPolicy.canAcceptDeferredEvidence(
+                ownerCurrent: false, pendingAdvanceExists: false,
+                callbackMatchesPending: false))
 
         print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
         exit(failures == 0 ? 0 : 1)

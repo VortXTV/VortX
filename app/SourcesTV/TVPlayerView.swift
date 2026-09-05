@@ -1694,6 +1694,20 @@ struct TVPlayerView: View {
         guard loadToken == coordinator.player?.activeLoadToken,
               (loadToken == committedLoadToken ||
                (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)) else { return false }
+        // Preflight the parked advance before accepting or mutating anything. A delayed grace callback for
+        // the old committed item must not alter start/watchdog state while a newer advance owns the surface.
+        if let pending = pendingAdvance {
+            guard pending.generation == episodeSwitchGeneration,
+                  AppleRemuxRecoveryPolicy.canAcceptDeferredEvidence(
+                    ownerCurrent: PlayerLoadProvenanceState.canCommit(
+                    callbackToken: loadToken,
+                    activeToken: coordinator.player?.activeLoadToken,
+                    pendingToken: pending.loadToken
+                    ),
+                    pendingAdvanceExists: true,
+                    callbackMatchesPending: true
+                  ) else { return false }
+        }
         switch assetSanityAttempt.acceptIncompleteEvidence(owner: loadToken) {
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
