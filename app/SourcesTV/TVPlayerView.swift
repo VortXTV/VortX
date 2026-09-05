@@ -1669,7 +1669,8 @@ struct TVPlayerView: View {
             guard !Task.isCancelled,
                   assetSanityObservationToken == loadToken else { return }
             guard loadToken == coordinator.player?.activeLoadToken,
-                  loadToken == committedLoadToken,
+                  (loadToken == committedLoadToken ||
+                   (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)),
                   assetSanityDeferredStartToken == loadToken else {
                 cancelAssetSanityObservationDeadline()
                 return
@@ -1691,10 +1692,21 @@ struct TVPlayerView: View {
         position: Double
     ) -> Bool {
         guard loadToken == coordinator.player?.activeLoadToken,
-              loadToken == committedLoadToken else { return false }
+              (loadToken == committedLoadToken ||
+               (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)) else { return false }
         switch assetSanityAttempt.acceptIncompleteEvidence(owner: loadToken) {
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
+            // Pending binge validation can hold `hasStartedPlaying` at false while evidence is incomplete.
+            // Bounded acceptance proves the frame is usable, so retire the no-frame watchdogs or a healthy
+            // 4K fallback can later be misclassified and hopped as if it never started.
+            hasStartedPlaying = true
+            loadTimeout?.cancel(); loadTimeout = nil
+            recoveryDeadline?.cancel(); recoveryDeadline = nil
+            avStartWatchdog?.cancel(); avStartWatchdog = nil
+            if pendingAdvance != nil {
+                guard commitPendingAdvanceOnFirstFrame(loadToken: loadToken) else { return false }
+            }
             publishAssetSanityStartEffectsIfNeeded(
                 loadToken: loadToken, position: position
             )

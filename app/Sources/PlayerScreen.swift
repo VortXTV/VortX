@@ -1705,7 +1705,8 @@ struct PlayerScreen: View {
             guard !Task.isCancelled,
                   assetSanityObservationToken == loadToken else { return }
             guard loadToken == coordinator.player?.activeLoadToken,
-                  loadToken == committedLoadToken,
+                  (loadToken == committedLoadToken ||
+                   (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)),
                   assetSanityDeferredStartToken == loadToken else {
                 cancelAssetSanityObservationDeadline()
                 return
@@ -1724,10 +1725,22 @@ struct PlayerScreen: View {
         position: Double
     ) -> Bool {
         guard loadToken == coordinator.player?.activeLoadToken,
-              loadToken == committedLoadToken else { return false }
+              (loadToken == committedLoadToken ||
+               (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)) else { return false }
         switch assetSanityAttempt.acceptIncompleteEvidence(owner: loadToken) {
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
+            // A pending advance may have deliberately kept `hasStartedPlaying` false while telemetry was
+            // incomplete. Once the bounded observation grace accepts this already-rendered frame, restore
+            // the start transition and retire every no-frame watchdog; otherwise a healthy 4K fallback can
+            // be mistaken for a hung load and hopped again later.
+            hasStartedPlaying = true
+            loadTimeout?.cancel(); loadTimeout = nil
+            recoveryDeadline?.cancel(); recoveryDeadline = nil
+            avStartWatchdog?.cancel(); avStartWatchdog = nil
+            if pendingAdvance != nil {
+                guard commitPendingAdvanceOnFirstFrame(loadToken: loadToken) else { return false }
+            }
             publishAssetSanityStartEffectsIfNeeded(
                 loadToken: loadToken, position: position
             )
