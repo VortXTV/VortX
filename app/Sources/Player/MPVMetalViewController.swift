@@ -1192,7 +1192,7 @@ final class MPVMetalViewController: PlatformViewController {
     func invalidateLoadToken() {
         finishCacheFlushFlight(cacheFlushFlight.reset())
         seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
-        seekEOFRecovery.cancel()
+        seekEOFRecovery.reset()
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.invalidate()
     }
@@ -1624,7 +1624,7 @@ final class MPVMetalViewController: PlatformViewController {
         if commandResult >= 0 {
             if !preservingSeekEOFRecovery {
                 seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
-                seekEOFRecovery.cancel()
+                seekEOFRecovery.reset()
             }
             seekEOFReloadSource = SeekEOFReloadSource(
                 url: url, headers: headers, live: live, audioSidecar: audioSidecar
@@ -2829,11 +2829,16 @@ final class MPVMetalViewController: PlatformViewController {
     /// latest Play/Pause action before issuing the new seek so it captures the real user intent and cannot hang.
     private func supersedeSeekEOFRecoveryForExplicitSeek() {
         seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
-        if let intent = seekEOFRecovery.supersedeReload() {
+        let hadForcedRecovery = seekEOFRecovery.current.map {
+            switch $0.phase {
+            case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition: return true
+            default: return false
+            }
+        } ?? false
+        if let intent = seekEOFRecovery.supersedeForNewExplicitSeek(), hadForcedRecovery {
             setFlag(MPVProperty.pause, intent.wasPaused)
             DiagnosticsLog.log("player", "seek-eof-recovery superseded generation=\(intent.transportGeneration) loadToken=\(intent.owner.hashValue)")
         }
-        seekEOFRecovery.cancel()
     }
 
     /// A viewer-controlled seek supersedes a cache-maintenance reanchor before it can reissue an old target.

@@ -536,6 +536,26 @@ check("seek EOF: reload owner is a fresh token and must restore target position 
         && seekEOF.completeReloadAtPosition(owner: 3, position: 620)?.wasPaused == true
         && seekEOF.current == nil)
 
+// A and B deliberately share an owner: this models consecutive scrubs in one loaded mpv item, where
+// MPV_EVENT_SEEK offers no command id and an already-queued A callback must not certify B.
+var rapidSameSource = SeekEOFRecoveryPolicy<Int>()
+rapidSameSource.begin(owner: 40, target: 300, wasPaused: true, duration: 1398.08, origin: .viewer, now: 400)
+let supersededA = rapidSameSource.supersedeForNewExplicitSeek()
+rapidSameSource.cancel() // mirrors controller cancellation bookkeeping; ambiguity must survive through B begin
+rapidSameSource.begin(owner: 40, target: 631.53, wasPaused: true, duration: 1398.08, origin: .viewer, now: 400.01)
+_ = rapidSameSource.observeSeek(owner: 40)       // queued A SEEK
+rapidSameSource.observePosition(owner: 40, position: 300) // queued A time-pos
+check("seek EOF: rapid same-source A callbacks cannot certify superseding B",
+      supersededA?.target == 300
+        && rapidSameSource.current?.inheritedUnsettledSeekAmbiguity == true
+        && rapidSameSource.current?.phase == .awaitingSeekEvent
+        && !rapidSameSource.shouldRecoverEOF(owner: 40, now: 400.02)
+        && rapidSameSource.shouldRejectUnprovenEOF(owner: 40, now: 400.02))
+rapidSameSource.reset()
+rapidSameSource.begin(owner: 41, target: 631.53, wasPaused: true, duration: 1398.08, origin: .viewer, now: 401)
+check("seek EOF: a real source reset clears same-source ambiguity",
+      rapidSameSource.current?.inheritedUnsettledSeekAmbiguity == false)
+
 var transportEOF = SeekEOFRecoveryPolicy<Int>()
 transportEOF.begin(owner: 10, target: 631.53, wasPaused: true, duration: 1398.08, origin: .viewer, now: 300)
 _ = transportEOF.observeSeek(owner: 10)

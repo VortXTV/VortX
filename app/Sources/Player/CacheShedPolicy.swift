@@ -226,6 +226,10 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         /// A source-fenced time-pos callback received after SEEK. It proves the player remained transportable
         /// before EOF, without imposing a brittle keyframe-distance threshold on ordinary absolute seeks.
         var positionAfterSeek: Double?
+        /// libmpv SEEK callbacks have no command id. If this request replaced any unsettled same-source seek,
+        /// a queued callback from the old request is indistinguishable from this one and may not authorise
+        /// automatic reopen.
+        let inheritedUnsettledSeekAmbiguity: Bool
         let issuedAt: TimeInterval
         let origin: Origin
         var phase: Phase
@@ -233,6 +237,8 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
 
     private(set) var current: Intent?
     private var nextTransportGeneration: UInt64 = 0
+    /// Survives `supersedeForNewExplicitSeek()` through the caller's cancel -> begin sequence.
+    private var pendingUnsettledSeekAmbiguity = false
 
     mutating func begin(owner: Owner, target: Double, wasPaused: Bool, duration: Double,
                         origin: Origin, now: TimeInterval) {
@@ -243,7 +249,9 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
                          transportGeneration: nextTransportGeneration,
                          durationAtIssue: duration.isFinite && duration > 0 ? duration : nil,
                          positionAfterSeek: nil,
+                         inheritedUnsettledSeekAmbiguity: pendingUnsettledSeekAmbiguity,
                          issuedAt: now, origin: origin, phase: .awaitingSeekEvent)
+        pendingUnsettledSeekAmbiguity = false
     }
 
     /// This is the required libmpv boundary. A successful `mpv_command` alone must never arm recovery.
@@ -251,6 +259,9 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         guard var intent = current, intent.owner == owner else { return nil }
         switch intent.phase {
         case .awaitingSeekEvent:
+            // A and B share one libmpv source token. Do not guess whether this untagged event belongs to
+            // B after B superseded A; the EOF route will fail closed as an error instead.
+            guard !intent.inheritedUnsettledSeekAmbiguity else { return nil }
             intent.phase = .seekObserved
             current = intent
             return .seekObserved
@@ -265,7 +276,8 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
 
     mutating func observePosition(owner: Owner, position: Double) {
         guard var intent = current, intent.owner == owner, position.isFinite,
-              intent.phase == .seekObserved else { return }
+              intent.phase == .seekObserved,
+              !intent.inheritedUnsettledSeekAmbiguity else { return }
         intent.positionAfterSeek = position
         current = intent
     }
@@ -277,6 +289,7 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
                           minimumDistanceFromEnd: Double = 8,
                           maximumAdjacency: TimeInterval = 5) -> Bool {
         guard let intent = current, intent.owner == owner, intent.phase == .seekObserved,
+              !intent.inheritedUnsettledSeekAmbiguity,
               let duration = intent.durationAtIssue, intent.positionAfterSeek != nil, now.isFinite,
               minimumDistanceFromEnd.isFinite, minimumDistanceFromEnd > 0,
               maximumAdjacency.isFinite, maximumAdjacency > 0 else { return false }
@@ -382,9 +395,26 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         }
     }
 
+    /// Retire any seek lifecycle before a new explicit seek. Unlike ordinary cancellation this deliberately
+    /// carries an ambiguity bit forward: callbacks already queued for the old same-source seek cannot be
+    /// attributed to the replacement because MPV_EVENT_SEEK exposes no request identifier.
+    mutating func supersedeForNewExplicitSeek() -> Intent? {
+        guard let intent = current else { return nil }
+        pendingUnsettledSeekAmbiguity = true
+        current = nil
+        return intent
+    }
+
     mutating func cancel(owner: Owner? = nil) {
         guard let owner else { current = nil; return }
         if current?.owner == owner { current = nil }
+    }
+
+    /// A real source replacement/invalidation ends the same-source ambiguity domain. Explicit seek
+    /// supersession intentionally uses `supersedeForNewExplicitSeek` instead, so it retains the bit until B.
+    mutating func reset() {
+        current = nil
+        pendingUnsettledSeekAmbiguity = false
     }
 }
 
