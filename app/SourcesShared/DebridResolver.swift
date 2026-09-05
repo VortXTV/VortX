@@ -1451,7 +1451,6 @@ extension DebridCoordinator {
     /// below so it can skip an unavailable row without spending time downloading every NZB candidate.
     enum ExplicitUsenetResolution: Sendable, Equatable {
         case ready(DebridPlaybackRef)
-        case notReady(String)
         case unsupported(String)
         case failed(String)
     }
