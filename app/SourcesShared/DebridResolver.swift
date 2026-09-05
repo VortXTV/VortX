@@ -1443,6 +1443,36 @@ extension CoreStream {
 }
 
 extension DebridCoordinator {
+    /// Manual NZB playback gets a typed terminal outcome.  Auto-pick continues using the optional resolver
+    /// below so it can skip an unavailable row without spending time downloading every NZB candidate.
+    enum ExplicitUsenetResolution: Sendable, Equatable {
+        case ready(DebridPlaybackRef)
+        case unsupported(String)
+        case failed(String)
+    }
+
+    /// Resolve a user-selected NZB without the cache gate that intentionally keeps unattended candidate
+    /// selection fast.  Messages are stable and actionable, and deliberately contain no host, URL, or
+    /// credential material.
+    func resolveExplicitUsenetPlayback(for stream: CoreStream,
+                                       episode: DebridEpisode? = nil) async -> ExplicitUsenetResolution {
+        guard stream.isUsenet else {
+            return .unsupported("This source is not an NZB stream.")
+        }
+        let remoteAvailable = DebridPlaybackAvailability.shared.canResolveUsenetRemotely
+        let localAvailable = StremioServer.usenetNodeBase != nil
+            && (UsenetProviderStore.isConfigured || !stream.usenetServers.isEmpty)
+        guard remoteAvailable || localAvailable else {
+            return .unsupported("NZB playback needs a Usenet provider, a supported add-on server, or a TorBox account. Native streaming and Lite builds cannot play NZB streams locally.")
+        }
+        if let ref = await resolvedPlaybackRef(for: stream, episode: episode,
+                                               confirmedCachedHashes: nil,
+                                               confirmedUsenetURLs: nil) {
+            return .ready(ref)
+        }
+        return .failed("This NZB source could not be started. Check that the provider is available and try another source.")
+    }
+
     /// Streaming-settle ceiling for an in-line resolve. A CONFIRMED-cached torrent resolves in ~1 round trip,
     /// so 5s comfortably covers it while bounding a stall (a flaky provider, a hung network) so the play action
     /// never hangs the UI. On timeout the resolve Task is cancelled and the caller falls soft to the local

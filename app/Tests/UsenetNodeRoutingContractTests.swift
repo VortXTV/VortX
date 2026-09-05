@@ -57,12 +57,17 @@ private enum UsenetNodeRoutingContractTests {
         check("CoreBridge round-trips plural NZBs and servers", bridge.contains("raw[\"nzbUrls\"] = nzbs")
               && bridge.contains("raw[\"servers\"] = servers"))
         check("NZB control route is Node-only and follows the discovered port", server.contains("static var usenetNodeBase: String?")
-              && server.contains("NodeServer.discoveredPort ?? 11470")
-              && server.contains("VortxNativeServer.publishedPort == nil"))
+              && server.contains("if let port = NodeServer.discoveredPort")
+              && server.contains("never guess 11470 while native is active"))
         check("resolver posts the Node NZB contract and never generic embedded", resolver.contains("StremioServer.usenetNodeBase")
               && resolver.contains("\"nzbUrls\": validNZBs") && !resolver.contains("let base = StremioServer.embedded"))
+        check("add-on server ordering does not silently mix saved credentials", resolver.contains("if localServers.isEmpty, let credentials, credentials.isValid"))
         check("resolver returns Node redirect endpoint rather than raw NZB", resolver.contains("/nzb/stream?key="))
         check("coordinator supplies add-on mirrors and servers", coordinator.contains("nzbURLs: stream.usenetURLs, servers: stream.usenetServers"))
+        check("explicit NZB playback has a typed result while auto retains optional resolution", coordinator.contains("enum ExplicitUsenetResolution")
+              && coordinator.contains("func resolveExplicitUsenetPlayback") && coordinator.contains("func resolvedPlaybackRef"))
+        check("CoreBridge server data stays on the private engine-player path", bridge.contains("private func rawStreamDict")
+              && bridge.contains("func loadEnginePlayer(for stream: CoreStream"))
 
         if failures > 0 { throw NSError(domain: "UsenetNodeRoutingContract", code: failures) }
     }

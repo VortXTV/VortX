@@ -2503,6 +2503,7 @@ struct CoreStreamList: View {
     @State private var showAudioLanguagePicker = false   // session audio-language filter dialog
     @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
     @State private var showPlayerPicker = false
+    @State private var usenetPlaybackMessage: String?
     @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
     /// Focus anchors are visible action controls: Watch/Resume owns `.primary`, and the first secondary action
     /// owns `.secondary`. Setting either target performs a real row transition; no dummy button is inserted.
@@ -3011,6 +3012,14 @@ struct CoreStreamList: View {
         // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
         // first focusable view, which on the movie page is the Trailer chip laid out higher up.
         .defaultFocus($watchFocused, true)
+        .alert("NZB playback", isPresented: Binding(
+            get: { usenetPlaybackMessage != nil },
+            set: { if !$0 { usenetPlaybackMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(usenetPlaybackMessage ?? "")
+        }
         // Warm the Trakt playback shadow so the "Resume from <time>" chip decides off a cache rather than
         // blocking the page on a network call. Internally throttled, opt-in gated, and a no-op when Trakt is
         // unconfigured or disconnected, so it costs nothing for everyone else. Mirrors iOS iOSDetailView.
@@ -3748,7 +3757,14 @@ struct CoreStreamList: View {
         // returns nil with zero network and falls straight through to the embedded path below, which plays in a
         // snap (its own playableURL + prepareTorrent) exactly like the pre-511c973 instant path.
         let ref: DebridPlaybackRef?
-        if canResolveNatively(stream) {
+        if explicit, stream.isUsenet {
+            switch await DebridCoordinator.shared.resolveExplicitUsenetPlayback(for: stream, episode: targetHint) {
+            case .ready(let resolved): ref = resolved
+            case .unsupported(let message), .failed(let message):
+                usenetPlaybackMessage = message
+                return
+            }
+        } else if canResolveNatively(stream) {
             ref = await DebridCoordinator.shared.resolvedPlaybackRef(
                 for: stream, episode: targetHint,
                 confirmedCachedHashes: debridCache.cachedHashes,

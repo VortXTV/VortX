@@ -35,8 +35,13 @@ enum StremioServer {
         guard !NodeServer.isUsingNativeServer else { return nil }
         return "http://127.0.0.1:11470"
         #else
+        // Native and Node can run together on Apple mobile targets.  A discovered Node port is proof of
+        // the Node listener and must win even while native has published its own port.  If Node has not
+        // announced a port, never guess 11470 while native is active: that could post NZB credentials to
+        // the native torrent server.
+        if let port = NodeServer.discoveredPort { return "http://127.0.0.1:\(port)" }
         guard VortxNativeServer.publishedPort == nil else { return nil }
-        return "http://127.0.0.1:\(NodeServer.discoveredPort ?? 11470)"
+        return "http://127.0.0.1:11470"
         #endif
     }
     private static let urlKey = "stremiox.serverURL"

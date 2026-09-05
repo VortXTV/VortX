@@ -602,6 +602,7 @@ struct iOSDetailView: View {
     // always presents reliably. The player-cover variant sizes its content to fill the macOS window.
     @State private var presentation: Presentation?
     @State private var preparing = false                 // movie Watch Now is resolving
+    @State private var usenetPlaybackMessage: String?
     @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
     @State private var initialResumeGate = OneShotResumeAdmissionGate<TraktSessionID>()
     @State private var downloadPicker: DownloadPickerRequest?   // pre-download quality picker payload (#30 follow-up)
@@ -1085,6 +1086,14 @@ struct iOSDetailView: View {
         // than blocking the open on a network call. Internally throttled, opt-in gated, and a no-op when
         // Trakt is unconfigured or disconnected, so this costs nothing for everyone else.
         .onAppear { TraktPlaybackShadow.shared.refreshIfStale() }
+        .alert("NZB playback", isPresented: Binding(
+            get: { usenetPlaybackMessage != nil },
+            set: { if !$0 { usenetPlaybackMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(usenetPlaybackMessage ?? "")
+        }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
             case .player(let launch):
@@ -3114,9 +3123,19 @@ struct iOSDetailView: View {
         // INSTANT FIRST-PLAY: the parallel-cached race above already tried every confirmed-cached candidate, so
         // this single-resolve fallback on the ranked best cache-gates too: a not-confirmed best returns a nil
         // ref with zero network and primes+plays the embedded torrent instantly instead of blocking.
-        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-            for: stream, confirmedCachedHashes: debridCache.cachedHashes,
-            confirmedUsenetURLs: debridCache.cachedUsenetURLs)
+        let ref: DebridPlaybackRef?
+        if stream.isUsenet {
+            switch await DebridCoordinator.shared.resolveExplicitUsenetPlayback(for: stream) {
+            case .ready(let resolved): ref = resolved
+            case .unsupported(let message), .failed(let message):
+                usenetPlaybackMessage = message
+                return
+            }
+        } else {
+            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+                for: stream, confirmedCachedHashes: debridCache.cachedHashes,
+                confirmedUsenetURLs: debridCache.cachedUsenetURLs)
+        }
         guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: stream.isUsenet, resolvedURL: ref?.url,
             fallbackURL: stream.playableURL
@@ -4109,6 +4128,7 @@ struct iOSEpisodeStreams: View {
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
     @State private var preparing = false
+    @State private var usenetPlaybackMessage: String?
     @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
     @State private var initialStartGate = OneShotResumeAdmissionGate<TraktSessionID>()
     /// Smart Source Selection (Lane A) auto-pick: when `SourcePreferences.autoPickBest` is on, this page
@@ -4286,6 +4306,14 @@ struct iOSEpisodeStreams: View {
             reanchorToEngineEpisode()
         }
         #endif
+        .alert("NZB playback", isPresented: Binding(
+            get: { usenetPlaybackMessage != nil },
+            set: { if !$0 { usenetPlaybackMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(usenetPlaybackMessage ?? "")
+        }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
             case .player(let launch):
@@ -4632,7 +4660,20 @@ struct iOSEpisodeStreams: View {
         let target = shownVideo
         let targetGeneration = episodeTargetGeneration
         let ep = debridHint(for: target)
-        let (ref, isTorrent) = await playbackRef(for: stream, episode: ep)
+        let ref: DebridPlaybackRef?
+        let isTorrent: Bool
+        if explicit, stream.isUsenet {
+            switch await DebridCoordinator.shared.resolveExplicitUsenetPlayback(for: stream, episode: ep) {
+            case .ready(let resolved):
+                ref = resolved
+                isTorrent = false
+            case .unsupported(let message), .failed(let message):
+                usenetPlaybackMessage = message
+                return
+            }
+        } else {
+            (ref, isTorrent) = await playbackRef(for: stream, episode: ep)
+        }
         guard presentation == nil,
               episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
         guard let playURL = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(

@@ -158,7 +158,11 @@ enum UsenetLocalResolver {
             guard let url = URL(string: value), let scheme = url.scheme?.lowercased() else { return false }
             return (scheme == "nntp" || scheme == "nntps") && url.host?.isEmpty == false
         }
-        if let credentials, credentials.isValid { localServers.append(credentials.nntpServerURL) }
+        // An add-on's server list is an explicit routing choice.  Keep that ordering intact and use the
+        // Keychain provider only when the stream did not specify any server; do not silently mix accounts.
+        if localServers.isEmpty, let credentials, credentials.isValid {
+            localServers.append(credentials.nntpServerURL)
+        }
         guard !validNZBs.isEmpty, !localServers.isEmpty,
               let base = StremioServer.usenetNodeBase else { throw ResolveError.unavailable }
         guard let createURL = URL(string: "\(base)/nzb/create") else { throw ResolveError.unavailable }
