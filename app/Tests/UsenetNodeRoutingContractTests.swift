@@ -2,7 +2,8 @@
 //
 // Run from repository root:
 // swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
-//   -o /tmp/usenet-node-routing app/Tests/UsenetNodeRoutingContractTests.swift && /tmp/usenet-node-routing
+//   -o /tmp/usenet-node-routing app/SourcesShared/UsenetStreamValidation.swift \
+//   app/Tests/UsenetNodeRoutingContractTests.swift && /tmp/usenet-node-routing
 
 import Foundation
 
@@ -43,6 +44,7 @@ private enum UsenetNodeRoutingContractTests {
         check("plural-only NZB plus infohash is Usenet, never both Usenet and torrent", UsenetStreamValidation.isUsenet(url: nil, singular: nil, plural: ["https://only.example/a.nzb"])
               && !UsenetStreamValidation.isTorrent(url: nil, infoHash: "abc", singular: nil, plural: ["https://only.example/a.nzb"]))
         check("plural-only NZB has a stable non-placeholder identity", UsenetStreamValidation.streamIdentity(url: nil, externalURL: nil, infoHash: nil, singular: nil, plural: ["https://only.example/a.nzb"]) == "https://only.example/a.nzb")
+        check("NZB identity wins over a redundant torrent hash", UsenetStreamValidation.streamIdentity(url: nil, externalURL: nil, infoHash: "same-hash", singular: nil, plural: ["https://only.example/a.nzb"]) != UsenetStreamValidation.streamIdentity(url: nil, externalURL: nil, infoHash: "same-hash", singular: nil, plural: ["https://only.example/b.nzb"]))
 
         check("production stream preserves add-on fields", models.contains("let nzbUrls: [String]?")
               && models.contains("let servers: [String]?") && models.contains("let fileMustInclude: String?"))

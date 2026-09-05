@@ -26,7 +26,7 @@ private final class FakeNodeProtocol: URLProtocol, @unchecked Sendable {
             body = data
         } else { body = nil }
         Self.state.lock.withLock { Self.state.captured = request; Self.state.body = body }
-        let data = Data(#"{"key":"node key"}"#.utf8)
+        let data = Data(#"{"key":"node key&other=value#fragment"}"#.utf8)
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
                                        headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -55,7 +55,10 @@ private enum UsenetNodeClientIntegrationTests {
               let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
               (object["nzbUrls"] as? [String])?.count == 2,
               (object["servers"] as? [String])?.count == 1,
-              stream.absoluteString == "http://127.0.0.1:45678/nzb/stream?key=node%20key" else {
+              stream.absoluteString == "http://127.0.0.1:45678/nzb/stream?key=node%20key%26other%3Dvalue%23fragment",
+              URLComponents(url: stream, resolvingAgainstBaseURL: false)?.queryItems == [
+                URLQueryItem(name: "key", value: "node key&other=value#fragment")
+              ] else {
             throw NSError(domain: "UsenetNodeClientIntegration", code: 1)
         }
         print("PASS  injected Node POST/key/redirect contract follows dynamic local port")

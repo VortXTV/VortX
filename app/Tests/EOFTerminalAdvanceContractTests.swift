@@ -25,6 +25,9 @@
 //     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
 //     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
+//     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
+//     app/SourcesShared/DebridPlaybackAvailability.swift \
+//     app/SourcesShared/UsenetStreamValidation.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/Tests/EOFTerminalAdvanceContractTests.swift && /tmp/eof-terminal-test
 //
@@ -78,12 +81,20 @@ final class DebridKeys {
     func isConfigured(_ service: DebridService) -> Bool { false }
 }
 
+enum UsenetProviderStore { static let isConfigured = false }
+
 enum StremioServer {
+    static let usenetNodeBase: String? = nil
     static let base = "http://127.0.0.1:11470"
     static let trailerResolverBase = "https://trailer.invalid"
 }
 
 enum PlaybackSettings { static let torrentsDisabled = false }
+
+final class CommunityStreamGateway {
+    static let shared = CommunityStreamGateway()
+    func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { upstream }
+}
 
 // MARK: - Assertion harness (mirrors the binge contract test)
 

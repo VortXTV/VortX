@@ -12,7 +12,7 @@ enum UsenetStreamValidation {
     }
 
     static func streamIdentity(url: String?, externalURL: String?, infoHash: String?, singular: String?, plural: [String]?) -> String {
-        url ?? externalURL ?? infoHash ?? nzbURLs(singular: singular, plural: plural).first ?? "?"
+        url ?? externalURL ?? nzbURLs(singular: singular, plural: plural).first ?? infoHash ?? "?"
     }
 
     static func nzbURLs(singular: String?, plural: [String]?) -> [String] {

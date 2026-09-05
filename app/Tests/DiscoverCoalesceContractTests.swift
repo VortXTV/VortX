@@ -4,6 +4,7 @@
 //   xcrun swiftc -o /tmp/discover-coalesce-test \
 //     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
 //     app/SourcesShared/CatalogRowResolution.swift \
+//     app/SourcesShared/UsenetStreamValidation.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/DiscoverCoalesceContractTests.swift && \
@@ -72,7 +73,10 @@ final class DebridKeys {
     func isConfigured(_ service: DebridService) -> Bool { false }
 }
 
+enum UsenetProviderStore { static let isConfigured = false }
+
 enum StremioServer {
+    static let usenetNodeBase: String? = nil
     static let base = "http://127.0.0.1:11470"
     static let trailerResolverBase = "https://trailer.invalid"
 }

@@ -1434,11 +1434,11 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
         // property). Neither configured -> nil, the pre-usenet behavior. Deliberately NOT behind the torrents
         // gate: the TorBox path resolves to a remote link (Lite plays it); the built-in path is full-target
         // only and gated inside `canResolveUsenet`.
-        if isUsenet,
-           (DebridPlaybackAvailability.shared.canResolveUsenetRemotely
+        if isUsenet {
+            guard (DebridPlaybackAvailability.shared.canResolveUsenetRemotely
                 || (StremioServer.usenetNodeBase != nil
                     && (UsenetProviderStore.isConfigured || !usenetServers.isEmpty))),
-           let nzb = usenetURLs.first, let parsed = URL(string: nzb) {
+                  let nzb = usenetURLs.first, let parsed = URL(string: nzb) else { return nil }
             return parsed
         }
         if let ytId, !ytId.isEmpty {

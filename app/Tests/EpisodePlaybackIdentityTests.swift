@@ -7,6 +7,7 @@
 //     app/SourcesShared/AppleCWSeasonRolloverPolicy.swift \
 //     app/SourcesShared/AppleEpisodeResolverAdmission.swift \
 //     app/SourcesShared/DebridPlaybackAvailability.swift \
+//     app/SourcesShared/UsenetStreamValidation.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
 //     app/Tests/EpisodePlaybackIdentityTests.swift && \
@@ -57,7 +58,10 @@ final class DebridKeys {
     func isConfigured(_ service: DebridService) -> Bool { false }
 }
 
+enum UsenetProviderStore { static let isConfigured = false }
+
 enum StremioServer {
+    static let usenetNodeBase: String? = nil
     static let base = "http://127.0.0.1:11470"
     static let trailerResolverBase = "https://trailer.invalid"
 }
@@ -1004,7 +1008,12 @@ private struct EpisodePlaybackIdentityTests {
             "nzbUrl": rawNZB.absoluteString,
         ])
         let nzbOnlyStream = try! JSONDecoder().decode(CoreStream.self, from: nzbOnlyData)
+        let nzbWithHash = try! JSONDecoder().decode(CoreStream.self, from: JSONSerialization.data(withJSONObject: [
+            "nzbUrls": [rawNZB.absoluteString], "infoHash": "abc123", "fileIdx": 0,
+        ]))
         DebridPlaybackAvailability.shared.publish(torBoxConfigured: false)
+        expect(nzbWithHash.isUsenet && !nzbWithHash.isTorrent && nzbWithHash.playableURL == nil,
+               "unsupported NZB with hash cannot fall through to torrent playback")
         expect(DispatchQueue.global().sync {
             nzbOnlyStream.playableURL(isEpisode: false)
         } == nil, "usenet playableURL is closed when TorBox availability is false")

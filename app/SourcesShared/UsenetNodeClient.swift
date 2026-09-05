@@ -21,7 +21,11 @@ enum UsenetNodeClient {
         guard (200...299).contains(code) else { throw ClientError.createFailed(code) }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let key = object["key"] as? String, !key.isEmpty else { throw ClientError.badResponse }
-        let encodedKey = key.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? key
+        // A Node key is one opaque value, never additional query parameters or a fragment.
+        let keyCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        guard let encodedKey = key.addingPercentEncoding(withAllowedCharacters: keyCharacters) else {
+            throw ClientError.badResponse
+        }
         guard let streamURL = URL(string: "\(base)/nzb/stream?key=\(encodedKey)") else {
             throw ClientError.badResponse
         }

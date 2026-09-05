@@ -13,6 +13,7 @@
 //     app/SourcesShared/DetailMetaRecoveryPolicy.swift \
 //     app/SourcesShared/CatalogRowResolution.swift \
 //     app/SourcesShared/SubtitleReleaseFingerprint.swift \
+//     app/SourcesShared/UsenetStreamValidation.swift \
 //     app/SourcesShared/CoreModels.swift \
 //     app/SourcesShared/SourceSettlementPolicy.swift \
 //     app/SourcesShared/StreamRanking.swift \
@@ -59,7 +60,10 @@ final class DebridKeys {
     func isConfigured(_ service: DebridService) -> Bool { false }
 }
 
+enum UsenetProviderStore { static let isConfigured = false }
+
 enum StremioServer {
+    static let usenetNodeBase: String? = nil
     static let base = "http://127.0.0.1:11470"
     static let trailerResolverBase = "https://trailer.invalid"
 }
@@ -102,6 +106,7 @@ final class CommunityStreamGateway {
 final class DebridPlaybackAvailability {
     static let shared = DebridPlaybackAvailability()
     var canResolveUsenet: Bool { false }
+    var canResolveUsenetRemotely: Bool { false }
 }
 
 // MARK: - StreamRanking peripheral stubs (the ranker names them; the settle gate never calls them)
