@@ -13,6 +13,7 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
         testBoundariesAndCounterexamples()
         testMissingEvidenceAndRuntimeVetoes()
         testAttemptOwnershipAndOneShotVerdict()
+        testLatePendingEvidenceAndAppleWiring()
         testEpisodeResolutionDeadlineOwnership()
         testTrickplayIdentityGates()
         testEOFFailOpenRequiresFirstFrameOwnership()
@@ -52,7 +53,7 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
         durationSeconds: Double = 120,
         trackListObserved: Bool = true,
         audioTrackCount: Int = 0,
-        expectedRuntimeSeconds: Double? = 3_600
+        expectedRuntimeSeconds: Double? = nil
     ) -> EpisodicAssetSanityPolicy.Evidence {
         .init(
             isLibMPV: isLibMPV,
@@ -190,6 +191,60 @@ private enum DiagnosticPlaybackIntegrityPolicyTests {
             ) == .reject,
             "the exact 25 percent boundary remains eligible"
         )
+    }
+
+    private static func testLatePendingEvidenceAndAppleWiring() {
+        let incoming = Token(value: 91)
+        var preview = EpisodicAssetSanityAttempt<Token>()
+        preview.begin(owner: incoming)
+        expect(preview.evaluate(owner: incoming, evidence: evidence(trackListObserved: false)) == .waiting,
+               "a rendered pending file does not certify an unobserved track inventory")
+        expect(preview.evaluate(owner: incoming, evidence: evidence(durationSeconds: 30)) == .rejected,
+               "late duration and track evidence reject the pending placeholder before acceptance")
+        expect(preview.acceptIncompleteEvidence(owner: incoming) == .settled(.reject),
+               "grace cannot undo the late placeholder rejection")
+        var healthy = EpisodicAssetSanityAttempt<Token>()
+        healthy.begin(owner: incoming)
+        expect(healthy.evaluate(owner: incoming, evidence: evidence(trackListObserved: false)) == .waiting,
+               "healthy pending media initially waits for its own evidence")
+        expect(healthy.evaluate(owner: incoming, evidence: evidence(durationSeconds: 1398, audioTrackCount: 1)) == .accepted,
+               "late complete healthy evidence accepts without waiting for the five-second grace")
+        expect(healthy.evaluate(owner: incoming, evidence: evidence()) == .settled(.accept),
+               "the accepted pending verdict is one-shot")
+        expect(EpisodicAssetSanityPolicy.verdict(for: evidence(actualWidth: 3840, actualHeight: 2160,
+               framesPerSecond: 24, durationSeconds: 30, audioTrackCount: 1, expectedRuntimeSeconds: 1398)) == .reject,
+               "known long-runtime mismatch still rejects even with high resolution, motion and audio")
+        expect(EpisodicAssetSanityPolicy.verdict(for: evidence(actualWidth: 3840, actualHeight: 2160,
+               framesPerSecond: 24, durationSeconds: 1398, audioTrackCount: 1, expectedRuntimeSeconds: 1398)) == .accept,
+               "healthy full-runtime content remains accepted")
+
+        // This is a source-wiring contract, not a claim to instantiate SwiftUI in the pure-policy harness.
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        for path in ["app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift"] {
+            let source = try! String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+            expect(source.contains("pendingAdvance?.deferredDuration = value\n                recheckParkedAssetAfterTelemetry(loadToken: loadToken)")
+                   && source.contains("pendingAdvance?.deferredTrackList = true\n                recheckParkedAssetAfterTelemetry(loadToken: loadToken)"),
+                   "\(path): pending telemetry re-enters validation before the early deferral return")
+            expect(source.contains("let observedMetadata = pending?.meta ?? metadata ?? curMeta")
+                   && source.contains("season: observedMetadata?.season")
+                   && source.contains("episode: observedMetadata?.episode")
+                   && source.contains("pending?.deferredTrackList ?? (assetSanityTrackListToken == loadToken)"),
+                   "\(path): pending evidence uses incoming identity and its own observation")
+            expect(source.contains("assetSanityDeferredStartToken == loadToken,\n              !hasStartedPlaying")
+                   && source.contains("handleProperty(MPVProperty.timePos,\n                       PlayerTimePositionEvent(seconds: assetSanityDeferredStartPosition"),
+                   "\(path): only an owned already-rendered pending file may re-enter first-frame commit")
+            expect(source.contains("if publishStartEffects, pendingAdvance == nil"),
+                   "\(path): normal late acceptance cannot publish start effects for the outgoing identity")
+            let deferred = source.components(separatedBy: "private func acceptIncompleteAssetSanityIfCurrent").last!
+                .components(separatedBy: "private func settleAssetSanityIfPossible").first!
+            expect(deferred.range(of: "assetSanityAttempt.evaluate")!.lowerBound
+                   < deferred.range(of: "assetSanityAttempt.acceptIncompleteEvidence")!.lowerBound,
+                   "\(path): the grace reevaluates late evidence before falling back")
+            let firstFrame = source.components(separatedBy: "let validatingPendingAdvance = pendingAdvanceMetadata != nil").last!
+            expect(firstFrame.range(of: "settleAssetSanityIfPossible")!.lowerBound
+                   < firstFrame.range(of: "commitPendingAdvanceOnFirstFrame")!.lowerBound,
+                   "\(path): full first-frame transaction validates before committing pending identity")
+        }
     }
 
     private static func testAttemptOwnershipAndOneShotVerdict() {

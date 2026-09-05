@@ -1571,21 +1571,25 @@ struct TVPlayerView: View {
         let player = coordinator.player
         let summary = player?.mediaSummary()
         let engineDuration = player?.mediaDurationSeconds() ?? 0
-        let observedDuration = duration > 0 ? duration : engineDuration
+        // Pending properties must not borrow the outgoing episode's duration, tracks, or metadata.
+        let pending = pendingAdvance.flatMap { $0.issued && $0.loadToken == loadToken ? $0 : nil }
+        let observedMetadata = pending?.meta ?? metadata ?? curMeta
+        let observedDuration = pending.map { $0.deferredDuration ?? engineDuration }
+            ?? (duration > 0 ? duration : engineDuration)
         return .init(
             isLibMPV: !(player is AVPlayerEngineController),
-            season: (metadata ?? curMeta)?.season,
-            episode: (metadata ?? curMeta)?.episode,
+            season: observedMetadata?.season,
+            episode: observedMetadata?.episode,
             isLive: isCurrentLiveStream,
             isTrailer: isTrailer,
             claimedResolutionRank: curSourceStream.map(StreamRanking.resolutionRank) ?? 0,
-            actualWidth: summary?.width ?? videoWidth,
-            actualHeight: summary?.height ?? videoHeight,
+            actualWidth: summary?.width ?? (pending == nil ? videoWidth : 0),
+            actualHeight: summary?.height ?? (pending == nil ? videoHeight : 0),
             framesPerSecond: player?.containerFrameRate() ?? 0,
             durationSeconds: observedDuration,
-            trackListObserved: assetSanityTrackListToken == loadToken,
-            audioTrackCount: audioTracks.count,
-            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds(for: metadata)
+            trackListObserved: pending?.deferredTrackList ?? (assetSanityTrackListToken == loadToken),
+            audioTrackCount: pending == nil ? audioTracks.count : (player?.tracks(ofType: "audio").count ?? 0),
+            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds(for: observedMetadata)
         )
     }
 
@@ -1709,9 +1713,20 @@ struct TVPlayerView: View {
                     callbackMatchesPending: true
                   ) else { return false }
         }
+        // A late duration/track receipt may now prove a mismatch. Recheck it before accepting missing data.
+        let latest = assetSanityAttempt.evaluate(owner: loadToken, evidence: assetSanityEvidence(loadToken: loadToken))
+        if latest == .rejected || latest == .settled(.reject) {
+            cancelAssetSanityObservationDeadline()
+            handleRejectedEpisodicAsset(loadToken: loadToken)
+            return false
+        }
         switch assetSanityAttempt.acceptIncompleteEvidence(owner: loadToken) {
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
+            if pendingAdvance != nil {
+                recheckParkedAssetAfterTelemetry(loadToken: loadToken)
+                return pendingAdvance == nil && committedLoadToken == loadToken && hasStartedPlaying
+            }
             // Pending binge validation can hold `hasStartedPlaying` at false while evidence is incomplete.
             // Bounded acceptance proves the frame is usable, so retire the no-frame watchdogs or a healthy
             // 4K fallback can later be misclassified and hopped as if it never started.
@@ -1719,9 +1734,6 @@ struct TVPlayerView: View {
             loadTimeout?.cancel(); loadTimeout = nil
             recoveryDeadline?.cancel(); recoveryDeadline = nil
             avStartWatchdog?.cancel(); avStartWatchdog = nil
-            if pendingAdvance != nil {
-                guard commitPendingAdvanceOnFirstFrame(loadToken: loadToken) else { return false }
-            }
             publishAssetSanityStartEffectsIfNeeded(
                 loadToken: loadToken, position: position
             )
@@ -1755,7 +1767,7 @@ struct TVPlayerView: View {
             return true
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
-            if publishStartEffects {
+            if publishStartEffects, pendingAdvance == nil {
                 publishAssetSanityStartEffectsIfNeeded(
                     loadToken: loadToken, position: position
                 )
@@ -1769,6 +1781,20 @@ struct TVPlayerView: View {
             cancelAssetSanityObservationDeadline()
             return false
         }
+    }
+
+    /// Re-enter the single first-frame transaction after exact pending telemetry arrives. The original
+    /// rendered-frame token is required; duration or tracks alone can never manufacture playback success.
+    private func recheckParkedAssetAfterTelemetry(loadToken: PlayerLoadToken?) {
+        guard let loadToken, let pending = pendingAdvance,
+              pending.issued, pending.generation == episodeSwitchGeneration,
+              pending.loadToken == loadToken,
+              coordinator.player?.activeLoadToken == loadToken,
+              assetSanityDeferredStartToken == loadToken,
+              !hasStartedPlaying else { return }
+        handleProperty(MPVProperty.timePos,
+                       PlayerTimePositionEvent(seconds: assetSanityDeferredStartPosition, loadToken: loadToken),
+                       loadToken: loadToken)
     }
 
     private func handleRejectedEpisodicAsset(loadToken: PlayerLoadToken) {
@@ -1828,6 +1854,7 @@ struct TVPlayerView: View {
            !callbackBelongsToCommittedMedia(loadToken) {
             if pendingAdvance?.issued == true, loadToken == pendingAdvance?.loadToken {
                 pendingAdvance?.deferredDuration = value
+                recheckParkedAssetAfterTelemetry(loadToken: loadToken)
             } else if supersededAdvance?.pending.issued == true,
                       loadToken == supersededAdvance?.pending.loadToken {
                 supersededAdvance?.pending.deferredDuration = value
@@ -1837,6 +1864,7 @@ struct TVPlayerView: View {
         if name == MPVProperty.trackList, !callbackBelongsToCommittedMedia(loadToken) {
             if pendingAdvance?.issued == true, loadToken == pendingAdvance?.loadToken {
                 pendingAdvance?.deferredTrackList = true
+                recheckParkedAssetAfterTelemetry(loadToken: loadToken)
             } else if supersededAdvance?.pending.issued == true,
                       loadToken == supersededAdvance?.pending.loadToken {
                 supersededAdvance?.pending.deferredTrackList = true
