@@ -19,6 +19,16 @@
       "versions": [
         {
           "version": "0.4.0",
+          "buildVersion": "236",
+          "date": "2026-09-05",
+          "localizedDescription": "Apple Beta 2: pause/resume, Dolby Vision recovery, duplicate subtitles, source switching, Continue Watching and Mac settings.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.2/VortX-iOS-v0.4.0-beta.2-ci.ipa",
+          "size": 65113674,
+          "sha256": "f751a9c9a63e55e28e08a3304c4e8dcfb3e8cc0875fd676022661cb75d08c670",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.4.0",
           "buildVersion": "235",
           "date": "2026-09-03",
           "localizedDescription": "0.4 Beta 1: AVPlayer recovery and remux synchronization, episode focus, debrid refresh, update checks, subtitles and previews. Android TV parity is planned separately.",
@@ -86,15 +96,6 @@
           "size": 64243010,
           "sha256": "3feab87f4d005f1726b7c0a0bc83225478907b59bbc2fe54a6fdbd0855618596",
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "219",
-          "date": "2026-08-20",
-          "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-iOS-v0.3.14-beta.17-ci.ipa",
-          "size": 64227247,
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -109,6 +110,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.4.0",
+          "buildVersion": "236",
+          "date": "2026-09-05",
+          "localizedDescription": "Apple Beta 2: pause/resume, Dolby Vision recovery, duplicate subtitles, source switching, Continue Watching and Mac settings.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.2/VortX-tvOS-v0.4.0-beta.2-ci.ipa",
+          "size": 64678475,
+          "sha256": "b6b202bb2dbf9e29f856d126ee7372b8f591e6b8d2a520d8c57e9a57ee0d0c33",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.4.0",
           "buildVersion": "235",
@@ -177,15 +188,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.18/VortX-tvOS-v0.3.14-beta.18-ci.ipa",
           "size": 63680653,
           "sha256": "ea22ad198314a0425ccb589caa3e797c3c8db91c697930cb24881e6f382eb76e",
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "219",
-          "date": "2026-08-20",
-          "localizedDescription": "0.3.14 Beta 17. Source picking and scrub previews fixed, on-device usenet with your own provider, smoother scrubbing and next episode, and an add-on setup fix. In-place update over any earlier build, nothing resets.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.17/VortX-tvOS-v0.3.14-beta.17-ci.ipa",
-          "size": 63660824,
           "minOSVersion": "18.0"
         }
       ]
