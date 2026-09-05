@@ -1612,8 +1612,8 @@ struct PlayerScreen: View {
         cancelAssetSanityObservationDeadline()
     }
 
-    private var assetSanityExpectedRuntimeSeconds: Double? {
-        guard let m = curMeta,
+    private func assetSanityExpectedRuntimeSeconds(for metadata: PlaybackMeta? = nil) -> Double? {
+        guard let m = metadata ?? curMeta,
               let loaded = core.metaDetails?.meta,
               loaded.id == m.libraryId,
               let seconds = loaded.runtimeSeconds,
@@ -1622,7 +1622,8 @@ struct PlayerScreen: View {
     }
 
     private func assetSanityEvidence(
-        loadToken: PlayerLoadToken
+        loadToken: PlayerLoadToken,
+        metadata: PlaybackMeta? = nil
     ) -> EpisodicAssetSanityPolicy.Evidence {
         let player = coordinator.player
         let summary = player?.mediaSummary()
@@ -1641,7 +1642,7 @@ struct PlayerScreen: View {
             durationSeconds: observedDuration,
             trackListObserved: assetSanityTrackListToken == loadToken,
             audioTrackCount: audioTracks.count,
-            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds
+            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds(for: metadata)
         )
     }
 
@@ -1771,13 +1772,16 @@ struct PlayerScreen: View {
     @discardableResult
     private func settleAssetSanityIfPossible(
         loadToken: PlayerLoadToken,
-        position: Double
+        position: Double,
+        metadata: PlaybackMeta? = nil,
+        publishStartEffects: Bool = true
     ) -> Bool {
         guard loadToken == coordinator.player?.activeLoadToken,
-              loadToken == committedLoadToken else { return false }
+              (loadToken == committedLoadToken ||
+               (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)) else { return false }
         switch assetSanityAttempt.evaluate(
             owner: loadToken,
-            evidence: assetSanityEvidence(loadToken: loadToken)
+            evidence: assetSanityEvidence(loadToken: loadToken, metadata: metadata)
         ) {
         case .stale:
             return false
@@ -1786,9 +1790,11 @@ struct PlayerScreen: View {
             return true
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
-            publishAssetSanityStartEffectsIfNeeded(
-                loadToken: loadToken, position: position
-            )
+            if publishStartEffects {
+                publishAssetSanityStartEffectsIfNeeded(
+                    loadToken: loadToken, position: position
+                )
+            }
             return true
         case .rejected:
             cancelAssetSanityObservationDeadline()
@@ -1958,7 +1964,31 @@ struct PlayerScreen: View {
                     let deferredDuration = pendingAdvance?.deferredDuration
                     let deferredTrackList = pendingAdvance?.deferredTrackList == true
                     let deferredSeekable = pendingAdvance?.deferredSeekable
-                    commitPendingAdvanceOnFirstFrame(loadToken: event.loadToken)
+                    let pendingAdvanceMetadata = pendingAdvance?.meta
+                    let validatingPendingAdvance = pendingAdvanceMetadata != nil
+                    // Validate the incoming episode while its identity is still parked. A short audio-less
+                    // preview can render one frame; publishing first made the decoy current before the
+                    // mismatch path could pause and hop away.
+                    assetSanityDeferredStartToken = event.loadToken
+                    assetSanityDeferredStartPosition = d
+                    guard settleAssetSanityIfPossible(
+                        loadToken: event.loadToken,
+                        position: d,
+                        metadata: pendingAdvanceMetadata,
+                        publishStartEffects: !validatingPendingAdvance
+                    ) else { return }
+                    if validatingPendingAdvance {
+                        guard assetSanityAttempt.isAccepted(owner: event.loadToken) else {
+                            // Keep the parked identity and the start watchdog alive while telemetry is still
+                            // incomplete. No first-frame commit is allowed on a mere rendered-frame receipt.
+                            hasStartedPlaying = false
+                            return
+                        }
+                        guard commitPendingAdvanceOnFirstFrame(loadToken: event.loadToken) else { return }
+                        publishAssetSanityStartEffectsIfNeeded(
+                            loadToken: event.loadToken, position: d
+                        )
+                    }
                     if let deferredDuration {
                         handleProperty(MPVProperty.duration, deferredDuration, loadToken: event.loadToken)
                     }
@@ -1968,11 +1998,6 @@ struct PlayerScreen: View {
                     if let deferredSeekable {
                         handleProperty(MPVProperty.seekable, deferredSeekable, loadToken: event.loadToken)
                     }
-                    assetSanityDeferredStartToken = event.loadToken
-                    assetSanityDeferredStartPosition = d
-                    guard settleAssetSanityIfPossible(
-                        loadToken: event.loadToken, position: d
-                    ) else { return }
                     loadTimeout?.cancel()
                     // The retry task can be a native-debrid provider request. An accepted frame cancels it only
                     // when this exact callback token owns that request; a delayed old-item frame must never

@@ -1555,8 +1555,8 @@ struct TVPlayerView: View {
         cancelAssetSanityObservationDeadline()
     }
 
-    private var assetSanityExpectedRuntimeSeconds: Double? {
-        guard let m = curMeta,
+    private func assetSanityExpectedRuntimeSeconds(for metadata: PlaybackMeta? = nil) -> Double? {
+        guard let m = metadata ?? curMeta,
               let loaded = core.metaDetails?.meta,
               loaded.id == m.libraryId,
               let seconds = loaded.runtimeSeconds,
@@ -1565,7 +1565,8 @@ struct TVPlayerView: View {
     }
 
     private func assetSanityEvidence(
-        loadToken: PlayerLoadToken
+        loadToken: PlayerLoadToken,
+        metadata: PlaybackMeta? = nil
     ) -> EpisodicAssetSanityPolicy.Evidence {
         let player = coordinator.player
         let summary = player?.mediaSummary()
@@ -1573,8 +1574,8 @@ struct TVPlayerView: View {
         let observedDuration = duration > 0 ? duration : engineDuration
         return .init(
             isLibMPV: !(player is AVPlayerEngineController),
-            season: curMeta?.season,
-            episode: curMeta?.episode,
+            season: (metadata ?? curMeta)?.season,
+            episode: (metadata ?? curMeta)?.episode,
             isLive: isCurrentLiveStream,
             isTrailer: isTrailer,
             claimedResolutionRank: curSourceStream.map(StreamRanking.resolutionRank) ?? 0,
@@ -1584,7 +1585,7 @@ struct TVPlayerView: View {
             durationSeconds: observedDuration,
             trackListObserved: assetSanityTrackListToken == loadToken,
             audioTrackCount: audioTracks.count,
-            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds
+            expectedRuntimeSeconds: assetSanityExpectedRuntimeSeconds(for: metadata)
         )
     }
 
@@ -1736,13 +1737,16 @@ struct TVPlayerView: View {
     @discardableResult
     private func settleAssetSanityIfPossible(
         loadToken: PlayerLoadToken,
-        position: Double
+        position: Double,
+        metadata: PlaybackMeta? = nil,
+        publishStartEffects: Bool = true
     ) -> Bool {
         guard loadToken == coordinator.player?.activeLoadToken,
-              loadToken == committedLoadToken else { return false }
+              (loadToken == committedLoadToken ||
+               (pendingAdvance?.issued == true && pendingAdvance?.loadToken == loadToken)) else { return false }
         switch assetSanityAttempt.evaluate(
             owner: loadToken,
-            evidence: assetSanityEvidence(loadToken: loadToken)
+            evidence: assetSanityEvidence(loadToken: loadToken, metadata: metadata)
         ) {
         case .stale:
             return false
@@ -1751,9 +1755,11 @@ struct TVPlayerView: View {
             return true
         case .accepted, .settled(.accept):
             cancelAssetSanityObservationDeadline()
-            publishAssetSanityStartEffectsIfNeeded(
-                loadToken: loadToken, position: position
-            )
+            if publishStartEffects {
+                publishAssetSanityStartEffectsIfNeeded(
+                    loadToken: loadToken, position: position
+                )
+            }
             return true
         case .rejected:
             cancelAssetSanityObservationDeadline()
@@ -1980,18 +1986,34 @@ struct TVPlayerView: View {
                     // the engine writes, the display identity, and the stream store all move as one.
                     let deferredDuration = pendingAdvance?.deferredDuration
                     let deferredTrackList = pendingAdvance?.deferredTrackList == true
-                    commitPendingAdvanceOnFirstFrame(loadToken: event.loadToken)
+                    let pendingAdvanceMetadata = pendingAdvance?.meta
+                    let validatingPendingAdvance = pendingAdvanceMetadata != nil
+                    // Validate while the incoming identity is still parked. A short audio-less preview can
+                    // render one frame; committing first made the decoy current before mismatch recovery.
+                    assetSanityDeferredStartToken = event.loadToken
+                    assetSanityDeferredStartPosition = d
+                    guard settleAssetSanityIfPossible(
+                        loadToken: event.loadToken,
+                        position: d,
+                        metadata: pendingAdvanceMetadata,
+                        publishStartEffects: !validatingPendingAdvance
+                    ) else { return }
+                    if validatingPendingAdvance {
+                        guard assetSanityAttempt.isAccepted(owner: event.loadToken) else {
+                            hasStartedPlaying = false
+                            return
+                        }
+                        guard commitPendingAdvanceOnFirstFrame(loadToken: event.loadToken) else { return }
+                        publishAssetSanityStartEffectsIfNeeded(
+                            loadToken: event.loadToken, position: d
+                        )
+                    }
                     if let deferredDuration {
                         handleProperty(MPVProperty.duration, deferredDuration, loadToken: event.loadToken)
                     }
                     if deferredTrackList {
                         handleProperty(MPVProperty.trackList, nil, loadToken: event.loadToken)
                     }
-                    assetSanityDeferredStartToken = event.loadToken
-                    assetSanityDeferredStartPosition = d
-                    guard settleAssetSanityIfPossible(
-                        loadToken: event.loadToken, position: d
-                    ) else { return }
                     if let m = curMeta {
                         onPlaybackIdentityCommitted(m)
                     }
@@ -6546,10 +6568,10 @@ struct TVPlayerView: View {
                     case .cancel:
                         break
                     case .hopSource:
+                        let inputReceipt = terminal.inputBytesRead.map(String.init) ?? "-"
                         DiagnosticsLog.log(
                             "dv",
-                            "remux terminal failure -> source hop (\(terminal.producedBytes)B output, "
-                                + "input=\(terminal.inputBytesRead.map(String.init) ?? "-"))"
+                            "remux terminal failure -> source hop (\(terminal.producedBytes)B output, input=\(inputReceipt))"
                         )
                         if hopToNextSource(reason: "remux terminal failure") { return }
                         DiagnosticsLog.log("dv", "remux terminal failure had no source hop; demoting engine")
