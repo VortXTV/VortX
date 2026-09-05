@@ -505,6 +505,50 @@ _ = independentA.install(
 check("single-flight: two helper instances have independent gates",
       independentA.current != nil && independentB.current == nil && independentB.admit(owner: 10) == .started)
 
+// MARK: - Seek-adjacent EOF recovery (diag-13)
+
+// This is intentionally a distinct state machine from cache flushing. Its most important negative is that
+// accepted commands and a wall-clock alone are never evidence of a recoverable EOF.
+var seekEOF = SeekEOFRecoveryPolicy<Int>()
+seekEOF.begin(owner: 1, target: 631.53, wasPaused: true, origin: .viewer, now: 100)
+check("seek EOF: an accepted manual backseek alone cannot suppress EOF",
+      !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, now: 100.05))
+check("seek EOF: only the same source can observe the seek boundary",
+      seekEOF.observeSeek(owner: 2) == nil && seekEOF.current?.phase == .awaitingSeekEvent)
+check("seek EOF: observed manual backseek EOF is recoverable mid-file",
+      seekEOF.observeSeek(owner: 1) == .seekObserved
+        && seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, now: 100.05))
+let manualIntent = seekEOF.consumeEOFForReload(owner: 1)
+check("seek EOF: one recovery consumes the original terminal candidate",
+      manualIntent?.target == 631.53 && seekEOF.current?.phase == .awaitingReloadFile
+        && !seekEOF.shouldRecoverEOF(owner: 1, duration: 1398.08, now: 100.06))
+check("seek EOF: reload owner is a fresh token and must restore target position before success",
+      seekEOF.adoptReload(owner: 3)?.owner == 3
+        && seekEOF.beginReloadSeek(owner: 3)?.phase == .awaitingReloadSeekEvent
+        && seekEOF.observeSeek(owner: 3) == .awaitingReloadPosition
+        && seekEOF.completeReloadAtPosition(owner: 3, position: 620) == nil
+        && seekEOF.completeReloadAtPosition(owner: 3, position: 631.53)?.wasPaused == true
+        && seekEOF.current == nil)
+
+var clampEOF = SeekEOFRecoveryPolicy<Int>()
+clampEOF.begin(owner: 7, target: 909.992, wasPaused: true, origin: .cacheReanchor, now: 200)
+_ = clampEOF.observeSeek(owner: 7)
+check("seek EOF: paused maintenance reanchor has the same source-fenced mid-file recovery",
+      clampEOF.shouldRecoverEOF(owner: 7, duration: 1398.08, now: 200.1))
+check("seek EOF: true EOF near duration remains terminal",
+      !clampEOF.shouldRecoverEOF(owner: 7, duration: 915, now: 200.1))
+check("seek EOF: unknown duration remains terminal",
+      !clampEOF.shouldRecoverEOF(owner: 7, duration: 0, now: 200.1))
+check("seek EOF: stale source event cannot consume recovery",
+      clampEOF.consumeEOFForReload(owner: 8) == nil && clampEOF.current?.owner == 7)
+check("seek EOF: an old observed seek expires rather than reclassifying a later genuine EOF",
+      !clampEOF.shouldRecoverEOF(owner: 7, duration: 1398.08, now: 206))
+_ = clampEOF.consumeEOFForReload(owner: 7)
+_ = clampEOF.adoptReload(owner: 9)
+check("seek EOF: second EOF during recovery is failure-only, never another completion candidate",
+      clampEOF.reloadIsInFlight(owner: 9)
+        && !clampEOF.shouldRecoverEOF(owner: 9, duration: 1398.08, now: 200.2))
+
 // Source contracts here are intentionally small and semantic: they keep this executable harness useful even
 // when the controller cannot be compiled outside the Apple target. The full command/lifecycle mutants live in
 // MPVCacheFlushReceiptContractTests.swift.

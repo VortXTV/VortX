@@ -199,6 +199,117 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
     }
 }
 
+/// Narrow ownership state for an EOF that arrives immediately after a seek.  This is deliberately
+/// not a timer-based EOF filter: command acceptance is insufficient, and an EOF is recoverable only
+/// after libmpv emitted the seek boundary, for the same source, at a target provably away from a known
+/// finite duration.  The short lifetime only prevents an old seek from reclassifying a genuine EOF much
+/// later in playback.
+struct SeekEOFRecoveryPolicy<Owner: Equatable> {
+    enum Origin: Equatable { case viewer, cacheReanchor }
+    enum Phase: Equatable {
+        case awaitingSeekEvent
+        case seekObserved
+        case awaitingReloadFile
+        case awaitingReloadSeekEvent
+        case awaitingReloadPosition
+    }
+    struct Intent: Equatable {
+        var owner: Owner
+        let target: Double
+        let wasPaused: Bool
+        let issuedAt: TimeInterval
+        let origin: Origin
+        var phase: Phase
+    }
+
+    private(set) var current: Intent?
+
+    mutating func begin(owner: Owner, target: Double, wasPaused: Bool,
+                        origin: Origin, now: TimeInterval) {
+        guard target.isFinite, target >= 0, now.isFinite else { current = nil; return }
+        current = Intent(owner: owner, target: target, wasPaused: wasPaused,
+                         issuedAt: now, origin: origin, phase: .awaitingSeekEvent)
+    }
+
+    /// This is the required libmpv boundary. A successful `mpv_command` alone must never arm recovery.
+    mutating func observeSeek(owner: Owner) -> Phase? {
+        guard var intent = current, intent.owner == owner else { return nil }
+        switch intent.phase {
+        case .awaitingSeekEvent:
+            intent.phase = .seekObserved
+            current = intent
+            return .seekObserved
+        case .awaitingReloadSeekEvent:
+            intent.phase = .awaitingReloadPosition
+            current = intent
+            return .awaitingReloadPosition
+        default:
+            return nil
+        }
+    }
+
+    /// Accept only the diagnosed shape: same source, observed seek, finite VOD, mid-file target, and
+    /// immediate adjacency. The duration/target guard preserves genuine EOF and leaves unknown-duration
+    /// sources entirely on the normal terminal path.
+    func shouldRecoverEOF(owner: Owner, duration: Double, now: TimeInterval,
+                          minimumDistanceFromEnd: Double = 8,
+                          maximumAdjacency: TimeInterval = 5) -> Bool {
+        guard let intent = current, intent.owner == owner, intent.phase == .seekObserved,
+              duration.isFinite, duration > 0, now.isFinite,
+              minimumDistanceFromEnd.isFinite, minimumDistanceFromEnd > 0,
+              maximumAdjacency.isFinite, maximumAdjacency > 0 else { return false }
+        return intent.target < duration - minimumDistanceFromEnd
+            && now >= intent.issuedAt
+            && now - intent.issuedAt <= maximumAdjacency
+    }
+
+    /// Consumes the one allowed recovery attempt. A later EOF while reloading is a failure, not a new
+    /// completion candidate, so it cannot mark the episode watched or advance the playlist.
+    mutating func consumeEOFForReload(owner: Owner) -> Intent? {
+        guard var intent = current, intent.owner == owner, intent.phase == .seekObserved else { return nil }
+        intent.phase = .awaitingReloadFile
+        current = intent
+        return intent
+    }
+
+    mutating func adoptReload(owner: Owner) -> Intent? {
+        guard var intent = current, intent.phase == .awaitingReloadFile else { return nil }
+        intent.owner = owner
+        current = intent
+        return intent
+    }
+
+    mutating func beginReloadSeek(owner: Owner) -> Intent? {
+        guard var intent = current, intent.owner == owner, intent.phase == .awaitingReloadFile else { return nil }
+        intent.phase = .awaitingReloadSeekEvent
+        current = intent
+        return intent
+    }
+
+    mutating func completeReloadAtPosition(owner: Owner, position: Double,
+                                            tolerance: Double = 2) -> Intent? {
+        guard let intent = current, intent.owner == owner,
+              intent.phase == .awaitingReloadPosition,
+              position.isFinite, tolerance.isFinite, tolerance >= 0,
+              abs(position - intent.target) <= tolerance else { return nil }
+        current = nil
+        return intent
+    }
+
+    func reloadIsInFlight(owner: Owner) -> Bool {
+        guard let intent = current, intent.owner == owner else { return false }
+        switch intent.phase {
+        case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition: return true
+        default: return false
+        }
+    }
+
+    mutating func cancel(owner: Owner? = nil) {
+        guard let owner else { current = nil; return }
+        if current?.owner == owner { current = nil }
+    }
+}
+
 /// Dependency-free memory-warning cache-shedding decisions for `MPVMetalViewController`, split out so the
 /// executable test harness can run them without UIKit/libmpv/RemoteConfig (the DVPlaybackContractTests pattern).
 /// Every device-scaled, RemoteConfig-backed number (`floorBytes`, `stepBytes`) is PASSED IN by the controller,
