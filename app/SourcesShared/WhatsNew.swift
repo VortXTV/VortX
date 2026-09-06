@@ -5,7 +5,7 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.9"
+    static let version = "0.4.0-beta.10"
     static let highlights: [String] = [
         "Continue Watching can recover a series' episode list without waiting for all sources. Missing episode metadata no longer makes the player treat the current episode as the series finale and return Home.",
         "Pause time no longer consumes playback recovery deadlines. Manual Play, seek, source changes, and player changes retire old intent so delayed work cannot take control of the new playback session.",

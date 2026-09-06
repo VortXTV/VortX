@@ -4,9 +4,11 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.4.0 Beta 9 - Playback recovery, NNTP streaming, and Continue Watching
+## 0.4.0 Beta 10 - Playback recovery, NNTP streaming, and Continue Watching
 
-**Install this over any earlier build.** Beta 9 brings the Apple playback repairs made since Beta 8 into one update: Continue Watching episode recovery, pause and seek ownership, on-device Usenet streaming, and stricter Dolby Vision output checks. Apple build **242**.
+**Install this over any earlier build.** Beta 10 brings the Apple playback repairs made since Beta 8 into one update: Continue Watching episode recovery, pause and seek ownership, on-device Usenet streaming, and stricter Dolby Vision output checks. Apple build **243**.
+
+Beta 9 did not publish: release validation caught an iOS 16 compatibility error. Beta 10 includes that correction and is built under a new protected tag; no package from the failed build is reused.
 
 ### What's fixed
 
@@ -32,7 +34,7 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **Remote streaming-server Test and Save agree.** Both actions use the same normalized endpoint and validation policy. A response to an older address cannot validate a newer edit, addressing the case where Test reported reachable but Save and Use immediately rejected the server. The shared settings view retains iOS 16 compatibility, with a deployment-target type-check covering its lifecycle handlers.
 
-**Release information is current again.** The in-app What's New version and bundled changelog now identify Beta 9 instead of retaining Beta 2's metadata. The release pipeline verifies the new packages and publishes matching update-feed and AltStore metadata.
+**Release information is current again.** The in-app What's New version and bundled changelog now identify Beta 10 instead of retaining Beta 2's metadata. The release pipeline verifies the new packages and publishes matching update-feed and AltStore metadata.
 
 ### Subtitles and verification
 
@@ -40,7 +42,7 @@ WebVTT timestamp headers now use the canonical LOCAL-then-MPEGTS form. Full cue 
 
 The production AVPlayer/remux harness covers audio-selection recovery, pause, backward seek, playback progress, and failed-selection rollback. Production libmpv checks cover paused/playing cache recovery and fresh-start seek behavior. Focused tests cover Continue Watching inventory and EOF handling, pause clocks, resume ownership, producer re-anchoring, NNTP routing, and DV initialization integrity.
 
-**Built-in subtitle duplication is not declared completely resolved.** The native-renderer repro did not produce usable subtitle-output evidence. A separate risk involving cues extended after subtitle segments have been published remains under investigation; Beta 9 does not introduce an unverified timing rewrite or claim physical Apple TV long-run DV/subtitle validation.
+**Built-in subtitle duplication is not declared completely resolved.** The native-renderer repro did not produce usable subtitle-output evidence. A separate risk involving cues extended after subtitle segments have been published remains under investigation; Beta 10 does not introduce an unverified timing rewrite or claim physical Apple TV long-run DV/subtitle validation.
 
 ### Android
 
@@ -62,7 +64,7 @@ This beta contains **Apple packages only**: iPhone/iPad, Full Apple TV, Lite App
 
 For feed-based updates, use the [VortX AltStore source](https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json). The release includes `SHA256SUMS-ci.txt`; the public [Apple release workflow](https://github.com/VortXTV/VortX/blob/main/.github/workflows/release-tvos.yml) checks the source tag, package metadata, artifact digests, and deployed feeds.
 
-<!-- vortx-build: 242 -->
+<!-- vortx-build: 243 -->
 <!-- vortx-platforms: apple -->
 
 ## 0.4.0-beta.2 (build 236)
