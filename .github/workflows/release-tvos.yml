@@ -968,11 +968,16 @@ jobs:
         with:
           name: VortX-tvOS-ci
           path: |
+            out/VortX-tvOS-ci.ipa
+            out/VortX-tvOS-lite-ci.ipa
+            out/VortX-iOS-ci.ipa
+            out/VortX-macOS-ci.dmg
             out/VortX-tvOS-${{ inputs.release_tag }}-ci.ipa
             out/VortX-tvOS-lite-${{ inputs.release_tag }}-ci.ipa
             out/VortX-iOS-${{ inputs.release_tag }}-ci.ipa
             out/VortX-macOS-${{ inputs.release_tag }}-ci.dmg
             out/SHA256SUMS-ci.txt
+          if-no-files-found: error
 
       - name: Upload the immutable feed handoff
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
