@@ -4,6 +4,67 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.4.0 Beta 9 - Playback recovery, NNTP streaming, and Continue Watching
+
+**Install this over any earlier build.** Beta 9 brings the Apple playback repairs made since Beta 8 into one update: Continue Watching episode recovery, pause and seek ownership, on-device Usenet streaming, and stricter Dolby Vision output checks. Apple build **242**.
+
+### What's fixed
+
+**Continue Watching keeps its episode navigation.** Opening a series from Continue Watching can recover its episode inventory without waiting for every source search to finish. The player validates the returned series and episode before using that inventory. If episode metadata is missing at the end of playback, it opens the episode picker with a refresh path instead of assuming this is the finale and returning Home. Manual Next and Previous can use the recovered inventory.
+
+**The episode you selected remains the episode you return to.** A failed playback attempt no longer restores a different, previously watched episode on the detail page. Source changes also restart any episode-metadata request owned by the current playback session instead of leaving an older request in charge.
+
+**Pausing does not spend the recovery clock.** Startup, resume, and AVPlayer progress recovery measure active playback time, excluding explicit viewer pauses. Play, seek, and source-retry actions update the current transport intent. An older pending operation cannot later reinstate the pause state or position that you have already changed.
+
+**Seeking backward can release a throttled Dolby Vision producer.** Producer buffer accounting is rebuilt from the media that is actually retained after the seek. Position callbacks queued before the seek are rejected, and newly produced segments are counted once. This repairs a path where the producer could remain throttled while the player waited for data.
+
+**AVPlayer restores playback and track choices as separate operations.** Position and pause state are restored when the replacement item is ready; late audio/subtitle group loading cannot seek back to an old position. Audio changes retain their recovery and rollback behavior. A failed external-subtitle download no longer discards the working native selection, and an older download cannot override a newer subtitle choice.
+
+**Changing players uses the current source.** Switching between AVPlayer and VortX Player keeps the selected source URL, required request headers, and current playback context instead of reopening the original launch source. Resume-origin reuse is restricted to the same logical source request. VortX Player also fences EOF recovery to the seek that created it and releases completed cache-refill holds.
+
+**NNTP streaming has a repaired byte pipeline.** Multipart RAR volumes are parsed individually, split archive and HTTP byte ranges are handled consistently, yEnc decoding avoids the previous expensive per-byte path, and normal range-request teardown no longer cancels healthy streaming. NNTP framing, bounded read-ahead, and reusable stream lifecycle receive further fixes. Backup-server responses cannot revive a cancelled reader or inherit a stale primary-server error.
+
+**Paused NNTP playback keeps useful buffered data.** A healthy foreground pause no longer sheds the open Usenet buffer. Local NNTP playback in VortX Player uses an automatic startup cushion rather than relying on the viewer to pause immediately after opening the video. Resume and subsequent manual seeks retain separate ownership. Provider throughput and article availability still determine whether a particular release can sustain playback.
+
+**On-device NNTP is eligible for Dolby Vision when the source qualifies.** The player's own validated loopback NNTP URL is no longer rejected solely for being local. Remux must be enabled and the source must meet the DV path's requirements; non-DV sources and an explicit VortX Player preference remain supported. A local Apple TV URL is not sent to a separate Mac remux server that cannot read it.
+
+**Dolby Vision output must match its declaration.** A failed Profile 7 metadata conversion now stops before the original, incompatible metadata can be muxed under a Profile 8.1 declaration. Missing required DV configuration and an invalid initialization brand also fail explicitly. An already correctly branded init remains valid. These are output-integrity repairs, not a claim that every reported DV stall had this cause.
+
+**Remote streaming-server Test and Save agree.** Both actions use the same normalized endpoint and validation policy. A response to an older address cannot validate a newer edit, addressing the case where Test reported reachable but Save and Use immediately rejected the server.
+
+**Release information is current again.** The in-app What's New version and bundled changelog now identify Beta 9 instead of retaining Beta 2's metadata. The release pipeline verifies the new packages and publishes matching update-feed and AltStore metadata.
+
+### Subtitles and verification
+
+WebVTT timestamp headers now use the canonical LOCAL-then-MPEGTS form. Full cue intervals and stable identities remain intact across segment boundaries.
+
+The production AVPlayer/remux harness covers audio-selection recovery, pause, backward seek, playback progress, and failed-selection rollback. Production libmpv checks cover paused/playing cache recovery and fresh-start seek behavior. Focused tests cover Continue Watching inventory and EOF handling, pause clocks, resume ownership, producer re-anchoring, NNTP routing, and DV initialization integrity.
+
+**Built-in subtitle duplication is not declared completely resolved.** The native-renderer repro did not produce usable subtitle-output evidence. A separate risk involving cues extended after subtitle segments have been published remains under investigation; Beta 9 does not introduce an unverified timing rewrite or claim physical Apple TV long-run DV/subtitle validation.
+
+### Android
+
+This beta contains **Apple packages only**: iPhone/iPad, Full Apple TV, Lite Apple TV, and Mac. Android playback, interface parity, and redesign work remain a separate follow-up; no Android package is attached to this beta.
+
+### Please test
+
+- Open a series from Continue Watching, check the episode list, and use Next/Previous before and after one episode ends.
+- Pause for several minutes, resume, then seek backward and forward in both players. Confirm playback resumes at the requested position.
+- Try an NNTP episode without the manual pause-to-buffer workaround, then test pause/resume and source changes.
+- With remux enabled, test a known compatible DV source and check whether the TV remains in Dolby Vision.
+- Change built-in/external subtitles and audio tracks. If doubled subtitles or a stall remains, export the new diagnostic from this build.
+
+### Install
+
+**Mac:** download the DMG, open it, and copy VortX to Applications.
+
+**iPhone, iPad, and Apple TV:** download the appropriate IPA and sign/install it using your sideloading method. Full Apple TV and Lite Apple TV are separate packages; choose the variant you normally use. See the [installation guide](https://github.com/VortXTV/VortX/wiki/Installing).
+
+For feed-based updates, use the [VortX AltStore source](https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json). The release includes `SHA256SUMS-ci.txt`; the public [Apple release workflow](https://github.com/VortXTV/VortX/blob/main/.github/workflows/release-tvos.yml) checks the source tag, package metadata, artifact digests, and deployed feeds.
+
+<!-- vortx-build: 242 -->
+<!-- vortx-platforms: apple -->
+
 ## 0.4.0-beta.2 (build 236)
 
 This Apple-only beta carries the playback, subtitle, navigation, library, and Mac fixes collected since Beta 1. Android is not attached to this build. Please test this beta on your own Apple devices, especially the Dolby Vision and subtitle cases below.

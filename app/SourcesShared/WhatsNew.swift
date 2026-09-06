@@ -5,16 +5,15 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.2"
+    static let version = "0.4.0-beta.9"
     static let highlights: [String] = [
-        "Dolby Vision recovery remembers a successful DV picture across replacement player items, so a same-stream recovery cannot reset that evidence and reopen HDR10 fallback.",
-        "Built-in subtitle cues retain their full timing and identity across HLS segment boundaries. Proven duplicate ASS render records are removed while distinct dialogue is preserved, and external subtitles wait for native deselection before rendering.",
-        "A failed optional subtitle track no longer fails healthy video. Its last valid playlist remains available, while delayed subtitle preparation does not hold back video playback.",
-        "On Apple TV, iPhone, and iPad, VortX Player cache cleanup now preserves the open file and pause state instead of leaving a frozen, unseekable player after Play. Manual seeks also cancel superseded Continue Watching resume tasks and stale refill recovery.",
-        "Saved Continue Watching positions, manual Next from Continue Watching, episode focus, and current Library and watched-state updates receive further Apple fixes. Old callbacks remain fenced to the playback session that created them.",
-        "Mac returns to its floating in-window Settings design. Apple TV and high-resolution Mac displays can use adaptive 4K hero artwork, with bounded image memory and a safe display fallback.",
-        "Movie sources can be filtered by audio language, tabs and discovery choices stay with their profile, TorBox retries retain the selected title, and Plex linking requests the short code accepted by plex.tv/link.",
-        "This beta contains Apple packages only. Android playback and interface parity continue separately. Physical Apple TV long-run Dolby Vision, subtitle, and extended-pause testing remains important."
+        "Continue Watching can recover a series' episode list without waiting for all sources. Missing episode metadata no longer makes the player treat the current episode as the series finale and return Home.",
+        "Pause time no longer consumes playback recovery deadlines. Manual Play, seek, source changes, and player changes retire old intent so delayed work cannot take control of the new playback session.",
+        "Backward seeks rebuild the Dolby Vision producer's buffer accounting from retained media. AVPlayer track changes restore position and pause state separately from asynchronous audio and subtitle selection.",
+        "NNTP streaming gains faster yEnc decoding, correct multipart RAR volume mapping and byte ranges, cancellation-safe backup reads, preserved paused buffers, and automatic startup cushioning in VortX Player.",
+        "On-device NNTP streams can enter the Dolby Vision remux path when the source qualifies and remux is enabled. Failed Profile 7 conversion and missing required DV initialization metadata now fail explicitly instead of emitting mismatched video.",
+        "Changing players uses the currently selected source and request headers. Remote streaming-server Test and Save use the same endpoint validation, and failed playback preserves the episode you selected.",
+        "This is an Apple-only beta. Long-run Apple TV DV, NNTP pause/seek, and built-in subtitle rendering still need device confirmation; this release does not claim every doubled-subtitle report is resolved."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses
