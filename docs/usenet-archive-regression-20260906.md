@@ -88,6 +88,12 @@ The additional tracked `patch-server-nntp.js` repair addresses:
   them. Fetching the raw response preserves valid XML.
 - GROUP rejection must not prevent ARTICLE by message-ID; this retains existing
   provider compatibility under RFC 3977 section 6.2.1.
+- Reentrant result delivery passed the primary server's missing-article error into
+  a newly subscribed backup-server request before that server responded. Snapshotting
+  and detaching the old subscriber bucket before callbacks preserves the new request.
+  Both a failing-control test and real two-server raw/archive byte-equality tests
+  verify this additional fix. The patch can also update the existing wire-v1 bundle
+  idempotently, without replacing any native app binary.
 
 `node test/server-nntp.test.js` exercises the actual vendored worker, NZB parser,
 scheduler, yEnc decoder, raw-file HTTP route, and split-7z route against local
@@ -95,7 +101,8 @@ synthetic TCP/HTTP servers. It reproduces the unpatched hang and verifies fragme
 status/body/end markers, disconnect/timeout/cancel recovery, exact complete/ranged
 bytes, backward/forward seeks, HEAD, idle same-key reopen, and a stalled-first-piece
 window. Backbone recovery is tested while paused, then all 100 ordered pieces drain
-after resume. `VORTX_NNTP_MEDIA_TEST=1` additionally generates synthetic Matroska video
+after resume. Real primary/backup servers additionally recover missing middle articles
+without corrupting raw or archived bytes. `VORTX_NNTP_MEDIA_TEST=1` generates synthetic Matroska video
 and audio with FFmpeg and decodes both raw and split-archive NNTP HTTP streams.
 
 Separately, failed-before-first-frame playback now returns to the attempted episode

@@ -162,6 +162,15 @@ function once(source, before, after) {
 }
 
 function patch(source) {
+    // A failure callback can synchronously subscribe a backup-server request
+    // for the same article. Never drain that NEW subscription with the old
+    // provider's result or delete its bucket after the callback returns.
+    const deliveryMarker = '/* VortX NNTP subscriber snapshot v1 */';
+    if (!source.includes(deliveryMarker)) {
+        source = once(source,
+            'for (;subscribers[segmentId].length; ) subscribers[segmentId].shift()(err, buffer, group, article, bytes);\n                delete subscribers[segmentId], buffer &&',
+            deliveryMarker + '\n                const deliveries = subscribers[segmentId];\n                delete subscribers[segmentId];\n                for (const deliver of deliveries) deliver(err, buffer, group, article, bytes);\n                buffer &&');
+    } else if (source.split(deliveryMarker).length !== 2) throw new Error("Duplicate NNTP subscriber marker");
     if (source.includes(marker)) {
         if (source.split(marker).length !== 2) throw new Error("Duplicate NNTP patch marker");
         return source;

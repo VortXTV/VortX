@@ -48,7 +48,7 @@ function encode(data, name = "fixture.mkv") {
 function article(body) {
     return Buffer.concat([Buffer.from("220 1 <fixture> article follows\r\nSubject: fixture\r\nMessage-ID: <fixture>\r\n\r\n"), body, Buffer.from(".\r\n")]);
 }
-async function fixture(articles) {
+async function fixture(articles, missing = new Set()) {
     let connections = 0;
     const requested = [];
     const server = net.createServer(socket => {
@@ -75,7 +75,7 @@ async function fixture(articles) {
                 else if (line === "ARTICLE <disconnect>") { socket.write("220 article\r\nSubject: x\r\n\r\npartial"); socket.end(); }
                 else if (line.startsWith("ARTICLE ")) {
                     requested.push(line.slice(9, -1));
-                    const body = articles.get(line.slice(9, -1));
+                    const body = missing.has(line.slice(9, -1)) ? undefined : articles.get(line.slice(9, -1));
                     void send(body ? article(body) : Buffer.from("430 article not found\r\n"));
                 }
             }
@@ -187,6 +187,26 @@ function legacyControl() {
     assert.equal(calls, 0); assert.equal(worker.state, "BUSY");
     console.log("PASS control reproduces old worker permanently BUSY on split article terminator");
 }
+function subscriberTest(requireBundle) {
+    const exercise = subscriber => {
+        const segment = { group: "fixture", article: "backup-handoff" };
+        const received = [];
+        subscriber.subscribe(subscriber.expected([segment]), segment.group, segment.article, () => {
+            subscriber.subscribe(subscriber.expected([segment]), segment.group, segment.article, error => received.push(error));
+        });
+        subscriber.pushSegment("primary missing", null, segment.group, segment.article, 0);
+        return { subscriber, received, segment };
+    };
+    if (!source.includes("/* VortX NNTP subscriber snapshot v1 */")) {
+        const old = exercise(load(source)(1117));
+        assert.deepEqual(old.received, ["primary missing"], "control replays the primary failure into the new backup subscription");
+    }
+    const fixed = exercise(requireBundle(1117));
+    assert.deepEqual(fixed.received, [], "backup waits for its own server response");
+    fixed.subscriber.pushSegment(null, Buffer.from("backup bytes"), fixed.segment.group, fixed.segment.article, 12);
+    assert.deepEqual(fixed.received, [null]);
+    console.log("PASS subscription handoff isolates new backup requests from stale primary results");
+}
 function request(port, pathname, { range, method = "GET", body, cancel = false } = {}) {
     return new Promise((resolve, reject) => {
         const bytes = body && Buffer.from(JSON.stringify(body));
@@ -204,7 +224,7 @@ function request(port, pathname, { range, method = "GET", body, cancel = false }
         req.on("error", reject); req.end(bytes);
     });
 }
-async function httpTests(requireBundle, port, data, segmentSize, articles, archive = false) {
+async function httpTests(requireBundle, port, data, segmentSize, articles, archive = false, backupPort) {
     const route = requireBundle(1088);
     const app = requireBundle(241)();
     const packed = archive && archiveFixture([{ name: "readme.txt", bytes: Buffer.from("not video") }, { name: "video.mkv", bytes: data }]);
@@ -229,7 +249,7 @@ async function httpTests(requireBundle, port, data, segmentSize, articles, archi
     route.setIP("127.0.0.1"); route.setPort(httpPort);
     try {
         const created = await request(httpPort, "/nzb/create", { method: "POST", body: {
-            servers: [`nntp://fixture:fixture@127.0.0.1:${port}/2`], nzbUrl: `http://127.0.0.1:${httpPort}/fixture.nzb` } });
+            servers: [port, backupPort].filter(Boolean).map(value => `nntp://fixture:fixture@127.0.0.1:${value}/2`), nzbUrl: `http://127.0.0.1:${httpPort}/fixture.nzb` } });
         assert.equal(created.status, 200, created.data.toString());
         const key = JSON.parse(created.data).key;
         const link = await request(httpPort, `/nzb/stream?key=${key}`);
@@ -241,7 +261,7 @@ async function httpTests(requireBundle, port, data, segmentSize, articles, archi
             const response = await request(httpPort, streamPath, { range });
             assert.equal(response.status, range ? 206 : 200);
             assert.equal(Number(response.headers["content-length"]), end - start + 1);
-            assert.deepEqual(response.data, data.subarray(start, end + 1), `exact NNTP bytes ${range || "full"}`);
+            assert(response.data.equals(data.subarray(start, end + 1)), `exact NNTP bytes ${range || "full"}`);
         }
         await request(httpPort, streamPath, { cancel: true });
         await delay(140); // crosses accelerated route idle socket retirement
@@ -262,6 +282,7 @@ async function main() {
     assert.equal(patch(patched), patched, "patch is idempotent");
     assert.throws(() => patch("wrong pinned bundle"));
     const requireBundle = load(patched);
+    subscriberTest(requireBundle);
     let data = Buffer.alloc(8 * 32768 + 93);
     for (let i = 0; i < data.length; i++) data[i] = (i * 37 + (i >>> 7)) & 255;
     data[0] = 4; // encoded leading dot exercises dot-stuffing exactly once
@@ -271,20 +292,24 @@ async function main() {
     }
     const articles = new Map();
     for (let i = 0; i * 32768 < data.length; i++) articles.set(`piece${i}`, encode(data.subarray(i * 32768, (i + 1) * 32768)));
-    const nntp = await fixture(articles);
+    const nntp = await fixture(articles, new Set(["raw-0-3", "archive-0-2"]));
+    const backup = await fixture(articles);
     try {
         await wireTests(requireBundle, nntp.port, articles);
         await grabberCloseTest(requireBundle, nntp.port, articles);
         await windowTest(requireBundle, nntp, articles);
-        await httpTests(requireBundle, nntp.port, data, 32768, articles);
+        await httpTests(requireBundle, nntp.port, data, 32768, articles, false, backup.port);
         // A fresh module instance mirrors an independent stream session and
         // avoids retaining the first Express router's mounts across fixtures.
-        await httpTests(load(patched), nntp.port, data, 32768, articles, true);
+        await httpTests(load(patched), nntp.port, data, 32768, articles, true, backup.port);
+        assert(backup.requested.includes("raw-0-3") && backup.requested.includes("archive-0-2"), "real backup server supplied missing primary articles");
+        console.log("PASS real two-provider failover preserves exact raw and archive stream bytes");
     }
     finally {
         for (const timer of timers) clearTimeout(timer);
         for (const socket of sockets) socket.destroy();
         await new Promise(resolve => nntp.server.close(resolve));
+        await new Promise(resolve => backup.server.close(resolve));
     }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
