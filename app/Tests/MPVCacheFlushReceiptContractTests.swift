@@ -314,6 +314,9 @@ private enum MPVCacheFlushReceiptContractTests {
         ) else { return false }
         return ordered(
             [
+                "VortXCacheShedPolicy.shouldClampPausedCache(",
+                "isBackgrounded: UIApplication.shared.applicationState == .background",
+                "foreground paused buffer preserved",
                 "setString(\"demuxer-max-bytes\", Self.clampedCacheCap)",
                 "flushDemuxerCachePreservingPosition(reason: .pausedCacheClamp)",
             ],

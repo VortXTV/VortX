@@ -2059,10 +2059,12 @@ struct PlayerScreen: View {
                         pause: { coordinator.player?.pause() },
                         togglePause: { coordinator.player?.togglePause() },
                         seekBy: { delta in
+                            if handleDeferredResumeUserSeek(.relative(delta)) { return }
                             cancelPendingResumeForUserSeek()
                             coordinator.player?.seek(by: delta)
                         },
                         seekTo: { position in
+                            if handleDeferredResumeUserSeek(.absolute(position)) { return }
                             cancelPendingResumeForUserSeek()
                             coordinator.player?.seek(to: position)
                         },
@@ -3936,6 +3938,42 @@ struct PlayerScreen: View {
         }
     }
 
+    private func handleDeferredResumeUserSeek(_ intent: DeferredResumeUserSeekPolicy.Intent) -> Bool {
+        let unsettled = postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
+            ? postFrameResumeSeekWatchdogTarget : nil
+        switch DeferredResumeUserSeekPolicy.decision(
+            intent: intent, pendingTarget: pendingLibmpvResumeSeek, unsettledTarget: unsettled,
+            firstFrameRendered: hasStartedPlaying, duration: duration
+        ) {
+        case .normal: return false
+        case .ignore: return true
+        case .deferred(let target):
+            pendingLibmpvResumeSeek = target
+            if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+                assetSanityRequestedResume = target
+            }
+            suppressedResumeFloor = nil
+            currentTime = target; lastReported = target
+            DiagnosticsLog.log("playback", "user seek updated deferred resume target=\(target)")
+        case .absolute(let target):
+            cancelPendingResumeForUserSeek()
+            if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+                assetSanityRequestedResume = target
+            }
+            suppressedResumeFloor = nil
+            currentTime = target; lastReported = target
+            coordinator.player?.seek(to: target)
+        case .startAtBeginning:
+            cancelPendingResumeForUserSeek()
+            if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+                assetSanityRequestedResume = 0
+            }
+            suppressedResumeFloor = nil
+            currentTime = 0; lastReported = 0
+        }
+        return true
+    }
+
     /// Watch for a hard stall after playback has started. Both a silent frozen surface and visible buffering
     /// need a bounded recovery owner. Buffering gets a longer allowance so an ordinary short network pause is
     /// not mistaken for a wedged player. Disabled for live, whose reconnect path owns recovery separately.
@@ -4212,7 +4250,7 @@ struct PlayerScreen: View {
         } else if hasStartedPlaying {
             resume = max(currentTime, suppressedResumeFloor ?? 0)
         } else {
-            resume = max(resumeSeconds, suppressedResumeFloor ?? 0)
+            resume = retryResumeTarget()
         }
         let handoff = AVToMPVHandoff(
             url: curURL ?? url,
@@ -4350,7 +4388,7 @@ struct PlayerScreen: View {
         let reissueMediaGeneration = resumeRetryGeneration
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
         avStartWatchdog?.cancel(); avStartWatchdog = nil
-        let resume = hasStartedPlaying ? currentTime : (resumeSeconds > 5 ? resumeSeconds : 0)
+        let resume = retryResumeTarget()
         // Whether the AVPlayer mount we're switching INTO will be the forward-only DV remux: it can't honor a
         // resume seek, so it starts at 0. Capture the real position as a save floor (mirrors tvOS maybeResume)
         // so the periodic / exit saves don't regress the account resume below where the viewer actually was.
@@ -4782,8 +4820,7 @@ struct PlayerScreen: View {
         if let dead = curURL { tried.insert(dead) }
         // `midPlayFailureResume` carries the play head of a source that died MID-PLAY, whose handler had to
         // clear `hasStartedPlaying` for the ladder to admit; without it this hop would restart the episode.
-        let resume: Double = resumeOverride
-            ?? (hasStartedPlaying ? currentTime : (midPlayFailureResume ?? resumeSeconds))
+        let resume: Double = resumeOverride ?? retryResumeTarget()
         srcProbe("hopToNextSource(\(reason)) HOP \(sourceHops)->\(sourceHops + 1) to host=\(newURL.host ?? "-") torrent=\(stream.isTorrent ? "Y" : "N") (candidates=\(srcProbeCandidateCount))")
         guard switchStream(
             to: stream, url: newURL, userInitiated: false,
@@ -4906,8 +4943,7 @@ struct PlayerScreen: View {
         // `midPlayFailureResume` carries the play head of a source that died MID-PLAY, whose handler had to
         // clear `hasStartedPlaying` before the recovery ladder would admit. Without it a switch taken from
         // that state (the viewer picking another source off the error overlay) would restart the episode.
-        let resume = resumeOverride
-            ?? (hasStartedPlaying ? currentTime : (midPlayFailureResume ?? resumeSeconds))
+        let resume = resumeOverride ?? retryResumeTarget()
         let priorPending = pendingAdvance
         // A source switch DURING a pending advance (the auto-hop lane when the incoming episode's first
         // source is dead) swaps WHICH FILE will first-frame, not which episode: keep the pending record
@@ -6389,6 +6425,7 @@ struct PlayerScreen: View {
     /// A9: single logged choke point for a seek so the exportable trail shows every jump (reason, from, to,
     /// duration). maybeResume / nudgeResume and the automatic-skip path log their own dedicated lines.
     private func issueSeek(to target: Double, reason: String) {
+        if handleDeferredResumeUserSeek(.absolute(target)) { return }
         cancelPendingResumeForUserSeek()
         DiagnosticsLog.log(
             "playback",
@@ -6398,6 +6435,7 @@ struct PlayerScreen: View {
     }
 
     private func seekBy(_ delta: Double) {
+        if handleDeferredResumeUserSeek(.relative(delta)) { scheduleHide(); return }
         let target = min(max(currentTime + delta, 0), max(duration - 1, 0))
         issueSeek(to: target, reason: "relative")
         currentTime = target

@@ -71,16 +71,24 @@ check("tvOS resume seek bypasses the manual absolute-seek cache hold",
         && controller.contains("func seekForResume(to seconds: Double)")
         && !section(controller, from: "func seekForResume(to seconds: Double)", to: "func seek(by seconds: Double)")!.contains("armSeekCacheHold()"))
 
-check("tvOS explicit seeks cancel a deferred cold-start resume before issuing the user target",
+check("tvOS user seeks resolve the deferred logical target before ordinary seek cancellation",
       player.contains("private func cancelPendingLibmpvResumeForUserSeek()")
         && player.contains("pendingLibmpvResumeSeek = nil")
         && player.contains("inFlightSeekTarget = nil")
-        && section(player, from: "private func issueSeek(to target: Double", to: "private func seek(_ delta: Double)")?.contains("cancelPendingLibmpvResumeForUserSeek()") == true
-        && section(player, from: "private func seek(_ delta: Double)", to: "private func restart()")?.contains("cancelPendingLibmpvResumeForUserSeek()") == true)
+        && section(player, from: "private func issueSeek(to target: Double", to: "private func seek(_ delta: Double)")?.contains("if handleDeferredResumeUserSeek(.absolute(target)) { return }") == true
+        && section(player, from: "private func seek(_ delta: Double)", to: "private func restart()")?.contains("if handleDeferredResumeUserSeek(.relative(delta))") == true)
 
-check("Now Playing seek closures cancel deferred resume on both Apple surfaces",
-      section(player, from: "NowPlayingCenter.wireCommands(", to: "refreshNowPlaying(at: d")?.contains("cancelPendingLibmpvResumeForUserSeek()") == true
-        && section(playerScreen, from: "NowPlayingCenter.wireCommands(", to: "stepSeconds:")?.contains("cancelPendingResumeForUserSeek()") == true)
+check("Now Playing seek closures share the deferred logical-target policy on both Apple surfaces",
+      section(player, from: "NowPlayingCenter.wireCommands(", to: "refreshNowPlaying(at: d")?.contains("handleDeferredResumeUserSeek(.relative(delta))") == true
+        && section(playerScreen, from: "NowPlayingCenter.wireCommands(", to: "stepSeconds:")?.contains("handleDeferredResumeUserSeek(.relative(delta))") == true)
+
+for surface in [player, playerScreen] {
+    check("both surfaces update the exact active retry owner for positive and zero user targets",
+          surface.contains("assetSanityRequestedResume = target") && surface.contains("assetSanityRequestedResume = 0")
+          && surface.contains("if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner"))
+}
+check("tvOS no-frame deadline consumes the revised pending target, not its original captured offset",
+      section(player, from: "private func startLibmpvResumeWatchdog", to: "private func clearPostFrameResumeSeekWatchdog")?.contains("let currentTarget = pendingLibmpvResumeSeek") == true)
 
 struct DeferredResumeSeekCancellationModel {
     var pending: Double?

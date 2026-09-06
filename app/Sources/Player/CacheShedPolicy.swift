@@ -1,5 +1,16 @@
 import Foundation
 
+/// Buffering only: this does not authorize a URL, forward credentials, or select a player engine.
+/// Recognize the embedded NZB endpoint before its redirect, not every loopback/torrent/proxy URL.
+enum LocalNNTPBufferPolicy {
+    static func waitSeconds(url: URL, live: Bool, preview: Bool) -> Double {
+        guard !live, !preview, url.scheme?.lowercased() == "http",
+              ["127.0.0.1", "localhost", "[::1]", "::1"].contains(url.host?.lowercased() ?? ""),
+              url.path == "/nzb/stream" else { return 1 }
+        return 6
+    }
+}
+
 /// The only finite sources allowed to request the bounded cache re-anchor. Keeping this beside the value gate
 /// makes the gate dependency-free while preventing an arbitrary diagnostic string from becoming ownership data.
 enum CacheFlushReason: String, Equatable {
@@ -439,6 +450,19 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
 /// the 2 GB Apple TV HD (`PerformanceMode.reduced`). Shedding under GENUINE low headroom is therefore
 /// preserved unchanged: the guard only removes the FALSE positives.
 enum VortXCacheShedPolicy {
+
+    /// Pause duration alone is not a pressure signal. A foreground viewer may be deliberately
+    /// accumulating a streaming cushion; flushing it after a timer expires defeats that buffer.
+    /// Background parking and genuinely low process headroom still permit jetsam relief.
+    static func shouldClampPausedCache(
+        isBackgrounded: Bool,
+        availableBytes: UInt64,
+        physicalBytes: UInt64
+    ) -> Bool {
+        isBackgrounded || availableBytes < TVOSProactiveMemoryPressurePolicy.pressureThresholdBytes(
+            physicalMemoryBytes: physicalBytes
+        )
+    }
 
     /// The pinned MPVKit build does not move the forward demuxer payload out of process RAM when
     /// `cache-on-disk` is enabled. Keep this as the single capability authority for both setup and per-load

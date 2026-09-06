@@ -86,6 +86,45 @@ enum DeferredResumePolicy {
     }
 }
 
+/// User input edits an outstanding logical resume, not the engine's still-zero playhead.
+/// Before first frame, retain the cold-pipeline deferral; once warm, replace with an absolute seek.
+enum DeferredResumeUserSeekPolicy {
+    enum Intent { case relative(Double), absolute(Double) }
+    enum Decision: Equatable {
+        case normal
+        case ignore
+        case deferred(Double)
+        case absolute(Double)
+        case startAtBeginning
+    }
+
+    static func decision(
+        intent: Intent,
+        pendingTarget: Double?,
+        unsettledTarget: Double?,
+        firstFrameRendered: Bool,
+        duration: Double
+    ) -> Decision {
+        let value: Double
+        switch intent { case .relative(let v), .absolute(let v): value = v }
+        guard value.isFinite else { return .ignore }
+        let logicalTarget = !firstFrameRendered ? pendingTarget : unsettledTarget
+        guard let logicalTarget, logicalTarget.isFinite, logicalTarget >= 0 else { return .normal }
+        let requested: Double
+        switch intent {
+        case .relative: requested = logicalTarget + value
+        case .absolute: requested = value
+        }
+        guard requested.isFinite else { return .ignore }
+        let target = duration.isFinite && duration > 0
+            ? min(max(0, requested), max(0, duration - 1)) : max(0, requested)
+        if !firstFrameRendered {
+            return target == 0 ? .startAtBeginning : .deferred(target)
+        }
+        return .absolute(target)
+    }
+}
+
 enum DeferredResumeFloorPolicy {
     /// Arm the persistence fence synchronously with the deferred seek. A low first-frame or exit callback can
     /// otherwise overwrite the saved resume before the next polling tick observes a usable duration.

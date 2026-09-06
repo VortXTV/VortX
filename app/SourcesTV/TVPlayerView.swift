@@ -2076,10 +2076,12 @@ struct TVPlayerView: View {
                         pause: { coordinator.player?.pause() },
                         togglePause: { coordinator.player?.togglePause() },
                         seekBy: { delta in
+                            if handleDeferredResumeUserSeek(.relative(delta)) { return }
                             cancelPendingLibmpvResumeForUserSeek()
                             coordinator.player?.seek(by: delta)
                         },
                         seekTo: { position in
+                            if handleDeferredResumeUserSeek(.absolute(position)) { return }
                             cancelPendingLibmpvResumeForUserSeek()
                             coordinator.player?.seek(to: position)
                         },
@@ -6326,7 +6328,7 @@ struct TVPlayerView: View {
         libmpvResumeWatchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(libmpvResumeWatchdogSeconds))
             guard !Task.isCancelled, !hasStartedPlaying,
-                  pendingLibmpvResumeSeek != nil,
+                  let currentTarget = pendingLibmpvResumeSeek,
                   coordinator.player?.activeLoadToken == armedToken else { return }
             let sourceStillCurrent = directAVNoFrameRecovery?.url == (curURL ?? url)
                 && directAVNoFrameRecovery?.episodeGeneration == episodeSwitchGeneration
@@ -6376,7 +6378,7 @@ struct TVPlayerView: View {
             // regressed and the viewer can scrub forward on a warm pipeline. Mirrors the remux `.unreachable`
             // recovery (progress floor + note) plus the existing same-source reload.
             pendingLibmpvResumeSeek = nil
-            let floor = min(max(0, target), max(0, duration - 5))
+            let floor = duration > 0 ? min(max(0, currentTarget), max(0, duration - 5)) : max(0, currentTarget)
             suppressedResumeFloor = floor
             lastSaved = floor
             resumeSeconds = nil   // reload from 0, not the offset that never framed
@@ -6416,6 +6418,52 @@ struct TVPlayerView: View {
         // This marker belongs to the deferred resume seek, not to the user's new seek. The next real tick
         // should therefore be authoritative for the explicit destination and must not be filtered as stale.
         if inFlightSeekTarget == oldTarget { inFlightSeekTarget = nil }
+    }
+
+    /// Returns true when input belongs to the outstanding resume transaction. Never changes Play/Pause.
+    private func handleDeferredResumeUserSeek(_ intent: DeferredResumeUserSeekPolicy.Intent) -> Bool {
+        let unsettled = postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
+            ? postFrameResumeSeekWatchdogTarget : nil
+        let decision = DeferredResumeUserSeekPolicy.decision(
+            intent: intent, pendingTarget: pendingLibmpvResumeSeek, unsettledTarget: unsettled,
+            firstFrameRendered: hasStartedPlaying, duration: duration
+        )
+        switch decision {
+        case .normal: return false
+        case .ignore: return true
+        case .deferred(let target):
+            // Keep the original no-frame deadline; repeated remote taps must not extend it forever.
+            pendingLibmpvResumeSeek = target
+            resumeSeconds = target
+            if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+                assetSanityRequestedResume = target
+            }
+            currentTime = target; lastSaved = target
+            suppressedResumeFloor = nil
+            inFlightSeekTarget = target
+            inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
+            DiagnosticsLog.log("playback", "user seek updated deferred resume target=\(target)")
+        case .absolute(let target):
+            cancelPendingLibmpvResumeForUserSeek()
+            resumeSeconds = target
+            if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+                assetSanityRequestedResume = target
+            }
+            suppressedResumeFloor = nil
+            currentTime = target; lastSaved = target
+            inFlightSeekTarget = target
+            inFlightSeekIssuedAt = Date().timeIntervalSinceReferenceDate
+            coordinator.player?.seek(to: target)
+        case .startAtBeginning:
+            cancelPendingLibmpvResumeForUserSeek()
+            resumeSeconds = 0
+            if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+                assetSanityRequestedResume = 0
+            }
+            suppressedResumeFloor = nil
+            currentTime = 0; lastSaved = 0
+        }
+        return true
     }
 
     private func settlePostFrameResumeSeekIfOwned(target: Double, loadToken: PlayerLoadToken) {
@@ -10090,6 +10138,7 @@ struct TVPlayerView: View {
     /// (an absolute `seek(to:)` arms the cache hold and empties the forward buffer, which a small hop must
     /// not), but they emit the same line for a complete trail. maybeResume logs its own resume line.
     private func issueSeek(to target: Double, reason: String) {
+        if handleDeferredResumeUserSeek(.absolute(target)) { return }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user seek")
         DiagnosticsLog.log(
@@ -10100,6 +10149,7 @@ struct TVPlayerView: View {
     }
 
     private func seek(_ delta: Double) {
+        if handleDeferredResumeUserSeek(.relative(delta)) { flashControls(); return }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user relative seek")
         DiagnosticsLog.log(

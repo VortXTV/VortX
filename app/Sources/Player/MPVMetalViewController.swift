@@ -1593,6 +1593,15 @@ final class MPVMetalViewController: PlatformViewController {
         // userinfo and query string, which must not land in the device's persistent unified log.
         let redactedURL = "\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"
         mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(sidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
+        #if os(tvOS)
+        // Apply before load admission so the first frame cannot outrun the NNTP cushion. A rejected
+        // replacement restores the prior profile, including an outstanding manual-seek hold.
+        let priorCachePauseInitial = getString("cache-pause-initial") ?? "no"
+        let priorCachePauseWait = getString("cache-pause-wait") ?? "1"
+        let nextCachePauseWait = LocalNNTPBufferPolicy.waitSeconds(url: playURL, live: live, preview: startMuted)
+        setString("cache-pause-initial", nextCachePauseWait > 1 ? "yes" : "no")
+        setString("cache-pause-wait", String(nextCachePauseWait))
+        #endif
         // `loadfile replace` mutates the playlist synchronously, while actual loading begins later. Hold the
         // same lock START_FILE takes and consume the immutable entry id returned by this exact command before
         // a racing event can bind. Reading playlist/0 afterward is racy because redirects and START_FILE may
@@ -1661,10 +1670,18 @@ final class MPVMetalViewController: PlatformViewController {
             if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
             #if os(tvOS)
             // A seek cache hold with no pausedForCache release edge must not hold THIS accepted file's start.
+            cachePauseWaitSeconds = nextCachePauseWait
             releaseSeekCacheHoldIfArmed()
+            if nextCachePauseWait > 1 {
+                DiagnosticsLog.log("player", "local NNTP startup/rebuffer cushion=\(Int(nextCachePauseWait))s; memory cap unchanged")
+            }
             #endif
         } else {
             // Rejected replace: preserve the previous source's cache lifecycle and any active single flight.
+            #if os(tvOS)
+            setString("cache-pause-initial", priorCachePauseInitial)
+            setString("cache-pause-wait", priorCachePauseWait)
+            #endif
         }
         return issuedToken
     }
@@ -1819,10 +1836,10 @@ final class MPVMetalViewController: PlatformViewController {
     // re-enables the idle timer, so a few minutes in the SCREENSAVER (its own 4K video pipeline) starts on
     // top, exactly when this app is at its fattest, and jetsam reaps the app: the "start a video, pause
     // for some minutes, app is suddenly gone" crash. Two defenses, both engine-local and reset per load:
-    //  1. Paused clamp: after `pausedClampGraceSeconds` of continuous pause, drop the forward cap to a
-    //     small floor and atomically reanchor the demuxer at its current position. Restored on resume.
-    //  2. Memory warning: the system's last call before jetsam. Clamp to the floor immediately and keep
-    //     it there for the rest of this file; playback survives fine on the small rolling buffer.
+    //  1. Paused clamp: background parking or genuinely low headroom may drop the forward cap and
+    //     reanchor the demuxer. A foreground pause with healthy headroom keeps its downloaded buffer.
+    //  2. Memory warning / proactive sampling: measured pressure lowers the budget in bounded steps;
+    //     sustained recovered headroom can restore it. These remain active while paused.
 
     private static let pausedClampGraceSeconds: TimeInterval = 60
     private static let clampedCacheCap = "48MiB"
@@ -1855,8 +1872,8 @@ final class MPVMetalViewController: PlatformViewController {
         activeReadAheadCap.flatMap(VortXCacheShedPolicy.capBytes) ?? pausedClampFloorBytes
     }
 
-    /// Main-thread mirror of mpv's pause property (posted from the event drain). Arms the paused clamp
-    /// after the grace period, and restores the per-file cache cap on resume.
+    /// Main-thread mirror of mpv's pause property. Checks paused memory pressure after the grace period,
+    /// and restores the per-file cache cap on resume. The timer alone never authorizes eviction.
     private func pausedStateChanged(_ paused: Bool) {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         if paused {
@@ -1930,12 +1947,22 @@ final class MPVMetalViewController: PlatformViewController {
         finishCacheFlushFlight(ended)
     }
 
-    /// `reason` only labels the log line; the decision is identical on both paths. `configuredLiveMode` is
-    /// re-checked here (not only in pausedStateChanged) because enterBackground calls this directly.
+    /// Recheck both transport and real lifecycle/headroom at execution, not when the timer was armed.
+    /// In diag19 a healthy foreground pause discarded 24s of NNTP data and restarted with less than 1s.
+    /// Background parking retains its guard; advisory elapsed pause time does not justify a reanchor.
     private func applyPausedCacheClamp(reason: String = "long pause") {
         guard mpv != nil, !configuredLiveMode, !pausedCacheClamped,
               currentReadAheadBudgetBytes > pausedClampFloorBytes else { return }
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
+        let availableBytes = UInt64(os_proc_available_memory())
+        guard VortXCacheShedPolicy.shouldClampPausedCache(
+            isBackgrounded: UIApplication.shared.applicationState == .background,
+            availableBytes: availableBytes,
+            physicalBytes: ProcessInfo.processInfo.physicalMemory
+        ) else {
+            DiagnosticsLog.log("player", "\(reason): foreground paused buffer preserved, headroom=\(availableBytes >> 20)MiB")
+            return
+        }
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
         let flushDisposition = flushDemuxerCachePreservingPosition(reason: .pausedCacheClamp)
@@ -2917,6 +2944,12 @@ final class MPVMetalViewController: PlatformViewController {
     /// event drain (mirroring pausedStateChanged).
     private var seekCacheHoldArmed = false
 
+    /// A local NNTP load assembles articles on this device, unlike an already-served HTTP file.
+    /// Let mpv prebuffer/rebuffer a cushion automatically without changing the viewer's pause property.
+    /// mpv releases early at EOF or its byte cap, so short/high-bitrate inputs cannot wait for an
+    /// impossible duration. Every accepted source replacement resets this profile.
+    private var cachePauseWaitSeconds = 1.0
+
     /// Bounded, progress-aware watchdog for the OUT-OF-WINDOW scrub refill. An out-of-window jump empties the
     /// forward cache and then refills from a cold mid-file range read; on some sources (slow debrid CDN edges)
     /// that read resyncs slowly or wedges outright - paused-for-cache never clears and the vo never draws again
@@ -2964,7 +2997,7 @@ final class MPVMetalViewController: PlatformViewController {
         guard !startMuted, mpv != nil else { return }
         seekCacheHoldArmed = true
         setString("cache-pause-initial", "yes")
-        setString("cache-pause-wait", "1.5")
+        setString("cache-pause-wait", String(max(1.5, cachePauseWaitSeconds)))
     }
 
     /// Put the cache-pause options back to their fast defaults once the held seek's playback has
@@ -2975,8 +3008,8 @@ final class MPVMetalViewController: PlatformViewController {
         seekCacheHoldArmed = false
         cancelSeekRefillWatchdog()   // the refill reached cache-pause-wait and playback resumed: the wedge net is done
         guard mpv != nil else { return }
-        setString("cache-pause-initial", "no")
-        setString("cache-pause-wait", "1")
+        setString("cache-pause-initial", cachePauseWaitSeconds > 1 ? "yes" : "no")
+        setString("cache-pause-wait", String(cachePauseWaitSeconds))
     }
 
     /// Arm the bounded refill watchdog for the out-of-window seek just issued. Cancels any prior arm (a new

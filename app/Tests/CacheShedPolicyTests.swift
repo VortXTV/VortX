@@ -37,7 +37,36 @@ let twoGiB = UInt64(2) << 30
 let threshold = Proactive.pressureThresholdBytes(physicalMemoryBytes: twoGiB)          // 256 MiB
 let restoreThreshold = Proactive.restoreThresholdBytes(physicalMemoryBytes: twoGiB)    // 512 MiB
 
+// An ordinary foreground pause is how viewers accumulate an NNTP buffer. Elapsed pause time is
+// not memory pressure: diag19 discarded 24.384s after 60s paused, leaving 0.448s on resume.
+check("foreground pause with ample headroom preserves downloaded video",
+      !P.shouldClampPausedCache(isBackgrounded: false, availableBytes: restoreThreshold, physicalBytes: twoGiB))
+check("foreground pause at the pressure boundary preserves downloaded video",
+      !P.shouldClampPausedCache(isBackgrounded: false, availableBytes: threshold, physicalBytes: twoGiB))
+check("foreground pause still relieves genuine memory pressure",
+      P.shouldClampPausedCache(isBackgrounded: false, availableBytes: threshold - 1, physicalBytes: twoGiB))
+check("zero available headroom still permits paused jetsam relief",
+      P.shouldClampPausedCache(isBackgrounded: false, availableBytes: 0, physicalBytes: twoGiB))
+check("background pause retains the parked-player memory guard",
+      P.shouldClampPausedCache(isBackgrounded: true, availableBytes: restoreThreshold * 4, physicalBytes: twoGiB))
+
 // MARK: - The raised, device-scaled floor and the shed rung
+
+for host in ["127.0.0.1", "localhost", "[::1]"] {
+    let localNNTP = URL(string: "http://\(host):11470/nzb/stream?key=synthetic")!
+    check("NNTP automatic startup cushion for \(host)",
+          LocalNNTPBufferPolicy.waitSeconds(url: localNNTP, live: false, preview: false) == 6)
+    check("NNTP live/ambient starts remain unchanged for \(host)",
+          LocalNNTPBufferPolicy.waitSeconds(url: localNNTP, live: true, preview: false) == 1
+          && LocalNNTPBufferPolicy.waitSeconds(url: localNNTP, live: false, preview: true) == 1)
+}
+for spelling in ["http://127.0.0.1:11470/torrent", "http://127.0.0.1:11470/nzb/stream-other",
+                 "http://127.0.0.1:11470/proxy", "http://127.0.0.1:11470/trailer",
+                 "https://cdn.example/video.mkv", "http://192.168.1.10/nzb/stream",
+                 "http://localhost.example/nzb/stream"] {
+    check("non-NNTP source resets to fast standard buffering: \(spelling)",
+          LocalNNTPBufferPolicy.waitSeconds(url: URL(string: spelling)!, live: false, preview: false) == 1)
+}
 
 check("normal shed floor is 192 MiB (up from the old 48 MiB)", P.floorBytes == 192 * mib)
 check("hard-never-below is 150 MiB", P.hardMinFloorBytes == 150 * mib)
