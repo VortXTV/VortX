@@ -627,6 +627,31 @@ if grep -Eq 'contents:\s*write|actions/checkout' <<<"$verify_published_block"; t
 fi
 ok "published-release verifier has least privilege and runs no repository code"
 
+# --- Full tvOS test lane stays TV-only and cannot publish ------------------------------------------
+node - "$APPLE_RELEASE_WF" <<'NODE'
+const fs = require('node:fs'), assert = require('node:assert/strict');
+const workflow = fs.readFileSync(process.argv[2], 'utf8');
+function step(name) {
+    const start = workflow.indexOf('      - name: ' + name + '\n');
+    assert(start >= 0, name);
+    const end = workflow.indexOf('\n      - ', start + 1);
+    return workflow.slice(start, end < 0 ? undefined : end);
+}
+for (const name of ['Build tvOS (Lite)', 'Build iOS', 'Gate iOS-simulator link + dSYM (fail closed)', 'Build macOS', 'Package the IPAs', 'Retain app dSYMs to the private symbols vault (guarded)']) {
+    assert(step(name).includes('if: inputs.tvos_test_only != true'), name + ' must be excluded from TV-only tests');
+}
+for (const name of ['Build tvOS (Full)', 'Smoke-test tvOS launch in a simulator (fail closed)', 'Verify Apple engine artifacts (fail closed)', 'Verify tvOS device artifact metadata (fail closed)', 'Audit bundle symlinks (fail closed)']) {
+    assert(!step(name).includes('if: inputs.tvos_test_only'), name + ' must remain enabled');
+}
+const packaging = step('Package Full tvOS test IPA');
+assert(packaging.includes('unzip -tqq out/VortX-tvOS-ci.ipa'));
+assert(packaging.includes('shasum -a 256 out/VortX-tvOS-ci.ipa'));
+assert(!/hdiutil|VortXTVLite|VortXiOSNative/.test(packaging));
+const guard = step('Constrain Full tvOS test mode to artifact-only builds');
+for (const check of ['[ -z "$TEST_RELEASE_TAG" ]', '[ -z "$TEST_RELEASE_ID" ]', '[ "$TEST_PUBLISH" != "true" ]', 'exit 1']) assert(guard.includes(check));
+console.log('ok: Full tvOS test lane preserves TV gates, skips other app builds, packages only TV, and refuses release writes');
+NODE
+
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then

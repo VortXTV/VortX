@@ -31,6 +31,11 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
+      tvos_test_only:
+        description: "Build and upload only the Full tvOS test IPA. Requires a blank release tag; cannot publish."
+        required: false
+        type: boolean
+        default: false
       release_tag:
         description: "Attach the built apps to this existing release tag (e.g. v0.3.0-beta13). Leave blank to upload as a run artifact only."
         required: false
@@ -92,6 +97,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Constrain Full tvOS test mode to artifact-only builds
+        if: inputs.tvos_test_only == true
+        env:
+          TEST_RELEASE_TAG: ${{ inputs.release_tag }}
+          TEST_RELEASE_ID: ${{ inputs.release_id }}
+          TEST_PUBLISH: ${{ inputs.publish_release }}
+        run: |
+          [ -z "$TEST_RELEASE_TAG" ] && [ -z "$TEST_RELEASE_ID" ] && [ "$TEST_PUBLISH" != "true" ] || {
+            echo "::error::Full tvOS test mode cannot target or publish a release"
+            exit 1
+          }
 
       # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
       # Apple builds BOTH engines: StremioXCore.xcframework from core/ AND VortxEngine.xcframework
@@ -641,6 +658,7 @@ jobs:
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Build tvOS (Lite)
+        if: inputs.tvos_test_only != true
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTVLite \
             -configuration Release -destination 'generic/platform=tvOS' \
@@ -652,6 +670,7 @@ jobs:
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Build iOS
+        if: inputs.tvos_test_only != true
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
             -configuration Release -destination 'generic/platform=iOS' \
@@ -669,6 +688,7 @@ jobs:
       # grep DETECTS and fails the build (the opposite of suppressing a warning); nothing is filtered
       # from the log, which is streamed in full via tee.
       - name: Gate iOS-simulator link + dSYM (fail closed)
+        if: inputs.tvos_test_only != true
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/ios-sim-dsym.log"
@@ -698,6 +718,7 @@ jobs:
           echo "iOS-simulator link + dSYM gate passed: no newer-minOS, no missing-OSO"
 
       - name: Build macOS
+        if: inputs.tvos_test_only != true
         run: |
           # ARCHS=arm64 (not just destination arch): a macOS Release build otherwise compiles the universal
           # ARCHS_STANDARD (arm64 + x86_64), and the StremioXCore.xcframework macOS slice is arm64-only, so the
@@ -714,6 +735,8 @@ jobs:
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Verify tvOS device artifact metadata (fail closed)
+        env:
+          TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
         run: |
           set -euo pipefail
           EXPECTED_MINOS="18.0"
@@ -793,13 +816,15 @@ jobs:
           assert_tvos_build_version \
             "VortXTV" \
             "app/build/ci/Build/Products/Release-appletvos/VortXTV.app/VortXTV"
-          assert_tvos_build_version \
-            "VortXTVLite" \
-            "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app/VortXTVLite"
+          if [ "$TVOS_TEST_ONLY" != "true" ]; then
+            assert_tvos_build_version \
+              "VortXTVLite" \
+              "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app/VortXTVLite"
+          fi
           assert_tvos_build_version \
             "VortXTopShelf" \
             "app/build/ci/Build/Products/Release-appletvos/VortXTV.app/PlugIns/VortXTopShelf.appex/VortXTopShelf"
-          echo "tvOS artifact metadata verified for Full, Lite, and Top Shelf"
+          echo "tvOS artifact metadata verified for every built TV target"
 
       # Fail closed on unsafe symlinks in the SHIPPED bundles. These are the exact .app trees that
       # get zipped into the IPAs and the DMG below, so this is where the check has to run; a
@@ -807,12 +832,18 @@ jobs:
       # escapes its bundle (the shipped `fonts/fonts -> /Users/daksh/...` link was all three on CI),
       # while allowing the legitimate RELATIVE framework symlinks that VortXMac's bundle contains.
       - name: Audit bundle symlinks (fail closed)
+        env:
+          TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
         run: |
-          bash scripts/audit-bundle-symlinks.sh \
-            "app/build/ci/Build/Products/Release-appletvos/VortXTV.app" \
-            "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app" \
-            "app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app" \
-            "app/build/ci-mac/Build/Products/Release/VortX.app"
+          if [ "$TVOS_TEST_ONLY" = "true" ]; then
+            bash scripts/audit-bundle-symlinks.sh "app/build/ci/Build/Products/Release-appletvos/VortXTV.app"
+          else
+            bash scripts/audit-bundle-symlinks.sh \
+              "app/build/ci/Build/Products/Release-appletvos/VortXTV.app" \
+              "app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app" \
+              "app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app" \
+              "app/build/ci-mac/Build/Products/Release/VortX.app"
+          fi
 
       # Private-symbols RETENTION. Keep the five shipped app dSYMs for later crash symbolication in a
       # PRIVATE symbols vault, keyed by the exact release tag + built commit. Must run BEFORE "Package
@@ -821,6 +852,7 @@ jobs:
       # repo. GUARDED: with no SYMBOL_VAULT_TOKEN (provisioned separately) or no release tag to key by,
       # the step SKIPS cleanly (exit 0) and changes nothing, so it is a no-op on ordinary pushes today.
       - name: Retain app dSYMs to the private symbols vault (guarded)
+        if: inputs.tvos_test_only != true
         env:
           # Distinct from GITHUB_TOKEN and ENGINE_REPO_TOKEN: a narrowly scoped token for the symbols
           # vault only. Absent today (provisioned separately), which makes the step skip.
@@ -884,7 +916,18 @@ jobs:
           gh release upload -R "$VAULT" -- "$VAULT_TAG" "$BUNDLE"
           echo "private dSYM retention complete: $VAULT $VAULT_TAG"
 
+      - name: Package Full tvOS test IPA
+        if: inputs.tvos_test_only == true
+        run: |
+          set -euo pipefail
+          mkdir -p out/full/Payload
+          mv app/build/ci/Build/Products/Release-appletvos/VortXTV.app out/full/Payload/
+          (cd out/full && zip -qry ../VortX-tvOS-ci.ipa Payload)
+          unzip -tqq out/VortX-tvOS-ci.ipa
+          shasum -a 256 out/VortX-tvOS-ci.ipa | tee out/SHA256SUMS-ci.txt
+
       - name: Package the IPAs
+        if: inputs.tvos_test_only != true
         run: |
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
           mv app/build/ci/Build/Products/Release-appletvos/VortXTV.app out/full/Payload/
