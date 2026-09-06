@@ -11,7 +11,7 @@ const net = require("node:net");
 const http = require("node:http");
 const { patch } = require("../scripts/patch-server-nntp.js");
 const { patch: patchArchive } = require("../scripts/patch-server-usenet.js");
-const { fixture: archiveFixture } = require("./server-usenet-archive.test.js");
+const { fixture: archiveFixture, rarFixture } = require("./server-usenet-archive.test.js");
 const execFile = require("node:util").promisify(require("node:child_process").execFile);
 const source = fs.readFileSync(process.argv[2] || path.join(__dirname, "../app/Resources/server.js"), "utf8");
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -47,6 +47,41 @@ function encode(data, name = "fixture.mkv") {
 }
 function article(body) {
     return Buffer.concat([Buffer.from("220 1 <fixture> article follows\r\nSubject: fixture\r\nMessage-ID: <fixture>\r\n\r\n"), body, Buffer.from(".\r\n")]);
+}
+
+function decoderByteExactTests(requireBundle) {
+    const baseline = load(source)(1115), decoded = requireBundle(1115);
+    const payload = Buffer.alloc(768 * 1024);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 37 + (i >>> 7)) & 255;
+    payload[0] = 4; // leading dot, plus all 256 values throughout the fixture
+    const encoded = encode(payload, "episode=é.mkv");
+    const corpus = [encoded, encoded.subarray(0, -2),
+        Buffer.from(encoded.toString("latin1").replace(/\r\n/g, "\n"), "latin1"),
+        Buffer.from(encoded.toString("latin1").replace(/\r\n/g, "\r"), "latin1"),
+        Buffer.from("=ybegin name=\r\n=ypart begin=1 end=2\r\n\r\n..=j\r\n=yend\r\n"),
+        Buffer.from("=ybegin name=x\n==\nA=\nB\n=yend"),
+        Buffer.from("=ybegin name=x\r.\r..\r...\r=yunknown\r=yend"),
+        Buffer.from("=ybegin name=x\nAA\n"), // incomplete: same zero-filled vendor result
+        encode(Buffer.alloc(0))];
+    const crc = requireBundle(1116).unsigned(payload).toString(16);
+    corpus.push(Buffer.from(encoded.toString("latin1").replace(/=yend[^\r]*/, `=yend size=${payload.length} pcrc32=000${crc}`), "latin1"));
+    for (const [index, input] of corpus.entries()) {
+        const expected = baseline(input), actual = decoded(input);
+        assert.equal(actual[0], expected[0], `decoder filename ${index}`);
+        assert.deepEqual(actual[1], expected[1], `decoder bytes ${index}`);
+    }
+    assert.deepEqual(decoded(encoded)[1], payload, "full article preserves every byte");
+    // Same workload, same process, same JIT mode. Timing is diagnostic, never a flaky CI pass threshold.
+    const timing = decoder => {
+        const samples = [];
+        for (let i = 0; i < 7; i++) {
+            const start = performance.now();
+            assert.deepEqual(decoder(encoded)[1], payload);
+            samples.push(performance.now() - start);
+        }
+        return samples.sort((a, b) => a - b)[3].toFixed(2);
+    };
+    console.log(`PASS byte-exact vendor/optimized yEnc corpus; 768KiB median old=${timing(baseline)}ms new=${timing(decoded)}ms`);
 }
 async function fixture(articles, missing = new Set()) {
     let connections = 0;
@@ -250,13 +285,17 @@ function request(port, pathname, { range, method = "GET", body, cancel = false }
 async function httpTests(requireBundle, port, data, segmentSize, articles, archive = false, backupPort) {
     const route = requireBundle(1088);
     const app = requireBundle(241)();
-    const packed = archive && archiveFixture([{ name: "readme.txt", bytes: Buffer.from("not video") }, { name: "video.mkv", bytes: data }]);
-    const files = archive ? [packed.subarray(0, 131072), packed.subarray(131072, 262144), packed.subarray(262144)] : [data];
+    const rawRAR = archive === "rar", kind = rawRAR ? "rar" : archive ? "archive" : "raw";
+    const packed = archive && !rawRAR && archiveFixture([{ name: "readme.txt", bytes: Buffer.from("not video") }, { name: "video.mkv", bytes: data }]);
+    const split = Math.floor(data.length / 2);
+    const files = rawRAR ? rarFixture(data, [split, data.length - split]).map(file => file.bytes)
+        : archive ? [packed.subarray(0, 131072), packed.subarray(131072, 262144), packed.subarray(262144)] : [data];
     const nzbFiles = files.map((bytes, index) => {
-        const name = archive ? `archive.7z.${String(index + 1).padStart(3, "0")}` : "fixture.mkv";
+        const name = rawRAR ? `fixture.part${String(index + 1).padStart(2, "0")}.rar`
+            : archive ? `archive.7z.${String(index + 1).padStart(3, "0")}` : "fixture.mkv";
         const segments = [];
         for (let i = 0; i * segmentSize < bytes.length; i++) {
-            const id = `${archive ? "archive" : "raw"}-${index}-${i}`;
+            const id = `${kind}-${index}-${i}`;
             articles.set(id, encode(bytes.subarray(i * segmentSize, (i + 1) * segmentSize), name));
             segments.push(`<segment bytes="${segmentSize}" number="${i + 1}">${id}</segment>`);
         }
@@ -266,6 +305,7 @@ async function httpTests(requireBundle, port, data, segmentSize, articles, archi
     app.get("/fixture.nzb", (_, res) => res.type("application/xml").send(nzb));
     app.use("/nzb", route.router());
     app.use("/7zip", requireBundle(1287)());
+    app.use("/rar", requireBundle(1121)());
     const server = http.createServer(app);
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     const httpPort = server.address().port;
@@ -294,9 +334,9 @@ async function httpTests(requireBundle, port, data, segmentSize, articles, archi
         assert.equal(head.status, 206); assert.equal(head.data.length, 0);
         if (process.env.VORTX_NNTP_MEDIA_TEST === "1") {
             await execFile("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", `http://127.0.0.1:${httpPort}${streamPath}`, "-f", "null", "-"], { timeout: 20000 });
-            console.log(`PASS actual FFmpeg video/audio decode over ${archive ? "split 7z" : "raw MKV"} NNTP HTTP route`);
+            console.log(`PASS actual FFmpeg video/audio decode over ${kind} NNTP HTTP route`);
         }
-        console.log(`PASS real ${archive ? "split-7z" : "raw-file"} NZB→NNTP→yEnc→HTTP: full file, one byte, forward/backward seeks, cancellation, idle pause/reopen and HEAD`);
+        console.log(`PASS real ${kind} NZB→NNTP→yEnc→HTTP: full file, one byte, forward/backward seeks, cancellation, idle pause/reopen and HEAD`);
     } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 }
 async function main() {
@@ -305,6 +345,9 @@ async function main() {
     assert.equal(patch(patched), patched, "patch is idempotent");
     assert.throws(() => patch("wrong pinned bundle"));
     const requireBundle = load(patched);
+    assert(patched.includes("/* VortX yEnc byte decoder v1 */"));
+    assert(!patched.includes("results.push(buffer[i++] = code)"));
+    decoderByteExactTests(requireBundle);
     subscriberTest(requireBundle);
     cancelledBackboneTest(requireBundle);
     let data = Buffer.alloc(8 * 32768 + 93);
@@ -316,7 +359,7 @@ async function main() {
     }
     const articles = new Map();
     for (let i = 0; i * 32768 < data.length; i++) articles.set(`piece${i}`, encode(data.subarray(i * 32768, (i + 1) * 32768)));
-    const nntp = await fixture(articles, new Set(["raw-0-3", "archive-0-2"]));
+    const nntp = await fixture(articles, new Set(["raw-0-3", "archive-0-2", "rar-0-3"]));
     const backup = await fixture(articles);
     try {
         await wireTests(requireBundle, nntp.port, articles);
@@ -326,7 +369,8 @@ async function main() {
         // A fresh module instance mirrors an independent stream session and
         // avoids retaining the first Express router's mounts across fixtures.
         await httpTests(load(patched), nntp.port, data, 32768, articles, true, backup.port);
-        assert(backup.requested.includes("raw-0-3") && backup.requested.includes("archive-0-2"), "real backup server supplied missing primary articles");
+        await httpTests(load(patched), nntp.port, data, 32768, articles, "rar", backup.port);
+        assert(backup.requested.includes("raw-0-3") && backup.requested.includes("archive-0-2") && backup.requested.includes("rar-0-3"), "real backup server supplied missing primary articles");
         console.log("PASS real two-provider failover preserves exact raw and archive stream bytes");
     }
     finally {

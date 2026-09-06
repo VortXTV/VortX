@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-// Deterministic post-checksum patch of the pinned server's split-7z reader.
+// Deterministic post-checksum patch of the pinned server's archive readers.
 // Keep this tracked: Resources/server.js is a generated, ignored build input.
 const fs = require("node:fs");
 const path = require("node:path");
@@ -188,7 +188,7 @@ async function serveArchiveFile(req, res, file) {
     }
 }
 
-function patch(source) {
+function patch7z(source) {
     if (source.includes(marker)) { unique(source, marker); return source; }
     const anchor = 'var _events = __webpack_require__(4), ZXX_EXTENSION = /\\.7Z';
     const index = unique(source, anchor);
@@ -248,10 +248,78 @@ function patch(source) {
     return beforeRouter + router + reader.replace('    "use strict";', '    "use strict";\n    ' + marker) + suffix;
 }
 
+async function parseRARVolumes(files, opts) {
+    // A split file's unpackedSize is its TOTAL size, not the bytes remaining
+    // after the current part. Never infer later payload offsets or part counts
+    // from it. Read each volume's own headers, in a small bounded pool so a
+    // 75-part release does not require 75 serialized network round trips.
+    const results = new Array(files.length);
+    let next = 0, failure;
+    const worker = async () => {
+        while (!failure && next < files.length) {
+            const index = next++;
+            try {
+                results[index] = (await this.parseFile(files[index], opts)).chunks;
+            } catch (error) { failure = error || new Error("RAR volume header read failed"); }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, files.length) }, worker));
+    if (failure) throw failure;
+    return results;
+}
+
+function patchRawRAR(source) {
+    const rawMarker = "/* VortX raw-RAR byte ranges v1 */";
+    if (source.includes(rawMarker)) { unique(source, rawMarker); return source; }
+    const at = unique(source, 'var _events = __webpack_require__(4), RXX_EXTENSION = /\\.R');
+    const start = source.lastIndexOf('\n}, function(module, exports, __webpack_require__) {', at);
+    const end = source.indexOf('\n}, function(module, exports, __webpack_require__) {', at);
+    if (start < 0 || end < at) throw new Error("Usenet patch: missing raw RAR reader boundary");
+    let reader = source.slice(start, end);
+    reader = replaceBetween(reader, '            const parsedFileChunks = [], {files: files} = this.rarFileBundle;',
+        '            const fileChunks = parsedFileChunks.flat()',
+        '            const {files} = this.rarFileBundle;\n' +
+        '            const parsedFileChunks = await parseRARVolumes.call(this, files, opts);\n' +
+        '            if (parsedFileChunks.some(chunks => !chunks.length)) { this.emit("parsing-complete", []); return []; }\n');
+    reader = replaceOnce(reader, '    exports.LocalFileMedia = class {',
+        '    ' + parseRARVolumes.toString() + '\n    exports.LocalFileMedia = class {');
+    reader = replaceOnce(reader, 'return Math.max(0, this.endOffset - this.startOffset);',
+        'return Math.max(0, this.endOffset - this.startOffset + 1);');
+    reader = replaceBetween(reader, 'InnerFileStream = class extends _stream.Readable {', '}, streamToBuffer = async stream',
+        'InnerFileStream = ' + ArchiveInnerStream.toString().replace('extends require("node:stream").Readable', 'extends _stream.Readable').replace(/\}\s*$/, ''));
+    reader = replaceBetween(reader, '                getChunksToStream(fileStart, fileEnd) {', '                createReadStream(interval) {',
+        `                getChunksToStream(fileStart, fileEnd) {
+                    const first = this.findMappedChunk(fileStart), last = this.findMappedChunk(fileEnd);
+                    const chunks = this.rarFileChunks.slice(first.index, last.index + 1);
+                    chunks[0] = chunks[0].padStart(fileStart - first.start);
+                    chunks[chunks.length - 1] = chunks[chunks.length - 1].padEnd(last.end - fileEnd);
+                    return chunks;
+                }
+`);
+    reader = replaceOnce(reader, 'if (start < 0 || end >= this.length) throw Error("Illegal start/end offset");',
+        'if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || end >= this.length) throw Error("Illegal start/end offset");');
+    reader = replaceOnce(reader, 'const start = fileOffset, end = fileOffset + chunk.length;',
+        'const start = fileOffset, end = fileOffset + chunk.length - 1;');
+    reader = replaceBetween(reader, '                    let selectedMap = this.chunkMap[0];', '                    return selectedMap;',
+        '                    const selectedMap = this.chunkMap.find(mapping => offset >= mapping.start && offset <= mapping.end);\n' +
+        '                    if (!selectedMap) throw new Error("Archive seek is outside the file");\n');
+    source = source.slice(0, start) + reader.replace('    "use strict";', '    "use strict";\n    ' + rawMarker) + source.slice(end);
+    const routerAt = unique(source, 'const Router = __webpack_require__(109), bodyParser = __webpack_require__(50), getRarStream = __webpack_require__(514)');
+    const routerEnd = source.indexOf('\n}, function(module, exports, __webpack_require__) {', routerAt);
+    if (routerEnd < routerAt) throw new Error("Usenet patch: missing raw RAR router boundary");
+    let router = source.slice(routerAt, routerEnd);
+    router = replaceBetween(router, '            if ("HEAD" === req.method)', '        })), router;',
+        '            return serveArchiveFile(req, res, rarInnerFile);\n');
+    router = replaceOnce(router, '    module.exports = function() {', serveArchiveFile.toString() + '\n    module.exports = function() {');
+    return source.slice(0, routerAt) + router + source.slice(routerEnd);
+}
+
+function patch(source) { return patchRawRAR(patch7z(source)); }
+
 module.exports = { patch };
 if (require.main === module) {
     const target = process.argv[2] || path.join(__dirname, "../app/Resources/server.js");
     const input = fs.readFileSync(target, "utf8"), output = patch(input);
     if (output !== input) fs.writeFileSync(target, output);
-    console.log("Usenet split-7z byte-range patch verified");
+    console.log("Usenet split-7z and raw-RAR byte-range patches verified");
 }

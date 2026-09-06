@@ -161,6 +161,81 @@ function once(source, before, after) {
     return source.slice(0, at) + after + source.slice(at + before.length);
 }
 
+// NodeMobile on tvOS runs without a JIT. The old decoder built two JavaScript arrays per
+// physical line and pushed every byte twice, plus allocated a Buffer/string to recognize
+// headers on every payload line. Keep payload byte-oriented and allocate only the output.
+function createYencDecoder(crc32, log) {
+    return function(input) {
+        // Keep the vendor's zero-filled result for incomplete/no-trailer articles, too.
+        let buffer = Buffer.alloc(input.length), filename = null, out = 0;
+        function processLine(start, end) {
+            if (start === end) return;
+            if (end - start > 1 && input[start] === 46 && input[start + 1] === 46) start++;
+            let directive = 0;
+            if (input[start] === 61 && input[start + 1] === 121) {
+                if (end - start >= 7 && input[start + 2] === 98 && input[start + 3] === 101 &&
+                    input[start + 4] === 103 && input[start + 5] === 105 && input[start + 6] === 110) directive = 1;
+                else if (end - start >= 6 && input[start + 2] === 112 && input[start + 3] === 97 &&
+                    input[start + 4] === 114 && input[start + 5] === 116) directive = 2;
+                else if (end - start >= 5 && input[start + 2] === 101 && input[start + 3] === 110 &&
+                    input[start + 4] === 100) directive = 3;
+            }
+            if (directive) {
+                const line = input.toString("utf8", start, end);
+                if (directive === 1) {
+                    const match = line.match(/name\=(.*)/);
+                    if (match) filename = match[1];
+                } else if (directive === 3) {
+                    buffer = buffer.subarray(0, out);
+                    const match = line.match(/pcrc32\=([^\s]*)/);
+                    if (match) {
+                        const expected = match[1].toLowerCase().replace(/^0+/, "");
+                        const actual = crc32.unsigned(buffer).toString(16).toLowerCase().replace(/^0+/, "");
+                        if (actual !== expected) log.err("File " + filename.bold + " crc fail, expected " + expected + " got " + actual);
+                    }
+                }
+                return;
+            }
+            for (; start < end; start++) {
+                let code = input[start];
+                if (code === 61) {
+                    // Escape state ends at physical EOL, matching the pinned decoder.
+                    if (++start >= end) return;
+                    code = input[start] - 64;
+                }
+                buffer[out++] = (code - 42) & 255;
+            }
+        }
+        // Native Buffer searches avoid a second interpreted per-byte pass. Cache each next
+        // delimiter so LF-only/CR-only input stays linear, rather than rescanning its tail.
+        let start = 0, cr = input.indexOf(13), lf = input.indexOf(10);
+        while (cr >= 0 || lf >= 0) {
+            const end = cr < 0 ? lf : lf < 0 ? cr : Math.min(cr, lf);
+            processLine(start, end);
+            start = end + 1;
+            if (cr === end) cr = input.indexOf(13, start);
+            if (lf === end) lf = input.indexOf(10, start);
+        }
+        processLine(start, input.length);
+        return [filename, buffer];
+    };
+}
+
+function patchYenc(source) {
+    const yencMarker = "/* VortX yEnc byte decoder v1 */";
+    if (source.includes(yencMarker)) {
+        if (source.split(yencMarker).length !== 2) throw new Error("Duplicate yEnc decoder marker");
+        return source;
+    }
+    const anchor = "    var c, char, crc32, k, len, log, ref;\n    for (crc32 = __webpack_require__(1116), log = __webpack_require__(245), c = {}, ";
+    const at = source.indexOf(anchor);
+    if (at < 0 || source.indexOf(anchor, at + anchor.length) >= 0) throw new Error("yEnc module missing/ambiguous");
+    const end = source.indexOf("\n}, function(module, exports, __webpack_require__) {", at);
+    if (end < 0) throw new Error("yEnc module boundary missing");
+    return source.slice(0, at) + "    " + yencMarker + "\n    module.exports = (" + createYencDecoder.toString() +
+        ")(__webpack_require__(1116), __webpack_require__(245));" + source.slice(end);
+}
+
 function patchCancellation(source) {
     const stopMarker = '/* VortX NNTP response retirement v1 */';
     if (source.includes(stopMarker)) {
@@ -191,6 +266,7 @@ function patchCancellation(source) {
 }
 
 function patch(source) {
+    source = patchYenc(source);
     // A failure callback can synchronously subscribe a backup-server request
     // for the same article. Never drain that NEW subscription with the old
     // provider's result or delete its bucket after the callback returns.
@@ -270,7 +346,7 @@ function patch(source) {
     return patchCancellation(source);
 }
 
-module.exports = { patch, createWorker };
+module.exports = { patch, createWorker, createYencDecoder };
 if (require.main === module) {
     const target = process.argv[2] || path.join(__dirname, "../app/Resources/server.js");
     const input = fs.readFileSync(target, "utf8"), output = patch(input);

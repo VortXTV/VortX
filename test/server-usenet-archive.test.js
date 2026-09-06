@@ -13,11 +13,11 @@ const { patch } = require("../scripts/patch-server-usenet.js");
 const root = path.resolve(__dirname, "..");
 const source = fs.readFileSync(process.argv[2] || path.join(root, "app/Resources/server.js"), "utf8");
 
-function loadReader(bundle) {
-    const at = bundle.indexOf('var _events = __webpack_require__(4), ZXX_EXTENSION = /\\.7Z');
+function loadReader(bundle, rawRAR = false) {
+    const at = bundle.indexOf(rawRAR ? 'var _events = __webpack_require__(4), RXX_EXTENSION = /\\.R' : 'var _events = __webpack_require__(4), ZXX_EXTENSION = /\\.7Z');
     assert(at > 0, "actual 7z parser is present");
     const start = bundle.lastIndexOf('function(module, exports, __webpack_require__) {', at);
-    const end = bundle.indexOf('\n}, function(module, exports)', at) + 2;
+    const end = bundle.indexOf(rawRAR ? '\n}, function(module, exports, __webpack_require__) {' : '\n}, function(module, exports)', at) + 2;
     const deps = { 4: require("node:events"), 3: require("node:stream"), 5: path, 1: fs,
         1289: { decompress() { throw new Error("Fixture headers are intentionally uncompressed"); } } };
     const context = { Buffer, process, console: { log() {}, error() {} } };
@@ -27,15 +27,17 @@ function loadReader(bundle) {
     return module.exports.RarFilesPackage;
 }
 
-function loadRoute(bundle, file) {
-    const at = bundle.indexOf('const Router = __webpack_require__(109), bodyParser = __webpack_require__(50), getRarStream = __webpack_require__(561)');
+function loadRoute(bundle, file, rawRAR = false) {
+    const at = bundle.indexOf('const Router = __webpack_require__(109), bodyParser = __webpack_require__(50), getRarStream = __webpack_require__(' + (rawRAR ? 514 : 561) + ')');
     const start = bundle.lastIndexOf('function(module, exports, __webpack_require__) {', at);
     const end = bundle.indexOf('\n}, function(module, exports, __webpack_require__)', at) + 2;
     let handler;
     const router = { use() { return this; }, post() { return this; }, all() { return this; }, get(_, fn) { handler = fn; return this; } };
     const deps = { 109: () => router, 50: { json() {} }, 561: async () => file,
         1292: () => "video/x-matroska", 169: {}, 278: {}, 4: require("node:events"),
-        1293: { createKey() {}, async waitForKey() {} } };
+        1293: { createKey() {}, async waitForKey() {} }, 514: async () => file,
+        1231: () => "video/x-matroska", 162: {}, 272: {},
+        1232: { createKey() {}, async waitForKey() {} } };
     const factory = vm.runInNewContext('(' + bundle.slice(start, end) + ')', { console });
     const module = { exports: {} };
     factory(module, module.exports, id => { assert(id in deps, String(id)); return deps[id]; });
@@ -57,8 +59,8 @@ function loadURLMedia(bundle, get) {
     return module.exports;
 }
 
-async function testHTTP(bundle, file, expected) {
-    const handler = loadRoute(bundle, file);
+async function testHTTP(bundle, file, expected, rawRAR = false) {
+    const handler = loadRoute(bundle, file, rawRAR);
     const server = http.createServer((req, res) => { handler(req, res).catch(error => { res.destroy(error); }); });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
     const request = (range, method = "GET") => new Promise((resolve, reject) => {
@@ -155,6 +157,37 @@ async function buffer(input) {
     const data = []; for await (const chunk of input) data.push(chunk); return Buffer.concat(data);
 }
 
+// Small stored RAR4 volumes exercise the actual raw reader used by /rar/stream (not the 7z twin).
+function rarFixture(payload, sizes = [payload.length], headerPadding = () => 0) {
+    function crc32(bytes) {
+        let crc = -1;
+        for (const byte of bytes) {
+            crc ^= byte;
+            for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+        }
+        return (crc ^ -1) >>> 0;
+    }
+    function seal(header) { header.writeUInt16LE(crc32(header.subarray(2)) & 65535); return header; }
+    let offset = 0;
+    return sizes.map((size, index) => {
+        const data = payload.subarray(offset, offset + size); offset += size;
+        const archive = Buffer.alloc(13); archive[2] = 0x73;
+        archive.writeUInt16LE(sizes.length > 1 ? 1 : 0, 3); archive.writeUInt16LE(13, 5);
+        const name = Buffer.from("video.mkv"), file = Buffer.alloc(32 + name.length + headerPadding(index));
+        file[2] = 0x74;
+        file.writeUInt16LE(0x8000 | (index > 0 ? 1 : 0) | (index < sizes.length - 1 ? 2 : 0), 3);
+        file.writeUInt16LE(file.length, 5); file.writeUInt32LE(size, 7);
+        file.writeUInt32LE(payload.length, 11); file[15] = 2; file.writeUInt32LE(crc32(payload), 16);
+        file[24] = 20; file[25] = 0x30; file.writeUInt16LE(name.length, 26); file.writeUInt32LE(32, 28); name.copy(file, 32);
+        const end = Buffer.alloc(7); end[2] = 0x7b; end.writeUInt16LE(7, 5);
+        const bytes = Buffer.concat([Buffer.from([82, 97, 114, 33, 26, 7, 0]), seal(archive), seal(file), data, seal(end)]);
+        return { bytes, name: `fixture.part${String(index + 1).padStart(2, "0")}.rar`, length: bytes.length,
+            async createReadStream({ start = 0, end = bytes.length - 1 } = {}) {
+                return Readable.from([bytes.subarray(start, end + 1)]);
+            } };
+    });
+}
+
 async function run() {
     const output = patch(source);
     assert.equal(patch(output), output, "patch is idempotent");
@@ -163,6 +196,73 @@ async function run() {
     new vm.Script(output, { filename: "patched-server.js" });
     const Reader = loadReader(output), OldReader = loadReader(source);
     const movie = Buffer.from(Array.from({ length: 74 }, (_, i) => i + 10));
+    const RawReader = loadReader(output, true), OldRawReader = loadReader(source, true);
+    const oldRaw = (await new OldRawReader(rarFixture(movie)).parse())[0];
+    assert.notEqual(oldRaw.length, movie.length, "raw RAR control reproduces shortened member");
+    for (const sizes of [[74], [41, 33]]) {
+        const rawFile = (await new RawReader(rarFixture(movie, sizes)).parse())[0];
+        assert.equal(rawFile.length, movie.length, "raw RAR has exact inclusive length");
+        assert.deepEqual(await rawFile.readToEnd(), movie, "raw RAR full bytes across volumes");
+        for (const [start, end] of [[0, 0], [40, 41], [41, 41], [43, 72], [73, 73]]) {
+            assert.deepEqual(await buffer(await rawFile.createReadStream({ start, end })), movie.subarray(start, end + 1));
+        }
+        await testHTTP(output, rawFile, movie, true);
+    }
+    // The old parser's continuation shortcut fabricated extents for parts 3+,
+    // including a nonexistent next volume for equal-sized parts. Vary both
+    // payload sizes and header offsets so copying part 2 can never pass.
+    for (const sizes of [[100, 100, 100], [100, 100, 37], Array(75).fill(100),
+                         [...Array(74).fill(100), 37], Array.from({ length: 75 }, (_, i) => 50 + i % 31)]) {
+        const payload = Buffer.from(Array.from({ length: sizes.reduce((a, b) => a + b, 0) }, (_, i) => i % 251));
+        const volumes = rarFixture(payload, sizes, i => (i * 7) % 113);
+        const parser = new RawReader(volumes);
+        const original = parser.parseFile;
+        let active = 0, maximum = 0, parsed = 0;
+        parser.parseFile = async function (...args) {
+            active++; maximum = Math.max(maximum, active);
+            try { return await original.apply(this, args); }
+            finally { active--; parsed++; }
+        };
+        const file = (await parser.parse())[0];
+        assert.equal(parsed, sizes.length, "every multipart extent comes from its own header");
+        assert.equal(maximum, Math.min(4, sizes.length), "bounded concurrent RAR header parsing");
+        assert.equal(file.length, payload.length);
+        assert.deepEqual(await file.readToEnd(), payload, "3/75-part archive bytes including short/nonuniform parts");
+        for (const start of [0, 99, payload.length - 2]) {
+            const end = Math.min(payload.length - 1, start + 25);
+            assert.deepEqual(await buffer(await file.createReadStream({ start, end })), payload.subarray(start, end + 1));
+        }
+    }
+    const failedParser = new RawReader(rarFixture(Buffer.alloc(1000), Array(10).fill(100)));
+    let activeHeaders = 0, startedHeaders = 0;
+    failedParser.parseFile = async function () {
+        activeHeaders++; const index = startedHeaders++;
+        try {
+            await new Promise(resolve => setTimeout(resolve, 2));
+            if (index === 0) throw new Error("synthetic missing volume");
+            return { chunks: [] };
+        } finally { activeHeaders--; }
+    };
+    await assert.rejects(failedParser.parse(), /synthetic missing volume/);
+    assert.equal(startedHeaders, 4, "no new volume work after a header failure");
+    assert.equal(activeHeaders, 0, "all in-flight workers settled before parser rejects");
+    // Completing an inbound GET does not authorize aborting an outbound movie response.
+    let childAborts = 0;
+    const fakeFile = { length: 74, createReadStream: async () => {
+        const readable = new Readable({ read() {} });
+        readable.stream = { request: { abort() { childAborts++; } } };
+        return readable;
+    } };
+    for (const [bundle, expectedAborts] of [[source, 1], [output, 0]]) {
+        childAborts = 0;
+        const req = new (require("node:events"))(); req.headers = {}; req.method = "GET";
+        const res = new (require("node:stream").Writable)({ write(_, __, done) { done(); } });
+        res.setHeader = () => {};
+        await loadRoute(bundle, fakeFile, true)(req, res);
+        req.emit("close");
+        assert.equal(childAborts, expectedAborts, "only old raw RAR aborts on request completion");
+        res.destroy();
+    }
     const single = fixture([{ name: "video.mkv", bytes: movie }]);
 
     const old = await new OldReader(volumes(single).files).parse();
@@ -230,7 +330,7 @@ async function run() {
     assert(fetch.indexOf('verify_sha256 "$SERVER_DEST"') < fetch.indexOf('node test/server-usenet-archive.test.js'));
     assert(fetch.indexOf('node test/server-usenet-archive.test.js') < fetch.indexOf('node scripts/patch-server-usenet.js'));
 
-    console.log("Usenet split-7z: PASS — control length mismatch reproduced; exact full/seek bytes, COPY subfile offsets, split headers, malformed sizes, async cancellation verified");
+    console.log("Usenet split-7z + raw RAR: PASS — control length/GET-close failures reproduced; exact full/seek bytes, volume boundaries, COPY offsets, malformed sizes, async cancellation verified");
 }
-module.exports = { fixture };
+module.exports = { fixture, rarFixture };
 if (require.main === module) run().catch(error => { console.error(error); process.exitCode = 1; });
