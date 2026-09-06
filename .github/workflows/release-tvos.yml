@@ -412,6 +412,13 @@ jobs:
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
 
+      - name: Check shared server settings at the iOS 16 deployment target
+        if: inputs.tvos_test_only != true
+        run: |
+          xcrun swiftc -typecheck -swift-version 5 -target arm64-apple-ios16.0 \
+            -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            app/Tests/ServerConfigViewAvailabilityTests.swift app/SourcesShared/ServerConfigView.swift
+
       # Derive the masked edge secret and inject it into every app build.
       #
       # WHY THE APP GETS A MASKED BLOB WHILE THE WORKERS HOLD RAW HEX. The VortX edge workers
@@ -1323,7 +1330,7 @@ jobs:
             source_b64="$(base64 <"$file" | tr -d '\n')"
             blob_sha="$(jq -cn --arg content "$source_b64" '{content:$content,encoding:"base64"}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/blobs")"
             tree_sha="$(jq -cn --arg base "$base_tree" --arg blob "$blob_sha" '{base_tree:$base,tree:[{path:"altstore/source.json",mode:"100644",type:"blob",sha:$blob}]}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/trees")"
-            commit_sha="$(jq -cn --arg message "$message" --arg tree "$tree_sha" --arg parent "$main_head" '{message:$message,tree:$tree,parents:[$parent]}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/commits")"
+            commit_sha="$(jq -cn --arg message "$message" --arg tree "$tree_sha" --arg parent "$main_head" '{message:$message,tree:$tree,parents:[$parent],author:{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"},committer:{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"}}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/commits")"
             jq -cn --arg sha "$commit_sha" '{sha:$sha,force:false}' | gh api --method PATCH --input - --jq '.object.sha' -- "repos/$GH_REPO/git/refs/heads/main" >/dev/null
             SOURCE_COMMITTED=1
           }

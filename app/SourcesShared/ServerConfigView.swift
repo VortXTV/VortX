@@ -54,7 +54,7 @@ struct ServerConfigView: View {
             .padding(.vertical, Theme.Space.xl)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .onChange(of: url) { _, _ in
+        .onChange(of: url) { _ in
             probeGeneration &+= 1; testing = false; testResult = nil; validationMessage = nil
         }
         .onDisappear { probeGeneration &+= 1 }

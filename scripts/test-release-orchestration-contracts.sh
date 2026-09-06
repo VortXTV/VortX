@@ -652,6 +652,16 @@ for (const check of ['[ -z "$TEST_RELEASE_TAG" ]', '[ -z "$TEST_RELEASE_ID" ]', 
 console.log('ok: Full tvOS test lane preserves TV gates, skips other app builds, packages only TV, and refuses release writes');
 NODE
 
+# Keep the shared settings deployment floor and release-feed commit identity explicit.
+require_grep "shared settings availability fixture runs before app packaging" \
+    'app/Tests/ServerConfigViewAvailabilityTests.swift app/SourcesShared/ServerConfigView.swift' "$APPLE_RELEASE_WF"
+require_grep "shared settings fixture targets supported iOS 16" \
+    'swiftc -typecheck -swift-version 5 -target arm64-apple-ios16.0' "$APPLE_RELEASE_WF"
+require_grep "release feed commits retain Mamaclapper authorship" \
+    'author:\{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"\}' "$APPLE_RELEASE_WF"
+require_grep "release feed commits retain Mamaclapper committer identity" \
+    'committer:\{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"\}' "$APPLE_RELEASE_WF"
+
 # --- Workflow YAML parses --------------------------------------------------------------------------
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then

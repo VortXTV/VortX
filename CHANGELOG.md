@@ -30,7 +30,7 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 **Dolby Vision output must match its declaration.** A failed Profile 7 metadata conversion now stops before the original, incompatible metadata can be muxed under a Profile 8.1 declaration. Missing required DV configuration and an invalid initialization brand also fail explicitly. An already correctly branded init remains valid. These are output-integrity repairs, not a claim that every reported DV stall had this cause.
 
-**Remote streaming-server Test and Save agree.** Both actions use the same normalized endpoint and validation policy. A response to an older address cannot validate a newer edit, addressing the case where Test reported reachable but Save and Use immediately rejected the server.
+**Remote streaming-server Test and Save agree.** Both actions use the same normalized endpoint and validation policy. A response to an older address cannot validate a newer edit, addressing the case where Test reported reachable but Save and Use immediately rejected the server. The shared settings view retains iOS 16 compatibility, with a deployment-target type-check covering its lifecycle handlers.
 
 **Release information is current again.** The in-app What's New version and bundled changelog now identify Beta 9 instead of retaining Beta 2's metadata. The release pipeline verifies the new packages and publishes matching update-feed and AltStore metadata.
 
