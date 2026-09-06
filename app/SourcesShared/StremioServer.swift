@@ -129,20 +129,13 @@ enum StremioServer {
     static func useEmbedded() { UserDefaults.standard.removeObject(forKey: urlKey) }
 
     static func normalize(_ raw: String?) -> String? {
-        guard var s = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return nil }
-        if !s.lowercased().hasPrefix("http://") && !s.lowercased().hasPrefix("https://") { s = "http://" + s }
-        while s.hasSuffix("/") { s.removeLast() }
-        return URL(string: s) != nil ? s : nil
+        StreamingServerConnectionPolicy.normalizedBase(raw)
     }
 
     /// Reachability of an arbitrary server URL (for the "Test" button before saving).
     static func reachable(_ raw: String?) async -> Bool {
-        guard let b = normalize(raw), let url = URL(string: "\(b)/settings") else { return false }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 6
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return false }
-        return (resp as? HTTPURLResponse)?.statusCode == 200
+        guard let b = normalize(raw) else { return false }
+        return await respondsAsServer("\(b)/settings")
     }
 
     /// Is the active streaming server reachable? (Settings shows this.) Scans the embedded server's whole
@@ -172,13 +165,11 @@ enum StremioServer {
     private static func respondsAsServer(_ urlString: String) async -> Bool {
         guard let url = URL(string: urlString) else { return false }
         var req = URLRequest(url: url)
-        req.timeoutInterval = 4
+        req.timeoutInterval = StreamingServerConnectionPolicy.timeoutSeconds
         req.cachePolicy = .reloadIgnoringLocalCacheData
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              obj["values"] != nil else { return false }
-        return true
+              let http = resp as? HTTPURLResponse else { return false }
+        return StreamingServerConnectionPolicy.accepts(statusCode: http.statusCode, body: data)
     }
 
     /// The playable URL for a stream, its direct URL, or the local server's file endpoint for a

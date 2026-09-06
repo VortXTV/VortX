@@ -10,6 +10,8 @@ struct ServerConfigView: View {
     @State private var url: String = StremioServer.isCustom ? StremioServer.base : ""
     @State private var testResult: Bool?
     @State private var testing = false
+    @State private var validationMessage: String?
+    @State private var probeGeneration: UInt64 = 0
 
     private var trimmed: String { url.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -36,7 +38,9 @@ struct ServerConfigView: View {
                         .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
                 }
 
-                if let testResult {
+                if let validationMessage {
+                    Text(validationMessage).foregroundStyle(Theme.Palette.danger)
+                } else if let testResult {
                     Label(testResult ? "Reachable" : "Couldn't reach that server",
                           systemImage: testResult ? "checkmark.circle.fill" : "xmark.circle.fill")
                         .font(Theme.Typography.body)
@@ -50,6 +54,10 @@ struct ServerConfigView: View {
             .padding(.vertical, Theme.Space.xl)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+        .onChange(of: url) { _, _ in
+            probeGeneration &+= 1; testing = false; testResult = nil; validationMessage = nil
+        }
+        .onDisappear { probeGeneration &+= 1 }
     }
 
     // `.textInputAutocapitalization(_:)` and `.textContentType(_:)` are UIKit-backed (iOS / tvOS
@@ -76,27 +84,43 @@ struct ServerConfigView: View {
     }
 
     private func save() {
-        guard !trimmed.isEmpty else { testResult = false; return }   // need a URL to save
-        StremioServer.setBase(trimmed)
-        onChange()
-        dismiss()
+        probe(saveIfReachable: true)
     }
 
     private func useEmbedded() {
+        probeGeneration &+= 1
         StremioServer.useEmbedded()
         onChange()
         dismiss()
     }
 
     private func test() {
+        probe(saveIfReachable: false)
+    }
+
+    private func probe(saveIfReachable: Bool) {
         guard !testing else { return }
-        // Test the entered URL; if the field is empty, test the currently-active server so the button
-        // always gives feedback (it silently did nothing before when the field was empty).
-        let target = trimmed.isEmpty ? StremioServer.base : trimmed
-        testing = true; testResult = nil
-        Task {
+        let entered = trimmed
+        guard let target = StremioServer.normalize(entered) else {
+            testResult = nil
+            validationMessage = "Enter the Mac or remote server's HTTP address first. Use Embedded selects this device's server."
+            return
+        }
+        testing = true; testResult = nil; validationMessage = nil
+        probeGeneration &+= 1
+        let generation = probeGeneration
+        Task { @MainActor in
             let ok = await StremioServer.reachable(target)
-            testing = false; testResult = ok
+            guard probeGeneration == generation else { return }
+            testing = false
+            // A test of an earlier URL must never mark a newly typed endpoint reachable or save it.
+            guard trimmed == entered else { return }
+            testResult = ok
+            if ok, saveIfReachable {
+                StremioServer.setBase(target)
+                onChange()
+                dismiss()
+            }
         }
     }
 }
