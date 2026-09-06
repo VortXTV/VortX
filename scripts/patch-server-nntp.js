@@ -161,6 +161,35 @@ function once(source, before, after) {
     return source.slice(0, at) + after + source.slice(at + before.length);
 }
 
+function patchCancellation(source) {
+    const stopMarker = '/* VortX NNTP response retirement v1 */';
+    if (source.includes(stopMarker)) {
+        if (source.split(stopMarker).length !== 2) throw new Error("Duplicate NNTP retirement marker");
+        return source;
+    }
+    source = once(source, 'let chunkBuffer = Buffer.alloc(0), bufferSize = 0, isDone = !1;',
+        'let chunkBuffer = Buffer.alloc(0), bufferSize = 0, isDone = !1, responseEnded = false;');
+    source = once(source, 'resp.chunk && (bufferSize += resp.chunk.length, chunkBuffer = Buffer.concat(',
+        stopMarker + '\n                    if (responseEnded || !resp) return;\n                    resp.chunk && (bufferSize += resp.chunk.length, chunkBuffer = Buffer.concat(');
+    const cleanup = 'controller.stop(), chunkBuffer = null;';
+    if (source.split(cleanup).length !== 3) throw new Error("NNTP HTTP cleanup anchor mismatch");
+    source = source.split(cleanup).join('responseEnded = true, controller.stop(), chunkBuffer = null;');
+    const start = source.indexOf('NzbGrabber.prototype.grabSegments = function(segs, cb, pushAll, requestId) {');
+    const end = source.indexOf('}, NzbGrabber.prototype.parse = nzb', start);
+    if (start < 0 || end < start) throw new Error("NNTP retirement grabber boundary missing");
+    let grab = source.slice(start, end);
+    for (const signature of [
+        'skipSegment: (filename, group, article, bytes, skipIdx) => {',
+        'resumeQueue: () => {',
+        'pushFromBackbone: (err, filename, chunk, done, group, article, bytes, chunkIdx) => {'
+    ]) grab = once(grab, signature, signature + '\n                    if (stopped) return;');
+    // Stop can be called synchronously by a reader while delivering the first
+    // buffered piece. Do not deliver the remaining cached pieces afterwards.
+    if (grab.split('; cache[j]; )').length !== 4) throw new Error("NNTP delivery retirement anchor mismatch");
+    grab = grab.split('; cache[j]; )').join('; !stopped && cache[j]; )');
+    return source.slice(0, start) + grab + source.slice(end);
+}
+
 function patch(source) {
     // A failure callback can synchronously subscribe a backup-server request
     // for the same article. Never drain that NEW subscription with the old
@@ -173,7 +202,7 @@ function patch(source) {
     } else if (source.split(deliveryMarker).length !== 2) throw new Error("Duplicate NNTP subscriber marker");
     if (source.includes(marker)) {
         if (source.split(marker).length !== 2) throw new Error("Duplicate NNTP patch marker");
-        return source;
+        return patchCancellation(source);
     }
     const anchor = "    var NNTPWorker, async, id, net, bind = function(fn, me) {";
     const at = source.indexOf(anchor);
@@ -238,7 +267,7 @@ function patch(source) {
     grab = once(grab, 'resumeQueue: () => {\n                    self.queue.next();',
         'resumeQueue: () => {\n                    pumpWindow();\n                    self.queue.next();');
     source = source.slice(0, grabStart) + grab + source.slice(grabEnd);
-    return source;
+    return patchCancellation(source);
 }
 
 module.exports = { patch, createWorker };

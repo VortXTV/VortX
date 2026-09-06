@@ -175,6 +175,29 @@ async function windowTest(requireBundle, nntp, articles) {
     controller.stop(); await new Promise(resolve => grabber.closeAllConns(resolve));
     console.log("PASS ordered read-ahead bounded while first article stalls; backbone recovery honors pause and drains all 100 pieces after resume");
 }
+function cancelledBackboneTest(requireBundle) {
+    const Grabber = requireBundle(1089);
+    for (const mode of ["success", "missing", "stop-during-delivery"]) {
+        const grabber = new Grabber({ conn: 1 });
+        // Deterministically hold the primary. Supply the asynchronous backup
+        // result after HTTP cancellation, independent of socket timing/load.
+        grabber.queue.next = () => {};
+        const segments = [0, 1].map(i => ({ group: "fixture", article: `${mode}-${i}`, bytes: 1 }));
+        let calls = 0;
+        const controller = grabber.grabSegments(segments, () => {
+            calls++;
+            if (mode === "stop-during-delivery") controller.stop();
+        }, true);
+        controller.pushFromBackbone(null, "fixture.mkv", Buffer.from("b"), false, "fixture", segments[1].article, 1, 1);
+        if (mode !== "stop-during-delivery") controller.stop();
+        controller.pushFromBackbone(mode === "missing" ? new Error("missing") : null,
+            "fixture.mkv", mode === "missing" ? null : Buffer.from("a"), false,
+            "fixture", segments[0].article, 1, 0);
+        assert.equal(calls, mode === "stop-during-delivery" ? 1 : 0,
+            `${mode}: a retired HTTP reader must receive no further backup data`);
+    }
+    console.log("PASS cancelled readers reject late backup success/failure and stop ordered callback drain immediately");
+}
 function legacyControl() {
     if (source.includes("/* VortX NNTP wire v1 */")) return;
     const OldWorker = load(source)(1102);
@@ -283,6 +306,7 @@ async function main() {
     assert.throws(() => patch("wrong pinned bundle"));
     const requireBundle = load(patched);
     subscriberTest(requireBundle);
+    cancelledBackboneTest(requireBundle);
     let data = Buffer.alloc(8 * 32768 + 93);
     for (let i = 0; i < data.length; i++) data[i] = (i * 37 + (i >>> 7)) & 255;
     data[0] = 4; // encoded leading dot exercises dot-stuffing exactly once

@@ -94,6 +94,12 @@ The additional tracked `patch-server-nntp.js` repair addresses:
   Both a failing-control test and real two-server raw/archive byte-equality tests
   verify this additional fix. The patch can also update the existing wire-v1 bundle
   idempotently, without replacing any native app binary.
+- TV-only CI exposed a cancellation race: a late backup result could deliver into
+  an already-finished HTTP response whose buffer had been cleared, crashing the
+  engine with `Buffer.concat` receiving null. Response retirement now fences both
+  cleanup paths; stopped grabbers reject backup success/failure and halt an ordered
+  callback drain immediately. A deterministic regression reproduced two deliveries
+  after cancellation before the fix and zero afterwards (including failed backup).
 
 `node test/server-nntp.test.js` exercises the actual vendored worker, NZB parser,
 scheduler, yEnc decoder, raw-file HTTP route, and split-7z route against local
