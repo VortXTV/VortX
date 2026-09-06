@@ -61,3 +61,48 @@ long pause/reseek/reopen behavior, the first archive's volume-size provenance, a
 source-specific CPU stalls. Separate DV mux failure, TorBox DNS failures/backoff, and
 immediate failures of some direct add-on links in earlier log sessions remain distinct
 findings; this archive patch does not claim to fix them. No release was cut for this change.
+
+## Diagnostic 15 follow-up: wire framing and bounded delivery
+
+All 19,002 diagnostic lines are accounted for: lines 1–13,398 exactly match the
+previously read diagnostic prefix; the remaining lines were read in disjoint ranges.
+The first new attempt is a plain NNTP MKV, not an archive. Neither it nor the later
+patched-7z attempt reaches a first frame; Easynews++ HTTP does. The 7z request for
+`bytes=0-31` proves the previous archive patch was installed. NNTP heartbeat delays
+reach 9.191 seconds and RSS reaches 1,187 MB. Packet contents are not in this log,
+so protocol fixtures establish the defects below, not the exact packet split on TV.
+
+The additional tracked `patch-server-nntp.js` repair addresses:
+
+- A split NNTP article terminator leaves the old worker permanently BUSY. Status
+  lines also incorrectly assumed TCP packet boundaries. A byte-stream parser now
+  handles both; disconnect, cancellation and bounded response timeout settle work.
+- Idle connection retirement permanently poisoned a reusable grabber. Cancellation
+  now drains before its close callback, and an explicit new read can reopen it.
+- An early stalled article allowed later articles to accumulate without reaching
+  HTTP backpressure. A connection-sized ordered window, capped at 16 pieces, bounds
+  this read-ahead and advances without rescanning every earlier completed slot.
+- HTTP backpressure had an inverted comparison. Response ownership also now follows
+  the outgoing response lifecycle, and NZB ranged replies correctly return 206.
+- Needle auto-parsed `application/xml` NZBs before the actual NZB parser received
+  them. Fetching the raw response preserves valid XML.
+- GROUP rejection must not prevent ARTICLE by message-ID; this retains existing
+  provider compatibility under RFC 3977 section 6.2.1.
+
+`node test/server-nntp.test.js` exercises the actual vendored worker, NZB parser,
+scheduler, yEnc decoder, raw-file HTTP route, and split-7z route against local
+synthetic TCP/HTTP servers. It reproduces the unpatched hang and verifies fragmented
+status/body/end markers, disconnect/timeout/cancel recovery, exact complete/ranged
+bytes, backward/forward seeks, HEAD, idle same-key reopen, and a stalled-first-piece
+window. Backbone recovery is tested while paused, then all 100 ordered pieces drain
+after resume. `VORTX_NNTP_MEDIA_TEST=1` additionally generates synthetic Matroska video
+and audio with FFmpeg and decodes both raw and split-archive NNTP HTTP streams.
+
+Separately, failed-before-first-frame playback now returns to the attempted episode
+instead of the last watched episode. Close-scoped attempted identity is distinct
+from a genuine first-frame receipt: it never writes watched/progress/scrobble state.
+Both detail surfaces are wired, and all 16 standalone Swift policy checks pass.
+
+Independent Swift and JavaScript review passed. This is a local-test build change,
+not a public release. Physical Apple TV playback with the user's provider/title
+still requires the new IPA test; no synthetic result is represented as that receipt.

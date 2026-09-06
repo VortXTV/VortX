@@ -143,7 +143,9 @@ node scripts/patch-server-proxy.js "$SERVER_DEST"
 # Exercise the real vendor parser before patching, including the failing control,
 # then ship the exact deterministic split-archive repair that passed the tests.
 node test/server-usenet-archive.test.js "$SERVER_DEST"
+node test/server-nntp.test.js "$SERVER_DEST"
 node scripts/patch-server-usenet.js "$SERVER_DEST"
+node scripts/patch-server-nntp.js "$SERVER_DEST"
 node --check "$SERVER_DEST"
 
 # Final fail-closed gate: the fetched tree must leave NO symlink under app/Resources/. This is the

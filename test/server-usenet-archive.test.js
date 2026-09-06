@@ -232,4 +232,5 @@ async function run() {
 
     console.log("Usenet split-7z: PASS — control length mismatch reproduced; exact full/seek bytes, COPY subfile offsets, split headers, malformed sizes, async cancellation verified");
 }
-run().catch(error => { console.error(error); process.exitCode = 1; });
+module.exports = { fixture };
+if (require.main === module) run().catch(error => { console.error(error); process.exitCode = 1; });
