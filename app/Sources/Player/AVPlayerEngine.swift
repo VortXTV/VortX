@@ -336,8 +336,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// a same-token `loadFile` remount.
     private var localRemuxPlaylistURL: URL?
     /// The only remount-spanning snapshot. Audio replacement, HDR recovery and host loss update and rebind this
-    /// same value, and `loadSelectionGroups` is the one restore/consume point.
+    /// same value until the replacement item becomes ready.  It owns position restoration only; media
+    /// selection then moves into `pendingMediaSelectionIntent` so an unavailable AVAsset group cannot hold
+    /// transport or a remux-seek transaction hostage.
     private var pendingPlaybackIntent: PlaybackIntentPolicy.Intent?
+    /// Selection-only continuation of a consumed playback intent.  It is deliberately writable while the
+    /// asset's media-selection groups are loading, but it never owns a seek or defers play/pause.
+    private var pendingMediaSelectionIntent: PlaybackIntentPolicy.Intent?
     /// A hosted status poll may lag the init-surgery publication that makes HDR recovery possible. Exactly one
     /// bounded refresh owns that uncertainty for the current failed item; duplicate KVO and notification
     /// callbacks observe this task and wait for its single retry or fatal completion.
@@ -570,6 +575,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var externalSubActive = false
     /// Supersedes delayed native-legible settlement reads after a newer subtitle intent or item lifecycle.
     private var subtitleSelectionRevision: UInt64 = 0
+    /// New external subtitle requests supersede every earlier fetch, including a later Off/built-in choice on
+    /// the same AVPlayerItem.  Item/token ownership alone cannot distinguish those requests.
+    private var externalSubtitleRequestRevision: UInt64 = 0
     /// A loaded external cue file waits here while AVFoundation is still resolving the item's legible group.
     private var pendingExternalSubtitleActivation = false
     /// Label of the loaded external overlay subtitle, so it can be published as a REAL row of `tracks(ofType:
@@ -873,6 +881,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if let requestID = registeredSeekRequestID,
            let server = registeredSeekServer {
             server.cancelPreparedSeek(requestID: requestID)
+            if remuxHLSServer === server { installPlayheadReceiptObserver() }
         }
         registeredSeekServer = nil
         registeredSeekRequestID = nil
@@ -904,6 +913,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               registeredSeekServer === server else { return }
         registeredSeekServer = nil
         registeredSeekRequestID = nil
+        if remuxHLSServer === server { installPlayheadReceiptObserver() }
     }
 
     private func completeSeekAdmission(
@@ -919,6 +929,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               registeredSeekServer === server else { return }
         registeredSeekServer = nil
         registeredSeekRequestID = nil
+        if remuxHLSServer === server { installPlayheadReceiptObserver() }
     }
 
     /// Store a sanitized origin for exactly the next logical `loadFile`. This must be called before the load:
@@ -993,6 +1004,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             isTransitioning: pipState.isTransitioning)
         let preparedCandidate = configuredPreparedRemux
         configuredPreparedRemux = nil
+        let sameLogicalRequest = loadToken != nil && loadToken == activeLoadToken
+            && lastLoadURL == url && lastLoadHeaders == headers && lastLoadLive == live
         let carriesOwnedRecoveryIntent = PlaybackIntentPolicy.carriesIntentForOwnedRecovery(
             recoveryTokenMatchesActiveLoad: loadToken != nil && loadToken == activeLoadToken,
             sameRequestMetadata: lastLoadURL == url
@@ -1003,7 +1016,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             fatalErrorEmitted: fatalErrorEmitted,
             terminalClaimed: terminalLatch.hasEmitted)
         if carriesOwnedRecoveryIntent {
-            pendingPlaybackIntent = capturePlaybackIntent(from: item)
+            pendingPlaybackIntent = beginPlaybackRemountIntent(from: item)
         }
         let isIntentRemount = pendingPlaybackIntent != nil
             && (loadToken != nil || carriesOwnedRecoveryIntent)
@@ -1035,16 +1048,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         }
         // Consume before ANY remux mount can be constructed. An internal same-token remount deliberately
         // reuses the logical request's origin; a fresh unrelated load with no configuration starts at zero.
-        if let configured = resumeConfiguration.consumeForNextLoad() {
-            currentLoadResumeOrigin = configured
-            if isIntentRemount {
-                pendingPlaybackIntent?.updateSourceSeconds(configured)
-            }
-        } else if !isIntentRemount {
-            currentLoadResumeOrigin = 0
-        }
+        currentLoadResumeOrigin = RemuxResumePolicy.originForLoad(
+            configuredOrigin: resumeConfiguration.consumeForNextLoad(),
+            sameLogicalRequest: sameLogicalRequest,
+            previousOrigin: currentLoadResumeOrigin)
         let requestedRemuxOrigin = currentLoadResumeOrigin
         if carriesOwnedRecoveryIntent,
+           remuxSeekRemountTarget == nil, audioReplacement == nil,
            let existingToken = activeLoadToken,
            retryFreshItemOnHealthyMount(
                reason: "surface same-source stall recovery",
@@ -1098,7 +1108,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         item = nil
         videoOutput = nil
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
-        if !isIntentRemount { playbackRequested = true }
+        if !sameLogicalRequest { playbackRequested = true }
         hdrFallbackRetried = false; usingHDRFallbackItem = false
         publishedTailItemRecoveryRetried = false
         if !isIntentRemount {
@@ -1115,6 +1125,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         audioGroup = nil; subGroup = nil; audioTracks = []; subTracks = []; loadedChapters = []; containerFPS = 0
         selectionTopologyGeneration = nil
         selectionRefreshState.reset()
+        // The old item's delayed group task cannot own choices on this mount.  A fresh continuation is made
+        // only when this item's position transaction is released at ready.
+        pendingMediaSelectionIntent = nil
         // A source-audio remount is the same title and keeps the parsed external cues; a new title discards them.
         disableExternalSubtitle(discardingCues: !isIntentRemount)
         // Claim .playback before play so PiP and locked-screen audio work, and advertise multichannel so the
@@ -1214,6 +1227,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         bypassExternalEngine = false
         if adoptedPrepared == nil,
            wantsRemux, VortXRemuxHLSServer.deliveryEnabled, !externalConsumed,
+           !PlayerEngineRouter.isLoopbackURL(url),
            case .external = VortXExternalEngine.shared.mountPlan {
             beginExternalEngineMount(
                 url: url,
@@ -1840,7 +1854,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         // Capture before groups and the current item are retired. If an audio replacement already owns an
         // intent, this refreshes that same value and preserves any newest choice made while groups were empty.
-        var recoveryIntent = capturePlaybackIntent(from: currentItem)
+        var recoveryIntent = beginPlaybackRemountIntent(from: currentItem)
         if let pendingSeek { recoveryIntent.updateSourceSeconds(pendingSeek) }
         pendingPlaybackIntent = recoveryIntent
         hdrFallbackRetried = true
@@ -1931,7 +1945,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               let playlistURL = (currentItem.asset as? AVURLAsset)?.url,
               let loadToken = activeLoadToken else { return false }
 
-        pendingPlaybackIntent = capturePlaybackIntent(from: currentItem)
+        pendingPlaybackIntent = beginPlaybackRemountIntent(from: currentItem)
         if claimsPublishedTailRetry { publishedTailItemRecoveryRetried = true }
         DiagnosticsLog.log(
             "avplayer",
@@ -2177,11 +2191,45 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func refreshPendingIntentTransport() {
-        guard var intent = pendingPlaybackIntent else { return }
-        intent.updateTransport(
-            playbackRequested: playbackRequested,
-            requestedRate: requestedRate)
+        if var intent = pendingPlaybackIntent {
+            intent.updateTransport(
+                playbackRequested: playbackRequested,
+                requestedRate: requestedRate)
+            pendingPlaybackIntent = intent
+        }
+        if var intent = pendingMediaSelectionIntent {
+            intent.updateTransport(
+                playbackRequested: playbackRequested,
+                requestedRate: requestedRate)
+            pendingMediaSelectionIntent = intent
+        }
+    }
+
+    /// A choice made while AVFoundation is still discovering groups must reach both the replacement's
+    /// position transaction and its later selection continuation.  The latter has already released transport,
+    /// so refresh its source clock before carrying it into any future replacement.
+    private func updatePendingSelectionIntent(
+        _ update: (inout PlaybackIntentPolicy.Intent) -> Void
+    ) {
+        if var intent = pendingPlaybackIntent {
+            update(&intent)
+            pendingPlaybackIntent = intent
+        }
+        if var intent = pendingMediaSelectionIntent {
+            intent.updateSourceSeconds(playbackPositionSeconds)
+            intent.updateTransport(playbackRequested: playbackRequested, requestedRate: requestedRate)
+            update(&intent)
+            pendingMediaSelectionIntent = intent
+        }
+    }
+
+    /// Promote a selection continuation only when a new item is actually being mounted.  Ordinary post-ready
+    /// seeks keep acting on the live item; this prevents an old remount target from becoming authoritative.
+    private func beginPlaybackRemountIntent(from currentItem: AVPlayerItem?) -> PlaybackIntentPolicy.Intent {
+        let intent = capturePlaybackIntent(from: currentItem)
+        pendingMediaSelectionIntent = nil
         pendingPlaybackIntent = intent
+        return intent
     }
 
     /// A seek can arrive while hosted HDR capability is being refreshed on a failed item. Once the refresh
@@ -2317,7 +2365,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
         let requestedTarget = sourceSeconds.isFinite ? max(0, sourceSeconds) : 0
         let mountOrigin = RemuxResumePolicy.originRequest(resumeSeconds: requestedTarget)
-        var intent = capturePlaybackIntent(from: item)
+        var intent = beginPlaybackRemountIntent(from: item)
         intent.updateSourceSeconds(requestedTarget)
         pendingPlaybackIntent = intent
         remuxSeekRemountTarget = requestedTarget
@@ -2352,6 +2400,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         if var intent = pendingPlaybackIntent {
             intent.updateSourceSeconds(seconds)
             pendingPlaybackIntent = intent
+        }
+        if var intent = pendingMediaSelectionIntent {
+            // Keep only the selection continuation current; the ready item below still receives this seek
+            // directly and is never put back behind group discovery.
+            intent.updateSourceSeconds(seconds)
+            pendingMediaSelectionIntent = intent
         }
         // A hosted -12927 capability refresh intentionally keeps the failed item mounted for a bounded interval.
         // AVPlayer cannot honor a seek on that failed item, so preserve the newest source-time intent for the
@@ -2658,6 +2712,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         playbackRequested = false
         usingHDRFallbackItem = false
         pendingPlaybackIntent = nil
+        pendingMediaSelectionIntent = nil
         remuxSeekRemountTarget = nil
         audioReplacement = nil
         remuxSourceAudioTracks = []
@@ -2843,6 +2898,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// not rewrite an existing one after capture.
     private func capturePlaybackIntent(from currentItem: AVPlayerItem?) -> PlaybackIntentPolicy.Intent {
         if let intent = pendingPlaybackIntent { return intent }
+        if var intent = pendingMediaSelectionIntent {
+            // Position has already been restored, so this is the current live clock rather than the old
+            // remount target retained by the selection continuation.
+            intent.updateSourceSeconds(playbackPositionSeconds)
+            intent.updateTransport(playbackRequested: playbackRequested, requestedRate: requestedRate)
+            return intent
+        }
 
         let subtitle: PlaybackIntentPolicy.SubtitleSelection
         if externalSubActive {
@@ -2866,6 +2928,49 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 ? nil : selectedRemuxAudioSourceIndex,
             nativeAudioIndex: remuxSourceAudioTracks.isEmpty ? nativeAudio : nil,
             subtitle: subtitle)
+    }
+
+    /// Release the position half of a remount as soon as AVPlayer says this item is playable.  Group discovery
+    /// is allowed to take arbitrarily long (or never finish for a malformed/remote asset), so it cannot own
+    /// the playhead, remux target, or transport gate.  The copied continuation owns selections only.
+    private func releasePendingPlaybackIntentAtReady(for readyItem: AVPlayerItem) {
+        guard var intent = pendingPlaybackIntent,
+              let restore = intent.consume(
+                generation: itemGeneration,
+                mountIdentity: playbackMountIdentity
+              ) else { return }
+
+        var selectionIntent = PlaybackIntentPolicy.Intent(
+            sourceSeconds: restore.sourceSeconds,
+            playbackRequested: playbackRequested,
+            requestedRate: requestedRate,
+            audioSelectionKnown: restore.audioSelectionKnown,
+            audioSourceIndex: restore.audioSourceIndex,
+            nativeAudioIndex: restore.nativeAudioIndex,
+            subtitle: restore.subtitle)
+        selectionIntent.bind(generation: itemGeneration, mountIdentity: playbackMountIdentity)
+        pendingMediaSelectionIntent = selectionIntent
+        pendingPlaybackIntent = nil
+        remuxSeekRemountTarget = nil
+
+        let playerSeconds: Double
+        if isRemuxMounted {
+            let sourceDuration = remuxHLSServer?.sourceDurationSeconds
+                ?? remuxRemoteMount?.sourceDurationSeconds
+                ?? remuxLoader?.sourceDurationSeconds
+            playerSeconds = RemuxResumePolicy.playerSeek(
+                sourceSeconds: restore.sourceSeconds,
+                origin: remuxTimelineOrigin,
+                authoritativeSourceDurationSeconds: sourceDuration,
+                playerDurationSeconds: readyItem.duration.seconds,
+                producedEdgePlayerSeconds: producedEdgeSeconds)
+        } else {
+            playerSeconds = restore.sourceSeconds
+        }
+        player.seek(to: CMTime(seconds: playerSeconds, preferredTimescale: 600), completionHandler: { _ in })
+        DiagnosticsLog.log(
+            "avplayer",
+            "released recovery position at ready generation=\(itemGeneration) mount=\(playbackMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)); selection restoration continues asynchronously")
     }
 
     private func sourceAudioMPVTracks() -> [MPVTrack] {
@@ -2954,7 +3059,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             guard replacement.targetSourceIndex != id else { return }
             replacement.retarget(to: id)
             audioReplacement = replacement
-            var intent = capturePlaybackIntent(from: item)
+            var intent = beginPlaybackRemountIntent(from: item)
             intent.selectSourceAudio(id)
             pendingPlaybackIntent = intent
             mountCurrentAudioReplacement(reason: "audio replacement retargeted")
@@ -2966,7 +3071,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               activeLoadToken != nil,
               lastLoadURL != nil else { return }
 
-        var intent = capturePlaybackIntent(from: currentItem)
+        var intent = beginPlaybackRemountIntent(from: currentItem)
         intent.selectSourceAudio(id)
         pendingPlaybackIntent = intent
         audioReplacement = RemuxAudioReplacementPolicy.State(
@@ -2981,6 +3086,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// detour through an embedded track or Off), which is what makes the external row behave like every other
     /// row in the picker instead of being a one-way door.
     func setSubtitleTrack(_ id: Int) {
+        // This user decision supersedes any in-flight external file fetch for the same item.
+        externalSubtitleRequestRevision &+= 1
         let nativeID: Int
         if let source = remuxSourceSubtitleTracks.first(where: { $0.sourceIndex == id }) {
             guard source.unavailableReason == nil,
@@ -2995,21 +3102,19 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         } else {
             nativeID = id
         }
-        if pendingPlaybackIntent != nil {
-            var intent = capturePlaybackIntent(from: item)
+        if pendingPlaybackIntent != nil || pendingMediaSelectionIntent != nil {
             if id == Self.externalSubtitleTrackID {
                 guard externalSubLabel != nil, subtitleRenderer.hasCues else { return }
-                intent.selectExternalSubtitle()
+                updatePendingSelectionIntent { $0.selectExternalSubtitle() }
                 disableExternalSubtitle()
             } else if id < 0 {
-                intent.selectSubtitlesOff()
+                updatePendingSelectionIntent { $0.selectSubtitlesOff() }
                 disableExternalSubtitle()
             } else {
                 // The transaction carries the stable source identity. Group indices belong to one mount.
-                intent.selectEmbeddedSubtitle(sourceIndex: id)
+                updatePendingSelectionIntent { $0.selectEmbeddedSubtitle(sourceIndex: id) }
                 disableExternalSubtitle()
             }
-            pendingPlaybackIntent = intent
             publishTrackListIfTopologyReady()
             return
         }
@@ -3152,6 +3257,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// AVPlayer-native legible track so subtitles never double up. `completion(true)` once cues are loaded.
     func addExternalSubtitle(url: String, title: String, lang: String,
                              timeout: TimeInterval, completion: ((Bool) -> Void)?) {
+        externalSubtitleRequestRevision &+= 1
+        let requestRevision = externalSubtitleRequestRevision
+        // Keep the current selection during I/O. A failed/empty subtitle must not erase a working native
+        // track. The revision reserves this request's right to commit, not a claim that cues already exist.
         guard let remote = URL(string: url),
               let requestToken = activeLoadToken,
               let requestItem = item,
@@ -3169,12 +3278,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 let cues = SubtitleCueRenderer.parse(data: data)
                 guard !cues.isEmpty else { finish(false); return }
                 guard let self,
-                      self.owns(requestItem, loadToken: requestToken) else {
+                      self.owns(requestItem, loadToken: requestToken),
+                      self.externalSubtitleRequestRevision == requestRevision else {
                     finish(false)
                     return
                 }
                 self.subtitleRenderer.load(cues: cues)
                 self.externalSubLabel = (title: title, lang: lang)
+                self.updatePendingSelectionIntent { $0.selectExternalSubtitle() }
                 self.selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
                 finish(true)
             }
@@ -3193,6 +3304,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // Cancellation is required even when keeping parsed cues for a picker detour: a newer selection may
         // re-activate them, but delayed settlement work from the old one must never do so on its own.
         pendingExternalSubtitleActivation = false
+        externalSubtitleRequestRevision &+= 1
         subtitleSelectionRevision &+= 1
         externalSubActive = false
         subtitleOverlay?.setText(nil)
@@ -3773,18 +3885,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 }
             }
         }
-        // The DV/remux playhead receipt, on its own serial queue. `reportPlaybackPosition` is a lock-guarded
-        // (VortXRemuxHLSServer.swift:387-391) write of one Double into a struct that itself refuses samples
-        // while a seek is pending (VortXHLSSeekAnchorState.swift:16-22), so it is safe off the main actor and
-        // cannot reorder ahead of a seek destination. The server is bound weakly HERE rather than read through
-        // `self` each tick because `self` is @MainActor-isolated: `remuxHLSServer` is assigned exactly once per
-        // load (in load(), before this attach point), so the binding is the same object the main-queue block
-        // used to reach. A no-remux mount captures nil and the block is a no-op, matching the old `?.` behaviour.
-        playheadObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: playheadQueue
-        ) { [weak remuxServer = remuxHLSServer] time in
-            remuxServer?.reportPlaybackPosition(playerSeconds: time.seconds)
-        }
+        // Producer/consumption receipts run on their own serial queue, including the retained-window
+        // accounting refresh after a seek. The observer captures the exact server and seek epoch, so queued
+        // old samples cannot overwrite a new seek and no stream/spool work enters the main UI observer.
+        installPlayheadReceiptObserver()
         NotificationCenter.default.addObserver(self, selector: #selector(didPlayToEnd(_:)),
                                                name: .AVPlayerItemDidPlayToEndTime, object: item)
         NotificationCenter.default.addObserver(self, selector: #selector(failedToEnd(_:)),
@@ -3912,10 +4016,6 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if seekable { emit(MPVProperty.duration, emittedDuration, loadToken: loadToken) }
             emit(MPVProperty.seekable, seekable, loadToken: loadToken)
             refreshRemuxSourceAudioTracks()
-            // Publish audio and subtitle topology together after both media-selection groups resolve. An
-            // audio-only publication would consume the chrome's one-shot automatic selection before the
-            // subtitle rows exist.
-            loadSelectionGroups()
             loadChapters()                     // async; re-emits track-list if the asset has chapter markers
             emitDynamicRange(item)             // Gap 7: light the chrome's HDR chip for DV / HDR10 / HLG content
             loadContainerFrameRate(item)       // Gap 8: cache the video track fps for the subtitle fingerprint
@@ -3952,15 +4052,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
                 }
             }
+            // Consume and clear the remount transaction before kicking off unbounded group discovery.  This
+            // makes the ready item authoritative for all later seek/play/pause calls even if the asset never
+            // returns an audible or legible group.
+            releasePendingPlaybackIntentAtReady(for: item)
+            // Publish audio and subtitle topology together after both media-selection groups resolve. An
+            // audio-only publication would consume the chrome's one-shot automatic selection before the
+            // subtitle rows exist.
+            loadSelectionGroups()
             if !didStart {
                 didStart = true
-                if pendingPlaybackIntent == nil {
-                    applyCommittedTransport()
-                } else {
-                    DiagnosticsLog.log(
-                        "avplayer",
-                        "readyToPlay deferred transport until recovery selection and playhead restoration")
-                }
+                applyCommittedTransport()
                 DiagnosticsLog.log(
                     "avplayer",
                     "readyToPlay transport playbackRequested=\(playbackRequested) requestedRate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
@@ -4682,7 +4784,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     "source audio primary was not ready; retaining \(remuxSourceAudioTracks.count) source rows with no selected claim")
                 selectedRemuxAudioSourceIndex = nil
             }
-            let intentSnapshot = pendingPlaybackIntent
+            // Position and transport were consumed at ready. This continuation applies media choices only.
+            let intentSnapshot = pendingMediaSelectionIntent
             let replacementReady = audioReplacement.map {
                 $0.isReady(generation: selectionGeneration)
             } ?? true
@@ -4693,27 +4796,6 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     mountIdentity: selectionMountIdentity)
                 : nil
             if let restore {
-                let playerSeconds: Double
-                if isRemuxMounted {
-                    let sourceDuration = remuxHLSServer?.sourceDurationSeconds
-                        ?? remuxRemoteMount?.sourceDurationSeconds
-                        ?? remuxLoader?.sourceDurationSeconds
-                    playerSeconds = RemuxResumePolicy.playerSeek(
-                        sourceSeconds: restore.sourceSeconds,
-                        origin: remuxTimelineOrigin,
-                        authoritativeSourceDurationSeconds: sourceDuration,
-                        playerDurationSeconds: item.duration.seconds,
-                        producedEdgePlayerSeconds: producedEdgeSeconds)
-                } else {
-                    playerSeconds = restore.sourceSeconds
-                }
-                // Queue a normal AVPlayer seek. An exact awaited seek can suspend on a forward-only HLS mount
-                // when the viewer changed the target during remount. The policy above clamps the newest source
-                // intent into the produced player window, and this MainActor block has no suspension between
-                // consuming and clearing that intent.
-                player.seek(
-                    to: CMTime(seconds: playerSeconds, preferredTimescale: 600),
-                    completionHandler: { _ in })
                 if restore.audioSelectionKnown,
                    remuxSourceAudioTracks.isEmpty,
                    restore.audioSourceIndex == nil,
@@ -4741,23 +4823,22 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     break
                 }
 
-                // The snapshot owns playhead and media selections only. Transport is live controller state:
-                // play(), pause() and setSpeed() may have committed a newer choice while groups were loading.
+                // Transport is live controller state. The playhead was restored at ready and must not be
+                // rewound here after a later live seek.
                 applyCommittedTransport()
-                pendingPlaybackIntent = nil
-                remuxSeekRemountTarget = nil
+                pendingMediaSelectionIntent = nil
                 audioReplacement = nil
                 DiagnosticsLog.log(
                     "avplayer",
-                    "playback intent restored once generation=\(selectionGeneration) mount=\(selectionMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)) audio=\(restore.audioSourceIndex.map(String.init) ?? restore.nativeAudioIndex.map(String.init) ?? "default") subtitle=\(String(describing: restore.subtitle)) capturedPlaybackRequested=\(restore.playbackRequested) capturedRate=\(restore.requestedRate) committedPlaybackRequested=\(playbackRequested) committedRate=\(requestedRate)")
-            } else if pendingPlaybackIntent != nil {
+                    "media selection restored once generation=\(selectionGeneration) mount=\(selectionMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)) audio=\(restore.audioSourceIndex.map(String.init) ?? restore.nativeAudioIndex.map(String.init) ?? "default") subtitle=\(String(describing: restore.subtitle)) committedPlaybackRequested=\(playbackRequested) committedRate=\(requestedRate)")
+            } else if pendingMediaSelectionIntent != nil {
                 // A live mount always restores here: `replacementReady` is true by this point (the audio
                 // replacement block above either marks the transaction ready or returns), and loadFile / the
                 // recovery remount rebind the intent to every mount's generation and identity, so `consume`
                 // matches and lands exactly once for the current mount. The only way to reach this branch is a
                 // stale selection pass whose generation the guards above already rejected; keep the unconsumed
                 // local copy so nothing is lost, but there is no restore to retry.
-                pendingPlaybackIntent = ownedIntent
+                pendingMediaSelectionIntent = ownedIntent
             }
             // A selection notification may arrive before the groups finish loading and publish an empty
             // snapshot. Open the generation gate only after both groups and restoration are complete, then
@@ -4860,6 +4941,20 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         observations.forEach { $0.invalidate() }
         observations.removeAll()
         NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Rebinding after seek completion/cancellation rejects callbacks queued by the outgoing observer.
+    /// It is independent of the UI observer: no new KVO subscriptions or item replacement is needed.
+    private func installPlayheadReceiptObserver() {
+        if let playheadObserver { player.removeTimeObserver(playheadObserver) }
+        playheadObserver = nil
+        guard timeObserver != nil, let server = remuxHLSServer else { return }
+        let epoch = server.playbackReceiptEpoch
+        playheadObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: playheadQueue
+        ) { [weak server] time in
+            server?.reportPlaybackPosition(playerSeconds: time.seconds, receiptEpoch: epoch)
+        }
     }
 
     deinit {

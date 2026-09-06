@@ -46,6 +46,14 @@ enum RemuxResumePolicy {
     /// weakening the sanitisation or timeline-mapping tests below.
     static let isEnabledByDefault = true
 
+    /// An internal retry owns the consumed origin even before its first item/intent exists.
+    /// An unrelated source never inherits it. Explicit zero still overrides a previous resume.
+    static func originForLoad(configuredOrigin: Double?, sameLogicalRequest: Bool,
+                              previousOrigin: Double) -> Double {
+        if let configuredOrigin { return originRequest(resumeSeconds: configuredOrigin) }
+        return sameLogicalRequest ? originRequest(resumeSeconds: previousOrigin) : 0
+    }
+
     /// The smallest resume point worth seeking the input for.
     ///
     /// Below this the seek costs a keyframe hunt (a real network round trip on a debrid link, inside the cold

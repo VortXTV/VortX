@@ -561,6 +561,17 @@ struct CoreMetaDetails: Decodable {
 
     var selectedMetaID: String? { selected?.metaPath.id }
 
+    /// Navigation only: an episode list does not depend on unrelated stream searches completing.
+    /// Callers must also own the bridge refresh generation. This is never proof of series finality.
+    func appleCWNavigationMeta(for requestedID: String, streamID: String) -> CoreMetaItem? {
+        guard selectedMetaID == requestedID, let candidate = meta, candidate.id == requestedID,
+              let videos = candidate.videos,
+              EpisodePlaybackIdentity.appleCWSeriesInventory(from: videos, authority: .launch) != nil,
+              videos.contains(where: { $0.id == streamID })
+                || allStreamGroups.contains(where: { $0.request.path.id == streamID }) else { return nil }
+        return candidate
+    }
+
     /// A terminal exact-title meta response for Apple refreshes. General `metaResolution` is intentionally
     /// broader: it becomes `.ready` when ANY provider is ready. This seam waits for every provider entry to
     /// be terminal (`Ready` or `Err`), requires at least one ready item for the exact selected title, rejects
@@ -1121,7 +1132,7 @@ enum EpisodePlaybackIdentity {
     }
 
     /// Convert CoreVideo metadata into the Apple inventory contract without discarding raw ordering. The
-    /// settled-backfill case rejects partial coordinates and raw unsorted input; all metadata remains usable
+    /// settled-backfill case rejects partial coordinates and duplicate identities; all metadata remains usable
     /// only for safe successor navigation because CoreMetaDetails has no completeness marker.
     static func appleCWSeriesInventory(from episodes: [CoreVideo],
                                        authority: AppleCWSeriesInventory.Authority) -> AppleCWSeriesInventory? {
@@ -1134,7 +1145,7 @@ enum EpisodePlaybackIdentity {
     }
 
     /// Accept a later settled backfill when it is fuller than, or an exact identity match for, the launch list.
-    /// The candidate remains raw until the inventory check rejects partial or unsorted metadata. This seam may
+    /// The candidate remains raw while the inventory validates coordinates and derives navigation order. This seam may
     /// establish a successor for navigation, never destructive series finality.
     static func appleCWAuthoritativeBackfill(from episodes: [CoreVideo],
                                              replacing launchEpisodes: [CoreVideo]) -> [CoreVideo]? {

@@ -105,9 +105,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// cohort. It is not playback proof and must never authorize eviction because AVPlayer reads far ahead.
     /// Guarded by `publicationLock`.
     private var highestServedVideoSegmentID = -1
-    /// AVPlayer's latest displayed local-media clock. The 4 Hz main-thread observer writes only this tiny value
-    /// under its own lock. Playlist publication maps it to the current common generation while already off the
-    /// main actor, so filesystem work under `publicationLock` cannot freeze player chrome or progress delivery.
+    /// AVPlayer's latest displayed local-media clock. A dedicated 4 Hz receipt queue updates it and the
+    /// producer ledger; neither spool snapshots nor publication work run on the main UI observer.
     private let playbackClockLock = NSLock()
     private var seekAnchorState = VortXHLSSeekAnchorState()
     /// Producer-boundary and 4 Hz consumer-clock receipts rendezvous here. The HLS server used to evaluate
@@ -115,6 +114,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// between AVPlayer's roughly six-second reloads.
     private let producerLeadLock = NSLock()
     private var producerLeadLedger = VortXRemuxProducerLeadLedger()
+    private var producerLeadNeedsReanchor = false
     private var lastProducerLeadPaused: Bool?
     /// Cumulative produced-segment byte and media totals, sampled from the same producer-boundary receipts the
     /// lead ledger consumes. Their ratio is the OBSERVED muxed-output bitrate that
@@ -674,19 +674,28 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return first.start...last.end
     }
 
-    /// Records the current AVPlayer clock without entering the publication critical section. Invalid clocks fail
-    /// closed. The publisher later maps the clock to its exact common generation, so speculative segment requests
-    /// still cannot substitute for playback proof.
-    func reportPlaybackPosition(playerSeconds: Double) {
+    /// Receipt observers capture this revision rather than reading the current one when a queued tick arrives.
+    var playbackReceiptEpoch: UInt64 {
+        playbackClockLock.lock(); defer { playbackClockLock.unlock() }
+        return seekAnchorState.playbackReceiptEpoch
+    }
+
+    /// Accept only current-epoch clocks outside a pending seek, without entering publication ownership.
+    func reportPlaybackPosition(playerSeconds: Double, receiptEpoch: UInt64) {
         playbackClockLock.lock()
-        seekAnchorState.reportPlaybackPosition(playerSeconds)
-        playbackClockLock.unlock()
+        defer { playbackClockLock.unlock() }
+        guard seekAnchorState.reportPlaybackPosition(playerSeconds, receiptEpoch: receiptEpoch) else { return }
+        // Keep admission and the ledger receipt atomic. Previously rejected pre-seek ticks still reached
+        // the producer ledger, and its monotonic frontier then ignored every legitimate backward tick.
         refreshProducerLeadGate(playbackReceipt: playerSeconds)
     }
 
     func registerLatestSeekRequest(requestID: UInt64) {
         playbackClockLock.lock()
         seekAnchorState.registerSeek(requestID: requestID)
+        producerLeadLock.lock()
+        producerLeadNeedsReanchor = true
+        producerLeadLock.unlock()
         playbackClockLock.unlock()
     }
 
@@ -787,13 +796,26 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                 couplingProducedBytes += safeBytes
             }
         }
-        if let playbackReceipt { producerLeadLedger.recordPlayback(playbackReceipt) }
+        if let playbackReceipt {
+            if producerLeadNeedsReanchor {
+                // Lock order: playbackClock -> producerLead -> stream HLS snapshot. Segment callbacks run
+                // after the stream releases hlsLock. Holding producerLead across snapshot + replacement
+                // means a simultaneously published tail is either in this snapshot or its later callback,
+                // never lost between a snapshot and ledger reset.
+                let retained = stream.hlsWindowSnapshot().window.segments.map {
+                    VortXRemuxProducerLeadLedger.Segment(id: $0.id, end: $0.end, byteLength: $0.byteLength)
+                }
+                producerLeadLedger.reanchor(to: playbackReceipt, retainedSegments: retained)
+                producerLeadNeedsReanchor = false
+            } else {
+                producerLeadLedger.recordPlayback(playbackReceipt)
+            }
+        }
         let producedEnd = producerLeadLedger.producedEnd
         let playback = producerLeadLedger.playbackSeconds
         let aheadBytes = producerLeadLedger.outstandingBytes
         let segmentCount = producerLeadLedger.outstandingSegmentCount
-        producerLeadLock.unlock()
-        guard let producedEnd else { return }
+        guard let producedEnd else { producerLeadLock.unlock(); return }
         let playhead = playback ?? .nan
         let wasPaused = stream.producerLeadGate.isPaused
         let shouldPause = VortXRemuxProducerLeadPolicy.shouldPauseProducer(
@@ -801,7 +823,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             aheadBytes: aheadBytes,
             currentlyPaused: wasPaused)
         stream.producerLeadGate.setPaused(shouldPause)
-        producerLeadLock.lock()
         let changed = lastProducerLeadPaused != shouldPause
         lastProducerLeadPaused = shouldPause
         producerLeadLock.unlock()

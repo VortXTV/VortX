@@ -307,16 +307,26 @@ struct VortXRemuxProducerLeadLedger: Sendable {
     private var latestPlayhead: Double?
     private var aheadBytes = 0
 
+    /// Only an accepted post-seek clock may reset the monotonic frontier. Rebuild from the real retained
+    /// window: the compacted consumption ledger no longer contains segments a backward seek can revisit.
+    mutating func reanchor(to seconds: Double, retainedSegments: [Segment]) {
+        guard seconds.isFinite, seconds >= 0 else { return }
+        self = Self()
+        for segment in retainedSegments { recordProduced(segment) }
+        recordPlayback(seconds)
+    }
+
     mutating func recordProduced(_ segment: Segment) {
         guard segment.id > latestSegmentID,
               segment.end.isFinite,
               segment.byteLength >= 0 else { return }
         latestSegmentID = segment.id
         segments.append(segment)
-        if latestPlayhead.map({ segment.end > $0 }) ?? true {
-            let (next, overflow) = aheadBytes.addingReportingOverflow(segment.byteLength)
-            aheadBytes = overflow ? Int.max : next
-        }
+        let (next, overflow) = aheadBytes.addingReportingOverflow(segment.byteLength)
+        aheadBytes = overflow ? Int.max : next
+        // A boundary callback may arrive after a seek receipt already moved past that segment. Account it
+        // once, then consume it once; excluding the addition but later subtracting it undercounted the lead.
+        if let latestPlayhead { recordPlayback(latestPlayhead) }
     }
 
     mutating func recordPlayback(_ seconds: Double) {

@@ -640,6 +640,7 @@ struct PlayerScreen: View {
     /// True only after this player has issued its own direct-resume authoritative metadata request. A partial
     /// launch list alone is not permission to retain manual navigation beyond a known boundary.
     @State private var directResumeInventoryRefreshPending = false
+    @State private var episodeInventoryUnavailable = false
     @State private var sourceSwitchGeneration = 0
     @State private var loadedSeriesEpisodes: [PlayerEpisodeRef] = []
     @State private var loadedSeriesVideoMetadata: [CoreVideo] = []
@@ -854,6 +855,7 @@ struct PlayerScreen: View {
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
     @State private var isSeekable = true
     @State private var loadTimeout: Task<Void, Never>?
+    @State private var playbackDeadlineClock = PlaybackActiveTimeClock()
     @State private var reconnecting = false          // showing the "Recovering…" auto-retry state
     @State private var reconnectMsg = "Recovering…"
     @State private var autoRetryCount = 0
@@ -1007,6 +1009,8 @@ struct PlayerScreen: View {
         .onChange(of: sourceSwitchGeneration) { _ in
             cancelDirectResumeInventoryRefresh()
             clearPendingManualEpisodeNavigation(reason: "source replacement")
+            episodeInventoryUnavailable = false
+            hydrateDirectResumeSeriesInventory()
         }
         .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(); LoopbackPlaybackAssertion.end() }
     }
@@ -1017,6 +1021,9 @@ struct PlayerScreen: View {
     /// re-renders the other engine on the SAME view; `avEngineFailed` still wins (a failed manual AVPlayer pick
     /// falls back to libmpv, no loop).
     @State private var manualEngineAVPlayer: Bool?
+    @State private var engineSurfaceURLOverride: URL?
+    @State private var engineSurfaceHeadersOverride: [String: String]?
+    @State private var engineSurfaceUsesActiveTuple = false
 
     /// Whether to mount the AVFoundation engine instead of libmpv for this stream. In `auto`: remote HLS routes
     /// here for native ABR + AirPlay + PiP (Gap 1: through the full chrome now, not the old bare HLSPlayerView),
@@ -1043,8 +1050,8 @@ struct PlayerScreen: View {
     private var canUseAVPlayerEngine: Bool {
         if audioSidecarURL != nil { return false }
         let activeURL = curURL ?? url
-        let loopback = activeURL.host == "127.0.0.1" || activeURL.host == "localhost"
-        if curIsTorrent || loopback { return false }
+        let loopback = PlayerEngineRouter.isLoopbackURL(activeURL)
+        if curIsTorrent || (loopback && !PlayerEngineRouter.isLocalNNTPURL(activeURL)) { return false }
         return PlayerEngineRouter.isAVPlayerContainer(activeURL) || activeAVPlayerWouldRemux
             || activeAVPlayerWouldPlainRemux
     }
@@ -1095,7 +1102,7 @@ struct PlayerScreen: View {
         // to the router below; compiled out of release builds.
         assert(!(isTrailer && PlayerEngineRouter.isHLS(url)),
                "trailer manifest must route to libmpv, never AVPlayer")
-        let loopback = url.host == "127.0.0.1" || url.host == "localhost"
+        let loopback = PlayerEngineRouter.isLoopbackURL(url) && !PlayerEngineRouter.isLocalNNTPURL(url)
         let isDV = StreamRanking.isDolbyVision(recordQualityText ?? "")
         // Pass this display's DV capability so the DV mandate holds on macOS too (DV -> the remux->AVPlayer
         // lane on any DV-capable display). Evaluated once at play start (this feeds engineLatch in onAppear).
@@ -1160,9 +1167,10 @@ struct PlayerScreen: View {
                 // DV title silently demoted to libmpv HDR10 while the chrome briefly claimed AVPlayer.
                 // AVFoundation attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey in loadFile) and
                 // the remux server takes them directly; only libmpv (mpvSurface below) keeps the proxy.
-                .play(url, headers: headers,
-                      isDolbyVision: StreamRanking.isDolbyVision(recordQualityText ?? ""))
-                .live(initialIsLive)
+                .play(engineSurfacePlayback.url, headers: engineSurfacePlayback.headers,
+                      isDolbyVision: StreamRanking.isDolbyVision(
+                        engineSurfaceUsesActiveTuple ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? "")))
+                .live(engineSurfaceUsesActiveTuple ? isLive : initialIsLive)
                 .resumeOrigin(avSurfaceResumeOrigin ?? resumeSeconds)
                 .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                 .ignoresSafeArea()
@@ -1511,7 +1519,7 @@ struct PlayerScreen: View {
                                       loadToken: coordinator.player?.activeLoadToken
                                   ) else { return }
                             if launched, !isPaused {
-                                coordinator.player?.togglePause()
+                                viewerPause()
                             } else if !launched {
                                 externalLinkDead = true
                             }
@@ -2055,9 +2063,9 @@ struct PlayerScreen: View {
                     // DISTINCT from the toggle now: the system sends the command it wants, so routing an
                     // explicit "play" into a toggle paused a playing film (#157).
                     NowPlayingCenter.wireCommands(
-                        play: { coordinator.player?.play() },
-                        pause: { coordinator.player?.pause() },
-                        togglePause: { coordinator.player?.togglePause() },
+                        play: { viewerPlay() },
+                        pause: { viewerPause() },
+                        togglePause: { viewerToggle() },
                         seekBy: { delta in
                             if handleDeferredResumeUserSeek(.relative(delta)) { return }
                             cancelPendingResumeForUserSeek()
@@ -2471,10 +2479,14 @@ struct PlayerScreen: View {
             } else if hasNext, !skipEditActive {
                 onNext()                                  // legacy non-episode caller (in-place)
             } else if !skipEditActive {
-                if let m = curMeta, m.usesSeriesLifecycle {
+                if let m = curMeta, isEpisodePlaybackContext {
                     let decision = terminalSeriesDecision(for: m)
                     if decision == .refresh, !terminalFinalityRefreshUsed {
                         refreshTerminalSeriesInventory(for: m)
+                        return
+                    }
+                    guard canExitAtKnownEpisodeBoundary else {
+                        presentUnavailableEpisodeInventory()
                         return
                     }
                 } else if let m = curMeta, terminalRewindGate.issueTerminalRewind() {
@@ -2905,6 +2917,14 @@ struct PlayerScreen: View {
         playback(for: url, headers: headers)
     }
 
+    /// Seed a replacement controller with the active raw transport, not the original episode's URL.
+    private var engineSurfacePlayback: (url: URL, headers: [String: String]?) {
+        if engineSurfaceUsesActiveTuple {
+            return (engineSurfaceURLOverride ?? url, engineSurfaceHeadersOverride)
+        }
+        return (url, headers)
+    }
+
     /// A post-AV fallback must construct MPV with the source that is current at the handoff boundary.
     /// Loading the immutable launch tuple first can first-frame a previous source before a deferred correction.
     private var mpvSurfacePlayback: (url: URL, headers: [String: String]?, audioSidecar: URL?, live: Bool, isDolbyVision: Bool) {
@@ -3235,7 +3255,7 @@ struct PlayerScreen: View {
             } else {
                 srcProbe("native debrid: fresh same-source link unavailable reason=\(reason)")
                 reconnecting = false
-                if currentPickWasExplicit {
+                if currentPickWasExplicit && !currentPlaybackIsResume {
                     if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
                     presentTerminalLoadFailure()
                 } else if !hopToNextSource(reason: "native debrid source unavailable", resumeOverride: retryResume) {
@@ -3467,6 +3487,45 @@ struct PlayerScreen: View {
     /// 30s budget; every caller uses this one except the post-demote mpv leg.
     private func startLoadTimeout() { startLoadTimeout(seconds: 30) }
 
+    /// User transport alone owns this clock; a ready item's initial pause notification does not.
+    private var playbackDeadlineNow: Double {
+        playbackDeadlineClock.value(at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    private func viewerPause() {
+        guard coordinator.player != nil else { return }
+        playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
+        coordinator.player?.pause()
+    }
+
+    private func viewerPlay() {
+        playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        coordinator.player?.play()
+    }
+
+    private func retryPlaybackByUser() {
+        playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        retryLoad()
+    }
+
+    private func viewerToggle() {
+        if isPaused { viewerPlay() } else { viewerPause() }
+    }
+
+    /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
+    private func waitForPlaybackTime(_ seconds: Double) async -> Bool {
+        let deadline = playbackDeadlineNow + seconds
+        while !Task.isCancelled {
+            let remaining = deadline - playbackDeadlineNow
+            if remaining <= 0, !playbackDeadlineClock.isPaused { return true }
+            do {
+                try await Task.sleep(for: .seconds(min(0.25, max(0.05, remaining))))
+            } catch { return false }
+        }
+        return false
+    }
+
+
     /// `seconds` is the ordinary 30s budget for every caller except the post-demote mpv leg, which passes the
     /// shorter `avPostDemoteStartTimeoutSeconds` (W2-A item 3b). Nothing else about the timer changes.
     private func startLoadTimeout(seconds: Double) {
@@ -3478,7 +3537,7 @@ struct PlayerScreen: View {
         lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
         srcProbe("start-watchdog ARMED (\(Int(seconds))s) bufferedEdge=\(String(format: "%.1f", bufferedTime))")
         loadTimeout = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(seconds))
+            guard await waitForPlaybackTime(seconds) else { return }
             // A cancelled watchdog (superseded by a hop / reload / new load) must NOT fire: Task.sleep throws
             // CancellationError on cancel and `try?` swallows it, so without this guard the cancelled timer
             // runs handleStartTimeout immediately, and each hop arms+cancels the next, cascading through every
@@ -3540,7 +3599,7 @@ struct PlayerScreen: View {
             lastBufferedAtWatchdog = bufferedTime
             loadTimeout?.cancel()
             loadTimeout = Task { @MainActor in
-                try? await Task.sleep(for: .seconds(20))
+                guard await waitForPlaybackTime(20) else { return }
                 guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }   // cancelled re-arm must not fire (see start-watchdog)
                 handleStartTimeout()
             }
@@ -3875,7 +3934,7 @@ struct PlayerScreen: View {
     private func startRecoveryDeadline() {
         guard recoveryDeadline == nil else { return }
         recoveryDeadline = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(maxRecoverySeconds))
+            guard await waitForPlaybackTime(maxRecoverySeconds) else { return }
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
             loadTimeout?.cancel(); autoRetryTask?.cancel(); stallWatchdog?.cancel()
             if loadErrorMsg.isEmpty { loadErrorMsg = "Couldn't start playback after trying several sources." }
@@ -3897,7 +3956,7 @@ struct PlayerScreen: View {
         postFrameResumeSeekWatchdogTarget = target
         postFrameResumeSeekWatchdogOwner = armedToken
         postFrameResumeSeekWatchdog = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(postFrameResumeSeekWatchdogSeconds))
+            guard await waitForPlaybackTime(postFrameResumeSeekWatchdogSeconds) else { return }
             guard !Task.isCancelled,
                   let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
                     targetSeconds: target,
@@ -3985,6 +4044,7 @@ struct PlayerScreen: View {
                 try? await Task.sleep(
                     for: .seconds(PlayerMidPlaybackStallPolicy.pollIntervalSeconds)
                 )
+                guard !Task.isCancelled else { return }
                 guard PlayerMidPlaybackStallPolicy.shouldObserve(
                     hasStartedPlaying: hasStartedPlaying,
                     isPaused: isPaused,
@@ -4403,6 +4463,9 @@ struct PlayerScreen: View {
         demotedEngineLoadToken = coordinator.player?.activeLoadToken
         coordinator.player?.stop()          // straddle invariant: old engine fully down before the surface swap
         clearCachedAudioOutputTruth()
+        engineSurfaceURLOverride = curURL ?? url
+        engineSurfaceHeadersOverride = curHeaders
+        engineSurfaceUsesActiveTuple = true
         avSurfaceResumeOrigin = resume
         manualEngineAVPlayer = toAVPlayer
         avEngineFailed = false              // a manual pick gets a fresh chance even after a prior demote
@@ -4425,8 +4488,9 @@ struct PlayerScreen: View {
         // A remux target consumes `avSurfaceResumeOrigin` before its initial load. Native AVPlayer and libmpv
         // still need their ordinary post-mount seek.
         if resume > 5, !targetIsRemux { nudgeResume(to: resume) }
-        // The fresh mount auto-loads the LAUNCH url; re-point at the ACTIVE source if this session switched.
-        if let cu = curURL, cu != url || pendingAdvance?.issued == true {
+        // Ordinary replacements already mount the active tuple. Only a pending episode needs an explicit
+        // issued load to rebind its pending-token transaction to the newly constructed controller.
+        if let cu = curURL, pendingAdvance?.issued == true {
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
                 guard manualEngineAVPlayer == toAVPlayer, !Task.isCancelled, curURL == cu,
@@ -4465,13 +4529,13 @@ struct PlayerScreen: View {
             // Give the surface one render beat to mount the controller, then read the lane ONCE. Unlike tvOS
             // (which arms after a synchronous mount) this chrome can arm before the controller exists; a late
             // or absent controller reads remuxMounted=false and keeps today's fixed deadline, never a longer one.
-            try? await Task.sleep(for: .seconds(1))
+            guard await waitForPlaybackTime(1) else { return }
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
             guard let watchedController = coordinator.player as? AVPlayerEngineController,
                   let watchedLoadToken = watchedController.activeLoadToken else { return }
             let remuxMounted = watchedController.isRemuxMounted
             if !remuxMounted {
-                try? await Task.sleep(for: .seconds(avStartWatchdogSeconds - 1))
+                guard await waitForPlaybackTime(avStartWatchdogSeconds - 1) else { return }
                 guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
                 guard let current = coordinator.player as? AVPlayerEngineController,
                       current === watchedController,
@@ -4485,17 +4549,18 @@ struct PlayerScreen: View {
             // monotonic progress counters at ~1 Hz; demote only on a TRUE stall (nothing moved for
             // avRemuxStallDemoteSeconds) or at the hard ceiling. A slow-but-steadily-downloading 4K DV source
             // keeps its true-DV session instead of being demoted to HDR10 + PCM by a fixed wall.
-            let armed = Date()
+            let armed = playbackDeadlineNow
             var lastProgressAt = armed
             var last = watchedController.remuxMountProgress
             var lastHoldLogAt = armed
             while true {
-                try? await Task.sleep(for: .seconds(1))
+                guard await waitForPlaybackTime(0) else { return }
+                guard await waitForPlaybackTime(1) else { return }
                 guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
                 guard let current = coordinator.player as? AVPlayerEngineController,
                       current === watchedController,
                       current.activeLoadToken == watchedLoadToken else { return }
-                let now = Date()
+                let now = playbackDeadlineNow
                 if let cur = current.remuxMountProgress {
                     // Progress = any monotonic counter moved since the last poll. A FAILED mount never counts;
                     // its demote belongs to the HLS-404 -> .failed path, and if that somehow never fires the
@@ -4540,8 +4605,8 @@ struct PlayerScreen: View {
                         return
                     }
                 }
-                let elapsed = now.timeIntervalSince(armed)
-                let stalled = now.timeIntervalSince(lastProgressAt)
+                let elapsed = (now - armed)
+                let stalled = (now - lastProgressAt)
                 // W2-A: the input-side receipts ride the same line as the output counters, so the exportable
                 // trail shows WHY a stall was called dead (or not) instead of only that it was called.
                 let inBytes: String = {
@@ -4587,7 +4652,7 @@ struct PlayerScreen: View {
                     return
                 }
                 // Past the old fixed wall and still holding: say WHY (progress is flowing), every ~10s.
-                if elapsed >= avStartWatchdogSeconds, now.timeIntervalSince(lastHoldLogAt) >= 10 {
+                if elapsed >= avStartWatchdogSeconds, (now - lastHoldLogAt) >= 10 {
                     lastHoldLogAt = now
                     DiagnosticsLog.log("dv", "start watchdog holding: remux progressing (elapsed=\(Int(elapsed))s, quiet=\(Int(stalled))s, \(state))")
                 }
@@ -4902,6 +4967,9 @@ struct PlayerScreen: View {
                               mediaGenerationAlreadyClaimed: Bool = false,
                               preparedRemux: VortXPreparedRemuxAttachment? = nil,
                               expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> Bool {
+        if userInitiated, loadFailed {
+            playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        }
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
@@ -5153,8 +5221,8 @@ struct PlayerScreen: View {
         )
     }
 
-    private func hydrateDirectResumeSeriesInventory() {
-        guard startedFromResume, let launchMeta = curMeta, launchMeta.usesSeriesLifecycle else { return }
+    private func hydrateDirectResumeSeriesInventory(force: Bool = false) {
+        guard (startedFromResume || force), isEpisodePlaybackContext, let launchMeta = curMeta else { return }
         cancelDirectResumeInventoryRefresh()
         directResumeInventoryRefreshTask = Task { @MainActor in
             for _ in 0..<40 {
@@ -5171,7 +5239,7 @@ struct PlayerScreen: View {
                 directResumeInventoryRefreshTarget = target
                 let requestGeneration = core.beginAppleCWAuthoritativeMetaRefresh(
                     type: current.type, id: current.libraryId,
-                    streamType: current.type, streamId: current.videoId
+                    streamType: current.type, streamId: current.videoId, navigationOnly: true
                 )
                 directResumeInventoryRefreshGeneration = requestGeneration
                 directResumeInventoryRefreshPending = true
@@ -5193,7 +5261,7 @@ struct PlayerScreen: View {
                     if AppleCWMetaRefreshAuthorityPolicy.accepts(
                         receipt, forRequestGeneration: requestGeneration,
                         expectedLibraryID: current.libraryId, expectedStreamID: current.videoId
-                    ), let loaded = core.appleCWMetaRefreshDetails?.appleCWTerminalFullMeta(
+                    ), let loaded = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
                         for: current.libraryId, streamID: current.videoId
                     ), let candidate = authoritativeBackfillRefs(loaded.videos ?? []) {
                         guard !Task.isCancelled,
@@ -5201,6 +5269,7 @@ struct PlayerScreen: View {
                         loadedSeriesEpisodes = candidate
                         loadedSeriesVideoMetadata = loaded.videos ?? []
                         authoritativeSeriesEpisodes = candidate
+                        if panel == .episodes { panelRows = rows(for: .episodes) }
                         return
                     }
                     guard attempt < 15 else { return }
@@ -5229,6 +5298,21 @@ struct PlayerScreen: View {
             return .completedWithFullInventory
         }
         return terminalFinalityRefreshUsed ? .completedWithoutFullInventory : .notAttempted
+    }
+
+    private var canExitAtKnownEpisodeBoundary: Bool {
+        AppleCWSeriesTerminalPolicy.canExitPlayer(
+            currentID: curMeta?.videoId,
+            inventory: seriesInventory(from: terminalEpisodeSource, authority: terminalInventoryAuthority),
+            refreshAttempted: terminalRefreshResult == .completedWithFullInventory)
+    }
+
+    private func presentUnavailableEpisodeInventory() {
+        episodeInventoryUnavailable = true
+        buffering = false
+        coordinator.player?.pause()
+        openPanel(.episodes)
+        DiagnosticsLog.log("binge", "episode ended without usable inventory; retained player with explicit refresh action")
     }
 
     private func terminalSeriesDecision(for m: PlaybackMeta) -> AppleCWSeriesTerminalDecision {
@@ -5269,7 +5353,7 @@ struct PlayerScreen: View {
         cancelTerminalFinalityRefresh()
         terminalFinalityRefreshTarget = target
         let requestGeneration = core.beginAppleCWAuthoritativeMetaRefresh(
-            type: m.type, id: m.libraryId, streamType: m.type, streamId: m.videoId
+            type: m.type, id: m.libraryId, streamType: m.type, streamId: m.videoId, navigationOnly: true
         )
         terminalFinalityRefreshGeneration = requestGeneration
         terminalFinalityRefreshTask = Task { @MainActor in
@@ -5289,7 +5373,7 @@ struct PlayerScreen: View {
                 if AppleCWMetaRefreshAuthorityPolicy.accepts(
                     receipt, forRequestGeneration: requestGeneration, expectedLibraryID: m.libraryId,
                     expectedStreamID: m.videoId
-                ), let loaded = core.appleCWMetaRefreshDetails?.appleCWTerminalFullMeta(
+                ), let loaded = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
                     for: m.libraryId, streamID: m.videoId
                 ),
                    let vids = loaded.videos, !vids.isEmpty {
@@ -5333,7 +5417,8 @@ struct PlayerScreen: View {
             case .refresh, .keepState:
                 guard !Task.isCancelled,
                       terminalRefreshTargetIsCurrent(target, loadToken: loadToken) else { return }
-                leavePlayback()
+                if canExitAtKnownEpisodeBoundary { leavePlayback() }
+                else { presentUnavailableEpisodeInventory() }
             }
         }
     }
@@ -5831,6 +5916,8 @@ struct PlayerScreen: View {
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
     @discardableResult
     private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) -> Bool {
+        episodeInventoryUnavailable = false
+        playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         cancelDirectResumeInventoryRefresh()
         clearPendingManualEpisodeNavigation(reason: "episode replacement")
         let refreshedMetadata = loadedSeriesVideoMetadata.first { $0.id == videoId }
@@ -6185,7 +6272,7 @@ struct PlayerScreen: View {
                     if hasAlternateSources {
                         Button { openPanel(.sources) } label: { Label("Other sources", systemImage: "rectangle.stack").padding(6) }
                     }
-                    Button { retryLoad() } label: { Label("Retry", systemImage: "arrow.clockwise").padding(6) }
+                    Button { retryPlaybackByUser() } label: { Label("Retry", systemImage: "arrow.clockwise").padding(6) }
                     Button { leavePlayback() } label: { Label("Back", systemImage: "chevron.left").padding(6) }
                 }
                 .buttonStyle(.borderedProminent).tint(Theme.Palette.accent).foregroundStyle(.white).padding(.top, 6)
@@ -6332,7 +6419,7 @@ struct PlayerScreen: View {
                         lastReported = 0
                         saveAccountProgress(0)
                     }
-                    if isPaused { coordinator.player?.togglePause() }   // restart implies resume
+                    viewerPlay()   // restart is an explicit resume, including its recovery budget
                     scheduleHide()
                 }
             }
@@ -6401,7 +6488,7 @@ struct PlayerScreen: View {
             if !isLive {
                 seekButton("gobackward.\(seekStep)", by: -seekStepSeconds)
             }
-            Button { Haptics.tap(); coordinator.player?.togglePause(); scheduleHide() } label: {
+            Button { Haptics.tap(); viewerToggle(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
                     // Glass transport disc (mockup .big) on the TIGHT disc variant: shape-clipped material,
@@ -6625,7 +6712,7 @@ struct PlayerScreen: View {
                     Spacer()
                     controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
                 }
-                if allEpisodeRefs.count > 1 {
+                if isEpisodePlaybackContext {
                     Spacer()
                     controlButton("list.bullet", "Episodes") { openPanel(.episodes) }
                 }
@@ -6820,7 +6907,7 @@ struct PlayerScreen: View {
                     Button {
                         skipDBPreviewing = true
                         coordinator.player?.seek(to: max(0, skipDBEditStart - 2))
-                        if isPaused { coordinator.player?.togglePause() }
+                        viewerPlay()
                     } label: {
                         Image(systemName: skipDBPreviewing ? "stop.circle.fill" : "play.circle")
                             .font(.caption.weight(.semibold))
@@ -7806,7 +7893,7 @@ struct PlayerScreen: View {
         sleepTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
-            if !isPaused { coordinator.player?.togglePause() }
+            if !isPaused { viewerPause() }
             sleepMinutes = nil; sleepDeadline = nil
         }
     }
@@ -7823,9 +7910,17 @@ struct PlayerScreen: View {
             } }
         case .episodes:
             // The season's episodes, current one highlighted; tapping switches in place (goToEpisode).
-            return allEpisodeRefs.map { ep in
+            var rows = [Row(label: "Refresh episode list") {
+                if episodeInventoryUnavailable, let current = curMeta {
+                    refreshTerminalSeriesInventory(for: current)
+                } else {
+                    hydrateDirectResumeSeriesInventory(force: true)
+                }
+            }]
+            rows += allEpisodeRefs.map { ep in
                 Row(label: ep.label, selected: ep.id == curMeta?.videoId) { goToEpisode(ep.id) }
             }
+            return rows
         case .sleep:
             var rs: [Row] = [Row(label: "Off", selected: sleepMinutes == nil && !sleepAtEpisodeEnd) {
                 armSleep(minutes: nil, atEpisodeEnd: false)
@@ -8565,7 +8660,7 @@ struct PlayerScreen: View {
             if event.window?.firstResponder is NSText { return event }
             switch Int(event.keyCode) {
             case Self.kVK_Space:
-                coordinator.player?.togglePause(); scheduleHide(); return nil
+                viewerToggle(); scheduleHide(); return nil
             case Self.kVK_LeftArrow:
                 seekBy(-seekStepSeconds); return nil
             case Self.kVK_RightArrow:
@@ -8995,7 +9090,7 @@ struct PlayerScreen: View {
         pendingStillWatchingEpisodeId = pendingNext
         // Always pause whatever is on screen so the prompt never plays over a running video (a boundary whose
         // file already ended pauses a no-op; a next episode that already began is stopped). Continue resumes.
-        if !isPaused { coordinator.player?.togglePause() }
+        if !isPaused { viewerPause() }
         hideTask?.cancel()
         withAnimation(.easeInOut(duration: 0.2)) { stillWatchingPrompt = true }
     }
@@ -9010,7 +9105,7 @@ struct PlayerScreen: View {
         if let next {
             goToEpisode(next, autoAdvance: true)
         } else {
-            if isPaused { coordinator.player?.togglePause() }
+            viewerPlay()
             scheduleHide()
         }
     }

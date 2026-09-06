@@ -288,6 +288,10 @@ if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
     -framework AppKit
   )
   ENGINE_TRANSACTION_SOURCES=(
+    app/SourcesShared/DetailMetaRecoveryPolicy.swift
+    app/SourcesShared/CatalogRowResolution.swift
+    app/SourcesShared/AppleCWSeasonRolloverPolicy.swift
+    app/SourcesShared/DebridPlaybackAvailability.swift
     app/SourcesShared/CoreModels.swift
     app/SourcesShared/UsenetStreamValidation.swift
     app/Sources/Player/MPVPlayerDelegate.swift
@@ -297,6 +301,9 @@ if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
     app/Sources/Player/PerformanceMode.swift
     app/Sources/Player/MPVProperty.swift
     app/Sources/Player/VortXRemuxResourceLoader.swift
+    app/Sources/Player/PlayerStallPolicy.swift
+    app/Sources/Player/VortXPreparedRemuxHandle.swift
+    app/Sources/Player/TrackSelector.swift
     app/Sources/Player/AVPlayerEngine.swift
   )
   echo "  engine gate     ENABLED: actual AVPlayerEngine setAudioTrack success + rollback"

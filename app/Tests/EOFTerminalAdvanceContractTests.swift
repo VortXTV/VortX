@@ -151,6 +151,22 @@ private func oldWatchdogStoodDown(buffering: Bool) -> Bool { buffering }
 @main
 enum EOFTerminalAdvanceContractTests {
     static func main() {
+        // A Continue Watching episode inventory must not wait on source searches. The explicit title/request
+        // fences remain, while the terminal/account-finality helper keeps its stricter settlement contract.
+        let navigationJSON = #"{"selected":{"metaPath":{"resource":"meta","type":"series","id":"kitsu:460"}},"metaItems":[{"request":{"base":"https://metadata.invalid","path":{"resource":"meta","type":"series","id":"kitsu:460"}},"content":{"type":"Ready","content":{"id":"kitsu:460","type":"series","name":"Fixture","videos":[{"id":"kitsu:460:1:2","season":1,"episode":2},{"id":"kitsu:460:1:1","season":1,"episode":1}]}}}],"streams":[{"request":{"base":"https://slow-source.invalid","path":{"resource":"stream","type":"series","id":"kitsu:460:1:1"}},"content":{"type":"Loading"}}]}"#
+        do {
+            let details = try JSONDecoder().decode(CoreMetaDetails.self, from: Data(navigationJSON.utf8))
+            expect(details.appleCWNavigationMeta(for: "kitsu:460", streamID: "kitsu:460:1:1")?.videos?.count == 2,
+                   "CW navigation accepts a ready episode list while source search is still loading")
+            expect(details.appleCWTerminalFullMeta(for: "kitsu:460", streamID: "kitsu:460:1:1") == nil,
+                   "early navigation receipt does not weaken terminal settlement authority")
+            expect(details.appleCWNavigationMeta(for: "different-title", streamID: "kitsu:460:1:1") == nil,
+                   "a different title can never donate the CW episode inventory")
+            expect(details.appleCWNavigationMeta(for: "kitsu:460", streamID: "kitsu:460:9:99") == nil,
+                   "an unrelated episode request cannot donate the CW inventory")
+        } catch {
+            expect(false, "CW navigation fixture decodes: \(error)")
+        }
         // =====================================================================================================
         // LAYER 1 - the advance is no longer swallowed: the hanging routes now require a bounded deadline.
         // =====================================================================================================

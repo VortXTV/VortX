@@ -140,10 +140,9 @@ enum PlayerEngineRouter {
                        dvDisplayCapable: Bool = false,
                        plainRemuxDelivery: Bool = true,
                        platformAllowsNonDVDefault: Bool = nonDVAVPlayerDefaultPlatform) -> Engine {
-        // (1) Torrents always play on libmpv: AVPlayer cannot replay the loopback server URL or run the
-        // torrent warm-up. Belt and suspenders: trust the flag AND the loopback host.
-        let host = (url.host ?? "").lowercased()
-        if isTorrent || host == "127.0.0.1" || host == "localhost" { return .mpv }
+        // The owned NNTP endpoint serves byte-exact, seekable media, not a torrent warm-up.
+        // Preserve the independent torrent veto and reject every other loopback endpoint.
+        if isTorrent || (isLoopbackURL(url) && !isLocalNNTPURL(url)) { return .mpv }
 
         // (1b) A COMPLETED offline HLS download is a local `.movpkg` bundle that ONLY AVPlayer can open
         // (libmpv has no reader for it), so it must route to AVPlayer even under an `.mpv` override. It is a
@@ -313,6 +312,22 @@ enum PlayerEngineRouter {
     /// container-side gate; the caller has already checked `isDolbyVision` and the loopback/override rules.
     static func isDVRemuxCandidate(_ url: URL) -> Bool { dvRemuxCandidacy(url).candidate }
 
+    static func isLoopbackURL(_ url: URL) -> Bool {
+        ["127.0.0.1", "localhost", "::1", "[::1]"].contains((url.host ?? "").lowercased())
+    }
+
+    /// Only the on-device NNTP resolver's opaque-key endpoint may cross the loopback remux gate.
+    /// Never pass provider credentials or arbitrary proxy routes into this exception.
+    static func isLocalNNTPURL(_ url: URL) -> Bool {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              isLoopbackURL(url), url.path == "/nzb/stream",
+              url.user == nil, url.password == nil, url.fragment == nil,
+              let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+              query.count == 1, query[0].name == "key",
+              let key = query[0].value, !key.isEmpty else { return false }
+        return true
+    }
+
     /// Extensions that name a REAL media container / manifest. Anything else that `URL.pathExtension` returns
     /// from a release-name path (the group tail ".H265-AOC", a numeric CDN id, a ".php" endpoint) is noise,
     /// NOT a container signal. Treating that noise as a container is exactly what pre-rejected a true DV
@@ -331,7 +346,8 @@ enum PlayerEngineRouter {
             return (false, "scheme=\(url.scheme ?? "nil") not http(s)")
         }
         let host = (url.host ?? "").lowercased()
-        if host == "127.0.0.1" || host == "localhost" || host.isEmpty { return (false, "loopback/empty host") }
+        if isLocalNNTPURL(url) { return (true, "local NNTP media (probe-and-fail-fast)") }
+        if isLoopbackURL(url) || host.isEmpty { return (false, "loopback/empty host") }
         // A genuine path-level mp4/m4v/mov (or HLS/DASH manifest) is AVPlayer-native (or an adaptive stream
         // the remux must never touch) and never needs the remux. Do NOT gate on isAVPlayerContainer here: its
         // extensionless mp4-token heuristic wrongly disqualified DV MKVs delivered as extensionless debrid

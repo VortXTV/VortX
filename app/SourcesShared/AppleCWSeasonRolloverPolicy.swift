@@ -36,9 +36,8 @@ struct AppleCWSeriesInventory: Equatable {
             if $0.episode != $1.episode { return $0.episode < $1.episode }
             return $0.id < $1.id
         }
-        // A refresh may normalize a launch list for successor navigation. A settled backfill must arrive in
-        // source order too, so a raw unsorted tvOS array cannot alter the successor list.
-        if authority == .authoritativeFullSeries, raw != ordered { return nil }
+        // Provider ordering is not a completeness signal. Normalize valid coordinates for navigation;
+        // neither this order nor a settled response establishes account/title finality.
         self.raw = raw
         self.ordered = ordered
         self.authority = authority
@@ -149,6 +148,14 @@ enum AppleCWSeriesTerminalDecision: Equatable {
 /// authorizes an app-side title rewind because CoreMetaDetails has no explicit completeness marker; the
 /// engine/account owns genuine final-series removal.
 enum AppleCWSeriesTerminalPolicy {
+    /// A settled navigation list may establish a visible end boundary, but not account-series completion.
+    /// Missing metadata/current identity must instead keep an actionable episode picker on screen.
+    static func canExitPlayer(currentID: String?, inventory: AppleCWSeriesInventory?,
+                              refreshAttempted: Bool) -> Bool {
+        guard refreshAttempted, let currentID, let inventory,
+              let index = inventory.index(of: currentID) else { return false }
+        return index == inventory.ordered.count - 1
+    }
     static func decide(currentID: String, inventory: AppleCWSeriesInventory?,
                        refresh: AppleCWSeriesRefreshResult) -> AppleCWSeriesTerminalDecision {
         guard let inventory, let index = inventory.index(of: currentID) else {

@@ -51,6 +51,14 @@ enum RemuxResumePolicyTests {
 }
 
 @MainActor func run() {
+    check("same logical retry preserves consumed origin",
+          RemuxResumePolicy.originForLoad(configuredOrigin: nil, sameLogicalRequest: true, previousOrigin: 1780) == 1780)
+    check("different source or token cannot inherit origin",
+          RemuxResumePolicy.originForLoad(configuredOrigin: nil, sameLogicalRequest: false, previousOrigin: 1780) == 0)
+    check("explicit zero overrides a retained origin",
+          RemuxResumePolicy.originForLoad(configuredOrigin: 0, sameLogicalRequest: true, previousOrigin: 1780) == 0)
+    check("configured resume wins over retained origin",
+          RemuxResumePolicy.originForLoad(configuredOrigin: 905, sameLogicalRequest: true, previousOrigin: 1780) == 905)
 
 // MARK: - originRequest
 

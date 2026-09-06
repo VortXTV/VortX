@@ -216,7 +216,7 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
 /// finite duration.  The short lifetime only prevents an old seek from reclassifying a genuine EOF much
 /// later in playback.
 struct SeekEOFRecoveryPolicy<Owner: Equatable> {
-    enum Origin: Equatable { case viewer, cacheReanchor }
+    enum Origin: Equatable { case viewer, resume, cacheReanchor }
     enum Phase: Equatable {
         case awaitingSeekEvent
         case seekObserved

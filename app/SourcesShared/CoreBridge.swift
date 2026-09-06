@@ -86,6 +86,7 @@ final class CoreBridge: ObservableObject {
         let libraryID: String
         let streamType: String?
         let streamID: String
+        let navigationOnly: Bool
         var phase: Phase
     }
     private var appleCWMetaRefreshGeneration = 0
@@ -1469,7 +1470,8 @@ final class CoreBridge: ObservableObject {
     /// receipt can certify completion for this exact stream request; full-series/finality authority remains
     /// a separate policy decision.
     func beginAppleCWAuthoritativeMetaRefresh(type: String, id: String,
-                                               streamType: String?, streamId: String) -> Int {
+                                               streamType: String?, streamId: String,
+                                               navigationOnly: Bool = false) -> Int {
         appleCWMetaRefreshGeneration &+= 1
         let generation = appleCWMetaRefreshGeneration
         appleCWMetaRefreshRequest = AppleCWMetaRefreshRequest(
@@ -1478,6 +1480,7 @@ final class CoreBridge: ObservableObject {
             libraryID: id,
             streamType: streamType,
             streamID: streamId,
+            navigationOnly: navigationOnly,
             phase: .awaitingInvalidation
         )
         appleCWMetaRefreshReceipt = nil
@@ -3666,9 +3669,10 @@ final class CoreBridge: ObservableObject {
                                   capturedGeneration: refreshGenerationAtSchedule,
                                   activeGeneration: request.generation
                               ) else { return }
-                        let settledForRequest = Self.appleCWMetaRefreshIsSettled(
-                            details, libraryID: request.libraryID, streamID: request.streamID
-                        )
+                        let settledForRequest = request.navigationOnly
+                            ? details?.appleCWNavigationMeta(for: request.libraryID, streamID: request.streamID) != nil
+                            : Self.appleCWMetaRefreshIsSettled(
+                                details, libraryID: request.libraryID, streamID: request.streamID)
                         switch request.phase {
                         case .awaitingInvalidation:
                             // A same-ID ready re-emit is explicitly NOT invalidation. Leave the request

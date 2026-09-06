@@ -160,7 +160,18 @@ enum AppleCWSeasonRolloverContractTests {
                                                   refresh: .completedWithoutFullInventory) == .keepState,
                "empty inventory keeps state and never rewinds")
         let rawUnsorted = AppleCWSeriesInventory(raw: [s1e10, s1e9], authority: .authoritativeFullSeries)
-        expect(rawUnsorted == nil, "raw unsorted tvOS metadata cannot become authoritative finality proof")
+        expect(rawUnsorted?.ordered.map(\.id) == ["s1e9", "s1e10"],
+               "valid unsorted metadata is normalized for navigation, never account finality")
+        expect(!AppleCWSeriesTerminalPolicy.canExitPlayer(currentID: "s1e10", inventory: nil, refreshAttempted: true),
+               "failed metadata refresh cannot dismiss an episode with no inventory")
+        expect(!AppleCWSeriesTerminalPolicy.canExitPlayer(currentID: "missing", inventory: rawUnsorted, refreshAttempted: true),
+               "an inventory missing the current episode cannot dismiss playback")
+        expect(!AppleCWSeriesTerminalPolicy.canExitPlayer(currentID: "s1e10", inventory: rawUnsorted, refreshAttempted: false),
+               "an unrefreshed launch list cannot silently end navigation")
+        expect(!AppleCWSeriesTerminalPolicy.canExitPlayer(currentID: "s1e9", inventory: rawUnsorted, refreshAttempted: true),
+               "a known successor never takes the exit branch")
+        expect(AppleCWSeriesTerminalPolicy.canExitPlayer(currentID: "s1e10", inventory: rawUnsorted, refreshAttempted: true),
+               "a settled known end boundary retains normal player exit without title removal")
 
         // 4. A later settled inventory replaces the launch list for successor navigation, so S1E10 is no
         // longer terminal once S2E1 arrives. Even a no-successor result never gives the app a series rewind
@@ -440,8 +451,8 @@ enum AppleCWSeasonRolloverContractTests {
         expect(tvPlayer.contains("terminalRewindGate.permitsExitProgressFlush")
                && iosPlayer.contains("terminalRewindGate.permitsExitProgressFlush"),
                "both Apple exits suppress progress flush after terminal rewind")
-        expect(coreBridge.contains("guard ProfileStore.shared.activeUsesEngineHistory")
-               && coreBridge.contains("ProfileStore.shared.finishedWatching(metaId: libraryId)")
+        expect(coreBridge.contains("guard target.stillOwnsCurrentContext(core: self)")
+               && coreBridge.contains("ProfileStore.shared.finishedWatching(metaId: libraryId, profileID: profileID)")
                && coreBridge.contains("RewindLibraryItem"),
                "engine/account owns the separate removal primitive and overlay finish remains local")
         expect(home.contains("core.changedFields.contains(\"continue_watching_preview\")")

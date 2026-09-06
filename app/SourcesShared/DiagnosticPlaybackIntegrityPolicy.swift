@@ -1,5 +1,27 @@
 import Foundation
 
+/// A monotonic clock whose value stops only for an explicit viewer pause. Engine startup can report
+/// `pause=true` before the viewer ever presses Pause; that observation must not disable failure deadlines.
+struct PlaybackActiveTimeClock {
+    private var pausedAt: Double?
+    private var totalPaused = 0.0
+    var isPaused: Bool { pausedAt != nil }
+
+    mutating func setPaused(_ paused: Bool, now: Double) {
+        guard now.isFinite else { return }
+        if paused {
+            if pausedAt == nil { pausedAt = now }
+        } else if let start = pausedAt {
+            totalPaused += max(0, now - start)
+            pausedAt = nil
+        }
+    }
+
+    func value(at now: Double) -> Double {
+        (pausedAt ?? now) - totalPaused
+    }
+}
+
 /// Exact ownership for work that resolves an episode before a player command has been admitted.
 /// The owner includes every mutable selector that can supersede an in-flight resolve.
 struct EpisodeResolutionOwner: Equatable, Sendable {

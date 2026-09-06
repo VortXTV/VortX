@@ -2941,7 +2941,7 @@ enum PlayerLiveContractTests {
             to: "func seek(by seconds: Double)")
         let playheadReceipt = sourceSection(
             server,
-            from: "func reportPlaybackPosition(playerSeconds: Double)",
+            from: "func reportPlaybackPosition(playerSeconds: Double, receiptEpoch: UInt64)",
             to: "private func playbackSegmentID(in window:")
         let midPlaybackWatchdog = sourceSection(
             playerScreen,
@@ -3076,6 +3076,10 @@ enum PlayerLiveContractTests {
         let playbackIntentCapture = sourceSection(
             engine,
             from: "private func capturePlaybackIntent(",
+            to: "private func releasePendingPlaybackIntentAtReady(")
+        let readyIntentRelease = sourceSection(
+            engine,
+            from: "private func releasePendingPlaybackIntentAtReady(",
             to: "private func sourceAudioMPVTracks()")
         let sourceAudioRows = sourceSection(
             engine,
@@ -3124,7 +3128,7 @@ enum PlayerLiveContractTests {
         let selectionRestore = sourceSection(
             groupLoad,
             from: "if let restore {",
-            to: "} else if pendingPlaybackIntent != nil")
+            to: "} else if pendingMediaSelectionIntent != nil")
         let sourceAudioAlignment = sourceSection(
             engine,
             from: "private func selectionContextIsCurrent(",
@@ -3747,7 +3751,7 @@ enum PlayerLiveContractTests {
               sourceContainsInOrder(remuxSeekRemount, [
                 "let requestedTarget =",
                 "let mountOrigin = RemuxResumePolicy.originRequest(",
-                "capturePlaybackIntent(from: item)",
+                "beginPlaybackRemountIntent(from: item)",
                 "intent.updateSourceSeconds(requestedTarget)",
                 "pendingPlaybackIntent = intent",
                 "remuxSeekRemountTarget = requestedTarget",
@@ -3778,7 +3782,7 @@ enum PlayerLiveContractTests {
               sourceContainsInOrder(hdrFallbackRetry, [
                 "hdrFallbackCapabilityRefreshTask = nil",
                 "remountPendingSeekIfOutsideWindow()",
-                "capturePlaybackIntent(from: currentItem)",
+                "beginPlaybackRemountIntent(from: currentItem)",
               ]))
         check("wiring: both AVPlayer demotions capture the engine-owned source target before stop",
               sourceContainsInOrder(playerScreenAVDemote, [
@@ -4062,15 +4066,15 @@ enum PlayerLiveContractTests {
                   "player.pause()",
               ])
                   && sourceContainsInOrder(remuxDurationMapping, [
+                      "releasePendingPlaybackIntentAtReady(for: item)",
+                      "loadSelectionGroups()",
                       "if !didStart",
-                      "if pendingPlaybackIntent == nil",
                       "applyCommittedTransport()",
-                      "readyToPlay deferred transport until recovery selection and playhead restoration",
                   ])
                   && sourceContainsInOrder(selectionRestore, [
                       "switch restore.subtitle",
                       "applyCommittedTransport()",
-                      "pendingPlaybackIntent = nil",
+                      "pendingMediaSelectionIntent = nil",
                   ]))
         check("wiring: selection restoration cannot overwrite newer live pause or play intent",
               selectionRestore?.contains(
@@ -4079,22 +4083,21 @@ enum PlayerLiveContractTests {
                       "requestedRate = restore.requestedRate") == false
                   && selectionRestore?.contains("player.play()") == false
                   && selectionRestore?.contains("player.pause()") == false
-                  && selectionRestore?.contains(
-                      "capturedPlaybackRequested=\\(restore.playbackRequested)") == true
+                  && selectionRestore?.contains("applyCommittedTransport()") == true
                   && selectionRestore?.contains(
                       "committedPlaybackRequested=\\(playbackRequested)") == true)
         check("wiring: passive intent capture cannot overwrite an explicit pending seek",
               sourceContainsInOrder(playbackIntentCapture, [
                   "if let intent = pendingPlaybackIntent",
                   "return intent",
+                  "if var intent = pendingMediaSelectionIntent",
+                  "intent.updateSourceSeconds(playbackPositionSeconds)",
+                  "intent.updateTransport(playbackRequested: playbackRequested, requestedRate: requestedRate)",
+                  "return intent",
                   "let subtitle:",
               ])
                   && playbackIntentCapture?.contains(
-                      "if var intent = pendingPlaybackIntent") == false
-                  && playbackIntentCapture?.contains(
-                      "intent.updateSourceSeconds(playbackPositionSeconds)") == false
-                  && playbackIntentCapture?.contains(
-                      "intent.updateTransport(") == false)
+                      "if var intent = pendingPlaybackIntent") == false)
         check("wiring: host loss preserves an existing pending seek before either remount branch",
               playbackIntentCapture?.contains(
                   "sourceSeconds: playbackPositionSeconds") == true
@@ -4134,7 +4137,7 @@ enum PlayerLiveContractTests {
                       "if audioReplacement != nil",
                       "if sourcePrimaryReady",
                       "audioReplacement?.markReady(generation: selectionGeneration)",
-                      "let intentSnapshot = pendingPlaybackIntent",
+                      "let intentSnapshot = pendingMediaSelectionIntent",
                       "let replacementReady = audioReplacement.map",
                       "ownedIntent?.consume(",
                   ]))
@@ -4156,7 +4159,7 @@ enum PlayerLiveContractTests {
                   "} else if sourceBackedAudio && !sourcePrimaryReady",
                   "selectedRemuxAudioSourceIndex = nil",
               ]))
-        check("wiring: selection restore guards group suspension then clamps without a second suspension",
+        check("wiring: selection restore guards group suspension and never re-seeks the live item",
               sourceContainsInOrder(groupLoad, [
                   "let selectionGeneration = itemGeneration",
                   "let selectionMountIdentity = playbackMountIdentity",
@@ -4171,16 +4174,27 @@ enum PlayerLiveContractTests {
                   "let sourcePrimaryReady",
                   "} else if sourceBackedAudio && !sourcePrimaryReady",
                   "selectedRemuxAudioSourceIndex = nil",
-                  "let intentSnapshot = pendingPlaybackIntent",
+                  "let intentSnapshot = pendingMediaSelectionIntent",
+                  "applyCommittedTransport()",
+                  "pendingMediaSelectionIntent = nil",
+              ])
+                  && groupLoad?.contains("player.seek(") == false
+                  && groupLoad?.components(
+                      separatedBy: "let intentSnapshot = pendingMediaSelectionIntent"
+                  ).last?.contains("await ") == false)
+        check("wiring: ready consumes the bound position before starting independent media selection",
+              sourceContainsInOrder(readyIntentRelease, [
+                  "guard var intent = pendingPlaybackIntent",
+                  "intent.consume(",
+                  "generation: itemGeneration",
+                  "mountIdentity: playbackMountIdentity",
+                  "pendingMediaSelectionIntent = selectionIntent",
+                  "pendingPlaybackIntent = nil",
+                  "remuxSeekRemountTarget = nil",
                   "RemuxResumePolicy.playerSeek(",
                   "producedEdgePlayerSeconds: producedEdgeSeconds",
-                  "player.seek(",
-                  "pendingPlaybackIntent = nil",
-              ])
-                  && groupLoad?.contains("await player.seek(") == false
-                  && groupLoad?.components(
-                      separatedBy: "let intentSnapshot = pendingPlaybackIntent"
-                  ).last?.contains("await ") == false)
+                  "player.seek(to:",
+              ]) && readyIntentRelease?.contains("await ") == false)
         check("wiring: initial track publication waits for both audio and subtitle groups",
               initialTrackPublication?.contains("emit(MPVProperty.trackList") == false
                   && engine?.components(separatedBy: "emit(MPVProperty.trackList").count == 2
@@ -4528,11 +4542,11 @@ enum PlayerLiveContractTests {
               playheadReceipt?.contains("playbackClockLock.lock()") == true
                   && sourceSection(
                     playheadReceipt,
-                    from: "func reportPlaybackPosition(playerSeconds: Double)",
+                    from: "func reportPlaybackPosition(playerSeconds: Double, receiptEpoch: UInt64)",
                     to: "func prepareForSeek(")?
                     .contains("publicationLock") == false
                   && sourceContainsInOrder(playheadReceipt, [
-                    "seekAnchorState.reportPlaybackPosition(playerSeconds)",
+                    "guard seekAnchorState.reportPlaybackPosition(playerSeconds, receiptEpoch: receiptEpoch) else { return }",
                     "self.seekAnchorState.admitSeek(",
                     "func completePreparedSeek(requestID: UInt64, playerSeconds: Double)",
                     "seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds)",
@@ -4598,9 +4612,10 @@ enum PlayerLiveContractTests {
               ])
                   && sourceContainsInOrder(groupLoad, [
                     "let restore = replacementReady",
-                    "player.seek(",
-                    "pendingPlaybackIntent = nil",
+                    "applyCommittedTransport()",
+                    "pendingMediaSelectionIntent = nil",
                   ])
+                  && groupLoad?.contains("player.seek(") == false
                   && groupLoad?.contains("registerSeekAdmission(") == false)
         check("wiring: AVPlayer mid-play recovery uses the item-generation-owned surface-stall transaction",
               sourceContainsInOrder(midPlaybackRecovery, [

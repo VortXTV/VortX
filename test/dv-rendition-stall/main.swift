@@ -19,9 +19,12 @@ import Darwin
 // Standalone harness shapes for app-wide settings and diagnostics that the production remux reads.
 // Keep these deliberately narrow so the executable still compiles the real remux implementation.
 struct TrackPreferences {
+    enum ForcedPolicy { case off, always, forced }
     let audioLanguages: [String]
     let subtitleLanguages: [String]
     let rejectTerms: [String]
+    let forcedPolicy: ForcedPolicy = .forced
+    static let subtitlesOnlyPreferred = false
 
     static let current = TrackPreferences(
         audioLanguages: ["en"],
@@ -56,6 +59,9 @@ func dumpInitSegment(_ body: Data, scenario: String, variant: String) {
 protocol PlayerEngine: AnyObject {}
 
 enum PlayerEngineRouter {
+    static func isLoopbackURL(_ url: URL) -> Bool {
+        ["127.0.0.1", "localhost", "::1", "[::1]"].contains((url.host ?? "").lowercased())
+    }
     static func shouldDVRemux(url: URL) -> Bool { false }
     static func shouldPlainRemux(url: URL) -> Bool { url.pathExtension.lowercased() == "mkv" }
     static func plainRemuxEnabled() -> Bool { true }
@@ -63,6 +69,7 @@ enum PlayerEngineRouter {
         url.pathExtension.lowercased() == "mkv"
     }
     static func dvRemuxEnabled(dvDisplayCapable: Bool) -> Bool { false }
+    static func dvRemuxEngaged(dvDisplayCapable: Bool) -> Bool { false }
 }
 
 enum DVDisplaySupport {
@@ -96,7 +103,7 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
 
     private init(playlistURL: URL) {
         self.playlistURL = playlistURL
-        identity = .init(sessionID: "test", playlistURL: playlistURL.absoluteString)
+        identity = .init(sessionID: "test", mountGeneration: "test-generation", playlistURL: playlistURL.absoluteString)
     }
 
     static func open(
@@ -105,6 +112,8 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
         mode: VortXEngineProtocol.RemuxMode,
         startAtSeconds: Double,
         selectedAudioStreamIndex: Int? = nil,
+        preferredAudioLanguages: [String]? = nil,
+        audioRejectTerms: [String]? = nil,
         engine: VortXExternalEngine = .shared,
         onLost: @escaping @Sendable (VortXRemoteRemuxMount) -> Void
     ) async -> VortXRemoteRemuxMount? {
@@ -119,6 +128,9 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
 
     func start() {}
     func invalidate() {}
+    func quiescenceReceipt() -> VortXRemuxQuiescenceReceipt {
+        VortXRemuxQuiescenceReceipt(terminal: nil)
+    }
     func markEngineReady() -> Bool { true }
     func awaitHDRFallbackCapability(timeoutSeconds: Double = 0) async -> Bool { false }
 
@@ -201,12 +213,6 @@ final class DebridCoordinator {
     }
 }
 
-enum CatalogRowResolution {
-    static func metaHandlesTMDB(providesMeta: Bool, idPrefixes: [String]) -> Bool {
-        providesMeta && idPrefixes.contains { "tmdb:0".hasPrefix($0) }
-    }
-}
-
 enum AddonTombstones {
     static func normalize(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -215,29 +221,6 @@ enum AddonTombstones {
 
 enum VortXSyncManager {
     static var appliedAddonOrder: [String] { [] }
-}
-
-enum DetailMetaRecoveryPolicy {
-    enum Resolution { case ready, pending, unresolved }
-    enum EntryState { case ready, loading, failed, notStarted }
-
-    static func resolution(entries: [EntryState]) -> Resolution {
-        if entries.contains(where: {
-            if case .ready = $0 { return true }
-            return false
-        }) {
-            return .ready
-        }
-        return entries.isEmpty ? .unresolved : .pending
-    }
-
-    static func resolution(
-        selectedID: String?,
-        requestedID: String,
-        entries: [EntryState]
-    ) -> Resolution? {
-        selectedID == requestedID ? resolution(entries: entries) : nil
-    }
 }
 
 final class DebridKeys {
@@ -252,6 +235,14 @@ enum PlaybackSettings {
 enum StremioServer {
     static let base = "http://127.0.0.1"
     static let trailerResolverBase = "https://example.invalid"
+    static let usenetNodeBase: String? = nil
+}
+
+enum UsenetProviderStore { static let isConfigured = false }
+
+final class CommunityStreamGateway {
+    static let shared = CommunityStreamGateway()
+    func localURLIfReady(for stream: CoreStream, upstream: URL) -> URL? { upstream }
 }
 
 final class SubtitleCueRenderer {
@@ -284,7 +275,7 @@ final class SubtitleOverlayView {
 
 final class VXProbeState {
     static let shared = VXProbeState()
-    func setPlayer(state: String, source: String, engine: String) {}
+    func setPlayer(state: String, source: String?, engine: String) {}
     func setPlayer(state: String, engine: String, buffering: Bool) {}
     func setPlayer(pos: Int, dur: Int?, engine: String) {}
 }
@@ -396,7 +387,7 @@ func runScenario(name: String, fixture: String, startAt: Double,
         print("FATAL fixture missing: \(input.path)")
         exit(2)
     }
-    guard let (server, playlistURL) = VortXRemuxHLSServer.make(
+    guard let (server, _) = VortXRemuxHLSServer.make(
         input: input, headers: nil, mode: .plain, startAtSeconds: startAt) else {
         print("FATAL server did not bind")
         exit(2)
@@ -1003,6 +994,9 @@ private struct EngineTransactionResult {
     var sawProductionSelection = false
     var sawProductionReady = false
     var sawProductionRestore = false
+    var heldPause = false
+    var backwardSeekReached = false
+    var progressedAfterBackwardSeek = false
 }
 
 private struct EngineRollbackResult {
@@ -1095,7 +1089,7 @@ private func engineTransactionSuccessScenario(
         return transactionLines.contains(where: {
             $0.contains("audio replacement generation") && $0.contains("reached source ready")
         }) && transactionLines.contains(where: {
-            $0.contains("playback intent restored once")
+            $0.contains("media selection restored once")
         })
     }
     let transactionLines = Array(DiagnosticsLog.capturedLines().dropFirst(logOffset))
@@ -1106,7 +1100,7 @@ private func engineTransactionSuccessScenario(
         $0.contains("audio replacement generation") && $0.contains("reached source ready")
     }
     result.sawProductionRestore = transactionLines.contains {
-        $0.contains("playback intent restored once")
+        $0.contains("media selection restored once")
     }
     result.tokenWasReused = engine.activeLoadToken == initialToken
     let replacementTracks = replacementReady ? engine.tracks(ofType: "audio") : []
@@ -1137,6 +1131,21 @@ private func engineTransactionSuccessScenario(
         result.longestStallAfterReady = max(
             result.longestStallAfterReady,
             Date().timeIntervalSince(lastAdvance))
+    }
+    if replacementReady, result.advancedAfterReady >= 20 {
+        engine.pause()
+        let parked = engine.playbackPositionSeconds
+        RunLoop.main.run(until: Date().addingTimeInterval(2))
+        result.heldPause = abs(engine.playbackPositionSeconds - parked) < 0.25
+        let destination = max(18, parked - 3)
+        engine.seek(to: destination)
+        result.backwardSeekReached = waitForEngineState(timeout: 8) {
+            abs(engine.playbackPositionSeconds - destination) < 0.5
+        }
+        engine.play()
+        result.progressedAfterBackwardSeek = waitForEngineState(timeout: 8) {
+            engine.playbackPositionSeconds >= destination + 2
+        }
     }
     result.errors = delegate.errors
     engine.stop()
@@ -1212,7 +1221,7 @@ private func engineTransactionRollbackScenario(
             $0.contains("audio replacement generation")
                 && $0.contains("reached source ready source=\(prior)")
         }) && transactionLines.contains(where: {
-            $0.contains("playback intent restored once")
+            $0.contains("media selection restored once")
                 && $0.contains("audio=\(prior)")
         })
     }
@@ -1236,7 +1245,7 @@ private func engineTransactionRollbackScenario(
             && $0.contains("reached source ready source=\(prior)")
     }
     result.sawRollbackRestore = transactionLines.contains {
-        $0.contains("playback intent restored once") && $0.contains("audio=\(prior)")
+        $0.contains("media selection restored once") && $0.contains("audio=\(prior)")
     }
     result.rollbackSourceSeconds = rollbackLines.first.flatMap { line in
         guard let atRange = line.range(of: " at "),
@@ -1587,6 +1596,10 @@ check("engine transaction: replacement advances 20s without a long stall or term
         engineTransaction.advancedAfterReady,
         engineTransaction.longestStallAfterReady,
         engineTransaction.errors.description))
+check("engine transport: pause holds and backward seek resumes real playback",
+      red: !engineTransaction.heldPause || !engineTransaction.backwardSeekReached
+          || !engineTransaction.progressedAfterBackwardSeek,
+      detail: "paused=\(engineTransaction.heldPause) sought=\(engineTransaction.backwardSeekReached) resumed=\(engineTransaction.progressedAfterBackwardSeek)")
 check("engine rollback: deterministic target failure triggers exactly one rollback",
       red: !engineRollback.sourceWasSuspended
           || !engineRollback.sawTargetFailure

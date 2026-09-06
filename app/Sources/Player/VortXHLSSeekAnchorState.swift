@@ -12,16 +12,22 @@ struct VortXHLSSeekAnchorState {
     private(set) var pendingAdmissionRequestID: UInt64?
     private(set) var pendingReceipt: (requestID: UInt64, playerSeconds: Double)?
     private(set) var latestRequestID: UInt64 = 0
+    /// A periodic observer captures this when installed. Old queued samples cannot cross a seek boundary.
+    private(set) var playbackReceiptEpoch: UInt64 = 0
 
-    mutating func reportPlaybackPosition(_ playerSeconds: Double) {
+    @discardableResult
+    mutating func reportPlaybackPosition(_ playerSeconds: Double, receiptEpoch: UInt64? = nil) -> Bool {
         guard playerSeconds.isFinite,
               playerSeconds >= 0,
+              receiptEpoch.map({ $0 == playbackReceiptEpoch }) ?? true,
               pendingAdmissionRequestID == nil,
-              pendingReceipt == nil else { return }
+              pendingReceipt == nil else { return false }
         currentPlaybackSeconds = playerSeconds
+        return true
     }
 
     mutating func registerSeek(requestID: UInt64) {
+        playbackReceiptEpoch &+= 1
         latestRequestID = requestID
         pendingAdmissionRequestID = requestID
         pendingReceipt = nil
@@ -56,6 +62,7 @@ struct VortXHLSSeekAnchorState {
             return
         }
         guard pendingReceipt?.requestID == requestID else { return }
+        playbackReceiptEpoch &+= 1
         pendingReceipt = nil
         currentPlaybackSeconds = playerSeconds
     }
@@ -65,10 +72,14 @@ struct VortXHLSSeekAnchorState {
         let cancelledReceipt = pendingReceipt?.requestID == requestID
         if cancelledAdmission { pendingAdmissionRequestID = nil }
         if cancelledReceipt { pendingReceipt = nil }
-        if cancelledAdmission || cancelledReceipt { currentPlaybackSeconds = nil }
+        if cancelledAdmission || cancelledReceipt {
+            playbackReceiptEpoch &+= 1
+            currentPlaybackSeconds = nil
+        }
     }
 
     mutating func invalidate() {
+        playbackReceiptEpoch &+= 1
         pendingAdmissionRequestID = nil
         pendingReceipt = nil
         currentPlaybackSeconds = nil

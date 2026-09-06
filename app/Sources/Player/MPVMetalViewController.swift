@@ -2922,7 +2922,15 @@ final class MPVMetalViewController: PlatformViewController {
     func seekForResume(to seconds: Double) {
         cancelCacheReanchorForExplicitSeek()
         supersedeSeekEOFRecoveryForExplicitSeek()
-        command("seek", args: [String(seconds), "absolute"])
+        let owner = callbackLoadToken(requiresLoadedFile: true)
+        let wasPaused = getFlag(MPVProperty.pause)
+        let duration = getDouble(MPVProperty.duration)
+        command("seek", args: [String(seconds), "absolute"], returnValueCallback: { [weak self] status in
+            guard let self, status >= 0, let owner else { return }
+            self.seekEOFRecovery.begin(
+                owner: owner, target: seconds, wasPaused: wasPaused, duration: duration, origin: .resume,
+                now: ProcessInfo.processInfo.systemUptime)
+        })
     }
 
     /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Small hops usually stay
@@ -2934,7 +2942,17 @@ final class MPVMetalViewController: PlatformViewController {
         // read-ahead ramp does not misread the keyframe re-decode drop burst as fill starvation (#202). Marshalled
         // on `queue` to serialize with the ramp step's read/clear.
         queue.async { [weak self] in self?.userSeekedSinceRampSample = true }
-        command("seek", args: [String(format: "%.1f", seconds), "relative"])
+        let owner = callbackLoadToken(requiresLoadedFile: true)
+        let position = getDouble(MPVProperty.timePos)
+        let target = max(0, position + seconds)
+        let wasPaused = getFlag(MPVProperty.pause)
+        let duration = getDouble(MPVProperty.duration)
+        command("seek", args: [String(format: "%.1f", seconds), "relative"], returnValueCallback: { [weak self] status in
+            guard let self, status >= 0, let owner, position.isFinite, seconds.isFinite else { return }
+            self.seekEOFRecovery.begin(
+                owner: owner, target: target, wasPaused: wasPaused, duration: duration, origin: .viewer,
+                now: ProcessInfo.processInfo.systemUptime)
+        })
     }
 
     #if os(tvOS)
@@ -3045,7 +3063,11 @@ final class MPVMetalViewController: PlatformViewController {
             // paused-for-cache AND no forward-cache growth across the whole window - is retried, so a healthy but
             // slow refill is never clobbered (mirrors the progress-aware start watchdog).
             let progressed = forwardCache > lastCacheSample + Self.seekRefillProgressEpsilonSecs
-            if !stillBuffering || progressed {
+            if !stillBuffering {
+                self.releaseSeekCacheHoldIfArmed()
+                return
+            }
+            if progressed {
                 self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: forwardCache)
                 return
             }

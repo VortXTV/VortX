@@ -291,6 +291,40 @@ check(!PlayerEngineRouter.dvRemuxCandidacy(plainMP4).candidate,
       "DV candidacy: native mp4 still vetoes")
 
 resetFlags()
+let nntp = url("http://127.0.0.1:11473/nzb/stream?key=opaque")
+for host in ["127.0.0.1", "localhost", "[::1]"] {
+    check(PlayerEngineRouter.isLocalNNTPURL(url("http://\(host):11473/nzb/stream?key=opaque")),
+          "NNTP exact loopback route accepted: \(host)")
+}
+for rejected in [
+    "http://127.0.0.1/nzb/stream", "http://127.0.0.1/nzb/stream?key=",
+    "http://127.0.0.1/nzb/stream?key=a&key=b", "http://127.0.0.1/nzb/stream?key=a&extra=b",
+    "http://user:pass@localhost/nzb/stream?key=a", "http://localhost/nzb/stream?key=a#fragment",
+    "http://localhost/nzb/stream-other?key=a", "http://192.168.1.1/nzb/stream?key=a",
+    "ftp://localhost/nzb/stream?key=a", "http://localhost/torrent/file.mkv"
+] {
+    check(!PlayerEngineRouter.isLocalNNTPURL(url(rejected)), "NNTP invalid route rejected: \(rejected)")
+}
+check(PlayerEngineRouter.dvRemuxCandidacy(nntp).candidate, "NNTP exact route is eligible for actual DV probing")
+check(PlayerEngineRouter.engine(for: nntp, isTorrent: false, isDolbyVision: true,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .avfoundation,
+      "NNTP DV uses AVPlayer when enabled")
+check(PlayerEngineRouter.engine(for: nntp, isTorrent: false, isDolbyVision: false,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "NNTP non-DV does not enter a speculative plain remux")
+check(PlayerEngineRouter.engine(for: nntp, isTorrent: true, isDolbyVision: true,
+                                override: .auto, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "torrent provenance still overrides an NNTP-looking URL")
+UserDefaults.standard.set(false, forKey: PlayerEngineRouter.dvRemuxKey)
+check(PlayerEngineRouter.engine(for: nntp, isTorrent: false, isDolbyVision: true,
+                                override: .avfoundation, dvDisplayCapable: true,
+                                platformAllowsNonDVDefault: true) == .mpv,
+      "NNTP explicit AV preference cannot bypass remux disabled")
+
+resetFlags()
 if failures > 0 {
     print("\n\(failures) FAILURE(S)")
     exit(1)

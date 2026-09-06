@@ -348,12 +348,13 @@ private struct StartupWiringRule {
         StartupWiringRule(
             name: "actual playhead receipt", usesServer: false,
             start: "playheadObserver = player.addPeriodicTimeObserver(",
-            end: "NotificationCenter.default.addObserver(self, selector: #selector(didPlayToEnd(_:)),",
+            end: "    deinit {",
             exactSection: """
             playheadObserver = player.addPeriodicTimeObserver(
                 forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: playheadQueue
-            ) { [weak remuxServer = remuxHLSServer] time in
-                remuxServer?.reportPlaybackPosition(playerSeconds: time.seconds)
+            ) { [weak server] time in
+                server?.reportPlaybackPosition(playerSeconds: time.seconds, receiptEpoch: epoch)
+            }
             }
             """,
             mutationTarget: "queue: playheadQueue",

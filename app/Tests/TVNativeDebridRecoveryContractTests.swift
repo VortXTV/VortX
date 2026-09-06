@@ -61,7 +61,8 @@ private enum TVNativeDebridRecoveryContractTests {
             "direct URLs without a native reference remain outside provider recovery",
             source.contains("let retryRef = pendingAdvance?.debridRef ?? curDebridRef")
                 && source.contains("guard !nativeDebridFreshLinkRecovery.freshLinkUsed,")
-                && source.contains("let ref = retryRef, !ref.infoHash.isEmpty else { return false }")
+                && source.contains("let ref = retryRef else { return false }")
+                && source.contains("guard !ref.infoHash.isEmpty || isUsenetRecovery else { return false }")
         )
         check(
             "an engine switch during reconnect refreshes before constructing the requested engine",
