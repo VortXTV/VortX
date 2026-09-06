@@ -954,7 +954,7 @@ let doc = Policy.webVTTDocument(cues: [
 let parsed = parseVTT(doc)
 check("doc: it is a WebVTT document", parsed.header.hasPrefix("WEBVTT"))
 check("doc: the timeline map ties cue time to media time",
-      parsed.header.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"))
+      parsed.header.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"))
 check("doc: every cue is present", parsed.cues.count == 2)
 check("doc: cue timings are formatted as WebVTT ranges",
       parsed.cues[0].time == "00:00:01.000 --> 00:00:03.000")
@@ -977,7 +977,7 @@ let adjacentSegmentCue = Cue(start: 9, end: 14, text: "Crosses boundary")
 let localSegment = parseVTT(Policy.webVTTDocument(
     cues: [adjacentSegmentCue], segmentStart: 6.125, segmentEnd: 12.375))
 check("doc: every remux segment uses the zero-origin timestamp map",
-      localSegment.header.contains("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000"))
+      localSegment.header.contains("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0"))
 check("doc: a cue crossing a segment edge retains its full absolute interval",
       localSegment.cues.first?.time == "00:00:09.000 --> 00:00:14.000")
 let nextLocalSegment = parseVTT(Policy.webVTTDocument(
@@ -1033,7 +1033,7 @@ let wrappedTimestamp = Policy.webVTTDocument(
     segmentStart: wrappedSeconds,
     segmentEnd: wrappedSeconds + 2)
 check("doc: MPEGTS timestamp map wraps at the 33-bit presentation timestamp boundary",
-      parseVTT(wrappedTimestamp).header.contains("MPEGTS:0,LOCAL:00:00:00.000")
+      parseVTT(wrappedTimestamp).header.contains("LOCAL:00:00:00.000,MPEGTS:0")
         && abs(mappedInterval(parseVTT(wrappedTimestamp).cues[0], header: parseVTT(wrappedTimestamp).header).start
             - wrappedSeconds) < 0.001
         && abs(mappedInterval(parseVTT(wrappedTimestamp).cues[0], header: parseVTT(wrappedTimestamp).header).end

@@ -1021,7 +1021,7 @@ enum SubtitleRenditionPolicy {
         _ = segmentStart // Segment overlap selects cues; a selected cue retains its complete interval.
         _ = segmentEnd
         let mpegTimestamp: Int64 = 0
-        var lines = ["WEBVTT", "X-TIMESTAMP-MAP=MPEGTS:\(mpegTimestamp),LOCAL:00:00:00.000", ""]
+        var lines = ["WEBVTT", "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:\(mpegTimestamp)", ""]
         for cue in cues {
             // A zero-or-negative-length cue is not displayable and some parsers reject the whole document
             // over one, so it is skipped here as a last line of defence even though `cue(payload:...)`

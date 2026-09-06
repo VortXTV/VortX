@@ -164,11 +164,17 @@ guard let st = brands(stamped), st.size == 36, st.major == "iso5",
 else { fail("C3 stamped ftyp not the expected 36B [iso5, iso6, dby1, mp41, db1p] + moov shape") }
 print("PASS C3: stamped ftyp = 36B compatible=\\(st.list), moov follows")
 
-// C4: idempotence contract, a brand already present must return nil (never double-append).
-if RealSurgery.appendFtypCompatibleBrand(servedDV, brand: "db1p") != nil {
-    fail("C4 append on an already-branded init must return nil")
+// C4: an already-correct init is valid, not an error, and never gains a second brand.
+if RealSurgery.appendFtypCompatibleBrand(servedDV, brand: "db1p") != servedDV {
+    fail("C4 append on an already-branded init must return the exact original")
 }
-print("PASS C4: append is idempotent (already-branded init returns nil)")
+var minorVersionLooksLikeBrand = rawInit
+minorVersionLooksLikeBrand.replaceSubrange(12..<16, with: Array("db1p".utf8))
+guard let minorStamped = RealSurgery.appendFtypCompatibleBrand(minorVersionLooksLikeBrand, brand: "db1p"),
+      minorStamped.count == minorVersionLooksLikeBrand.count + 4 else {
+    fail("C4 a matching numeric minor version is not proof of a compatible brand")
+}
+print("PASS C4: append is idempotent and the numeric minor version is not a brand")
 
 // C5: malformed inputs return nil (fail-soft contract: caller then serves original bytes).
 if RealSurgery.appendFtypCompatibleBrand(Data(count: 8), brand: "db1p") != nil { fail("C5 short data must return nil") }

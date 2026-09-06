@@ -12,6 +12,8 @@
 
 import Foundation
 import AVFoundation
+import Libavcodec
+import Libavutil
 #if ENGINE_TRANSACTION_HARNESS
 import Darwin
 #endif
@@ -1275,6 +1277,44 @@ private func engineTransactionRollbackScenario(
 
 // Iteration affordance ONLY: `ONLY_SELECTION=1` runs just the selection gate while that gate is being
 // developed. Every reported run is a full run (the variable is unset), and the summary states which it was.
+// These checks call the production transform against the same FFmpeg/libdovi linked by the remux harness.
+// Invalid DV metadata must never be stream-copied beneath a P8.1 declaration; non-DV NALs stay unchanged.
+func checkDVPacketIntegrity(_ label: String, bytes: [UInt8], lengthSize: Int, accepted: Bool) {
+    guard let packet = av_packet_alloc() else { fatalError("AVPacket allocation failed") }
+    defer { var owned: UnsafeMutablePointer<AVPacket>? = packet; av_packet_free(&owned) }
+    guard av_new_packet(packet, Int32(bytes.count)) == 0, let payload = packet.pointee.data else {
+        fatalError("AVPacket payload allocation failed")
+    }
+    for (index, byte) in bytes.enumerated() { payload[index] = byte }
+    packet.pointee.pts = 9_000
+    packet.pointee.dts = 8_000
+    var stats = VortXMKVRemuxStream.RPUConvStats()
+    let result = VortXMKVRemuxStream.convertPacketRPUToProfile81(
+        packet, nalLengthSize: lengthSize, stats: &stats)
+    let preserved = Int(packet.pointee.size) == bytes.count
+        && Array(UnsafeBufferPointer(start: packet.pointee.data, count: bytes.count)) == bytes
+        && packet.pointee.pts == 9_000 && packet.pointee.dts == 8_000
+    check("DV integrity: \(label)", red: result != accepted || !preserved,
+          detail: "accepted=\(result) originalPreserved=\(preserved)")
+}
+checkDVPacketIntegrity("ordinary HEVC NAL passes", bytes: [0, 0, 0, 3, 0x26, 1, 0], lengthSize: 4, accepted: true)
+checkDVPacketIntegrity("invalid P7 RPU rejects", bytes: [0, 0, 0, 3, 0x7c, 1, 0], lengthSize: 4, accepted: false)
+checkDVPacketIntegrity("truncated NAL rejects", bytes: [0, 0, 0, 9, 0x26, 1], lengthSize: 4, accepted: false)
+checkDVPacketIntegrity("trailing partial prefix rejects", bytes: [0, 0, 0, 2, 0x26, 1, 0], lengthSize: 4, accepted: false)
+checkDVPacketIntegrity("EL-only empty output rejects", bytes: [0, 0, 0, 2, 0x7e, 1], lengthSize: 4, accepted: false)
+checkDVPacketIntegrity("invalid length-size rejects", bytes: [0, 0, 0, 2, 0x26, 1], lengthSize: 0, accepted: false)
+check("DV integrity: missing output parameters reject synthetic metadata",
+      red: VortXMKVRemuxStream.attachSyntheticDoVi(nil, profile: 8, width: 3840, height: 2160, fps: 24),
+      detail: "required configuration cannot silently be omitted")
+if let parameters = avcodec_parameters_alloc() {
+    let attached = VortXMKVRemuxStream.attachSyntheticDoVi(parameters, profile: 8, width: 3840, height: 2160, fps: 24)
+    let recordPresent = parameters.pointee.nb_coded_side_data > 0
+        && parameters.pointee.coded_side_data?[0].type == AV_PKT_DATA_DOVI_CONF
+    check("DV integrity: real allocator attaches mandatory configuration", red: !attached || !recordPresent,
+          detail: "attached=\(attached) recordPresent=\(recordPresent)")
+    var owned: UnsafeMutablePointer<AVCodecParameters>? = parameters
+    avcodec_parameters_free(&owned)
+} else { fatalError("AVCodecParameters allocation failed") }
 if ProcessInfo.processInfo.environment["PACKET_STARTUP_REPRO"] == "1" {
     exit(runPacketStartupRepro(scratchRoot: scratchRoot))
 }

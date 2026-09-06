@@ -2349,10 +2349,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 // for a P7 source, else the detected profile). It is built already-conformant, so
                 // sanitizeOutputDoVi is NOT re-run over it.
                 if !Self.hasDoViSideData(outStream.pointee.codecpar) {
-                    Self.attachSyntheticDoVi(outStream.pointee.codecpar,
+                    guard Self.attachSyntheticDoVi(outStream.pointee.codecpar,
                                              profile: convertP7 ? 8 : info.dvProfile,
                                              width: info.width, height: info.height,
-                                             fps: Self.frameRate(inStream))
+                                             fps: Self.frameRate(inStream)) else {
+                        buffer.fail("required Dolby Vision configuration could not be attached")
+                        return
+                    }
                 }
                 }   // end mode == .dolbyVision (#147)
             }
@@ -2532,7 +2535,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 continue
             }
             if convertP7, outIdx == baseVideoOut {
-                Self.convertPacketRPUToProfile81(p, nalLengthSize: nalLengthSize, stats: &rpuStats)
+                guard Self.convertPacketRPUToProfile81(p, nalLengthSize: nalLengthSize, stats: &rpuStats) else {
+                    buffer.fail("Profile 7 metadata conversion failed before muxing [prebuffered drain]")
+                    return
+                }
             }
             // Classify before muxing so alternate audio can partition at the exact video timestamp. Publication
             // happens only after this packet has passed through the one interleaved write API and the post-write
@@ -2698,11 +2704,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             }
             // Profile 7 -> 8.1: rewrite the DV RPU NAL (and drop any in-band EL sublayer NAL) in the base-layer
             // video packets before muxing. Only the base video track is touched; audio and every other packet
-            // pass through byte-for-byte. Conversion is fail-SOFT: on any error the packet's bytes are left
-            // exactly as read, so a quirk in one access unit degrades to a possibly-imperfect frame rather than
-            // aborting the whole session (the AVPlayer -> libmpv demotion remains the hard backstop).
+            // pass through byte-for-byte. A failed conversion must not mux original P7 metadata under the
+            // output's already-published P8.1 configuration. Fail explicitly so recovery retains truthful input.
             if convertP7, outIdx == baseVideoOut {
-                Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize, stats: &rpuStats)
+                guard Self.convertPacketRPUToProfile81(pkt, nalLengthSize: nalLengthSize, stats: &rpuStats) else {
+                    av_packet_unref(pkt)
+                    buffer.fail("Profile 7 metadata conversion failed before muxing")
+                    return
+                }
             }
             // Classify before muxing so alternate audio can partition at the exact video timestamp. Publication
             // remains post-write, after movenc has seen this key packet and completed the preceding fragment.
@@ -3079,7 +3088,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 servedDV = branded
                 dvNote = "+\(brand)"
             } else {
-                dvNote = "\(brand) NOT appended (unexpected ftyp shape)"
+                hlsAbortInitScan("declared Dolby Vision brand \(brand) could not be verified in init")
+                return
             }
             if let recovered = Self.makeHDRRecoveryInit(initData) {
                 servedHDR = recovered
@@ -3168,8 +3178,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     }
 
     /// Append one compatibility brand (e.g. "db1p") to the ftyp of a captured ftyp+moov init segment.
-    /// Returns nil when the data does not open with a sane ftyp immediately followed by moov, or when the
-    /// brand is already present (movenc never writes it today, but stay idempotent).
+    /// Returns nil when the data does not open with a sane ftyp immediately followed by moov. An already
+    /// present major/compatible brand returns the original bytes, so nil always means an invalid init.
     static func appendFtypCompatibleBrand(_ data: Data, brand: String) -> Data? {
         let brandBytes = Array(brand.utf8)
         guard brandBytes.count == 4 else { return nil }
@@ -3180,10 +3190,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // ftyp: size + 'ftyp' + major + minor (16B) then 4-byte brands; moov must follow immediately.
         guard ftypSize >= 16, ftypSize % 4 == 0, ftypSize + 8 <= n,
               fourccAt(b, 4) == "ftyp", fourccAt(b, ftypSize + 4) == "moov" else { return nil }
-        var off = 8   // scan major + compatible brands for an existing copy
+        if Array(b[8..<12]) == brandBytes { return data }
+        var off = 16  // compatible brands only; bytes 12...15 are the numeric minor version, not a brand
         while off + 4 <= ftypSize {
             if b[off] == brandBytes[0], b[off + 1] == brandBytes[1],
-               b[off + 2] == brandBytes[2], b[off + 3] == brandBytes[3] { return nil }
+               b[off + 2] == brandBytes[2], b[off + 3] == brandBytes[3] { return data }
             off += 4
         }
         b.insert(contentsOf: brandBytes, at: ftypSize)
@@ -5229,14 +5240,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// needed. `av_dovi_alloc` allocates the struct (its size is not part of the public ABI) and
     /// `av_packet_side_data_add` takes ownership of that av_malloc'd block on success, so the record is freed
     /// here only when the add fails.
-    private static func attachSyntheticDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?,
-                                            profile: Int, width: Int, height: Int, fps: Double) {
-        guard let par else { return }
+    static func attachSyntheticDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?,
+                                    profile: Int, width: Int, height: Int, fps: Double) -> Bool {
+        guard let par else { return false }
         var recSize = 0
-        guard let rec = av_dovi_alloc(&recSize), recSize > 0 else {
+        guard let rec = av_dovi_alloc(&recSize) else {
             DiagnosticsLog.log("dv", "synthetic dvvC record: av_dovi_alloc failed")
-            return
+            return false
         }
+        guard recSize > 0 else { av_free(rec); return false }
         rec.pointee.dv_version_major = 1
         rec.pointee.dv_version_minor = 0
         rec.pointee.dv_profile = UInt8(max(0, min(profile, 255)))
@@ -5258,8 +5270,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                                    AV_PKT_DATA_DOVI_CONF, rec, recSize, 0) == nil {
             av_free(rec)
             DiagnosticsLog.log("dv", "synthetic dvvC record: side-data add failed (record freed)")
+            return false
         } else {
             DiagnosticsLog.log("dv", "synthesized dvvC record for in-band-only DV source: profile=\(rec.pointee.dv_profile) level=\(rec.pointee.dv_level) blCompat=\(blCompat)")
+            return true
         }
     }
 
@@ -5326,14 +5340,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// each NAL either passes it through, converts it (the UNSPEC62 RPU), or drops it (the UNSPEC63 EL). The
     /// packet's data buffer is replaced with the rebuilt access unit via `av_packet_from_data`.
     ///
-    /// FAIL-SOFT by design: on ANY problem (unparseable prefixing, a libdovi parse/convert/write error, an
-    /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
-    /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
-    /// genuinely can't convert.
-    private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int, stats: inout RPUConvStats) {
-        guard let src = pkt.pointee.data else { return }
+    /// On failure the original packet remains intact, but false prohibits the caller from muxing it under
+    /// the P8.1 output configuration. A valid access unit without DV NALs remains an unchanged success.
+    static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int,
+                                           stats: inout RPUConvStats) -> Bool {
+        guard let src = pkt.pointee.data else { stats.pktBailed += 1; return false }
         let total = Int(pkt.pointee.size)
-        guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return }
+        guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else {
+            stats.pktBailed += 1
+            return false
+        }
 
         var out = [UInt8]()
         out.reserveCapacity(total)
@@ -5346,7 +5362,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             let nalStart = pos + nalLengthSize
             // A corrupt/misaligned length means we no longer understand the bitstream: abandon the edit and
             // leave the ORIGINAL packet untouched rather than emit a truncated access unit.
-            guard nalLen > 0, nalStart + nalLen <= total else { stats.pktBailed += 1; return }
+            guard nalLen >= 2, nalStart + nalLen <= total else { stats.pktBailed += 1; return false }
             let nalType = (src[nalStart] >> 1) & 0x3F
 
             if nalType == hevcNalTypeDoViEL {
@@ -5356,8 +5372,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 stats.elDropped += 1
             } else if nalType == hevcNalTypeDoViRPU {
                 // Convert the RPU NAL (its 2-byte header 0x7C 0x01 is exactly the escaped UNSPEC62 prefix
-                // libdovi expects) to Profile 8.1 and re-emit it length-prefixed. On any libdovi error, keep
-                // the ORIGINAL RPU NAL (still valid DV metadata) so the frame is not left without an RPU.
+                // libdovi expects) to Profile 8.1 and re-emit it length-prefixed. Original P7 metadata is not
+                // compatible with the output's P8.1 declaration, so conversion failure rejects this packet.
                 let converted: [UInt8]? = src.withMemoryRebound(to: UInt8.self, capacity: total) { base -> [UInt8]? in
                     guard let rpu = dovi_parse_unspec62_nalu(base + nalStart, nalLen) else { return nil }
                     defer { dovi_rpu_free(rpu) }
@@ -5368,12 +5384,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     return Array(UnsafeBufferPointer(start: wdata, count: Int(written.pointee.len)))
                 }
                 if let newNal = converted {
+                    guard UInt64(newNal.count) < (UInt64(1) << (8 * nalLengthSize)) else {
+                        stats.pktBailed += 1
+                        return false
+                    }
                     appendLengthPrefixed(&out, newNal, nalLengthSize: nalLengthSize)
                     changed = true
                     stats.rpuConverted += 1
                 } else {
-                    appendLengthPrefixed(&out, src, from: nalStart, count: nalLen, nalLengthSize: nalLengthSize)
                     stats.rpuFellBack += 1
+                    return false
                 }
             } else {
                 // Every other NAL (VPS/SPS/PPS/slices/SEI) passes through unchanged.
@@ -5382,14 +5402,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             pos = nalStart + nalLen
         }
         // Trailing bytes we could not parse as a complete NAL: bail to the untouched original for safety.
-        guard pos == total else { stats.pktBailed += 1; return }
-        guard changed else { return }   // nothing to rewrite; keep the original buffer
+        guard pos == total else { stats.pktBailed += 1; return false }
+        guard changed else { return true }   // nothing to rewrite; keep the original buffer
+        guard !out.isEmpty, out.count <= Int(Int32.max) else { stats.pktBailed += 1; return false }
 
         // Replace the packet payload. av_packet_from_data takes ownership of an av_malloc'd buffer padded with
         // AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes (libav readers over-read the tail); allocate + copy into one.
         let newSize = out.count
         guard let dst = av_malloc(newSize + AV_INPUT_BUFFER_PADDING_SIZE_CONST)?
-            .assumingMemoryBound(to: UInt8.self) else { return }   // original packet untouched
+            .assumingMemoryBound(to: UInt8.self) else { stats.pktBailed += 1; return false }
         out.withUnsafeBufferPointer { buf in
             if let b = buf.baseAddress { memcpy(dst, b, newSize) }
         }
@@ -5398,12 +5419,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // Wrap the converted bytes in a SCRATCH packet first, so the original packet stays byte-for-byte intact
         // on every error path. Only once the new ref-counted buffer is fully built do we hand it to `pkt`.
         // av_packet_from_data owns `dst` on success (freeing it on unref) and does NOT take it on failure.
-        guard let tmp = av_packet_alloc() else { av_free(dst); return }   // original packet untouched
+        guard let tmp = av_packet_alloc() else { av_free(dst); stats.pktBailed += 1; return false }
         if av_packet_from_data(tmp, dst, Int32(newSize)) < 0 {
             av_free(dst)                                 // wrap failed: we still own dst, free it
             var t: UnsafeMutablePointer<AVPacket>? = tmp
             av_packet_free(&t)
-            return                                       // original packet untouched: fail-soft stream-copies it
+            stats.pktBailed += 1
+            return false                                 // original packet untouched, but must not be muxed
         }
 
         // The scratch packet now solely owns a valid buffer ref for the converted access unit. Move that single
@@ -5420,6 +5442,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         tmp.pointee.size = 0
         var t: UnsafeMutablePointer<AVPacket>? = tmp
         av_packet_free(&t)                               // frees the scratch struct only; buffer now owned by pkt
+        return true
     }
 
     /// Append a NAL slice from a source pointer to `out`, writing the big-endian length prefix first.
