@@ -1741,7 +1741,7 @@ struct CoreSeasonedEpisodes: View {
         resolvedResumeVideoID(committed: nil)
     }
 
-    private func resolvedResumeVideoID(committed: PlaybackMeta?) -> String? {
+    private func resolvedResumeVideoID(committed: PlaybackMeta?, attempted: PlaybackMeta? = nil) -> String? {
         EpisodeReturnIdentityPolicy.resolve(
             libraryID: meta.id,
             isVideoAvailable: { id in videos.contains { $0.id == id } },
@@ -1749,7 +1749,9 @@ struct CoreSeasonedEpisodes: View {
             committedVideoID: committed?.videoId,
             engineVideoID: profiles.activeUsesEngineHistory
                 ? core.metaDetails?.libraryItem?.state.videoId
-                : profiles.watch[meta.id]?.videoId
+                : profiles.watch[meta.id]?.videoId,
+            attemptedLibraryID: attempted?.libraryId,
+            attemptedVideoID: attempted?.videoId
         )
     }
     private var resumeSeason: Int? { resumeVideoId.flatMap { id in videos.first { $0.id == id }?.season } }
@@ -1898,8 +1900,9 @@ struct CoreSeasonedEpisodes: View {
     /// trigger re-points the moment it closes) and on the engine naming a known episode.
     private func reanchorGridToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
         let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
+        let attempted = preferPlaybackCloseReceipt ? presenter.playbackCloseAttempt : nil
         guard presenter.request == nil,
-              let id = resolvedResumeVideoID(committed: committed),
+              let id = resolvedResumeVideoID(committed: committed, attempted: attempted),
               videos.contains(where: { $0.id == id }) else { return }
         if let s = videos.first(where: { $0.id == id })?.season,
            s != season, seasons.contains(s) { season = s }
@@ -2169,7 +2172,7 @@ struct CoreEpisodeStreams: View {
         resolvedResumeVideoID(committed: nil)
     }
 
-    private func resolvedResumeVideoID(committed: PlaybackMeta?) -> String? {
+    private func resolvedResumeVideoID(committed: PlaybackMeta?, attempted: PlaybackMeta? = nil) -> String? {
         EpisodeReturnIdentityPolicy.resolve(
             libraryID: meta.id,
             isVideoAvailable: { id in episodes.contains { $0.id == id } },
@@ -2177,7 +2180,9 @@ struct CoreEpisodeStreams: View {
             committedVideoID: committed?.videoId,
             engineVideoID: profiles.activeUsesEngineHistory
                 ? core.metaDetails?.libraryItem?.state.videoId
-                : profiles.watch[meta.id]?.videoId
+                : profiles.watch[meta.id]?.videoId,
+            attemptedLibraryID: attempted?.libraryId,
+            attemptedVideoID: attempted?.videoId
         )
     }
 
@@ -2305,8 +2310,9 @@ struct CoreEpisodeStreams: View {
     /// (paused, same episode) leaves the page untouched.
     private func reanchorPageToEngineEpisode(preferPlaybackCloseReceipt: Bool) {
         let committed = preferPlaybackCloseReceipt ? presenter.playbackCloseReceipt : nil
+        let attempted = preferPlaybackCloseReceipt ? presenter.playbackCloseAttempt : nil
         guard presenter.request == nil,
-              let id = resolvedResumeVideoID(committed: committed),
+              let id = resolvedResumeVideoID(committed: committed, attempted: attempted),
               id != currentVideo.id,
               let moved = episodes.first(where: { $0.id == id }) else { return }
         episodeTargetGeneration &+= 1

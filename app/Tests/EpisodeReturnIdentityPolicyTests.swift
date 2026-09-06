@@ -29,6 +29,32 @@ private enum EpisodeReturnIdentityPolicyTests {
         )
 
         check(
+            "failed-before-first-frame returns to the attempted episode before stale engine history",
+            EpisodeReturnIdentityPolicy.resolve(
+                libraryID: "series",
+                isVideoAvailable: available.contains,
+                committedLibraryID: nil,
+                committedVideoID: nil,
+                engineVideoID: "series:4:4",
+                attemptedLibraryID: "series",
+                attemptedVideoID: "series:2:1"
+            ) == "series:2:1"
+        )
+
+        check(
+            "a committed first-frame episode outranks the attempted request target",
+            EpisodeReturnIdentityPolicy.resolve(
+                libraryID: "series",
+                isVideoAvailable: available.contains,
+                committedLibraryID: "series",
+                committedVideoID: "series:2:2",
+                engineVideoID: "series:2:3",
+                attemptedLibraryID: "series",
+                attemptedVideoID: "series:2:1"
+            ) == "series:2:2"
+        )
+
+        check(
             "identity from another series cannot move this detail page",
             EpisodeReturnIdentityPolicy.resolve(
                 libraryID: "series",
@@ -47,6 +73,41 @@ private enum EpisodeReturnIdentityPolicyTests {
                 committedLibraryID: "series",
                 committedVideoID: "series:9:9",
                 engineVideoID: "series:2:3"
+            ) == "series:2:3"
+        )
+
+        check(
+            "foreign or inventory-missing attempted targets fall back to known engine history",
+            EpisodeReturnIdentityPolicy.resolve(
+                libraryID: "series",
+                isVideoAvailable: available.contains,
+                committedLibraryID: nil,
+                committedVideoID: nil,
+                engineVideoID: "series:2:3",
+                attemptedLibraryID: "other-series",
+                attemptedVideoID: "series:2:1"
+            ) == "series:2:3"
+                && EpisodeReturnIdentityPolicy.resolve(
+                    libraryID: "series",
+                    isVideoAvailable: available.contains,
+                    committedLibraryID: nil,
+                    committedVideoID: nil,
+                    engineVideoID: "series:2:3",
+                    attemptedLibraryID: "series",
+                    attemptedVideoID: "series:9:9"
+                ) == "series:2:3"
+        )
+
+        check(
+            "missing attempted target falls back to known engine history",
+            EpisodeReturnIdentityPolicy.resolve(
+                libraryID: "series",
+                isVideoAvailable: available.contains,
+                committedLibraryID: nil,
+                committedVideoID: nil,
+                engineVideoID: "series:2:3",
+                attemptedLibraryID: nil,
+                attemptedVideoID: nil
             ) == "series:2:3"
         )
 
@@ -77,6 +138,24 @@ private enum EpisodeReturnIdentityPolicyTests {
                 && receipt.closedReceipt?.requestID == 2
         )
 
+        receipt.begin(requestID: 6)
+        check(
+            "receipt lifecycle publishes an attempted target even without a first frame",
+            receipt.recordAttempt("series:2:1", requestID: 6)
+                && receipt.close(requestID: 6) == nil
+                && receipt.closedAttempt?.requestID == 6
+                && receipt.closedAttempt?.meta == "series:2:1"
+        )
+
+        receipt.begin(requestID: 7)
+        check(
+            "a trailer or metadata-less request has no attempted target",
+            receipt.recordAttempt(nil, requestID: 7)
+                && receipt.close(requestID: 7) == nil
+                && receipt.closedAttempt?.requestID == 7
+                && receipt.closedAttempt?.meta == nil
+        )
+
         receipt.begin(requestID: 3)
         check(
             "receipt lifecycle clears an older close receipt when a newer request begins",
@@ -92,6 +171,22 @@ private enum EpisodeReturnIdentityPolicyTests {
             receipt.close(requestID: 4) == nil
                 && receipt.activeRequestID == 5
                 && receipt.closedReceipt == nil
+        )
+
+        receipt.begin(requestID: 8)
+        _ = receipt.recordAttempt("series:2:2", requestID: 8)
+        receipt.begin(requestID: 9)
+        check(
+            "a newer request clears the older attempted target and fences its close",
+            receipt.close(requestID: 8) == nil
+                && receipt.activeRequestID == 9
+                && receipt.closedAttempt == nil
+        )
+
+        check(
+            "nil request close cannot publish an attempted target",
+            receipt.close(requestID: 9) == nil
+                && receipt.closedAttempt == nil
         )
 
         if failures > 0 {

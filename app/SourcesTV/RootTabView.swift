@@ -78,6 +78,10 @@ final class PlayerPresenter: ObservableObject {
     /// One close-scoped first-frame receipt. It is published only when its exact request closes and is cleared
     /// when a newer request begins, so trailers, profile changes and later visits cannot reuse stale identity.
     @Published private(set) var playbackCloseReceipt: PlaybackMeta?
+    /// The closing request's intended target, retained separately from the first-frame receipt. It is used only
+    /// to keep a failed-before-first-frame return on the episode the user tried to play; it is never persisted as
+    /// watched/progress/scrobble state and is cleared when a newer request begins.
+    @Published private(set) var playbackCloseAttempt: PlaybackMeta?
     private var receiptState = EpisodeReturnReceiptState<UUID, PlaybackMeta>()
 
     @Published var request: PlaybackRequest? {
@@ -88,9 +92,12 @@ final class PlayerPresenter: ObservableObject {
             if let request {
                 receiptState.begin(requestID: request.id)
                 playbackCloseReceipt = nil
+                playbackCloseAttempt = nil
             } else if let closing = oldValue,
                       receiptState.activeRequestID == closing.id {
+                _ = receiptState.recordAttempt(closing.meta, requestID: closing.id)
                 playbackCloseReceipt = receiptState.close(requestID: closing.id)
+                playbackCloseAttempt = receiptState.closedAttempt?.meta
             }
         }
     }
@@ -105,8 +112,10 @@ final class PlayerPresenter: ObservableObject {
     /// by didSet as a defensive fallback; the player exit path uses this deterministic close operation.
     @discardableResult
     func close(requestID: UUID) -> Bool {
-        guard request?.id == requestID else { return false }
+        guard let closing = request, closing.id == requestID else { return false }
+        _ = receiptState.recordAttempt(closing.meta, requestID: requestID)
         playbackCloseReceipt = receiptState.close(requestID: requestID)
+        playbackCloseAttempt = receiptState.closedAttempt?.meta
         request = nil
         return true
     }

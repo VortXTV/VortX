@@ -12,12 +12,19 @@ enum EpisodeReturnIdentityPolicy {
         isVideoAvailable: (String) -> Bool,
         committedLibraryID: String?,
         committedVideoID: String?,
-        engineVideoID: String?
+        engineVideoID: String?,
+        attemptedLibraryID: String? = nil,
+        attemptedVideoID: String? = nil
     ) -> String? {
         if committedLibraryID == libraryID,
            let committedVideoID,
            isVideoAvailable(committedVideoID) {
             return committedVideoID
+        }
+        if attemptedLibraryID == libraryID,
+           let attemptedVideoID,
+           isVideoAvailable(attemptedVideoID) {
+            return attemptedVideoID
         }
         if let engineVideoID, isVideoAvailable(engineVideoID) {
             return engineVideoID
@@ -33,17 +40,32 @@ struct EpisodeReturnReceiptState<RequestID: Equatable, Meta> {
     private(set) var activeRequestID: RequestID?
     private var activeCommit: (requestID: RequestID, meta: Meta)?
     private(set) var closedReceipt: (requestID: RequestID, meta: Meta)?
+    private var activeAttempt: (requestID: RequestID, meta: Meta?)?
+    private(set) var closedAttempt: (requestID: RequestID, meta: Meta?)?
 
     mutating func begin(requestID: RequestID) {
         activeRequestID = requestID
         activeCommit = nil
+        activeAttempt = nil
         closedReceipt = nil
+        closedAttempt = nil
     }
 
     @discardableResult
     mutating func record(_ meta: Meta, requestID: RequestID) -> Bool {
         guard activeRequestID == requestID else { return false }
         activeCommit = (requestID, meta)
+        return true
+    }
+
+    /// Records the request's launch metadata as a close-scoped fallback. This is deliberately separate from
+    /// `record`: an attempted request is not evidence that a first frame rendered and must never enter watch,
+    /// progress, or scrobble persistence. The request-id fence keeps an old close callback from naming a newer
+    /// request's target.
+    @discardableResult
+    mutating func recordAttempt(_ meta: Meta?, requestID: RequestID) -> Bool {
+        guard activeRequestID == requestID else { return false }
+        activeAttempt = (requestID, meta)
         return true
     }
 
@@ -56,7 +78,13 @@ struct EpisodeReturnReceiptState<RequestID: Equatable, Meta> {
         } else {
             closedReceipt = nil
         }
+        if let activeAttempt, activeAttempt.requestID == requestID {
+            closedAttempt = activeAttempt
+        } else {
+            closedAttempt = nil
+        }
         activeCommit = nil
+        activeAttempt = nil
         return closedReceipt?.meta
     }
 }
