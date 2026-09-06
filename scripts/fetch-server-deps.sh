@@ -140,6 +140,11 @@ echo "(+ scripts/build-ffi-xcframework.sh on the engine/apple-cutover branch), t
 #    original download. Idempotent: a fresh fetch has no marker so it re-patches.
 bash scripts/patch-server-yt.sh
 node scripts/patch-server-proxy.js "$SERVER_DEST"
+# Exercise the real vendor parser before patching, including the failing control,
+# then ship the exact deterministic split-archive repair that passed the tests.
+node test/server-usenet-archive.test.js "$SERVER_DEST"
+node scripts/patch-server-usenet.js "$SERVER_DEST"
+node --check "$SERVER_DEST"
 
 # Final fail-closed gate: the fetched tree must leave NO symlink under app/Resources/. This is the
 # durable fix for the shipped fonts/fonts defect. Every path that populates app/Resources/ has run
