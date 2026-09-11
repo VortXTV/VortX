@@ -3,7 +3,7 @@ name: Release apps (iOS + tvOS + macOS)
 # Builds the iOS + tvOS IPAs and the native macOS app from source on GitHub's
 # runners and hands the immutable bytes to the draft release lane (issue #7). The app sources, scripts,
 # NodeMobile + fonts (this repo's vendor release), and server.js (Stremio's CDN)
-# are public; the two ENGINE crates (stremiox-core, vortx-core) are PRIVATE
+# are public; the two ENGINE crates (stremiox-core, vortx-core) are PRIVATE.
 # (moved out of the public tree in 33ff9b5) and are fetched below at pinned
 # commits with the ENGINE_REPO_TOKEN secret. Bumping an engine pin means editing
 # this file, which is itself a path trigger, so the old `core/**` path filters
@@ -133,11 +133,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/stremiox-core
-          # fix/meta-imdb-link-preserve: engine keeps addon-supplied imdbRating when the addon
-          # also sends its own links. PUSH GATE: this ref carries a path patch on stremio-core;
-          # publish the patched stremio-core to the private mirror and swap the patch for a git
-          # rev pin (see the engine repo's Cargo.toml note), then update this ref to that commit.
-          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
+          # Private wrapper release pin. Its Cargo patch resolves the reviewed public stremio-core fork,
+          # including the imdb-rating and local add-on action fixes; the public-core library suite passed 243 tests.
+          ref: 201409f886502981c28870b2d4031781e6109ee3
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

@@ -104,7 +104,8 @@ final class AddonHealthStore: ObservableObject {
 }
 
 /// Add-ons installed on your account, read live from the engine. Install one by its manifest URL,
-/// or remove a non-default add-on here. Changes sync to your account and to the official apps.
+/// or remove a non-default add-on here. Changes sync to your account and to the official apps when mirroring
+/// is enabled; a Change URL is an atomic engine replacement that retains its priority slot.
 struct AddonsView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks add-on management even with no Stremio account connected
@@ -778,12 +779,11 @@ private struct EditAddonURLView: View {
         message = nil
         let newURL = url.trimmingCharacters(in: .whitespaces)
         Task { @MainActor in
-            if let error = await CoreBridge.shared.installAddon(urlString: newURL) {
+            if let error = await CoreBridge.shared.installAddon(urlString: newURL,
+                                                                 replacingExisting: true,
+                                                                 replacingDescriptor: addon) {
                 message = error; working = false; return
             }
-            // Change-URL is a REPLACE, not a removal: drop the old URL but do NOT tombstone it, so the
-            // same URL stays re-addable on every device (a removal tombstone would wrongly suppress it).
-            CoreBridge.shared.uninstallAddon(addon, tombstone: false)
             working = false
             dismiss()
         }

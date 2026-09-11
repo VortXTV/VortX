@@ -174,6 +174,44 @@ enum AddonReorderOrderTests {
             check(display.map(\.name) == ["C", "A", "B"], "tail: an un-ordered add-on (B) keeps its place at the end, never hidden")
         }
 
+        // 5. A confirmed distinct-URL replacement preserves the OLD priority slot and removes a target URL
+        //    that was already present in the order. This invokes the real policy used after ReplaceAddonLocal.
+        do {
+            let old = b.transportUrl
+            let new = "https://replacement.example/manifest.json"
+            let rewritten = AddonOrderSyncPolicy.replacing([a.transportUrl, old, c.transportUrl, new],
+                                                            oldURL: old, newURL: new)
+            check(rewritten == [a.transportUrl, new, c.transportUrl].map(OrderStore.normalize),
+                  "replace order: new URL takes old slot and is deduplicated")
+            check(AddonOrderSyncPolicy.replacing([a.transportUrl, c.transportUrl], oldURL: old, newURL: new)
+                    == [a, c].map { OrderStore.normalize($0.transportUrl) },
+                  "replace order: absent old URL does not append an unrequested priority")
+            check(AddonOrderSyncPolicy.replacing([new, a.transportUrl, old, c.transportUrl], oldURL: old, newURL: new)
+                    == [a.transportUrl, new, c.transportUrl].map(OrderStore.normalize),
+                  "replace order: a stale earlier target does not shift the old slot right")
+        }
+
+        // 6. Equal versions warm-hydrate only a certified, unforced current owner. A first restore after
+        //    an accepted push has no applied epoch yet, so effectiveForce MUST remain an apply.
+        do {
+            check(AddonSyncPullPolicy.decision(pulledVersion: 7, lastSyncedVersion: 7,
+                                                effectiveForce: true, hasAppliedAccountDoc: false,
+                                                hasPendingAccountDocApply: false, credentialIsCurrent: true) == .apply,
+                  "sync gate: forced equal first restore applies instead of early-hydrating")
+            check(AddonSyncPullPolicy.decision(pulledVersion: 7, lastSyncedVersion: 7,
+                                                effectiveForce: false, hasAppliedAccountDoc: true,
+                                                hasPendingAccountDocApply: false, credentialIsCurrent: true) == .warmHydrate,
+                  "sync gate: certified unforced equal document warm-hydrates")
+            check(AddonSyncPullPolicy.decision(pulledVersion: 6, lastSyncedVersion: 7,
+                                                effectiveForce: true, hasAppliedAccountDoc: false,
+                                                hasPendingAccountDocApply: false, credentialIsCurrent: true) == .reject,
+                  "sync gate: lower version is rejected even when forced")
+            check(AddonSyncPullPolicy.decision(pulledVersion: 8, lastSyncedVersion: 7,
+                                                effectiveForce: true, hasAppliedAccountDoc: true,
+                                                hasPendingAccountDocApply: false, credentialIsCurrent: false) == .reject,
+                  "sync gate: stale credentials reject every version")
+        }
+
         print("")
         if failures == 0 {
             print("ALL TESTS PASSED")

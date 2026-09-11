@@ -513,6 +513,13 @@ final class VortXSyncManager: ObservableObject {
             NSLog("[addon] in-app reorder pushed to sync (%d add-ons, ok=%@)", normalized.count, ok ? "yes" : "no")
         }
     }
+
+    /// Called only after CoreBridge has owner-fenced a confirmed atomic engine replacement.  Keep the
+    /// previous URL's explicit priority slot rather than letting the new descriptor fall through to last.
+    func replaceInAppAddonOrder(oldTransportURL: String, newTransportURL: String) {
+        applyInAppAddonOrder(AddonOrderSyncPolicy.replacing(
+            Self.appliedAddonOrder, oldURL: oldTransportURL, newURL: newTransportURL))
+    }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
     private struct PendingDebridApply: Equatable {
         let capture: CredentialScopeRegistry.Capture
@@ -2258,7 +2265,24 @@ final class VortXSyncManager: ObservableObject {
         // and returns false forever. That is what makes the loss permanent on the client, and with no peer to
         // publish a newer version a single-device user never escapes it. Gating on hasAppliedAccountDoc instead
         // of on the version is what breaks that: the version can lie about whether we restored, the flag cannot.
-        if !effectiveForce, pulled.version <= lastSyncedVersion { return false }
+        switch AddonSyncPullPolicy.decision(
+            pulledVersion: pulled.version,
+            lastSyncedVersion: lastSyncedVersion,
+            effectiveForce: effectiveForce,
+            hasAppliedAccountDoc: hasAppliedAccountDoc,
+            hasPendingAccountDocApply: hasPendingAccountDocApply(for: capture),
+            credentialIsCurrent: isCurrent(capture)
+        ) {
+        case .reject:
+            return false
+        case .warmHydrate:
+            // An equal document is never reapplied, but a certified current owner may still need its
+            // already-pulled descriptors materialized after a warm engine lost them. Do not fetch again.
+            CoreBridge.shared.hydrateAddonsFromAccount(Self.ownedAddons(from: pulled.doc))
+            return false
+        case .apply:
+            break
+        }
         let doc = pulled.doc
         var restored = false
         var pendingDebridValues = pendingDebridApply?.values ?? [:]
@@ -2691,6 +2715,10 @@ final class VortXSyncManager: ObservableObject {
             stampSyncSuccess()
         }
         guard isCurrent(capture) else { return false }
+        // Materialize this exact, just-settled document while its credential owner is still current.
+        // This is deliberately after provider settlement and reuses `doc`: no second GET can race a
+        // newer owner or an equal/lower version.
+        CoreBridge.shared.hydrateAddonsFromAccount(Self.ownedAddons(from: doc))
         // OwnerResumeStore changed without an engine event, so publish its new resume positions now. This stays
         // unconditional because refreshOwnerResumeCache does not contribute to `restored`.
         guard isCurrent(capture) else { return false }

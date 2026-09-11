@@ -35,6 +35,38 @@ enum AddonOrderSyncPolicy {
         guard let pending, let sent else { return false }
         return pending.accountID == accountID && pending == sent
     }
+
+    /// Replacing an installed add-on must retain the user's explicit priority slot.  The engine replaces
+    /// its descriptor atomically, but its transport URL is the order key, so rewrite that intent only after
+    /// the replacement itself has been confirmed.  Remove an existing target first to avoid duplicate ranks.
+    static func replacing(_ order: [String], oldURL: String, newURL: String) -> [String] {
+        let old = oldURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let new = newURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var result = unique(order.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+        guard !old.isEmpty, !new.isEmpty, old != new,
+              let oldIndex = result.firstIndex(of: old) else { return result }
+        // A stale order can still contain `new` before `old`; removing it must not make the replacement
+        // drift right. Count the surviving prefix first, then insert at that logical old slot.
+        let replacementIndex = result[..<oldIndex].filter { $0 != new }.count
+        result.removeAll { $0 == old || $0 == new }
+        result.insert(new, at: min(replacementIndex, result.count))
+        return result
+    }
+}
+
+/// Pure version gate for an already-pulled account document. Kept Foundation-only so the standalone
+/// regression binary executes the exact policy used by `VortXSyncManager.syncDown`.
+enum AddonSyncPullPolicy {
+    enum Decision: Equatable { case reject, warmHydrate, apply }
+
+    static func decision(pulledVersion: Int, lastSyncedVersion: Int, effectiveForce: Bool,
+                         hasAppliedAccountDoc: Bool, hasPendingAccountDocApply: Bool,
+                         credentialIsCurrent: Bool) -> Decision {
+        guard credentialIsCurrent, pulledVersion >= lastSyncedVersion else { return .reject }
+        guard pulledVersion == lastSyncedVersion, !effectiveForce else { return .apply }
+        return hasAppliedAccountDoc && !hasPendingAccountDocApply && credentialIsCurrent
+            ? .warmHydrate : .reject
+    }
 }
 
 /// The same stable order drives the add-on list and source groups. Never discard unlisted add-ons:

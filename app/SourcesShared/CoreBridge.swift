@@ -125,6 +125,9 @@ final class CoreBridge: ObservableObject {
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
     private var switchInFlight = false
     private var switchFromUID: String?
+    /// One-shot authority for an explicit user-requested Stremio import. Background settlement must not
+    /// overwrite a mirror-off VortX projection with PullAddonsFromAPI.
+    private var explicitAddonImportPending = false
     /// Authentication is asynchronous. This token-to-engine binding is cleared before every
     /// profile auth and created only after an authenticated token identity agrees with engine ctx,
     /// so profile selection cannot mislabel the old engine context as the selected account.
@@ -351,21 +354,15 @@ final class CoreBridge: ObservableObject {
             // while it is emitting the ctx event we are handling. tombstone:false via a direct dispatch
             // because the URL is already in the set; re-recording would be a redundant no-op.
             //
-            // Push-to-Stremio gate (owner-locked default OFF = one-way / pull-only): when a live Stremio
-            // session exists, stremio-core PERSISTS an engine UninstallAddon upstream via api.strem.io
-            // addonCollectionSet, so this loop is the periodic path that would delete a tombstoned add-on
-            // from the user's REAL Stremio account on every ctx cycle (launch / PullAddonsFromAPI). Only
-            // reconcile the engine collection when push is ON, OR when signed out of Stremio (a local-only
-            // engine edit that cannot reach the account). When push is OFF + a session is live we STILL
-            // drop the tombstoned add-on from the published set below (survivingTyped / publishedRaw), so
-            // the user never sees it, but we leave the engine collection (and the Stremio account) intact.
-            let pushDeletionsToStremio = (MirrorSettings.mirrorAddons && isLoggedIn()) || !isLoggedIn()
-            if !toUninstall.isEmpty, pushDeletionsToStremio {
+            // Tombstoned rows must be reconciled in the engine too. The centralized selector uses
+            // UninstallAddonLocal while mirror-off, so this periodic cleanup refreshes catalogs/sources
+            // without writing an authenticated Stremio addon collection.
+            if !toUninstall.isEmpty {
                 Task { @MainActor [weak self] in
                     guard let self, self.publicationStillCurrent(publicationToken) else { return }
                     for rawDescriptor in toUninstall {
                         guard self.publicationStillCurrent(publicationToken) else { return }
-                        self.dispatchCtx(["action": "UninstallAddon", "args": rawDescriptor])
+                        self.dispatchCtx(["action": self.addonMutationAction("UninstallAddon", local: "UninstallAddonLocal"), "args": rawDescriptor])
                     }
                 }
             }
@@ -398,9 +395,9 @@ final class CoreBridge: ObservableObject {
     /// no Remove for them). A REMOVABLE official add-on (YouTube, WatchHub, Public Domain, OpenSubtitles:
     /// official=true, protected=false) IS tombstoned, because the engine re-seeds OFFICIAL_ADDONS on every
     /// reset and would otherwise resurrect a user's deletion on the next launch (#137); a genuine re-add
-    /// through the store clears it via `AddonTombstones.forget`. The Change-URL replace path passes
-    /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
-    /// URL must stay re-addable on every device.
+    /// through the store clears it via `AddonTombstones.forget`. Change URL does not use this uninstall path:
+    /// it atomically replaces the descriptor, then tombstones the old identity only after the new one is
+    /// owner-fenced and confirmed, so peers cannot resurrect the obsolete URL.
     func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
         let mutationToken = capturePublicationToken()
         // A logout, unresolved binding, or rejected credential still belongs to the previous
@@ -426,19 +423,12 @@ final class CoreBridge: ObservableObject {
             }
         }
         let raw = rawAddonsByUrl[descriptor.transportUrl]
-        // Push-to-Stremio gate (owner-locked default OFF = one-way / pull-only). When a live Stremio
-        // session exists, stremio-core's ctx reducer PERSISTS an UninstallAddon by calling api.strem.io
-        // addonCollectionSet, i.e. the deletion would propagate to the user's REAL Stremio account. That
-        // is the destructive two-way delete users reported. So only dispatch the engine uninstall when
-        // the "Mirror add-ons from Stremio" two-way toggle is ON, OR when there is no live Stremio session
-        // (deleting from a signed-out engine is local-only and safe). When push is OFF and a session is
-        // live, we keep the tombstone (the VortX-view removal) and rely on refreshAddons to suppress the
-        // add-on from the published set every ctx cycle, never touching the user's Stremio account.
-        // The Change-URL replace path (tombstone:false) always dispatches: swapping a manifest URL is a
-        // local edit, not a real removal, and must not be blocked.
+        // The mirror-off local action mutates the local profile and persists its normal receipts without
+        // writing AddonCollectionSet. Mirror-on retains the existing upstream behavior; signed-out edits
+        // are local in either case. The Change-URL replacement itself no longer uses this two-step path.
         let pushDeletionToStremio = (MirrorSettings.mirrorAddons && isLoggedIn()) || !isLoggedIn()
-        if let raw, !tombstone || pushDeletionToStremio {
-            dispatchCtx(["action": "UninstallAddon", "args": raw])
+        if let raw, !tombstone || pushDeletionToStremio || !MirrorSettings.mirrorAddons {
+            dispatchCtx(["action": addonMutationAction("UninstallAddon", local: "UninstallAddonLocal"), "args": raw])
         } else {
             // Tombstone-only path (push OFF + live Stremio session, OR no raw descriptor to dispatch): we did
             // NOT dispatch an engine uninstall, so no ctx event will fire and refreshAddons will not re-run
@@ -462,8 +452,10 @@ final class CoreBridge: ObservableObject {
     /// Legacy facade: nil means the engine has confirmed the add-on, while the typed path below carries
     /// already-installed/retryability information for QR acknowledgements.
     @MainActor
-    func installAddon(urlString: String, replacingExisting: Bool = false) async -> String? {
-        switch await installAddonConfirmed(urlString: urlString, replacingExisting: replacingExisting) {
+    func installAddon(urlString: String, replacingExisting: Bool = false,
+                      replacingDescriptor: CoreDescriptor? = nil) async -> String? {
+        switch await installAddonConfirmed(urlString: urlString, replacingExisting: replacingExisting,
+                                           replacingDescriptor: replacingDescriptor) {
         case .installed, .alreadyInstalled:
             return nil
         case .failed(_, let message):
@@ -473,9 +465,11 @@ final class CoreBridge: ObservableObject {
 
     /// Single hardened installer used by QR. It does not report success at dispatch time: the engine roster
     /// must contain the expected descriptor first. A timeout is retryable and leaves the previous replacement
-    /// intact when the new manifest never confirms.
+    /// intact when the new manifest never confirms. A replacement is rejected before dispatch if the old
+    /// descriptor is protected/configuration-required or its distinct target already exists.
     @MainActor
-    func installAddonConfirmed(urlString: String, replacingExisting: Bool = false) async -> AddonInstallOutcome {
+    func installAddonConfirmed(urlString: String, replacingExisting: Bool = false,
+                               replacingDescriptor: CoreDescriptor? = nil) async -> AddonInstallOutcome {
         let mutationToken = capturePublicationToken()
         guard addonMutationStillAllowed(mutationToken) else {
             return .failed(retryable: true, message: Self.accountTransitionMessage)
@@ -526,18 +520,29 @@ final class CoreBridge: ObservableObject {
         guard let identityURL = URL(string: identity) else {
             return .failed(retryable: false, message: "That URL did not return a valid add-on manifest.")
         }
+        if ((manifest["behaviorHints"] as? [String: Any])?["configurationRequired"] as? Bool) == true {
+            return .failed(retryable: false, message: Self.addonNeedsConfigurationMessage)
+        }
+
+        if let replacingDescriptor {
+            guard !replacingDescriptor.isProtected,
+                  replacingDescriptor.manifest.behaviorHints?.configurationRequired != true else {
+                return .failed(retryable: false, message: "This add-on cannot be replaced.")
+            }
+            // `ReplaceAddonLocal` rejects a target already installed at another URL. Without this preflight,
+            // awaitAddonInstalled could observe that pre-existing target and mistake the rejected action for
+            // success, then tombstone the old descriptor.
+            if replacingDescriptor.transportUrl != identity,
+               rawAddonsByUrl[identity] != nil || addons.contains(where: { $0.transportUrl == identity }) {
+                return .failed(retryable: false, message: "That add-on URL is already installed.")
+            }
+        }
 
         // A redirect can land on an already-installed identity different from the submitted URL.
         let replacing = addons.contains(where: { $0.transportUrl == identity })
         if replacing, !replacingExisting { return .alreadyInstalled }
         let previousManifest: [String: Any]? = replacing
             ? (rawAddonsByUrl[identity]?["manifest"] as? [String: Any]) : nil
-        if replacing, let existing = rawAddonsByUrl[identity] {
-            guard addonMutationStillAllowed(mutationToken),
-                  dispatchCtx(["action": "UninstallAddon", "args": existing]) else {
-                return .failed(retryable: true, message: Self.accountTransitionMessage)
-            }
-        }
 
         // The descriptor is installed under the guarded final identity, never the unvalidated redirect source.
         let descriptor: [String: Any] = [
@@ -553,10 +558,20 @@ final class CoreBridge: ObservableObject {
         // URL failed with "Install did not confirm". An explicit user install is intent to have the
         // add-on, the same authority the Library add path uses to supersede LibraryTombstones. If the
         // install itself fails, the user can remove the add-on again, which re-tombstones it.
-        guard addonMutationStillAllowed(mutationToken),
-              dispatchCtx(["action": "InstallAddon", "args": descriptor], beforeDispatch: {
-                  AddonTombstones.forget(identityURL.absoluteString)
-              }) else {
+        let action: [String: Any]
+        if let replacingDescriptor {
+            guard let old = rawAddonsByUrl[replacingDescriptor.transportUrl] else {
+                return .failed(retryable: true, message: Self.accountTransitionMessage)
+            }
+            action = ["action": addonMutationAction("ReplaceAddon", local: "ReplaceAddonLocal"),
+                      "args": ["old": old, "new": descriptor]]
+        } else {
+            action = ["action": addonMutationAction("InstallAddon", local: "InstallAddonLocal"),
+                      "args": descriptor]
+        }
+        guard addonMutationStillAllowed(mutationToken), dispatchCtx(action, beforeDispatch: {
+            AddonTombstones.forget(identityURL.absoluteString)
+        }) else {
             return .failed(retryable: true, message: Self.accountTransitionMessage)
         }
 
@@ -568,7 +583,28 @@ final class CoreBridge: ObservableObject {
         guard installConfirmed else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
         }
+        if let replacingDescriptor, replacingDescriptor.transportUrl != identityURL.absoluteString {
+            guard addonMutationStillAllowed(mutationToken) else {
+                return .failed(retryable: true, message: Self.accountTransitionMessage)
+            }
+            // Distinct URLs must prove the old descriptor disappeared. A pre-existing target alone cannot
+            // acknowledge a rejected replace action; preserving old/order is safer than tombstoning data.
+            guard rawAddonsByUrl[replacingDescriptor.transportUrl] == nil,
+                  !addons.contains(where: { $0.transportUrl == replacingDescriptor.transportUrl }) else {
+                return .failed(retryable: true, message: "Replacement did not confirm. Your existing add-on was kept.")
+            }
+            VortXSyncManager.shared.replaceInAppAddonOrder(
+                oldTransportURL: replacingDescriptor.transportUrl,
+                newTransportURL: identityURL.absoluteString)
+            AddonTombstones.tombstone(replacingDescriptor.transportUrl)
+        }
         return .installed
+    }
+
+    /// Select the local core mutation whenever add-on mirroring is disabled. The local actions persist and
+    /// refresh the profile, but never enqueue an authenticated AddonCollectionSet write.
+    private func addonMutationAction(_ mirrored: String, local: String) -> String {
+        MirrorSettings.mirrorAddons ? mirrored : local
     }
 
     struct AddonManifestPreview: Equatable {
@@ -756,7 +792,7 @@ final class CoreBridge: ObservableObject {
     /// lacks (idempotent). This is the load-bearing "account owns everything" capability: it lets a
     /// logged-out / degraded Stremio session show the account's add-ons + sources instead of zero.
     ///
-    /// Uses the EXACT `InstallAddon` descriptor shape `installAddon` sends (`{transportUrl, manifest,
+    /// Uses the EXACT `InstallAddonLocal` descriptor shape `installAddon` sends (`{transportUrl, manifest,
     /// flags}`, camelCase), the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
     /// A lowercase-key mismatch silently no-ops in the engine, so `VortXOwnedAddon.installDescriptor`
     /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
@@ -768,7 +804,7 @@ final class CoreBridge: ObservableObject {
         var installedCount = 0
         for addon in owned where !installed.contains(addon.transportUrl) {
             guard addonMutationStillAllowed(mutationToken) else { return }
-            if dispatchCtx(["action": "InstallAddon", "args": addon.installDescriptor]) {
+            if dispatchCtx(["action": "InstallAddonLocal", "args": addon.installDescriptor]) {
                 installedCount += 1
             }
         }
@@ -979,10 +1015,16 @@ final class CoreBridge: ObservableObject {
         }
     }
 
-    /// Refresh installed addons + library from api.strem.io (needs an authenticated session).
-    private func refreshFromAPI() {
+    /// Refresh the library from api.strem.io and pull its add-on collection only when two-way mirroring
+    /// is enabled or the current account settlement carries an explicit user import request.
+    private func refreshFromAPI(explicitAddonImport: Bool = false) {
         guard !enginePublicationBlocked else { return }
-        dispatchCtx(["action": "PullAddonsFromAPI"])
+        let shouldPullAddons = !importedAwayFromStremio
+            && (MirrorSettings.mirrorAddons || explicitAddonImport || explicitAddonImportPending)
+        if shouldPullAddons {
+            dispatchCtx(["action": "PullAddonsFromAPI"])
+        }
+        explicitAddonImportPending = false
         dispatchCtx(["action": "SyncLibraryWithAPI"])
     }
 
@@ -1015,8 +1057,9 @@ final class CoreBridge: ObservableObject {
         for removedURL in AddonTombstones.all() {
             AddonTombstones.forget(removedURL)
         }
+        explicitAddonImportPending = true
         if isLoggedIn(), let key = Keychain.string(activeTokenAccount), !key.isEmpty {
-            switchAccount(token: key)
+            switchAccount(token: key, explicitAddonImport: true)
         } else {
             bootstrapAuth()
         }
@@ -1027,7 +1070,8 @@ final class CoreBridge: ObservableObject {
     /// profile we're leaving.) LoginWithToken installs the new session in place and the engine then
     /// pulls that account's addons + library itself; completion is accepted only when authenticated
     /// token identity agrees with the engine ctx.
-    func switchAccount(token: String) {
+    func switchAccount(token: String, explicitAddonImport: Bool = false) {
+        if explicitAddonImport { explicitAddonImportPending = true }
         beginAccountBinding(for: token)
         let publicationToken = capturePublicationToken()
         switchInFlight = true
@@ -3105,6 +3149,7 @@ final class CoreBridge: ObservableObject {
         awaitingAuthMigration = false
         switchInFlight = false
         switchFromUID = nil
+        explicitAddonImportPending = false
     }
 
     private func retireSignedOutRepairRequest() {
@@ -3282,6 +3327,7 @@ final class CoreBridge: ObservableObject {
     }
 
     private func finishSettledAccountBinding() {
+        let explicitAddonImport = explicitAddonImportPending
         let completingLegacyMigration = awaitingAuthMigration
         if completingLegacyMigration {
             // A PullUser ctx can race ahead of getUser proof.  Once that proof later agrees with
@@ -3296,16 +3342,16 @@ final class CoreBridge: ObservableObject {
                 switchFromUID = nil
             }
             NSLog("[CoreBridge] authKey migration identity verified -> pulling addons + syncing library")
-            refreshFromAPI()
+            refreshFromAPI(explicitAddonImport: explicitAddonImport)
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
         } else if switchInFlight {
             switchInFlight = false
             switchFromUID = nil
             NSLog("[CoreBridge] account switch identity verified -> reloading")
-            refreshFromAPI()
+            refreshFromAPI(explicitAddonImport: explicitAddonImport)
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.loadBoard() }
         } else {
-            refreshFromAPI()
+            refreshFromAPI(explicitAddonImport: explicitAddonImport)
         }
         // The successful settlement advanced publicationEpoch.  Replace the launch/pending repair
         // timer with exactly one timer bound to this now-valid account context.
