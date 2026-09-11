@@ -78,7 +78,8 @@ jobs:
     #
     # Read-only-build vs release-write split (amended): the feed-artifact lane inside this
     # job must fail-closed VERIFY the target draft (id, tag, draft/prerelease bits).
-    # Stable tags are non-prereleases; beta tags retain the prerelease bit.
+    # Stable tags are non-prereleases; beta tags retain that bit unless the exact Latest-beta
+    # release-body marker authorizes the strict beta.N channel exception checked below.
     # before any release bytes are built, and GitHub only exposes draft releases to
     # `contents: write` tokens. This job therefore carries `contents: write`, reachable only
     # through the manually approved `engine-ci` environment gate above. Asset attachment,
@@ -1281,7 +1282,12 @@ jobs:
           SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary <"$RUNNER_TEMP/feed-receipt.json" | od -An -tx1 | tr -d ' \n')"
           RECEIPT_RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS \
             -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" \
-            --data-binary @"$RUNNER_TEMP/feed-receipt.json" https://vortx.tv/__release/receipt)"
+            --data-binary @"$RUNNER_TEMP/feed-receipt.json" https://vortx.tv/__release/receipt)" || {
+              # Keep the bounded JSON validation reason; command substitution otherwise swallows
+              # --fail-with-body output on set -e. Never print receipt contents or HMAC headers.
+              jq -c '{error, message}' <<<"$RECEIPT_RESPONSE" >&2 || echo "feed staging returned a non-JSON failure" >&2
+              exit 1
+            }
           jq -e --arg generation "$(jq -er '.generation' feed-artifact/manifest.json)" '.staged == true and .generation == $generation' <<<"$RECEIPT_RESPONSE" >/dev/null
           for ASSET_ID_FILE in "$IOS_ID:out/$IOS_NAME" "$TVOS_ID:out/$TVOS_NAME" "$LITE_ID:out/$LITE_NAME" "$MAC_ID:out/$MAC_NAME" "$CHECKSUM_ID:out/SHA256SUMS-ci.txt"; do
             ASSET_ID="${ASSET_ID_FILE%%:*}"; FILE="${ASSET_ID_FILE#*:}"
@@ -1387,7 +1393,7 @@ jobs:
             local current
             current="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
             if [ -n "$current" ] && [ -n "${PUBLISHED_AT:-}" ] && jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" --argjson prerelease "$IS_PRERELEASE" '.tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at == $published' <<<"$current" >/dev/null; then
-              restored="$(gh api --method PATCH -f draft=true -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+              restored="$(gh api --method PATCH -F draft=true -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
               jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == true' <<<"$restored" >/dev/null || { echo "::error::incident: GitHub could not restore release $RELEASE_ID to draft"; ROLLBACK_FAILURE=1; }
             elif [ -n "${PUBLISHED_AT:-}" ]; then
               echo "::error::incident: release rollback identity changed before restore"
@@ -1488,16 +1494,30 @@ jobs:
           PUBLISH_DEADLINE=$(($(date +%s) + 90))
           PUBLISHED=0
           while [ "$(date +%s)" -lt "$PUBLISH_DEADLINE" ]; do
-            if [ "$IS_PRERELEASE" = false ]; then
-              gh api --method PATCH -f draft=false -f make_latest=true -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
+            if [ -z "${PUBLISHED_AT:-}" ]; then
+              RELEASE_JSON="$(gh api --method PATCH -F draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
             else
-              gh api --method PATCH -f draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" >/dev/null || true
+              RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
             fi
-            RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            if ! jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null' <<<"$RELEASE_JSON" >/dev/null; then
+              sleep 5
+              continue
+            fi
+            OBSERVED_PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
+            [ -z "${PUBLISHED_AT:-}" ] || [ "$PUBLISHED_AT" = "$OBSERVED_PUBLISHED_AT" ] || { echo "::error::publication timestamp changed during Latest selection"; exit 1; }
+            # Arm exact-publication compensation immediately, even if Latest never converges.
+            PUBLISHED_AT="$OBSERVED_PUBLISHED_AT"
             LATEST_JSON='{}'
-            if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest" 2>/dev/null || true)"; fi
+            if [ "$IS_PRERELEASE" = false ]; then
+              # A draft cannot be Latest. Prove publication first, then make this separate transition.
+              LATEST_UPDATE="$(gh api --method PATCH -f make_latest=true -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
+              if ! jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .prerelease == false and .published_at == $published' <<<"$LATEST_UPDATE" >/dev/null; then
+                sleep 5
+                continue
+              fi
+              LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest" || true)"
+            fi
             if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null; then
-              PUBLISHED_AT="$(jq -er '.published_at' <<<"$RELEASE_JSON")"
               PUBLISHED=1
               break
             fi

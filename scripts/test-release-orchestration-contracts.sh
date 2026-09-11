@@ -558,7 +558,11 @@ require_grep "published verifier rejects partial Android feeds" \
 require_grep "published verifier retains byte proof for a present inherited Android feed" \
     'if \[ "\$HAS_ANDROID" = true \]; then' "$APPLE_RELEASE_WF"
 require_grep "Stable publish sends GitHub's string-valued latest mode" \
-    'gh api --method PATCH -f draft=false -f make_latest=true' "$APPLE_RELEASE_WF"
+    'gh api --method PATCH -f make_latest=true' "$APPLE_RELEASE_WF"
+require_grep "Publication sends a typed draft Boolean in a separate request" \
+    'gh api --method PATCH -F draft=false' "$APPLE_RELEASE_WF"
+require_absent "Publication and Latest must be separate proven transitions" \
+    'draft=false.*make_latest=true' "$APPLE_RELEASE_WF"
 require_absent "Stable publish must not encode make_latest as a JSON boolean" \
     '[-]F make_latest=true' "$APPLE_RELEASE_WF"
 require_absent "numeric release objects must not use the non-existent is_latest field" '\.is_latest' "$APPLE_RELEASE_WF"
