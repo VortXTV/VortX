@@ -219,9 +219,9 @@ private enum AppleNativeDebridRecoveryContractTests {
         check("engine switch joins the second recovery", refreshLifecycle.join(engine: false))
         check("second recovery completes with the joined engine", refreshLifecycle.finish(ownedBy: secondGeneration!) == false)
         check(
-            "recovery preserves paused transport intent and semantic audio across mount-local track IDs",
-            source.contains("let pausedIntent = isPaused")
-                && source.contains("if pausedIntent { coordinator.player?.pause() }")
+            "recovery preserves latest user transport intent and semantic audio across mount-local track IDs",
+            source.contains("if playbackDeadlineClock.isPaused { coordinator.player?.pause() }\n                        else { coordinator.player?.play() }")
+                && !source.contains("if pausedIntent { coordinator.player?.pause() }")
                 && source.contains("pendingAudioReapply = captureSelectedAudioChoice()")
                 && source.contains("PlayerRecoveryAudioChoice.matchingID(")
         )

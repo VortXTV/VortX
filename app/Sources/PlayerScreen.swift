@@ -918,6 +918,7 @@ struct PlayerScreen: View {
     /// True once this foreground has already booked its one delayed loopback re-check, so a foreground can never
     /// queue more than one (no busy loop). Cleared on every foreground entry.
     @State private var foregroundMountRecheckArmed = false
+    @State private var foregroundMountRevalidation = ForegroundMountRevalidation<PlayerLoadToken>()
     /// How long the delayed re-check waits. `VortxNativeServer` clears `publishedPort` on background and only
     /// restarts at scenePhase `.active`, which lands AFTER `willEnterForeground`, so at revalidation time
     /// `StremioServer.base` still names the dead port and the heal below can prove nothing. One re-check past
@@ -2278,6 +2279,11 @@ struct PlayerScreen: View {
                     else { ScrobbleCoordinator.shared.playbackResumed(m, position: pos, duration: duration) }
                 }
             }
+            #if canImport(UIKit)
+            // Recovery is one-shot and load/user-intent fenced, not a scrobble. An already-false echo
+            // may still release deferred foreground work even if an intermediate pause was not observed.
+            if let b = data as? Bool, !b { resumeDeferredForegroundMountRevalidation() }
+            #endif
         case MPVProperty.trackList:
             refreshTracks()
             if let loadToken, callbackBelongsToCommittedMedia(loadToken) {
@@ -3069,6 +3075,7 @@ struct PlayerScreen: View {
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
         if let issuedToken {
+            foregroundMountRevalidation.clear()
             sourceSwitchGeneration &+= 1
             beginAssetSanityAttemptIfNeeded(
                 loadToken: issuedToken,
@@ -3176,7 +3183,6 @@ struct PlayerScreen: View {
         let retryURL = curURL
         guard let retryLoadToken = coordinator.player?.activeLoadToken else { return false }
         let retryResume = retryResumeTarget()
-        let pausedIntent = isPaused
         let audioChoice = captureSelectedAudioChoice()
         let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
         let retryEpisodeGeneration = episodeSwitchGeneration
@@ -3262,7 +3268,10 @@ struct PlayerScreen: View {
                     )
                     if pendingAdvance != nil { pendingAdvance?.loadToken = issuedToken }
                     if issuedToken != nil {
-                        if pausedIntent { coordinator.player?.pause() }
+                        // Resolving may span a later user Pause or Play. The user-owned clock is current;
+                        // a transport snapshot taken before that await can autoplay a deliberately paused item.
+                        if playbackDeadlineClock.isPaused { coordinator.player?.pause() }
+                        else { coordinator.player?.play() }
                         startLoadTimeout()
                     }
                 }
@@ -3845,6 +3854,13 @@ struct PlayerScreen: View {
     private func revalidateMountOnForeground(suspendedFor seconds: TimeInterval,
                                              playHeadAtSuspension stamp: Double?) {
         guard hasStartedPlaying, !loadFailed, !playbackExited, pendingAdvance == nil else { return }
+        guard let owner = coordinator.player?.activeLoadToken else { return }
+        guard !isPaused, !playbackDeadlineClock.isPaused else {
+            foregroundMountRevalidation.deferUntilPlay(owner: owner, suspendedFor: seconds,
+                                                       playHeadAtSuspension: stamp)
+            return
+        }
+        foregroundMountRevalidation.clear()
         // DEMONSTRABLY HEALTHY playback is left alone. `keepPlayingInBackground` defaults ON, so the audio
         // really does keep running while backgrounded, and a play head that MOVED across the suspension proves
         // the mount survived it. Re-minting a live debrid link then costs the viewer a reload plus a re-seek of
@@ -3874,6 +3890,15 @@ struct PlayerScreen: View {
         healLoopbackMountOnForeground(allowRecheck: true)
     }
 
+    private func resumeDeferredForegroundMountRevalidation() {
+        guard let request = foregroundMountRevalidation.consume(
+            owner: coordinator.player?.activeLoadToken,
+            isPaused: isPaused || playbackDeadlineClock.isPaused
+        ) else { return }
+        revalidateMountOnForeground(suspendedFor: request.suspendedFor,
+                                    playHeadAtSuspension: request.playHeadAtSuspension)
+    }
+
     /// The loopback half of the foreground revalidation, split out so the ONE delayed re-check below can re-run
     /// exactly it and nothing else.
     ///
@@ -3885,10 +3910,17 @@ struct PlayerScreen: View {
     /// a poll - and every path still returns to today's behavior when it cannot prove a better mount.
     private func healLoopbackMountOnForeground(allowRecheck: Bool) {
         guard hasStartedPlaying, !loadFailed, !playbackExited, pendingAdvance == nil else { return }
+        guard let owner = coordinator.player?.activeLoadToken else { return }
+        guard !isPaused, !playbackDeadlineClock.isPaused else {
+            foregroundMountRevalidation.deferUntilPlay(owner: owner, suspendedFor: 0,
+                                                       playHeadAtSuspension: nil)
+            return
+        }
         guard let healed = liveMountURL(), healed != curURL else {
             guard allowRecheck, !foregroundMountRecheckArmed else { return }
             foregroundMountRecheckArmed = true
             DispatchQueue.main.asyncAfter(deadline: .now() + foregroundMountRecheckDelay) {
+                guard coordinator.player?.activeLoadToken == owner else { return }
                 healLoopbackMountOnForeground(allowRecheck: false)
             }
             return
