@@ -349,11 +349,20 @@ enum RemuxItemEndPolicyTests {
               containsInOrder(seekHandler, ["supersedeSeekRequest()", "eventOwnedRecoveryTask?.cancel()",
                   "deferredEventOwnedRecovery = nil", "deferredTerminal.discardEOF", "guard isReady else",
                   "seekEndBoundary.begin", "armSeekCompletionDeadline", "server.prepareForSeek"]))
-        check("wiring: completion settles only its own deadline before landing or aborting admission",
-              containsInOrder(seekHandler, ["self?.seekEndBoundary.requestID == requestID",
-                  "self?.seekCompletionTimeoutTask?.cancel()", "self?.seekEndBoundary.finish",
-                  "finished,", "self.seekRequestGeneration == requestID", "self.cancelSeekAdmission",
-                  "self.completeSeekAdmission"]))
+        let completion = sourceSection(seekHandler, from: "private func commitPlayerSeek", to: "let reported = RemuxResumePolicy.presented")
+        check("wiring: stale seek completions cannot cancel the current deadline or release its EOF fence",
+              containsInOrder(completion, ["self.seekRequestGeneration == requestID",
+                  "self.itemGeneration == seekGeneration", "self.item === seekItem",
+                  "self.activeLoadToken == seekLoadToken", "self.cancelSeekAdmission",
+                  "self.seekCompletionTimeoutTask?.cancel()", "guard finished, landing.isFinite else"]))
+        check("wiring: unfinished current seek retires ownership and recovers the exact requested source target",
+              containsInOrder(completion, ["guard finished, landing.isFinite else",
+                  "self.invalidateSeekRequests()", "seekItem?.cancelPendingSeeks()",
+                  "self.remountForSeek(sourceSeconds: sourceSeconds)", "self.emit(MPVProperty.endFileError",
+                  "return", "self.seekEndBoundary.finish", "self.completeSeekAdmission"]))
+        check("wiring: successful seek corrects paused position and cue from the producer's same actual landing",
+              containsInOrder(completion, ["let landing = self.player.currentTime().seconds",
+                  "self.completeSeekAdmission", "playerSeconds: landing", "self.publishSeekPosition(playerSeconds: landing)"]))
         let seekDeadline = sourceSection(engine, from: "private func armSeekCompletionDeadline", to: "private func registerSeekAdmission")
         check("wiring: deadline checks owner then invalidates before native cancellation and target-only remount",
               containsInOrder(seekDeadline, ["Task.sleep", "self.seekRequestGeneration == requestID",

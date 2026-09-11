@@ -304,6 +304,7 @@ if [ "${ENGINE_TRANSACTION:-0}" = "1" ]; then
     app/Sources/Player/PlayerStallPolicy.swift
     app/Sources/Player/VortXPreparedRemuxHandle.swift
     app/Sources/Player/TrackSelector.swift
+    app/Sources/Player/AVEmbeddedSubtitleBackground.swift
     app/Sources/Player/AVPlayerEngine.swift
   )
   echo "  engine gate     ENABLED: actual AVPlayerEngine setAudioTrack success + rollback"

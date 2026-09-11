@@ -4000,10 +4000,9 @@ struct TVPlayerView: View {
                                 resumeOrigin: Double? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
-        // A load command supersedes any deferred-resume watchdog before it can issue a new token.  Keep
-        // this central guard in addition to the named lifecycle exits below: foreground reconcile and
-        // prepared episode admission also issue loads without passing through the ordinary retry path.
-        clearPostFrameResumeSeekWatchdog()
+        // Commit deferred-resume retirement only after native admission below. Refused loads retain
+        // the current seek's deadline; both engines enqueue their callbacks on the main queue, so
+        // an accepted load still retires it before any new-token event can reach this view.
         // Keep the yt-direct audio sidecar ONLY when reloading the launch URL itself (a trailer retry);
         // any other target (episode/source switch) is a normal content stream and must load sidecar-free.
         let sidecar = (url == self.url) ? audioSidecarURL : nil
@@ -4097,6 +4096,7 @@ struct TVPlayerView: View {
             terminalAdvanceDeadlineTask = nil
         }
         if let issuedToken {
+            clearPostFrameResumeSeekWatchdog()
             beginAssetSanityAttemptIfNeeded(
                 loadToken: issuedToken,
                 requestedResumeOrigin: requestedResumeOrigin
@@ -7220,22 +7220,30 @@ struct TVPlayerView: View {
     /// Reload the current stream. Manual retries and fresh loads reset the auto-recovery budget; the
     /// auto-retry path passes `false` so its bounded count keeps counting down toward the overlay.
     private func retryLoad(resetAutoRetries: Bool = true) {
-        if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; recoveryDeadline?.cancel(); recoveryDeadline = nil }
         autoRetryTask?.cancel()
-        clearPostFrameResumeSeekWatchdog()
-        captureRecoverySelections()
         let resume = hasStartedPlaying ? currentTime : (resumeSeconds ?? 0)
+        let audioChoice = captureSelectedAudioChoice()
+        let subtitleChoice = userPickedSubtitle ? captureSubtitleChoice() : nil
+        let previousURL = curURL
+        let replacementURL = liveMountURL()
+        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: replacementURL)
+        let issuedToken = loadIntoPlayer(replacementURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
+                                         resumeOrigin: resume)
+        guard issuedToken != nil else {
+            // No new mount owns these resets or a load timeout. The previous surface, position,
+            // selections and first-frame state remain authoritative until a replacement is accepted.
+            DiagnosticsLog.log("playback", "retry load refused: retaining current surface")
+            return
+        }
+        if resetAutoRetries { autoRetryCount = 0; reconnecting = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1; recoveryDeadline?.cancel(); recoveryDeadline = nil }
+        pendingAudioReapply = audioChoice
+        pendingSubtitleReapply = subtitleChoice
         avToMPVHandoffBlocked = false
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
         buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; appliedSize = false; loadErrorMsg = ""; pendingLibmpvResumeSeek = nil
         subtitleLoadingURL = nil   // self-heal: a subtitle load stranded by the old engine must not gate the reload's picks
-        let previousURL = curURL
-        let replacementURL = liveMountURL()
-        prepareRawTorrentAfterLoopbackRebind(from: previousURL, to: replacementURL)
         curURL = replacementURL   // self-heal a drifted embedded-server port before replaying the mount
-        loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream,
-                       resumeOrigin: resume)
         startLoadTimeout()
     }
 

@@ -132,7 +132,6 @@ check("tvOS watchdog ownership includes target and exact load token, and cleanup
 
 for (name, boundary, end) in [
     ("episode reset", "private func resetRuntimeForIssuedEpisode()", "/// Device-local resume"),
-    ("retry", "private func retryLoad(resetAutoRetries", "/// Live HLS providers"),
     ("explicit exit", "private func leavePlayback()", "private func maybeResume()")
 ] {
     let body = section(player, from: boundary, to: end) ?? ""
@@ -140,9 +139,19 @@ for (name, boundary, end) in [
           body.contains("clearPostFrameResumeSeekWatchdog()"))
 }
 
-check("every load issuer centrally retires the old watchdog before a new token",
-      section(player, from: "private func loadIntoPlayer(", to: "// Keep the yt-direct audio")
-        .map { $0.contains("clearPostFrameResumeSeekWatchdog()") } ?? false)
+private let loadIssuer = section(player, from: "private func loadIntoPlayer(", to: "/// Switch the playing source") ?? ""
+check("every accepted load retires the old watchdog before queued native events; refusal preserves it",
+      loadIssuer.range(of: "if let issuedToken {\n            clearPostFrameResumeSeekWatchdog()") != nil
+        && loadIssuer.components(separatedBy: "clearPostFrameResumeSeekWatchdog()").count == 2)
+
+private let retryBody = section(player, from: "private func retryLoad(resetAutoRetries", to: "/// Live HLS providers") ?? ""
+private let retryAdmission = retryBody.range(of: "guard issuedToken != nil else")
+check("tvOS refused retry cannot reset the old surface or arm a replacement watchdog",
+      retryAdmission != nil && ["bufferedTime = 0", "hasStartedPlaying = false", "startLoadTimeout()", "curURL = replacementURL"].allSatisfy {
+          guard let mutation = retryBody.range(of: $0), let retryAdmission else { return false }
+          return retryAdmission.upperBound < mutation.lowerBound
+      } && retryBody.contains("let issuedToken = loadIntoPlayer(replacementURL")
+        && !retryBody.contains("clearPostFrameResumeSeekWatchdog()"))
 
 private var ownership = ResumeWatchdogModel()
 ownership.arm(target: 900, owner: "A")

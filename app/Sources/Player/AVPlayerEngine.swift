@@ -2579,6 +2579,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 }
                 self.commitPlayerSeek(
                     playerSeconds: clamped,
+                    sourceSeconds: seconds,
                     requestID: seekRequestID,
                     preparedServer: admitted ? server : nil
                 )
@@ -2589,11 +2590,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             return
         }
         armSeekCompletionDeadline(requestID: seekRequestID, sourceSeconds: seconds)
-        commitPlayerSeek(playerSeconds: clamped, requestID: seekRequestID)
+        commitPlayerSeek(playerSeconds: clamped, sourceSeconds: seconds, requestID: seekRequestID)
     }
 
     private func commitPlayerSeek(
         playerSeconds clamped: Double,
+        sourceSeconds: Double,
         requestID: UInt64,
         preparedServer: VortXRemuxHLSServer? = nil
     ) {
@@ -2604,13 +2606,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600)) {
             [weak self, weak preparedServer] finished in
             Task { @MainActor in
-                if self?.seekEndBoundary.requestID == requestID {
-                    self?.seekCompletionTimeoutTask?.cancel()
-                    self?.seekCompletionTimeoutTask = nil
-                }
-                self?.seekEndBoundary.finish(requestID: requestID)
                 guard let self,
-                      finished,
                       self.seekRequestGeneration == requestID,
                       self.itemGeneration == seekGeneration,
                       self.item === seekItem,
@@ -2625,17 +2621,40 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     }
                     return
                 }
+                self.seekCompletionTimeoutTask?.cancel()
+                self.seekCompletionTimeoutTask = nil
+                let landing = self.player.currentTime().seconds
+                guard finished, landing.isFinite else {
+                    // An interrupted current seek is not a successful landing. Retire its ownership
+                    // before cancelling native work, then recover the requested source position using
+                    // the same bounded path as the deadline. Stale callbacks above cannot enter here.
+                    self.invalidateSeekRequests()
+                    seekItem?.cancelPendingSeeks()
+                    DiagnosticsLog.log("avplayer", "seek completion interrupted: restoring requested target")
+                    if !self.remountForSeek(sourceSeconds: sourceSeconds), let seekLoadToken {
+                        self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: seekLoadToken)
+                    }
+                    return
+                }
+                self.seekEndBoundary.finish(requestID: requestID)
                 if let preparedServer {
                     self.completeSeekAdmission(
                         requestID: requestID,
                         server: preparedServer,
-                        playerSeconds: self.player.currentTime().seconds
+                        playerSeconds: landing
                     )
                 }
+                // A paused clock may not tick again. Keep the chrome and cue on the actual landing,
+                // exactly like the producer lead ledger, not the optimistic requested position.
+                self.publishSeekPosition(playerSeconds: landing)
             }
         }
+        publishSeekPosition(playerSeconds: clamped)
+    }
+
+    private func publishSeekPosition(playerSeconds: Double) {
         let reported = RemuxResumePolicy.presented(
-            playerSeconds: clamped,
+            playerSeconds: playerSeconds,
             origin: remuxTimelineOrigin)
         if let item, let loadToken = activeLoadToken,
            owns(item, loadToken: loadToken) {
