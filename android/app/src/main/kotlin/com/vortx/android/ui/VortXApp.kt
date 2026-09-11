@@ -2,6 +2,7 @@ package com.vortx.android.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
@@ -41,6 +42,8 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -1433,6 +1436,17 @@ private fun ManualSourcePickOverlay(
     onRefind: () -> Unit,
     onClose: () -> Unit,
 ) {
+    val firstSourceFocus = remember { FocusRequester() }
+    val closeFocus = remember { FocusRequester() }
+    // Move remote focus away from the covered player. Back remains reachable while resolving,
+    // and a failed resolve returns focus to the re-enabled source list on the next frame.
+    LaunchedEffect(sources.firstOrNull()?.id, resolving) {
+        withFrameNanos { }
+        runCatching {
+            if (sources.isNotEmpty() && !resolving) firstSourceFocus.requestFocus()
+            else closeFocus.requestFocus()
+        }
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1474,6 +1488,7 @@ private fun ManualSourcePickOverlay(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = DefaultEmber)
+                                .then(manualSourceControlFocus(if (source.id == sources.firstOrNull()?.id) firstSourceFocus else null))
                                 .clickable(enabled = !resolving) { onPick(source) }
                                 .padding(horizontal = 14.dp, vertical = 10.dp),
                             verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -1511,21 +1526,32 @@ private fun ManualSourcePickOverlay(
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
                     modifier = Modifier
+                        .then(manualSourceControlFocus())
                         .clickable(enabled = !resolving, onClick = onRefind)
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                 )
                 Text(
-                    text = if (resolving) "Starting…" else "Back",
+                    text = if (resolving) "Cancel loading" else "Back",
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
                     modifier = Modifier
-                        .clickable(enabled = !resolving, onClick = onClose)
+                        .then(manualSourceControlFocus(closeFocus))
+                        .clickable(onClick = onClose)
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                 )
             }
         }
     }
+}
+
+@Composable
+private fun manualSourceControlFocus(requester: FocusRequester? = null): Modifier {
+    var focused by remember { mutableStateOf(false) }
+    return Modifier
+        .then(if (requester != null) Modifier.focusRequester(requester) else Modifier)
+        .onFocusChanged { focused = it.isFocused }
+        .border(2.dp, if (focused) DefaultEmber else Color.Transparent, RoundedCornerShape(10.dp))
 }
 
 /// Seconds the Up Next overlay counts down before auto-playing the next episode. Long enough to cancel,
