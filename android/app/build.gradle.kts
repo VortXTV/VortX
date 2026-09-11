@@ -99,7 +99,7 @@ android {
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 236
+        versionCode = 237
         versionName = "0.4.0"
 
         // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /

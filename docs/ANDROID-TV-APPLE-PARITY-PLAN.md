@@ -2,11 +2,13 @@
 
 Status: planned after 0.4 Beta 1. This is not a claim that parity ships in Beta 1.
 
-## September 11 follow-up (after the immutable Beta 13 tag)
+## September 11 follow-up (bundled in Beta 14)
 
 Phone and TV now show add-on-declared Prequel, Sequel, and Related rails through the normal detail navigation. They use the currently loaded metadata, preserve movie/series IDs (including namespaced anime IDs on series routes), reject external/malformed links, remove self-links and duplicates, and remain hidden for live content. Both Android variants compile and pass their unit suites; physical TV focus testing remains required.
 
-This follow-up is not in Beta 13. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. Still outstanding: custom `anime`/other content-type routing without coercing types to movies, plus full visual and remote-navigation acceptance below.
+Beta 13 remained an unpublished draft; this follow-up is included in Beta 14. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. Still outstanding: custom `anime`/other content-type routing without coercing types to movies, plus full visual and remote-navigation acceptance below.
+
+Also outstanding: rapid title selection can race asynchronous TMDB-to-IMDb lookups in phone and TV detail navigation. A later selection needs to cancel and supersede the earlier lookup, including direct relation selection; verify reversed completion order and page disposal before shipping that change.
 
 The Home/Discover Collections visibility switches now belong to each profile on Apple and Android, including roster sync and backup projection handling. Explicit off values survive round trips; an unset legacy profile gets visible defaults on selection without overwriting an active profile during a partial sync. Apple screens use the shared observable catalog owner, and Android refreshes an already-open settings screen and captures edits immediately. Verification: 25 Apple isolation checks, both Android unit suites, and full iOS arm64 simulator/tvOS Release builds pass. This addresses the remaining two global switches in issue #215; it does not claim every profile or cross-device behavior is physically verified.
 
