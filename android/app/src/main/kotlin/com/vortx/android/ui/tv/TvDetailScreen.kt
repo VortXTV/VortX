@@ -536,6 +536,19 @@ private fun TvDetailContent(
                 )
             }
 
+            com.vortx.android.model.MediaRelation.visible(
+                if (tvIsLiveType(detail.type)) emptyList() else detail.relations,
+                setOf(detail.id, viewModel.routeId),
+            )
+                .groupBy { it.kind }.forEach { (kind, relations) ->
+                    TvSimilarRail(
+                        type = detail.type,
+                        titles = relations.map { it.item },
+                        onOpen = onOpenTitle,
+                        heading = kind.label,
+                        modifier = Modifier.padding(top = TvDimens.rowGap),
+                    )
+                }
             // DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in
             // release order, rendered JUST ABOVE More Like This (Apple parity). Hidden for a single-part
             // collection. Each tile resolves its tmdb: id to a tt id before opening, the same fail-soft resolve

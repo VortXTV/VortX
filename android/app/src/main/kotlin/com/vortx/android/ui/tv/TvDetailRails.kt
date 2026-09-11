@@ -159,6 +159,7 @@ fun TvSimilarRail(
     titles: List<MetaItem>,
     onOpen: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
+    heading: String? = null,
 ) {
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -166,10 +167,10 @@ fun TvSimilarRail(
     ) {
         Column(modifier = Modifier.padding(horizontal = TvDimens.edge)) {
             Text(
-                text = (if (type == MediaType.SERIES) "Similar Series" else "Similar Movies").uppercase(),
+                text = (if (heading != null) "Relations" else if (type == MediaType.SERIES) "Similar Series" else "Similar Movies").uppercase(),
                 style = VortXTheme.type.eyebrow,
             )
-            Text(text = "More Like This", style = VortXTheme.type.sectionTitle)
+            Text(text = heading ?: "More Like This", style = VortXTheme.type.sectionTitle)
         }
         LazyRow(
             contentPadding = PaddingValues(horizontal = TvDimens.edge),

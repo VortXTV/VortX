@@ -16,6 +16,7 @@ import com.vortx.android.model.LibraryPortability
 import com.vortx.android.model.LibrarySortOption
 import com.vortx.android.model.LibraryTypeOption
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MediaRelation
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.StreamGroup
@@ -511,7 +512,20 @@ internal object EngineState {
             libraryItem = parseLibraryItemInfo(root.optJSONObject("libraryItem")),
             watchedVideoIds = parseWatchedVideoIds(root),
             trailerYouTubeId = parseTrailerYouTubeId(metaObj),
+            relations = parseRelations(metaObj),
         )
+    }
+
+    private fun parseRelations(meta: JSONObject): List<MediaRelation> {
+        val links = meta.optJSONArray("links") ?: return emptyList()
+        return MediaRelation.visible((0 until links.length()).mapNotNull { index ->
+            val link = links.optJSONObject(index) ?: return@mapNotNull null
+            MediaRelation.parse(
+                link.opt("category") as? String ?: return@mapNotNull null,
+                link.opt("name") as? String ?: return@mapNotNull null,
+                link.opt("url") as? String ?: return@mapNotNull null,
+            )
+        }, setOf(meta.optString("id")))
     }
 
     /// Parse `meta_details.libraryItem` (the engine's saved library entry for the OPEN title, a

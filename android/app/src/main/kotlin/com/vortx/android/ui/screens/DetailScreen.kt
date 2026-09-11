@@ -609,6 +609,20 @@ fun DetailScreen(
                         )
                     }
                 }
+                com.vortx.android.model.MediaRelation.visible(
+                    if (isLiveType(m.data.type)) emptyList() else m.data.relations,
+                    setOf(m.data.id, viewModel.routeId),
+                )
+                    .groupBy { it.kind }.forEach { (kind, relations) ->
+                        item {
+                            SimilarRail(
+                                type = m.data.type,
+                                titles = relations.map { it.item },
+                                onOpen = { titleTarget = it },
+                                heading = kind.label,
+                            )
+                        }
+                    }
                 // DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in
                 // release order, reusing the More-Like-This rail idiom. Hidden for a single-part collection.
                 movieCollection?.takeIf { it.parts.size > 1 }?.let { collection ->
@@ -1344,14 +1358,14 @@ private fun CreditLine(role: String, names: List<String>) {
 /// keyless edge), each opening the nested detail overlay via [onOpen]. Mirrors the Apple detail view's
 /// `moreLikeThisSection`; the caller already dropped an empty list, so this always has tiles to show.
 @Composable
-private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaItem) -> Unit) {
+private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaItem) -> Unit, heading: String? = null) {
     Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
         Column(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
             Text(
-                text = (if (type == MediaType.SERIES) "Similar Series" else "Similar Movies").uppercase(),
+                text = (if (heading != null) "Relations" else if (type == MediaType.SERIES) "Similar Series" else "Similar Movies").uppercase(),
                 style = VortXTheme.type.eyebrow,
             )
-            Text(text = "More Like This", style = VortXTheme.type.sectionTitle)
+            Text(text = heading ?: "More Like This", style = VortXTheme.type.sectionTitle)
         }
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
