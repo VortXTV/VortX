@@ -4,6 +4,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -26,6 +28,7 @@ import com.vortx.android.ui.theme.vortxGlassRow
 /// [pinned] marks the stream the user's source pin floats to the top (Apple's per-row pin badge, #15);
 /// [onLongClick] (additive: null keeps every existing call site unchanged) opens the pin menu the
 /// caller anchors to this row, the Android analogue of Apple's `.contextMenu { pinMenu(...) }`.
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SourceRow(
     addon: String,
@@ -69,8 +72,14 @@ fun SourceRow(
             contentDescription = null,
             tint = if (enabled) colors.accent else colors.textTertiary,
         )
-        Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+        ) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
                 if (pinned) Badge("Pinned")
                 quality?.let { Badge(it) }
                 Badge(addon)

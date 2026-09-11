@@ -5955,12 +5955,13 @@ struct iOSSourceList: View {
     // MARK: Controls (Watch-in-X · Quality picker · All sources)
 
     @ViewBuilder private var controlBar: some View {
-        // The flow layout (HStack that wraps) is simulated with two rows so it stays tidy on a phone.
+        // Keep Play on its own row. Four competing controls in one HStack compressed labels into
+        // vertical slivers on phones; the selectors now wrap at their natural sizes below it.
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             // Watch-in pick honors the remembered-quality continuity hint, so reopening a title lands
             // on the same quality it last played (same-release-group biased), matching tvOS.
             if let best = bestStream, let url = best.playableURL(isEpisode: isEpisode) {
-                HStack(spacing: Theme.Space.sm) {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
                     // press plays the best of ALL sources, not the best of whoever replied first, the tvOS
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
@@ -5982,9 +5983,11 @@ struct iOSSourceList: View {
                     .disabled(loading)
                     .opacity(loading ? 0.55 : 1)
 
-                    qualityMenu
-                    launchPlayerMenu
-                    audioLanguageMenu
+                    FlowLayout(spacing: Theme.Space.sm) {
+                        qualityMenu
+                        launchPlayerMenu
+                        audioLanguageMenu
+                    }
                 }
             }
             HStack(spacing: Theme.Space.sm) {
