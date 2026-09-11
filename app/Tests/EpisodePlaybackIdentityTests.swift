@@ -447,6 +447,29 @@ private struct EpisodeTransactionHarness {
 @main
 private struct EpisodePlaybackIdentityTests {
     static func main() async {
+        // Same anime title, two metadata arrivals: the first must not pin a blank hero/inventory.
+        func metadata(_ changes: [String: Any] = [:]) -> CoreMetaItem {
+            var value: [String: Any] = ["id": "kitsu:460", "type": "series", "name": "Anime",
+                "videos": [["id": "kitsu:460:1", "season": 1, "episode": 1, "title": "Episode 1"]]]
+            value.merge(changes) { _, replacement in replacement }
+            return try! JSONDecoder().decode(CoreMetaItem.self,
+                from: JSONSerialization.data(withJSONObject: value))
+        }
+        let blankAnime = metadata()
+        expect(blankAnime.hasSamePresentation(as: metadata()), "identical metadata remains coalesced")
+        for field in ["poster", "background", "logo"] {
+            expect(!blankAnime.hasSamePresentation(as: metadata([field: "https://anime.invalid/art.jpg"])),
+                   "same-title late \(field) republishes")
+        }
+        let illustratedEpisode = metadata(["videos": [["id": "kitsu:460:1", "season": 1,
+            "episode": 1, "title": "Episode 1", "thumbnail": "https://anime.invalid/episode.jpg"]]])
+        expect(!blankAnime.hasSamePresentation(as: illustratedEpisode), "late episode thumbnail republishes")
+        expect(!blankAnime.hasSamePresentation(as: metadata(["videos": []])), "changed episode inventory republishes")
+        expect(!blankAnime.hasSamePresentation(as: metadata(["trailerStreams": [["ytId": "abcdefghijk"]]])),
+               "late trailer stream republishes")
+        expect(source("SourcesShared/CoreBridge.swift").contains("!currentMeta.hasSamePresentation(as: nextMeta)"),
+               "bridge consumes production metadata presentation comparison")
+
         let hash = "0123456789abcdef0123456789abcdef01234567"
         let e2 = stream(hash: hash, fileIdx: 1)
         let e3 = stream(hash: hash, fileIdx: 2)

@@ -666,6 +666,18 @@ struct CoreMetaItem: Decodable {
     /// `videos[]` is a now/next schedule rather than an episode list. Optional so sparse add-ons decode.
     let behaviorHints: CoreMetaBehaviorHints?
 
+    /// A title ID is not a version of its metadata. A higher-priority add-on can finish later with
+    /// artwork or an episode inventory that the first response lacked. Compare the visible payload
+    /// so the bridge publishes that arrival without rebuilding sources for unrelated image changes.
+    func hasSamePresentation(as other: CoreMetaItem) -> Bool {
+        id == other.id && type == other.type && name == other.name
+            && poster == other.poster && background == other.background && logo == other.logo
+            && description == other.description && releaseInfo == other.releaseInfo
+            && runtime == other.runtime && links == other.links && videos == other.videos
+            && trailerStreams == other.trailerStreams
+            && behaviorHints == other.behaviorHints
+    }
+
     var genres: [String] {
         // The engine emits the genres link category as "Genres" (PLURAL); the old "Genre" (singular)
         // filter matched nothing, so detail + episode headers always showed empty genres. Accept both.
@@ -792,7 +804,7 @@ struct CoreMetaItem: Decodable {
 /// Meta-level `behaviorHints` (NOT the per-stream `CoreStreamBehaviorHints`). All fields optional so
 /// sparse add-ons decode. `hasScheduledVideos` marks a live channel whose `videos[]` is a now/next
 /// EPG schedule; `featuredVideoId` (when present) names the currently-airing program directly.
-struct CoreMetaBehaviorHints: Decodable {
+struct CoreMetaBehaviorHints: Decodable, Equatable {
     let hasScheduledVideos: Bool?
     let featuredVideoId: String?
     /// The canonical video id for a single-video title (a movie). For a title from a TMDB/Kitsu catalog
@@ -822,12 +834,12 @@ struct EPGSchedule {
     }
 }
 
-struct CoreLink: Decodable {
+struct CoreLink: Decodable, Equatable {
     let name: String
     let category: String
 }
 
-struct CoreVideo: Decodable, Identifiable {
+struct CoreVideo: Decodable, Identifiable, Equatable {
     let id: String
     let title: String?
     let released: String?

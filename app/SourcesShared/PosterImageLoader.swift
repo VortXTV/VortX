@@ -498,10 +498,12 @@ enum PosterImageLoader {
 
         // Serialize large decodes before taking one of the six normal image permits. Otherwise several 4K
         // waiters could occupy the normal pipeline while queued behind the one large-decode slot.
-        if pixel >= HeroArtworkQualityPolicy.ultraHDLongEdge {
+        let needsUltraHDPermit = pixel >= HeroArtworkQualityPolicy.ultraHDLongEdge
+        if needsUltraHDPermit {
             guard await ultraHDGate.acquire() else { return nil }
-            defer { Task { await ultraHDGate.release() } }
         }
+        // Function-scoped: a defer inside the if block released the permit before the load/decode.
+        defer { if needsUltraHDPermit { Task { await ultraHDGate.release() } } }
         // A cancelled acquire holds NO permit, so return without releasing (releasing here would free a permit
         // we never took and let `active` drift below zero, over-admitting loads). Only release when granted.
         guard await gate.acquire() else {

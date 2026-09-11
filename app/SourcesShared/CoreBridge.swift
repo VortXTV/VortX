@@ -3875,6 +3875,8 @@ final class CoreBridge: ObservableObject {
         if current.selectedMetaID != next.selectedMetaID { return true }
         if current.metaResolution != next.metaResolution { return true }
         if current.meta?.id != next.meta?.id { return true }
+        if let currentMeta = current.meta, let nextMeta = next.meta,
+           !currentMeta.hasSamePresentation(as: nextMeta) { return true }
         if current.libraryItem?.id != next.libraryItem?.id
             || current.libraryItem?.removed != next.libraryItem?.removed
             || current.libraryItem?.temp != next.libraryItem?.temp
