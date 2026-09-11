@@ -32,7 +32,7 @@ class MpvRuntimeSafetyTest {
     }
 
     @Test
-    fun `audio health accepts no audio only after track list arrival or bounded timeout`() {
+    fun `audio health accepts no audio only after a valid track list arrival`() {
         assertEquals(
             MpvAudioTrackListHealthAction.NO_AUDIO_TRACK,
             mpvAudioTrackListHealthAction(
@@ -42,7 +42,7 @@ class MpvRuntimeSafetyTest {
             ),
         )
         assertEquals(
-            MpvAudioTrackListHealthAction.NO_AUDIO_TRACK,
+            MpvAudioTrackListHealthAction.UNAVAILABLE,
             mpvAudioTrackListHealthAction(
                 trackListObserved = false,
                 hasAudioTrack = false,

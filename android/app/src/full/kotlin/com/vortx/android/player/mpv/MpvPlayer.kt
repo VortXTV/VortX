@@ -49,7 +49,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
@@ -972,7 +971,15 @@ class MpvPlayer private constructor(
             if (trackListAction == MpvAudioTrackListHealthAction.PENDING_TRACK_LIST) {
                 delay(AUDIO_TRACK_LIST_WAIT_MS)
                 if (!audioOutputCheckActive(generation)) return
+                // The property notification may have been unavailable or malformed. Re-read once,
+                // without replacing/cancelling the health job that owns this bounded opportunity.
+                refreshTracks(rearmHealth = false)
+                if (!audioOutputCheckActive(generation)) return
                 trackListAction = audioTrackListHealthAction(generation, timedOut = true)
+            }
+            if (trackListAction == MpvAudioTrackListHealthAction.UNAVAILABLE) {
+                fallbackReason = EngineFallbackReason.AUDIO_OUTPUT_FAILED
+                return
             }
             if (trackListAction != MpvAudioTrackListHealthAction.CHECK_AUDIO_OUTPUT) return
 
@@ -1070,36 +1077,14 @@ class MpvPlayer private constructor(
 
     /// Re-read `track-list` (a JSON array of track objects) and republish the audio + subtitle tracks.
     /// Called on file-loaded / video-reconfig / track-list change, mirroring the Apple track observer.
-    private fun refreshTracks() {
-        val json = mpv.getPropertyString(PROP_TRACK_LIST) ?: return
-        val audio = mutableListOf<PlayerTrack>()
-        val subs = mutableListOf<PlayerTrack>()
-        runCatching {
-            val arr = JSONArray(json)
-            for (i in 0 until arr.length()) {
-                val t = arr.getJSONObject(i)
-                val type = t.optString("type")
-                val trackId = t.optInt("id", -1)
-                if (trackId < 0) continue
-                val entry = PlayerTrack(
-                    id = trackId,
-                    title = t.optString("title").ifEmpty { t.optString("lang").ifEmpty { "$type $trackId" } },
-                    lang = t.optString("lang").ifEmpty { null },
-                    selected = t.optBoolean("selected", false),
-                    // mpv track-list carries the container's forced disposition; carry it so TrackSelector's
-                    // forced-subtitle policy keys off the flag, matching the ExoPlayer engine.
-                    forced = t.optBoolean("forced", false),
-                    // Audio channel count for the fidelity tie-break (0 for subs; mpv reports none there).
-                    channels = if (type == "audio") t.optInt("demux-channel-count", 0) else 0,
-                )
-                when (type) {
-                    "audio" -> audio.add(entry)
-                    "sub" -> subs.add(entry)
-                }
-            }
+    private fun refreshTracks(rearmHealth: Boolean = true) {
+        val generation = subtitleLoadGeneration.get()
+        val snapshot = parseMpvTrackSnapshot(mpv.getPropertyString(PROP_TRACK_LIST)) ?: return
+        synchronized(subtitleGenerationGate) {
+            if (released.get() || subtitleLoadGeneration.get() != generation) return
+            _state.update { it.copy(audioTracks = snapshot.audio, subtitleTracks = snapshot.subtitles) }
+            trackListUpdated(snapshot.audio.isNotEmpty(), rearmHealth)
         }
-        _state.update { it.copy(audioTracks = audio, subtitleTracks = subs) }
-        trackListUpdated(audio.isNotEmpty())
     }
 
     /**
@@ -1107,7 +1092,7 @@ class MpvPlayer private constructor(
      * Only the first audio-bearing transition rearms health work, preventing repeated property changes
      * from creating recovery loops. The generation fence drops a late old-source notification.
      */
-    private fun trackListUpdated(hasAudioTrack: Boolean) {
+    private fun trackListUpdated(hasAudioTrack: Boolean, rearmHealth: Boolean = true) {
         val generation = subtitleLoadGeneration.get()
         val shouldRearm = synchronized(audioHealthLock) {
             if (released.get() || audioFileLoadedGeneration != generation) return
@@ -1126,7 +1111,7 @@ class MpvPlayer private constructor(
         }
         // An empty first snapshot resolves the pending state in the existing bounded check. A later
         // audio-bearing update must rearm, even if that bounded check already accepted no audio.
-        if (shouldRearm) scheduleAudioOutputHealthCheck(replaceExisting = true)
+        if (shouldRearm && rearmHealth) scheduleAudioOutputHealthCheck(replaceExisting = true)
     }
 
     @Composable

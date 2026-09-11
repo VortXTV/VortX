@@ -22,8 +22,8 @@ class MpvSeam private constructor() {
     private var handleGate: MpvNativeHandleGate? = null
     private val destroyDispatcher = MpvNativeDestroyDispatcher()
     private val surfaceLock = Any()
-    private val observers = mutableListOf<EventObserver>()
-    private val logObservers = mutableListOf<LogObserver>()
+    private val observers = MpvObserverRegistry<EventObserver>()
+    private val logObservers = MpvObserverRegistry<LogObserver>()
 
     companion object {
         private const val NATIVE_CALL_UNAVAILABLE = Int.MIN_VALUE
@@ -155,32 +155,24 @@ class MpvSeam private constructor() {
     private external fun nativeObserveProperty(instance: Long, property: String, format: Int)
 
     fun addObserver(o: EventObserver) {
-        synchronized(observers) {
-            observers.add(o)
-        }
+        observers.add(o)
     }
 
     fun removeObserver(o: EventObserver) {
-        synchronized(observers) {
-            observers.remove(o)
-        }
+        observers.remove(o)
     }
 
     // ---- Native dispatch surface (called by libvortx_mpv_seam.so on the mpv event thread). ----
 
     private fun dispatchEvent(callback: (EventObserver) -> Unit) {
         destroyDispatcher.withinNativeCallback {
-            synchronized(observers) {
-                for (observer in observers) callback(observer)
-            }
+            observers.dispatch(callback)
         }
     }
 
     private fun dispatchLog(callback: (LogObserver) -> Unit) {
         destroyDispatcher.withinNativeCallback {
-            synchronized(logObservers) {
-                for (observer in logObservers) callback(observer)
-            }
+            logObservers.dispatch(callback)
         }
     }
 
@@ -216,15 +208,11 @@ class MpvSeam private constructor() {
     }
 
     fun addLogObserver(o: LogObserver) {
-        synchronized(logObservers) {
-            logObservers.add(o)
-        }
+        logObservers.add(o)
     }
 
     fun removeLogObserver(o: LogObserver) {
-        synchronized(logObservers) {
-            logObservers.remove(o)
-        }
+        logObservers.remove(o)
     }
 
     fun logMessage(prefix: String, level: Int, text: String) {

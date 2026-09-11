@@ -9,10 +9,11 @@ internal enum class MpvAudioOutputHealthAction {
 /**
  * `FILE_LOADED` is allowed to precede mpv's first usable `track-list` property notification. Until a
  * track list has actually arrived, an empty published track collection means "not known yet", not
- * "this file has no audio". The caller waits for one bounded interval before accepting the latter.
+ * "this file has no audio". A bounded timeout remains unknown and enters source recovery.
  */
 internal enum class MpvAudioTrackListHealthAction {
     PENDING_TRACK_LIST,
+    UNAVAILABLE,
     NO_AUDIO_TRACK,
     CHECK_AUDIO_OUTPUT,
 }
@@ -23,7 +24,8 @@ internal fun mpvAudioTrackListHealthAction(
     timedOut: Boolean,
 ): MpvAudioTrackListHealthAction = when {
     !trackListObserved && !timedOut -> MpvAudioTrackListHealthAction.PENDING_TRACK_LIST
-    !trackListObserved || !hasAudioTrack -> MpvAudioTrackListHealthAction.NO_AUDIO_TRACK
+    !trackListObserved -> MpvAudioTrackListHealthAction.UNAVAILABLE
+    !hasAudioTrack -> MpvAudioTrackListHealthAction.NO_AUDIO_TRACK
     else -> MpvAudioTrackListHealthAction.CHECK_AUDIO_OUTPUT
 }
 
