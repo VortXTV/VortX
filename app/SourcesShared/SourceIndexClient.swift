@@ -1639,8 +1639,8 @@ enum SourceContributionFailureKind: Equatable, Sendable {
 }
 
 /// Only opaque SHA-256 receipts are persisted. No title id, infohash, URL, account value, or descriptor body
-/// enters preferences, SettingsBackup, or sync. The dedicated suite also keeps these local delivery receipts
-/// outside the app's ordinary settings domain.
+/// enters SettingsBackup or sync. These local, reconstructible delivery receipts live in a file, never
+/// preferences: tvOS terminates processes whose defaults database reaches 1 MiB.
 struct SourceContributionReceiptState: Codable, Equatable, Sendable {
     static let schema = 1
 
@@ -1666,23 +1666,49 @@ protocol SourceContributionReceiptPersisting: Sendable {
     @discardableResult func save(_ state: SourceContributionReceiptState) -> Bool
 }
 
-final class SourceContributionDefaultsReceiptStore: SourceContributionReceiptPersisting, @unchecked Sendable {
-    static let shared = SourceContributionDefaultsReceiptStore()
+final class SourceContributionFileReceiptStore: SourceContributionReceiptPersisting, @unchecked Sendable {
+    static let shared = SourceContributionFileReceiptStore()
 
     private static let dataKey = "delivery-receipts-v1"
-    private let defaults: UserDefaults
+    private static let fileBackedKey = "delivery-receipts-file-backed-v1"
+    private let fileURL: URL?
+    private let legacyDefaults: UserDefaults?
     private let lock = NSLock()
 
-    init(defaults: UserDefaults = UserDefaults(suiteName: "tv.vortx.source-index-delivery")!) {
-        self.defaults = defaults
+    init(fileURL: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+        .appendingPathComponent("VortXSourceDelivery", isDirectory: true)
+        .appendingPathComponent("delivery-receipts-v1.json"),
+         legacyDefaults: UserDefaults? = UserDefaults(suiteName: "tv.vortx.source-index-delivery")) {
+        self.fileURL = fileURL
+        self.legacyDefaults = legacyDefaults
     }
 
     func load() -> SourceContributionReceiptLoad {
         lock.withLock {
-            guard let data = defaults.data(forKey: Self.dataKey) else { return .empty }
+            guard let fileURL else { return .unavailable }
+            let data: Data
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                guard let stored = try? Data(contentsOf: fileURL) else { return .unavailable }
+                data = stored
+            } else if let legacy = legacyDefaults?.data(forKey: Self.dataKey) {
+                data = legacy
+            } else {
+                // tvOS may purge caches. A missing established ledger is NOT a new installation:
+                // stop contributing instead of silently re-submitting previously delivered entries.
+                return legacyDefaults?.bool(forKey: Self.fileBackedKey) == true ? .unavailable : .empty
+            }
             guard let decoded = try? JSONDecoder().decode(SourceContributionReceiptState.self, from: data),
                   decoded.schema == SourceContributionReceiptState.schema else {
                 return .unavailable
+            }
+            // Copy and verify BEFORE retiring the old key. A failed migration closes contributions for
+            // this process instead of discarding receipts and re-submitting the entire library.
+            if legacyDefaults?.object(forKey: Self.dataKey) != nil {
+                guard write(data, to: fileURL) else { return .unavailable }
+                legacyDefaults?.removeObject(forKey: Self.dataKey)
+            }
+            if legacyDefaults?.bool(forKey: Self.fileBackedKey) != true {
+                legacyDefaults?.set(true, forKey: Self.fileBackedKey)
             }
             return .loaded(decoded)
         }
@@ -1691,9 +1717,24 @@ final class SourceContributionDefaultsReceiptStore: SourceContributionReceiptPer
     @discardableResult
     func save(_ state: SourceContributionReceiptState) -> Bool {
         lock.withLock {
-            guard let data = try? JSONEncoder().encode(state) else { return false }
-            defaults.set(data, forKey: Self.dataKey)
-            return defaults.data(forKey: Self.dataKey) == data
+            guard let fileURL, let data = try? JSONEncoder().encode(state) else { return false }
+            guard write(data, to: fileURL) else { return false }
+            legacyDefaults?.removeObject(forKey: Self.dataKey)
+            if legacyDefaults?.bool(forKey: Self.fileBackedKey) != true {
+                legacyDefaults?.set(true, forKey: Self.fileBackedKey)
+            }
+            return true
+        }
+    }
+
+    private func write(_ data: Data, to url: URL) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            return try Data(contentsOf: url) == data
+        } catch {
+            return false
         }
     }
 }
@@ -1723,7 +1764,7 @@ private enum SourceContributionReceipt {
 /// work stops instead of evicting an old success receipt and allowing a duplicate after restart.
 actor SourceUploadCoordinator {
     static let shared = SourceUploadCoordinator(
-        persistence: SourceContributionDefaultsReceiptStore.shared
+        persistence: SourceContributionFileReceiptStore.shared
     )
 
     private struct StoredReservation {

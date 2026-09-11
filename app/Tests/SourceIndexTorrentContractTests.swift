@@ -626,6 +626,56 @@ struct SourceIndexTorrentContractTests {
         }
     }
 
+    @MainActor
+    static func testReceiptFileStorage() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vortx-receipt-test-\(UUID().uuidString)", isDirectory: true)
+        let file = directory.appendingPathComponent("receipts.json")
+        let suite = "vortx-receipt-test-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { fatalError("test defaults unavailable") }
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+            defaults.removePersistentDomain(forName: suite)
+        }
+        let store = SourceContributionFileReceiptStore(fileURL: file, legacyDefaults: defaults)
+        let large = SourceContributionReceiptState(
+            delivered: (0..<40_000).map { String(format: "%064x", $0) }, rejected: [])
+        expect(store.save(large), "full 40000-receipt budget writes outside tvOS preferences")
+        expect(defaults.object(forKey: "delivery-receipts-v1") == nil,
+               "large receipt writes never touch UserDefaults")
+        if case .loaded(let reloaded) = SourceContributionFileReceiptStore(
+            fileURL: file, legacyDefaults: defaults).load() {
+            expect(reloaded == large, "all receipts survive a process-style file-store recreation")
+        } else { expect(false, "file receipts reload") }
+        do {
+            try FileManager.default.removeItem(at: file)
+            if case .unavailable = store.load() {
+                expect(true, "tvOS cache purge closes contributions instead of replaying delivered descriptors")
+            } else { expect(false, "purged receipt ledger must not become a fresh empty ledger") }
+            let legacy = SourceContributionReceiptState(delivered: [String(repeating: "a", count: 64)], rejected: [])
+            defaults.set(try JSONEncoder().encode(legacy), forKey: "delivery-receipts-v1")
+            if case .loaded(let migrated) = store.load() {
+                expect(migrated == legacy, "legacy defaults receipts migrate without losing deduplication")
+            } else { expect(false, "legacy migration succeeds") }
+            expect(defaults.object(forKey: "delivery-receipts-v1") == nil,
+                   "verified migration retires oversized defaults key")
+            let data = try Data(contentsOf: file)
+            let decoded = try JSONDecoder().decode(SourceContributionReceiptState.self, from: data)
+            expect(decoded == legacy,
+                   "migration verifies file content before retiring defaults")
+            try Data("invalid".utf8).write(to: file)
+            if case .unavailable = store.load() { expect(true, "corrupt file closes contributions") }
+            else { expect(false, "corrupt file must not reset deduplication") }
+            defaults.set(try JSONEncoder().encode(legacy), forKey: "delivery-receipts-v1")
+            let blocked = SourceContributionFileReceiptStore(
+                fileURL: file.appendingPathComponent("cannot-create.json"), legacyDefaults: defaults)
+            if case .unavailable = blocked.load() { expect(true, "failed migration closes contributions") }
+            else { expect(false, "failed migration must close contributions") }
+            expect(defaults.data(forKey: "delivery-receipts-v1") != nil,
+                   "failed migration retains recoverable legacy receipts")
+        } catch { expect(false, "receipt storage harness failed: \(error)") }
+    }
+
     static func launchedDescriptors(
         _ decision: SourceUploadCoordinator.LaunchDecision
     ) -> [SourceIndexClient.Descriptor] {
@@ -786,6 +836,7 @@ struct SourceIndexTorrentContractTests {
 
     @MainActor
     static func main() async {
+        testReceiptFileStorage()
         let lower = "abcdef0123456789abcdef0123456789abcdef01"
         let upper = lower.uppercased()
         let privateURL = "https://debrid.example/file?token=private-token"
