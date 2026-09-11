@@ -13,7 +13,7 @@ import java.util.UUID
 /// Plex AUTH (PIN link against plex.tv) plus the Plex resolver ([PlexProvider]). Kotlin port of the Plex
 /// halves of `app/SourcesShared/MediaServerAuth.swift` + `app/SourcesShared/PlexProvider.swift`.
 ///
-/// AUTH: request a strong PIN, show its code (the user enters it on plex.tv/link), poll the PIN until it
+/// AUTH: request a short PIN, show its code (the user enters it on plex.tv/link), poll the PIN until it
 /// carries an account authToken, then discover the account's Plex Media Servers (each with its OWN per-server
 /// access token + ordered, reachability-probed connection URLs). Every call carries the stable
 /// `X-Plex-Client-Identifier` so the granted token stays anchored across discovery re-runs.
@@ -29,11 +29,11 @@ object PlexClient {
         "Accept" to "application/json",
     )
 
-    /// Step 1: request a strong PIN. Returns the pin id + the code to display.
+    /// Step 1: request the short code accepted by plex.tv/link, not the long browser-auth code.
     suspend fun requestPin(clientId: String): PlexPin {
         val resp = IntegrationsHttp.request(
             method = "POST",
-            urlString = "$PINS_URL?strong=true",
+            urlString = "$PINS_URL?strong=false",
             headers = headers(clientId),
         )
         if (resp.status == 0) throw MediaServerAuthException.Network("Could not reach plex.tv.")
