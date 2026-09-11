@@ -4091,11 +4091,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                         classified: classifiedFPS, assetTrack: assetFPS) {
                         let videoRange = remuxHLSServer?.signaling?.videoRange
                             ?? remuxRemoteMount?.videoRange
-                        let recoveryRange = DVPlaybackPolicy.hdrFallbackDisplayRange(
-                            videoRange: videoRange)
-                        let requestedRange: ContentDynamicRange = usingHDRFallbackItem
-                            ? (recoveryRange == .hlg ? .hlg : .hdr10)
-                            : .dolbyVision
+                        let range = DVPlaybackPolicy.remuxDisplayRange(
+                            dolbyVision: remuxHLSServer?.signaling?.dolbyVision
+                                ?? remuxRemoteMount?.carriesDolbyVision ?? false,
+                            hdrFallback: usingHDRFallbackItem, videoRange: videoRange)
+                        let requestedRange: ContentDynamicRange
+                        switch range {
+                        case .dolbyVision: requestedRange = .dolbyVision
+                        case .hdr10: requestedRange = .hdr10
+                        case .hlg: requestedRange = .hlg
+                        case .sdr: requestedRange = .sdr
+                        }
                         HDRDisplayMode.request(requestedRange, fps: fps,
                                                width: Int(size.width), height: Int(size.height), in: nil)
                         VXProbe.log(

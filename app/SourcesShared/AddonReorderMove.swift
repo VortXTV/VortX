@@ -1,5 +1,20 @@
 import Foundation
 
+/// The same stable order drives the add-on list and source groups. Never discard unlisted add-ons:
+/// new installs remain at the end, and multiple groups from one add-on retain their response order.
+enum AddonAppliedOrder {
+    static func sorted<T>(_ items: [T], order: [String], key: (T) -> String) -> [T] {
+        guard !order.isEmpty else { return items }
+        var rank: [String: Int] = [:]
+        for (index, value) in order.enumerated() where rank[value] == nil { rank[value] = index }
+        return items.enumerated().sorted { lhs, rhs in
+            let left = rank[key(lhs.element)] ?? Int.max
+            let right = rank[key(rhs.element)] ?? Int.max
+            return left == right ? lhs.offset < rhs.offset : left < right
+        }.map(\.element)
+    }
+}
+
 /// The pure move + focus math behind the tvOS installed-add-on reorder (`AddonReorderTVView`). tvOS has no
 /// touch/pointer drag, so it reorders with two focusable controls per row (Move up / Move down); this type
 /// owns exactly the logic that must be right for that to feel good on a remote - the swap, the top/bottom

@@ -433,6 +433,8 @@ struct PlayerScreen: View {
     /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos-driven tick). Cancelled on
     /// disappear. See startTrickplayCaptureTimer.
     @State private var trickplayCaptureTimer: Task<Void, Never>?
+    @State private var trickplayRuntimeGate = TrickplayRuntimeLookupGate()
+    @State private var trickplayRuntimeTask: Task<Void, Never>?
     /// Capture cadence in seconds. Matches the local frame cache's ~10s tile interval and the community
     /// upload/vtt interval, so timer-driven and timePos-driven captures share one grid.
     private static var trickplayCaptureIntervalSecs: Double {
@@ -2527,6 +2529,11 @@ struct PlayerScreen: View {
     /// runtime; the real mpv duration later re-keys the exact bucket and unblocks uploads.
     private func configureCommunityTrickplayProvisional() {
         guard let m = curMeta else { return }
+        if duration.isFinite, duration > 0 {
+            scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                               duration: duration, isRealDuration: true)
+            return
+        }
         if let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
            let secs = loaded.runtimeSeconds, secs > 0 {
             // A tmdb-keyed hub play often carries its imdb id in the loaded meta for free
@@ -2543,8 +2550,13 @@ struct PlayerScreen: View {
         // self-heal with a one-shot runtime fetch; mpv's real duration (when it does arrive) still
         // re-keys exactly as before. A tmdb-keyed play resolves its tt id FIRST (Cinemeta only speaks
         // imdb), and the resolver caches the mapping for the store's own keying. Fail-soft on every step.
+        let key = "\(m.libraryId)|\(m.videoId)"
+        guard let claim = trickplayRuntimeGate.begin(key: key, now: Date.timeIntervalSinceReferenceDate) else { return }
+        trickplayRuntimeTask?.cancel()
         VXProbe.log("tp", "provisional key MISS: playing=\(VXProbeRedaction.identityToken(m.libraryId)) metaDetails=\(VXProbeRedaction.identityToken(core.metaDetails?.meta?.id)) (fetching runtime)")
-        Task {
+        trickplayRuntimeTask = Task { @MainActor in
+            var succeeded = false
+            defer { trickplayRuntimeGate.finish(claim, now: Date.timeIntervalSinceReferenceDate, succeeded: succeeded) }
             var ttId = m.libraryId
             if !ttId.hasPrefix("tt") {
                 guard ttId.lowercased().hasPrefix("tmdb"),
@@ -2560,12 +2572,11 @@ struct PlayerScreen: View {
                 VXProbe.log("tp", "provisional key MISS stays: no cinemeta runtime for \(VXProbeRedaction.identityToken(ttId))")
                 return
             }
-            await MainActor.run {
-                guard curMeta?.libraryId == m.libraryId,
-                      curMeta?.videoId == m.videoId else { return }   // still the same episode
-                scrubThumbnails.configureCommunity(imdbId: ttId, season: m.season, episode: m.episode,
-                                                   duration: secs, isRealDuration: false)
-            }
+            guard !Task.isCancelled, duration <= 0,
+                  curMeta?.libraryId == m.libraryId, curMeta?.videoId == m.videoId else { return }
+            succeeded = true
+            scrubThumbnails.configureCommunity(imdbId: ttId, season: m.season, episode: m.episode,
+                                               duration: secs, isRealDuration: false)
         }
     }
 
@@ -2682,6 +2693,9 @@ struct PlayerScreen: View {
     }
 
     private func invalidateLocalTrickplayCapture() {
+        trickplayRuntimeTask?.cancel()
+        trickplayRuntimeTask = nil
+        trickplayRuntimeGate.cancel()
         localTrickplayCaptureGeneration &+= 1
         localTrickplayCaptureInFlight = false
     }
@@ -5260,7 +5274,8 @@ struct PlayerScreen: View {
                     )
                     if AppleCWMetaRefreshAuthorityPolicy.accepts(
                         receipt, forRequestGeneration: requestGeneration,
-                        expectedLibraryID: current.libraryId, expectedStreamID: current.videoId
+                        expectedLibraryID: current.libraryId, expectedStreamID: current.videoId,
+                        allowCanonicalNavigationID: true
                     ), let loaded = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
                         for: current.libraryId, streamID: current.videoId
                     ), let candidate = authoritativeBackfillRefs(loaded.videos ?? []) {
@@ -5372,7 +5387,7 @@ struct PlayerScreen: View {
                 )
                 if AppleCWMetaRefreshAuthorityPolicy.accepts(
                     receipt, forRequestGeneration: requestGeneration, expectedLibraryID: m.libraryId,
-                    expectedStreamID: m.videoId
+                    expectedStreamID: m.videoId, allowCanonicalNavigationID: true
                 ), let loaded = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
                     for: m.libraryId, streamID: m.videoId
                 ),

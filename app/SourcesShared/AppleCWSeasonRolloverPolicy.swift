@@ -106,16 +106,26 @@ enum AppleCWMetaRefreshGenerationFence {
 
 enum AppleCWMetaRefreshAuthorityPolicy {
     static func accepts(_ receipt: AppleCWMetaRefreshReceipt?, forRequestGeneration: Int,
-                        expectedLibraryID: String, expectedStreamID: String? = nil) -> Bool {
+                        expectedLibraryID: String, expectedStreamID: String? = nil,
+                        allowCanonicalNavigationID: Bool = false) -> Bool {
         guard let receipt,
               receipt.requestGeneration == forRequestGeneration,
               receipt.selectedMetaID == expectedLibraryID,
-              receipt.loadedMetaID == expectedLibraryID,
+              (receipt.loadedMetaID == expectedLibraryID
+                || (allowCanonicalNavigationID && expectedStreamID != nil && receipt.loadedMetaID != nil)),
               receipt.settled else { return false }
         if let expectedStreamID {
             guard receipt.requestedStreamID == expectedStreamID else { return false }
         }
         return true
+    }
+}
+
+/// Unload may return an empty model rather than JSON null, and unloading an already-empty model may
+/// emit no event. A still-selected or provider-populated response is never invalidation authority.
+enum AppleCWMetaInvalidationPolicy {
+    static func isUnloaded(hasSelection: Bool, hasMetaProviders: Bool, hasStreamRequests: Bool) -> Bool {
+        !hasSelection && !hasMetaProviders && !hasStreamRequests
     }
 }
 

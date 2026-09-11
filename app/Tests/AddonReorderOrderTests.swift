@@ -5,12 +5,13 @@
 //
 //     swiftc -parse-as-library app/SourcesShared/AddonReorderMove.swift app/Tests/AddonReorderOrderTests.swift -o /tmp/AddonReorderOrderTests && /tmp/AddonReorderOrderTests
 //
-// SCOPE: the account-scoped order STORE (VortXSyncManager.appliedAddonOrder / orderedByApplied / normalize)
+// SCOPE: the account-scoped order STORE (VortXSyncManager.appliedAddonOrder / normalize)
 // and the #144 resolution pick (CoreMetaDetails.meta) live in files that pull in the whole app target, so - as
 // with QRJoinerFlowTests / StreamRankingChipsTests - those are MIRRORED here (the real link is proven by the
 // 4-scheme Xcode build gate). The NEW tvOS code (the move + focus math) is the part that could silently
 // regress, so THAT is compiled and tested for real above. The mirrors below MUST stay in lockstep with
-// VortXSyncManager.swift (appliedAddonOrder + normalize + orderedByApplied) and CoreModels.swift (#144 meta).
+// VortXSyncManager.swift (appliedAddonOrder + normalize) and CoreModels.swift (#144 meta).
+// Source-group ordering now compiles the actual AddonAppliedOrder helper, not a mirrored comparator.
 
 import Foundation
 
@@ -44,22 +45,9 @@ struct OrderStore {
         appliedAddonOrder = normalized
     }
 
-    /// Mirror of VortXSyncManager.orderedByApplied(_:url:).
+    /// Invoke the real stable ordering helper used by VortXSyncManager and source groups.
     func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
-        let order = appliedAddonOrder
-        guard !order.isEmpty else { return items }
-        var index: [String: Int] = [:]
-        for (i, u) in order.enumerated() { index[u] = i }
-        return items.enumerated().sorted { a, b in
-            let ia = index[Self.normalize(url(a.element))]
-            let ib = index[Self.normalize(url(b.element))]
-            switch (ia, ib) {
-            case let (x?, y?): return x < y
-            case (_?, nil):    return true
-            case (nil, _?):    return false
-            case (nil, nil):   return a.offset < b.offset
-            }
-        }.map(\.element)
+        AddonAppliedOrder.sorted(items, order: appliedAddonOrder) { Self.normalize(url($0)) }
     }
 }
 
@@ -101,6 +89,12 @@ enum AddonReorderOrderTests {
         let a = Addon(transportUrl: "https://a.example/manifest.json", name: "A")
         let b = Addon(transportUrl: "https://b.example/manifest.json", name: "B")
         let c = Addon(transportUrl: "https://c.example/manifest.json", name: "C")
+
+        let groups = [("b", 1), ("new", 2), ("a", 3), ("b", 4), ("new2", 5)]
+        check(AddonAppliedOrder.sorted(groups, order: ["a", "b", "a"], key: { $0.0 }).map { $0.1 }
+              == [3, 1, 4, 2, 5], "sources: user order wins over install order, same-addon groups and new installs stay stable")
+        check(AddonAppliedOrder.sorted(groups, order: [], key: { $0.0 }).map { $0.1 }
+              == [1, 2, 3, 4, 5], "sources: no applied order preserves engine order")
 
         // 1. FOCUS REACHES MOVE CONTROLS + FOCUS-FOLLOW - asserted on the REAL AddonReorderMove helper.
         do {

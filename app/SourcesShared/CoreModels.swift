@@ -564,7 +564,7 @@ struct CoreMetaDetails: Decodable {
     /// Navigation only: an episode list does not depend on unrelated stream searches completing.
     /// Callers must also own the bridge refresh generation. This is never proof of series finality.
     func appleCWNavigationMeta(for requestedID: String, streamID: String) -> CoreMetaItem? {
-        guard selectedMetaID == requestedID, let candidate = meta, candidate.id == requestedID,
+        guard selectedMetaID == requestedID, let candidate = meta,
               let videos = candidate.videos,
               EpisodePlaybackIdentity.appleCWSeriesInventory(from: videos, authority: .launch) != nil,
               videos.contains(where: { $0.id == streamID })

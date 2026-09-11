@@ -38,6 +38,19 @@ import Foundation
 /// backward seeks real instead of silently pinning them to the first few produced seconds.
 enum RemuxResumePolicy {
 
+    /// A launch offset belongs only to the initial episode. Once a physical load or an engine switch has
+    /// configured an origin, that value (including zero) wins over immutable launch arguments.
+    static func surfaceOrigin(isLive: Bool, activeOrigin: Double?, resolvedResume: Double?,
+                              startFromZero: Bool, launchOffset: Double?, engineResume: Double?) -> Double? {
+        if isLive { return 0 }
+        if let activeOrigin { return activeOrigin }
+        if let resolvedResume { return resolvedResume }
+        if startFromZero { return 0 }
+        if let launchOffset { return launchOffset }
+        if let engineResume, engineResume > minimumResumeSeconds { return engineResume }
+        return nil
+    }
+
     // MARK: - Should this mount start part-way in?
 
     /// The launch contract is now complete: the chrome configures a one-shot origin before `loadFile`, the

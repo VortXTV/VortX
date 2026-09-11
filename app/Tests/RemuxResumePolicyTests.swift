@@ -51,6 +51,37 @@ enum RemuxResumePolicyTests {
 }
 
 @MainActor func run() {
+    check("display: plain SDR remux never requests Dolby Vision",
+          DVPlaybackPolicy.remuxDisplayRange(dolbyVision: false, hdrFallback: false, videoRange: nil) == .sdr)
+    check("display: plain PQ remux requests HDR10",
+          DVPlaybackPolicy.remuxDisplayRange(dolbyVision: false, hdrFallback: false, videoRange: "PQ") == .hdr10)
+    check("display: plain HLG remux remains HLG",
+          DVPlaybackPolicy.remuxDisplayRange(dolbyVision: false, hdrFallback: false, videoRange: "HLG") == .hlg)
+    check("display: proven DV primary remains Dolby Vision",
+          DVPlaybackPolicy.remuxDisplayRange(dolbyVision: true, hdrFallback: false, videoRange: "PQ") == .dolbyVision)
+    check("display: HDR recovery does not reassert Dolby Vision",
+          DVPlaybackPolicy.remuxDisplayRange(dolbyVision: true, hdrFallback: true, videoRange: "PQ") == .hdr10)
+    check("surface: live position wins over explicit launch zero during engine switch",
+          RemuxResumePolicy.surfaceOrigin(isLive: false, activeOrigin: 30.572, resolvedResume: 30.572,
+            startFromZero: false, launchOffset: 0, engineResume: 0) == 30.572)
+    check("surface: next episode cannot inherit previous episode CW launch offset",
+          RemuxResumePolicy.surfaceOrigin(isLive: false, activeOrigin: 15, resolvedResume: 15,
+            startFromZero: false, launchOffset: 2590.630, engineResume: 2590.630) == 15)
+    check("surface: next episode zero wins over previous episode resume",
+          RemuxResumePolicy.surfaceOrigin(isLive: false, activeOrigin: 0, resolvedResume: 0,
+            startFromZero: false, launchOffset: 2590.630, engineResume: 2590.630) == 0)
+    check("surface: play from beginning applies only before an active load exists",
+          RemuxResumePolicy.surfaceOrigin(isLive: false, activeOrigin: 90, resolvedResume: 90,
+            startFromZero: true, launchOffset: nil, engineResume: 0) == 90)
+    check("surface: initial explicit resume remains authoritative",
+          RemuxResumePolicy.surfaceOrigin(isLive: false, activeOrigin: nil, resolvedResume: nil,
+            startFromZero: false, launchOffset: 2590.630, engineResume: 0) == 2590.630)
+    check("surface: unresolved account resume keeps AV mount pending",
+          RemuxResumePolicy.surfaceOrigin(isLive: false, activeOrigin: nil, resolvedResume: nil,
+            startFromZero: false, launchOffset: nil, engineResume: 0) == nil)
+    check("surface: live never inherits a stored resume",
+          RemuxResumePolicy.surfaceOrigin(isLive: true, activeOrigin: 90, resolvedResume: 90,
+            startFromZero: false, launchOffset: 2590.630, engineResume: 100) == 0)
     check("same logical retry preserves consumed origin",
           RemuxResumePolicy.originForLoad(configuredOrigin: nil, sameLogicalRequest: true, previousOrigin: 1780) == 1780)
     check("different source or token cannot inherit origin",

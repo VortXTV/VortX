@@ -20,6 +20,30 @@ private func check(_ condition: Bool, _ name: String) {
 @main
 private struct LibraryWatchedMutationContractTests {
     static func main() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let expiry = now.addingTimeInterval(300)
+        check(Policy.deferredDecision(expiresAt: expiry, now: now, ownsContext: true,
+                                      logoutPending: false, metadataMatches: false) == .wait,
+              "CW missing metadata retains the episode watched intent")
+        check(Policy.deferredDecision(expiresAt: expiry, now: now, ownsContext: true,
+                                      logoutPending: false, metadataMatches: true) == .dispatch,
+              "matching metadata replays the previously completed episode")
+        check(Policy.deferredDecision(expiresAt: expiry, now: now, ownsContext: false,
+                                      logoutPending: false, metadataMatches: true) == .discard,
+              "profile/account change discards pending watched intent")
+        check(Policy.deferredDecision(expiresAt: now, now: now, ownsContext: true,
+                                      logoutPending: false, metadataMatches: true) == .discard,
+              "expired watched intent cannot mutate a later detail session")
+        check(Policy.deferredDecision(expiresAt: expiry, now: now, ownsContext: true,
+                                      logoutPending: true, metadataMatches: true) == .wait,
+              "signed-out repair blocks queued watched dispatch")
+        let app = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let bridge = (try? String(contentsOf: app.appendingPathComponent("SourcesShared/CoreBridge.swift"), encoding: .utf8)) ?? ""
+        check(bridge.contains("if dispatchMetaDetails([\"action\": \"MarkVideoAsWatched\", \"args\": [payload, true]]) {"),
+              "production consumes queued watched intent only after accepted dispatch")
+        check(bridge.contains("pendingEpisodeWatched.removeValue(forKey: \"\\(expected.id)|\\(video.id)\")")
+                && bridge.contains("$0.value.meta.libraryId != expected.id || $0.value.meta.season != season"),
+              "explicit episode or season unwatch cancels older deferred watched intent")
         let movie = Policy.MetaPreview(id: "tt0000001", type: "movie", name: "Movie", poster: nil)
         let series = Policy.MetaPreview(id: "tt0000002", type: "series", name: "Series", poster: "poster")
         let stale = Policy.MetaPreview(id: "tt0000003", type: "movie", name: "Stale", poster: nil)

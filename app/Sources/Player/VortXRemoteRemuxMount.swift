@@ -244,6 +244,7 @@ final class VortXRemoteRemuxMount: @unchecked Sendable {
     var videoHeight: Int { cached?.height ?? 0 }
     var declaredBandwidth: Int { cached?.bandwidth ?? 0 }
     var videoRange: String? { cached?.videoRange }
+    var carriesDolbyVision: Bool { cached?.dolbyVision ?? false }
     var supportsHDRFallback: Bool { cached?.supportsHDRFallback ?? false }
     var sourceAudioTracks: [VortXEngineProtocol.AudioTrack] { cached?.audioTracks ?? [] }
     var selectedSourceAudioIndex: Int? { cached?.selectedAudioStreamIndex }

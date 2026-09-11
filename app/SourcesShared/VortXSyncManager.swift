@@ -461,20 +461,9 @@ final class VortXSyncManager: ObservableObject {
     /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
     /// order returns the input unchanged, so this is a no-op until the user actually reorders.
     static func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
-        let order = appliedAddonOrder
-        guard !order.isEmpty else { return items }
-        var index: [String: Int] = [:]
-        for (i, u) in order.enumerated() { index[u] = i }
-        return items.enumerated().sorted { a, b in
-            let ia = index[AddonTombstones.normalize(url(a.element))]
-            let ib = index[AddonTombstones.normalize(url(b.element))]
-            switch (ia, ib) {
-            case let (x?, y?): return x < y
-            case (_?, nil):    return true                 // ordered items before not-yet-ordered
-            case (nil, _?):    return false
-            case (nil, nil):   return a.offset < b.offset  // stable for the un-ordered tail
-            }
-        }.map(\.element)
+        AddonAppliedOrder.sorted(items, order: appliedAddonOrder) {
+            AddonTombstones.normalize(url($0))
+        }
     }
 
     /// Persist a user-chosen add-on order (the in-app Reorder screen) and push it to the account IMMEDIATELY
@@ -484,6 +473,7 @@ final class VortXSyncManager: ObservableObject {
         let normalized = transportUrls.map { AddonTombstones.normalize($0) }
         guard normalized != Self.appliedAddonOrder else { return }
         Self.appliedAddonOrder = normalized
+        CoreBridge.shared.addonOrderDidChange()
         // Refresh any live add-on list NOW: appliedAddonOrder is a plain UserDefaults static, not @Published,
         // so views showing the list have no other signal to re-run orderedByApplied on their current body.
         NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
@@ -2462,8 +2452,8 @@ final class VortXSyncManager: ObservableObject {
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
         // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
         // ONLY inside this suppression region after a STRICTLY-NEWER, SUCCESSFUL pull, so a stale/partial
-        // sync can never scramble the order. Reordering the ALREADY-hydrated live engine Vec needs a
-        // CoreBridge action (out of scope here); the persisted order takes effect on the next hydrate.
+        // sync can never scramble the order. Source assembly applies this order directly and the source
+        // epoch invalidates already-published lists without mutating/reloading the engine collection.
         if let addonOrder = doc["addonOrder"] as? [String] {
             let normalized = addonOrder.map { AddonTombstones.normalize($0) }
             if normalized != Self.appliedAddonOrder {
@@ -2472,6 +2462,7 @@ final class VortXSyncManager: ObservableObject {
                 // A remote reorder landed: refresh any live add-on list on the main thread.
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.isCurrent(capture) else { return }
+                    CoreBridge.shared.addonOrderDidChange()
                     NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
                 }
             }

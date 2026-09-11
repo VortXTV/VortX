@@ -1000,6 +1000,8 @@ struct TVPlayerView: View {
     @State private var exitAcceptedLoadToken: PlayerLoadToken?
     /// Wall-clock trickplay capture driver (player-agnostic backstop to the timePos tick). See startTrickplayCaptureTimer.
     @State private var trickplayCaptureTimer: Task<Void, Never>?
+    @State private var trickplayRuntimeGate = TrickplayRuntimeLookupGate()
+    @State private var trickplayRuntimeTask: Task<Void, Never>?
     @State private var lastFrameDropReceiptAt = 0.0
     @State private var lastFrameDropCount = 0
     @State private var trickplayCaptureAttemptsSinceReceipt = 0
@@ -1421,12 +1423,13 @@ struct TVPlayerView: View {
     /// Origin available before AVPlayer's initial synchronous mount. A nonzero engine resume is synchronous;
     /// when only the account can answer, nil keeps the AV surface unmounted until `onAppear` resolves it.
     private var initialAVResumeOrigin: Double? {
-        if initialLiveMode || startFromZero { return 0 }
-        if let explicit = startAtSeconds { return explicit }
-        if let configured = avSurfaceResumeOrigin ?? resumeSeconds { return configured }
-        guard let m = curMeta ?? meta else { return 0 }
-        if let engineResume = core.engineResumeSeconds(for: m), engineResume > 5 { return engineResume }
-        return nil
+        let activeMeta = curMeta ?? meta
+        return RemuxResumePolicy.surfaceOrigin(
+            isLive: engineSurfaceUsesActiveTuple ? curIsLive : initialLiveMode,
+            activeOrigin: avSurfaceResumeOrigin, resolvedResume: resumeSeconds,
+            startFromZero: startFromZero, launchOffset: startAtSeconds,
+            engineResume: activeMeta.flatMap { core.engineResumeSeconds(for: $0) }
+        ) ?? (activeMeta == nil ? 0 : nil)
     }
 
     /// The raw routing computation, mirroring PlayerScreen.routedToAVPlayer. Consulted only for the pre-onAppear
@@ -6297,6 +6300,11 @@ struct TVPlayerView: View {
     /// duration-event call's identity (libraryId + season/episode).
     private func configureCommunityTrickplayProvisional() {
         guard let m = curMeta else { return }
+        if duration.isFinite, duration > 0 {
+            scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode,
+                                               duration: duration, isRealDuration: true)
+            return
+        }
         // The loaded meta carries the human runtime; use it only when it is THIS title's meta.
         if let loaded = core.metaDetails?.meta, loaded.id == m.libraryId,
            let secs = loaded.runtimeSeconds, secs > 0 {
@@ -6314,8 +6322,13 @@ struct TVPlayerView: View {
         // iOS self-heal: log the miss, then one-shot the runtime (movie then series) and key
         // provisionally. A tmdb-keyed play resolves its tt id FIRST (Cinemeta only speaks imdb), and the
         // resolver caches the mapping for the store's own keying. mpv's real `duration` still re-keys.
+        let key = "\(m.libraryId)|\(m.videoId)"
+        guard let claim = trickplayRuntimeGate.begin(key: key, now: Date.timeIntervalSinceReferenceDate) else { return }
+        trickplayRuntimeTask?.cancel()
         VXProbe.log("tp", "provisional key MISS (tvOS): playing=\(VXProbeRedaction.identityToken(m.libraryId)) metaDetails=\(VXProbeRedaction.identityToken(core.metaDetails?.meta?.id)) (fetching runtime)")
-        Task {
+        trickplayRuntimeTask = Task { @MainActor in
+            var succeeded = false
+            defer { trickplayRuntimeGate.finish(claim, now: Date.timeIntervalSinceReferenceDate, succeeded: succeeded) }
             var ttId = m.libraryId
             if !ttId.hasPrefix("tt") {
                 guard ttId.lowercased().hasPrefix("tmdb"),
@@ -6331,12 +6344,11 @@ struct TVPlayerView: View {
                 VXProbe.log("tp", "provisional key MISS stays (tvOS): no cinemeta runtime for \(VXProbeRedaction.identityToken(ttId))")
                 return
             }
-            await MainActor.run {
-                guard curMeta?.libraryId == m.libraryId,
-                      curMeta?.videoId == m.videoId else { return }   // still the same episode
-                scrubThumbnails.configureCommunity(imdbId: ttId, season: m.season, episode: m.episode,
-                                                   duration: secs, isRealDuration: false)
-            }
+            guard !Task.isCancelled, !leftPlayback, duration <= 0,
+                  curMeta?.libraryId == m.libraryId, curMeta?.videoId == m.videoId else { return }
+            succeeded = true
+            scrubThumbnails.configureCommunity(imdbId: ttId, season: m.season, episode: m.episode,
+                                               duration: secs, isRealDuration: false)
         }
     }
 
@@ -8152,7 +8164,8 @@ struct TVPlayerView: View {
                     )
                     if AppleCWMetaRefreshAuthorityPolicy.accepts(
                         receipt, forRequestGeneration: requestGeneration,
-                        expectedLibraryID: current.libraryId, expectedStreamID: current.videoId
+                        expectedLibraryID: current.libraryId, expectedStreamID: current.videoId,
+                        allowCanonicalNavigationID: true
                     ), let loaded = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
                         for: current.libraryId, streamID: current.videoId
                     ), let candidate = EpisodePlaybackIdentity.appleCWAuthoritativeBackfill(
@@ -8234,7 +8247,7 @@ struct TVPlayerView: View {
                 )
                 if AppleCWMetaRefreshAuthorityPolicy.accepts(
                     receipt, forRequestGeneration: requestGeneration, expectedLibraryID: m.libraryId,
-                    expectedStreamID: m.videoId
+                    expectedStreamID: m.videoId, allowCanonicalNavigationID: true
                 ), let loaded = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
                     for: m.libraryId, streamID: m.videoId
                 ),
@@ -10347,6 +10360,9 @@ struct TVPlayerView: View {
     }
 
     private func invalidateLocalTrickplayCapture() {
+        trickplayRuntimeTask?.cancel()
+        trickplayRuntimeTask = nil
+        trickplayRuntimeGate.cancel()
         localTrickplayCaptureGeneration &+= 1
         localTrickplayCaptureInFlight = false
     }

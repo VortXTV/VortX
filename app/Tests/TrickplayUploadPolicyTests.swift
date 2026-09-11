@@ -5,6 +5,7 @@ private enum TrickplayUploadPolicyTests {
     nonisolated(unsafe) private static var passed = 0
 
     static func main() {
+        testRuntimeLookupIsBoundedAndIdentitySafe()
         testFixedCaptureCadenceContinuesDuringActivePlayback()
         testCaptureCadenceKeepsWorkBounded()
         testUHDHDRLocalCaptureEligibilityMatrix()
@@ -31,6 +32,25 @@ private enum TrickplayUploadPolicyTests {
         testLocalCaptureBreakerOpensAndResets()
         testPlayerSourceHierarchyAndLaunchSafetyWiring()
         print("TrickplayUploadPolicyTests: \(passed)/\(passed) passed")
+    }
+
+    private static func testRuntimeLookupIsBoundedAndIdentitySafe() {
+        var gate = TrickplayRuntimeLookupGate()
+        guard let first = gate.begin(key: "episode1", now: 0) else { fatalError("first lookup") }
+        for tick in 1...1060 {
+            expect(gate.begin(key: "episode1", now: Double(tick) / 4) == nil,
+                   "clock tick must not spawn overlapping runtime requests")
+        }
+        gate.finish(first, now: 300, succeeded: false)
+        expect(gate.begin(key: "episode1", now: 329) == nil, "failure has bounded retry delay")
+        guard let retry = gate.begin(key: "episode1", now: 330) else { fatalError("retry") }
+        gate.cancel()
+        guard let replacement = gate.begin(key: "episode1", now: 331) else { fatalError("replacement") }
+        gate.finish(retry, now: 332, succeeded: true)
+        expect(gate.begin(key: "episode1", now: 400) == nil, "stale same-episode task cannot release current request")
+        gate.finish(replacement, now: 401, succeeded: true)
+        expect(gate.begin(key: "episode1", now: 1000) == nil, "successful runtime remains keyed")
+        expect(gate.begin(key: "episode2", now: 1001) != nil, "next episode can fetch independently")
     }
 
     private static func expect(

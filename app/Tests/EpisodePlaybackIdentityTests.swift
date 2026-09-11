@@ -210,7 +210,8 @@ private func video(id: String, season: Int, episode: Int) -> CoreVideo {
     return try! JSONDecoder().decode(CoreVideo.self, from: data)
 }
 
-private func metaEntry(base: String, state: String, videoIDs: [String] = ["s1e1"]) -> [String: Any] {
+private func metaEntry(base: String, state: String, videoIDs: [String] = ["s1e1"],
+                       loadedID: String = "show") -> [String: Any] {
     let path: [String: Any] = ["resource": "meta", "type": "series", "id": "show"]
     var entry: [String: Any] = [
         "request": ["base": base, "path": path],
@@ -219,7 +220,7 @@ private func metaEntry(base: String, state: String, videoIDs: [String] = ["s1e1"
         entry["content"] = [
             "type": "Ready",
             "content": [
-                "id": "show", "type": "series", "name": "Show",
+                "id": loadedID, "type": "series", "name": "Show",
                 "videos": videoIDs.enumerated().map {
                     ["id": $0.element, "title": $0.element, "season": 1, "episode": $0.offset + 1]
                 },
@@ -643,6 +644,17 @@ private struct EpisodePlaybackIdentityTests {
         // loading/not-started provider remains provisional; failed providers are terminal, but an all-failed
         // aggregation still has no title data to certify. When the higher-priority provider finally lands,
         // the settled seam must choose its unfiltered videos rather than the earlier lower-priority list.
+        let canonicalAlias = metaDetails(entries: [
+            metaEntry(base: "alias", state: "Ready", videoIDs: ["s1e1", "s1e2"], loadedID: "tt-canonical")
+        ])
+        expect(canonicalAlias.appleCWNavigationMeta(for: "show", streamID: "s1e1")?.id == "tt-canonical",
+               "canonical alias metadata supplies exact-episode navigation after a CW launch")
+        expect(canonicalAlias.appleCWNavigationMeta(for: "other-show", streamID: "s1e1") == nil,
+               "alias navigation cannot cross the selected title request")
+        expect(canonicalAlias.appleCWNavigationMeta(for: "show", streamID: "unrelated-episode") == nil,
+               "alias navigation cannot invent membership for an unrelated episode")
+        expect(canonicalAlias.appleCWTerminalFullMeta(for: "show") == nil,
+               "canonical alias navigation never certifies exact-title finality")
         let readyLowerLoadingHigher = metaDetails(entries: [
             metaEntry(base: "lower", state: "Ready", videoIDs: ["lower-episode"]),
             metaEntry(base: "higher", state: "Loading"),

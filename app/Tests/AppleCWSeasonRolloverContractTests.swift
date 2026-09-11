@@ -213,6 +213,26 @@ enum AppleCWSeasonRolloverContractTests {
             requestGeneration: 41, selectedMetaID: "show", loadedMetaID: "show", settled: true,
             requestedStreamID: "s1e10"
         )
+        expect(AppleCWMetaInvalidationPolicy.isUnloaded(hasSelection: false,
+            hasMetaProviders: false, hasStreamRequests: false), "empty model is a valid unload receipt")
+        expect(!AppleCWMetaInvalidationPolicy.isUnloaded(hasSelection: true,
+            hasMetaProviders: false, hasStreamRequests: false), "loading same-title response is not unloaded")
+        expect(!AppleCWMetaInvalidationPolicy.isUnloaded(hasSelection: false,
+            hasMetaProviders: true, hasStreamRequests: false), "cached providers cannot certify unload")
+        let alias = AppleCWMetaRefreshReceipt(requestGeneration: 41, selectedMetaID: "kitsu:460",
+            loadedMetaID: "tt1234567", settled: true, requestedStreamID: "tt1234567:1:4")
+        expect(AppleCWMetaRefreshAuthorityPolicy.accepts(alias, forRequestGeneration: 41,
+            expectedLibraryID: "kitsu:460", expectedStreamID: "tt1234567:1:4", allowCanonicalNavigationID: true),
+            "selected alias with exact episode can refresh navigation")
+        expect(!AppleCWMetaRefreshAuthorityPolicy.accepts(alias, forRequestGeneration: 41,
+            expectedLibraryID: "kitsu:460", expectedStreamID: "tt1234567:1:4"),
+            "navigation alias cannot certify terminal full-series authority")
+        expect(!AppleCWMetaRefreshAuthorityPolicy.accepts(alias, forRequestGeneration: 41,
+            expectedLibraryID: "other", expectedStreamID: "tt1234567:1:4", allowCanonicalNavigationID: true),
+            "another selected title cannot supply alias inventory")
+        expect(!AppleCWMetaRefreshAuthorityPolicy.accepts(alias, forRequestGeneration: 41,
+            expectedLibraryID: "kitsu:460", expectedStreamID: "tt1234567:1:5", allowCanonicalNavigationID: true),
+            "alias receipt cannot cross episodes")
         expect(AppleCWMetaRefreshAuthorityPolicy.accepts(
             freshExact, forRequestGeneration: 41, expectedLibraryID: "show", expectedStreamID: "s1e10"
         ), "only the exact request-owned selected/loaded ready receipt can certify the response")
@@ -370,6 +390,9 @@ enum AppleCWSeasonRolloverContractTests {
         let iosDetail = productionSource("SourcesiOS/iOSDetailView.swift")
         let tvDetail = productionSource("SourcesTV/DetailView.swift")
         let tvRoot = productionSource("SourcesTV/RootTabView.swift")
+        expect(tvPlayer.components(separatedBy: "allowCanonicalNavigationID: true").count == 3
+               && iosPlayer.components(separatedBy: "allowCanonicalNavigationID: true").count == 3,
+               "both initial CW and EOF navigation refreshes accept exact-request canonical aliases")
         expect(coreModels.contains("if EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) { return false }"),
                "CoreCWItem series progress cannot app-prune a series")
         expect(coreBridge.contains("EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished"),
@@ -388,7 +411,13 @@ enum AppleCWSeasonRolloverContractTests {
                && coreBridge.contains("appleCWMetaRefreshReceipt")
                && coreBridge.contains("appleCWMetaRefreshDetails")
                && coreBridge.contains("appleCWTerminalFullMeta")
-               && coreBridge.contains("guard details == nil else { return }")
+               && coreBridge.contains("AppleCWMetaInvalidationPolicy.isUnloaded(")
+               && coreBridge.contains("hasSelection: details?.selected != nil")
+               && coreBridge.contains("hasMetaProviders: !(details?.metaItems.isEmpty ?? true)")
+               && coreBridge.contains("hasStreamRequests: !(details?.allStreamGroups.isEmpty ?? true)")
+               && coreBridge.contains("self.refindGeneration == refindGenerationAtSchedule")
+               && coreBridge.contains("Self.decoder.decode(CoreMetaDetails?.self, from: data)")
+               && coreBridge.contains("metadata receipt decode failed; retaining last valid snapshot")
                && coreBridge.contains("cancelAppleCWMetaRefresh(generation:")
                && coreBridge.contains("AppleCWMetaRefreshGenerationFence.owns")
                && coreBridge.contains("refreshGenerationAtSchedule")

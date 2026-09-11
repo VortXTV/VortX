@@ -3,6 +3,15 @@ import Foundation
 /// Pure routing and payload rules shared by Apple detail mutations. Keeping these rules independent
 /// of the engine bridge makes the owner/overlay boundary and stale-detail fallbacks executable.
 enum LibraryWatchedMutationPolicy {
+    enum DeferredDecision: Equatable { case discard, wait, dispatch }
+
+    static func deferredDecision(expiresAt: Date, now: Date, ownsContext: Bool,
+                                 logoutPending: Bool, metadataMatches: Bool) -> DeferredDecision {
+        guard ownsContext, expiresAt > now else { return .discard }
+        guard !logoutPending, metadataMatches else { return .wait }
+        return .dispatch
+    }
+
     enum Route: Equatable {
         case engineAccount
         case profileOverlay

@@ -330,6 +330,19 @@ enum DVPlaybackPolicy {
         case hlg
     }
 
+    enum RemuxDisplayRange: Equatable { case dolbyVision, hdr10, hlg, sdr }
+
+    /// A plain remux is not Dolby Vision. Use the published classifier result, not simply the presence
+    /// of a remux server (which also handles ordinary HDR/SDR Matroska files).
+    static func remuxDisplayRange(dolbyVision: Bool, hdrFallback: Bool, videoRange: String?) -> RemuxDisplayRange {
+        if dolbyVision && !hdrFallback { return .dolbyVision }
+        switch videoRange?.uppercased() {
+        case "HLG": return .hlg
+        case "PQ": return .hdr10
+        default: return hdrFallback ? .hdr10 : .sdr
+        }
+    }
+
     /// Render the exact master artifact. With no optional tags or attributes this preserves the established
     /// plain and Dolby Vision bytes; feature-on media rows precede the variants and every variant receives the
     /// same group attributes.

@@ -79,6 +79,13 @@ check("negotiation telemetry records requested, active, fallback, codec, and dim
 check("negotiation telemetry is one-shot until a load or explicit decoder change",
       receipt.contains("guard !loggedHardwareDecoderNegotiation")
         && controller.contains("loggedHardwareDecoderNegotiation = false"))
+check("decoder diagnostics use real mpv properties and preserve pixel format evidence",
+      !controller.contains("video-codec-name") && receipt.contains("video-format")
+        && receipt.contains("video-params/pixelformat") && receipt.contains("video-params/hw-pixelformat"))
+let reconfigure = section(controller, from: "case MPV_EVENT_VIDEO_RECONFIG:", to: "case MPV_EVENT_END_FILE:") ?? ""
+check("negotiated decoder is sampled at video configuration rather than waiting for periodic stats",
+      reconfigure.contains("recordHardwareDecoderNegotiation(active:")
+        && reconfigure.contains("PlayerLoadProvenanceState.accepts"))
 
 check("Playback Info names a silent VideoToolbox fallback as software",
       controller.contains("software (VideoToolbox unavailable)"))

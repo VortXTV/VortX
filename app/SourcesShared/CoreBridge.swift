@@ -91,6 +91,14 @@ final class CoreBridge: ObservableObject {
     }
     private var appleCWMetaRefreshGeneration = 0
     private var appleCWMetaRefreshRequest: AppleCWMetaRefreshRequest?
+    private struct PendingEpisodeWatched {
+        let meta: PlaybackMeta
+        let target: PlaybackMutationTarget
+        let expiresAt: Date
+    }
+    /// A direct-resume metadata refresh temporarily unloads the model that accepts episode watched marks.
+    /// Retain the exact mutation until that model is ready, without ever marking the entire series.
+    private var pendingEpisodeWatched: [String: PendingEpisodeWatched] = [:]
     /// `rebuildContinueWatching` decodes on whichever engine worker delivered the event, then publishes on main.
     /// Fence those asynchronous publications so a slower, older snapshot cannot overwrite a newer rebuild.
     private let continueWatchingRebuildLock = NSLock()
@@ -296,7 +304,14 @@ final class CoreBridge: ObservableObject {
     }
 
     private func refreshAddons(capturedPublicationToken publicationToken: PublicationToken) {
-        let typed = decode(CoreCtx.self, field: "ctx")?.profile.addons ?? []
+        // Typed and raw descriptors must describe ONE engine receipt. Reading ctx twice can pair an old
+        // visible roster with a new raw map during a pull/install. A decode failure is not an empty roster.
+        guard let snapshot = stateData("ctx"),
+              let context = try? Self.decoder.decode(CoreCtx.self, from: snapshot) else {
+            VXProbe.log("engine", "add-on roster decode failed; retaining last valid snapshot")
+            return
+        }
+        let typed = context.profile.addons
         // A synced order can arrive before OR after the final add-on hydrate. Keep the full-range intent
         // alive across both sequences: if an explicit order already exists when ctx grows, widen only when
         // the new raw manifest count exceeds the range already requested. This is a LoadRange, not a full
@@ -309,8 +324,7 @@ final class CoreBridge: ObservableObject {
             }
         }
         var raw: [String: [String: Any]] = [:]
-        if let data = stateData("ctx"),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        if let object = try? JSONSerialization.jsonObject(with: snapshot) as? [String: Any],
            let profile = object["profile"] as? [String: Any],
            let addons = profile["addons"] as? [[String: Any]] {
             for addon in addons { if let url = addon["transportUrl"] as? String { raw[url] = addon } }
@@ -1472,6 +1486,8 @@ final class CoreBridge: ObservableObject {
     func beginAppleCWAuthoritativeMetaRefresh(type: String, id: String,
                                                streamType: String?, streamId: String,
                                                navigationOnly: Bool = false) -> Int {
+        refindRequest = nil
+        refindGeneration &+= 1
         appleCWMetaRefreshGeneration &+= 1
         let generation = appleCWMetaRefreshGeneration
         appleCWMetaRefreshRequest = AppleCWMetaRefreshRequest(
@@ -1491,6 +1507,9 @@ final class CoreBridge: ObservableObject {
         metaDetails = nil
         if hadDetails { streamsEpoch &+= 1 }
         dispatch(action: ["action": "Unload"], field: "meta_details")
+        // Unload of an already-unloaded model is an engine no-op: explicitly inspect its receipt rather
+        // than waiting forever for an event that will not fire. The same generation/phase fences apply.
+        scheduleMetaDetailsRepublish()
         return generation
     }
 
@@ -1503,6 +1522,7 @@ final class CoreBridge: ObservableObject {
     /// repaints to its loading state, then refills as the fresh sources land. Main-actor only (called from
     /// SwiftUI actions), mirroring `beginAppleCWAuthoritativeMetaRefresh`'s synchronous mutation style.
     func refindSources(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
+        cancelAppleCWMetaRefresh()
         refindGeneration &+= 1
         refindRequest = RefindRequest(
             generation: refindGeneration,
@@ -1520,6 +1540,7 @@ final class CoreBridge: ObservableObject {
         // model empties, then repaints as the re-queried title lands.
         if hadDetails { streamsEpoch &+= 1 }
         dispatch(action: ["action": "Unload"], field: "meta_details")
+        scheduleMetaDetailsRepublish()
     }
 
     /// Cancel a pending Apple terminal refresh when ordinary navigation or player teardown takes ownership
@@ -1616,6 +1637,12 @@ final class CoreBridge: ObservableObject {
         return assembleStreamGroups(details, streamId: nil)
     }
 
+    /// Re-rank already-loaded sources when the account's order changes; never wait for an engine rehydrate.
+    @MainActor
+    func addonOrderDidChange() {
+        streamsEpoch &+= 1
+    }
+
     /// Shared assembly for both `streamGroups` overloads: walk the meta-embedded stream groups
     /// (`metaStreams`) FIRST, then the stream-resource responses, mirroring the engine's own
     /// `[meta_streams, streams]` concat. This is the #122 fix: add-ons that serve plain HTTP / HLS links
@@ -1655,7 +1682,7 @@ final class CoreBridge: ObservableObject {
                                                     streams: streams))
             }
         }
-        return groups
+        return VortXSyncManager.orderedByApplied(groups, url: { $0.id })
     }
 
     /// True when a stream group's source add-on (keyed by its transport base URL, which is the
@@ -1855,6 +1882,9 @@ final class CoreBridge: ObservableObject {
         let videos = (residentMeta.videos ?? []).map {
             LibraryWatchedMutationPolicy.Video(id: $0.id, season: $0.season, episode: $0.episode)
         }
+        if !isWatched {
+            pendingEpisodeWatched = pendingEpisodeWatched.filter { $0.value.meta.libraryId != expected.id }
+        }
         for action in LibraryWatchedMutationPolicy.wholeTitleActions(videos: videos, isWatched: isWatched) {
             switch action {
             case .video(let video, let watched):
@@ -1879,6 +1909,11 @@ final class CoreBridge: ObservableObject {
             (meta.videos ?? []).filter { $0.season == season }.map(\.id)
         }) { return }
         guard !logoutAccountMutationPending else { return }
+        if !isWatched {
+            pendingEpisodeWatched = pendingEpisodeWatched.filter {
+                $0.value.meta.libraryId != expected.id || $0.value.meta.season != season
+            }
+        }
         dispatchMetaDetails(["action": "MarkSeasonAsWatched", "args": [season, isWatched]])
     }
 
@@ -1891,6 +1926,9 @@ final class CoreBridge: ObservableObject {
               residentMeta.videos?.contains(where: { $0.id == video.id }) == true else { return }
         if overlayMarkWatched(isWatched, videoIds: { _ in [video.id] }) { return }
         guard !logoutAccountMutationPending else { return }
+        if !isWatched {
+            pendingEpisodeWatched.removeValue(forKey: "\(expected.id)|\(video.id)")
+        }
         var payload: [String: Any] = ["id": video.id]
         if let season = video.season { payload["season"] = season }
         if let episode = video.episode { payload["episode"] = episode }
@@ -1952,8 +1990,8 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Called by the player when a title is effectively watched (~end of playback) so the marker
-    /// flips live instead of waiting for a library sync. Relies on meta_details being loaded (it is,
-    /// since playback is launched from the detail screen).
+    /// flips live instead of waiting for a library sync. CW launches and refreshes can temporarily
+    /// unload meta_details; retain the exact episode mark until matching metadata becomes available.
     func markPlaybackWatched(_ meta: PlaybackMeta, target: PlaybackMutationTarget? = nil,
                              allowEngineWrite: Bool = true) {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
@@ -1979,14 +2017,22 @@ final class CoreBridge: ObservableObject {
         let residentMatchesPlayback = LibraryWatchedMutationPolicy.residentMatches(
             expected, residentID: metaDetails?.meta?.id, residentType: metaDetails?.meta?.type)
         if meta.usesSeriesLifecycle {
-            guard residentMatchesPlayback else {
-                NSLog("[playback] dropped stale series watched callback id=%@", meta.libraryId)
+            guard episodeWatchedMetadataMatches(meta) else {
+                pendingEpisodeWatched = pendingEpisodeWatched.filter {
+                    $0.value.expiresAt > Date() && $0.value.target.stillOwnsCurrentContext(core: self)
+                }
+                guard pendingEpisodeWatched.count < 32 else { return }
+                pendingEpisodeWatched["\(meta.libraryId)|\(meta.videoId)"] = PendingEpisodeWatched(
+                    meta: meta, target: target, expiresAt: Date().addingTimeInterval(300))
+                VXProbe.log("playback", "episode watched mark deferred until exact metadata is ready")
                 return
             }
             var payload: [String: Any] = ["id": meta.videoId]
             if let season = meta.season { payload["season"] = season }
             if let episode = meta.episode { payload["episode"] = episode }
-            dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]])
+            if dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]]) {
+                pendingEpisodeWatched.removeValue(forKey: "\(meta.libraryId)|\(meta.videoId)")
+            }
         } else {
             // The MetaDetails action is id-less and would mutate whichever movie is resident after
             // navigation. The Ctx action below remains safely keyed by the captured library id.
@@ -2001,6 +2047,42 @@ final class CoreBridge: ObservableObject {
             // id, no meta_details dependency) so a finished movie reliably leaves Continue Watching.
             dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": meta.libraryId, "is_watched": true]])
         }
+    }
+
+    /// Called only on main after a real metadata publication. Alias-aware navigation matching still
+    /// requires the exact selected request and episode; an unrelated detail can never consume this queue.
+    private func replayPendingEpisodeWatched() {
+        let now = Date()
+        for key in Array(pendingEpisodeWatched.keys) {
+            guard let pending = pendingEpisodeWatched[key] else { continue }
+            switch LibraryWatchedMutationPolicy.deferredDecision(
+                expiresAt: pending.expiresAt, now: now,
+                ownsContext: pending.target.stillOwnsCurrentContext(core: self),
+                logoutPending: logoutAccountMutationPending,
+                metadataMatches: episodeWatchedMetadataMatches(pending.meta)) {
+            case .discard:
+                pendingEpisodeWatched.removeValue(forKey: key)
+                continue
+            case .wait:
+                continue
+            case .dispatch:
+                break
+            }
+            var payload: [String: Any] = ["id": pending.meta.videoId]
+            if let season = pending.meta.season { payload["season"] = season }
+            if let episode = pending.meta.episode { payload["episode"] = episode }
+            if dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, true]]) {
+                pendingEpisodeWatched.removeValue(forKey: key)
+                VXProbe.log("playback", "deferred episode watched mark dispatched to exact metadata")
+            }
+        }
+    }
+
+    private func episodeWatchedMetadataMatches(_ meta: PlaybackMeta) -> Bool {
+        LibraryWatchedMutationPolicy.residentMatches(
+            .init(id: meta.libraryId, type: meta.type),
+            residentID: metaDetails?.meta?.id, residentType: metaDetails?.meta?.type)
+        || metaDetails?.appleCWNavigationMeta(for: meta.libraryId, streamID: meta.videoId) != nil
     }
 
     /// Resume position (seconds) from the engine's library item for `meta`, or nil if the engine has
@@ -2187,6 +2269,9 @@ final class CoreBridge: ObservableObject {
             return
         }
         guard !logoutAccountMutationPending else { return }
+        if !isWatched {
+            pendingEpisodeWatched = pendingEpisodeWatched.filter { $0.value.meta.libraryId != id }
+        }
         dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]])
     }
 
@@ -2851,7 +2936,8 @@ final class CoreBridge: ObservableObject {
                  field: "player")
     }
 
-    private func dispatchMetaDetails(_ action: [String: Any]) {
+    @discardableResult
+    private func dispatchMetaDetails(_ action: [String: Any]) -> Bool {
         dispatch(action: ["action": "MetaDetails", "args": action], field: "meta_details")
     }
 
@@ -3617,11 +3703,21 @@ final class CoreBridge: ObservableObject {
             guard let self, self.publicationStillCurrent(publicationToken) else { return }
             self.metaDetailsWork?.cancel()
             let refreshGenerationAtSchedule = self.appleCWMetaRefreshRequest?.generation
+            let refindGenerationAtSchedule = self.refindGeneration
             let work = DispatchWorkItem { [weak self] in
                 guard let self else { return }
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self else { return }
-                    let details = self.decode(CoreMetaDetails.self, field: "meta_details")
+                    let details: CoreMetaDetails?
+                    do {
+                        guard let data = self.stateData("meta_details") else { return }
+                        // A valid JSON null is an unload receipt. A decoding/read failure is not:
+                        // preserve the current UI and never use a malformed snapshot to authorize Load.
+                        details = try Self.decoder.decode(CoreMetaDetails?.self, from: data)
+                    } catch {
+                        VXProbe.log("engine", "metadata receipt decode failed; retaining last valid snapshot")
+                        return
+                    }
                     if VXProbe.enabled {
                         // Count ready streams across every source group so the log shows when streams
                         // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
@@ -3636,7 +3732,8 @@ final class CoreBridge: ObservableObject {
                         // debounce work was scheduled. If teardown cancelled that generation, or a
                         // replacement player installed another one, discard the stale work before it can
                         // republish meta or drive the replacement's invalidation/load state.
-                        guard self.appleCWMetaRefreshRequest?.generation == refreshGenerationAtSchedule else {
+                        guard self.appleCWMetaRefreshRequest?.generation == refreshGenerationAtSchedule,
+                              self.refindGeneration == refindGenerationAtSchedule else {
                             return
                         }
                         if Self.metaDetailsNeedsRepublish(current: self.metaDetails, next: details) {
@@ -3648,12 +3745,17 @@ final class CoreBridge: ObservableObject {
                             self.metaDetails = details
                             if streamsChanged { self.streamsEpoch &+= 1 }
                         }
+                        self.replayPendingEpisodeWatched()
                         // Re-find sources: the minimal Unload -> nil -> Load arm, independent of the Apple CW
                         // authoritative refresh. The Unload's nil meta_details receipt is the only thing that
                         // opens the exact Load (a same-ID ready re-emit is NOT invalidation). One-shot: clear
                         // the request as the Load is dispatched, then the ordinary republish above refills the
                         // source list from the fresh sources as they land.
-                        if let refind = self.refindRequest, refind.awaitingInvalidation, details == nil {
+                        let invalidated = AppleCWMetaInvalidationPolicy.isUnloaded(
+                            hasSelection: details?.selected != nil,
+                            hasMetaProviders: !(details?.metaItems.isEmpty ?? true),
+                            hasStreamRequests: !(details?.allStreamGroups.isEmpty ?? true))
+                        if let refind = self.refindRequest, refind.awaitingInvalidation, invalidated {
                             self.refindRequest = nil
                             self.dispatch(
                                 action: self.metaLoadAction(
@@ -3678,7 +3780,7 @@ final class CoreBridge: ObservableObject {
                             // A same-ID ready re-emit is explicitly NOT invalidation. Leave the request
                             // pending so an unrelated event cannot turn a Load no-op into proof. Only the
                             // explicit Unload's nil meta_details receipt opens the exact Load phase.
-                            guard details == nil else { return }
+                            guard invalidated else { return }
                             self.appleCWMetaRefreshRequest?.phase = .awaitingLoadSettlement
                             self.dispatch(
                                 action: self.metaLoadAction(

@@ -3603,12 +3603,14 @@ final class MPVMetalViewController: PlatformViewController {
         loggedHardwareDecoderNegotiation = true
         let width = getInt("video-params/w")
         let height = getInt("video-params/h")
-        let codec = getString("video-codec-name") ?? "unknown"
+        let codec = getString("video-format") ?? getString("video-codec") ?? "unknown"
+        let pixelFormat = getString("video-params/pixelformat") ?? "unknown"
+        let hardwarePixelFormat = getString("video-params/hw-pixelformat") ?? "none"
         let fallback = MPVHardwareDecodePolicy.isSoftwareFallback(
             requested: requestedHardwareDecoder, active: active)
         DiagnosticsLog.log(
             "player",
-            "hwdec negotiation requested=\(requestedHardwareDecoder) active=\(active) fallback=\(fallback) codec=\(codec) video=\(width)x\(height)"
+            "hwdec negotiation requested=\(requestedHardwareDecoder) active=\(active) fallback=\(fallback) codec=\(codec) video=\(width)x\(height) pixelFormat=\(pixelFormat) hardwarePixelFormat=\(hardwarePixelFormat)"
         )
     }
 
@@ -3654,7 +3656,7 @@ final class MPVMetalViewController: PlatformViewController {
         rows.append(("Player", "libmpv"))   // this overlay is the libmpv path; the AVPlayer path (HLS/DV) has its own
         // --- Video ---
         let w = getInt("video-params/w"), h = getInt("video-params/h")
-        if w > 0 { rows.append(("Video", "\(w)×\(h)  \(getString("video-codec-name") ?? "")")) }
+        if w > 0 { rows.append(("Video", "\(w)×\(h)  \(getString("video-format") ?? getString("video-codec") ?? "")")) }
         let gamma = getString("video-params/gamma") ?? ""
         let primaries = getString("video-params/primaries") ?? ""
         let range = gamma == "pq" ? "HDR (PQ)" : gamma == "hlg" ? "HLG" : "SDR"
@@ -4345,6 +4347,7 @@ final class MPVMetalViewController: PlatformViewController {
                               ) else { return }
                         self.reapplyDynamicRange()
                         self.updateCapturePipeline()
+                        self.recordHardwareDecoderNegotiation(active: self.getString("hwdec-current"))
                     }
                 case MPV_EVENT_END_FILE:
                     // A file finished, if it ENDED IN ERROR (couldn't open: dead/uncached link,

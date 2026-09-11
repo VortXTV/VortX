@@ -285,6 +285,9 @@ struct iOSSettingsView: View {
                         // does not fire for our dotted keys), so re-read the init-once caches here. Without it
                         // the restored theme / rails / catalog prefs / playlists stay invisible AND the stale
                         // in-memory copies get flushed back over them on the next change, undoing the restore.
+                        // The imported profile roster owns catalog order. Reload it before the flat
+                        // discovery projections so a stale live profile cannot overwrite the restore.
+                        ProfileStore.shared.reloadFromDefaults()
                         SettingsBackup.reloadLiveStores()
                         backupAlert = BackupAlert(title: String(localized: "Restore Complete"),
                             message: "\(count) settings restored. Relaunch the app to apply everything.")

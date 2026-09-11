@@ -1,5 +1,34 @@
 import Foundation
 
+/// Bounds missing-runtime fallback work independently of the 2–4 Hz player clock. The caller cancels
+/// the old task on identity change; failed lookups may retry only after a quiet interval.
+struct TrickplayRuntimeLookupGate {
+    struct Claim: Equatable { let key: String; let generation: UInt64 }
+    private var key: String?
+    private var generation: UInt64 = 0
+    private var inFlight = false
+    private var retryAfter = 0.0
+
+    mutating func begin(key: String, now: Double) -> Claim? {
+        if self.key != key { self.key = key; inFlight = false; retryAfter = 0 }
+        guard !inFlight, now >= retryAfter else { return nil }
+        generation &+= 1
+        inFlight = true
+        return Claim(key: key, generation: generation)
+    }
+
+    mutating func finish(_ claim: Claim, now: Double, succeeded: Bool) {
+        guard key == claim.key, generation == claim.generation else { return }
+        inFlight = false
+        retryAfter = succeeded ? .infinity : now + 30
+    }
+
+    mutating func cancel() {
+        generation &+= 1
+        key = nil; inFlight = false; retryAfter = 0
+    }
+}
+
 /// Local-preview capture follows the same configured playback-time cadence that
 /// community coverage and VTT metadata advertise. Frame-drop diagnostics are
 /// deliberately absent: telemetry must never disable capture.
