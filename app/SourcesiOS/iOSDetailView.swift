@@ -807,7 +807,7 @@ struct iOSDetailView: View {
     /// ~20% strip on a modern phone) and ~58% of the Mac window, clamped so a short window still shows
     /// the action row without scrolling. Kept a fixed-per-layout (not aspect-ratio) band because the
     /// hero overlays a text block that an aspectRatio would fight on narrow windows.
-    private func heroBandHeight(viewport: CGFloat) -> CGFloat {
+    private func heroBandHeight(width: CGFloat, viewport: CGFloat) -> CGFloat {
         #if os(macOS)
         // The Mac detail hero reads near-fullscreen so the page stops looking empty (owner ask): on a TALL
         // window the cinematic banner takes ~72% of the height. But because `macDetailBody` PINS this band
@@ -823,8 +823,7 @@ struct iOSDetailView: View {
         let band = min(1000, min(viewport * 0.72, viewport - reservedForContent))
         return max(280, band)
         #else
-        guard viewport > 0 else { return 420 }
-        return max(360, viewport * 0.60)
+        return SourcePresentationPolicy.mobileHeroHeight(width: width, viewport: viewport)
         #endif
     }
 
@@ -1361,7 +1360,7 @@ struct iOSDetailView: View {
     /// title / meta / ratings / clamped-synopsis overlay and the circular back/overflow chrome. On macOS
     /// this is the FIXED layer of the pinned-hero scroll model; on iOS it is the top of the single column.
     private func heroBanner(width: CGFloat, height: CGFloat) -> some View {
-        let band = heroBandHeight(viewport: height)
+        let band = heroBandHeight(width: width, viewport: height)
         return ZStack(alignment: .bottomLeading) {
             backdrop(height: band)
                 // #44: cross-fade a muted, looping trailer clip over the still backdrop a beat after it
@@ -4340,7 +4339,7 @@ struct iOSEpisodeStreams: View {
         #else
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                hero(width: geo.size.width)
+                hero(width: geo.size.width, viewport: geo.size.height)
                 sourceListView(width: geo.size.width)
             }
             .padding(.bottom, Theme.Space.xl)
@@ -4509,13 +4508,13 @@ struct iOSEpisodeStreams: View {
 
     /// Episode backdrop + show eyebrow + episode title + S·E / air date / facts + overview, mirroring
     /// the tvOS `CoreEpisodeStreams` header block.
-    private func hero(width: CGFloat) -> some View {
+    private func hero(width: CGFloat, viewport: CGFloat) -> some View {
         // Fixed backdrop banner (show eyebrow + episode title + meta overlaid) with the overview flowing
         // below on the canvas, same structure as iOSDetailView.hero, so a long episode synopsis can't push
         // the backdrop down behind the text.
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             ZStack(alignment: .bottomLeading) {
-                backdrop
+                backdrop(height: SourcePresentationPolicy.mobileHeroHeight(width: width, viewport: viewport))
                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     Text(meta.name.uppercased())
                         .font(Theme.Typography.eyebrow).tracking(1.5)
@@ -6330,12 +6329,8 @@ extension iOSSourceList: Equatable {
     }
 }
 
-/// A CLEAN source row, mirroring the tvOS stream list's parsed labelling instead of dumping the
-/// add-on's raw verbose blurb (e.g. "Stream Expression (308) / Included Reasons / Removal Reasons /
-/// digitalRelease Bypass"). It shows: a leading play/torrent icon, a quality badge (4K / 1080p / …)
-/// next to the add-on + TORRENT badges, the parsed flavour tags (Remux · HDR · Atmos · HEVC · Cached)
-/// + file size, and a single trimmed title line for human context, built from `StreamRanking.sourceDetail`
-/// and `StreamRanking.qualityLabel`, the same parse that powers the Watch / Quality affordances.
+/// Source rows retain the add-on's authored formatter by default, matching the TV detail page.
+/// Parsed quality/flavour/size labels remain available through the explicit compact preference.
 private struct iOSStreamLabel: View {
     let addon: String
     let stream: CoreStream
@@ -6393,7 +6388,7 @@ private struct iOSStreamLabel: View {
                 }
                 // Parsed flavour tags + size, the clean line tvOS shows, minus the resolution (it is
                 // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".
-                if !flavors.isEmpty || size != nil {
+                if compactLabels && (!flavors.isEmpty || size != nil) {
                     HStack(spacing: 8) {
                         if !flavors.isEmpty {
                             Text(flavors.joined(separator: " · "))
@@ -6409,41 +6404,24 @@ private struct iOSStreamLabel: View {
                         }
                     }
                 }
-                // The release title for human context. Allowed two lines so the fuller release name
-                // shows (people want the detail) while a verbose multi-line add-on blurb still can't
-                // run away; `cleanTitle` already keeps only the first line of the add-on's name.
-                // Compact rows (#117) drop this line entirely: the parsed badges + tags + size above
-                // are the whole row.
-                if !compactLabels, let title = cleanTitle {
-                    Text(title)
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                        .lineLimit(2).truncationMode(.tail)
+                if !compactLabels {
+                    let lines = SourcePresentationPolicy.text(
+                        name: stream.name, description: stream.description,
+                        filename: stream.behaviorHints?.filename
+                    )
+                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                        Text(verbatim: line)
+                            .font(Theme.Typography.label)
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
             Spacer(minLength: 0)
         }
         .padding(Theme.Space.md)
         .opacity(enabled ? 1 : 0.55)
-    }
-
-    /// A single trimmed context line: the actual RELEASE NAME. Prefer behaviorHints.filename; it is the
-    /// only field that distinguishes "...Deathly.Hallows.Part.1..." from "Part.2", which a short add-on
-    /// label / quality blurb in `name` drops. Fall back to the stream `name`, then the first line of
-    /// `description`. Newlines collapse to the first line and a trailing container extension is stripped;
-    /// never the full multi-line blurb (the row is lineLimit(2), tail-truncated).
-    private var cleanTitle: String? {
-        let candidates = [stream.behaviorHints?.filename, stream.name, stream.description]
-        guard let raw = candidates.compactMap({ $0 }).first(where: { !$0.isEmpty }) else { return nil }
-        let firstLine = raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? raw
-        var trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        if let dot = trimmed.lastIndex(of: "."), trimmed.distance(from: dot, to: trimmed.endIndex) <= 6 {
-            let ext = trimmed[trimmed.index(after: dot)...].lowercased()
-            if ["mkv", "mp4", "avi", "ts", "m2ts", "webm", "mov", "wmv"].contains(ext) {
-                trimmed = String(trimmed[..<dot]).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        return trimmed.isEmpty ? nil : trimmed
     }
 
     @ViewBuilder private func badge(_ text: String, prominent: Bool = false) -> some View {
