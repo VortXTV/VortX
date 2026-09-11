@@ -1575,7 +1575,7 @@ extension DebridCoordinator {
             await warmIfNeeded()
             guard !Task.isCancelled, let usenetCapture = currentAuthorityCapture() else { return nil }
             let usenetRevision = latestCredentialRevision
-            // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet provider, resolve
+            // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet providers, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
             // TorBox EXCEPT when TorBox already has this source confirmed-cached (an instant direct link that
             // should win the auto-pick race), so a dual-configured user still plays a cached TorBox usenet
@@ -1584,12 +1584,16 @@ extension DebridCoordinator {
             // "no resolver" nil. Compiled out on Lite (no embedded server), which stays TorBox-only.
             #if !VORTX_NO_EMBEDDED_SERVER
             let torBoxHasItCached = confirmedUsenetURLs?.contains(nzb) ?? false
-            let usenetCreds = UsenetProviderStore.loadCredentials()
-            if !torBoxHasItCached, (!stream.usenetServers.isEmpty || usenetCreds != nil) {
+            // ONE synchronous owner-scoped snapshot of EVERY enabled server (priority order), taken before
+            // any await: the resolver routes through all of them and never reads the account/Keychain again
+            // inside the network awaits below.
+            let usenetSavedServers = UsenetProviderStore.loadEnabledServers(ownerCapture: usenetCapture)
+            if !torBoxHasItCached, (!stream.usenetServers.isEmpty || !usenetSavedServers.isEmpty) {
                 do {
                     let local = try await runProvider(capture: usenetCapture, revision: usenetRevision) {
                         try await UsenetLocalResolver.resolveRouted(
-                            nzbURLs: stream.usenetURLs, servers: stream.usenetServers, credentials: usenetCreds,
+                            nzbURLs: stream.usenetURLs, servers: stream.usenetServers,
+                            savedServers: usenetSavedServers,
                             waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes
                         )
                     }
