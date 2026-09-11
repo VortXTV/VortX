@@ -17,15 +17,15 @@ import java.util.Locale
  * re-renders the hub live. Every key string + default is Apple's EXACT value so the choices ride the same
  * cross-device carriage.
  *
- * CONSUMER STATUS on Android today (the rest persist on the exact key, ready for their consumer):
+ * Current consumers:
  *   - `vortx.home.showCollectionsHub`      -> CollectionsHubModel (WIRED, live).
  *   - `vortx.collections.refreshCadence`   -> CollectionsHubModel (WIRED, live).
- *   - `vortx.home.showCuratedRails`        -> no consumer yet (editorial-rails gate not ported).
- *   - `vortx.discover.showCollectionsHub`  -> no consumer yet (Discover hub not ported).
- *   - `vortx.mergeDiscoverSearch`          -> no consumer yet (combined surface not ported).
- *   - `vortx.detail.showFinancials`        -> no consumer yet (financials rows not ported).
- *   - `vortx.detail.spoilerSafe` / `vortx.spoilerBlur` -> no consumer yet (spoiler veil not ported).
- *   - `stremiox.catalog.hidePosterLabels`  -> no consumer yet (poster-label hide not ported).
+ *   - `vortx.home.showCuratedRails`        -> Home view model.
+ *   - `vortx.discover.showCollectionsHub`  -> phone and TV Discover hub, independent of Home.
+ *   - `vortx.mergeDiscoverSearch`          -> application navigation.
+ *   - `vortx.detail.showFinancials`        -> phone and TV detail.
+ *   - `vortx.detail.spoilerSafe` / `vortx.spoilerBlur` -> episode spoiler veils.
+ *   - `stremiox.catalog.hidePosterLabels`  -> poster presentation preferences.
  */
 class HomeDiscoverPreferences(context: Context) {
 

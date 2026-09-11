@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.onSubscription
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -37,6 +38,9 @@ import java.time.LocalDate
 import java.util.Locale
 
 internal const val SHOW_COLLECTIONS_HUB_KEY = "vortx.home.showCollectionsHub"
+internal enum class CollectionsHubSurface(val visibilityKey: String) {
+    HOME(SHOW_COLLECTIONS_HUB_KEY), DISCOVER("vortx.discover.showCollectionsHub")
+}
 internal const val COLLECTIONS_REFRESH_CADENCE_KEY = "vortx.collections.refreshCadence"
 internal const val COLLECTIONS_SELECTED_PROVIDERS_KEY = "vortx.collections.selectedProviders"
 internal const val COLLECTIONS_PROVIDER_ORDER_KEY = "vortx.collections.providerOrder"
@@ -229,6 +233,7 @@ internal interface CollectionsHubSource {
 internal data class CollectionsHubProviderCache(val encoded: String?, val savedAtMillis: Long)
 
 internal interface CollectionsHubPreferences {
+    val visibilityKey: String get() = SHOW_COLLECTIONS_HUB_KEY
     fun enabled(): Boolean
     fun refreshCadence(): String
     fun selectedProviders(): String
@@ -260,12 +265,13 @@ internal interface CollectionsHubPreferences {
     fun close()
 }
 
-private class AndroidCollectionsHubPreferences(context: Context) : CollectionsHubPreferences {
+private class AndroidCollectionsHubPreferences(context: Context, surface: CollectionsHubSurface) : CollectionsHubPreferences {
+    override val visibilityKey = surface.visibilityKey
     private val prefs = context.applicationContext
         .getSharedPreferences(ProfileStore.PREFS_FILE, Context.MODE_PRIVATE)
     private var preferenceListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
-    override fun enabled(): Boolean = prefs.getBoolean(SHOW_COLLECTIONS_HUB_KEY, COLLECTIONS_HUB_ENABLED_DEFAULT)
+    override fun enabled(): Boolean = prefs.getBoolean(visibilityKey, COLLECTIONS_HUB_ENABLED_DEFAULT)
 
     override fun refreshCadence(): String =
         prefs.getString(COLLECTIONS_REFRESH_CADENCE_KEY, COLLECTIONS_REFRESH_CADENCE_DEFAULT)
@@ -348,8 +354,9 @@ internal class CollectionsHubModel internal constructor(
         source: CollectionsHubSource = EdgeCollectionsHubSource(),
         nowMillis: () -> Long = System::currentTimeMillis,
         tmdbCatalogSupported: suspend () -> Boolean = { false },
+        surface: CollectionsHubSurface = CollectionsHubSurface.HOME,
     ) : this(
-        preferences = AndroidCollectionsHubPreferences(context.applicationContext),
+        preferences = AndroidCollectionsHubPreferences(context.applicationContext, surface),
         source = source,
         nowMillis = nowMillis,
         tmdbCatalogSupported = tmdbCatalogSupported,
@@ -375,8 +382,12 @@ internal class CollectionsHubModel internal constructor(
     private val _settingsChanges = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val settingsChanges: SharedFlow<Unit> = _settingsChanges.asSharedFlow()
 
+    // Register before the initial request: a synchronous settings change during initial loading must
+    // already have a subscriber, even though this shared flow deliberately retains no replay history.
+    internal fun refreshRequests(): kotlinx.coroutines.flow.Flow<Unit> = settingsChanges.onSubscription { emit(Unit) }
+
     private val listener: (String) -> Unit = { key ->
-        if (key == SHOW_COLLECTIONS_HUB_KEY ||
+        if (key == preferences.visibilityKey ||
             key == COLLECTIONS_REFRESH_CADENCE_KEY ||
             key == COLLECTIONS_SELECTED_PROVIDERS_KEY ||
             key == COLLECTIONS_PROVIDER_ORDER_KEY ||

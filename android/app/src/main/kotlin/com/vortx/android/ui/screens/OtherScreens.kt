@@ -37,6 +37,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -67,6 +68,10 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.components.CollectionsHub
+import com.vortx.android.ui.components.CollectionsBrowseScreen
+import com.vortx.android.ui.components.rememberDiscoverHub
+import kotlinx.coroutines.launch
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.PosterArt
@@ -118,6 +123,23 @@ fun DiscoverScreen(
     // SD-8: without a Stremio or VortX sign-in there are no catalogs to pivot; show the sign-in prompt.
     if (!signedIn) {
         SignedOutState(modifier = modifier.fillMaxSize())
+        return
+    }
+
+    val collectionsHub = rememberDiscoverHub()
+    val snapshot by collectionsHub.snapshot.collectAsStateWithLifecycle()
+    val browse by collectionsHub.browse.collectAsStateWithLifecycle()
+    val hubScope = rememberCoroutineScope()
+    if (browse.target != null) {
+        CollectionsBrowseScreen(
+            state = browse,
+            onBack = collectionsHub::closeBrowse,
+            onItem = onItem,
+            onCategory = { hubScope.launch { collectionsHub.selectCategory(it) } },
+            onRetry = { hubScope.launch { collectionsHub.retry() } },
+            onLoadMore = { hubScope.launch { collectionsHub.loadMore() } },
+            modifier = modifier,
+        )
         return
     }
 
@@ -175,6 +197,11 @@ fun DiscoverScreen(
                     },
                     showMenu = true,
                     gridState = gridState,
+                    header = if (snapshot.isVisible) {
+                        { CollectionsHub(snapshot,
+                            onOpen = { target -> hubScope.launch { collectionsHub.open(target) } },
+                            onRetryProviders = { hubScope.launch { collectionsHub.load() } }) }
+                    } else null,
                     footer = if (s.data.filters.hasNextPage) {
                         { LoadMoreFooter(loading = loadingMore, onClick = viewModel::loadMore) }
                     } else {
@@ -698,8 +725,9 @@ internal fun PosterGrid(
     // own scroll state (Library, the offline preview).
     gridState: LazyGridState? = null,
     footer: (@Composable () -> Unit)? = null,
+    header: (@Composable () -> Unit)? = null,
 ) {
-    if (items.isEmpty()) {
+    if (items.isEmpty() && header == null) {
         EmptyState(emptyHint, modifier)
         return
     }
@@ -723,6 +751,8 @@ internal fun PosterGrid(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
+        if (header != null) item(span = { GridItemSpan(maxLineSpan) }) { header() }
+        if (items.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) { EmptyState(emptyHint) }
         sections.forEach { section ->
             section.kind?.let { kind ->
                 item(key = searchResultSectionHeaderKey(kind), span = { GridItemSpan(maxLineSpan) }) {

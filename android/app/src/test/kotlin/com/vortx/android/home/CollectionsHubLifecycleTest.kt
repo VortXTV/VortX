@@ -14,6 +14,9 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -21,6 +24,56 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CollectionsHubLifecycleTest {
+    @Test fun `settings refresh emitted during first load is not lost before subscription`() = runBlocking {
+        val prefs = FakeCollectionsPreferences(CollectionsHubSurface.DISCOVER.visibilityKey)
+        val calls = AtomicInteger()
+        val refreshed = CompletableDeferred<Unit>()
+        val model = model(prefs, source(providers = { _, _ ->
+            if (calls.incrementAndGet() == 1) {
+                prefs.notify(COLLECTIONS_REFRESH_CADENCE_KEY)
+                awaitCancellation()
+            }
+            refreshed.complete(Unit)
+            emptyList()
+        }))
+        val collector = launch { model.refreshRequests().collectLatest { model.load() } }
+        try {
+            withTimeout(1_000) { refreshed.await() }
+            assertEquals(2, calls.get())
+        } finally {
+            collector.cancelAndJoin()
+            model.close()
+        }
+    }
+
+    @Test fun `visibility notifications belong only to the selected surface`() = runBlocking {
+        for (surface in CollectionsHubSurface.entries) {
+            val prefs = FakeCollectionsPreferences(surface.visibilityKey)
+            val model = model(prefs, source(providers = { _, _ -> emptyList() }))
+            val event = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                model.settingsChanges.first()
+            }
+            try {
+                assertTrue(model.snapshot.value.isVisible)
+                prefs.enabled = false
+                val other = CollectionsHubSurface.entries.first { it != surface }
+                prefs.notify(other.visibilityKey)
+                assertTrue(model.snapshot.value.isVisible)
+                assertFalse(event.isCompleted)
+                prefs.notify(surface.visibilityKey)
+                withTimeout(1_000) { event.await() }
+                assertFalse(model.snapshot.value.isVisible)
+                prefs.enabled = true
+                prefs.notify(surface.visibilityKey)
+                assertTrue(model.snapshot.value.isVisible)
+            } finally {
+                event.cancelAndJoin()
+                model.close()
+            }
+            assertTrue(prefs.closed)
+        }
+    }
+
     @Test
     fun `provider loading is distinct from valid empty`() = runBlocking {
         val started = CompletableDeferred<Unit>()
@@ -734,7 +787,7 @@ class CollectionsHubLifecycleTest {
     )
 }
 
-private class FakeCollectionsPreferences : CollectionsHubPreferences {
+private class FakeCollectionsPreferences(override val visibilityKey: String = SHOW_COLLECTIONS_HUB_KEY) : CollectionsHubPreferences {
     var enabled = true
     var cadence = COLLECTIONS_REFRESH_CADENCE_DEFAULT
     var selected = COLLECTIONS_SELECTED_PROVIDERS_DEFAULT

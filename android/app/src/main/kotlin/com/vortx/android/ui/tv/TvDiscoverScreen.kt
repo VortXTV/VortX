@@ -12,7 +12,6 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -21,15 +20,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.R
-import com.vortx.android.VortXApplication
-import com.vortx.android.home.CollectionsHubModel
-import com.vortx.android.home.CollectionsHubProviderPolicy
 import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.MetaItem
@@ -61,25 +56,11 @@ fun TvDiscoverScreen(
         return
     }
 
-    // Reuse the phone Collections hub model + composable (TvCollectionsHub / TvCollectionsBrowseScreen). It is
-    // owned here in-composition rather than injected through the (un-owned) ViewModel factory: a plain class
-    // held in `remember`, loaded once, and closed on dispose so it never leaks its prefs listener.
-    val context = LocalContext.current
-    val repo = remember { (context.applicationContext as? VortXApplication)?.catalogRepository }
-    val collectionsHub = remember {
-        CollectionsHubModel(
-            context = context.applicationContext,
-            tmdbCatalogSupported = {
-                repo?.installedAddons()?.getOrNull()
-                    ?.let(CollectionsHubProviderPolicy::supportsTmdbCatalogItems) ?: false
-            },
-        )
-    }
+    // Share the phone's Discover-only preference/lifecycle wiring; Home retains its independent instance.
+    val collectionsHub = com.vortx.android.ui.components.rememberDiscoverHub()
     val snapshot by collectionsHub.snapshot.collectAsStateWithLifecycle()
     val browse by collectionsHub.browse.collectAsStateWithLifecycle()
     val hubScope = rememberCoroutineScope()
-    LaunchedEffect(collectionsHub) { collectionsHub.load() }
-    DisposableEffect(collectionsHub) { onDispose { collectionsHub.close() } }
 
     // A tapped Collections tile takes over the whole surface with its own category browse, exactly like the
     // Home hub does (reuses the shared TvCollectionsBrowseScreen).
