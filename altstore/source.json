@@ -19,6 +19,16 @@
       "versions": [
         {
           "version": "0.4.0",
+          "buildVersion": "247",
+          "date": "2026-09-11",
+          "localizedDescription": "Apple playback, source controls and episode artwork repairs; Android audio, remote, Discover and title-relation improvements; profile-specific collection visibility.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.14/VortX-iOS-v0.4.0-beta.14-ci.ipa",
+          "size": 65500086,
+          "sha256": "bc5d4af376778faea57e8d56983df7a1cd1954c00be0c2ea42af7fe1cc5d760b",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.4.0",
           "buildVersion": "245",
           "date": "2026-09-11",
           "localizedDescription": "Apple build 245: playback recovery, add-on order and sync, artwork, prioritized Usenet and NZB indexers.",
@@ -86,16 +96,6 @@
           "size": 64763243,
           "sha256": "3345a872e545bf40ec9801ef0a2980c5ee481cfdefd21ab28c55e2831f15d026",
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "232",
-          "date": "2026-08-29",
-          "localizedDescription": "Beta 30 fixes Dolby Vision fallback, pause and episode navigation, watched state, subtitles, seek previews, and TorBox source recovery. Android is nearly ready and follows in Beta 31.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.30/VortX-iOS-v0.3.14-beta.30-ci.ipa",
-          "size": 64674417,
-          "sha256": "2e354cb5e031832e0c0ba935f9896d7db0f0537908f57dd690c903d594175179",
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -110,6 +110,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.4.0",
+          "buildVersion": "247",
+          "date": "2026-09-11",
+          "localizedDescription": "Apple playback, source controls and episode artwork repairs; Android audio, remote, Discover and title-relation improvements; profile-specific collection visibility.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.14/VortX-tvOS-v0.4.0-beta.14-ci.ipa",
+          "size": 65060961,
+          "sha256": "bade529bf77d30b5dbf769680769a0c2925e5f9f1679d21fb8a0a9ec1128318c",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.4.0",
           "buildVersion": "245",
@@ -178,16 +188,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.15/VortX-tvOS-v0.3.15-ci.ipa",
           "size": 64301950,
           "sha256": "7e4aad49f59db588f7f612795ca5602c6fee8974bd654f2377e73ecd25120628",
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.3.14",
-          "buildVersion": "232",
-          "date": "2026-08-29",
-          "localizedDescription": "Beta 30 fixes Dolby Vision fallback, pause and episode navigation, watched state, subtitles, seek previews, and TorBox source recovery. Android is nearly ready and follows in Beta 31.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.3.14-beta.30/VortX-tvOS-v0.3.14-beta.30-ci.ipa",
-          "size": 64162737,
-          "sha256": "b2a1b5c95b05b74afa7131f65a8b73a6756edcd6f8cc91e0240f1da5f54d317e",
           "minOSVersion": "18.0"
         }
       ]
