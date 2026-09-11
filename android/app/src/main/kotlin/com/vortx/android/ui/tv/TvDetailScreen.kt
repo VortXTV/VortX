@@ -554,6 +554,22 @@ private fun TvDetailContent(
             // collection. Each tile resolves its tmdb: id to a tt id before opening, the same fail-soft resolve
             // the More Like This rail uses.
             movieCollection?.takeIf { it.parts.size > 1 }?.let { collection ->
+                val (previous, next) = collection.releaseNeighbors()
+                listOf("Previous (Release Order)" to previous, "Next (Release Order)" to next)
+                    .forEach { (heading, neighbor) ->
+                        if (neighbor != null) TvSimilarRail(
+                            type = MediaType.MOVIE,
+                            titles = listOf(neighbor),
+                            onOpen = { item ->
+                                scope.launch {
+                                    val tt = TMDBPersonClient.imdbId(item.id, item.type)
+                                    onOpenTitle(if (tt != null) item.copy(id = tt) else item)
+                                }
+                            },
+                            heading = heading,
+                            modifier = Modifier.padding(top = TvDimens.rowGap),
+                        )
+                    }
                 TvCollectionRail(
                     collection = collection,
                     onOpen = { item ->

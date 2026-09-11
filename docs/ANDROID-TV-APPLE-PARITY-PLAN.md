@@ -6,7 +6,7 @@ Status: planned after 0.4 Beta 1. This is not a claim that parity ships in Beta 
 
 Phone and TV now show add-on-declared Prequel, Sequel, and Related rails through the normal detail navigation. They use the currently loaded metadata, preserve movie/series IDs (including namespaced anime IDs on series routes), reject external/malformed links, remove self-links and duplicates, and remain hidden for live content. Both Android variants compile and pass their unit suites; physical TV focus testing remains required.
 
-This follow-up is not in Beta 13. Still outstanding: custom `anime`/other content-type routing without coercing types to movies; TMDB previous/next collection release-order cards; full visual and remote-navigation acceptance below. The existing collection rail remains unchanged.
+This follow-up is not in Beta 13. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. Still outstanding: custom `anime`/other content-type routing without coercing types to movies, plus full visual and remote-navigation acceptance below.
 
 The Apple TV app is the reference for layout, navigation, information hierarchy, and behavior. Android phone remains a separate touch layout. Reuse Android's existing repositories, player engines, and profile stores; do not port Apple source files or replace current code with an older release.
 

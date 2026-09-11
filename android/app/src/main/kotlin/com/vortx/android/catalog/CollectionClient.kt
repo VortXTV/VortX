@@ -2,6 +2,7 @@ package com.vortx.android.catalog
 
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import java.time.LocalDate
 
 /// DET "Collection / franchise": the TMDB collection a MOVIE belongs to (`belongs_to_collection` on
 /// /movie/{id}) with every entry resolved to a card in RELEASE ORDER, the Android port of Apple
@@ -14,7 +15,23 @@ object CollectionClient {
 
     /// A movie's franchise: the collection's display name plus every entry as an engine-openable card, in
     /// release order. Mirrors Apple `TMDBClient.CollectionResult`.
-    data class MovieCollection(val id: Int, val name: String, val parts: List<MetaItem>)
+    data class MovieCollection(
+        val id: Int,
+        val name: String,
+        val parts: List<MetaItem>,
+        val currentPartId: String? = null,
+        val datedPartIds: Set<String> = emptySet(),
+    ) {
+        /** Release-order neighbors, never an assertion about narrative prequels or sequels. */
+        fun releaseNeighbors(): Pair<MetaItem?, MetaItem?> {
+            val dated = parts.filter { it.id in datedPartIds }
+            val index = dated.indexOfFirst { it.id == currentPartId }
+            return if (index < 0) null to null else dated.getOrNull(index - 1) to dated.getOrNull(index + 1)
+        }
+    }
+
+    internal fun hasReleaseDate(date: String): Boolean =
+        date.matches(Regex("[0-9]{4}-[0-9]{2}-[0-9]{2}")) && runCatching { LocalDate.parse(date) }.isSuccess
 
     /// The collection for [imdbId], or null with a series / a non-`tt` id / a standalone film / no data.
     /// Entries with no poster are KEPT (the card shows a placeholder) so the row lists the WHOLE set.
@@ -64,7 +81,11 @@ object CollectionClient {
                     .thenBy { it.entryIndex },
             )
             .map { it.item }
-        return MovieCollection(id = collectionId, name = name, parts = ordered)
+        return MovieCollection(
+            id = collectionId, name = name, parts = ordered,
+            currentPartId = "tmdb:$tmdbId",
+            datedPartIds = collected.filter { hasReleaseDate(it.date) }.mapTo(mutableSetOf()) { it.item.id },
+        )
     }
 
     /// The framed "Part of the <X> Collection" header from a TMDB collection name. TMDB names already end in

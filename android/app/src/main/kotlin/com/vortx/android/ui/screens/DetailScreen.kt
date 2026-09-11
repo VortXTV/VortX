@@ -626,6 +626,13 @@ fun DetailScreen(
                 // DET franchise/collection rail (MOVIES ONLY): the TMDB collection this movie belongs to, in
                 // release order, reusing the More-Like-This rail idiom. Hidden for a single-part collection.
                 movieCollection?.takeIf { it.parts.size > 1 }?.let { collection ->
+                    val (previous, next) = collection.releaseNeighbors()
+                    listOf("Previous (Release Order)" to previous, "Next (Release Order)" to next)
+                        .forEach { (heading, neighbor) ->
+                            if (neighbor != null) item {
+                                SimilarRail(MediaType.MOVIE, listOf(neighbor), openSimilar, heading)
+                            }
+                        }
                     item {
                         CollectionRail(
                             collection = collection,
