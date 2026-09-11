@@ -49,8 +49,10 @@ MOLTEN_ARCHIVE="$(find "$FALLBACK/MoltenVK" -type f -name 'libMoltenVK.a' \
   -path '*macos-arm64*' -print -quit)"
 [ -n "$MOLTEN_ARCHIVE" ] || { echo "missing macOS MoltenVK archive" >&2; exit 2; }
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/vortx-libmpv-fresh-start.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+RECOVERY="$MAIN_REPO/../_recovery/startup-playback-20260911"
+mkdir -p "$RECOVERY"
+WORK="$(mktemp -d "$RECOVERY/libmpv-fresh-start.XXXXXX")"
+echo "retained test artifacts: $WORK"
 BASE="$WORK/base.mkv"
 SHIFTED="$WORK/positive-start.mkv"
 BIN="$WORK/libmpv-fresh-start"
@@ -89,4 +91,4 @@ xcrun swiftc -sdk "$SDK_PATH" \
   -o "$BIN" \
   test/libmpv-fresh-start/main.swift
 
-"$BIN" "$SHIFTED"
+"$BIN" "$SHIFTED" "$BASE"

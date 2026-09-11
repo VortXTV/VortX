@@ -34,9 +34,24 @@ enum MPVDurationProbePolicy {
 enum MPVHardwareDecodePolicy {
     static let videoToolbox = "videotoolbox"
 
+    static func hardwarePreference(simulator: Bool) -> String {
+        // Keep zero-copy first. A real device can retain hardware decoding through copy-back
+        // when the GPU surface importer rejects a format, instead of jumping straight to CPU.
+        // Simulator uploads have a separate known Metal crash, so retain its direct-only lane.
+        simulator ? videoToolbox : "videotoolbox,videotoolbox-copy"
+    }
+
+    static var preferredVideoToolbox: String {
+        #if targetEnvironment(simulator)
+        hardwarePreference(simulator: true)
+        #else
+        hardwarePreference(simulator: false)
+        #endif
+    }
+
     static func requestedDecoder(arguments: [String]) -> String {
         guard let index = arguments.firstIndex(of: "-stremiox-hwdec"),
-              index + 1 < arguments.count else { return videoToolbox }
+              index + 1 < arguments.count else { return preferredVideoToolbox }
         return arguments[index + 1]
     }
 
@@ -367,6 +382,14 @@ final class MPVMetalViewController: PlatformViewController {
         view.addGestureRecognizer(tap)
         #endif
 
+        // Pin pixel dimensions before mpv can open its VO or load audio/video. A later first-layout
+        // `vid=no`/`vid=auto` used to destroy an already running decoder while audio kept advancing.
+        if let pixels = initialVideoSurface.prepare(
+            bounds: view.bounds.size, scale: metalLayer.contentsScale
+        ) {
+            metalLayer.drawableSize = pixels
+        }
+        VXProbe.log(probeChannel, "vo-start surfaceValidAtInit=\(!initialVideoSurface.needsInitialRebuild)")
         setupMpv()
 
         #if canImport(UIKit)
@@ -386,18 +409,9 @@ final class MPVMetalViewController: PlatformViewController {
     
     private var lastLaidOutSize: CGSize = .zero
 
-    /// True once layoutDrawable has kicked off the initial video-output build against a real,
-    /// validly sized surface. mpv configures its VO (render context + moltenvk swapchain) for the
-    /// size the metal layer has at mpv_initialize time. The full-window player and the iOS/tvOS
-    /// hero already have a sized surface then, so their first frame presents normally. The macOS
-    /// EMBEDDED hero clip is the exception: viewDidLoad (hence setupMpv / mpv_initialize) runs
-    /// before the view is in a window, so the VO configured against a zero/unsized surface and
-    /// never built a context that could present a frame, so the timePos -> showClip reveal never
-    /// fired and the hero stayed static. On the first valid layout we force one VO rebuild so the
-    /// context is (re)created at the real size and the first frame is produced. Gated by this flag
-    /// so it fires exactly once per surface config and can never turn an ordinary resize into a
-    /// VO thrash.
-    private var didBuildInitialVideoOutput = false
+    /// Preserve the unsized embedded Mac preview rescue, without applying it to a surface that
+    /// was already usable when mpv initialized. Ordinary layout/scale changes use native resize.
+    private var initialVideoSurface = MPVVideoSurfacePolicy()
 
     #if canImport(UIKit)
     override func viewDidLayoutSubviews() {
@@ -428,12 +442,8 @@ final class MPVMetalViewController: PlatformViewController {
             metalLayer.contentsScale = scale
             // Force layoutDrawable to re-pin the drawable against the corrected backing scale.
             lastLaidOutSize = .zero
-            // The VO that may already have built against the GUESSED backing scale (NSScreen.main in
-            // viewDidLoad) is now stale, because the drawable is being re-pinned at the real window
-            // scale. Allow one fresh initial build at the corrected size. This only runs when the
-            // scale actually differs (an embed on a non-main display), so it never rebuilds on an
-            // ordinary re-appear where the scale already matches.
-            didBuildInitialVideoOutput = false
+            // A changed pixel size is handled by the patched moltenvk resize path; it does not
+            // justify disabling the selected video track or restarting its decoder.
         }
         layoutDrawable()
     }
@@ -443,8 +453,13 @@ final class MPVMetalViewController: PlatformViewController {
     /// above forward here). Shared across UIKit and AppKit.
     private func layoutDrawable() {
         let size = view.bounds.size
-        guard size.width > 1, size.height > 1 else { return }
-        let didResize = lastLaidOutSize != .zero && size != lastLaidOutSize
+        let pixels = CGSize(width: size.width * metalLayer.contentsScale,
+                            height: size.height * metalLayer.contentsScale)
+        guard size.width.isFinite, size.height.isFinite,
+              pixels.width.isFinite, pixels.height.isFinite,
+              size.width > 1, size.height > 1, pixels.width > 1, pixels.height > 1 else { return }
+        let didResize = metalLayer.drawableSize != pixels
+            || (lastLaidOutSize != .zero && size != lastLaidOutSize)
 
         // Always size the drawable to the current bounds, not only on resize. If the first layout
         // leaves a stale/auto drawable, the video renders against the wrong surface and the size
@@ -453,21 +468,13 @@ final class MPVMetalViewController: PlatformViewController {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         metalLayer.frame = view.bounds
-        metalLayer.drawableSize = CGSize(width: size.width * metalLayer.contentsScale,
-                                         height: size.height * metalLayer.contentsScale)
+        metalLayer.drawableSize = pixels
         CATransaction.commit()
 
         lastLaidOutSize = size
 
-        // First valid layout: build the video output now that the surface has a real size (see
-        // didBuildInitialVideoOutput). This is the zero/invalid -> valid transition, which is
-        // DISTINCT from a live resize: didResize requires a PRIOR non-zero size, so it is false on
-        // the very first layout, and without this the VO built at mpv_initialize against an unsized
-        // surface (macOS embedded hero) would never be rebuilt and no first frame would present.
-        // The flag makes this fire exactly once, so it can never thrash the VO on every resize;
-        // ordinary resizes fall through to the didResize path below unchanged.
-        if !didBuildInitialVideoOutput {
-            didBuildInitialVideoOutput = true
+        if initialVideoSurface.consumeInitialRebuild() {
+            VXProbe.log(probeChannel, "vo-initial-rebuild reason=unsized-at-init")
             reconfigureVideoOutput()
         } else if didResize {
             // A live resize (rotation, macOS window drag) no longer needs the VO rebuilt. Our mpv
@@ -503,7 +510,7 @@ final class MPVMetalViewController: PlatformViewController {
         mpv_get_property_async(mpv, 0, "display-names", MPV_FORMAT_STRING)
     }
 
-    /// One-shot VO rebuild for the zero-size-at-init case only (see didBuildInitialVideoOutput). Live
+    /// One-shot VO rebuild for the zero-size-at-init case only (see initialVideoSurface). Live
     /// resizes no longer come through here: mpv's own render context now notices a layer resize, so
     /// layoutDrawable just re-applies the size mode. This remains because a VO that was configured
     /// against a surface with NO size never built a presentable context at all, which no amount of
@@ -763,10 +770,11 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "gpu-api", "vulkan"))
         checkError(mpv_set_option_string(mpv, "gpu-context", "moltenvk"))
         // Hardware-decode via VideoToolbox on both device and the (Apple-Silicon) simulator.
-        // This keeps decoded frames as GPU textures, which matters for more than speed: software
+        // Prefer keeping decoded frames as GPU textures, which matters for more than speed: software
         // decode puts frames in CPU memory, forcing libplacebo to upload them via a PBO, and
         // that path (vkAllocateMemory → MTLSimDevice) crashes the simulator's Metal driver on
-        // large 4K frames. GPU-resident frames skip the upload entirely. A launch arg overrides
+        // large 4K frames. GPU-resident frames skip the upload entirely. Real devices may try the
+        // hardware copy-back path if direct interop fails; simulators remain direct-only. A launch arg overrides
         // for diagnostics: -stremiox-hwdec <videotoolbox|no|auto-safe>.
         let hwdec = MPVHardwareDecodePolicy.requestedDecoder(
             arguments: ProcessInfo.processInfo.arguments)
@@ -3579,7 +3587,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// green frames, unsupported profile); it costs CPU, so hardware stays the default.
     func setHardwareDecoding(_ on: Bool) {
         hardwareDecoding = on
-        requestedHardwareDecoder = on ? MPVHardwareDecodePolicy.videoToolbox : "no"
+        requestedHardwareDecoder = on ? MPVHardwareDecodePolicy.preferredVideoToolbox : "no"
         loggedHardwareDecoderNegotiation = false
         setString("hwdec", requestedHardwareDecoder)
     }

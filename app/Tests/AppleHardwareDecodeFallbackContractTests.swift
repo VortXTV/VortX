@@ -28,8 +28,14 @@ private func section(_ source: String, from start: String, to end: String) -> St
 @main
 private enum AppleHardwareDecodeFallbackContractTests {
 static func main() throws {
-check("default decoder request is exact VideoToolbox",
-      MPVHardwareDecodePolicy.requestedDecoder(arguments: ["VortX"]) == "videotoolbox")
+check("default decoder requests the platform hardware preference",
+      MPVHardwareDecodePolicy.requestedDecoder(arguments: ["VortX"]) == MPVHardwareDecodePolicy.preferredVideoToolbox)
+check("real devices try direct then copy-back before software",
+      MPVHardwareDecodePolicy.hardwarePreference(simulator: false) == "videotoolbox,videotoolbox-copy")
+check("simulator preserves direct-only decoding to avoid its upload crash",
+      MPVHardwareDecodePolicy.hardwarePreference(simulator: true) == "videotoolbox")
+check("explicit diagnostic direct decoder remains exact",
+      MPVHardwareDecodePolicy.requestedDecoder(arguments: ["VortX", "-stremiox-hwdec", "videotoolbox"]) == "videotoolbox")
 check("diagnostic software override remains explicit user control",
       MPVHardwareDecodePolicy.requestedDecoder(
         arguments: ["VortX", "-stremiox-hwdec", "no"]) == "no")
@@ -40,6 +46,9 @@ check("explicit Software is not mislabeled as a fallback",
 check("active VideoToolbox is not mislabeled as a fallback",
       !MPVHardwareDecodePolicy.isSoftwareFallback(
         requested: "videotoolbox", active: "videotoolbox"))
+check("copy-back is hardware, not a software fallback",
+      !MPVHardwareDecodePolicy.isSoftwareFallback(
+        requested: "videotoolbox,videotoolbox-copy", active: "videotoolbox-copy"))
 
 let tests = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 let app = tests.deletingLastPathComponent()
@@ -63,8 +72,8 @@ check("setup synchronizes the settings selection with an explicit Software launc
 let runtimeSwitch = section(
     controller, from: "func setHardwareDecoding(_ on: Bool)",
     to: "/// Player-settings detail") ?? ""
-check("runtime control still offers exact VideoToolbox and Software requests",
-      runtimeSwitch.contains("on ? MPVHardwareDecodePolicy.videoToolbox : \"no\"")
+check("runtime control restores platform hardware preference or explicit Software",
+      runtimeSwitch.contains("on ? MPVHardwareDecodePolicy.preferredVideoToolbox : \"no\"")
         && runtimeSwitch.contains("setString(\"hwdec\", requestedHardwareDecoder)"))
 
 let receipt = section(

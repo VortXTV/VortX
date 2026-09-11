@@ -155,8 +155,26 @@ private func observe(
     )
 }
 
-guard CommandLine.arguments.count == 2 else {
-    print("usage: libmpv-fresh-start <positive-start-fixture.mkv>")
+// A null VO deliberately cannot import direct GPU surfaces. This exercises the real decoder
+// negotiation fallback, not a mock: direct-only must fall to CPU; copy-back can still use VT.
+private func negotiatedDecoder(fixture: String, requested: String) -> String? {
+    guard let handle = mpv_create() else { return nil }
+    defer { mpv_terminate_destroy(handle) }
+    for (name, value) in [("config", "no"), ("load-scripts", "no"),
+                           ("resume-playback", "no"), ("idle", "yes"),
+                           ("vo", "null"), ("ao", "null"), ("hwdec", requested)] {
+        setOption(handle, name, value)
+    }
+    guard mpv_initialize(handle) >= 0,
+          command(handle, ["loadfile", fixture, "replace"]) >= 0,
+          waitForPosition(handle, timeout: 15, predicate: { $0 > 0 && $0 < 2 }) != nil,
+          let raw = mpv_get_property_string(handle, "hwdec-current") else { return nil }
+    defer { mpv_free(raw) }
+    return String(cString: raw)
+}
+
+guard CommandLine.arguments.count == 3 else {
+    print("usage: libmpv-fresh-start <positive-start-fixture.mkv> <zero-start-fixture.mkv>")
     exit(2)
 }
 
@@ -207,6 +225,14 @@ results.check(
     "deep seek back to title start remains zero-based",
     String(format: "seek 0 -> time-pos %.3fs", production.returnedPosition)
 )
+
+let baseFixture = CommandLine.arguments[2]
+let direct = negotiatedDecoder(fixture: baseFixture, requested: "videotoolbox")
+let compatible = negotiatedDecoder(fixture: baseFixture, requested: "videotoolbox,videotoolbox-copy")
+results.check(direct == "no", "direct-only cannot use an unavailable surface importer",
+              "hwdec-current=\(direct ?? "unavailable")")
+results.check(compatible == "videotoolbox-copy", "copy-back preserves hardware decode when direct interop is unavailable",
+              "hwdec-current=\(compatible ?? "unavailable")")
 
 print("SUMMARY \(results.failures == 0 ? "PASS" : "FAIL") failures=\(results.failures)")
 exit(Int32(min(results.failures, 125)))
