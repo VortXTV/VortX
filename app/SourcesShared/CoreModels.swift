@@ -502,6 +502,8 @@ enum LiveTypes {
 /// title B's fallback while the shared bridge slot is changing pages.
 struct CoreMetaSelection: Decodable {
     let metaPath: CoreResourcePath
+    /// The exact episode stream request selected by the engine. Optional for movie/meta-only loads.
+    let streamPath: CoreResourcePath?
 }
 
 struct CoreMetaDetails: Decodable {

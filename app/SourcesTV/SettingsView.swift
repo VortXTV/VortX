@@ -467,6 +467,10 @@ struct SettingsView: View {
                     Label("Usenet provider", systemImage: "network")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                NavigationLink { NZBIndexerSettingsView() } label: {
+                    Label("NZB indexers", systemImage: "newspaper")
+                }
+                .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { XRDBSettingsView() } label: {
                     Label("Poster artwork (ERDB, ratings)", systemImage: "star.circle")
                 }

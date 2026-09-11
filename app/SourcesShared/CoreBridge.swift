@@ -120,6 +120,18 @@ final class CoreBridge: ObservableObject {
     }
     private var refindGeneration = 0
     private var refindRequest: RefindRequest?
+    // Direct Newznab results are deliberately separate from engine state: they contain short-lived NZB
+    // enclosure links and must never be serialized into an add-on, diagnostic, or sync payload.
+    private struct NZBIndexerResultKey: Hashable {
+        let owner: String; let profileID: UUID; let revision: Int; let titleID: String; let streamID: String?
+    }
+    private var nzbIndexerResults: [NZBIndexerResultKey: [CoreStreamSourceGroup]] = [:]
+    private var nzbIndexerTasks: [NZBIndexerResultKey: Task<Void, Never>] = [:]
+    private var nzbIndexerTerminal: Set<NZBIndexerResultKey> = []
+    /// Render getters consult this in-memory snapshot only; no Keychain access occurs while SwiftUI builds.
+    private var activeNZBIndexerKey: NZBIndexerResultKey?
+    private var activeNZBIndexerCount = 0
+    private var nzbIndexerGeneration = 0
     /// True while we're seeding the engine from the old app's authKey and waiting for the user fetch.
     private var awaitingAuthMigration = false
     /// Set while a profile account switch is in flight: the uid we're leaving (nil = was signed out).
@@ -1567,6 +1579,7 @@ final class CoreBridge: ObservableObject {
     /// SwiftUI actions), mirroring `beginAppleCWAuthoritativeMetaRefresh`'s synchronous mutation style.
     func refindSources(type: String, id: String, streamType: String? = nil, streamId: String? = nil) {
         cancelAppleCWMetaRefresh()
+        invalidateNZBIndexerResults()
         refindGeneration &+= 1
         refindRequest = RefindRequest(
             generation: refindGeneration,
@@ -1640,6 +1653,7 @@ final class CoreBridge: ObservableObject {
         // A navigation/load takes ownership of the meta slot: drop any pending re-find so its Unload's nil
         // receipt cannot re-dispatch a stale Load into this new target.
         refindRequest = nil
+        invalidateNZBIndexerResults()
         dispatch(action: metaLoadAction(type: type, id: id, streamType: streamType, streamId: streamId),
                  field: "meta_details")
         // If the engine already had this exact meta loaded, ActionLoad is a no-op (eq_update) and no
@@ -1654,12 +1668,14 @@ final class CoreBridge: ObservableObject {
             // A fresh load clears the resident streams: that IS a ready-stream-set change, so the
             // source-list epoch must bump (the model empties, then repaints as the new title lands).
             if !alreadyLoaded, hadDetails { self.streamsEpoch &+= 1 }
+            if alreadyLoaded, let current { self.startNZBIndexerSearchIfNeeded(details: current) }
         }
     }
 
     func unloadMeta() {
         cancelAppleCWMetaRefresh()
         refindRequest = nil
+        invalidateNZBIndexerResults()
         dispatch(action: ["action": "Unload"], field: "meta_details")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -1678,7 +1694,7 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func streamGroups() -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
-        return assembleStreamGroups(details, streamId: nil)
+        return assembleStreamGroups(details, streamId: nil) + indexerGroups(for: details, streamID: nil)
     }
 
     /// Re-rank already-loaded sources when the account's order changes; never wait for an engine rehydrate.
@@ -1729,6 +1745,112 @@ final class CoreBridge: ObservableObject {
         return VortXSyncManager.orderedByApplied(groups, url: { $0.id })
     }
 
+    /// Launch once from the metadata publication lifecycle, rather than from a source-list getter.
+    /// The identity fences owner, configuration generation, title and episode so a late response can
+    /// never bleed into a subsequent title or auto-next episode.
+    @MainActor
+    private func startNZBIndexerSearchIfNeeded(details: CoreMetaDetails) {
+        let scope = NZBIndexerStore.captureScope()
+        let owner = scope.identity
+        let document = NZBIndexerStore.load(scope: scope)
+        guard !document.enabled.isEmpty, let meta = details.meta else { return }
+        let profileID = scope.profileID
+        let streamID = details.selected?.streamPath?.id
+        let key = NZBIndexerResultKey(owner: owner, profileID: profileID, revision: document.revision, titleID: meta.id, streamID: streamID)
+        guard !nzbIndexerTerminal.contains(key), nzbIndexerResults[key] == nil, nzbIndexerTasks[key] == nil else { return }
+        // The bridge has one resident meta slot. Cancel any prior title/episode request before this
+        // selection can launch, including an episode switch that arrives without a new navigation call.
+        let staleTasks = nzbIndexerTasks.filter { $0.key != key }
+        for (oldKey, task) in staleTasks { task.cancel(); nzbIndexerTasks.removeValue(forKey: oldKey) }
+        let video = streamID.flatMap { requested in meta.videos?.first(where: { $0.id == requested }) }
+        let query = NZBIndexerClient.Search(title: meta.name, imdbID: meta.id.hasPrefix("tt") ? meta.id : nil,
+                                             season: video?.season, episode: video?.episode, isSeries: meta.type == "series")
+        // Metadata may precede the episode inventory. Do not terminalize an invalid episode query;
+        // the late-inventory publication will launch it with real coordinates.
+        if query.isSeries, query.season == nil || query.episode == nil { return }
+        let configs = document.enabled.compactMap { config -> (NZBIndexerConfig, String)? in
+            NZBIndexerStore.apiKey(for: config.id, scope: scope).map { (config, $0) }
+        }
+        guard !configs.isEmpty else { return }
+        nzbIndexerResults.removeAll(); nzbIndexerTerminal.removeAll()
+        activeNZBIndexerKey = key; activeNZBIndexerCount = configs.count
+        streamsEpoch &+= 1
+        nzbIndexerGeneration &+= 1; let generation = nzbIndexerGeneration
+        nzbIndexerTasks[key] = Task { [weak self] in
+            defer {
+                // Every terminal route (cancellation, transport failure, stale fence, or success)
+                // releases the launch latch. A later lifecycle/refind can therefore retry instead of
+                // being permanently represented as an empty completed group.
+                if let self, self.nzbIndexerGeneration == generation { self.nzbIndexerTasks[key] = nil }
+            }
+            var output: [(Int, CoreStreamSourceGroup)] = []
+            await withTaskGroup(of: (Int, CoreStreamSourceGroup)?.self) { group in
+                for (index, pair) in configs.enumerated() { let (config, apiKey) = pair; group.addTask {
+                    guard !Task.isCancelled,
+                          let releases = try? await NZBIndexerClient.search(config: config, apiKey: apiKey, search: query) else { return nil }
+                    let streams = releases.compactMap { Self.nzbIndexerStream($0, indexerName: config.name) }
+                    return streams.isEmpty ? nil : (index, CoreStreamSourceGroup(id: "nzbindexer:" + config.id, addon: config.name, streams: streams))
+                } }
+                for await result in group { if let result { output.append(result) } }
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.nzbIndexerGeneration == generation,
+                      NZBIndexerStore.isCurrent(scope),
+                      NZBIndexerStore.load(scope: scope).revision == key.revision,
+                      scope.profileID == key.profileID,
+                      self.metaDetails?.meta?.id == key.titleID,
+                      self.metaDetails?.selected?.streamPath?.id == key.streamID else { return }
+                let ordered = output.sorted { $0.0 < $1.0 }.map(\.1)
+                self.nzbIndexerResults[key] = ordered
+                self.nzbIndexerTerminal.insert(key)
+                self.streamsEpoch &+= 1
+            }
+        }
+    }
+
+    @MainActor private func indexerGroups(for details: CoreMetaDetails, streamID: String?) -> [CoreStreamSourceGroup] {
+        guard let key = activeNZBIndexerKey, key.owner == NZBIndexerStore.captureScope().identity,
+              key.titleID == details.meta?.id,
+              key.streamID == (streamID ?? details.selected?.streamPath?.id),
+              key.profileID == (ProfileStore.shared.activeID ?? UserProfile.ownerID) else { return [] }
+        return nzbIndexerResults[key] ?? []
+    }
+
+    /// Snapshot-only contribution to the ordinary settlement contract. This keeps an indexer-only
+    /// episode pending until its configured searches have become terminal, rather than treating the
+    /// absence of engine add-ons as a completed zero-source result.
+    @MainActor private func nzbIndexerProgress(details: CoreMetaDetails, streamID: String?) -> (loaded: Int, total: Int) {
+        guard let key = activeNZBIndexerKey,
+              key.owner == NZBIndexerStore.captureScope().identity,
+              key.titleID == details.meta?.id,
+              key.streamID == (streamID ?? details.selected?.streamPath?.id),
+              key.profileID == (ProfileStore.shared.activeID ?? UserProfile.ownerID),
+              activeNZBIndexerCount > 0 else { return (0, 0) }
+        return nzbIndexerTerminal.contains(key) ? (activeNZBIndexerCount, activeNZBIndexerCount) : (0, activeNZBIndexerCount)
+    }
+
+    private func invalidateNZBIndexerResults() {
+        nzbIndexerGeneration &+= 1; nzbIndexerTasks.values.forEach { $0.cancel() }
+        nzbIndexerTasks.removeAll(); nzbIndexerResults.removeAll(); nzbIndexerTerminal.removeAll(); activeNZBIndexerKey = nil; activeNZBIndexerCount = 0
+    }
+
+    /// Settings writes are synchronous and revisioned. Re-run the normal lifecycle for the resident
+    /// title immediately, so an enabled/disabled indexer cannot leave old rows on screen.
+    @MainActor func nzbIndexerConfigurationDidChange() {
+        invalidateNZBIndexerResults()
+        streamsEpoch &+= 1
+        if let metaDetails { startNZBIndexerSearchIfNeeded(details: metaDetails) }
+    }
+
+    private static func nzbIndexerStream(_ release: NZBIndexerClient.Release, indexerName: String) -> CoreStream? {
+        let object: [String: Any] = ["name": "📰 " + indexerName, "description": release.title,
+                                     "nzbUrl": release.enclosureURL.absoluteString,
+                                     "behaviorHints": ["filename": release.title]]
+        guard let data = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        return try? decoder.decode(CoreStream.self, from: data)
+    }
+
     /// True when a stream group's source add-on (keyed by its transport base URL, which is the
     /// descriptor's transportUrl) is in the durable removal tombstone set. Mirrors the refreshAddons
     /// enforcement (CoreBridge.refreshAddons): PROTECTED add-ons (Cinemeta, Local Files) are never
@@ -1750,7 +1872,7 @@ final class CoreBridge: ObservableObject {
     /// that have finished (returned streams or errored). The engine creates one loadable per stream
     /// add-on up front (all `.loading`), so `total` is stable and the UI can show "Loaded X/Y add-ons"
     /// to tell users whether to keep waiting or whether loading has stalled.
-    func streamLoadProgress() -> (loaded: Int, total: Int) {
+    @MainActor func streamLoadProgress() -> (loaded: Int, total: Int) {
         guard let details = metaDetails else { return (0, 0) }
         // Count the meta-embedded groups too (they land Ready the moment the meta resolves), so a title
         // whose ONLY sources are embedded HTTP/HLS streams settles at loaded == total instead of hanging
@@ -1763,7 +1885,8 @@ final class CoreBridge: ObservableObject {
             default: break   // .loading or nil → not done yet
             }
         }
-        return (loaded, all.count)
+        let indexer = nzbIndexerProgress(details: details, streamID: nil)
+        return (loaded + indexer.loaded, all.count + indexer.total)
     }
 
     /// Ready stream groups for a specific stream/episode id, matched on the stream request's own
@@ -1773,11 +1896,11 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func streamGroups(forStreamId streamId: String) -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
-        return assembleStreamGroups(details, streamId: streamId)
+        return assembleStreamGroups(details, streamId: streamId) + indexerGroups(for: details, streamID: streamId)
     }
 
     /// Stream-addon load progress for one stream/episode id (see `streamLoadProgress`).
-    func streamLoadProgress(forStreamId streamId: String) -> (loaded: Int, total: Int) {
+    @MainActor func streamLoadProgress(forStreamId streamId: String) -> (loaded: Int, total: Int) {
         guard let details = metaDetails else { return (0, 0) }
         var loaded = 0, total = 0
         for group in details.allStreamGroups where group.request.path.id == streamId {
@@ -1787,7 +1910,8 @@ final class CoreBridge: ObservableObject {
             default: break
             }
         }
-        return (loaded, total)
+        let indexer = nzbIndexerProgress(details: details, streamID: streamId)
+        return (loaded + indexer.loaded, total + indexer.total)
     }
 
     /// Registration-aware raw contributor state for SourceListModel's complete-set receipt. `total == 0`
@@ -3790,6 +3914,7 @@ final class CoreBridge: ObservableObject {
                             let streamsChanged = Self.metaDetailsStreamsChanged(current: self.metaDetails, next: details)
                             self.metaDetails = details
                             if streamsChanged { self.streamsEpoch &+= 1 }
+                            if let details { self.startNZBIndexerSearchIfNeeded(details: details) }
                         }
                         self.replayPendingEpisodeWatched()
                         // Re-find sources: the minimal Unload -> nil -> Load arm, independent of the Apple CW
@@ -3872,7 +3997,7 @@ final class CoreBridge: ObservableObject {
         // `meta` is nil while an add-on is loading and after every add-on has failed. Publish both
         // the selection change and pending-to-unresolved transition so detail recovery sees the
         // terminal state even when the ready meta and stream signatures remain empty.
-        if current.selectedMetaID != next.selectedMetaID { return true }
+        if current.selectedMetaID != next.selectedMetaID || current.selected?.streamPath?.id != next.selected?.streamPath?.id { return true }
         if current.metaResolution != next.metaResolution { return true }
         if current.meta?.id != next.meta?.id { return true }
         if let currentMeta = current.meta, let nextMeta = next.meta,
@@ -3913,7 +4038,7 @@ final class CoreBridge: ObservableObject {
     /// save while the stream set is unchanged.
     private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         guard let current, let next else { return (current != nil) != (next != nil) }
-        if current.selectedMetaID != next.selectedMetaID { return true }
+        if current.selectedMetaID != next.selectedMetaID || current.selected?.streamPath?.id != next.selected?.streamPath?.id { return true }
         if current.meta?.id != next.meta?.id { return true }
         // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
         return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)

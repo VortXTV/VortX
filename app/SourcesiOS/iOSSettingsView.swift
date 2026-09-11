@@ -637,6 +637,7 @@ struct iOSSettingsView: View {
             NavigationLink("Metadata (TMDB, MDBList, fanart)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Usenet provider") { UsenetProviderView() }
+            NavigationLink("NZB indexers") { NZBIndexerSettingsView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
             NavigationLink("Live TV (IPTV playlists)") { IPTVSettingsView() }
             NavigationLink("Media servers (Plex, Jellyfin, Emby)") { MediaServersSettingsView() }
