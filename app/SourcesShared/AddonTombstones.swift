@@ -90,6 +90,19 @@ enum AddonTombstones {
         return out
     }
 
+    /// Legacy settings blobs carry these maps as ordinary preferences. Preserve per-entry maxima when
+    /// applying cloud settings; a stale/partial blob must not erase a known install or removal receipt.
+    /// Manual backup-file restore remains an explicit replacement and does not call this wrapper.
+    static func preservingLocalSyncStamps<T>(_ restore: () throws -> T) rethrows -> T {
+        let addons = timestampsForSync()
+        let library = LibraryTombstones.timestampsForSync()
+        defer {
+            merge(legacyIDs: [], stampsRaw: addons)
+            LibraryTombstones.merge(legacyIDs: [], stampsRaw: library)
+        }
+        return try restore()
+    }
+
     /// Record an add-on removal so it sticks across devices. Idempotent for the caller. Returns true when the
     /// url becomes NEWLY effectively-removed. Callers MUST guard PROTECTED before calling (a protected stub is
     /// never a real removal); a removable official add-on is a legitimate removal and IS tombstoned (#137).

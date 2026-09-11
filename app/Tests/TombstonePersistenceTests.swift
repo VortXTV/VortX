@@ -21,6 +21,7 @@ enum TombstonePersistenceTests {
         testCanonicalLegacyArrayIsStableAndSorted()
         testIdenticalSecondSaveDoesNotWrite()
         testChangedTimestampWrites()
+        testCloudRestorePreservesPerEntryReceipts()
         print("Tombstone persistence tests passed")
     }
 
@@ -58,6 +59,36 @@ enum TombstonePersistenceTests {
     }
 
     private static let defaultsSuiteName = "TombstonePersistenceTests"
+
+    private static func testCloudRestorePreservesPerEntryReceipts() {
+        let defaults = UserDefaults.standard
+        let prefixes = ["stremiox.addons.", "stremiox.library."]
+        let keys = prefixes.flatMap { prefix in ["removedAt", "addedAt", "deleted"].map { prefix + $0 } }
+        let before = keys.reduce(into: [String: Any]()) { $0[$1] = defaults.object(forKey: $1) }
+        defer {
+            for key in keys {
+                if let value = before[key] { defaults.set(value, forKey: key) }
+                else { defaults.removeObject(forKey: key) }
+            }
+        }
+        for prefix in prefixes {
+            defaults.set(["removed": 200.0, "reinstalled": 100.0], forKey: prefix + "removedAt")
+            defaults.set(["removed": 100.0, "reinstalled": 300.0], forKey: prefix + "addedAt")
+            defaults.set(["removed"], forKey: prefix + "deleted")
+        }
+        AddonTombstones.preservingLocalSyncStamps {
+            for prefix in prefixes {
+                defaults.set(["reinstalled": 100.0, "peer-only": 250.0], forKey: prefix + "removedAt")
+                defaults.set(["removed": 100.0], forKey: prefix + "addedAt")
+                defaults.set(["reinstalled", "peer-only"], forKey: prefix + "deleted")
+            }
+        }
+        precondition(AddonTombstones.all() == ["removed", "peer-only"], "stale settings cannot resurrect removed add-ons or undo reinstalls")
+        precondition(LibraryTombstones.all() == ["removed", "peer-only"], "stale settings cannot erase library receipts")
+        let snapshot = AddonTombstones.timestampsForSync()
+        AddonTombstones.preservingLocalSyncStamps {}
+        precondition(AddonTombstones.timestampsForSync() == snapshot, "repeated restore is idempotent")
+    }
 
     private static func isolatedDefaults() -> UserDefaults {
         let defaults = UserDefaults(suiteName: defaultsSuiteName)!

@@ -431,9 +431,26 @@ final class VortXSyncManager: ObservableObject {
     /// value (local wins) rides up and the confirmed push clears the dirty mark. Debounced via requestSyncSoon so
     /// it coalesces with any other pending change. No-op when there is nothing unpushed.
     private func flushDirtySettingsIfNeeded() {
-        guard isSignedIn, !dirtySettings.isEmpty else { return }
+        guard isSignedIn, !dirtySettings.isEmpty || pendingAddonOrderIntent != nil else { return }
         requestSyncSoon()
     }
+    private var pendingAddonOrderIntent: AddonOrderIntent? {
+        get {
+            guard let id = account?.id,
+                  let data = UserDefaults.standard.data(forKey: "vortx.sync.pendingAddonOrder." + id),
+                  let intent = try? JSONDecoder().decode(AddonOrderIntent.self, from: data),
+                  intent.accountID == id else { return nil }
+            return intent
+        }
+        set {
+            guard let id = account?.id else { return }
+            let key = "vortx.sync.pendingAddonOrder." + id
+            if let newValue, newValue.accountID == id, let data = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(data, forKey: key)
+            } else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+    }
+    private var activeSyncUp: (id: UUID, capture: CredentialScopeRegistry.Capture)?
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
@@ -456,6 +473,14 @@ final class VortXSyncManager: ObservableObject {
     /// appliedAddonOrder is a plain UserDefaults static (not @Published) and gives SwiftUI no other signal.
     static let addonOrderChangedNote = Notification.Name("vortx.addonOrderChanged")
 
+    private func publishAppliedAddonOrder(_ order: [String]) {
+        let normalized = AddonOrderSyncPolicy.unique(order.map(AddonTombstones.normalize))
+        guard normalized != Self.appliedAddonOrder else { return }
+        Self.appliedAddonOrder = normalized
+        CoreBridge.shared.addonOrderDidChange()
+        NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
+    }
+
     /// Sort a live list of items by the shared `appliedAddonOrder` (the in-app / dashboard reorder), keyed
     /// by each item's transport URL. Items present in the order come first, in that order; any not yet in it
     /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
@@ -470,14 +495,20 @@ final class VortXSyncManager: ObservableObject {
     /// so the dashboard and the user's other devices converge, mirroring the dashboard's doc.addonOrder write.
     /// The immediate push avoids the debounce-starvation that delayed removals (see uninstallAddon).
     func applyInAppAddonOrder(_ transportUrls: [String]) {
-        let normalized = transportUrls.map { AddonTombstones.normalize($0) }
+        let normalized = AddonOrderSyncPolicy.unique(transportUrls.map { AddonTombstones.normalize($0) })
         guard normalized != Self.appliedAddonOrder else { return }
         Self.appliedAddonOrder = normalized
+        let capture = credentialAuthority.capture()
+        if isSignedIn, hasAppliedAccountDoc, isCurrent(capture), !hasPendingAccountDocApply(for: capture),
+           let id = account?.id {
+            pendingAddonOrderIntent = AddonOrderIntent(accountID: id, order: normalized)
+        }
         CoreBridge.shared.addonOrderDidChange()
         // Refresh any live add-on list NOW: appliedAddonOrder is a plain UserDefaults static, not @Published,
         // so views showing the list have no other signal to re-run orderedByApplied on their current body.
         NotificationCenter.default.post(name: Self.addonOrderChangedNote, object: nil)
         Task {
+            guard self.isCurrent(capture) else { return }
             let ok = await pushThisDevice()
             NSLog("[addon] in-app reorder pushed to sync (%d add-ons, ok=%@)", normalized.count, ok ? "yes" : "no")
         }
@@ -1527,7 +1558,9 @@ final class VortXSyncManager: ObservableObject {
     /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
     /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
     /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
-    private func pushDerivedDoc(_ initial: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil, rebuild: () async -> [String: Any]?) async -> Bool {
+    private func pushDerivedDoc(_ initial: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
+                                onAccepted: ([String: Any]) -> Void = { _ in },
+                                rebuild: () async -> [String: Any]?) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
         let maxRetries = 3
@@ -1536,6 +1569,7 @@ final class VortXSyncManager: ObservableObject {
         for attempt in 0..<maxRetries {
             switch await pushSyncDocAt(doc, version: version, credentialCapture: capture) {
             case .accepted:
+                onAccepted(doc)
                 return true
             case .error:
                 return false   // network / server / encode failure: do not advance, next pull reconciles
@@ -1787,14 +1821,14 @@ final class VortXSyncManager: ObservableObject {
         for entry in engineAddons {
             guard let url = entry["transportUrl"] as? String,
                   !removedAddons.contains(AddonTombstones.normalize(url)),
-                  seenAddonURLs.insert(url).inserted else { continue }
+                  seenAddonURLs.insert(AddonTombstones.normalize(url)).inserted else { continue }
             addonList.append(entry)
         }
         if !mirrorReplaceAddons, let prior = (existingVortx?["addons"] as? [[String: Any]]) {
             for entry in prior {
                 guard let url = entry["transportUrl"] as? String, !url.isEmpty,
                       !removedAddons.contains(AddonTombstones.normalize(url)),
-                      seenAddonURLs.insert(url).inserted else { continue }
+                      seenAddonURLs.insert(AddonTombstones.normalize(url)).inserted else { continue }
                 addonList.append(entry)
             }
         }
@@ -1917,17 +1951,38 @@ final class VortXSyncManager: ObservableObject {
         // domain (local wins), so every currently-dirty key's value rides up in this push. On a CONFIRMED push we
         // clear exactly these keys (unless re-edited since: clearPushed guards on the stamp), so the dirty mark is
         // released only once the value is safely on the account and a later pull may apply account values again.
+        // Serialize this device's derived pushes. Otherwise an older in-flight snapshot can land after
+        // an acknowledged reorder. Other accounts are isolated by the credential capture and operation id.
+        if activeSyncUp?.capture == capture {
+            requestSyncSoon()
+            return false
+        }
+        let operationID = UUID()
+        activeSyncUp = (operationID, capture)
+        defer { if activeSyncUp?.id == operationID { activeSyncUp = nil } }
         let dirtyAtPushStart = dirtySettings
+        let orderIntent = pendingAddonOrderIntent
         // Build the merged doc from the current account base, then push with optimistic-concurrency
         // recovery: if a concurrent write wins the race, re-run this exact merge onto the winner's doc and
         // retry (bounded). The rebuild closure re-pulls a fresh base each attempt so the recovered push
         // never clobbers the winner; it returns nil on a failed pull so the retry aborts safely.
         guard isCurrent(capture), !hasPendingAccountDocApply(for: capture),
-              let initial = await mergeLocalIntoDoc(base: nil, credentialCapture: capture),
+              let initial = await mergeLocalIntoDoc(orderIntent: orderIntent, credentialCapture: capture),
               isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
-        let pushed = await pushDerivedDoc(initial, credentialCapture: capture) { [weak self] in
+        let pushed = await pushDerivedDoc(initial, credentialCapture: capture, onAccepted: { [weak self] sentDoc in
+            guard let self, self.isCurrent(capture), let id = self.account?.id else { return }
+            self.withRemoteApplySuppressed {
+                if AddonOrderSyncPolicy.acknowledges(self.pendingAddonOrderIntent, sent: orderIntent, accountID: id) {
+                    self.pendingAddonOrderIntent = nil
+                }
+                // A push can learn a peer's newer order even when our next pull is version-skipped.
+                if self.pendingAddonOrderIntent == nil, let order = sentDoc["addonOrder"] as? [String] {
+                    self.publishAppliedAddonOrder(order)
+                }
+            }
+        }) { [weak self] in
             guard let self, self.isCurrent(capture), !self.hasPendingAccountDocApply(for: capture) else { return nil }
-            return await self.mergeLocalIntoDoc(base: nil, credentialCapture: capture)
+            return await self.mergeLocalIntoDoc(orderIntent: orderIntent, credentialCapture: capture)
         }
         guard isCurrent(capture) else { return false }
         if pushed { clearPushedDirtySettings(dirtyAtPushStart) }
@@ -1937,11 +1992,11 @@ final class VortXSyncManager: ObservableObject {
     /// Build the doc to push by MERGING this device's profiles + settings + keys + add-on order onto a
     /// freshly pulled account base (preserving keys other surfaces wrote). Extracted from syncUp so the
     /// optimistic-concurrency retry can re-run the EXACT same merge onto the winner's doc after a lost
-    /// race, with identical LWW / union / never-clobber-libraryItem semantics on every attempt. `base` is
-    /// unused today (each call re-pulls) but kept so a caller could pass a known base to avoid a re-pull.
+    /// race, with identical LWW / union / never-clobber-libraryItem semantics on every attempt. The order
+    /// intent is captured once per push; a newer edit stays pending until its own push is acknowledged.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(base: [String: Any]?, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(orderIntent: AddonOrderIntent?, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> [String: Any]? {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), isSignedIn else { return nil }
         var doc: [String: Any]
@@ -1988,12 +2043,14 @@ final class VortXSyncManager: ObservableObject {
         // Pass the PULLED vortx block so vortxSummary can union the account-owned add-on set (never
         // shrink it from a degraded engine) and preserve addonsOwnedAt.
         doc["vortx"] = vortxSummary(existingVortx: doc["vortx"] as? [String: Any])
-        // Shared cross-surface add-on ORDER (Bug B). A sibling top-level key (like profileEdits) the app
-        // WRITES from the current engine order and the web dashboard also reads/writes, so a reorder on
-        // any surface converges. Emit the normalized transportUrls in the engine's true priority order.
-        // Omitted when there is nothing to order so a fresh account never writes an empty key.
-        let order = Self.currentAddonOrder()
-        if order.isEmpty { doc.removeValue(forKey: "addonOrder") } else { doc["addonOrder"] = order }
+        // An unrelated push must not echo this device's stale order over the freshly fetched cloud order.
+        // Only the captured explicit reorder may override it; retries use that same acknowledged intent.
+        if let order = AddonOrderSyncPolicy.merge(
+            remote: (doc["addonOrder"] as? [String])?.map(AddonTombstones.normalize),
+            seed: Self.currentAddonOrder(), intent: orderIntent, accountID: account?.id ?? "",
+            removed: AddonTombstones.all()) {
+            doc["addonOrder"] = order
+        }
         // READ-MERGE, never wholesale-rebuild. Start from the PULLED apiKeys and only SET the keys this
         // device actually holds; never DELETE a key this device did not author. A device without a TMDB
         // key (or with no keys at all) used to drop the whole object on push, and because pushes version
@@ -2081,18 +2138,11 @@ final class VortXSyncManager: ObservableObject {
             guard !removed.contains(normalized), seen.insert(normalized).inserted else { continue }
             live.append(normalized)
         }
-        // Prefer the user's shared order (in-app Reorder screen or the dashboard drag): take the applied
-        // order intersected with the LIVE set (so an uninstalled/removed add-on drops out), then append any
-        // live add-on not yet in it (a fresh install) so it is never lost. This makes an in-app reorder the
-        // value that gets PUSHED, so it converges instead of the next push overwriting it with the raw engine
-        // Vec order. Empty applied order -> the live engine order unchanged (no behavior change until reorder).
+        // Missing engine entries do not prove uninstall: hydration may still be in flight. Retain the
+        // full applied spine and remove only timestamp-tombstoned URLs; new installs append stably.
         let applied = appliedAddonOrder
         guard !applied.isEmpty else { return live }
-        let liveSet = Set(live)
-        var result = applied.filter { liveSet.contains($0) }
-        let inResult = Set(result)
-        result.append(contentsOf: live.filter { !inResult.contains($0) })
-        return result
+        return AddonOrderSyncPolicy.unique((applied + live).filter { !removed.contains($0) })
     }
 
     /// GUARANTEED RESTORE (#145 M1). Make this device apply the account's document before it is ever allowed to
@@ -2233,17 +2283,20 @@ final class VortXSyncManager: ObservableObject {
             // a richer local profile (the data-loss bug). Restore, re-read the cloud roster, then UNION
             // the captured local roster back in so no local-only profile is ever dropped by this pull.
             let localRosterBefore = ProfileStore.shared.profiles
+            // These dictionaries are CRDT state, not replaceable scalar preferences. An older client's
+            // settings blob may contain older/empty maps even when this device has newer removals.
             // LOCAL-WINS: skip any syncable key the user changed on THIS device and has not pushed yet, so the
             // account's OLDER value cannot overwrite a just-made local edit before this device's push carries it
             // up (the durable, per-key successor to the in-memory hasPendingPush guard; see SettingsDirtyKeys and
             // the "would not stay" interplay at :1175-1182). A restored/fresh device has an empty set, so a full
             // restore is unchanged. The skipped keys keep their local value, which flushDirtySettingsIfNeeded then
             // pushes so the account heals.
-            if ((try? SettingsBackup.restore(
-                from: data,
-                skipping: Set(dirtySettings.keys),
-                excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys
-            )) ?? 0) > 0 {
+            if ((try? AddonTombstones.preservingLocalSyncStamps {
+                try SettingsBackup.restore(
+                    from: data,
+                    skipping: Set(dirtySettings.keys),
+                    excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys)
+            }) ?? 0) > 0 {
                 restored = true
                 // Stamp the applied-blob BASELINE (#145 resurrection fix): the syncable keys this pulled doc just
                 // wrote, in the SAME migrated form restore used. mergedSyncBlob reads it on the next push so a
@@ -2454,8 +2507,11 @@ final class VortXSyncManager: ObservableObject {
         // ONLY inside this suppression region after a STRICTLY-NEWER, SUCCESSFUL pull, so a stale/partial
         // sync can never scramble the order. Source assembly applies this order directly and the source
         // epoch invalidates already-published lists without mutating/reloading the engine collection.
-        if let addonOrder = doc["addonOrder"] as? [String] {
-            let normalized = addonOrder.map { AddonTombstones.normalize($0) }
+        if let addonOrder = AddonOrderSyncPolicy.merge(
+            remote: (doc["addonOrder"] as? [String])?.map(AddonTombstones.normalize),
+            seed: [], intent: pendingAddonOrderIntent, accountID: account?.id ?? "",
+            removed: AddonTombstones.all()) {
+            let normalized = addonOrder
             if normalized != Self.appliedAddonOrder {
                 Self.appliedAddonOrder = normalized
                 restored = true
@@ -3054,7 +3110,10 @@ final class VortXSyncManager: ObservableObject {
     /// Conflict resolution: replace this device's profiles + settings with the account's (forced).
     /// Even this "use account" path still UNIONs profiles (syncDown merges the local roster back in),
     /// so it can never delete a local-only profile; it only adopts the account's settings + fields.
-    func useAccountData() async { await syncDown(force: true) }
+    func useAccountData() async {
+        withRemoteApplySuppressed { pendingAddonOrderIntent = nil }
+        await syncDown(force: true)
+    }
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
     /// STAYS BEHIND THE #145 RESTORE GATE. Most callers are automatic, not user choices (the engine-driven
     /// pushes in CoreBridge, the in-app add-on reorder, "Sync now" once rosterConflictWithAccount reports no
@@ -3069,7 +3128,12 @@ final class VortXSyncManager: ObservableObject {
     /// device's state IS the account's state, so subsequent automatic pushes are no longer at risk of the #145
     /// blind overwrite. Never wire this to an automatic path.
     @discardableResult func keepThisDeviceOverridingAccount() async -> Bool {
-        withRemoteApplySuppressed { hasAppliedAccountDoc = true }
+        withRemoteApplySuppressed {
+            hasAppliedAccountDoc = true
+            if let id = account?.id {
+                pendingAddonOrderIntent = AddonOrderIntent(accountID: id, order: Self.currentAddonOrder())
+            }
+        }
         return await syncUp(afterUserChoseThisDevice: true)
     }
 

@@ -1,5 +1,42 @@
 import Foundation
 
+/// A user edit is different from an engine snapshot or a remote apply. The nonce is also required for
+/// A -> B -> A: acknowledging the first A must not acknowledge the later explicit undo.
+struct AddonOrderIntent: Codable, Equatable, Sendable {
+    let accountID: String
+    let nonce: UUID
+    let order: [String]
+
+    init(accountID: String, order: [String]) {
+        self.accountID = accountID
+        self.nonce = UUID()
+        self.order = AddonOrderSyncPolicy.unique(order)
+    }
+}
+
+enum AddonOrderSyncPolicy {
+    static func unique(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return Array(values.filter { !$0.isEmpty && seen.insert($0).inserted }.prefix(1024))
+    }
+
+    /// Without an explicit edit, the fetched cloud order wins. Missing engine entries are not removals.
+    /// Concurrent explicit reorders are atomic local-intent-wins; remote-only entries stay at the end.
+    /// Membership remains governed by the separate timestamped removal/install records, not this array.
+    static func merge(remote: [String]?, seed: [String], intent: AddonOrderIntent?,
+                      accountID: String, removed: Set<String>) -> [String]? {
+        let desired = intent.flatMap { $0.accountID == accountID ? $0.order : nil }
+        guard remote != nil || desired != nil || !seed.isEmpty else { return nil }
+        let values = desired.map { $0 + (remote ?? []) + seed } ?? remote ?? seed
+        return unique(values.filter { !removed.contains($0) })
+    }
+
+    static func acknowledges(_ pending: AddonOrderIntent?, sent: AddonOrderIntent?, accountID: String) -> Bool {
+        guard let pending, let sent else { return false }
+        return pending.accountID == accountID && pending == sent
+    }
+}
+
 /// The same stable order drives the add-on list and source groups. Never discard unlisted add-ons:
 /// new installs remain at the end, and multiple groups from one add-on retain their response order.
 enum AddonAppliedOrder {
