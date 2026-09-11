@@ -57,6 +57,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import coil3.compose.AsyncImage
+import com.vortx.android.ui.components.FallbackArtwork
 import com.vortx.android.R
 import com.vortx.android.VortXApplication
 import com.vortx.android.model.MetaItem
@@ -319,17 +320,12 @@ fun TvPlayButton(
 /// unloaded preview, a still-hydrating engine row) still reads as an intentional panel rather than a black
 /// bar. The caller layers scrims + content over it.
 @Composable
-fun TvBackdrop(url: String?, seed: String, modifier: Modifier = Modifier) {
-    if (url.isNullOrBlank()) {
-        Box(modifier = modifier.background(backdropBrush(seed, VortXTheme.colors)))
-    } else {
-        AsyncImage(
-            model = url,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = modifier,
-        )
-    }
+fun TvBackdrop(url: String?, seed: String, modifier: Modifier = Modifier, fallbackUrls: List<String?> = emptyList()) {
+    FallbackArtwork(
+        urls = listOf(url) + fallbackUrls,
+        contentDescription = null,
+        modifier = modifier.background(backdropBrush(seed, VortXTheme.colors)),
+    )
 }
 
 /// A deterministic two-stop gradient hued around the live accent, seeded by a string so an art-less hero

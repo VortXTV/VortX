@@ -14,7 +14,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
@@ -22,7 +21,7 @@ import com.vortx.android.ui.theme.vortxGlassRow
 
 /// One ranked source (DESIGN-SYSTEM.md §3 "Source row"): a surface-card row, leading play/download
 /// icon, a prominent [quality] badge (4K/1080p) + [addon] badge + a TORRENT badge when [isTorrent],
-/// then [flavorTags] + [size], then the release [title] (2-line clamp). Tapping resolves + plays;
+/// then [flavorTags] + [size], then the add-on-authored [title] and [description]. Tapping resolves + plays;
 /// [enabled] dims + disables the row while another resolve is in flight.
 ///
 /// [pinned] marks the stream the user's source pin floats to the top (Apple's per-row pin badge, #15);
@@ -51,6 +50,7 @@ fun SourceRow(
     // parsed badges + flavour tags + size. Additive default keeps every existing call site unchanged.
     compact: Boolean = false,
     onLongClick: (() -> Unit)? = null,
+    description: String? = null,
 ) {
     val colors = VortXTheme.colors
     Row(
@@ -96,10 +96,8 @@ fun SourceRow(
             }
             if (!compact) {
                 Text(
-                    text = title,
+                    text = sourceAuthoredText(title, description),
                     style = VortXTheme.type.cardTitle.copy(color = if (enabled) colors.textPrimary else colors.textTertiary),
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
                 )
             }
         }

@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
+import com.vortx.android.ui.components.FallbackArtwork
 import com.vortx.android.VortXApplication
 import com.vortx.android.catalog.AddonSimilarClient
 import com.vortx.android.catalog.CollectionClient
@@ -592,7 +593,7 @@ fun DetailScreen(
                                 }
                             },
                             onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
-                            thumb = { EpisodeThumb(episode, veiled = veiled) },
+                            thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
                             modifier = Modifier
                                 .padding(horizontal = VortXTheme.spacing.edge)
                                 .then(
@@ -776,7 +777,7 @@ private fun Backdrop(m: MetaDetail) {
         ) {
             // Route the backdrop through the artwork router: ERDB bakes ratings/quality onto backdrops when
             // active, otherwise the original add-on/metahub backdrop (or the poster) is used unchanged.
-            val rawBackdrop = m.background ?: m.poster
+            val rawBackdrop = m.background?.takeIf { it.isNotBlank() } ?: m.poster
             val backdropUrl = PosterArtwork.backdrop(m.id, rawBackdrop)
             // Dominant-color tint (item 6): the alpha-weighted average of the decoded backdrop, washed into
             // the lower hero band so the banner blends into a color drawn from the art itself, not a fixed
@@ -789,11 +790,11 @@ private fun Backdrop(m: MetaDetail) {
                         .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
                 )
             } else {
-                AsyncImage(
-                    model = backdropUrl,
+                FallbackArtwork(
+                    urls = listOf(backdropUrl, rawBackdrop, m.poster),
                     contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier.fillMaxSize()
+                        .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
                 )
             }
             tint?.let { bandTint ->
@@ -1576,19 +1577,15 @@ private fun SeasonMenu(
 /// When [veiled] (DET spoiler-safe: an unwatched, not-yet-revealed episode) the art is blurred and an
 /// eye-slash overlay marks it as hidden (blur is a no-op below API 31, so it degrades gracefully).
 @Composable
-private fun EpisodeThumb(episode: Episode, veiled: Boolean = false) {
+private fun EpisodeThumb(episode: Episode, veiled: Boolean = false, fallbackUrls: List<String?> = emptyList()) {
     Box(modifier = Modifier.fillMaxSize()) {
         val artModifier = if (veiled) Modifier.fillMaxSize().blur(14.dp) else Modifier.fillMaxSize()
-        if (episode.thumbnail.isNullOrBlank()) {
-            Box(modifier = artModifier) { DefaultEpisodeThumb() }
-        } else {
-            AsyncImage(
-                model = episode.thumbnail,
-                contentDescription = episode.title,
-                contentScale = ContentScale.Crop,
-                modifier = artModifier,
-            )
-        }
+        FallbackArtwork(
+            urls = listOf(episode.thumbnail) + fallbackUrls,
+            contentDescription = episode.title,
+            modifier = artModifier,
+            placeholder = { DefaultEpisodeThumb() },
+        )
         if (veiled) {
             Box(
                 modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)),
@@ -1974,6 +1971,7 @@ private fun StreamRowWithPinMenu(
         SourceRow(
             addon = source.addon,
             title = source.title,
+            description = source.description,
             quality = StreamRanking.qualityLabel(source),
             isTorrent = source.isTorrent,
             flavorTags = flavorTags,

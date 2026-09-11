@@ -18,6 +18,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import com.vortx.android.ui.components.sourceAuthoredText
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -558,10 +559,8 @@ private fun TvSourceDepthRow(
         ) {
             Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp)) {
                 Text(
-                    text = source.title,
+                    text = sourceAuthoredText(source.title, source.description),
                     style = VortXTheme.type.body,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
                 )
                 val metaLine = listOfNotNull(
                     quality.takeIf { it.isNotBlank() },

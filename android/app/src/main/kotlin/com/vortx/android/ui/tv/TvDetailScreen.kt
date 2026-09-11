@@ -284,7 +284,8 @@ private fun TvDetailContent(
             // The cinematic hero band fills the first screen; episodes + cast scroll up from beneath it.
             Box(modifier = Modifier.fillMaxWidth().height(bandHeight)) {
         TvBackdrop(
-            url = detail.background ?: detail.poster,
+            url = detail.background,
+            fallbackUrls = listOf(detail.poster),
             seed = detail.id,
             modifier = Modifier.fillMaxSize(),
         )
