@@ -803,8 +803,8 @@ struct iOSDetailView: View {
         #endif
     }
 
-    /// The cinematic VOD hero band: ~60% of the viewport on iPhone/iPad (a fixed 320 band read as a
-    /// ~20% strip on a modern phone) and ~58% of the Mac window, clamped so a short window still shows
+    /// The cinematic VOD hero band: 78% on phone portrait, 60% on tablet/landscape and a bounded
+    /// 72% of the Mac window, clamped so a short window still shows
     /// the action row without scrolling. Kept a fixed-per-layout (not aspect-ratio) band because the
     /// hero overlays a text block that an aspectRatio would fight on narrow windows.
     private func heroBandHeight(width: CGFloat, viewport: CGFloat) -> CGFloat {
@@ -3887,7 +3887,7 @@ struct iOSDetailView: View {
         // uncompressed) on the main thread and keeps it at full resolution behind a 132x74 frame. Shared
         // through PosterImageLoader instead: bounded concurrency, its own big URLCache, and an off-main
         // ImageIO downsample straight to the on-screen size (tvOS twin: EpisodeThumbImage in DetailView).
-        return iOSEpisodeThumbImage(url: v.thumbnail)
+        return iOSEpisodeThumbImage(url: v.thumbnail, fallbackURLs: [meta?.background, meta?.poster])
         .frame(width: 132, height: 74)
         .blur(radius: blurArt ? 14 : 0)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
@@ -4659,12 +4659,7 @@ struct iOSEpisodeStreams: View {
     /// The full-window BACKGROUND wash behind the pinned episode page: ALWAYS blurred `.fill` + dim, so the
     /// new full-window paint reads as soft atmosphere and never becomes a second crisp image beside the banner.
     private func backdropWash(height: CGFloat) -> some View {
-        AsyncImage(url: URL(string: shownVideo.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default: Theme.Palette.canvas
-            }
-        }
+        FallbackArtwork(urls: [shownVideo.thumbnail, meta.background, meta.poster])
         .frame(height: height)
         .frame(maxWidth: .infinity, alignment: .top)
         .clipped()
@@ -4684,12 +4679,7 @@ struct iOSEpisodeStreams: View {
     private var backdrop: some View { backdrop(height: backdropHeight) }
 
     private func backdrop(height: CGFloat) -> some View {
-        AsyncImage(url: URL(string: shownVideo.thumbnail ?? meta.background ?? meta.poster ?? "")) { phase in
-            switch phase {
-            case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-            default: Theme.Palette.surface1
-            }
-        }
+        FallbackArtwork(urls: [shownVideo.thumbnail, meta.background, meta.poster])
         .frame(height: height)
         // Width anchor for the episode hero ZStack, full viewport width, pinned leading (see iOSDetailView.backdrop).
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -5579,21 +5569,27 @@ private struct iOSProgressStripe: View {
 /// warm-cache peek so a revisit never flashes blank, a glyph placeholder while it loads, and a `.task(id:)` load.
 private struct iOSEpisodeThumbImage: View {
     let url: String?
+    var fallbackURLs: [String?] = []
+    private var candidates: [String] { ArtworkFallbackPolicy.candidates([url] + fallbackURLs) }
 
     /// ~300 px for a 132 pt-wide still: past 2x on every phone and iPad, and a fraction of the raw asset's
     /// pixels. Only what is drawn stays resident.
     private static let maxPixel: CGFloat = 300
 
     private var warmCache: VXPosterImage? {
-        guard let url, let parsed = URL(string: url) else { return nil }
-        return PosterImageLoader.cached(parsed, maxPixel: Self.maxPixel)
+        for candidate in candidates {
+            if let parsed = URL(string: candidate),
+               let cached = PosterImageLoader.cached(parsed, maxPixel: Self.maxPixel) { return cached }
+        }
+        return nil
     }
 
     @State private var image: VXPosterImage?
+    @State private var imageRequest: [String] = []
 
     var body: some View {
         Group {
-            if let img = image ?? warmCache {
+            if let img = (imageRequest == candidates ? image : nil) ?? warmCache {
                 imageView(img).resizable().aspectRatio(contentMode: .fill)
             } else {
                 Theme.Palette.surface2.overlay(
@@ -5601,9 +5597,15 @@ private struct iOSEpisodeThumbImage: View {
                         .foregroundStyle(Theme.Palette.textTertiary))
             }
         }
-        .task(id: url) {
-            guard image == nil, let url, !url.isEmpty else { return }
-            if let img = await PosterImageLoader.load(url, maxPixel: Self.maxPixel) { image = img }
+        .task(id: candidates) {
+            let request = candidates
+            image = nil
+            imageRequest = request
+            let loaded = await ArtworkFallbackPolicy.firstAvailable(request) {
+                await PosterImageLoader.load($0, maxPixel: Self.maxPixel)
+            }
+            guard !Task.isCancelled, imageRequest == request else { return }
+            image = loaded
         }
     }
 

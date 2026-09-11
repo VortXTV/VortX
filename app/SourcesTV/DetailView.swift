@@ -2142,7 +2142,7 @@ struct CoreSeasonedEpisodes: View {
         // uncompressed) on the main thread and keeps it at full resolution behind a 300x170 frame. Shared
         // through PosterImageLoader instead: bounded concurrency, its own big URLCache, and an off-main
         // ImageIO downsample straight to the on-screen size, so only the pixels actually drawn are resident.
-        return EpisodeThumbImage(url: v.thumbnail)
+        return EpisodeThumbImage(url: v.thumbnail, fallbackURLs: [meta.background, meta.poster])
         .frame(width: 300, height: 170)
         .blur(radius: blurArt ? 20 : 0)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
@@ -2193,30 +2193,42 @@ struct CoreSeasonedEpisodes: View {
 /// peek so a revisit never flashes blank, a glyph placeholder while it loads, and a `.task(id:)` load.
 private struct EpisodeThumbImage: View {
     let url: String?
+    var fallbackURLs: [String?] = []
+    private var candidates: [String] { ArtworkFallbackPolicy.candidates([url] + fallbackURLs) }
 
     /// 600 px for a 300 pt-wide still: covers the 2x render scale with room to spare while keeping roughly
     /// half the decoded bytes of the raw asset. Only what is drawn stays resident.
     private static let maxPixel: CGFloat = 600
 
     private var warmCache: VXPosterImage? {
-        guard let url, let parsed = URL(string: url) else { return nil }
-        return PosterImageLoader.cached(parsed, maxPixel: Self.maxPixel)
+        for candidate in candidates {
+            if let parsed = URL(string: candidate),
+               let cached = PosterImageLoader.cached(parsed, maxPixel: Self.maxPixel) { return cached }
+        }
+        return nil
     }
 
     @State private var image: VXPosterImage?
+    @State private var imageRequest: [String] = []
 
     var body: some View {
         Group {
-            if let img = image ?? warmCache {
+            if let img = (imageRequest == candidates ? image : nil) ?? warmCache {
                 imageView(img).resizable().aspectRatio(contentMode: .fill)
             } else {
                 Theme.Palette.surface2.overlay(
                     Image(systemName: "play.rectangle.fill").font(.title).foregroundStyle(Theme.Palette.textTertiary))
             }
         }
-        .task(id: url) {
-            guard image == nil, let url, !url.isEmpty else { return }
-            if let img = await PosterImageLoader.load(url, maxPixel: Self.maxPixel) { image = img }
+        .task(id: candidates) {
+            let request = candidates
+            image = nil
+            imageRequest = request
+            let loaded = await ArtworkFallbackPolicy.firstAvailable(request) {
+                await PosterImageLoader.load($0, maxPixel: Self.maxPixel)
+            }
+            guard !Task.isCancelled, imageRequest == request else { return }
+            image = loaded
         }
     }
 
@@ -2312,7 +2324,8 @@ struct CoreEpisodeStreams: View {
 
     var body: some View {
         ZStack {
-            FullBleedBackdrop(url: currentVideo.thumbnail ?? meta.background ?? meta.poster,
+            FullBleedBackdrop(url: currentVideo.thumbnail,
+                              fallbackURLs: [meta.background, meta.poster],
                               allowsUltraHD: currentVideo.thumbnail != nil || meta.background != nil)
             ScrollViewReader { proxy in
                 ScrollView {
@@ -2456,6 +2469,7 @@ struct CoreEpisodeStreams: View {
 /// while the image stays vivid up top. Content scrolls over it.
 struct FullBleedBackdrop: View {
     let url: String?
+    var fallbackURLs: [String?] = []
     // Series often have no landscape `background` and fall back to the PORTRAIT poster: .fill would crop a
     // tall image inside the wide hero band, so the series hero passes .fit. Defaults to .fill (movies + all
     // other call sites have a 16:9 backdrop and want it edge-to-edge), keeping those paths unchanged.
@@ -2473,8 +2487,10 @@ struct FullBleedBackdrop: View {
         return allowsUltraHD ? requested : min(requested, HeroArtworkQualityPolicy.fullHDLongEdge)
     }
 
-    private var preferredURL: String? {
-        HeroArtworkQualityPolicy.preferredURL(url, maxPixel: maxPixel)
+    private var artworkCandidates: [String] {
+        ArtworkFallbackPolicy.candidates(([url] + fallbackURLs).map {
+            HeroArtworkQualityPolicy.preferredURL($0, maxPixel: maxPixel)
+        })
     }
 
     var body: some View {
@@ -2500,13 +2516,13 @@ struct FullBleedBackdrop: View {
                 LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
                                startPoint: .leading, endPoint: .center))
             .ignoresSafeArea()
-            .task(id: "\(preferredURL ?? "")#\(maxPixel)") {
-                guard let preferredURL else {
-                    image = nil
-                    return
+            .task(id: "\(artworkCandidates.joined(separator: "\n"))#\(maxPixel)") {
+                // A failed new URL must not keep the previous title's artwork on screen.
+                image = nil
+                let loaded = await ArtworkFallbackPolicy.firstAvailable(artworkCandidates) {
+                    await PosterImageLoader.load($0, maxPixel: CGFloat(maxPixel))
                 }
-                guard let loaded = await PosterImageLoader.load(preferredURL, maxPixel: CGFloat(maxPixel)),
-                      !Task.isCancelled else { return }
+                guard !Task.isCancelled else { return }
                 image = loaded
             }
     }
