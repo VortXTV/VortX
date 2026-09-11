@@ -134,6 +134,7 @@ final class MPVMetalViewController: PlatformViewController {
     /// and event binding, so a wakeup cannot observe START_FILE before its exact entry ID is registered.
     private let loadTokenLock = NSLock()
     private var loadProvenance = PlayerLoadProvenanceState()
+    private var initializationFailure = MPVInitializationFailureState<PlayerLoadToken>()
     /// One destructive cache flight per controller; all mutations occur on the main queue.
     private var cacheFlushFlight = CacheFlushSingleFlight<PlayerLoadToken>()
     /// The source inputs needed for the one bounded same-source retry after a proven false EOF. Kept per
@@ -151,7 +152,7 @@ final class MPVMetalViewController: PlatformViewController {
     private static let seekEOFRecoveryTimeoutSeconds: TimeInterval = 12
     var activeLoadToken: PlayerLoadToken? {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
-        return loadProvenance.activeToken
+        return loadProvenance.activeToken ?? initializationFailure.activeToken
     }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
     private lazy var captureQueueState = CaptureQueueState(queue: captureQueue)
@@ -724,7 +725,8 @@ final class MPVMetalViewController: PlatformViewController {
         mpv = mpv_create()
         if mpv == nil {
             mpvLog.error("failed creating mpv context")
-            exit(1)
+            initializationFailure.fail("VortX Player could not create its playback engine. Try another player or reopen playback.")
+            return
         }
 
         // Hero-preview options (#44), set before mpv_initialize so they take at init time. `mute=yes`
@@ -1031,7 +1033,17 @@ final class MPVMetalViewController: PlatformViewController {
             }
         }
 
-        checkError(mpv_initialize(mpv))
+        let initializationStatus = mpv_initialize(mpv)
+        guard initializationStatus >= 0 else {
+            checkError(initializationStatus)
+            initializationFailure.fail("VortX Player could not initialize its playback engine. Try another player or reopen playback.")
+            // No wakeup observer or media load has been installed yet. Retire the failed context
+            // before publishing an error; never carry a partially initialized handle into loadFile.
+            let failedContext = mpv
+            mpv = nil
+            mpv_terminate_destroy(failedContext)
+            return
+        }
 
         mpv_observe_property(mpv, 0, MPVProperty.videoParamsSigPeak, MPV_FORMAT_DOUBLE)
         // Also observe the transfer characteristic (gamma): HLG content can sit at sig-peak ~1.0, so the
@@ -1203,6 +1215,7 @@ final class MPVMetalViewController: PlatformViewController {
         seekEOFRecovery.reset()
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.invalidate()
+        initializationFailure.invalidateLoad()
     }
 
     private func callbackLoadToken(requiresLoadedFile: Bool = false) -> PlayerLoadToken? {
@@ -1238,6 +1251,9 @@ final class MPVMetalViewController: PlatformViewController {
     /// prevents it from firing into a deallocated controller (the crash on close), and
     /// destruction is serialized onto the event queue so it can't race `readEvents`.
     func stop() {
+        loadTokenLock.lock()
+        initializationFailure.stop()
+        loadTokenLock.unlock()
         #if os(tvOS)
         stopFramePresentationDiagnostics()
         restoreFramePresentationCscale()
@@ -1365,7 +1381,24 @@ final class MPVMetalViewController: PlatformViewController {
         // registers the new entry.
         // Teardown nils the handle; a loadFile racing close must not hand a NULL mpv to the raw
         // mpv_set_property_string calls below (the setString/command helpers self-guard, these do not).
-        guard mpv != nil else { return issuedToken }
+        guard mpv != nil else {
+            loadTokenLock.lock()
+            let failure = initializationFailure.admit(issuedToken)
+            loadTokenLock.unlock()
+            if let failure {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.mpv == nil else { return }
+                    self.loadTokenLock.lock()
+                    let ownsFailure = self.initializationFailure.accepts(issuedToken)
+                    self.loadTokenLock.unlock()
+                    guard ownsFailure else { return }
+                    self.playDelegate?.propertyChange(
+                        propertyName: MPVProperty.endFileError, data: failure, loadToken: issuedToken
+                    )
+                }
+            }
+            return issuedToken
+        }
         loggedHardwareDecoderNegotiation = false
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
