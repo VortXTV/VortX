@@ -127,14 +127,24 @@ final class WatchedIndex: ObservableObject {
         SIMKLWatchedShadow.shared.refreshIfStale()
         let shadow = TraktSyncEngine.shared.shadowWatchedIDs()
             .union(SIMKLWatchedShadow.shared.shadowWatchedIDs())
+        // Explicit owner intents override stale engine bucket membership for badges. They are
+        // account-scoped and bound with the credential owner, so no previous-account cache leaks.
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let first = Self.bucketWatchedIDs(expectedUID: expectedUID)
-            DispatchQueue.main.async { self?.publish(live.union(first).union(shadow), ifCurrent: gen) }
+            DispatchQueue.main.async {
+                let ids = live.union(first).union(shadow)
+                self?.publish(ProfileStore.shared.active?.isOwner == true
+                    ? OwnerWatchedIntentStore.effectiveTitleIDs(engine: ids) : ids, ifCurrent: gen)
+            }
             // Resweep: the engine persists the bucket as an async effect AFTER the NewState emit,
             // so the first pass can read the pre-mark file. One trailing re-read settles it.
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.resweepDelay) { [weak self] in
                 let second = Self.bucketWatchedIDs(expectedUID: expectedUID)
-                DispatchQueue.main.async { self?.publish(live.union(second).union(shadow), ifCurrent: gen) }
+                DispatchQueue.main.async {
+                    let ids = live.union(second).union(shadow)
+                    self?.publish(ProfileStore.shared.active?.isOwner == true
+                        ? OwnerWatchedIntentStore.effectiveTitleIDs(engine: ids) : ids, ifCurrent: gen)
+                }
             }
         }
     }
@@ -143,6 +153,10 @@ final class WatchedIndex: ObservableObject {
     /// badge set reflects it without waiting for an engine event. Main-queue safe; the rebuild throttle
     /// already coalesces bursts.
     func externalShadowChanged() { rebuild() }
+
+    /// Remote or accepted local owner intent changed. This remains read-only: it publishes the
+    /// merged intent state but never writes it back to the engine bucket.
+    func ownerIntentsDidChange() { rebuild() }
 
     /// A detail view computed whether a SERIES is fully watched by its aired, regular-season episodes
     /// (issue #143). Union it into the badge set (read-only, in-memory) so the poster cover flips even when

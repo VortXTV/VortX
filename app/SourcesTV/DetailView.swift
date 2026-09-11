@@ -968,7 +968,7 @@ struct DetailView: View {
         // remove one it recorded. `seriesPrimaryEpisode` takes both because resume must be decided on the
         // local set alone (see its doc). Mirrors iOSDetailView.localWatchedSet / watchedSet exactly.
         let localWatched = profiles.activeUsesEngineHistory
-            ? (core.metaDetails?.watchedIds ?? [])
+            ? core.metaDetails.map { core.effectiveWatchedVideoIDs(for: $0) } ?? []
             : profiles.watchedVideoIds(forMeta: meta.id)
         let watched = localWatched.union(
             TraktEpisodeShadow.watchedVideoIDs(showIdentity: meta.id, videos: videos))

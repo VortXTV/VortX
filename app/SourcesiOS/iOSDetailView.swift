@@ -2012,7 +2012,7 @@ struct iOSDetailView: View {
     private var localWatchedSet: Set<String> {
         guard let m = meta else { return [] }
         return profiles.activeUsesEngineHistory
-            ? (core.metaDetails?.watchedIds ?? [])
+            ? core.metaDetails.map { core.effectiveWatchedVideoIDs(for: $0) } ?? []
             : profiles.watchedVideoIds(forMeta: m.id)
     }
 

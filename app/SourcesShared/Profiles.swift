@@ -1607,9 +1607,25 @@ final class ProfileStore: ObservableObject {
             let previous = Set(entry.watchedVideoIds)
             if isWatched {
                 for id in videoIds where !entry.watchedVideoIds.contains(id) { entry.watchedVideoIds.append(id) }
+                var marked = entry.markedAt ?? [:]
+                let unmarked = entry.unmarkedAt ?? [:]
+                for id in videoIds {
+                    marked[id] = Self.nextWatchMutationClock(markedAt: marked[id], unmarkedAt: unmarked[id])
+                }
+                entry.markedAt = marked
             }
-            else { entry.watchedVideoIds.removeAll { videoIds.contains($0) } }
-            guard Set(entry.watchedVideoIds) != previous else { return }
+            else {
+                entry.watchedVideoIds.removeAll { videoIds.contains($0) }
+                var unmarked = entry.unmarkedAt ?? [:]
+                let marked = entry.markedAt ?? [:]
+                for id in videoIds {
+                    unmarked[id] = Self.nextWatchMutationClock(markedAt: marked[id], unmarkedAt: unmarked[id])
+                }
+                entry.unmarkedAt = unmarked
+            }
+            // A user explicitly unwatching an already-absent id still needs a false operation
+            // clock, otherwise a delayed peer mark can resurrect it.
+            guard Set(entry.watchedVideoIds) != previous || !isWatched else { return }
             entry.lastWatched = Self.isoNow()
             if !name.isEmpty { entry.name = name }
             if !type.isEmpty { entry.type = type }
@@ -1630,6 +1646,10 @@ final class ProfileStore: ObservableObject {
                 name: meta.name, type: meta.type, poster: meta.poster)
             guard !entry.watchedVideoIds.contains(meta.videoId) else { return }
             entry.watchedVideoIds.append(meta.videoId)
+            var marked = entry.markedAt ?? [:]
+            marked[meta.videoId] = Self.nextWatchMutationClock(
+                markedAt: marked[meta.videoId], unmarkedAt: (entry.unmarkedAt ?? [:])[meta.videoId])
+            entry.markedAt = marked
             entry.lastWatched = Self.isoNow()
             entry.name = meta.name
             entry.type = meta.type
@@ -1849,9 +1869,11 @@ final class ProfileStore: ObservableObject {
 
     /// Hydrate an OVERLAY profile's local watch overlay from a synced byProfile payload (cloud -> device,
     /// the missing sync-down leg, so a secondary profile's library + CW show in the app on every device,
-    /// not just the dashboard). Merges per item last-writer-wins by lastWatched and UNIONs watchedVideoIds
-    /// so neither side's progress or watched-episodes are lost. Only ever writes overlay caches; an
-    /// engine-backed (owner) profile is skipped so the account library is never touched (the invariant).
+    /// not just the dashboard). Merges per item last-writer-wins by the REAL lastWatched clock and merges
+    /// watched episodes via per-video mark/unmark clocks (`OverlayWatchMergePolicy`), so an unmark
+    /// converges in either delivery order and independent episode operations survive. Only ever writes
+    /// overlay caches; an engine-backed (owner) profile is skipped so the account library is never
+    /// touched (the invariant).
     func applyRemoteOverlay(
         profileID: UUID,
         entries: [String: WatchEntry],
@@ -1862,7 +1884,8 @@ final class ProfileStore: ObservableObject {
         guard let inbound = OverlayWatchInboundPolicy.select(
             rows: entries.map { .init(id: $0.key, entry: $0.value) },
             removals: incomingRemovals,
-            identity: Self.watchIdentity
+            identity: Self.watchIdentity,
+            maximumEntries: OverlayWatchMergePolicy.durableWatchedEntryLimit
         ) else { return }
         // Merge against the same authority the UI is currently mutating. Reading the delayed disk cache for the
         // active profile could replace fresh progress for title A when a remote update for title B landed.
@@ -1870,14 +1893,12 @@ final class ProfileStore: ObservableObject {
         var changed = false
         for (metaId, incoming) in inbound.entries {
             guard var existing = current[metaId] else { current[metaId] = incoming; changed = true; continue }
-            let union = Array(Set(existing.watchedVideoIds).union(incoming.watchedVideoIds))
-            if incoming.lastWatched > existing.lastWatched {
-                var merged = incoming; merged.watchedVideoIds = union
-                current[metaId] = merged; changed = true
-            } else if union.count != existing.watchedVideoIds.count {
-                existing.watchedVideoIds = union
-                current[metaId] = existing; changed = true
-            }
+            // Per-video LWW clocks + scalar LWW by the real lastWatched clock. A NEWER inbound snapshot
+            // with a SMALLER watched set SHRINKS it (an unmark converges in either delivery order); an
+            // older inbound snapshot is never unioned back over a newer local one. Independent episode
+            // operations survive via the additive per-video mark/unmark clocks.
+            let merged = OverlayWatchMergePolicy.mergeEntry(existing: existing, incoming: incoming)
+            if merged != existing { current[metaId] = merged; changed = true }
         }
         let previousRemovals = watchRemovals(for: profileID)
         let resolved = OverlayWatchRemovalPolicy.resolve(
@@ -1965,6 +1986,15 @@ final class ProfileStore: ObservableObject {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: Date())
+    }
+
+    /// Wall-clock ms, the unit of the per-video mark/unmark clocks in `WatchEntry`.
+    private static func nowMillis() -> Double { Date().timeIntervalSince1970 * 1000 }
+
+    /// Local user operations need a strict per-video order even when two taps land in one millisecond.
+    /// Remote observations never call this; they retain their supplied causal clocks.
+    private static func nextWatchMutationClock(markedAt: Double?, unmarkedAt: Double?) -> Double {
+        max(nowMillis(), max(markedAt ?? 0, unmarkedAt ?? 0) + 1)
     }
 }
 

@@ -813,6 +813,7 @@ final class VortXSyncManager: ObservableObject {
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
         OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
+        OwnerWatchedIntentStore.bind(ownerID: scope.keychainOwnerID)
         return capture
     }
 
@@ -828,6 +829,7 @@ final class VortXSyncManager: ObservableObject {
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
         OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
+        OwnerWatchedIntentStore.bind(ownerID: scope.keychainOwnerID)
         return capture
     }
 
@@ -1608,6 +1610,7 @@ final class VortXSyncManager: ObservableObject {
     /// read-merge guards.
     private func vortxSummary(existingVortx: [String: Any]? = nil) -> [String: Any] {
         let store = ProfileStore.shared
+        let ownerWatched = OwnerWatchedIntentStore.wire(merging: existingVortx?["ownerWatched"])
         let profiles: [[String: Any]] = store.profiles.map { p in
             // pinHash is the salted SHA-256 (salt = the profile id, already here), never the raw PIN,
             // so the dashboard can verify a PIN entry by re-hashing without ever seeing the digits.
@@ -1664,14 +1667,35 @@ final class VortXSyncManager: ObservableObject {
             let removals = resolved.removals
             let library: [[String: Any]] = cache.map { (metaId, e) in
                 // t/d in seconds for the dashboard; v (resume episode/movie id) + w (watched episode ids)
-                // so syncDown can rebuild the FULL overlay on another device, not just library membership.
-                ["id": metaId, "name": e.name, "type": e.type, "poster": e.poster ?? "",
-                 "t": e.timeOffsetMs / 1000, "d": e.durationMs / 1000, "lastWatched": e.lastWatched,
-                 "v": e.videoId ?? "", "w": e.watchedVideoIds]
+                // + ma/ua (per-video mark/unmark clocks, wall-clock ms) so syncDown can rebuild the FULL
+                // overlay on another device, not just library membership — and so an unmark converges.
+                var row: [String: Any] = ["id": metaId, "name": e.name, "type": e.type, "poster": e.poster ?? "",
+                     "t": e.timeOffsetMs / 1000, "d": e.durationMs / 1000, "lastWatched": e.lastWatched,
+                     "v": e.videoId ?? "", "w": e.watchedVideoIds]
+                if let ma = e.markedAt, !ma.isEmpty { row["ma"] = ma }
+                if let ua = e.unmarkedAt, !ua.isEmpty { row["ua"] = ua }
+                return row
+            }
+            // DURABLE watched-history carrier, separate from the 120-row CW-rail trim above: the rail
+            // bound is a RENDER bound, and sharing it with durable history silently dropped every
+            // watched id below the 120 cut on fresh devices (history "disappeared"). This map carries
+            // every profile entry's watched ids + clocks (bounded far higher, still doc-safe), so a
+            // reinstall converges its full watched set. Rows inside `library` also carry the same data,
+            // so the read side unions both.
+            let durableOrder = snapshot.sorted { $0.value.lastWatched > $1.value.lastWatched }
+            var watchedMap: [String: Any] = [:]
+            for (metaId, e) in durableOrder
+            where !e.watchedVideoIds.isEmpty || !(e.markedAt ?? [:]).isEmpty || !(e.unmarkedAt ?? [:]).isEmpty {
+                guard watchedMap.count < OverlayWatchMergePolicy.durableWatchedEntryLimit else { break }
+                var row: [String: Any] = ["w": e.watchedVideoIds]
+                if let ma = e.markedAt, !ma.isEmpty { row["ma"] = ma }
+                if let ua = e.unmarkedAt, !ua.isEmpty { row["ua"] = ua }
+                watchedMap[metaId] = row
             }
             let removed: [[String: Any]] = removals.map { ["keys": $0.keys, "removedAt": $0.removedAt] }
             var bucket = priorBucket
             bucket["library"] = library
+            bucket["watched"] = watchedMap
             bucket["removed"] = removed
             byProfile[p.id.uuidString] = bucket
         }
@@ -1727,6 +1751,20 @@ final class VortXSyncManager: ObservableObject {
         }
         for entry in engineLibrary {
             guard let id = entry["id"] as? String else { continue }
+            if let prior = libraryByID[id] {
+                // CLOCK-DECIDED, atomic position resolution (cross-device CW defect): when either side
+                // carries a real `lastWatched` clock, the NEWER row's t/d/v/lastWatched win together —
+                // a warm device's OLDER positive engine position can no longer overwrite a NEWER remote
+                // playback, a newer rewind / finish-0 propagates, and a bare re-add (no clock) can never
+                // manufacture or erase a watch clock (the prior position + clock survive onto the fresh
+                // metadata). With no clock on either side the legacy guards below still decide.
+                let engineClock = OwnerLibraryPositionPolicy.lastWatchedMillis(entry["lastWatched"])
+                let priorClock = OwnerLibraryPositionPolicy.lastWatchedMillis(prior["lastWatched"])
+                if engineClock > 0 || priorClock > 0 {
+                    libraryByID[id] = OwnerLibraryPositionPolicy.resolve(engine: entry, prior: prior)
+                    continue
+                }
+            }
             // Wave 4 clobber guard (Finding 1): do NOT let a bare, progress-less engine item (t == 0 AND d == 0,
             // the signature of a freshly AddToLibrary'd title on a cold / recovered / post-import device whose
             // engine re-adds owner titles at time 0) OVERWRITE a prior doc entry that already carries a resume
@@ -1841,6 +1879,7 @@ final class VortXSyncManager: ObservableObject {
         }
 
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
+        if !ownerWatched.isEmpty { v["ownerWatched"] = ownerWatched }
         if !byProfile.isEmpty { v["byProfile"] = byProfile }
         if !ownerLibrary.isEmpty { v["library"] = ownerLibrary }
         if !addonList.isEmpty {
@@ -2525,6 +2564,13 @@ final class VortXSyncManager: ObservableObject {
         // excluded. Inside the withRemoteApplySuppressed region, so the cache write does not arm a self-echo push.
         OwnerResumeStore.recordReadds(libraryAdvance.readdedAddedAt)
         refreshOwnerResumeCache(from: doc)
+        // Owner watched intents are an account-scoped LWW carrier, deliberately separate from raw
+        // engine library JSON. Apply while remote suppression is active so this read cannot echo-push;
+        // then rebuild the read-only badge index from the merged local/remote intents.
+        if OwnerWatchedIntentStore.mergeWire((doc["vortx"] as? [String: Any])?["ownerWatched"]) {
+            WatchedIndex.shared.ownerIntentsDidChange()
+            restored = true
+        }
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
         // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
@@ -2577,10 +2623,11 @@ final class VortXSyncManager: ObservableObject {
                 guard lib.count <= OverlayWatchInboundPolicy.parseLimit,
                       appRemovals.count + webRemovals.count <= OverlayWatchInboundPolicy.parseLimit else { continue }
                 var rows: [OverlayWatchInboundPolicy.Row<WatchEntry>] = []
+                var rowIDs = Set<String>()
                 for item in lib {
                     guard let metaId = item["id"] as? String, !metaId.isEmpty else { continue }
-                    let tSec = (item["t"] as? Int) ?? Int((item["t"] as? Double) ?? 0)
-                    let dSec = (item["d"] as? Int) ?? Int((item["d"] as? Double) ?? 0)
+                    let tSec = Self.safeOverlaySeconds(item["t"])
+                    let dSec = Self.safeOverlaySeconds(item["d"])
                     let videoId = (item["v"] as? String).flatMap { $0.isEmpty ? nil : $0 }
                     var e = WatchEntry(videoId: videoId, timeOffsetMs: tSec * 1000, durationMs: dSec * 1000,
                                        lastWatched: item["lastWatched"] as? String ?? "",
@@ -2588,7 +2635,28 @@ final class VortXSyncManager: ObservableObject {
                                        type: item["type"] as? String ?? "movie",
                                        poster: (item["poster"] as? String).flatMap { $0.isEmpty ? nil : $0 })
                     e.watchedVideoIds = item["w"] as? [String] ?? []
+                    e.markedAt = Self.clockMap(item["ma"])
+                    e.unmarkedAt = Self.clockMap(item["ua"])
                     rows.append(.init(id: metaId, entry: e))
+                    rowIDs.insert(metaId)
+                }
+                // DURABLE watched-history rows the 120-row rail trim dropped: the writer emits a
+                // separate untrimmed `watched` map per profile bucket precisely so a fresh device
+                // receives ALL watched ids, not just the newest 120 rail-renderable rows. Zero-progress
+                // rows (no resume), so they badge watched episodes without fabricating CW positions;
+                // applyRemoteOverlay's scalar LWW keeps any newer local progress for the same title.
+                if let watchedMap = bucket["watched"] as? [String: Any],
+                   watchedMap.count <= OverlayWatchMergePolicy.durableWatchedEntryLimit {
+                    for (metaId, raw) in watchedMap {
+                        guard !metaId.isEmpty, !rowIDs.contains(metaId),
+                              let row = raw as? [String: Any] else { continue }
+                        let e = WatchEntry(videoId: nil, timeOffsetMs: 0, durationMs: 0, lastWatched: "",
+                                           name: "", type: "movie", poster: nil,
+                                           watchedVideoIds: row["w"] as? [String] ?? [],
+                                           markedAt: Self.clockMap(row["ma"]),
+                                           unmarkedAt: Self.clockMap(row["ua"]))
+                        rows.append(.init(id: metaId, entry: e))
+                    }
                 }
                 let removals: [OverlayWatchRemoval] = (appRemovals + webRemovals).compactMap {
                     guard let keys = $0["keys"] as? [String], !keys.isEmpty else { return nil }
@@ -2597,7 +2665,9 @@ final class VortXSyncManager: ObservableObject {
                     return OverlayWatchRemoval(keys: keys, removedAt: stamp)
                 }
                 guard let inbound = OverlayWatchInboundPolicy.select(
-                    rows: rows, removals: removals, identity: { ProfileStore.watchIdentityForSync(metaId: $0, entry: $1) }
+                    rows: rows, removals: removals,
+                    identity: { ProfileStore.watchIdentityForSync(metaId: $0, entry: $1) },
+                    maximumEntries: OverlayWatchMergePolicy.durableWatchedEntryLimit
                 ) else { continue }
                 ProfileStore.shared.applyRemoteOverlay(
                     profileID: uuid, entries: inbound.entries, removals: inbound.removals
@@ -2853,13 +2923,20 @@ final class VortXSyncManager: ObservableObject {
         // device resume exactly where device A left off; it must populate even when the engine still reports a
         // (stale, mid-Logout) library, so it runs before the recovery guards. Never destroys.
         refreshOwnerResumeCache(from: doc)
-        // Only RE-ADD titles to the engine when its account library is genuinely empty (a fresh / cold device).
         // Require the engine to have POSITIVELY reported a library first (`library != nil`): a nil library is the
-        // not-yet-loaded state, and treating that transient zero as "empty" would re-add a full account library
-        // while the engine is still loading its real one. A nil library defers recovery to a later call.
+        // not-yet-loaded state, and treating that transient zero as "missing everything" would re-add a full
+        // account library while the engine is still loading its real one. A nil library defers recovery to a
+        // later call.
         guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
-        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
-        guard !engineHasLibrary else { return }
+        // DIFF-BASED recovery, not empty-only: a WARM engine (titles already present) used to early-exit
+        // here, so a title added on device A landed in doc.vortx.library but NEVER appeared in device B's
+        // engine library / Library rail / Continue-Watching until a cold relaunch or data reset. Diff the
+        // account's owned ids against the engine's KNOWN identities (normalized, ignoring removed/temp
+        // markers) and install ONLY the missing ones. Tombstones were already consulted above and keep
+        // explicitly removed titles out; this is a machine membership re-add, never an ordinary install
+        // intent, and the account fence (`isCurrent`) re-validates around every await.
+        let knownIDs = Set(engineLibrary.filter { !($0.removed ?? false) }
+            .map { LibraryTombstones.normalize($0.id) }).subtracting([""])
         // stampIntent: false because this is a machine re-add of account-owned titles: stamping an addedAt here
         // could mint a machine timestamp that beats a real removedAt this device has not folded yet, durably
         // resurrecting a removed title.
@@ -2869,7 +2946,9 @@ final class VortXSyncManager: ObservableObject {
             guard let id = item["id"] as? String, !id.isEmpty,
                   !removedLibrary.contains(LibraryTombstones.normalize(id)),
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
-                  id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
+                  id.hasPrefix("tt") || id.hasPrefix("tmdb"),
+                  // Warm-engine diff: only the account-owned titles the engine does NOT already hold.
+                  !knownIDs.contains(LibraryTombstones.normalize(id)) else { continue }
             let type = (item["type"] as? String) == "series" ? "series" : "movie"
             if await CoreBridge.shared.addCatalogItemLocalOnly(id: id, type: type, credentialCapture: capture) {
                 recovered += 1
@@ -3003,6 +3082,32 @@ final class VortXSyncManager: ObservableObject {
         if let d = v as? Double { return Int(d) }
         if let n = v as? NSNumber { return n.intValue }
         return 0
+    }
+
+    /// Decode a per-video mark/unmark clock map (`"ma"`/`"ua"`: videoId -> wall-clock ms) from a doc
+    /// row. Tolerant of NSNumber/Double boxing and drops non-positive stamps (never a real clock).
+    private static func clockMap(_ raw: Any?) -> [String: Double]? {
+        guard let dict = raw as? [String: Any], !dict.isEmpty else { return nil }
+        var out: [String: Double] = [:]
+        for (k, v) in dict {
+            let ms: Double
+            if let d = v as? Double { ms = d }
+            else if let n = v as? NSNumber { ms = n.doubleValue }
+            else if let i = v as? Int { ms = Double(i) }
+            else { continue }
+            if ms.isFinite, ms > 0, !k.isEmpty { out[k] = ms }
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    private static func safeOverlaySeconds(_ raw: Any?) -> Int {
+        let value: Double
+        if let i = raw as? Int { value = Double(i) }
+        else if let d = raw as? Double { value = d }
+        else if let n = raw as? NSNumber { value = n.doubleValue }
+        else { return 0 }
+        guard value.isFinite, value >= 0, value <= 2_000_000 else { return 0 }
+        return Int(value)
     }
 
     /// Return only incoming tombstone identities whose wire stamp advances what this device already knows.

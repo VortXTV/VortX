@@ -2053,17 +2053,23 @@ final class CoreBridge: ObservableObject {
         if !isWatched {
             pendingEpisodeWatched = pendingEpisodeWatched.filter { $0.value.meta.libraryId != expected.id }
         }
+        var acceptedIntentIDs: [String] = []
         for action in LibraryWatchedMutationPolicy.wholeTitleActions(videos: videos, isWatched: isWatched) {
             switch action {
             case .video(let video, let watched):
                 var payload: [String: Any] = ["id": video.id]
                 if let season = video.season { payload["season"] = season }
                 if let episode = video.episode { payload["episode"] = episode }
-                dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, watched]])
+                if dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, watched]]) {
+                    acceptedIntentIDs.append(video.id)
+                }
             case .title(let watched):
-                dispatchMetaDetails(["action": "MarkAsWatched", "args": watched])
+                if dispatchMetaDetails(["action": "MarkAsWatched", "args": watched]) {
+                    acceptedIntentIDs.append(expected.id)
+                }
             }
         }
+        recordOwnerWatchedIntent(titleID: expected.id, videoIDs: acceptedIntentIDs, watched: isWatched)
     }
 
     /// Mark every episode of a season watched/unwatched.
@@ -2082,7 +2088,11 @@ final class CoreBridge: ObservableObject {
                 $0.value.meta.libraryId != expected.id || $0.value.meta.season != season
             }
         }
-        dispatchMetaDetails(["action": "MarkSeasonAsWatched", "args": [season, isWatched]])
+        if dispatchMetaDetails(["action": "MarkSeasonAsWatched", "args": [season, isWatched]]) {
+            recordOwnerWatchedIntent(titleID: expected.id,
+                                     videoIDs: (residentMeta.videos ?? []).filter { $0.season == season }.map(\.id),
+                                     watched: isWatched)
+        }
     }
 
     /// Mark a single episode watched/unwatched. The engine's `Video` only needs `id`.
@@ -2100,7 +2110,9 @@ final class CoreBridge: ObservableObject {
         var payload: [String: Any] = ["id": video.id]
         if let season = video.season { payload["season"] = season }
         if let episode = video.episode { payload["episode"] = episode }
-        dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, isWatched]])
+        if dispatchMetaDetails(["action": "MarkVideoAsWatched", "args": [payload, isWatched]]) {
+            recordOwnerWatchedIntent(titleID: expected.id, videoIDs: [video.id], watched: isWatched)
+        }
     }
 
     /// Route a detail-page watched toggle into the overlay when the active profile keeps
@@ -2114,6 +2126,22 @@ final class CoreBridge: ObservableObject {
                                        videoIds: ids.isEmpty ? [meta.id] : ids,
                                        name: meta.name, type: meta.type, poster: meta.poster)
         return true
+    }
+
+    /// Persist only an accepted owner mutation. The resident-detail and playback-target fences at
+    /// each caller prove the active profile/account still owns the action; this extra owner check
+    /// prevents any delayed callback from writing a secondary profile's account carrier.
+    private func recordOwnerWatchedIntent(titleID: String, videoIDs: [String], watched: Bool) {
+        guard Thread.isMainThread, ProfileStore.shared.active?.isOwner == true else { return }
+        var changed = false
+        MainActor.assumeIsolated {
+            for videoID in Set(videoIDs) where !videoID.isEmpty {
+                changed = OwnerWatchedIntentStore.record(titleID: titleID, videoID: videoID, watched: watched) || changed
+            }
+        }
+        guard changed else { return }
+        WatchedIndex.shared.ownerIntentsDidChange()
+        VortXSyncManager.shared.requestSyncSoon()
     }
 
     /// Display info for an overlay watch entry when a toggle arrives by bare id (the
@@ -2172,6 +2200,10 @@ final class CoreBridge: ObservableObject {
             return
         }
         guard !logoutAccountMutationPending else { return }
+        // Playback has already passed its profile/account target fence above, so this is an accepted
+        // owner watch fact even if the engine meta-details action is intentionally deferred.
+        recordOwnerWatchedIntent(titleID: meta.libraryId,
+                                 videoIDs: [meta.usesSeriesLifecycle ? meta.videoId : meta.libraryId], watched: true)
         // External sync (Trakt/SIMKL): the definitive watch signal fans out from this shared chokepoint
         // (the 90% marker, the EOF path, and manual in-player marks all route here). Additive + fail-soft +
         // gated + once-latched inside the coordinator (owner profile only; a no-op with empty creds). It
@@ -2253,6 +2285,15 @@ final class CoreBridge: ObservableObject {
         || metaDetails?.appleCWNavigationMeta(for: meta.libraryId, streamID: meta.videoId) != nil
     }
 
+    /// Owner-only effective detail ticks. Kept out of CoreModels so model decoding has no mutable
+    /// account-store dependency; an explicit remote false intent removes stale engine bits here.
+    func effectiveWatchedVideoIDs(for details: CoreMetaDetails) -> Set<String> {
+        let engine = details.watchedIds
+        guard ProfileStore.shared.active?.isOwner == true, let titleID = details.meta?.id else { return engine }
+        return OwnerWatchedIntentStore.effectiveVideoIDs(forTitle: titleID, engine: engine,
+            knownVideoIDs: Set(details.meta?.videos?.map(\.id) ?? []))
+    }
+
     /// Resume position (seconds) from the engine's library item for `meta`, or nil if the engine has
     /// no entry. For a series, the saved offset only counts when the saved video matches the episode
     /// being opened; a mismatch answers 0. (timeOffset is stored in ms.)
@@ -2284,8 +2325,10 @@ final class CoreBridge: ObservableObject {
         ) {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
+        // The by-id resolver carries the causal owner-cache comparison; use it even when this
+        // title is currently loaded, so a detail-open stale positive cannot hide newer remote state.
+        if let resolved = engineResumeSecondsByLibraryId(for: meta) { return resolved }
         let engine = max(0, item.state.timeOffset / 1000.0)
-        if engine > 0 { return flooredResumeSeconds(engine: engine, for: meta) }   // freshest local play wins
         // engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0, a recovered item the engine could not be given an offset). A genuine finished / rewound
         // 0 keeps duration > 0 and is REAL, so trust it and never offer a stale resume for a just-finished title.
@@ -2324,6 +2367,27 @@ final class CoreBridge: ObservableObject {
             return vortxOwnedResumeSeconds(for: meta) ?? 0
         }
         let engine = max(0, item.state.timeOffset / 1000.0)
+        // CROSS-DEVICE CONVERGENCE (owner resume defect): a warm device's engine bucket can hold a STALE
+        // positive position older than a peer's playback sitting in the VortX cache. The cache now
+        // preserves the row's real lastWatched clock, so when the cached clock is provably NEWER than the
+        // engine row's own clock, the cached position wins — including an explicit remote finish-0
+        // (t == 0), so a title finished on a peer converges here too. A clock-less engine row cannot prove
+        // it is newer, so it is also overridden. Merely having a detail model loaded is not playback:
+        // protect actual active playback, explicit local rewind/finish, and episode identity instead.
+        if !playerActive, !LocalRewindLog.contains(meta.libraryId),
+           let cached = OwnerResumeStore.entry(forId: meta.libraryId), cached.lw > 0 {
+            let engineClock = OwnerLibraryPositionPolicy.lastWatchedMillis(item.state.lastWatched)
+            // A missing engine clock cannot establish that its positive bucket is newer. Prefer the
+            // causally stamped account position unless this is the loaded/live item or an explicitly
+            // recorded local rewind/finish.
+            if cached.lw > engineClock,
+               !EpisodePlaybackIdentity.savedResumeTargetsDifferentEpisode(
+                   usesSeriesLifecycle: meta.usesSeriesLifecycle,
+                   savedVideoID: cached.v,
+                   requestedVideoID: meta.videoId) {
+                return max(0, cached.t)   // newer remote position (or explicit zero) beats the stale engine copy
+            }
+        }
         if engine > 0 { return flooredResumeSeconds(engine: engine, for: meta) }   // freshest local play wins
         // Engine reports 0: only fall back to the VortX cache for the BARE re-add signature (timeOffset == 0 AND
         // duration == 0). A genuine finished / rewound 0 keeps duration > 0 and is REAL, so trust it.
@@ -2440,7 +2504,9 @@ final class CoreBridge: ObservableObject {
         if !isWatched {
             pendingEpisodeWatched = pendingEpisodeWatched.filter { $0.value.meta.libraryId != id }
         }
-        dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]])
+        if dispatchCtx(["action": "LibraryItemMarkAsWatched", "args": ["id": id, "is_watched": isWatched]]) {
+            recordOwnerWatchedIntent(titleID: id, videoIDs: [id], watched: isWatched)
+        }
     }
 
     /// Drop finished titles from the Continue Watching list the engine hands us, BEFORE we publish it.
@@ -2855,7 +2921,9 @@ final class CoreBridge: ObservableObject {
               LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
                 metaID: metaId, expectedType: fallbackPreview?.type,
                 previewID: preview["id"] as? String, previewType: preview["type"] as? String) else { return }
-        dispatchCtx(["action": "MetaItemMarkAsWatched", "args": ["meta_item": preview, "is_watched": isWatched]])
+        if dispatchCtx(["action": "MetaItemMarkAsWatched", "args": ["meta_item": preview, "is_watched": isWatched]]) {
+            recordOwnerWatchedIntent(titleID: metaId, videoIDs: [metaId], watched: isWatched)
+        }
     }
 
     /// The raw `MetaItemPreview` JSON for a catalog item id, pulled verbatim from whichever catalog field

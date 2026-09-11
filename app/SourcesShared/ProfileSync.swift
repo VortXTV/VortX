@@ -33,8 +33,12 @@ enum OwnerResumeStore {
         return (keyPrefix + ownerID, receiptKeyPrefix + ownerID)
     }
 
-    /// A cached resume position: `t`/`d` in whole seconds, `v` = the resume video id (episode) for a series.
-    struct Entry { let t: Double; let d: Double; let v: String? }
+    /// A cached resume position: `t`/`d` in whole seconds, `v` = the resume video id (episode) for a
+    /// series, `lw` = the row's real `lastWatched` clock in wall-clock ms (0 when the doc row had no
+    /// parsable clock). The clock is what lets a reader prove a cached REMOTE position is newer than a
+    /// stale positive ENGINE position, so a warm device converges to the peer's playback (including an
+    /// explicit remote finish-0) instead of trusting its own older copy.
+    struct Entry { let t: Double; let d: Double; let v: String?; let lw: Double }
 
     /// Upsert owner-library resume entries from a pulled document. `t`/`d` are in SECONDS. A library page is
     /// not a complete snapshot, so omission must never delete another title's cached resume. Explicit library
@@ -46,12 +50,21 @@ enum OwnerResumeStore {
         for e in entries where !e.id.isEmpty {
             let id = LibraryTombstones.normalize(e.id)
             guard !id.isEmpty else { continue }
+            let incomingClock = lastWatchedMilliseconds(e.lastWatched)
             if let addedAt = (receipts[id] as? NSNumber)?.doubleValue ?? (receipts[id] as? Double),
-               !(lastWatchedMilliseconds(e.lastWatched) > addedAt) {
+               !(incomingClock > addedAt) {
                 continue // Legacy/missing/older row cannot prove it post-dates the re-add.
             }
+            let rawExisting = map[id] as? [String: Any]
+            let existingClock = (rawExisting?["lw"] as? NSNumber)?.doubleValue
+                ?? (rawExisting?["lw"] as? Double) ?? 0
+            // Preserve t/d/v/lw atomically: a stale delayed pull is an observation, not a local
+            // edit, so it must never acquire a synthetic "now" clock or undo a newer rewind/finish.
+            guard OwnerLibraryPositionPolicy.shouldReplaceCachedPosition(
+                existingClock: existingClock, incomingClock: incomingClock
+            ) else { continue }
             receipts.removeValue(forKey: id)
-            map[id] = ["t": e.t, "d": e.d, "v": e.v ?? ""]
+            map[id] = ["t": e.t, "d": e.d, "v": e.v ?? "", "lw": incomingClock]
         }
         UserDefaults.standard.set(map, forKey: keys.cache)
         if receipts.isEmpty { UserDefaults.standard.removeObject(forKey: keys.receipt) }
@@ -129,7 +142,9 @@ enum OwnerResumeStore {
             return 0
         }
         let v = raw["v"] as? String
-        return Entry(t: seconds(raw["t"]), d: seconds(raw["d"]), v: (v?.isEmpty == false) ? v : nil)
+        let lw = seconds(raw["lw"])
+        return Entry(t: seconds(raw["t"]), d: seconds(raw["d"]),
+                     v: (v?.isEmpty == false) ? v : nil, lw: lw > 0 ? lw : 0)
     }
 }
 
@@ -144,6 +159,11 @@ struct WatchEntry: Codable, Equatable {
     var type: String
     var poster: String?
     var watchedVideoIds: [String] = []
+    /// Per-video explicit watch/unmark clocks (wall-clock ms), the additive carrier that makes an
+    /// unmark converge cross-device instead of being resurrected by a set union. Optional + defaulted
+    /// so JSON written by older builds (and inbound rows from un-upgraded peers) still decodes.
+    var markedAt: [String: Double]? = nil
+    var unmarkedAt: [String: Double]? = nil
 
     var progress: Double {
         guard durationMs > 0 else { return 0 }

@@ -336,9 +336,11 @@ enum OverlayWatchInboundPolicy {
     static func select<Entry>(
         rows: [Row<Entry>],
         removals: [OverlayWatchRemoval],
-        identity: (String, Entry) -> ContinueWatchingDedupe.Identity
+        identity: (String, Entry) -> ContinueWatchingDedupe.Identity,
+        maximumEntries: Int = liveLimit
     ) -> (entries: [String: Entry], removals: [OverlayWatchRemoval])? {
-        guard rows.count <= parseLimit, removals.count <= parseLimit else { return nil }
+        guard rows.count <= parseLimit, removals.count <= parseLimit,
+              maximumEntries > 0, maximumEntries <= parseLimit else { return nil }
         let ordered = rows.sorted { lhs, rhs in
             preferred(lhs, over: rhs, identity: identity)
         }
@@ -352,7 +354,7 @@ enum OverlayWatchInboundPolicy {
         )
         let live = Dictionary(uniqueKeysWithValues: unique.compactMap { row in
             resolved.entries[row.id].map { (row.id, $0) }
-        }.prefix(liveLimit))
+        }.prefix(maximumEntries))
         return (live, resolved.removals)
     }
 
