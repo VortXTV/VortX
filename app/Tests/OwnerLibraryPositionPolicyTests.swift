@@ -103,6 +103,10 @@ do {
            "clock-less metadata cannot erase a cached causal clock")
 }
 
+expect(OwnerLibraryPositionPolicy.preferCachedPosition(engineClock: 100, cachedClock: 200, playerActive: false, locallyRewound: false), "rail adopts a newer peer episode and rewind")
+expect(!OwnerLibraryPositionPolicy.preferCachedPosition(engineClock: 300, cachedClock: 200, playerActive: false, locallyRewound: false), "rail keeps newer local progress")
+expect(!OwnerLibraryPositionPolicy.preferCachedPosition(engineClock: 100, cachedClock: 200, playerActive: true, locallyRewound: false), "active playback owns the local playhead")
+expect(!OwnerLibraryPositionPolicy.preferCachedPosition(engineClock: 100, cachedClock: 200, playerActive: false, locallyRewound: true), "explicit local rewind is not resurrected")
 print(failures == 0 ? "PASS owner-library position policy (\(checks) checks)" : "FAIL (\(failures)/\(checks))")
 exit(failures == 0 ? 0 : 1)
 }

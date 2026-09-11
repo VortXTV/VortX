@@ -20,6 +20,10 @@ enum OwnerWatchedIntentStoreTests {
     }
     static func main() {
         let owner = "owner-watch-test-" + UUID().uuidString
+        defer {
+            UserDefaults.standard.removeObject(forKey: "vortx.owner.watchedIntent.v1." + owner)
+            UserDefaults.standard.removeObject(forKey: "vortx.owner.watchedIntent.actor.v1." + owner)
+        }
         CredentialScopeRegistry.shared.owner = owner
         MainActor.assumeIsolated { OwnerWatchedIntentStore.bind(ownerID: owner) }
         precondition(OwnerWatchedIntentStore.mergeWire(["old": row("tt1", "tt1:1:1", true, 100, "a")]))
@@ -47,6 +51,12 @@ enum OwnerWatchedIntentStoreTests {
         _ = OwnerWatchedIntentStore.mergeWire(["wholeOn": row(title, title, true, 40, "a")])
         precondition(OwnerWatchedIntentStore.effectiveVideoIDs(forTitle: title, engine: [],
             knownVideoIDs: ["tt-series:1:1", "tt-series:1:2"]) == ["tt-series:1:1", "tt-series:1:2"])
+        let future = Date().timeIntervalSince1970 * 1000 + 60_000
+        _ = OwnerWatchedIntentStore.mergeWire(["peerWhole": row(title, title, false, future, "peer")])
+        precondition(OwnerWatchedIntentStore.record(titleID: title, videoIDs: ["tt-series:1:1", "tt-series:1:2"], watched: true))
+        precondition(OwnerWatchedIntentStore.effectiveVideoIDs(forTitle: title, engine: []) == ["tt-series:1:1", "tt-series:1:2"], "explicit batch follows an observed peer clock")
+        precondition(OwnerWatchedIntentStore.record(titleID: title, videoID: title, watched: false))
+        precondition(OwnerWatchedIntentStore.effectiveVideoIDs(forTitle: title, engine: []).isEmpty, "later whole-title unwatch follows batch clock")
         // Registry can switch before the next owner bind. The previous account's cached snapshot
         // must be invisible in that interval rather than leaking watched badges across accounts.
         CredentialScopeRegistry.shared.owner = "different-owner-" + UUID().uuidString

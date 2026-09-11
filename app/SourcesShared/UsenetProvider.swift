@@ -40,7 +40,7 @@ enum UsenetProviderStore {
     }
 
     static func loadServerList(ownerCapture capture: CredentialScopeRegistry.Capture) -> UsenetProviderServerList? {
-        guard let ownerAccount = account(capture), let json = Keychain.confirmedString(ownerAccount).value,
+        guard let ownerAccount = account(capture), case .value(let json) = Keychain.confirmedString(ownerAccount),
               let data = json.data(using: .utf8) else { return nil }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return nil }
         let decoded = UsenetProviderServerList.decode(data)

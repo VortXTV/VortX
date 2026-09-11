@@ -57,11 +57,23 @@ enum OwnerWatchedIntentStore {
     }
     @discardableResult @MainActor static func record(titleID: String, videoID: String, watched: Bool,
                                                      capture: CredentialScopeRegistry.Capture = CredentialScopeRegistry.shared.capture()) -> Bool {
+        record(titleID: titleID, videoIDs: [videoID], watched: watched, capture: capture)
+    }
+    /// A season/title action is one durable transaction, not one full-history JSON rewrite per episode.
+    @discardableResult @MainActor static func record(titleID: String, videoIDs: [String], watched: Bool,
+                                                     capture: CredentialScopeRegistry.Capture = CredentialScopeRegistry.shared.capture()) -> Bool {
         guard CredentialScopeRegistry.shared.isCurrent(capture), capture.scope.keychainOwnerID == ownerID,
-              valid(titleID), valid(videoID), let actor = actor() else { return false }
-        var all = entries(); let key = id(titleID, videoID); let prior = all[key]
-        all[key] = Entry(titleID: titleID, videoID: videoID, watched: watched,
-                          updatedAt: max(Date().timeIntervalSince1970 * 1000, (prior?.updatedAt ?? 0) + 1), actor: actor)
+              valid(titleID), !videoIDs.isEmpty, videoIDs.allSatisfy(valid), let actor = actor() else { return false }
+        var all = entries()
+        // Explicit local intent must follow every already-observed action for this title, including
+        // a peer whose wall clock runs ahead and a whole-title action followed by an episode override.
+        let observed = all.values.filter { $0.titleID == titleID }.map(\.updatedAt).max() ?? 0
+        let stamp = max(Date().timeIntervalSince1970 * 1000, observed + 1)
+        guard stamp.isFinite, stamp > observed else { return false }
+        for videoID in Set(videoIDs) {
+            all[id(titleID, videoID)] = Entry(titleID: titleID, videoID: videoID, watched: watched,
+                                             updatedAt: stamp, actor: actor)
+        }
         save(all); return true
     }
     @discardableResult @MainActor static func mergeWire(_ raw: Any?, capture: CredentialScopeRegistry.Capture = CredentialScopeRegistry.shared.capture()) -> Bool {

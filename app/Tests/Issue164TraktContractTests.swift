@@ -475,7 +475,7 @@ struct Issue164TraktContractTests {
         )
         let iosEpisodeContentLaunches = segment(
             in: iosDetail,
-            from: "private func play(_ stream: CoreStream, url: URL, explicit: Bool = true) async",
+            from: "private func play(\n        _ stream: CoreStream,\n        url: URL,",
             to: "private func autoPickAndPlayEpisode() async"
         )
         let iosEpisodeAutoPick = segment(

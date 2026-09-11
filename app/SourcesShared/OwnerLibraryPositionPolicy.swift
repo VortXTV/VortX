@@ -43,6 +43,14 @@ enum OwnerLibraryPositionPolicy {
         existingClock <= 0 || incomingClock >= existingClock
     }
 
+    /// A rail and its Play action must resolve the same causal observation, not choose different
+    /// episodes merely because the engine happens to have a positive offset.
+    static func preferCachedPosition(engineClock: Double, cachedClock: Double,
+                                     playerActive: Bool, locallyRewound: Bool) -> Bool {
+        !playerActive && !locallyRewound && cachedClock.isFinite && cachedClock > 0
+            && cachedClock > engineClock
+    }
+
     /// Resolve the position fields for one owner-library id. `engine` is this device's freshly emitted
     /// engine row; `prior` is the account doc's already-owned row. Pure: builds a new row, mutates nothing.
     /// The result always carries the engine's freshest display metadata (name/poster/type/id).

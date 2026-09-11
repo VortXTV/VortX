@@ -145,7 +145,7 @@ private final class NewznabXMLParser: NSObject, XMLParserDelegate {
         if n == "item" { itemTitle = attributes["title"] }
         if inItem, n == "title", itemTitle == nil { itemTitle = ""; readingTitle = true }
         if inItem, n == "enclosure", let raw = attributes["url"], raw.utf8.count <= 8192,
-           let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+           let url = URL(string: raw), url.scheme?.lowercased() == "https",
            let host = url.host, !host.isEmpty, url.user == nil, url.password == nil, url.fragment == nil {
             itemURL = url
             if let length = Int64(attributes["length"] ?? ""), length >= 0 { itemSize = length }

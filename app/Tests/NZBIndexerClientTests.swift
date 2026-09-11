@@ -29,6 +29,8 @@ import Foundation
         }
         let unsafe = Data("<rss><channel><item><title>x</title><enclosure url='https://user:pass@example.com/a'/></item></channel></rss>".utf8)
         check(try NZBIndexerClient.parse(data: unsafe).isEmpty, "reject enclosure userinfo")
+        let cleartext = Data("<rss><channel><item><title>x</title><enclosure url='http://index.example/get?apikey=secret'/></item></channel></rss>".utf8)
+        check(try NZBIndexerClient.parse(data: cleartext).isEmpty, "indexer cannot downgrade a credential-bearing enclosure to HTTP")
         let scope = NZBIndexerStore.captureScope()
         let config = NZBIndexerConfig(id: "one", name: "One", endpoint: endpoint.absoluteString)
         check(NZBIndexerStore.save(config, apiKey: "secret", scope: scope)?.indexers.count == 1, "secure save")

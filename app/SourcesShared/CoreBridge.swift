@@ -2133,15 +2133,12 @@ final class CoreBridge: ObservableObject {
     /// prevents any delayed callback from writing a secondary profile's account carrier.
     private func recordOwnerWatchedIntent(titleID: String, videoIDs: [String], watched: Bool) {
         guard Thread.isMainThread, ProfileStore.shared.active?.isOwner == true else { return }
-        var changed = false
-        MainActor.assumeIsolated {
-            for videoID in Set(videoIDs) where !videoID.isEmpty {
-                changed = OwnerWatchedIntentStore.record(titleID: titleID, videoID: videoID, watched: watched) || changed
-            }
+        let changed = MainActor.assumeIsolated {
+            OwnerWatchedIntentStore.record(titleID: titleID, videoIDs: videoIDs.filter { !$0.isEmpty }, watched: watched)
         }
         guard changed else { return }
         WatchedIndex.shared.ownerIntentsDidChange()
-        VortXSyncManager.shared.requestSyncSoon()
+        MainActor.assumeIsolated { VortXSyncManager.shared.requestSyncSoon() }
     }
 
     /// Display info for an overlay watch entry when a toggle arrives by bare id (the
@@ -2311,7 +2308,7 @@ final class CoreBridge: ObservableObject {
     /// PLANNED ARBITER: a later change makes engineResumeSeconds the single decision point, returning
     /// nil to mean "consult the account fallback" and 0 to mean "genuinely start fresh". Once that
     /// lands, the caller reverts to trusting any non-nil answer.
-    func engineResumeSeconds(for meta: PlaybackMeta) -> Double? {
+    @MainActor func engineResumeSeconds(for meta: PlaybackMeta) -> Double? {
         // Overlay (non-owner) profile: the engine library item belongs to the owner account, so its saved
         // resume position is not this profile's. Decline here so the caller falls back to account.resumeOffset,
         // which reads the active overlay profile's own history. Mirrors the activeUsesEngineHistory guard used
@@ -2565,10 +2562,12 @@ final class CoreBridge: ObservableObject {
             guard isLatest, self.publicationStillCurrent(publicationToken) else { return }
             // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
             // profile rides `profiles.cwItems` and ignores this published value entirely.
-            let ownerProfile = ProfileStore.shared.activeUsesEngineHistory
+            let ownerProfile = ProfileStore.shared.active?.isOwner == true
+            let causalPreview = ownerProfile
+                ? Self.applyCausalOwnerContinueWatching(preview, playerActive: self.playerActive) : preview
             let engine = Self.pruneFinished(ownerProfile
-                ? Self.applyOwnedContinueWatchingFloor(preview, mayReplace: mayReplaceCW)
-                : preview)
+                ? Self.applyOwnedContinueWatchingFloor(causalPreview, mayReplace: mayReplaceCW)
+                : causalPreview)
             let items = ownerProfile
                 ? Self.unionOwnerContinueWatching(engine: engine, library: library)
                 : engine
@@ -2608,6 +2607,22 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    /// Apply a newer peer observation before completion pruning and alias dedupe. Otherwise a warm
+    /// device's stale preview wins the rail even though Play correctly uses the peer's newer episode.
+    static func applyCausalOwnerContinueWatching(_ items: [CoreCWItem], playerActive: Bool) -> [CoreCWItem] {
+        items.compactMap { item in
+            guard let cached = OwnerResumeStore.entry(forId: item.id),
+                  OwnerLibraryPositionPolicy.preferCachedPosition(
+                    engineClock: OwnerLibraryPositionPolicy.lastWatchedMillis(item.state.lastWatched),
+                    cachedClock: cached.lw, playerActive: playerActive,
+                    locallyRewound: LocalRewindLog.contains(item.id)) else { return item }
+            guard cached.t > 0 else { return nil }
+            let state = CoreLibState(timeOffset: cached.t * 1000, duration: cached.d * 1000, videoId: cached.v)
+            return CoreCWItem(id: item.id, type: item.type, name: item.name, poster: item.poster,
+                              state: state, removed: item.removed, temp: item.temp)
+        }
+    }
+
     /// Merge the engine's live-offset preview with SYNTHESIZED entries for owner-library titles the engine
     /// holds at time 0 whose saved offset is cached in `OwnerResumeStore`. Engine items come FIRST (they are
     /// authoritative and already recency-sorted) and win any id present in both, so a title is never
@@ -2621,6 +2636,9 @@ final class CoreBridge: ObservableObject {
             // Real saved titles only: skip removed / temp markers, and skip anything the engine already
             // surfaces with a live offset. Deduplication happens below so aliases as well as exact ids collapse.
             guard !(item.removed ?? false), !(item.temp ?? false) else { continue }
+            // Rewind is dispatched asynchronously. Do not resurrect the pre-finish cached offset
+            // while waiting for the engine receipt and account cache to catch up.
+            guard !LocalRewindLog.contains(item.id) else { continue }
             // Only titles with a positive CACHED offset are resumable; a finished/rewound title caches t == 0
             // (a finish that propagated) and is correctly excluded, so it never resurrects here.
             guard let entry = OwnerResumeStore.entry(forId: item.id), entry.t > 0 else { continue }

@@ -3078,10 +3078,7 @@ final class VortXSyncManager: ObservableObject {
     /// Coerce a JSON numeric (Int / Double / NSNumber, or nil) to a whole-second Int, for owner-library
     /// offset comparisons in the summary union guard.
     private static func libSeconds(_ v: Any?) -> Int {
-        if let i = v as? Int { return i }
-        if let d = v as? Double { return Int(d) }
-        if let n = v as? NSNumber { return n.intValue }
-        return 0
+        safeOverlaySeconds(v)
     }
 
     /// Decode a per-video mark/unmark clock map (`"ma"`/`"ua"`: videoId -> wall-clock ms) from a doc
