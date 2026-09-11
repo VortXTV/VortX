@@ -155,18 +155,25 @@ enum AddonPairingClient {
             body: AddonPairingProtocol.bodyForNew()
         ) else { return nil }
 
-        guard let data = await performData(req),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let data = await performData(req) else { return nil }
+        return parseCreatedSession(data)
+    }
+
+    /// The relay owns this authority. A locally generated UUID cannot claim or acknowledge its deliveries.
+    static func parseCreatedSession(_ data: Data) -> Session? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj[AddonPairingProtocol.Field.ok] as? Bool == true,
               exactInt(obj[AddonPairingProtocol.Field.protocolVersion]) == AddonPairingProtocol.version,
               let token = obj[AddonPairingProtocol.Field.token] as? String, isStrictToken(token),
+              let authoritySession = obj[AddonPairingProtocol.Field.authoritySession] as? String,
+              AddonPairingProtocol.isMutationID(authoritySession),
               let pageUrl = obj[AddonPairingProtocol.Field.pageURL] as? String, isTrustedPageURL(pageUrl),
               let expiresAt = finiteNumeric(obj[AddonPairingProtocol.Field.expiresAt]), expiresAt > 0,
               let generation = exactInt(obj[AddonPairingProtocol.Field.authorityGeneration]), generation >= 1,
               let sessionGeneration = exactInt(obj[AddonPairingProtocol.Field.sessionGeneration]),
               sessionGeneration == generation else { return nil }
         return Session(token: token, pageUrl: pageUrl, expiresAtMs: expiresAt,
-                       generation: generation)
+                       generation: generation, authoritySession: authoritySession)
     }
 
     /// Tokens are opaque path components, not arbitrary URL strings. Restricting their alphabet prevents

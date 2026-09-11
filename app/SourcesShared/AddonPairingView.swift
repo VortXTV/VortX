@@ -655,7 +655,7 @@ struct AddonPairingView: View {
                 createFailed = true
                 return   // startSession()'s Retry button re-enters this loop
             }
-            authority = AddonPairingClient.Authority(id: authority.id, generation: created.generation)
+            authority = AddonPairingClient.Authority(id: created.authoritySession, generation: created.generation)
             let persisted = AddonPairingClient.Session(token: created.token,
                                                        pageUrl: created.pageUrl,
                                                        expiresAtMs: created.expiresAtMs,

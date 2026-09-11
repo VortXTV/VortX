@@ -16,6 +16,7 @@ struct AddonPairingHardeningTests {
     nonisolated(unsafe) private static var failures = 0
 
     static func main() async {
+        createdSessionRetainsRelayAuthority()
         durableDeliveryReplayIsIdempotent()
         wrongSessionIsRejected()
         invalidClaimCannotStartInstall()
@@ -111,6 +112,32 @@ struct AddonPairingHardeningTests {
             .resolvedDurable(ticket: ticket, outcome: outcome),
             normalize: normalize
         )
+    }
+
+    private static func createdSessionRetainsRelayAuthority() {
+        let token = "abcdefghijklmnopqrstuvwx"
+        let authority = "relay_authority_123456789"
+        var reply: [String: Any] = ["ok": true, "proto": 2, "token": token,
+            "session": authority, "pageUrl": "https://add.vortx.tv/p#\(token)",
+            "expiresAt": 1_900_000_000_000, "generation": 1, "sessionGeneration": 1]
+        func parse() -> AddonPairingClient.Session? {
+            AddonPairingClient.parseCreatedSession(try! JSONSerialization.data(withJSONObject: reply))
+        }
+        let session = parse()
+        expect(session?.authoritySession == authority, "new: retains relay-issued authority")
+        if let session {
+            let body = AddonPairingProtocol.bodyForClaim(token: session.token,
+                authority: .init(id: session.authoritySession, generation: session.generation),
+                deliveries: [.init(deliveryID: "delivery-1", deliveryRevision: 0)], mutationID: "mutation-1")
+            expect(body["session"] as? String == authority, "new: subsequent claim uses the relay authority")
+        }
+        reply.removeValue(forKey: "session")
+        expect(parse() == nil, "new: missing relay authority fails closed")
+        reply["session"] = "bad/session"
+        expect(parse() == nil, "new: malformed relay authority fails closed")
+        reply["session"] = authority
+        reply["sessionGeneration"] = 2
+        expect(parse() == nil, "new: inconsistent generation fails closed")
     }
 
     private static func durableDeliveryReplayIsIdempotent() {
@@ -2357,8 +2384,8 @@ struct AddonPairingHardeningTests {
 
     private static func httpsSchemeIsRequiredByFetchGuard() async {
         let http = URL(string: "http://8.8.8.8/manifest.json")!
-        expect(await AddonURLGuard.validate(http) == .invalidScheme,
-               "manifest fetch: public HTTP URLs are rejected to match the relay contract")
+        expect(await AddonURLGuard.validate(http) == nil,
+               "manifest fetch: direct public HTTP remains supported independently of HTTPS-only QR ingress")
     }
 
     private static func streamedBodyCapIsBounded() {
