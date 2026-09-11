@@ -2037,11 +2037,11 @@ struct PlayerScreen: View {
                         handleProperty(MPVProperty.seekable, deferredSeekable, loadToken: event.loadToken)
                     }
                     loadTimeout?.cancel()
-                    // The retry task can be a native-debrid provider request. An accepted frame cancels it only
-                    // when this exact callback token owns that request; a delayed old-item frame must never
-                    // cancel a newer source's refresh transaction.
-                    if !nativeDebridFreshLinkRecovery.freshLinkInFlight
-                        || nativeDebridFreshLinkRecovery.isOwned(by: event.loadToken) {
+                    // The provider resolver captures the STILL-MOUNTED item's token. A late first frame
+                    // from that item therefore matches the token but must not cancel the refresh or a
+                    // joined engine switch. Only a frame after the provider transaction has finished
+                    // may retire ordinary retries.
+                    if !nativeDebridFreshLinkRecovery.freshLinkInFlight {
                         autoRetryTask?.cancel()
                     }
                     recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -2056,7 +2056,7 @@ struct PlayerScreen: View {
                         }
                     }
                     #endif
-                    reconnecting = episodeResolveGeneration != nil
+                    reconnecting = episodeResolveGeneration != nil || nativeDebridFreshLinkRecovery.freshLinkInFlight
                     loadFailed = false
                     autoRetryCount = 0
                     // Lock Screen / Control Center / media-key transport. Relative mpv seek so the skip always
@@ -4431,14 +4431,6 @@ struct PlayerScreen: View {
         toAVPlayer: Bool,
         preservingNativeDebridRecoveryGeneration: Bool = false
     ) {
-        guard toAVPlayer != isAVPlayerActive else { close(); return }
-        // A manual AV→MPV pick is the same physical handoff as automatic recovery.  Going through the shared
-        // transaction preserves the live URL/generations and refuses to mount MPV until every producer stops.
-        if !toAVPlayer, coordinator.player is AVPlayerEngineController {
-            demoteAVPlayerToMPV(silent: true)
-            close()
-            return
-        }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
         // non-DV MKV, or a mid-session switch to a torrent) so we never feed a dead URL into AVPlayer.
@@ -4451,8 +4443,16 @@ struct PlayerScreen: View {
             close()
             return
         }
+        guard toAVPlayer != isAVPlayerActive else { close(); return }
         if (reconnecting || autoRetryTask != nil),
            recoverCurrentNativeDebridLink(reason: "engine switch", requestedEngine: toAVPlayer) {
+            close()
+            return
+        }
+        // Resolve a stale provider URL (or join its current refresh) BEFORE the physical AV→MPV handoff.
+        // Otherwise the direct demotion bypasses fresh-link recovery and loads the same failed transport.
+        if !toAVPlayer, coordinator.player is AVPlayerEngineController {
+            demoteAVPlayerToMPV(silent: true)
             close()
             return
         }

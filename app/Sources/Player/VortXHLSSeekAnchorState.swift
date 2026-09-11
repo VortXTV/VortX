@@ -56,15 +56,17 @@ struct VortXHLSSeekAnchorState {
         return true
     }
 
-    mutating func completeSeek(requestID: UInt64, playerSeconds: Double) {
+    @discardableResult
+    mutating func completeSeek(requestID: UInt64, playerSeconds: Double) -> Bool {
         guard playerSeconds.isFinite, playerSeconds >= 0 else {
             cancelSeek(requestID: requestID)
-            return
+            return false
         }
-        guard pendingReceipt?.requestID == requestID else { return }
+        guard pendingReceipt?.requestID == requestID else { return false }
         playbackReceiptEpoch &+= 1
         pendingReceipt = nil
         currentPlaybackSeconds = playerSeconds
+        return true
     }
 
     mutating func cancelSeek(requestID: UInt64) {

@@ -4236,7 +4236,8 @@ final class MPVMetalViewController: PlatformViewController {
                                             )
                                             #endif
                                             self.seekEOFRecovery.observePosition(
-                                                owner: loadToken, position: value
+                                                owner: loadToken, position: value,
+                                                now: ProcessInfo.processInfo.systemUptime
                                             )
                                             self.completeSeekEOFRecovery(
                                                 loadToken: loadToken, position: value

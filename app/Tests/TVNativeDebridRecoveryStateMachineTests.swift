@@ -32,8 +32,12 @@ private enum TVNativeDebridRecoveryStateMachineTests {
         check("a failed native-debrid mount begins one fresh-link transaction", true)
         check("the transaction is visibly in flight", state.freshLinkInFlight)
         check("an engine switch joins the in-flight refresh instead of replacing the stale mount", state.joinEngineSwitch(false))
+        // Mirror the first-frame decision before delivering the provider result.
+        if !state.freshLinkInFlight { _ = state.retireFreshLink(ownedBy: firstRecovery) }
+        check("old mount first frame preserves the pending engine choice", state.requestedEngine == false)
         check("fresh-link completion consumes the joined engine exactly once", state.finishFreshLink(ownedBy: firstRecovery)?.requestedEngine == false)
         check("completion closes the in-flight transaction", !state.freshLinkInFlight)
+        check("fresh mount first frame may retire ordinary retries", !state.freshLinkInFlight)
         check("the completed source cannot start a second fresh-link request", state.beginFreshLink() == nil)
 
         state.reset()
@@ -43,6 +47,11 @@ private enum TVNativeDebridRecoveryStateMachineTests {
         }
         check("a new source or episode owns a new fresh-link transaction", true)
         check("the initial engine request survives until fresh-link completion", state.finishFreshLink(ownedBy: requestedEngineRecovery)?.requestedEngine == true)
+
+        state.reset()
+        let reversal = state.beginFreshLink(requestedEngine: false)!
+        check("reselecting the mounted engine reverses the pending engine choice", state.joinEngineSwitch(true))
+        check("fresh URL reloads the mounted engine after reversal", state.finishFreshLink(ownedBy: reversal)?.requestedEngine == true)
 
         state.reset()
         guard let cancelledRecovery = state.beginFreshLink() else {

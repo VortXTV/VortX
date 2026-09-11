@@ -224,6 +224,27 @@ enum VortXPlaybackEndNotificationPolicy {
             defer { terminal = nil }
             return terminal
         }
+
+        /// Rewinding is new playback intent in the SAME item. Only its old positional EOF is stale;
+        /// a real decoder/producer error is still an error and must survive the gesture.
+        mutating func discardEOF(generation: UInt64) {
+            guard generation == self.generation, terminal == .eof else { return }
+            terminal = nil
+        }
+    }
+
+    /// AVPlayer end notifications do not carry a seek ID. A queued notification from the old
+    /// position cannot authorize auto-next while the newest asynchronous seek is unresolved.
+    struct SeekBoundary: Equatable, Sendable {
+        private(set) var requestID: UInt64?
+        var isPending: Bool { requestID != nil }
+
+        mutating func begin(requestID: UInt64) { self.requestID = requestID }
+        mutating func finish(requestID: UInt64) {
+            guard self.requestID == requestID else { return }
+            self.requestID = nil
+        }
+        mutating func reset() { requestID = nil }
     }
 }
 

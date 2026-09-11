@@ -101,6 +101,18 @@ private enum TVNativeDebridRecoveryContractTests {
                 && source.contains("engineSurfaceHeadersOverride = curHeaders")
         )
         check(
+            "an old mount's first frame preserves the resolver and its joined engine switch",
+            source.contains("if !nativeDebridFreshLinkRecovery.freshLinkInFlight {\n                        reconnecting = false\n                        autoRetryTask?.cancel()\n                    }")
+        )
+        let switchStart = source.range(of: "private func switchPlayerEngine(toAVPlayer: Bool)")!
+        let switchEnd = source.range(of: "private func performPlayerEngineSwitch", range: switchStart.upperBound..<source.endIndex)!
+        let switchSource = String(source[switchStart.lowerBound..<switchEnd.lowerBound])
+        let join = switchSource.range(of: "nativeDebridFreshLinkRecovery.joinEngineSwitch")?.lowerBound
+        let noOp = switchSource.range(of: "guard toAVPlayer != isAVPlayerActive")?.lowerBound
+        check("latest engine reversal joins before current-engine no-op and reloads fresh URL",
+              join != nil && noOp != nil && join! < noOp!
+                && source.contains("if let requestedEngine = recoveryCompletion.requestedEngine,\n                   requestedEngine != isAVPlayerActive {"))
+        check(
             "only a raw torrent rebind creates before a replacement load",
             source.contains("private func prepareRawTorrentAfterLoopbackRebind")
                 && source.contains("curDebridRef == nil")

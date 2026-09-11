@@ -649,6 +649,23 @@ check("seek EOF: stale source event cannot consume recovery",
       clampEOF.consumeEOFForReload(owner: 8) == nil && clampEOF.current?.owner == 7)
 check("seek EOF: an old observed seek expires rather than reclassifying a later genuine EOF",
       !clampEOF.shouldRecoverEOF(owner: 7, now: 206))
+var slowSeek = SeekEOFRecoveryPolicy<Int>()
+slowSeek.begin(owner: 30, target: 600, wasPaused: true, duration: 1800, origin: .viewer, now: 100)
+_ = slowSeek.observeSeek(owner: 30)
+check("seek EOF: a cold seek without landing cannot become episode completion after five seconds",
+      slowSeek.shouldRejectUnsettledEOF(owner: 30, now: 140)
+        && !slowSeek.shouldRejectUnsettledEOF(owner: 31, now: 140))
+slowSeek.observePosition(owner: 30, position: 598, now: 140)
+check("seek EOF: bounded recovery is adjacent to first actual landing, not time spent buffering",
+      slowSeek.shouldRecoverEOF(owner: 30, now: 142)
+        && !slowSeek.shouldRecoverEOF(owner: 30, now: 146))
+slowSeek.observePosition(owner: 30, position: 900, now: 440)
+check("seek EOF: ordinary position ticks cannot indefinitely renew recovery eligibility",
+      !slowSeek.shouldRecoverEOF(owner: 30, now: 442))
+_ = slowSeek.supersedeForNewExplicitSeek()
+slowSeek.begin(owner: 30, target: 300, wasPaused: false, duration: 1800, origin: .viewer, now: 450)
+check("seek EOF: a completed first seek does not poison the next ordinary seek as ambiguous",
+      slowSeek.observeSeek(owner: 30) == .seekObserved)
 _ = clampEOF.consumeEOFForReload(owner: 7)
 _ = clampEOF.adoptReload(owner: 9)
 check("seek EOF: second EOF during recovery is failure-only, never another completion candidate",

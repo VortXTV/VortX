@@ -2064,7 +2064,13 @@ struct TVPlayerView: View {
                             DiagnosticsLog.log("dv", String(format: "remux first frame in %.1fs (start watchdog disarmed)", Date().timeIntervalSince(armed)))
                         }
                     }
-                    autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()   // playback started: clear auto-recovery
+                    autoRetryCount = 0
+                    // The old mount can render while a provider URL is being refreshed. Its first frame
+                    // cannot cancel the resolver (or the user's joined engine switch) in this shared slot.
+                    if !nativeDebridFreshLinkRecovery.freshLinkInFlight {
+                        reconnecting = false
+                        autoRetryTask?.cancel()
+                    }
                     applyDefaultVolume()            // D5: start at the user's saved "Default volume" (the launch mount begins at 100%)
                     // Honest badge (message-only): a Dolby Vision title on the libmpv lane (a DV torrent, or
                     // a demoted remux) outputs tone-mapped HDR10, and the mpv lane no longer requests the
@@ -6157,7 +6163,6 @@ struct TVPlayerView: View {
     /// fresh provider URL is acquired before either surface is constructed. Healthy switches retain their
     /// current URL and never make a provider request.
     private func switchPlayerEngine(toAVPlayer: Bool) {
-        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
         if toAVPlayer, !canUseAVPlayerEngine {
             showEngineNote("This source can only play on the built-in (libmpv) engine.")
             withAnimation { showOptions = false }; return
@@ -6168,6 +6173,7 @@ struct TVPlayerView: View {
             withAnimation { showOptions = false }
             return
         }
+        guard toAVPlayer != isAVPlayerActive else { withAnimation { showOptions = false }; return }
         let needsFreshNativeDebridLink = reconnecting || autoRetryTask != nil
         if needsFreshNativeDebridLink,
            recoverCurrentNativeDebridLink(reason: "engine switch", requestedEngine: toAVPlayer) {
@@ -7044,7 +7050,8 @@ struct TVPlayerView: View {
                     )
                 }
                 resumeSeconds = resume
-                if let requestedEngine = recoveryCompletion.requestedEngine {
+                if let requestedEngine = recoveryCompletion.requestedEngine,
+                   requestedEngine != isAVPlayerActive {
                     // `engineSurfacePlayback` seeds the next SwiftUI controller with this fresh URL. The
                     // actual mount remains owned by the normal switch transaction, which preserves all
                     // stop-before-swap and token fencing guarantees.

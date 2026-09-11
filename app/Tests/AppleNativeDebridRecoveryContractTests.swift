@@ -197,9 +197,18 @@ private enum AppleNativeDebridRecoveryContractTests {
                 && source.contains("preservingNativeDebridRecoveryGeneration: true")
         )
         check(
-            "a first frame cancels a provider refresh only when it owns that request token",
-            source.contains("nativeDebridFreshLinkRecovery.isOwned(by: event.loadToken)")
+            "a still-mounted first frame cannot cancel its pending provider refresh",
+            source.contains("if !nativeDebridFreshLinkRecovery.freshLinkInFlight {\n                        autoRetryTask?.cancel()")
+                && !source.contains("nativeDebridFreshLinkRecovery.isOwned(by: event.loadToken)")
         )
+        let engineSwitch = sourceSection(source, from: "private func switchPlayerEngine(", to: "srcProbe(\"user engine switch")
+        let joinedAt = engineSwitch.range(of: "nativeDebridFreshLinkRecovery.joinEngineSwitch")?.lowerBound
+        let noOpAt = engineSwitch.range(of: "guard toAVPlayer != isAVPlayerActive")?.lowerBound
+        let freshAt = engineSwitch.range(of: "recoverCurrentNativeDebridLink(reason:")?.lowerBound
+        let demoteAt = engineSwitch.range(of: "demoteAVPlayerToMPV(silent: true)")?.lowerBound
+        check("pending engine reversal is joined before no-op, and URL refresh precedes AV demotion",
+              joinedAt != nil && noOpAt != nil && freshAt != nil && demoteAt != nil
+                && joinedAt! < noOpAt! && freshAt! < demoteAt!)
         var refreshLifecycle = NativeDebridRefreshLifecycleModel()
         let cancelledGeneration = refreshLifecycle.begin()
         check("cancelled refresh begins with an exact generation", cancelledGeneration != nil)

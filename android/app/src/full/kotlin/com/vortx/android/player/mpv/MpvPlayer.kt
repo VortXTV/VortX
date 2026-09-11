@@ -435,17 +435,17 @@ class MpvPlayer private constructor(
         // (opt-in + unmetered gated inside noteStream). Fail-soft.
         AdaptiveTuning.noteStream(appContext, playable.url, playable.headers)
 
+        // Associate adaptive trailer audio BEFORE loading its video. An immediate audio-add after loadfile
+        // races file initialization and may attach to the outgoing file (or no file). Always clear first,
+        // including ordinary streams, so a previous trailer's audio cannot leak into the next title.
+        // argv append preserves a signed URL's colons/commas without path-list re-parsing, matching Apple.
+        mpv.command(arrayOf("change-list", "audio-files", "clr", ""))
+        playable.audioUrl?.let { audio ->
+            mpv.command(arrayOf("change-list", "audio-files", "append", audio))
+        }
+
         // loadfile as an argv array so a URL containing mpv's list/escape chars is one argument.
         mpv.command(arrayOf("loadfile", playable.url, "replace"))
-
-        // yt-direct adaptive trailer: mount the separate audio-only leg so mpv merges it with the video-only
-        // file (the Android analogue of Apple's `--audio-files`/`change-list append`). argv form so a URL with
-        // mpv's list/escape chars stays ONE argument. `audio-add` defaults to selecting the added track. Only a
-        // client-resolved adaptive trailer carries [audioUrl]; a muxed trailer / worker fallback / any other
-        // stream has none and plays as a single file.
-        playable.audioUrl?.let { audio ->
-            mpv.command(arrayOf("audio-add", audio))
-        }
 
         // WHY audit 07.5: never hand an untrusted remote subtitle URL to mpv. Download under the same
         // 8 MiB / 20s bounds as Apple, then mount only the local cache file. Failure never affects playback.

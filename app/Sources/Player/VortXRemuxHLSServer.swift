@@ -742,7 +742,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     func completePreparedSeek(requestID: UInt64, playerSeconds: Double) {
         playbackClockLock.lock()
-        seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds)
+        if seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds) {
+            // Completion supplies a genuine landing receipt, including when the viewer remains paused.
+            // Reconcile the producer before reopening normal observer admission instead of waiting for
+            // an optional later periodic tick. A stale completion must never touch the newer ledger.
+            refreshProducerLeadGate(playbackReceipt: playerSeconds)
+        }
         playbackClockLock.unlock()
     }
 

@@ -237,6 +237,8 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         /// A source-fenced time-pos callback received after SEEK. It proves the player remained transportable
         /// before EOF, without imposing a brittle keyframe-distance threshold on ordinary absolute seeks.
         var positionAfterSeek: Double?
+        var firstPositionAt: TimeInterval?
+        var hasObservedLanding: Bool { phase == .seekObserved && positionAfterSeek != nil }
         /// libmpv SEEK callbacks have no command id. If this request replaced any unsettled same-source seek,
         /// a queued callback from the old request is indistinguishable from this one and may not authorise
         /// automatic reopen.
@@ -256,11 +258,12 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         guard target.isFinite, target >= 0, now.isFinite else { current = nil; return }
         precondition(nextTransportGeneration < UInt64.max)
         nextTransportGeneration += 1
-        let inheritedAmbiguity = pendingUnsettledSeekAmbiguity || current != nil
+        let inheritedAmbiguity = pendingUnsettledSeekAmbiguity || (current.map { !$0.hasObservedLanding } ?? false)
         current = Intent(owner: owner, target: target, wasPaused: wasPaused,
                          transportGeneration: nextTransportGeneration,
                          durationAtIssue: duration.isFinite && duration > 0 ? duration : nil,
                          positionAfterSeek: nil,
+                         firstPositionAt: nil,
                          inheritedUnsettledSeekAmbiguity: inheritedAmbiguity,
                          issuedAt: now, origin: origin, phase: .awaitingSeekEvent)
         pendingUnsettledSeekAmbiguity = false
@@ -286,11 +289,15 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
         }
     }
 
-    mutating func observePosition(owner: Owner, position: Double) {
+    mutating func observePosition(owner: Owner, position: Double, now: TimeInterval? = nil) {
         guard var intent = current, intent.owner == owner, position.isFinite,
               intent.phase == .seekObserved,
               !intent.inheritedUnsettledSeekAmbiguity else { return }
         intent.positionAfterSeek = position
+        if intent.firstPositionAt == nil {
+            let receiptTime = now ?? intent.issuedAt
+            if receiptTime.isFinite, receiptTime >= intent.issuedAt { intent.firstPositionAt = receiptTime }
+        }
         current = intent
     }
 
@@ -307,7 +314,7 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
               maximumAdjacency.isFinite, maximumAdjacency > 0 else { return false }
         return intent.target < duration - minimumDistanceFromEnd
             && now >= intent.issuedAt
-            && now - intent.issuedAt <= maximumAdjacency
+            && now - (intent.firstPositionAt ?? intent.issuedAt) <= maximumAdjacency
     }
 
     /// A command accepted for the exact current mid-file target is still not a successful seek. If libmpv
@@ -328,16 +335,15 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
 
     /// SEEK arrived but no owned time-pos callback followed before EOF. This remains ambiguous, so protect the
     /// episode with the same recoverable-error outcome rather than treating the target as natural completion.
+    /// Time spent waiting for cold media is not evidence of completion; unlike the one-shot reopen window,
+    /// this protection does not expire until a landing or a new source/seek supersedes it.
     func shouldRejectUnsettledEOF(owner: Owner, now: TimeInterval,
-                                  minimumDistanceFromEnd: Double = 8,
-                                  maximumAdjacency: TimeInterval = 5) -> Bool {
+                                  minimumDistanceFromEnd: Double = 8) -> Bool {
         guard let intent = current, intent.owner == owner, intent.phase == .seekObserved,
               intent.positionAfterSeek == nil, let duration = intent.durationAtIssue, now.isFinite,
-              minimumDistanceFromEnd.isFinite, minimumDistanceFromEnd > 0,
-              maximumAdjacency.isFinite, maximumAdjacency > 0 else { return false }
+              minimumDistanceFromEnd.isFinite, minimumDistanceFromEnd > 0 else { return false }
         return intent.target < duration - minimumDistanceFromEnd
             && now >= intent.issuedAt
-            && now - intent.issuedAt <= maximumAdjacency
     }
 
     /// Consumes the one allowed recovery attempt. A later EOF while reloading is a failure, not a new
@@ -412,7 +418,7 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     /// attributed to the replacement because MPV_EVENT_SEEK exposes no request identifier.
     mutating func supersedeForNewExplicitSeek() -> Intent? {
         guard let intent = current else { return nil }
-        pendingUnsettledSeekAmbiguity = true
+        pendingUnsettledSeekAmbiguity = !intent.hasObservedLanding
         current = nil
         return intent
     }

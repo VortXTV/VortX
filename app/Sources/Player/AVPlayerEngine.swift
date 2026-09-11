@@ -275,6 +275,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// older task and completion callback, even when they target the same AVPlayerItem generation.
     private var seekRequestGeneration: UInt64 = 0
     private var preparedSeekTask: Task<Void, Never>?
+    private var seekCompletionTimeoutTask: Task<Void, Never>?
     private weak var registeredSeekServer: VortXRemuxHLSServer?
     private var registeredSeekRequestID: UInt64?
     #if os(tvOS)
@@ -297,6 +298,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// A true terminal receipt captured while the viewer is paused. Its exact item generation prevents a
     /// replacement item from replaying the previous item's completion when the viewer presses Play.
     private var deferredTerminal = VortXPlaybackEndNotificationPolicy.DeferredTerminal()
+    private var seekEndBoundary = VortXPlaybackEndNotificationPolicy.SeekBoundary()
     /// Exact ownership and producer snapshot taken when AVPlayer reports a recoverable local-HLS event. A
     /// paused viewer resumes the same bounded observation on Play, rather than receiving a background autoplay
     /// or borrowing an unrelated surface-watchdog sample.
@@ -304,6 +306,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let loadToken: PlayerLoadToken
         let generation: UInt64
         let mountIdentity: UInt64
+        let seekRequestID: UInt64
         let progress: VortXMKVRemuxStream.MountProgress
     }
     private struct DeferredEventOwnedRecovery {
@@ -876,6 +879,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// leave a server playhead pinned behind an admission that AVPlayer will never receive.
     @discardableResult
     private func supersedeSeekRequest() -> UInt64 {
+        seekEndBoundary.reset()
+        seekCompletionTimeoutTask?.cancel()
+        seekCompletionTimeoutTask = nil
         preparedSeekTask?.cancel()
         preparedSeekTask = nil
         if let requestID = registeredSeekRequestID,
@@ -891,6 +897,37 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     private func invalidateSeekRequests() {
         _ = supersedeSeekRequest()
+    }
+
+    /// A seek temporarily excludes ordinary HLS consumption receipts. Bound that exclusion independently
+    /// of playback ticks: AVFoundation may still be waiting for data and cannot prove its own liveness.
+    /// This is one recovery of an explicit seek, not a mid-play watchdog or a reason to change engines.
+    private func armSeekCompletionDeadline(requestID: UInt64, sourceSeconds: Double) {
+        seekCompletionTimeoutTask?.cancel()
+        let seekItem = item
+        let generation = itemGeneration
+        let loadToken = activeLoadToken
+        seekCompletionTimeoutTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 12_000_000_000)
+            } catch { return }
+            guard let self, !Task.isCancelled,
+                  self.seekRequestGeneration == requestID,
+                  self.itemGeneration == generation,
+                  self.item === seekItem,
+                  self.activeLoadToken == loadToken,
+                  self.seekEndBoundary.requestID == requestID else { return }
+            self.seekCompletionTimeoutTask = nil
+            // Advance ownership before cancelling AVFoundation: its resulting completion is now stale.
+            self.invalidateSeekRequests()
+            seekItem?.cancelPendingSeeks()
+            DiagnosticsLog.log("avplayer", "seek completion deadline: aborting owned seek and restoring requested target")
+            if !self.remountForSeek(sourceSeconds: sourceSeconds), let loadToken {
+                // A direct asset cannot use the remux seek replacement. Expose a failure instead of
+                // leaving the chrome frozen or manufacturing an EOF that would advance the episode.
+                self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: loadToken)
+            }
+        }
     }
 
     private func registerSeekAdmission(
@@ -2022,6 +2059,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             loadToken: loadToken,
             generation: itemGeneration,
             mountIdentity: playbackMountIdentity,
+            seekRequestID: seekRequestGeneration,
             progress: progress)
     }
 
@@ -2034,6 +2072,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             && player.currentItem === eventItem
             && itemGeneration == receipt.generation
             && playbackMountIdentity == receipt.mountIdentity
+            && seekRequestGeneration == receipt.seekRequestID
             && !fatalErrorEmitted
             && !terminalLatch.hasEmitted
             && remuxHLSServer?.isMountHealthy == true
@@ -2061,7 +2100,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 // newer item's task if this canceled callback wakes after that ownership transition.
                 if self.activeLoadToken == receipt.loadToken,
                    self.itemGeneration == receipt.generation,
-                   self.playbackMountIdentity == receipt.mountIdentity {
+                   self.playbackMountIdentity == receipt.mountIdentity,
+                   self.seekRequestGeneration == receipt.seekRequestID {
                     self.eventOwnedRecoveryTask = nil
                 }
             }
@@ -2399,7 +2439,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     func seek(to seconds: Double) {
+        guard seconds.isFinite else { return }
         let seekRequestID = supersedeSeekRequest()
+        eventOwnedRecoveryTask?.cancel()
+        eventOwnedRecoveryTask = nil
+        deferredEventOwnedRecovery = nil
+        deferredTerminal.discardEOF(generation: itemGeneration)
+        resetSurfaceStallEvidence()
         if var intent = pendingPlaybackIntent {
             intent.updateSourceSeconds(seconds)
             pendingPlaybackIntent = intent
@@ -2417,6 +2463,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // The capability-refresh completion takes a fresh snapshot from the still-mounted failed item.
             // Keep this separate override so that snapshot cannot replace the user's newer requested time.
             pendingSeek = seconds
+            return
+        }
+        // A paused growing-tail failure has a dead AVPlayerItem even though its producer is healthy.
+        // A newer seek replaces that item at the requested source time instead of replaying the old
+        // tail recovery on Play or asking AVFoundation to seek a failed item.
+        if item?.status == .failed,
+           case .recoverablePublishedTail = currentRemuxItemEndDecision(),
+           remountForSeek(sourceSeconds: seconds) {
             return
         }
         // Before the item is playable, remember the target and apply it on ready (covers the chrome's
@@ -2477,11 +2531,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         } else {
             clamped = (dur.isFinite && dur > 1) ? min(max(seconds, 0), max(dur - 1, 0)) : max(seconds, 0)
         }
+        // Pre-ready targets above have not issued an AVPlayer seek. Fence only the actual admission/
+        // seek transaction, otherwise a deferred or already-satisfied target would suppress EOF forever.
         if let server = remuxHLSServer {
             guard registerSeekAdmission(
                 requestID: seekRequestID,
                 server: server
             ) else { return }
+            seekEndBoundary.begin(requestID: seekRequestID)
+            armSeekCompletionDeadline(requestID: seekRequestID, sourceSeconds: seconds)
             let seekGeneration = itemGeneration
             let seekLoadToken = activeLoadToken
             preparedSeekTask = Task { @MainActor [weak self] in
@@ -2530,6 +2588,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             }
             return
         }
+        armSeekCompletionDeadline(requestID: seekRequestID, sourceSeconds: seconds)
         commitPlayerSeek(playerSeconds: clamped, requestID: seekRequestID)
     }
 
@@ -2538,12 +2597,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         requestID: UInt64,
         preparedServer: VortXRemuxHLSServer? = nil
     ) {
+        seekEndBoundary.begin(requestID: requestID)
         let seekItem = item
         let seekGeneration = itemGeneration
         let seekLoadToken = activeLoadToken
         player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600)) {
             [weak self, weak preparedServer] finished in
             Task { @MainActor in
+                if self?.seekEndBoundary.requestID == requestID {
+                    self?.seekCompletionTimeoutTask?.cancel()
+                    self?.seekCompletionTimeoutTask = nil
+                }
+                self?.seekEndBoundary.finish(requestID: requestID)
                 guard let self,
                       finished,
                       self.seekRequestGeneration == requestID,
@@ -3343,12 +3408,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// `SubtitleStyle` keys the libmpv path uses. Fail-soft: a nil rule just leaves the system default styling.
     private func applyEmbeddedSubtitleTextStyle() {
         guard let item = player.currentItem else { return }
-        var attrs: [String: Any] = [:]
+        var attrs = AVEmbeddedSubtitleBackground.attributes(style: SubtitleStyle.backgroundId)
         if let fg = Self.argbComponents(fromHex: SubtitleStyle.colorHex) {
             attrs[kCMTextMarkupAttribute_ForegroundColorARGB as String] = fg
         }
-        attrs[kCMTextMarkupAttribute_CharacterBackgroundColorARGB as String] =
-            Self.backgroundARGB(SubtitleStyle.backgroundId)
         // Named base sizes (40 / 55 / 72 / 92 libass px on a ~720 canvas) mapped to a percentage of video
         // height: Medium ~= 5%, scaling linearly, so the Smaller/Larger steps visibly change AVPlayer subs too.
         let pct = max(2.0, min(12.0, Double(SubtitleStyle.fontSize) / 11.0))
@@ -3367,15 +3430,6 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return [1.0, r, g, b]
     }
 
-    /// The [alpha, red, green, blue] background colour for the named background style (mirrors the libmpv
-    /// `sub-back-color`): outline = transparent, shaded = ~50% black, box = opaque black.
-    private static func backgroundARGB(_ id: String) -> [Double] {
-        switch id {
-        case "shaded": return [0.5, 0, 0, 0]
-        case "box":    return [1.0, 0, 0, 0]
-        default:       return [0.0, 0, 0, 0]   // outline only: transparent background
-        }
-    }
     /// The current external-subtitle delay in seconds, so the sync-capture path can pool the learned offset.
     func currentSubDelaySeconds() -> Double { subtitleRenderer.offset }
 
@@ -4477,8 +4531,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let terminal: VortXPlaybackEndNotificationPolicy.Terminal
         switch currentRemuxItemEndDecision() {
         case .contentEOF:
+            guard !seekEndBoundary.isPending else { return }
             terminal = .eof
         case .recoverablePublishedTail:
+            guard !seekEndBoundary.isPending else { return }
             guard !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
             if !playbackRequested {
                 guard deferredEventOwnedRecovery == nil,
@@ -4562,6 +4618,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               let failedItem = note.object as? AVPlayerItem,
               let loadToken = activeLoadToken,
               owns(failedItem, loadToken: loadToken) else { return }
+        // A queued old-tail notification cannot fail a new seek on a still-healthy remux item.
+        // Actual failed items and concrete producer failures remain observable.
+        if seekEndBoundary.isPending,
+           failedItem.status != .failed,
+           case .recoverablePublishedTail = currentRemuxItemEndDecision() {
+            return
+        }
         let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
         let message = err?.localizedDescription ?? "Playback failed"
         if !playbackRequested {

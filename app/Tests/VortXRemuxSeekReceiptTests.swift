@@ -60,5 +60,23 @@ enum VortXRemuxSeekReceiptTests {
         anchor.cancelSeek(requestID: 3)
         precondition(anchor.playbackReceiptEpoch == latestEpoch && anchor.pendingAdmissionRequestID == 4)
         print("PASS cancellation retires receipts without clearing a superseding seek")
+
+        precondition(anchor.admitSeek(requestID: 4, playerSeconds: 120, targetIsPublished: true))
+        let blockedEpoch = anchor.playbackReceiptEpoch
+        precondition(!anchor.reportPlaybackPosition(120, receiptEpoch: blockedEpoch))
+        precondition(!anchor.completeSeek(requestID: 3, playerSeconds: 900))
+        precondition(anchor.pendingReceipt?.requestID == 4)
+        anchor.cancelSeek(requestID: 4) // owned deadline / false native completion
+        precondition(anchor.pendingReceipt == nil)
+        precondition(!anchor.reportPlaybackPosition(900, receiptEpoch: blockedEpoch))
+        precondition(anchor.reportPlaybackPosition(119.5, receiptEpoch: anchor.playbackReceiptEpoch))
+        print("PASS missing seek completion abort restores receipt flow without certifying the target")
+
+        anchor.registerSeek(requestID: 5)
+        precondition(anchor.admitSeek(requestID: 5, playerSeconds: 200, targetIsPublished: true))
+        precondition(anchor.completeSeek(requestID: 5, playerSeconds: 198.5))
+        precondition(anchor.currentPlaybackSeconds == 198.5)
+        precondition(!anchor.completeSeek(requestID: 5, playerSeconds: 700))
+        print("PASS landing is accepted once at the actual position, not the requested destination")
     }
 }

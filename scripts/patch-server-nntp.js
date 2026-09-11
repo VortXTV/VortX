@@ -34,6 +34,7 @@ function createWorker(net, tls) {
             this.pending = null;
             if (!pending) return;
             clearTimeout(pending.timer);
+            clearTimeout(pending.totalTimer);
             pending.chunks = [];
             error ? pending.reject(error) : pending.resolve(value);
         }
@@ -42,9 +43,14 @@ function createWorker(net, tls) {
             if (command && /[\r\n]/.test(command)) return Promise.reject(new Error("Invalid NNTP command"));
             return new Promise((resolve, reject) => {
                 const pending = this.pending = { resolve, reject, article, mode: "status",
-                    control: Buffer.alloc(0), chunks: [], bytes: 0, tail: Buffer.alloc(0), timer: null };
+                    control: Buffer.alloc(0), chunks: [], bytes: 0, tail: Buffer.alloc(0), timer: null, totalTimer: null };
                 const timeout = Number.isFinite(this.opts.timeout) && this.opts.timeout > 0 ? this.opts.timeout : 20000;
                 pending.timer = setTimeout(() => this.disconnect(new Error("NNTP response timed out")), timeout);
+                // Article bodies use an inactivity deadline below. Keep a separate hard bound so a
+                // dribbling/malformed peer cannot occupy a worker forever (the 64 MiB cap also remains).
+                if (article) pending.totalTimer = setTimeout(
+                    () => this.disconnect(new Error("NNTP article transfer exceeded safety deadline")),
+                    Math.max(timeout, 120000));
                 if (command) {
                     if (!this.client || this.client.destroyed) this.disconnect(new Error("NNTP socket unavailable"));
                     else this.client.write(command + "\r\n");
@@ -75,6 +81,9 @@ function createWorker(net, tls) {
                 buffer = data.subarray(end + 2);
             }
             if (!buffer.length) return;
+            // A provider-limited article can take longer than 20s while continuously making progress.
+            // Do not repeatedly throw away those bytes and re-fetch the same segment from its start.
+            pending.timer.refresh();
             // Carry four bytes between socket reads: the five-byte article
             // terminator is allowed to straddle ANY TCP/TLS packet boundary.
             const scan = pending.tail.length ? Buffer.concat([pending.tail, buffer]) : buffer;
@@ -278,6 +287,13 @@ function patch(source) {
     } else if (source.split(deliveryMarker).length !== 2) throw new Error("Duplicate NNTP subscriber marker");
     if (source.includes(marker)) {
         if (source.split(marker).length !== 2) throw new Error("Duplicate NNTP patch marker");
+        // Refresh the worker body on previously patched build inputs as well as pristine bundles.
+        // The v1 marker alone must not silently retain an older timeout implementation.
+        const at = source.indexOf("    " + marker);
+        const end = source.indexOf("\n}, function(module, exports, __webpack_require__) {", at);
+        if (at < 0 || end < at) throw new Error("Patched NNTP worker boundary missing");
+        source = source.slice(0, at) + "    " + marker + "\n    module.exports = (" + createWorker.toString() +
+            ")(__webpack_require__(39), __webpack_require__(71));" + source.slice(end);
         return patchCancellation(source);
     }
     const anchor = "    var NNTPWorker, async, id, net, bind = function(fn, me) {";

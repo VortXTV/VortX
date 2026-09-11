@@ -99,6 +99,29 @@ enum RemuxItemEndPolicyTests {
             deferred.capture(.error("old item failed"), generation: 14)
                 && { deferred.reset(generation: 15); return deferred.consume(generation: 14) == nil }())
 
+        deferred.reset(generation: 16)
+        check("same-item rewind discards paused EOF", deferred.capture(.eof, generation: 16))
+        deferred.discardEOF(generation: 16)
+        check("Play after rewind cannot consume old EOF", deferred.consume(generation: 16) == nil)
+        check("capture concrete failure before rewind", deferred.capture(.error("producer failed"), generation: 16))
+        deferred.discardEOF(generation: 16)
+        check("rewind preserves real failure", deferred.consume(generation: 16) == .error("producer failed"))
+        check("capture newer item EOF", deferred.capture(.eof, generation: 16))
+        deferred.discardEOF(generation: 15)
+        check("stale seek cannot discard new item EOF", deferred.consume(generation: 16) == .eof)
+
+        var seekBoundary = VortXPlaybackEndNotificationPolicy.SeekBoundary()
+        seekBoundary.begin(requestID: 100)
+        check("queued tail cannot pass while seek is pending", seekBoundary.isPending)
+        seekBoundary.begin(requestID: 101)
+        seekBoundary.finish(requestID: 100)
+        check("old completion cannot release newest seek", seekBoundary.isPending)
+        seekBoundary.finish(requestID: 101)
+        check("newest completion releases terminal observation", !seekBoundary.isPending)
+        seekBoundary.begin(requestID: 102)
+        seekBoundary.reset()
+        check("replacement retires seek boundary", !seekBoundary.isPending)
+
         check(
             "raw AVPlayer end remains content EOF",
             VortXRemuxItemEndPolicy.classify(
@@ -321,6 +344,28 @@ enum RemuxItemEndPolicyTests {
                 "deliverTerminal(deferred, loadToken: loadToken, generation: itemGeneration)",
                 "player.rate = requestedRate",
             ]))
+        let seekHandler = sourceSection(engine, from: "func seek(to seconds: Double)", to: "func seek(by seconds: Double)")
+        check("wiring: rewind retires old EOF and tail recovery before issuing the new seek",
+              containsInOrder(seekHandler, ["supersedeSeekRequest()", "eventOwnedRecoveryTask?.cancel()",
+                  "deferredEventOwnedRecovery = nil", "deferredTerminal.discardEOF", "guard isReady else",
+                  "seekEndBoundary.begin", "armSeekCompletionDeadline", "server.prepareForSeek"]))
+        check("wiring: completion settles only its own deadline before landing or aborting admission",
+              containsInOrder(seekHandler, ["self?.seekEndBoundary.requestID == requestID",
+                  "self?.seekCompletionTimeoutTask?.cancel()", "self?.seekEndBoundary.finish",
+                  "finished,", "self.seekRequestGeneration == requestID", "self.cancelSeekAdmission",
+                  "self.completeSeekAdmission"]))
+        let seekDeadline = sourceSection(engine, from: "private func armSeekCompletionDeadline", to: "private func registerSeekAdmission")
+        check("wiring: deadline checks owner then invalidates before native cancellation and target-only remount",
+              containsInOrder(seekDeadline, ["Task.sleep", "self.seekRequestGeneration == requestID",
+                  "self.itemGeneration == generation", "self.item === seekItem",
+                  "self.activeLoadToken == loadToken", "self.seekEndBoundary.requestID == requestID",
+                  "self.invalidateSeekRequests()", "seekItem?.cancelPendingSeeks()",
+                  "self.remountForSeek(sourceSeconds: sourceSeconds)"])
+                && seekDeadline?.contains("player.play()") == false)
+        check("wiring: completion reanchors producer immediately from accepted actual landing",
+              containsInOrder(server, ["func completePreparedSeek", "if seekAnchorState.completeSeek",
+                  "refreshProducerLeadGate(playbackReceipt: playerSeconds)", "playbackClockLock.unlock()",
+                  "func cancelPreparedSeek"]))
         check(
             "wiring: explicit Play during recovery updates intent but cannot start before restoration",
             containsInOrder(engine, [
