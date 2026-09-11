@@ -656,6 +656,19 @@ assert(!/hdiutil|VortXTVLite|VortXiOSNative/.test(packaging));
 const guard = step('Constrain Full tvOS test mode to artifact-only builds');
 for (const check of ['[ -z "$TEST_RELEASE_TAG" ]', '[ -z "$TEST_RELEASE_ID" ]', '[ "$TEST_PUBLISH" != "true" ]', 'exit 1']) assert(guard.includes(check));
 console.log('ok: Full tvOS test lane preserves TV gates, skips other app builds, packages only TV, and refuses release writes');
+const publicPackaging = step('Package the IPAs');
+assert(publicPackaging.includes('set -euo pipefail'));
+const payloadCleanup = publicPackaging.indexOf('rm -rf out/full/Payload');
+for (const asset of ['VortX-tvOS-ci.ipa', 'VortX-tvOS-lite-ci.ipa', 'VortX-iOS-ci.ipa']) {
+    const verified = publicPackaging.indexOf('unzip -tqq out/' + asset);
+    assert(verified >= 0 && verified < payloadCleanup, asset + ' must verify before cleanup');
+}
+const inputCleanup = publicPackaging.indexOf('rm -rf app/Vendor/MPVKit-DVFEL/artifacts');
+const signCheck = publicPackaging.indexOf('codesign --verify --deep --strict "$MAC_APP"');
+const dmg = publicPackaging.indexOf('\n          hdiutil create');
+assert(payloadCleanup < inputCleanup && inputCleanup < signCheck && signCheck < dmg);
+assert(!publicPackaging.includes('rm -rf app/build/ci-mac'));
+console.log('ok: public packaging verifies IPAs before cleanup and the retained Mac signature before DMG creation');
 NODE
 
 # Keep the shared settings deployment floor and release-feed commit identity explicit.

@@ -5,15 +5,15 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.10"
+    static let version = "0.4.0-beta.12"
     static let highlights: [String] = [
-        "Continue Watching can recover a series' episode list without waiting for all sources. Missing episode metadata no longer makes the player treat the current episode as the series finale and return Home.",
-        "Pause time no longer consumes playback recovery deadlines. Manual Play, seek, source changes, and player changes retire old intent so delayed work cannot take control of the new playback session.",
-        "Backward seeks rebuild the Dolby Vision producer's buffer accounting from retained media. AVPlayer track changes restore position and pause state separately from asynchronous audio and subtitle selection.",
-        "NNTP streaming gains faster yEnc decoding, correct multipart RAR volume mapping and byte ranges, cancellation-safe backup reads, preserved paused buffers, and automatic startup cushioning in VortX Player.",
-        "On-device NNTP streams can enter the Dolby Vision remux path when the source qualifies and remux is enabled. Failed Profile 7 conversion and missing required DV initialization metadata now fail explicitly instead of emitting mismatched video.",
-        "Changing players uses the currently selected source and request headers. Remote streaming-server Test and Save use the same endpoint validation, and failed playback preserves the episode you selected.",
-        "This is an Apple-only beta. Long-run Apple TV DV, NNTP pause/seek, and built-in subtitle rendering still need device confirmation; this release does not claim every doubled-subtitle report is resolved."
+        "Interrupted AVPlayer seeks recover the requested position instead of silently losing their recovery owner. Paused seeks update both the position and subtitle cue from the actual landing.",
+        "Refused Apple TV retries preserve the current surface and resume watchdog. Player changes and fresh-link recovery keep the active source, headers, episode, and transport intent.",
+        "Startup avoids resetting an already-valid decoder surface. Apple devices try direct VideoToolbox then hardware copy-back before software; explicit overrides are preserved.",
+        "Add-on order and removal intent survive stale or partial sync. Source groups follow your order, mirroring-off changes stay local, and QR pairing retains its relay authority.",
+        "Continue Watching, library progress, and watched actions merge with account/profile ownership. Late episode and hero artwork publishes, and Trakt thumbnails gain URL and alias repairs.",
+        "Save prioritized NNTP servers, search NZBGeek/Newznab directly, and open supplied prequel/sequel links or known collection neighbors. Active NNTP reads renew their inactivity deadline.",
+        "Apple-only build 245. Physical-device DV, sustained NNTP throughput, frame pacing, and the separate iOS pre-player crash report are not claimed universally resolved. Android packages and broader UI parity remain follow-up work."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses

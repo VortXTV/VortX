@@ -934,6 +934,7 @@ jobs:
       - name: Package the IPAs
         if: inputs.tvos_test_only != true
         run: |
+          set -euo pipefail
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
           mv app/build/ci/Build/Products/Release-appletvos/VortXTV.app out/full/Payload/
           mv app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app out/lite/Payload/
@@ -941,12 +942,20 @@ jobs:
           (cd out/full && zip -qry ../VortX-tvOS-ci.ipa Payload)
           (cd out/lite && zip -qry ../VortX-tvOS-lite-ci.ipa Payload)
           (cd out/ios && zip -qry ../VortX-iOS-ci.ipa Payload)
+          unzip -tqq out/VortX-tvOS-ci.ipa
+          unzip -tqq out/VortX-tvOS-lite-ci.ipa
+          unzip -tqq out/VortX-iOS-ci.ipa
           # Reclaim disk before building the .dmg: the IPAs are zipped now, so the tvOS/iOS build
           # trees and the unzipped payloads are dead weight, and the macos-26 runner disk is
           # tight (four MPVKit-GPL builds + node). Without this, `hdiutil create` failed with
           # "No space left on device" on the macOS leg (the empty-asset release for v0.3.6).
           rm -rf out/full/Payload out/lite/Payload out/ios/Payload
           rm -rf app/build/ci app/build/ci-lite app/build/ci-ios
+          # Every build and bundle audit above has finished. These pinned download inputs are no
+          # longer needed by packaging; retaining all platform slices exhausted the Beta 11 runner.
+          # Keep the built macOS app, private symbols and packaged IPAs untouched.
+          rm -f /tmp/mpvkit.zip
+          rm -rf app/Vendor/MPVKit-DVFEL/artifacts
           df -h / | tail -1
           # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it
           # (every nested binary gets a valid signature, so the kernel will run it), then package it as
@@ -955,6 +964,7 @@ jobs:
           # give the one-time right-click-Open / xattr fix.
           MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
           codesign --force --deep --sign - "$MAC_APP"
+          codesign --verify --deep --strict "$MAC_APP"
           codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
           DMG_STAGE="$(mktemp -d)"
           mv "$MAC_APP" "$DMG_STAGE/"
