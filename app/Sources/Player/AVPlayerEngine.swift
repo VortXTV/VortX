@@ -2314,6 +2314,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     reason: deferred.reason,
                     claimsPublishedTailRetry: deferred.claimsPublishedTailRetry) {
                     logTransport("play -> resumed deferred event-owned recovery observation")
+                    // Recovery may wait at rate zero before replacing the item, so KVO cannot publish
+                    // this Play intent. Keep the chrome/toggle state in sync with the ordinary Play path.
+                    emit(MPVProperty.pause, false)
                     return
                 }
                 deliverTerminal(

@@ -379,8 +379,8 @@ enum RemuxItemEndPolicyTests {
             "wiring: surface same-source replacement captures intent before teardown and keeps exact resume origin",
             containsInOrder(loadFile, [
                 "PlaybackIntentPolicy.carriesIntentForOwnedRecovery(",
-                "pendingPlaybackIntent = capturePlaybackIntent(from: item)",
-                "pendingPlaybackIntent?.updateSourceSeconds(configured)",
+                "pendingPlaybackIntent = beginPlaybackRemountIntent(from: item)",
+                "RemuxResumePolicy.originForLoad(",
                 "retryFreshItemOnHealthyMount(",
                 "return existingToken",
                 "teardownRemux()",
@@ -407,12 +407,12 @@ enum RemuxItemEndPolicyTests {
             from: "case .failed:",
             to: "default:")
         check(
-            "wiring: recovery ready cannot apply transport before async selection restoration",
+            "wiring: recovery ready releases position before transport without blocking on unbounded group discovery",
             containsInOrder(readyHandler, [
+                "releasePendingPlaybackIntentAtReady(for: item)",
                 "loadSelectionGroups()",
-                "if pendingPlaybackIntent == nil {",
+                "if !didStart {",
                 "applyCommittedTransport()",
-                "readyToPlay deferred transport until recovery selection and playhead restoration",
             ])
                 && containsInOrder(engine, [
                     "private func loadSelectionGroups()",
@@ -420,9 +420,9 @@ enum RemuxItemEndPolicyTests {
                     "applyCommittedTransport()",
                 ]))
         check(
-            "wiring: same-mount tail recovery captures selection intent and restores it before transport",
+            "wiring: same-mount tail recovery binds preserved selection intent and reapplies committed transport after selection",
             containsInOrder(tailRecovery, [
-                "pendingPlaybackIntent = capturePlaybackIntent(from: currentItem)",
+                "pendingPlaybackIntent = beginPlaybackRemountIntent(from: currentItem)",
                 "let freshItem = AVPlayerItem(asset: AVURLAsset(url: playlistURL))",
                 "pendingPlaybackIntent?.bind(",
                 "player.replaceCurrentItem(with: freshItem)",
@@ -455,6 +455,11 @@ enum RemuxItemEndPolicyTests {
                     "if let deferred = deferredEventOwnedRecovery",
                     "currentRemuxItemEndDecision()",
                 ]))
+        check(
+            "wiring: Play during deferred recovery publishes resumed intent before returning",
+            containsInOrder(engine?.components(separatedBy:
+                "logTransport(\"play -> resumed deferred event-owned recovery observation\")").dropFirst().first?
+                .components(separatedBy: "return").first, ["emit(MPVProperty.pause, false)"]))
         check(
             "wiring: deferred and immediate EOF/error delivery share the exact-generation terminal latch",
             engine?.contains("private func deliverTerminal(") == true
