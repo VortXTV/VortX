@@ -308,6 +308,10 @@ function sha256Buffer(value) {
 
 export function buildReleaseFeedArtifact(options) {
   const tag = requireTag(options.tag);
+  if (options.prerelease !== undefined && ![true, false, "true", "false"].includes(options.prerelease)) {
+    die("--prerelease must be true or false");
+  }
+  const prerelease = options.prerelease === undefined ? tag.includes("-") : String(options.prerelease) === "true";
   const build = requirePositiveInteger("build", options.build);
   const sourceCommit = String(options.sourceCommit || "");
   if (!/^[0-9a-f]{40}$/i.test(sourceCommit)) die("--source-commit must be a 40-character commit SHA");
@@ -354,7 +358,7 @@ export function buildReleaseFeedArtifact(options) {
     version: tag.replace(/^v/, "").split("-", 1)[0],
     name,
     notes: note,
-    prerelease: tag.includes("-"),
+    prerelease,
     sourceCommit,
     ios: assets.ios,
     tvos: assets.tvos,
@@ -373,7 +377,7 @@ export function buildReleaseFeedArtifact(options) {
     version: tag.replace(/^v/, "").split("-", 1)[0],
     name,
     notes: cleanMultilineProse(note) || `${name}. One-tap update over any earlier build, nothing resets.`,
-    prerelease: tag.includes("-"),
+    prerelease,
     sourceCommit,
     releaseId: options.releaseId ? String(options.releaseId) : null,
     generation: `${tag}:${build}:${feedSha256}`,
@@ -1106,6 +1110,7 @@ export function main(argv = process.argv.slice(2)) {
       date: args.date,
       name: args.name,
       note: args.note,
+      prerelease: args.prerelease,
       releaseId: args["release-id"],
     });
     console.log(`release-feed: built ${result.manifest.generation}`);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { execFileSync } from "node:child_process";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -149,6 +150,10 @@ test("release and manual cut paths both require feed propagation", async () => {
   assert.match(workflow, /node scripts\/release-feed\.mjs project-build --file app\/project\.yml/);
   assert.match(workflow, /PUBLISH_DEADLINE/);
   assert.match(workflow, /IS_PRERELEASE=false; \[\[ "\$TAG" == \*-\* \]\] && IS_PRERELEASE=true/);
+  assert.match(workflow, /LATEST_BETA_MARKER='<!-- vortx-channel: latest-beta -->'/);
+  assert.match(workflow, /latest-beta marker is allowed only on strict beta tags/);
+  assert.match(workflow, /--prerelease "\$IS_PRERELEASE"/);
+  assert.match(workflow, /feed prerelease state differs from the computed release state/);
   assert.match(workflow, /\.prerelease == \$prerelease/);
   assert.match(workflow, /rollback-verify=\$restore/);
   assert.match(workflow, /rollback-raw-source\.json/);
@@ -282,7 +287,7 @@ test("content-addressed artifact records exact local bytes and keeps Android nul
   await writeFile(files.mac, "mac-content");
   const local = Object.values(files).slice(0, 4);
   await writeFile(files.checksum, `${local.map((file) => `${sha256File(file)}  out/${file.split("/").pop()}`).join("\n")}\n`);
-  const result = buildReleaseFeedArtifact({
+  const options = {
     tag: TAG,
     build: BUILD,
     sourceCommit: "a".repeat(40),
@@ -295,7 +300,8 @@ test("content-addressed artifact records exact local bytes and keeps Android nul
     checksumFile: files.checksum,
     name: "Beta 19",
     note: "Beta release notes.",
-  });
+  };
+  const result = buildReleaseFeedArtifact(options);
   assert.equal(result.manifest.android, null);
   assert.equal(result.manifest.assets.ios.state, "trusted-local");
   assert.equal(result.manifest.assets.mac.url, MAC_URL);
@@ -305,6 +311,33 @@ test("content-addressed artifact records exact local bytes and keeps Android nul
   assert.equal(appcast.ios.altstore, "https://vortx.tv/altstore.json");
   assert.equal(appcast.tvos.altstore, null);
   assert.equal(appcast.mac.artifactType, "dmg");
+  assert.equal(result.manifest.prerelease, true, "ordinary beta stays a prerelease");
+  const latest = buildReleaseFeedArtifact({ ...options, output: join(temp, "latest-beta-artifact"), prerelease: "false" });
+  assert.equal(latest.manifest.prerelease, false);
+  const latestAppcast = JSON.parse(await readFile(join(temp, "latest-beta-artifact", "appcast.json"), "utf8"));
+  for (const platform of ["ios", "tvos", "mac"]) assert.equal(latestAppcast[platform].prerelease, false);
+  assert.equal(latestAppcast.android, null);
+  assert.throws(() => buildReleaseFeedArtifact({ ...options, prerelease: "garbage" }), /must be true or false/);
+});
+
+test("every real workflow channel gate preserves defaults and rejects invalid latest-beta markers", async () => {
+  const workflow = await readFile(new URL("../../.github/workflows/release-tvos.yml", import.meta.url), "utf8");
+  const blocks = [...workflow.matchAll(/IS_PRERELEASE=false; \[\[ "\$(?:EVENT_TAG|TAG)" == \*-\* \]\] && IS_PRERELEASE=true\n(?:\s+RELEASE_BODY=[^\n]*\n)?\s+LATEST_BETA_MARKER=[\s\S]*?^\s+fi$/gm)].map(match => match[0]);
+  assert.equal(blocks.length, 4, "build, attach, published readiness and published identity all enforce the channel");
+  const marker = "<!-- vortx-channel: latest-beta -->";
+  for (const block of blocks) {
+    const run = (tag, body) => execFileSync("bash", ["-c", `set -euo pipefail\n${block}\nprintf '%s' "$IS_PRERELEASE"`], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, TAG: tag, EVENT_TAG: tag, RELEASE_BODY: body, RELEASE_JSON: JSON.stringify({ body }) },
+    });
+    assert.equal(run("v0.4.0", "regular release"), "false");
+    assert.equal(run("v0.4.0-beta.11", "regular beta"), "true");
+    assert.equal(run("v0.4.0-beta.11", `Notes\n${marker}\n`), "false");
+    assert.equal(run("v0.4.0-beta.11", `Notes\r\n${marker}\r\n`), "false");
+    assert.throws(() => run("v0.4.0", marker));
+    assert.throws(() => run("v0.4.0-rc.1", marker));
+    assert.throws(() => run("v0.4.0-beta.11", ` ${marker}`));
+  }
 });
 
 // =================================================================================================

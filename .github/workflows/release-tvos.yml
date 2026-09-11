@@ -980,7 +980,6 @@ jobs:
           TAG="$RELEASE_TAG"
           TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
           [[ "$TAG" =~ $TAG_RE ]] || { echo "::error::release tag $TAG is not strict"; exit 1; }
-          IS_PRERELEASE=false; [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
           BUILD="$(node scripts/release-feed.mjs project-build --file app/project.yml)"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::tag project build is not numeric"; exit 1; }
           if [[ "$RELEASE_ID_INPUT" =~ ^[0-9]+$ ]]; then
@@ -989,9 +988,17 @@ jobs:
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "first(.[] | select(.tag_name == \"$TAG\"))")"
           fi
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
-          jq -e --arg tag "$TAG" --argjson prerelease "$IS_PRERELEASE" '.tag_name == $tag and .draft == true and .prerelease == $prerelease' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing draft with the tag-derived prerelease state"; exit 1; }
           RELEASE_NAME="$(jq -r '.name // .tag_name' <<<"$RELEASE_JSON")"
           RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
+          IS_PRERELEASE=false; [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
+          LATEST_BETA_MARKER='<!-- vortx-channel: latest-beta -->'
+          if grep -Fqx "$LATEST_BETA_MARKER" < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+            [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || { echo "::error::latest-beta marker is allowed only on strict beta tags"; exit 1; }
+            IS_PRERELEASE=false
+          elif grep -Fq 'vortx-channel: latest-beta' < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+            echo "::error::latest-beta channel marker must be the exact immutable release-body line"; exit 1
+          fi
+          jq -e --arg tag "$TAG" --argjson prerelease "$IS_PRERELEASE" '.tag_name == $tag and .draft == true and .prerelease == $prerelease' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::target release must be an existing draft with the computed prerelease state"; exit 1; }
           mv out/VortX-tvOS-ci.ipa "out/VortX-tvOS-$TAG-ci.ipa"
           mv out/VortX-tvOS-lite-ci.ipa "out/VortX-tvOS-lite-$TAG-ci.ipa"
           mv out/VortX-iOS-ci.ipa "out/VortX-iOS-$TAG-ci.ipa"
@@ -1008,6 +1015,7 @@ jobs:
             --ios-file "out/VortX-iOS-$TAG-ci.ipa" --tvos-file "out/VortX-tvOS-$TAG-ci.ipa" \
             --tvos-lite-file "out/VortX-tvOS-lite-$TAG-ci.ipa" --mac-file "out/VortX-macOS-$TAG-ci.dmg" \
             --checksum-file out/SHA256SUMS-ci.txt --date "$(date -u +%F)" \
+            --prerelease "$IS_PRERELEASE" \
             --name "$RELEASE_NAME" --note "${ALTSTORE_NOTE:-$RELEASE_BODY}" --release-id "$RELEASE_ID"
           jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" --arg id "$RELEASE_ID" '.tag == $tag and .sourceCommit == $commit and (.releaseId | tostring) == $id and .android == null' feed-artifact/manifest.json >/dev/null
           test -s feed-artifact/source.json -a -s feed-artifact/appcast.json -a -s feed-artifact/manifest.json -a -s feed-artifact/SHA256SUMS-ci.txt
@@ -1080,7 +1088,6 @@ jobs:
             echo "::error::release tag '$TAG' is not strict"
             exit 1
           fi
-          IS_PRERELEASE=false; [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
           MANIFEST=feed-artifact/manifest.json
           jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" \
             '.tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
@@ -1092,6 +1099,16 @@ jobs:
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases?per_page=100" --jq "first(.[] | select(.tag_name == \"$TAG\"))")"
           fi
           RELEASE_ID="$(jq -er '.id' <<<"$RELEASE_JSON")"
+          RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
+          IS_PRERELEASE=false; [[ "$TAG" == *-* ]] && IS_PRERELEASE=true
+          LATEST_BETA_MARKER='<!-- vortx-channel: latest-beta -->'
+          if grep -Fqx "$LATEST_BETA_MARKER" < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+            [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || { echo "::error::latest-beta marker is allowed only on strict beta tags"; exit 1; }
+            IS_PRERELEASE=false
+          elif grep -Fq 'vortx-channel: latest-beta' < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+            echo "::error::latest-beta channel marker must be the exact immutable release-body line"; exit 1
+          fi
+          jq -e --argjson prerelease "$IS_PRERELEASE" '.prerelease == $prerelease' "$MANIFEST" >/dev/null || { echo "::error::feed prerelease state differs from the computed release state"; exit 1; }
           jq -e --arg id "$RELEASE_ID" '(.releaseId | tostring) == $id' "$MANIFEST" >/dev/null || { echo "::error::draft release identity differs from the immutable feed artifact"; exit 1; }
           [ "$(jq -r '.draft' <<<"$RELEASE_JSON")" = true ] || { echo "::error::release $RELEASE_ID is not a draft; refusing asset writes"; exit 1; }
           APPLE_ONLY=false
@@ -1529,11 +1546,19 @@ jobs:
         run: |
           set -euo pipefail
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
-          IS_PRERELEASE=false; [[ "$EVENT_TAG" == *-* ]] && IS_PRERELEASE=true
           READ_DEADLINE=$(($(date +%s) + 90))
           READY=0
           while [ "$(date +%s)" -lt "$READ_DEADLINE" ]; do
             RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+            IS_PRERELEASE=false; [[ "$EVENT_TAG" == *-* ]] && IS_PRERELEASE=true
+            RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON" 2>/dev/null || true)"
+            LATEST_BETA_MARKER='<!-- vortx-channel: latest-beta -->'
+            if grep -Fqx "$LATEST_BETA_MARKER" < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+              [[ "$EVENT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || { echo "::error::latest-beta marker is allowed only on strict beta tags"; exit 1; }
+              IS_PRERELEASE=false
+            elif grep -Fq 'vortx-channel: latest-beta' < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+              echo "::error::latest-beta channel marker must be the exact immutable release-body line"; exit 1
+            fi
             LATEST_JSON='{}'
             if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest" 2>/dev/null || true)"; fi
             if [ -n "$RELEASE_JSON" ] && jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null; then
@@ -1555,6 +1580,14 @@ jobs:
           [ "$RELEASE_ID" -gt 0 ] || { echo "::error::published event has no immutable release ID"; exit 1; }
           RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID")"
           IS_PRERELEASE=false; [[ "$EVENT_TAG" == *-* ]] && IS_PRERELEASE=true
+          RELEASE_BODY="$(jq -r '.body // ""' <<<"$RELEASE_JSON")"
+          LATEST_BETA_MARKER='<!-- vortx-channel: latest-beta -->'
+          if grep -Fqx "$LATEST_BETA_MARKER" < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+            [[ "$EVENT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || { echo "::error::latest-beta marker is allowed only on strict beta tags"; exit 1; }
+            IS_PRERELEASE=false
+          elif grep -Fq 'vortx-channel: latest-beta' < <(printf '%s' "$RELEASE_BODY" | tr -d '\r'); then
+            echo "::error::latest-beta channel marker must be the exact immutable release-body line"; exit 1
+          fi
           LATEST_JSON='{}'
           if [ "$IS_PRERELEASE" = false ]; then LATEST_JSON="$(gh api -- "repos/$GH_REPO/releases/latest")"; fi
           jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" --argjson latest "$LATEST_JSON" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at != null and (if $prerelease then true else ($latest.id == $id and $latest.tag_name == $tag) end)' <<<"$RELEASE_JSON" >/dev/null || { echo "::error::release ID/tag/latest identity changed or release was recreated"; exit 1; }

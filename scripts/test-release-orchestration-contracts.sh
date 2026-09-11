@@ -493,6 +493,12 @@ numeric_release_id_guards="$(grep -Fc 'if [[ "$RELEASE_ID_INPUT" =~ ^[0-9]+$ ]];
 ok "Apple release workflow rejects nonnumeric draft release IDs and falls back to tag lookup"
 require_grep "Apple coordinator derives prerelease state from the tag" \
     'IS_PRERELEASE=false; \[\[ "\$TAG" == \*-\* \]\] && IS_PRERELEASE=true' "$APPLE_RELEASE_WF"
+require_grep "latest beta channel requires the durable exact marker" \
+    "LATEST_BETA_MARKER='<!-- vortx-channel: latest-beta -->'" "$APPLE_RELEASE_WF"
+require_grep "latest beta channel is restricted to strict beta tags" \
+    'latest-beta marker is allowed only on strict beta tags' "$APPLE_RELEASE_WF"
+require_grep "feed artifact carries the computed prerelease state" \
+    '--prerelease "\$IS_PRERELEASE"' "$APPLE_RELEASE_WF"
 require_grep "Android lane refuses partial publication" \
     'Refuse Android-only publication' "$RELEASE_WF"
 require_grep "Android checksum lists downloadable basenames" \
