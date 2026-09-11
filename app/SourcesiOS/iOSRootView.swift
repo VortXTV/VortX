@@ -808,7 +808,8 @@ struct iOSHomeView: View {
         if profiles.activeUsesEngineHistory {
             _ = traktContinueWatchingRevision
             return TraktPlaybackShadow.shared.continueWatchingSelection(
-                fallback: core.continueWatching
+                fallback: core.continueWatching,
+                libraryItems: core.library?.catalog ?? []
             )
         }
         return .init(items: profiles.cwItems, source: .local, sessionID: nil)

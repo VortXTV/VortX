@@ -2,6 +2,7 @@
 //
 // Run with:
 //   swiftc -o /tmp/trakt-cw-fold \
+//     app/SourcesShared/TraktArtworkPolicy.swift \
 //     app/SourcesShared/TraktContinueWatchingFold.swift \
 //     app/Tests/TraktContinueWatchingFoldTests.swift && /tmp/trakt-cw-fold
 
@@ -122,6 +123,33 @@ func testKeepsOnlyNewestEpisodePerShow() {
 }
 
 @MainActor
+func testMergesAliasesAcrossDuplicateRows() {
+    let rows = jsonRows("""
+    [
+      {"progress":20,"paused_at":"2026-07-28T12:00:00Z","type":"episode",
+       "episode":{"season":1,"number":3},"show":{"title":"Show","ids":{"imdb":"tt4444444"}}},
+      {"progress":30,"paused_at":"2026-07-28T11:00:00Z","type":"episode",
+       "episode":{"season":1,"number":2},"show":{"title":"Show","ids":{"imdb":"tt4444444","tmdb":44}}},
+      {"progress":40,"paused_at":"2026-07-28T10:00:00Z","type":"episode",
+       "episode":{"season":1,"number":1},"show":{"title":"Show","ids":{"tmdb":44}}}
+    ]
+    """)
+    let seeds = TraktContinueWatchingFold.fold(rows)
+    expectEqual(seeds.count, 1, "identity subsets for one show collapse to one card")
+    expectEqual(seeds.first?.videoID, "tt4444444:1:3", "newest duplicate row remains the winner")
+    expectEqual(seeds.first?.aliases, ["tmdb:tv:44", "tmdb:44"],
+                "duplicate rows contribute their full identity union to the winner")
+    var lateBridge = rows
+    lateBridge[1]["paused_at"] = "2026-07-28T09:00:00Z"
+    let linked = TraktContinueWatchingFold.fold(lateBridge)
+    expectEqual(linked.count, 1, "late bridge merges two already retained identities")
+    expectEqual(linked.first?.progress, 20, "late bridge preserves newest progress")
+    var overflow = rows[0]
+    overflow["episode"] = ["season": 1, "number": 1e100]
+    expect(TraktContinueWatchingFold.fold([overflow]).isEmpty, "oversized episode number fails safely")
+}
+
+@MainActor
 func testRejectsUnusableAndFinishedRows() {
     let rows = jsonRows("""
     [
@@ -171,6 +199,7 @@ struct TraktContinueWatchingFoldTestRunner {
         testFoldsMovieAndEpisodeInPausedOrder()
         testUsesTypedTmdbFallbacks()
         testKeepsOnlyNewestEpisodePerShow()
+        testMergesAliasesAcrossDuplicateRows()
         testRejectsUnusableAndFinishedRows()
         testTracksMovieAndEpisodeActivitySeparately()
 

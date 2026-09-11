@@ -3,6 +3,7 @@
 // Run with:
 //   swiftc -strict-concurrency=complete -warnings-as-errors -o /tmp/trakt-cache-security \
 //     app/SourcesShared/TraktScrobbleProgressPolicy.swift \
+//     app/SourcesShared/TraktArtworkPolicy.swift \
 //     app/SourcesShared/TraktContinueWatchingFold.swift \
 //     app/SourcesShared/TraktPlaybackCacheStorage.swift \
 //     app/Tests/TraktPlaybackCacheSecurityTests.swift && /tmp/trakt-cache-security

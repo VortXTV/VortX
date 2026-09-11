@@ -71,10 +71,14 @@ struct Issue164TraktContractTests {
                 "whole playback snapshots must feed the shared fold")
         require(shadow.contains("?extended=full"),
                 "runtime-bearing Trakt rows must be requested")
-        require(tvHome.contains("continueWatchingSelection(fallback: core.continueWatching)"),
-                "tvOS Home must consume the selected Trakt source")
-        require(iosHome.contains("continueWatchingSelection("),
-                "iOS and macOS Home must consume the selected Trakt source")
+        require(tvHome.contains("continueWatchingSelection(")
+                    && tvHome.contains("fallback: core.continueWatching")
+                    && tvHome.contains("libraryItems: core.library?.catalog ?? []"),
+                "tvOS Home must consume the selected Trakt source and local catalog artwork")
+        require(iosHome.contains("continueWatchingSelection(")
+                    && iosHome.contains("fallback: core.continueWatching")
+                    && iosHome.contains("libraryItems: core.library?.catalog ?? []"),
+                "iOS and macOS Home must consume the selected Trakt source and local catalog artwork")
 
         // Blocker 2: the offset printed on a Trakt card is the direct player's start offset.
         require(occurrences(of: "startAtSeconds: item.resumeSeconds", in: tvHome) == 2,

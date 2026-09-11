@@ -161,17 +161,24 @@ final class TraktPlaybackShadow {
 
     /// The Home rail source selected by the user. Until the first whole Trakt snapshot succeeds, keep
     /// the local rail visible. After success, even an empty Trakt snapshot is authoritative and stays empty.
+    ///
+    /// `libraryItems` is an OPTIONAL, purely local supplement: cached library rows the caller can hand
+    /// over without any new metadata request. Artwork is joined by exact identity (primary id, then the
+    /// seed's aliases) against the CW rail plus this pool; a private Trakt row still never triggers a
+    /// third-party lookup.
     func continueWatchingSelection(
-        fallback localItems: [CoreCWItem]
+        fallback localItems: [CoreCWItem],
+        libraryItems: [CoreCWItem] = []
     ) -> ContinueWatchingSelection {
         guard ExternalSyncToggle.isOn(ExternalSyncToggle.traktContinueWatching, default: false),
               ProfileStore.shared.activeUsesEngineHistory else {
             return ContinueWatchingSelection(items: localItems, source: .local, sessionID: nil)
         }
-        let existingByID = Dictionary(
-            localItems.map { ($0.id, $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
+        // Identity-join pool: the local CW rail plus any locally cached library rows the caller
+        // supplied. First occurrence wins, so the (freshest) CW entry shadows a library duplicate.
+        let joinPool = (localItems + libraryItems).map {
+            TraktArtworkPolicy.Candidate(id: $0.id, type: $0.type, poster: $0.poster)
+        }
         lock.lock()
         defer { lock.unlock() }
         guard let currentSession = TraktAuth.storedSessionID,
@@ -183,7 +190,16 @@ final class TraktPlaybackShadow {
             return ContinueWatchingSelection(items: localItems, source: .local, sessionID: nil)
         }
         let items = continueWatchingSeeds.map { seed in
-            let existing = existingByID[seed.id]
+            // The type-safe identity join: exact primary id first, then the seed's aliases (typed
+            // tmdb:tv:/tmdb:movie: and untyped tmdb:), but only against rows of the SAME type, so a
+            // movie and a series sharing one tmdb number never borrow each other's artwork and no
+            // name-only matching can ever occur.
+            let existing = TraktArtworkPolicy.matchedCandidate(
+                seedID: seed.id,
+                seedAliases: seed.aliases ?? [],
+                seedType: seed.type,
+                candidates: joinPool
+            )
             let duration = max(0, (seed.durationSeconds ?? 0) * 1000)
             let offset = max(0, (seed.resumeSeconds ?? 0) * 1000)
             return CoreCWItem(
@@ -448,8 +464,8 @@ final class TraktPlaybackShadow {
         let type = row["type"] as? String
         if type == "episode" {
             guard let episode = row["episode"] as? [String: Any],
-                  let season = double(episode["season"]).map({ Int($0) }),
-                  let number = double(episode["number"]).map({ Int($0) }),
+                  let season = safeInt(episode["season"]),
+                  let number = safeInt(episode["number"]),
                   let showIDs = (row["show"] as? [String: Any])?["ids"] as? [String: Any] else { return }
             for id in identities(showIDs, isSeries: true) {
                 out[episodeKey(id, season: season, episode: number)] = percent
@@ -466,7 +482,7 @@ final class TraktPlaybackShadow {
     private static func identities(_ ids: [String: Any], isSeries: Bool) -> [String] {
         var out: [String] = []
         if let imdb = ids["imdb"] as? String, !imdb.isEmpty { out.append(imdb) }
-        if let tmdb = double(ids["tmdb"]).map({ Int($0) }), tmdb > 0 {
+        if let tmdb = safeInt(ids["tmdb"]), tmdb > 0 {
             out.append("tmdb:\(tmdb)")
             out.append(isSeries ? "tmdb:tv:\(tmdb)" : "tmdb:movie:\(tmdb)")
         }
@@ -479,6 +495,13 @@ final class TraktPlaybackShadow {
         if let n = value as? Int { return Double(n) }
         if let s = value as? String, let n = Double(s), n.isFinite { return n }
         return nil
+    }
+
+    private static func safeInt(_ value: Any?) -> Int? {
+        guard let n = double(value), n >= Double(Int.min), n < Double(Int.max) else {
+            return nil
+        }
+        return Int(n)
     }
 
     // MARK: - Network (read-only)

@@ -34,7 +34,10 @@ struct HomeView: View {
             return .init(items: profiles.cwItems, source: .local, sessionID: nil)
         }
         _ = traktContinueWatchingRevision
-        return TraktPlaybackShadow.shared.continueWatchingSelection(fallback: core.continueWatching)
+        return TraktPlaybackShadow.shared.continueWatchingSelection(
+            fallback: core.continueWatching,
+            libraryItems: core.library?.catalog ?? []
+        )
     }
 
     private var continueWatching: [CoreCWItem] { continueWatchingSelection.items }
