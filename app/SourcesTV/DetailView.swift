@@ -1054,7 +1054,7 @@ struct DetailView: View {
             WatchedIndex.shared.noteSeriesWatched(meta.id,
                 isFullyWatched: SeriesWatched.isFullyWatched(videos: videos, watched: watched))
         }
-        .onChange(of: videos.count) {
+        .onChange(of: videos) {
             WatchedIndex.shared.noteSeriesWatched(meta.id,
                 isFullyWatched: SeriesWatched.isFullyWatched(videos: videos, watched: watched))
         }
@@ -1993,10 +1993,10 @@ struct CoreSeasonedEpisodes: View {
             else { didApplyInitial = true }
             recomputeEpisodes()
         }
-        // A series' `videos` often stream in AFTER this panel first renders, so the season/episode lists built
-        // on first appear can be stale or empty, and the initial-season hint (from Continue Watching) may not
-        // resolve until they arrive. Re-run the resolver when the videos array grows so the hint still lands.
-        .onChange(of: videos.count) { applyPreferredSeason() }
+        // Metadata can replace a same-sized inventory with populated artwork, corrected seasons, or titles.
+        // Observe content, not just count, so cached rows refresh too. The resolver retains a valid manually
+        // selected season; focus state is untouched and unrelated focus/watch repaints do not re-sort rows.
+        .onChange(of: videos) { applyPreferredSeason() }
     }
 
     /// #7 return-to-episode, shared by BOTH triggers (player dismissal + app foreground): jump the grid to

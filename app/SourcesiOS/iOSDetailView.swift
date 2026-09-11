@@ -3561,11 +3561,11 @@ struct iOSDetailView: View {
             .padding(.horizontal, Theme.Space.md)
             // Initial season = the season you were LAST watching (Continue Watching), else first-unwatched,
             // else the first non-special, else 1, matching the tvOS rule. Re-applies when a large series'
-            // episodes stream in after the list first appears (onChange videos.count), guarded so a manual tap
-            // is never overridden.
+            // episode metadata changes after the list first appears, including same-count season/release
+            // corrections. The existing guard preserves a valid manual selection.
             .onAppear { applyEpisodeSeason(seasons); publishSeriesWatchRollup() }
             // Single-param onChange: the zero-/two-param forms are iOS 17+, target here is iOS 16.
-            .onChange(of: videos.count) { _ in
+            .onChange(of: videos) { _ in
                 applyEpisodeSeason(Array(Set(videos.compactMap { $0.season })).sorted())
                 publishSeriesWatchRollup()
             }

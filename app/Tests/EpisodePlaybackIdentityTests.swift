@@ -464,6 +464,22 @@ private struct EpisodePlaybackIdentityTests {
         let illustratedEpisode = metadata(["videos": [["id": "kitsu:460:1", "season": 1,
             "episode": 1, "title": "Episode 1", "thumbnail": "https://anime.invalid/episode.jpg"]]])
         expect(!blankAnime.hasSamePresentation(as: illustratedEpisode), "late episode thumbnail republishes")
+        expect(blankAnime.videos?.count == illustratedEpisode.videos?.count
+               && blankAnime.videos != illustratedEpisode.videos,
+               "equal-sized episode arrays observe late artwork content")
+        let reseasonedEpisode = metadata(["videos": [["id": "kitsu:460:1", "season": 2,
+            "episode": 1, "title": "Episode 1"]]])
+        expect(blankAnime.videos?.count == reseasonedEpisode.videos?.count
+               && blankAnime.videos != reseasonedEpisode.videos,
+               "equal-sized episode arrays observe corrected season membership")
+        let tvDetail = source("SourcesTV/DetailView.swift")
+        expect(tvDetail.contains(".onChange(of: videos) { applyPreferredSeason() }")
+               && !tvDetail.contains(".onChange(of: videos.count)"),
+               "TV cached rows and watched rollup refresh on episode content, not only count")
+        let phoneDetail = source("SourcesiOS/iOSDetailView.swift")
+        expect(phoneDetail.contains(".onChange(of: videos) { _ in")
+               && !phoneDetail.contains(".onChange(of: videos.count)"),
+               "phone and Mac season validity and watched rollup observe episode content")
         expect(!blankAnime.hasSamePresentation(as: metadata(["videos": []])), "changed episode inventory republishes")
         expect(!blankAnime.hasSamePresentation(as: metadata(["trailerStreams": [["ytId": "abcdefghijk"]]])),
                "late trailer stream republishes")
