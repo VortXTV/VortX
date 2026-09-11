@@ -349,8 +349,13 @@ async function validateStage(payload) {
   const manifest = payload.manifest;
   if (!manifest || Number(manifest.schemaVersion) !== ARTIFACT_SCHEMA || !RELEASE_TAG_RE.test(String(manifest.tag || ""))) throw new Error("manifest identity is invalid");
   const tagIsPrerelease = String(manifest.tag).includes("-");
-  if (typeof manifest.prerelease !== "boolean" || manifest.prerelease !== tagIsPrerelease) {
-    throw new Error("manifest prerelease state must match the release tag");
+  // The protected publisher verifies the exact release-body Latest-beta marker before signing.
+  // Feed notes are a short summary, not that body. Accept its authenticated explicit false only
+  // for strict beta.N tags; appcast identity/digests below must still agree byte-for-byte.
+  const latestBeta = /^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$/.test(manifest.tag)
+    && manifest.prerelease === false;
+  if (typeof manifest.prerelease !== "boolean" || manifest.prerelease !== (tagIsPrerelease && !latestBeta)) {
+    throw new Error("manifest prerelease state must match the release tag and authenticated channel");
   }
   positiveInteger(manifest.build, "manifest build");
   text(manifest.name, "manifest name");

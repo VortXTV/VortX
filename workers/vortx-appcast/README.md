@@ -20,6 +20,12 @@ staged generations, the active generation, exact rollback snapshots, and an appe
 receipt. KV is deliberately not an authority for release state. Android is `null` until a signed
 artifact with a signer, build, URL, size, and digest is added to the release contract.
 
+The protected publisher may explicitly designate a strict `vX.Y.Z-beta.N` tag as Latest after
+checking the exact release-body channel marker. Its authenticated receipt then has
+`prerelease: false`, and the appcast must agree. The Worker accepts that bounded channel alongside
+ordinary prereleases; RC/nightly tags cannot use it. Feed `notes` are a short summary, so the
+Worker must not search them for a marker that exists only in the GitHub release body.
+
 If a pre-Durable-Object generation must be migrated, prepare a full independently verified receipt
 with `scripts/repair-release-feed.mjs`. The command only writes an unsigned local receipt unless an
 operator supplies both `--execute` and the protected receipt secret. Repair is one-time: it refuses

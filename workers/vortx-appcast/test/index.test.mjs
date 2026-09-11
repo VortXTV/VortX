@@ -28,9 +28,9 @@ function asset(tag, slug, extension, checksumName, byte, assetId) {
   return { name, checksumName, url, size: byte.length, sha256: sha256(byte), state: "uploaded", assetId };
 }
 
-function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
+function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG, latestBeta = false, note = "Verified release notes." } = {}) {
   const version = tag.replace(/^v/, "").replace(/-.*/, "");
-  const prerelease = tag.includes("-");
+  const prerelease = tag.includes("-") && !latestBeta;
   const releaseName = prerelease ? "Beta 19" : `VortX ${version}`;
   const assets = {
     ios: asset(tag, "iOS", "ipa", "VortX-iOS-ci.ipa", "ios-bytes", 11),
@@ -38,7 +38,6 @@ function makeReceipt({ releaseId = "19", build = BUILD, tag = TAG } = {}) {
     tvosLite: asset(tag, "tvOS-lite", "ipa", "VortX-tvOS-lite-ci.ipa", "lite-bytes", 13),
     mac: asset(tag, "macOS", "dmg", "VortX-macOS-ci.dmg", "mac-bytes", 14),
   };
-  const note = "Verified release notes.";
   const source = {
     name: "VortX",
     identifier: "tv.vortx.altstore",
@@ -233,6 +232,35 @@ test("stable and prerelease receipts require tag-matching prerelease state", asy
     environment(new MemoryKV()),
   );
   assert.equal(prereleaseMismatchResponse.status, 503);
+});
+
+test("authenticated Latest beta accepts strict beta tags with summary notes", async () => {
+  for (const latestBeta of [true, false]) {
+    const receipt = makeReceipt({ latestBeta, tag: "v0.4.0-beta.12", note: "Apple build: verified playback repairs." });
+    const response = await worker.fetch(signedRequest("/__release/receipt", receipt), environment(new MemoryKV()));
+    assert.equal(response.status, 200, await response.text());
+  }
+  for (const tag of ["v0.4.0-rc.1", "v0.4.0-beta.1.extra", "v0.4.0-beta", "v0.4.0-nightly.1"]) {
+    const receipt = makeReceipt({ latestBeta: true, tag });
+    const response = await worker.fetch(signedRequest("/__release/receipt", receipt), environment(new MemoryKV()));
+    assert.equal(response.status, 503, tag);
+  }
+  for (const prerelease of ["false", null, 0]) {
+    const receipt = makeReceipt({ latestBeta: true });
+    receipt.manifest.prerelease = prerelease;
+    const response = await worker.fetch(signedRequest("/__release/receipt", receipt), environment(new MemoryKV()));
+    assert.equal(response.status, 503);
+  }
+});
+
+test("Latest beta channel still rejects changed appcast identity or unsigned receipts", async () => {
+  const receipt = makeReceipt({ latestBeta: true, note: "<!-- vortx-channel: latest-beta -->" });
+  const appcast = JSON.parse(receipt.appcast);
+  appcast.tvos.prerelease = true;
+  receipt.appcast = `${JSON.stringify(appcast, null, 2)}\n`;
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), environment(new MemoryKV()))).status, 503);
+  const unsigned = new Request("https://vortx.tv/__release/receipt", { method: "POST", body: JSON.stringify(makeReceipt({ latestBeta: true, note: "<!-- vortx-channel: latest-beta -->" })) });
+  assert.equal((await worker.fetch(unsigned, environment(new MemoryKV()))).status, 401);
 });
 
 test("promotion migrates a valid legacy active receipt into durable rollback state without weakening CAS", async () => {
