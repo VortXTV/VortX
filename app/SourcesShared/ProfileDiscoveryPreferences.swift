@@ -28,6 +28,8 @@ struct ProfileDiscoveryPreferences: Codable, Equatable {
     var hideDiscoverTab: Bool? = nil
     var hideLibraryTab: Bool? = nil
     var hideSearchTab: Bool? = nil
+    var showCollectionsHome: Bool? = nil
+    var showCollectionsDiscover: Bool? = nil
 }
 
 /// The one persistence bridge for profile-owned catalog and Discover values. Existing UI and
@@ -46,6 +48,8 @@ enum ProfileDiscoveryPreferencesStore {
         static let hideDiscoverTab = TabBarPrefs.hideDiscover
         static let hideLibraryTab = TabBarPrefs.hideLibrary
         static let hideSearchTab = TabBarPrefs.hideSearch
+        static let showCollectionsHome = "vortx.home.showCollectionsHub"
+        static let showCollectionsDiscover = "vortx.discover.showCollectionsHub"
     }
 
     /// The legacy keys are a projection of whichever profile is active on THIS device. They remain
@@ -64,6 +68,8 @@ enum ProfileDiscoveryPreferencesStore {
         Key.hideDiscoverTab,
         Key.hideLibraryTab,
         Key.hideSearchTab,
+        Key.showCollectionsHome,
+        Key.showCollectionsDiscover,
     ]
 
     static func capture(from defaults: UserDefaults = .standard) -> ProfileDiscoveryPreferences {
@@ -81,7 +87,9 @@ enum ProfileDiscoveryPreferencesStore {
             hideLiveTab: defaults.bool(forKey: Key.hideLiveTab),
             hideDiscoverTab: defaults.bool(forKey: Key.hideDiscoverTab),
             hideLibraryTab: defaults.bool(forKey: Key.hideLibraryTab),
-            hideSearchTab: defaults.bool(forKey: Key.hideSearchTab))
+            hideSearchTab: defaults.bool(forKey: Key.hideSearchTab),
+            showCollectionsHome: collectionsVisible(Key.showCollectionsHome, from: defaults),
+            showCollectionsDiscover: collectionsVisible(Key.showCollectionsDiscover, from: defaults))
     }
 
     /// Apply one profile's snapshot to the legacy keys. `resetUnset` is true only for an actual
@@ -121,6 +129,15 @@ enum ProfileDiscoveryPreferencesStore {
             defaults.removeObject(forKey: Key.providerOrder)
         }
         applyTabVisibility(prefs, resetUnset: resetUnset, to: defaults)
+        for (value, key) in [(prefs?.showCollectionsHome, Key.showCollectionsHome),
+                             (prefs?.showCollectionsDiscover, Key.showCollectionsDiscover)] {
+            if let value { defaults.set(value, forKey: key) }
+            else if resetUnset { defaults.set(true, forKey: key) }
+        }
+    }
+
+    static func collectionsVisible(_ key: String, from defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: key) as? Bool ?? true
     }
 
     static func hiddenCatalogs(from defaults: UserDefaults = .standard) -> [String] {

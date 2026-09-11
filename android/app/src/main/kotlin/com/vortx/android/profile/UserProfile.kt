@@ -192,6 +192,8 @@ data class UserProfile(
             p.hideDiscoverTab?.let { put("hideDiscoverTab", it) }
             p.hideLibraryTab?.let { put("hideLibraryTab", it) }
             p.hideSearchTab?.let { put("hideSearchTab", it) }
+            p.showCollectionsHome?.let { put("showCollectionsHome", it) }
+            p.showCollectionsDiscover?.let { put("showCollectionsDiscover", it) }
         }
 
         private fun decodeDiscovery(o: JSONObject): ProfileDiscoveryPreferences = ProfileDiscoveryPreferences(
@@ -209,6 +211,8 @@ data class UserProfile(
             hideDiscoverTab = o.optBooleanOrNull("hideDiscoverTab"),
             hideLibraryTab = o.optBooleanOrNull("hideLibraryTab"),
             hideSearchTab = o.optBooleanOrNull("hideSearchTab"),
+            showCollectionsHome = o.optBooleanOrNull("showCollectionsHome"),
+            showCollectionsDiscover = o.optBooleanOrNull("showCollectionsDiscover"),
         )
     }
 }

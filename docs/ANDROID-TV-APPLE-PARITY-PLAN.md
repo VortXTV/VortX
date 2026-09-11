@@ -8,6 +8,8 @@ Phone and TV now show add-on-declared Prequel, Sequel, and Related rails through
 
 This follow-up is not in Beta 13. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. Still outstanding: custom `anime`/other content-type routing without coercing types to movies, plus full visual and remote-navigation acceptance below.
 
+The Home/Discover Collections visibility switches now belong to each profile on Apple and Android, including roster sync and backup projection handling. Explicit off values survive round trips; an unset legacy profile gets visible defaults on selection without overwriting an active profile during a partial sync. Apple screens use the shared observable catalog owner, and Android refreshes an already-open settings screen and captures edits immediately. Verification: 25 Apple isolation checks, both Android unit suites, and full iOS arm64 simulator/tvOS Release builds pass. This addresses the remaining two global switches in issue #215; it does not claim every profile or cross-device behavior is physically verified.
+
 The Apple TV app is the reference for layout, navigation, information hierarchy, and behavior. Android phone remains a separate touch layout. Reuse Android's existing repositories, player engines, and profile stores; do not port Apple source files or replace current code with an older release.
 
 ## 1. Home and hero

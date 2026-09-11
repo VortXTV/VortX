@@ -9,6 +9,45 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProfileDiscoveryPreferencesCodecTest {
+    @Test fun `collection hub visibility follows profiles without partial-sync resets`() {
+        val values = mutableMapOf<String, Any?>()
+        lateinit var editor: android.content.SharedPreferences.Editor
+        editor = java.lang.reflect.Proxy.newProxyInstance(
+            android.content.SharedPreferences.Editor::class.java.classLoader,
+            arrayOf(android.content.SharedPreferences.Editor::class.java),
+        ) { _, method, args ->
+            when (method.name) {
+                "putString", "putStringSet", "putBoolean" -> { values[args!![0] as String] = args[1]; editor }
+                "remove" -> { values.remove(args!![0]); editor }
+                "apply" -> Unit
+                else -> error("Unexpected editor call ${method.name}")
+            }
+        } as android.content.SharedPreferences.Editor
+        val prefs = java.lang.reflect.Proxy.newProxyInstance(
+            android.content.SharedPreferences::class.java.classLoader,
+            arrayOf(android.content.SharedPreferences::class.java),
+        ) { _, method, args ->
+            when (method.name) {
+                "getString", "getStringSet", "getBoolean" -> values[args!![0]] ?: args[1]
+                "edit" -> editor
+                else -> error("Unexpected preferences call ${method.name}")
+            }
+        } as android.content.SharedPreferences
+        val a = ProfileDiscoveryPreferences(showCollectionsHome = false, showCollectionsDiscover = true)
+        ProfileDiscoveryPreferencesStore.apply(a, true, prefs)
+        val captured = ProfileDiscoveryPreferencesStore.capture(prefs)
+        assertEquals(false, captured.showCollectionsHome)
+        assertEquals(true, captured.showCollectionsDiscover)
+        ProfileDiscoveryPreferencesStore.apply(ProfileDiscoveryPreferences(), false, prefs)
+        assertEquals(captured, ProfileDiscoveryPreferencesStore.capture(prefs))
+        ProfileDiscoveryPreferencesStore.apply(null, true, prefs)
+        val b = ProfileDiscoveryPreferencesStore.capture(prefs)
+        assertEquals(true, b.showCollectionsHome)
+        assertEquals(true, b.showCollectionsDiscover)
+        ProfileDiscoveryPreferencesStore.apply(captured, true, prefs)
+        assertEquals(captured, ProfileDiscoveryPreferencesStore.capture(prefs))
+    }
+
     @Test
     fun `discovery snapshot round trips with Apple's exact field names`() {
         val snapshot = ProfileDiscoveryPreferences(
@@ -26,6 +65,8 @@ class ProfileDiscoveryPreferencesCodecTest {
             hideDiscoverTab = false,
             hideLibraryTab = true,
             hideSearchTab = false,
+            showCollectionsHome = false,
+            showCollectionsDiscover = true,
         )
         val profile = UserProfile(name = "Viewer", avatar = "🍿", discovery = snapshot)
         val encoded = UserProfile.encodeProfile(profile)
@@ -35,6 +76,7 @@ class ProfileDiscoveryPreferencesCodecTest {
             "hiddenCatalogs", "catalogOrder", "hiddenHubCategories", "regionOverrideCaptured",
             "regionOverride", "filtersCaptured", "filtersData", "selectedProviders", "providerOrder",
             "tabVisibilityCaptured", "hideLiveTab", "hideDiscoverTab", "hideLibraryTab", "hideSearchTab",
+            "showCollectionsHome", "showCollectionsDiscover",
         ).forEach { assertTrue("missing $it", discovery.has(it)) }
         assertEquals(snapshot, UserProfile.decodeProfile(encoded).discovery)
     }

@@ -119,8 +119,6 @@ struct iOSSettingsView: View {
     @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
-    @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
-    @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
     // Apple TV Top Shelf mirror of Continue Watching. Settings parity: the SAME flat key the tvOS
     // SettingsView binds ("vortx.topShelf.showContinueWatching", declared on tvOS by
     // TopShelfSnapshotWriter, which the phone targets do not compile). It is surfaced here BECAUSE the
@@ -1716,8 +1714,8 @@ struct iOSSettingsView: View {
             Toggle("Continue Watching on the TV Home screen", isOn: $topShelfCW)
             Text("Puts what you are part-way through on the Apple TV Home screen, above the apps. Applies to VortX on Apple TV.")
                 .font(.caption).foregroundStyle(.secondary)
-            Toggle("Collections on Home", isOn: $showHubHome)
-            Toggle("Collections on Discover", isOn: $showHubDiscover)
+            Toggle("Collections on Home", isOn: $catalogPrefs.showCollectionsHome)
+            Toggle("Collections on Discover", isOn: $catalogPrefs.showCollectionsDiscover)
             Picker("Refresh collections", selection: $hubCadence) {
                 Text("Daily").tag("daily")
                 Text("Twice daily").tag("twiceDaily")

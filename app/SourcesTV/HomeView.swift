@@ -19,7 +19,7 @@ struct HomeView: View {
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton): Discover cards + Streaming-service tiles + Genre tiles
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
-    @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
+    private var showCollectionsHub: Bool { catalogPrefs.showCollectionsHome }
     @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
     @State private var traktContinueWatchingRevision = 0
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer

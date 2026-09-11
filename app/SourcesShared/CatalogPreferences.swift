@@ -259,6 +259,19 @@ final class CatalogPreferences: ObservableObject {
     static let shared = CatalogPreferences()
     @Published private(set) var hidden: Set<String> = CatalogPrefsStore.hidden()
     @Published private(set) var order: [String] = CatalogPrefsStore.order()
+    @Published var showCollectionsHome = ProfileDiscoveryPreferencesStore.collectionsVisible(ProfileDiscoveryPreferencesStore.Key.showCollectionsHome) {
+        didSet { persistCollectionsVisibility(showCollectionsHome, key: ProfileDiscoveryPreferencesStore.Key.showCollectionsHome) }
+    }
+    @Published var showCollectionsDiscover = ProfileDiscoveryPreferencesStore.collectionsVisible(ProfileDiscoveryPreferencesStore.Key.showCollectionsDiscover) {
+        didSet { persistCollectionsVisibility(showCollectionsDiscover, key: ProfileDiscoveryPreferencesStore.Key.showCollectionsDiscover) }
+    }
+
+    private func persistCollectionsVisibility(_ value: Bool, key: String) {
+        // Profile/backup reload already applied the complete projection; do not recapture it as a new edit.
+        guard ProfileDiscoveryPreferencesStore.collectionsVisible(key) != value else { return }
+        UserDefaults.standard.set(value, forKey: key)
+        ProfileStore.shared.captureDiscovery()
+    }
     /// Drives whether catalog cards render as cinematic 16:9 landscape pills (TMDB backdrop) or
     /// legacy portrait posters. Two-way bound by the Appearance toggle; persists on change.
     @Published var landscapeCards: Bool = CatalogPrefsStore.landscapeCards() {
@@ -321,6 +334,10 @@ final class CatalogPreferences: ObservableObject {
     /// Guarded per property so an unchanged value never churns `objectWillChange` (and, for `regionOverride`,
     /// never fires a redundant hub reload). Call on the main thread.
     func reloadFromDefaults() {
+        let homeHub = ProfileDiscoveryPreferencesStore.collectionsVisible(ProfileDiscoveryPreferencesStore.Key.showCollectionsHome)
+        if showCollectionsHome != homeHub { showCollectionsHome = homeHub }
+        let discoverHub = ProfileDiscoveryPreferencesStore.collectionsVisible(ProfileDiscoveryPreferencesStore.Key.showCollectionsDiscover)
+        if showCollectionsDiscover != discoverHub { showCollectionsDiscover = discoverHub }
         let savedHidden = CatalogPrefsStore.hidden()
         let hiddenChanged = hidden != savedHidden
         if hidden != savedHidden { hidden = savedHidden }

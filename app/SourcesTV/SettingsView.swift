@@ -50,8 +50,6 @@ struct SettingsView: View {
     @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
     @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
-    @AppStorage("vortx.home.showCollectionsHub") private var showHubHome = true
-    @AppStorage("vortx.discover.showCollectionsHub") private var showHubDiscover = true
     // Top Shelf mirror of Continue Watching (the tvOS Home screen row). The writer reads this same key,
     // and the change handler below republishes so a toggle takes effect without waiting for a re-seed.
     @AppStorage(TopShelfSnapshotWriter.showKey) private var topShelfCW = TopShelfSnapshotWriter.showDefault
@@ -996,9 +994,9 @@ struct SettingsView: View {
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
             choiceRow(String(localized: "Collections on Home"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { showHubHome ? "1" : "0" }, set: { showHubHome = ($0 == "1") }))
+                      selection: Binding(get: { catalogPrefs.showCollectionsHome ? "1" : "0" }, set: { catalogPrefs.showCollectionsHome = ($0 == "1") }))
             choiceRow(String(localized: "Collections on Discover"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { showHubDiscover ? "1" : "0" }, set: { showHubDiscover = ($0 == "1") }))
+                      selection: Binding(get: { catalogPrefs.showCollectionsDiscover ? "1" : "0" }, set: { catalogPrefs.showCollectionsDiscover = ($0 == "1") }))
             choiceRow(String(localized: "Refresh collections"), [("daily", "Daily"), ("twiceDaily", "Twice"), ("fourTimesDaily", "4x")],
                       selection: $hubCadence)
             // Home rows editor (INS-260722-02): the focusable entry point the remote can actually reach.

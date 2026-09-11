@@ -177,6 +177,40 @@ do {
           "tab snapshot JSON uses the exact cross-platform field names and booleans")
 }
 
+do {
+    let defaults = suite()
+    let home = ProfileDiscoveryPreferencesStore.Key.showCollectionsHome
+    let discover = ProfileDiscoveryPreferencesStore.Key.showCollectionsDiscover
+    let a = ProfileDiscoveryPreferences(showCollectionsHome: false, showCollectionsDiscover: true)
+    ProfileDiscoveryPreferencesStore.apply(a, resetUnset: true, to: defaults)
+    let captured = ProfileDiscoveryPreferencesStore.capture(from: defaults)
+    check(captured.showCollectionsHome == false && captured.showCollectionsDiscover == true,
+          "hub capture preserves explicit false and independent surface choices")
+    ProfileDiscoveryPreferencesStore.apply(ProfileDiscoveryPreferences(), resetUnset: false, to: defaults)
+    check(!ProfileDiscoveryPreferencesStore.collectionsVisible(home, from: defaults),
+          "partial remote hub snapshot cannot erase active profile choice")
+    ProfileDiscoveryPreferencesStore.apply(nil, resetUnset: true, to: defaults)
+    check(ProfileDiscoveryPreferencesStore.collectionsVisible(home, from: defaults) &&
+          ProfileDiscoveryPreferencesStore.collectionsVisible(discover, from: defaults),
+          "legacy profile selection resets both hubs to visible defaults")
+    ProfileDiscoveryPreferencesStore.apply(captured, resetUnset: true, to: defaults)
+    check(ProfileDiscoveryPreferencesStore.capture(from: defaults) == captured,
+          "A to B to A restores independent collection visibility")
+    check([home, discover].allSatisfy { ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains($0) },
+          "hub preferences cannot sync as global active-viewer projections")
+    let encoded = try! JSONEncoder().encode(a)
+    check((try? JSONDecoder().decode(ProfileDiscoveryPreferences.self, from: encoded)) == a,
+          "hub booleans survive the roster codec")
+    let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    for file in ["app/SourcesTV/HomeView.swift", "app/SourcesTV/DiscoverView.swift", "app/SourcesTV/SettingsView.swift",
+                 "app/SourcesiOS/iOSRootView.swift", "app/SourcesiOS/iOSSettingsView.swift"] {
+        let source = (try? String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)) ?? ""
+        check(!source.isEmpty && !source.contains("@AppStorage(\"vortx.home.showCollectionsHub\")") &&
+              !source.contains("@AppStorage(\"vortx.discover.showCollectionsHub\")"),
+              "\(file) observes the profile-aware catalog owner")
+    }
+}
+
 if failures == 0 {
     print("ALL TESTS PASSED")
     exit(0)

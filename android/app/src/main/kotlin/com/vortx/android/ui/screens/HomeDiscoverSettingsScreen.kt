@@ -13,6 +13,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -45,6 +46,22 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     var showFinancials by remember { mutableStateOf(prefs.showFinancials) }
     var spoilerSafe by remember { mutableStateOf(prefs.spoilerSafe) }
     var hidePosterLabels by remember { mutableStateOf(prefs.hidePosterLabels) }
+
+    DisposableEffect(prefs) {
+        val stop = prefs.observeChanges {
+            showCuratedRails = prefs.showCuratedRails
+            showHubHome = prefs.showCollectionsHubHome
+            showHubDiscover = prefs.showCollectionsHubDiscover
+            refreshCadence = prefs.refreshCadence
+            mergeDiscoverSearch = prefs.mergeDiscoverSearch
+            regionPreference = prefs.regionPreference
+            hiddenCategories = prefs.hiddenCategories
+            showFinancials = prefs.showFinancials
+            spoilerSafe = prefs.spoilerSafe
+            hidePosterLabels = prefs.hidePosterLabels
+        }
+        onDispose { stop() }
+    }
 
     Scaffold(
         topBar = {

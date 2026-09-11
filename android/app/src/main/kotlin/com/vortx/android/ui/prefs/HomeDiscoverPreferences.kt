@@ -37,11 +37,26 @@ class HomeDiscoverPreferences(context: Context) {
 
     var showCollectionsHubHome: Boolean
         get() = prefs.getBoolean(KEY_SHOW_HUB_HOME, true)
-        set(value) { prefs.edit().putBoolean(KEY_SHOW_HUB_HOME, value).apply() }
+        set(value) {
+            prefs.edit().putBoolean(KEY_SHOW_HUB_HOME, value).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery()
+        }
 
     var showCollectionsHubDiscover: Boolean
         get() = prefs.getBoolean(KEY_SHOW_HUB_DISCOVER, true)
-        set(value) { prefs.edit().putBoolean(KEY_SHOW_HUB_DISCOVER, value).apply() }
+        set(value) {
+            prefs.edit().putBoolean(KEY_SHOW_HUB_DISCOVER, value).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery()
+        }
+
+    /** Keep a mounted settings screen current across profile switches and backup/account applies. */
+    fun observeChanges(onChange: () -> Unit): () -> Unit {
+        // Android delivers preference callbacks on the main thread, like the Compose effect/disposal.
+        var active = true
+        val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> if (active) onChange() }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        return { active = false; prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
 
     /** "daily" | "twiceDaily" | "fourTimesDaily" (Apple raw values). */
     var refreshCadence: String

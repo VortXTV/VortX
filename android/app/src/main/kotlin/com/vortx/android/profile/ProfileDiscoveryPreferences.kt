@@ -30,6 +30,8 @@ data class ProfileDiscoveryPreferences(
     val hideDiscoverTab: Boolean? = null,
     val hideLibraryTab: Boolean? = null,
     val hideSearchTab: Boolean? = null,
+    val showCollectionsHome: Boolean? = null,
+    val showCollectionsDiscover: Boolean? = null,
 )
 
 /** Bridges a profile's snapshot to the legacy flat keys consumed by Android UI and engine code. */
@@ -37,6 +39,8 @@ internal object ProfileDiscoveryPreferencesStore {
     const val HIDDEN_CATALOGS_KEY = "stremiox.catalog.hidden"
     const val CATALOG_ORDER_KEY = "stremiox.catalog.order"
     const val PROVIDER_ORDER_KEY = COLLECTIONS_PROVIDER_ORDER_KEY
+    const val SHOW_COLLECTIONS_HOME_KEY = "vortx.home.showCollectionsHub"
+    const val SHOW_COLLECTIONS_DISCOVER_KEY = "vortx.discover.showCollectionsHub"
 
     /** These keys project ONLY the active viewer and must never independently ride account settings sync. */
     val activeProjectionKeys: Set<String> = setOf(
@@ -51,6 +55,8 @@ internal object ProfileDiscoveryPreferencesStore {
         TabBarPrefs.HIDE_DISCOVER_KEY,
         TabBarPrefs.HIDE_LIBRARY_KEY,
         TabBarPrefs.HIDE_SEARCH_KEY,
+        SHOW_COLLECTIONS_HOME_KEY,
+        SHOW_COLLECTIONS_DISCOVER_KEY,
     )
 
     fun capture(prefs: SharedPreferences): ProfileDiscoveryPreferences = ProfileDiscoveryPreferences(
@@ -70,6 +76,8 @@ internal object ProfileDiscoveryPreferencesStore {
         hideDiscoverTab = prefs.getBoolean(TabBarPrefs.HIDE_DISCOVER_KEY, false),
         hideLibraryTab = prefs.getBoolean(TabBarPrefs.HIDE_LIBRARY_KEY, false),
         hideSearchTab = prefs.getBoolean(TabBarPrefs.HIDE_SEARCH_KEY, false),
+        showCollectionsHome = prefs.getBoolean(SHOW_COLLECTIONS_HOME_KEY, true),
+        showCollectionsDiscover = prefs.getBoolean(SHOW_COLLECTIONS_DISCOVER_KEY, true),
     )
 
     fun apply(snapshot: ProfileDiscoveryPreferences?, resetUnset: Boolean, prefs: SharedPreferences) {
@@ -90,6 +98,10 @@ internal object ProfileDiscoveryPreferencesStore {
         applyTab(e, TabBarPrefs.HIDE_DISCOVER_KEY, snapshot, snapshot?.hideDiscoverTab, resetUnset)
         applyTab(e, TabBarPrefs.HIDE_LIBRARY_KEY, snapshot, snapshot?.hideLibraryTab, resetUnset)
         applyTab(e, TabBarPrefs.HIDE_SEARCH_KEY, snapshot, snapshot?.hideSearchTab, resetUnset)
+        listOf(SHOW_COLLECTIONS_HOME_KEY to snapshot?.showCollectionsHome,
+            SHOW_COLLECTIONS_DISCOVER_KEY to snapshot?.showCollectionsDiscover).forEach { (key, value) ->
+            if (value != null) e.putBoolean(key, value) else if (resetUnset) e.putBoolean(key, true)
+        }
         e.apply()
     }
 

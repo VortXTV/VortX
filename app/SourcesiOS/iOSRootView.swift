@@ -780,7 +780,8 @@ struct iOSHomeView: View {
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared   // Collections hub (shared singleton)
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
-    @AppStorage("vortx.home.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Home (needs a TMDB key)
+    @ObservedObject private var homeCatalogPrefs = CatalogPreferences.shared
+    private var showCollectionsHub: Bool { homeCatalogPrefs.showCollectionsHome }
     @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
     @State private var traktContinueWatchingRevision = 0
     @State private var path = NavigationPath()
@@ -2570,7 +2571,7 @@ struct iOSDiscoverView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared
-    @AppStorage("vortx.discover.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Discover (needs a TMDB key)
+    private var showCollectionsHub: Bool { catalogPrefs.showCollectionsDiscover }
     /// Merge Discover + Search into one surface (Settings toggle, default OFF, reversible). When ON the root
     /// drops the Search tab and Discover shows an inline search field at the top; an active query (≥2 chars)
     /// swaps the catalog browse for grouped search results. OFF = Discover is unchanged and Search is its own tab.

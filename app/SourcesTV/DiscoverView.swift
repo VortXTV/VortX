@@ -12,7 +12,7 @@ struct DiscoverView: View {
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var collectionsHub = CollectionsHubModel.shared
-    @AppStorage("vortx.discover.showCollectionsHub") private var showCollectionsHub = true   // toggle the hub on Discover (needs a TMDB key)
+    private var showCollectionsHub: Bool { catalogPrefs.showCollectionsDiscover }
     /// Presents the advanced filter panel (genre / year / age rating / duration / seasons / upcoming).
     @State private var showFilters = false
     /// Below this many matching cards, while more pages exist, auto-load the next page so a strict filter
