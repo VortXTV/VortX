@@ -649,6 +649,11 @@ struct iOSDetailView: View {
     /// hides the row. `collectionKey` de-dupes the fetch per imdb id.
     @State private var collection: TMDBClient.CollectionResult?
     @State private var collectionKey: String?
+    /// The current movie's RELEASE-order neighbors inside its TMDB collection (previous/next by
+    /// release date — explicitly NOT narrative order), from the SAME keyed/fenced fetch as
+    /// `collection`. Movies only; nil hides the rail. Each pushed detail page owns its own state,
+    /// so a stale rail cannot cross titles.
+    @State private var collectionNeighbors: (previous: MetaPreview?, next: MetaPreview?)?
     /// Cast & Crew disclosure: the full cast rail shows by default (#10, owner wants who-played-who with
     /// photos visible); the "Cast & Crew" button can still fold it away to declutter, animating
     /// transform/opacity only.
@@ -892,6 +897,8 @@ struct iOSDetailView: View {
                                 .frame(maxWidth: .infinity)
                                 whereToWatchSection
                                 collectionSection
+                                relationsSection
+                                collectionChronologySection
                                 moreLikeThisSection
                             }
                         }
@@ -1331,6 +1338,8 @@ struct iOSDetailView: View {
                     .frame(maxWidth: .infinity)
                     whereToWatchSection
                     collectionSection
+                    relationsSection
+                    collectionChronologySection
                     moreLikeThisSection
                 }
                 .padding(.bottom, Theme.Space.xl)
@@ -2785,10 +2794,13 @@ struct iOSDetailView: View {
         guard effectiveType != "series", let imdb = ratingsImdbID, collectionKey != imdb else { return }
         collectionKey = imdb
         Task {
-            let result = await TMDBClient.movieCollection(imdbID: imdb, type: effectiveType)
+            let result = await TMDBClient.movieCollectionChronology(imdbID: imdb, type: effectiveType)
             await MainActor.run {
                 guard collectionKey == imdb else { return }   // title switched mid-fetch
-                collection = result
+                collection = result?.collection
+                collectionNeighbors = result.map {
+                    MediaRelations.releaseNeighbors($0.datedParts, currentID: "tmdb:\($0.currentTMDBID)", id: \.id)
+                }
             }
         }
     }
@@ -3935,6 +3947,110 @@ struct iOSDetailView: View {
                                               poster: item.poster, progress: 0)
                             }
                             .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                }
+            }
+        }
+    }
+
+    // MARK: Relations (explicit prequel/sequel/related from the meta add-on)
+
+    /// The ids that all mean "this very page", so the relations parser can never list the current
+    /// title as its own prequel/sequel: the request/catalog id, the resolved tt id, and the meta's
+    /// defaultVideoId (the tt id behind a tmdb:/kitsu: catalog entry).
+    private var selfRelationIDs: Set<String> {
+        var ids: Set<String> = [metaRequestID, id]
+        if let imdb = ratingsImdbID { ids.insert(imdb) }
+        if let dv = meta?.behaviorHints?.defaultVideoId { ids.insert(dv) }
+        return ids
+    }
+
+    /// The EXPLICIT relation entries (prequel/sequel/related) the meta add-on attached, parsed
+    /// straight off the FENCED meta — no fetch, no stored state — so a title change can never show
+    /// a previous title's rail: the fence yields nil for the new page until its own meta lands.
+    /// A meta without relation fields yields [] and no rail is rendered (never faked). Series and
+    /// anime run through the same path (anime ids keep their real kitsu:/anilist:/mal: identity).
+    private var mediaRelations: [MediaRelations.Entry] {
+        guard let m = meta, !LiveTypes.contains(type) else { return [] }
+        return MediaRelations.entries(from: m.links, selfIDs: selfRelationIDs)
+    }
+
+    /// The relations rail: each entry a tappable card opening the normal detail page
+    /// (NavigationLink -> iOSDetailView, the SAME lifecycle as More Like This / the collection
+    /// rail), with its declared kind as a small caption. Header says "Prequels & Sequels" only
+    /// when a prequel/sequel is actually declared; otherwise "Related Titles".
+    @ViewBuilder private var relationsSection: some View {
+        let items = mediaRelations
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                iOSRailHeader(eyebrow: "Relations",
+                              title: items.contains { $0.kind != .related } ? "Prequels & Sequels" : "Related Titles")
+                    .padding(.horizontal, Theme.Space.md)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: Theme.Space.sm) {
+                        ForEach(items, id: \.identity) { item in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(item.kind.label)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                NavigationLink {
+                                    iOSDetailView(id: item.id, type: item.type, title: item.name)
+                                } label: {
+                                    PosterCardiOS(id: item.id, type: item.type, name: item.name,
+                                                  poster: item.poster, progress: 0)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                }
+            }
+        }
+    }
+
+    /// The movie "previous / next in the collection" rail, derived from the SAME TMDB collection
+    /// fetch as `collectionSection`. RELEASE ORDER ONLY — labeled that way on the card captions,
+    /// because TMDB collection parts carry release dates, not narrative positions; no story order
+    /// is invented. Movies only (the fetch is already skipped for series); hidden when the movie
+    /// is alone at an edge of its collection or not found in it.
+    @ViewBuilder private var collectionChronologySection: some View {
+        if let neighbors = collectionNeighbors,
+           neighbors.previous != nil || neighbors.next != nil {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                iOSRailHeader(eyebrow: "Collection", title: "Previous & Next (Release Order)")
+                    .padding(.horizontal, Theme.Space.md)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: Theme.Space.sm) {
+                        if let previous = neighbors.previous {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Previous (earlier release)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                NavigationLink {
+                                    iOSDetailView(id: previous.id, type: previous.type, title: previous.name)
+                                } label: {
+                                    PosterCardiOS(id: previous.id, type: previous.type, name: previous.name,
+                                                  poster: previous.poster, progress: 0)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        if let next = neighbors.next {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Next (later release)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                NavigationLink {
+                                    iOSDetailView(id: next.id, type: next.type, title: next.name)
+                                } label: {
+                                    PosterCardiOS(id: next.id, type: next.type, name: next.name,
+                                                  poster: next.poster, progress: 0)
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
                     .padding(.horizontal, Theme.Space.md)

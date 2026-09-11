@@ -52,6 +52,10 @@ struct DetailView: View {
     /// series / any miss, which hides the row. `collectionKey` de-dupes the fetch per imdb id.
     @State private var collection: TMDBClient.CollectionResult?
     @State private var collectionKey: String?
+    /// The current movie's RELEASE-order neighbors inside its TMDB collection (previous/next by
+    /// release date — explicitly NOT narrative order), from the SAME keyed/fenced fetch as
+    /// `collection`. Movies only; nil hides the rail. Reset with the collection on a title change.
+    @State private var collectionNeighbors: (previous: MetaPreview?, next: MetaPreview?)?
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
     @State private var financials: TMDBClient.Financials?
@@ -216,6 +220,7 @@ struct DetailView: View {
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
             castMembers = []; creditsKey = nil  // new title: reset the cast rail before refetching (H16)
             collection = nil; collectionKey = nil   // new title: drop the old franchise rail before refetching
+            collectionNeighbors = nil   // ditto: drop the old release-order neighbors
             if effectiveType != "series" { loadMovieStreamsIfNeeded() }
             loadCredits()
             loadCollection()
@@ -542,15 +547,20 @@ struct DetailView: View {
 
     /// Fetch this movie's franchise/collection (TMDB belongs_to_collection -> parts, release order) from the
     /// keyless edge, keyed per imdb id so meta arriving after the tt-only first load doesn't refetch (works
-    /// with meta=nil for a hub-seeded tt). Movies only. Fail-soft: a standalone film / miss leaves the row hidden.
+    /// with meta=nil for a hub-seeded tt). Movies only. Fail-soft: a standalone film / miss leaves the row
+    /// hidden. ONE fetch now also reports the movie's own TMDB id, so the release-order previous/next
+    /// neighbors are derived from the SAME payload (MediaRelations.releaseNeighbors) — no second request.
     private func loadCollection() {
         guard effectiveType != "series", let imdb = ratingsImdbID, collectionKey != imdb else { return }
         collectionKey = imdb
         Task {
-            let result = await TMDBClient.movieCollection(imdbID: imdb, type: effectiveType)
+            let result = await TMDBClient.movieCollectionChronology(imdbID: imdb, type: effectiveType)
             await MainActor.run {
                 guard collectionKey == imdb else { return }   // title switched mid-fetch
-                collection = result
+                collection = result?.collection
+                collectionNeighbors = result.map {
+                    MediaRelations.releaseNeighbors($0.datedParts, currentID: "tmdb:\($0.currentTMDBID)", id: \.id)
+                }
             }
         }
     }
@@ -697,6 +707,94 @@ struct DetailView: View {
                         ForEach(collection.parts) { item in
                             PosterCard(title: item.name, poster: item.poster,
                                        type: item.type, id: item.id)
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.vertical, Theme.Space.lg)
+                }
+            }
+        }
+    }
+
+    // MARK: Relations (explicit prequel/sequel/related from the meta add-on)
+
+    /// The ids that all mean "this very page", so the relations parser can never list the current
+    /// title as its own prequel/sequel: the request/catalog id, the resolved tt id, and the meta's
+    /// defaultVideoId (the tt id behind a tmdb:/kitsu: catalog entry).
+    private var selfRelationIDs: Set<String> {
+        var ids: Set<String> = [metaRequestID, id]
+        if let imdb = ratingsImdbID { ids.insert(imdb) }
+        if let dv = fencedMeta?.behaviorHints?.defaultVideoId { ids.insert(dv) }
+        return ids
+    }
+
+    /// The EXPLICIT relation entries (prequel/sequel/related) the meta add-on attached, parsed
+    /// straight off the FENCED meta — no fetch, no stored state — so a title change can never show
+    /// a previous title's rail: the fence yields nil for the new page until its own meta lands.
+    /// A meta without relation fields yields [] and no rail is rendered (never faked). Series and
+    /// anime run through the same path (anime ids keep their real kitsu:/anilist:/mal: identity).
+    private var mediaRelations: [MediaRelations.Entry] {
+        guard let m = fencedMeta, !LiveTypes.contains(type) else { return [] }
+        return MediaRelations.entries(from: m.links, selfIDs: selfRelationIDs)
+    }
+
+    /// The relations rail: each entry a focusable, tappable PosterCard (the SAME card + navigation
+    /// lifecycle as More Like This) with its declared kind as a small caption. Header says
+    /// "Prequels & Sequels" only when a prequel/sequel is actually declared; otherwise "Related".
+    @ViewBuilder private var relationsSection: some View {
+        let items = mediaRelations
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                RailHeader(eyebrow: "Relations",
+                           title: items.contains { $0.kind != .related } ? "Prequels & Sequels" : "Related Titles")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                        ForEach(items, id: \.identity) { item in
+                            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                                Text(item.kind.label)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                PosterCard(title: item.name, poster: item.poster,
+                                           type: item.type, id: item.id)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge)
+                    .padding(.vertical, Theme.Space.lg)
+                }
+            }
+        }
+    }
+
+    /// The movie "previous / next in the collection" rail, derived from the SAME TMDB collection
+    /// fetch as `collectionSection`. RELEASE ORDER ONLY — labeled that way on the card captions,
+    /// because TMDB collection parts carry release dates, not narrative positions; no story order
+    /// is invented. Movies only (the fetch is already skipped for series); hidden when the movie
+    /// is alone at an edge of its collection or not found in it.
+    @ViewBuilder private var collectionChronologySection: some View {
+        if let neighbors = collectionNeighbors,
+           neighbors.previous != nil || neighbors.next != nil {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                RailHeader(eyebrow: "Collection", title: "Previous & Next (Release Order)")
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                        if let previous = neighbors.previous {
+                            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                                Text("Previous (earlier release)")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                PosterCard(title: previous.name, poster: previous.poster,
+                                           type: previous.type, id: previous.id)
+                            }
+                        }
+                        if let next = neighbors.next {
+                            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                                Text("Next (later release)")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+                                PosterCard(title: next.name, poster: next.poster,
+                                           type: next.type, id: next.id)
+                            }
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge)
@@ -932,6 +1030,10 @@ struct DetailView: View {
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         collectionSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
+                        relationsSection
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
+                        collectionChronologySection
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         moreLikeThisSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                     }
@@ -1040,6 +1142,10 @@ struct DetailView: View {
                         whereToWatchSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         collectionSection
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
+                        relationsSection
+                            .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
+                        collectionChronologySection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }
                         moreLikeThisSection
                             .onMoveCommand { handleDetailMove($0, from: .lower, using: proxy) }

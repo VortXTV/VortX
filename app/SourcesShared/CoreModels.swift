@@ -814,6 +814,7 @@ struct CoreMetaBehaviorHints: Decodable, Equatable {
     let defaultVideoId: String?
 }
 
+
 /// Pure, engine-free now/next selection over a live channel's scheduled `videos[]`. Mirrors the
 /// reference serializer's now/next rule: NOW is the latest program that has already started
 /// (`released <= reference`), NEXT is the earliest program still to come (`released > reference`).
@@ -837,6 +838,16 @@ struct EPGSchedule {
 struct CoreLink: Decodable, Equatable {
     let name: String
     let category: String
+    let url: String?
+
+    private enum CodingKeys: String, CodingKey { case name, category, url }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Add-on links are untrusted: a malformed row must not erase all otherwise-valid links.
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        category = (try? c.decode(String.self, forKey: .category)) ?? ""
+        url = try? c.decode(String.self, forKey: .url)
+    }
 }
 
 struct CoreVideo: Decodable, Identifiable, Equatable {

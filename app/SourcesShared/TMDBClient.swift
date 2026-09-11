@@ -1113,6 +1113,15 @@ enum TMDBClient {
         let parts: [MetaPreview]
     }
 
+    /// A movie's collection PLUS the TMDB id of the movie itself, so a caller can derive its
+    /// RELEASE-order previous/next neighbors inside the collection (see MediaRelations
+    /// .releaseNeighbors — release chronology ONLY, never narrative order).
+    struct CollectionChronology {
+        let collection: CollectionResult
+        let currentTMDBID: Int
+        let datedParts: [MetaPreview]
+    }
+
     /// The TMDB collection a MOVIE belongs to (the `belongs_to_collection` on /movie/{id}), with every entry
     /// resolved to a card in RELEASE ORDER, from the SAME keyless edge path every other call here uses (no
     /// user key required). Movies only (TMDB tags no franchise on TV). Fail-soft: nil on a series / a
@@ -1122,6 +1131,25 @@ enum TMDBClient {
     /// per-entry external_ids round-trip. Entries with no poster are KEPT (the card shows a placeholder) so a
     /// franchise row lists the WHOLE set rather than silently dropping a poster-less entry.
     static func movieCollection(imdbID: String, type: String) async -> CollectionResult? {
+        await collectionWithPosition(imdbID: imdbID, type: type)?.collection
+    }
+
+    /// The SAME single fetch as `movieCollection`, additionally reporting the current movie's own
+    /// TMDB id (already resolved by the /find step, so no extra request). This powers the movie
+    /// "previous / next in the collection, by release order" navigation: the caller pairs it with
+    /// `MediaRelations.releaseNeighbors` and labels it RELEASE order. Same fail-soft contract.
+    static func movieCollectionChronology(imdbID: String, type: String) async -> CollectionChronology? {
+        guard let found = await collectionWithPosition(imdbID: imdbID, type: type),
+              let currentTMDBID = found.currentTMDBID else { return nil }
+        return CollectionChronology(collection: found.collection, currentTMDBID: currentTMDBID,
+                                    datedParts: found.collection.parts.filter { found.datedIDs.contains($0.id) })
+    }
+
+    /// Shared loader for the two public collection calls: the collection in release order plus
+    /// the matched movie's TMDB id (nil when /find missed, which leaves only the rail).
+    private static func collectionWithPosition(
+        imdbID: String, type: String
+    ) async -> (collection: CollectionResult, currentTMDBID: Int?, datedIDs: Set<String>)? {
         guard type != "series", imdbID.hasPrefix("tt") else { return nil }
         let key = ApiKeys.effectiveTMDBKey()
         guard let found = await get("/find/\(imdbID)?external_source=imdb_id&api_key=\(key)"),
@@ -1151,7 +1179,13 @@ enum TMDBClient {
                                posterShape: "poster", popularity: entry["popularity"] as? Double)
         }
         guard !previews.isEmpty else { return nil }
-        return CollectionResult(id: collectionID, name: name, parts: previews)
+        // TBA entries remain in the full collection, but cannot establish a release-order neighbor.
+        let datedIDs = Set(parts.compactMap { entry -> String? in
+            guard let tid = entry["id"] as? Int, let date = entry["release_date"] as? String,
+                  date.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else { return nil }
+            return "tmdb:\(tid)"
+        })
+        return (CollectionResult(id: collectionID, name: name, parts: previews), tmdbID, datedIDs)
     }
 
     /// The framed "Part of the <X> Collection" header from a TMDB collection name. TMDB names already end in
