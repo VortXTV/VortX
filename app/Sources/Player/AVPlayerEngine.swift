@@ -575,6 +575,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // legible track is deselected to avoid double subtitles.
     private let subtitleRenderer = SubtitleCueRenderer()
     private weak var subtitleOverlay: SubtitleOverlayView?
+    private var nativeSubtitleOverlayBridge: AVNativeSubtitleOverlayBridge?
     private var externalSubActive = false
     /// Supersedes delayed native-legible settlement reads after a newer subtitle intent or item lifecycle.
     private var subtitleSelectionRevision: UInt64 = 0
@@ -3222,6 +3223,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         _ requested: AVMediaSelectionOption?,
         activatingExternalAfterSettlement: Bool
     ) {
+        invalidateNativeSubtitleOverlay()
         subtitleSelectionRevision &+= 1
         let revision = subtitleSelectionRevision
         guard let group = subGroup, let item = player.currentItem else {
@@ -3282,6 +3284,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func setExternalSubtitleActive(_ active: Bool) {
+        if active { invalidateNativeSubtitleOverlay() }
         externalSubActive = active
         guard active else {
             subtitleOverlay?.setText(nil)
@@ -3335,6 +3338,48 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     func attachSubtitleOverlay(_ overlay: SubtitleOverlayView) {
         subtitleOverlay = overlay
         overlay.setText(nil)
+        if let item = player.currentItem { refreshNativeSubtitleOverlay(for: item) }
+    }
+
+    private func invalidateNativeSubtitleOverlay() {
+        let hadNativeOverlay = nativeSubtitleOverlayBridge != nil
+        nativeSubtitleOverlayBridge?.invalidate()
+        nativeSubtitleOverlayBridge = nil
+        // Item replacement increments generation before observer teardown. Its stale callback guard must
+        // reject old text, but teardown still owns clearing any last native cue from the shared view.
+        if hadNativeOverlay, !externalSubActive { subtitleOverlay?.setText(nil) }
+    }
+
+    /// Only take over known text renditions. Bitmap/unknown native formats retain AVFoundation rendering.
+    private func refreshNativeSubtitleOverlay(for item: AVPlayerItem) {
+        guard player.currentItem === item, subtitleOverlay != nil, !externalSubActive,
+              AVNativeSubtitleOverlayBridge.canRenderInline(
+                pipActive: isPictureInPictureActive,
+                pipTransitioning: isPictureInPictureTransitioning,
+                externalPlayback: player.isExternalPlaybackActive),
+              let group = subGroup,
+              let option = item.currentMediaSelection.selectedMediaOption(in: group) else {
+            invalidateNativeSubtitleOverlay()
+            return
+        }
+        let index = Self.selectedIndex(in: group, item: item)
+        let remuxText = index.map { index in
+            remuxSourceSubtitleTracks.contains { $0.renditionIndex == index && $0.delivery == .webVTT }
+        } ?? false
+        guard remuxText || option.mediaSubTypes.contains(where: { $0.uint32Value == kCMSubtitleFormatType_WebVTT }) else {
+            invalidateNativeSubtitleOverlay()
+            return
+        }
+        if nativeSubtitleOverlayBridge?.owns(item: item, option: option) == true { return }
+        invalidateNativeSubtitleOverlay()
+        subtitleOverlay?.applyStyle()
+        let generation = itemGeneration
+        nativeSubtitleOverlayBridge = AVNativeSubtitleOverlayBridge(item: item, option: option) { [weak self, weak item] text in
+            guard let self, let item, self.player.currentItem === item,
+                  self.itemGeneration == generation, !self.externalSubActive else { return }
+            self.subtitleOverlay?.setText(text)
+        }
+        DiagnosticsLog.log("avplayer", "WebVTT overlay attached: app-local subtitle appearance; native suppression waits for text")
     }
 
     /// Load an EXTERNAL srt/vtt subtitle (add-on or community-pooled) and render it ourselves over the
@@ -3419,6 +3464,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     func applySubtitleStyle() {
         subtitleOverlay?.applyStyle()
         applyEmbeddedSubtitleTextStyle()
+        if let item = player.currentItem { refreshNativeSubtitleOverlay(for: item) }
     }
 
     /// Best-effort styling for AVPlayer-native subtitle tracks (P5, #76). AVFoundation exposes only a coarse
@@ -3723,6 +3769,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         isPictureInPicturePossible = pipState.isAvailable
         isPictureInPictureActive = pipState.isActive
         pictureInPictureTransition = pipState.transition
+        // PiP owns the AVPlayerLayer, not our sibling overlay. Restore native captions for the whole
+        // transition; reattach inline styling after stop or failed start using the current item's selection.
+        if let item = player.currentItem { refreshNativeSubtitleOverlay(for: item) }
     }
 
     private func pictureInPictureGeneration(
@@ -3803,6 +3852,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 guard let self, observedItem.isPlaybackLikelyToKeepUp,
                       self.owns(observedItem, loadToken: loadToken) else { return }
                 self.emit(MPVProperty.pausedForCache, false, loadToken: loadToken)
+            }
+        })
+        observations.append(player.observe(\.isExternalPlaybackActive, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in
+                guard let self, self.owns(item, loadToken: loadToken) else { return }
+                self.refreshNativeSubtitleOverlay(for: item)
             }
         })
         observations.append(player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
@@ -4956,6 +5011,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// field report) because nothing in the group had changed.
     private func refreshSelectionTracks(for item: AVPlayerItem) {
         guard player.currentItem === item else { return }
+        refreshNativeSubtitleOverlay(for: item)
         let audioID = remuxSourceAudioTracks.isEmpty
             ? audioGroup.flatMap { Self.selectedIndex(in: $0, item: item) }
             : selectedRemuxAudioSourceIndex
@@ -5023,6 +5079,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func teardownObservers() {
+        invalidateNativeSubtitleOverlay()
         remuxSubtitleInventoryRefreshTask?.cancel()
         remuxSubtitleInventoryRefreshTask = nil
         if let timeObserver { player.removeTimeObserver(timeObserver) }

@@ -199,6 +199,8 @@ final class MPVMetalViewController: PlatformViewController {
     /// One negotiation receipt per file or explicit decoder change. Reset before either operation so a
     /// later fallback is visible without repeating the same line in every 30-second performance receipt.
     private var loggedHardwareDecoderNegotiation = false
+    /// Event-queue owned, bounded for the controller lifetime. Only allowlisted decoder receipts escape.
+    private var decoderFailureReceipts = Set<String>()
     private var configuredLiveMode = false
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
@@ -746,7 +748,12 @@ final class MPVMetalViewController: PlatformViewController {
 #if DEBUG
         checkError(mpv_request_log_messages(mpv, "v"))
 #else
-        checkError(mpv_request_log_messages(mpv, "no"))
+        // FFmpeg's AV_LOG_VERBOSE maps to mpv DEBUG, not "v". Subscribe only to decoder categories when
+        // probing: global verbose logs include HTTP traffic and can flood the playback event queue.
+        checkError(mpv_set_option_string(mpv, "terminal", "no"))
+        checkError(mpv_set_option_string(mpv, "msg-level",
+            VXProbe.enabled ? "all=no,vd=debug,ffmpeg/video=debug" : "all=no"))
+        checkError(mpv_request_log_messages(mpv, "terminal-default"))
 #endif
 #if os(macOS)
         checkError(mpv_set_option_string(mpv, "input-media-keys", "yes"))
@@ -2974,8 +2981,8 @@ final class MPVMetalViewController: PlatformViewController {
         })
     }
 
-    /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Small hops usually stay
-    /// inside the buffered window, so no cache hold is armed for these.
+    /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Apply the same cache-window
+    /// decision as an absolute scrub: a ten-second backward hop can exceed the small back buffer.
     func seek(by seconds: Double) {
         cancelCacheReanchorForExplicitSeek()
         supersedeSeekEOFRecoveryForExplicitSeek()
@@ -2988,6 +2995,13 @@ final class MPVMetalViewController: PlatformViewController {
         let target = max(0, position + seconds)
         let wasPaused = getFlag(MPVProperty.pause)
         let duration = getDouble(MPVProperty.duration)
+        #if os(tvOS)
+        if position.isFinite, seconds.isFinite, target.isFinite, seekTargetOutsideCache(target) {
+            armSeekCacheHold()
+            lastOutOfWindowSeekTarget = target
+            armSeekRefillWatchdog()
+        }
+        #endif
         command("seek", args: [String(format: "%.1f", seconds), "relative"], returnValueCallback: { [weak self] status in
             guard let self, status >= 0, let owner, position.isFinite, seconds.isFinite else { return }
             self.seekEOFRecovery.begin(
@@ -4440,11 +4454,18 @@ final class MPVMetalViewController: PlatformViewController {
                 case MPV_EVENT_LOG_MESSAGE:
                     if let msg = UnsafeMutablePointer<mpv_event_log_message>(OpaquePointer(event!.pointee.data)) {
                         let prefix = String(cString: msg.pointee.prefix)
-                        let level = String(cString: msg.pointee.level)
                         let text = String(cString: msg.pointee.text).trimmingCharacters(in: .newlines)
+                        if self.decoderFailureReceipts.count < 24,
+                           let receipt = MPVDecoderFailureReceipt.code(prefix: prefix, message: text),
+                           self.decoderFailureReceipts.insert(receipt).inserted {
+                            DiagnosticsLog.log("decoder", receipt)
+                        }
                         // mpv's verbose log echoes resolved URLs and request headers (Authorization / Cookie),
                         // so keep the message body private; prefix + level stay public for log filtering.
+                        #if DEBUG
+                        let level = String(cString: msg.pointee.level)
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
+                        #endif
                     }
                 case MPV_EVENT_GET_PROPERTY_REPLY:
                     // wakeVideoOutputThread reads a property purely to hand work to the
