@@ -114,3 +114,32 @@ movement, disabled producer bounds, forced software decoding, or private-engine 
 The separate 4K H.264 first-session failure remains unresolved. A fresh bounded attempt to retrieve the
 same AIOStreams candidate again returned only configuration/password error entries, not the failed media.
 No settings, credentials, add-on order or server configuration were changed to work around that response.
+
+## Episode completion, CW target, and season focus follow-up (build 250)
+
+- Issue #223 exposed a missing general premature-EOF guard: after a first frame, an EOF far before a
+  known duration could enter watched/auto-next handling. Both Apple players now classify it as a
+  same-episode source failure before completion side effects. Recovery uses observed media position,
+  not an optimistic seek target or retained resume floor. Live, trailer, unknown-duration and genuine
+  final-tail behavior remains unchanged. This closes a proven code gap; the reporter supplied no log,
+  so attribution of their particular failure remains unconfirmed.
+- Completion evidence and duplicate-EOF suppression belong to a physical mount. AVPlayer item generation
+  resets them even when a logical token is reused; libmpv already mints a fresh token on every load.
+- Local CW fallback to Details no longer drops its episode ID/resume position on TV and iPhone. An exact
+  zero-offset episode remains a valid target, rather than selecting the first unwatched special. A newer
+  profile-local first-frame stream receipt supersedes that navigation hint after subsequent playback.
+  The hero waits if its exact target is missing from a partial inventory; it does not invent S0E1.
+- iOS hero resume offsets are now checked against the selected episode ID, matching tvOS.
+- First episode Up explicitly reveals/focuses the selected season chip, not the hero. First-row Down
+  still targets the second episode and deeper rows retain native navigation.
+
+Verification: 28 completion-evidence checks, 22 CW-target checks, 43 focus contract checks, 105 existing
+integrity checks, 77 Trakt/session contracts, 27 identity caller/mutation checks, the existing EOF ownership
+suite and both diagnostic-21/relative-seek Node contracts pass. Changed iOS source parses against the iOS
+SDK. Independent Terra/Luna reviews checked recovery ownership and CW/focus wiring; review findings were
+resolved before packaging. Artifact/build provenance is recorded alongside the local IPA after build.
+
+Muse Spark 1.3 Contributor was present in the OpenCode Go model catalog, but the bounded read-only attempt
+returned no model response before timeout. No model-quality conclusion or successful external review is
+claimed. No fresh device diagnostics were pulled while the owner tested the previous IPA. These changes
+do not claim to resolve the separate 4K H.264 decoding/initial-frame defect or prove an on-device soak.

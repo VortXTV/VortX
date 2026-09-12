@@ -371,13 +371,14 @@ struct Issue164TraktContractTests {
                     && !myListsImport.contains("DiagnosticsLog.log(\"trakt-my-lists\", \"\\(list.kind.rawValue) '\\(list.name)'"),
                 "private list reads, publication, persistence, and logs must remain session-bound and private")
 
-        // A failed direct resume keeps the remote card's offset and episode identity through source choice.
-        require(tvHome.contains("resumeSeconds: traktSessionID == nil ? nil : item.resumeSeconds")
-                    && tvHome.contains("videoID: traktSessionID == nil ? nil : item.state.videoId")
+        // A failed direct resume keeps either local or remote CW identity through source choice.
+        require(tvHome.contains("resumeSeconds: item.resumeSeconds")
+                    && tvHome.contains("videoID: item.state.videoId")
+                    && !tvHome.contains("traktSessionID == nil ? nil : item.resumeSeconds")
                     && tvHome.contains("initialResumeSeconds: $0.resumeSeconds")
                     && tvHome.contains("initialTraktSessionID: $0.traktSessionID")
                     && tvSharedUI.contains("else if let onDetails"),
-                "tvOS direct-resume fallback must retain the Trakt resume target")
+                "tvOS direct-resume fallback must retain both local and Trakt resume targets")
         require(tvDetail.contains("var initialResumeSeconds: Double? = nil")
                     && tvDetail.contains("var initialVideoID: String? = nil")
                     && occurrences(of: "var initialTraktSessionID: TraktSessionID? = nil", in: tvDetail) >= 3
@@ -386,11 +387,12 @@ struct Issue164TraktContractTests {
                     && occurrences(of: "initialStartGate.admit(", in: tvDetail) == 4
                     && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: tvDetail) == 4,
                 "tvOS detail/source selection must revalidate the remote session and consume only after launch")
-        require(iosHome.contains("resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil")
-                    && iosHome.contains("videoID: carriesTraktResume ? item.cwVideoId : nil")
+        require(iosHome.contains("resumeSeconds: item.resumeSeconds")
+                    && iosHome.contains("videoID: item.cwVideoId")
+                    && !iosHome.contains("carriesTraktResume ?")
                     && iosHome.contains("initialResumeSeconds: target.resumeSeconds")
                     && iosHome.contains("initialTraktSessionID: target.traktSessionID"),
-                "iOS direct-resume fallback must retain the Trakt resume target")
+                "iOS direct-resume fallback must retain both local and Trakt resume targets")
         let iosContinueWatchingProvenance = segment(
             in: iosHome,
             from: "private struct iOSCWProducerProvenance: Sendable",
@@ -464,7 +466,8 @@ struct Issue164TraktContractTests {
                     && iosCapturedFallback.contains(
                         "guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID)"
                     )
-                    && iosCapturedFallback.contains("let carriesTraktResume = provenance.source == .trakt")
+                    && iosCapturedFallback.contains("resumeSeconds: item.resumeSeconds")
+                    && iosCapturedFallback.contains("videoID: item.cwVideoId")
                     && iosCapturedFallback.contains("traktSessionID: provenance.traktSessionID")
                     && !iosCapturedFallback.contains("continueWatchingSelection"),
                 "iOS A-to-B account changes during direct-resume await must fail closed before fallback")

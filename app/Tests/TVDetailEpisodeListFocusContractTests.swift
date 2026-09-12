@@ -33,8 +33,10 @@ private struct TVDetailEpisodeListFocusContractTests {
                    "episode row \(index) keeps native Up navigation")
         }
 
-        expect(TVDetailEpisodeListFocusPolicy.destination(for: .up, fromEpisodeIndex: 0, episodeCount: 12) == .hero,
-               "first episode forwards Up to the detail hero")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .up, fromEpisodeIndex: 0, episodeCount: 12) == .seasonPicker,
+               "first episode forwards Up to the selected season")
+        expect(TVDetailEpisodeListFocusPolicy.destination(for: .up, fromEpisodeIndex: 0, episodeCount: 1) == .seasonPicker,
+               "one-episode seasons still return Up to the season picker")
         expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: 0, episodeCount: 12) == .episode(1),
                "first episode explicitly focuses the second episode on Down")
         expect(TVDetailEpisodeListFocusPolicy.destination(for: .down, fromEpisodeIndex: 0, episodeCount: 1) == .native,
@@ -77,8 +79,14 @@ private struct TVDetailEpisodeListFocusContractTests {
                "first-row directional routing is decided by the production policy")
         expect(detailView.contains("focusedEpisode = episodes[targetIndex].id"),
                "first-row Down targets the second row through its stable CoreVideo id")
-        expect(detailView.contains("onEpisodeMove: {\n                                                 focusDetailRegion(.top, using: proxy)\n                                             }"),
-               "series detail maps the first-episode hero escape directly to its visible top focus anchor")
+        expect(detailView.contains("proxy.scrollTo(CoreSeasonedEpisodes.seasonPickerAnchor, anchor: .center)"),
+               "first-episode Up scrolls the season picker into the parent viewport")
+        expect(detailView.contains(".focused($focusedSeason, equals: s)")
+                    && detailView.contains("chips.scrollTo(selectedSeason, anchor: .center)")
+                    && detailView.contains("focusedSeason = selectedSeason"),
+               "selected season chip is horizontally revealed before focus is seated")
+        expect(!detailView.contains("onEpisodeMove:"),
+               "episode boundary no longer has the old hero escape callback")
         expect(!detailView.contains("onEpisodeMove: { direction in\n                                                 handleDetailMove(direction, from: .lower, using: proxy)\n                                             }"),
                "adversarial regression: the hero escape cannot be reclassified as lower content and land on Library")
         expect(!detailView.contains(".id(\"detailContent\")\n                            .onMoveCommand"),

@@ -1,10 +1,10 @@
 import SwiftUI
 
-/// The series episode-list Up boundary. A list can escape to the detail hero only from its first row;
+/// The series episode-list Up boundary. Only its first row hands focus to the selected season;
 /// every deeper row belongs to tvOS's native previous-row navigation.
 enum TVDetailEpisodeListFocusPolicy {
     enum Destination: Equatable {
-        case hero
+        case seasonPicker
         case episode(Int)
         case native
     }
@@ -21,7 +21,7 @@ enum TVDetailEpisodeListFocusPolicy {
         guard rowOwnsUpEscape(at: index) else { return .native }
         switch direction {
         case .up:
-            return .hero
+            return .seasonPicker
         case .down where episodeCount > 1:
             return .episode(1)
         default:

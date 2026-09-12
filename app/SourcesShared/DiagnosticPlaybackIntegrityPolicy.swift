@@ -1,5 +1,53 @@
 import Foundation
 
+/// A decoder EOF is not necessarily content completion: a truncated HTTP/torrent response can end cleanly
+/// after one frame. Only load-owned media telemetry is evidence here, never UI scrub/resume targets or CW
+/// persistence floors. Keep unknown-duration/live/trailer semantics unchanged and tolerate a small final tail.
+struct PlaybackCompletionEvidence<Token: Equatable> {
+    enum Decision: Equatable {
+        case allowCompletion
+        case ignore
+        case premature(position: Double, duration: Double)
+    }
+
+    private(set) var owner: Token?
+    private var mountGeneration: UInt64 = 0
+    private var position: Double?
+    private var duration: Double?
+    private var rejectedEOF = false
+
+    // AVPlayer can replace its physical item while retaining a logical load token. Evidence and the
+    // duplicate-EOF latch must never survive that replacement. mpv mints a fresh token on every reload.
+    mutating func begin(owner: Token, mountGeneration: UInt64) {
+        guard self.owner != owner || self.mountGeneration != mountGeneration else { return }
+        self.owner = owner
+        self.mountGeneration = mountGeneration
+        position = nil
+        duration = nil
+        rejectedEOF = false
+    }
+
+    mutating func recordPosition(_ seconds: Double, owner: Token) {
+        guard self.owner == owner, seconds.isFinite, seconds >= 0 else { return }
+        position = seconds
+    }
+
+    mutating func recordDuration(_ seconds: Double, owner: Token) {
+        // mpv can clear duration while retiring a file. That must not erase its last valid duration.
+        guard self.owner == owner, seconds.isFinite, seconds > 0 else { return }
+        duration = seconds
+    }
+
+    mutating func consumeEOF(owner: Token, isLive: Bool, isTrailer: Bool) -> Decision {
+        guard self.owner == owner, !rejectedEOF else { return .ignore }
+        guard !isLive, !isTrailer, let position, let duration else { return .allowCompletion }
+        let tailTolerance = min(30, max(2, duration * 0.01))
+        guard position < duration - tailTolerance else { return .allowCompletion }
+        rejectedEOF = true
+        return .premature(position: position, duration: duration)
+    }
+}
+
 /// A monotonic clock whose value stops only for an explicit viewer pause. Engine startup can report
 /// `pause=true` before the viewer ever presses Pause; that observation must not disable failure deadlines.
 struct PlaybackActiveTimeClock {

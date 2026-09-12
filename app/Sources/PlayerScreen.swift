@@ -461,6 +461,7 @@ struct PlayerScreen: View {
         nonmutating set { timePosClock.position = newValue }
     }
     @State private var duration = 0.0
+    @State private var completionEvidence = PlaybackCompletionEvidence<PlayerLoadToken>()
     @State private var bufferedTime = 0.0   // buffered-ahead edge (seconds) for the YouTube-style grey scrubber band
     @State private var lastReported = -1.0     // last whole-second progress pushed to stremio-core
     @State private var isPaused = false
@@ -1887,11 +1888,20 @@ struct PlayerScreen: View {
 
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
         if let loadToken, loadToken == coordinator.player?.activeLoadToken {
+            // AV callbacks are generation-fenced by the engine; mpv uses a fresh token per mount.
+            completionEvidence.begin(owner: loadToken,
+                                     mountGeneration: (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0)
             beginAssetSanityAttemptIfNeeded(
                 loadToken: loadToken,
                 requestedResumeOrigin: avSurfaceResumeOrigin
                     ?? (hasStartedPlaying ? currentTime : resumeSeconds)
             )
+            if name == MPVProperty.duration, let seconds = data as? Double {
+                completionEvidence.recordDuration(seconds, owner: loadToken)
+            } else if name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
+                      event.loadToken == loadToken {
+                completionEvidence.recordPosition(event.seconds, owner: loadToken)
+            }
         }
         if pendingAdvance == nil, supersededAdvance == nil,
            let loadToken, loadToken == coordinator.player?.activeLoadToken {
@@ -2408,6 +2418,7 @@ struct PlayerScreen: View {
                 srcProbe("endFileError IGNORED (live stream owns its own reconnect) reason=\((data as? String) ?? "-")")
             }
         case MPVProperty.endFileEof:
+            if let loadToken, rejectPrematureEOFIfNeeded(loadToken: loadToken) { return }
             let completionOnly: Bool
             switch terminalAction(for: loadToken, kind: .eof) {
             case .handleCommitted:
@@ -3298,23 +3309,45 @@ struct PlayerScreen: View {
         recoverCurrentNativeDebridLink(reason: "resume")
     }
 
-    /// MID-PLAY libmpv FAILURE (diag-21). This case used to only log "IGNORED": `handleLoadFailure` is gated on
-    /// `!hasStartedPlaying`, and so are the start watchdog and the recovery deadline, so the only owner left was
-    /// the stall watchdog - several frozen ticks before it reloaded, and it reloaded the same URL verbatim. A
-    /// background-resume death, an expired debrid link mid-episode and a server that moved port all land here,
-    /// and all of them have a real recovery behind `handleLoadFailure` (auto-retry -> same-source re-resolve ->
-    /// failover hop -> fresh-sources wait). Preserve where the viewer was, clear the started flag so the ladder
-    /// can admit, and hand it over.
-    ///
-    /// BOUNDED PER MOUNT by `midPlayRecoveryCount`, because `handleLoadFailure`'s own budgets cannot bound this
-    /// lane: a retry that reaches even one frame clears `autoRetryCount` AND `recoveryDeadline` at first frame,
-    /// so a source that frames for a tick and re-dies replenishes everything it just spent and loops at roughly
-    /// a reload a second, forever. Past the cap the SOURCE is the problem rather than the load, so hop instead -
-    /// bounded in turn by `sourceHops`, and ending on the error overlay.
-    ///
-    /// Live streams never reach here: their reconnect lane is owned by `scheduleReconnect` off the EOF path,
-    /// and widening this into it is not the fix. Mirrors TVPlayerView.handleMidPlayFailure.
-    private func handleMidPlayFailure(_ failureMessage: String, loadToken: PlayerLoadToken?) {
+    /// A known early EOF is a source failure, not permission to mark watched or advance. Live/trailer and
+    /// unknown-duration semantics are left intact. Mirrors TVPlayerView's ownership-fenced path.
+    private func rejectPrematureEOFIfNeeded(loadToken: PlayerLoadToken) -> Bool {
+        guard loadToken == coordinator.player?.activeLoadToken else { return true }
+        switch completionEvidence.consumeEOF(owner: loadToken, isLive: effectivelyLive, isTrailer: isTrailer) {
+        case .allowCompletion:
+            return false
+        case .ignore:
+            return true
+        case let .premature(position, duration):
+            DiagnosticsLog.log("player", "premature EOF rejected position=\(position) duration=\(duration); retaining episode")
+            switch terminalAction(for: loadToken, kind: .error) {
+            case .handleCommitted:
+                if hasStartedPlaying {
+                    handleMidPlayFailure("Source ended before the episode finished", loadToken: loadToken,
+                        resumeOverride: position)
+                } else {
+                    handleLoadFailure("Source ended before playback started")
+                }
+            case .handlePending:
+                pendingAdvance?.terminal = true
+                uncommittedIdentityBlocked = true
+                loadTimeout?.cancel()
+                handleLoadFailure("Source ended before the episode started")
+            case .markSupersededTerminal:
+                supersededAdvance?.pending.terminal = true
+                uncommittedIdentityBlocked = true
+            case .ignoreOutgoingError, .ignoreStale, .persistOutgoingCompletionOnly:
+                break
+            }
+            return true
+        }
+    }
+
+    /// Preserve the actual play head, reopen the existing bounded recovery ladder, and spend its separate
+    /// mid-play budget. First-frame success resets the startup budget, so that alone cannot bound repeated
+    /// frame-then-die failures. Exhaustion hops sources for the same episode, then ends on the error overlay.
+    private func handleMidPlayFailure(_ failureMessage: String, loadToken: PlayerLoadToken?,
+                                      resumeOverride: Double? = nil) {
         // Once per load, and FAIL-CLOSED on a missing token: with no token this cannot tell a second error on
         // the same mount from a first one on a fresh mount, and doing nothing is exactly the pre-wave-1
         // behavior for a mid-play error, so the unprovable case costs no regression.
@@ -3324,7 +3357,7 @@ struct PlayerScreen: View {
         // Park the play head BEFORE clearing the started flag: every lane below (`retryResumeTarget`,
         // `hopToNextSource`) reads the load's ORIGIN once `hasStartedPlaying` is false, which would restart
         // the episode from the beginning. See `midPlayFailureResume`.
-        let resume = max(currentTime, suppressedResumeFloor ?? 0)
+        let resume = resumeOverride ?? max(currentTime, suppressedResumeFloor ?? 0)
         midPlayRecoveryCount += 1
         midPlayFailureResume = resume
         hasStartedPlaying = false

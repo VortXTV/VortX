@@ -1481,11 +1481,10 @@ struct iOSHomeView: View {
         provenance: iOSCWProducerProvenance
     ) -> iOSCWDetailTarget? {
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return nil }
-        let carriesTraktResume = provenance.source == .trakt
         return iOSCWDetailTarget(
             item: FeaturedHeroItem.from(rail: item),
-            resumeSeconds: carriesTraktResume ? item.resumeSeconds : nil,
-            videoID: carriesTraktResume ? item.cwVideoId : nil,
+            resumeSeconds: item.resumeSeconds,
+            videoID: item.cwVideoId,
             traktSessionID: provenance.traktSessionID
         )
     }

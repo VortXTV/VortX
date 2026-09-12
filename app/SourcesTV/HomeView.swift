@@ -620,8 +620,8 @@ struct CoreContinueWatchingRow: View {
                                        detailTarget = CWDetailTarget(
                                            id: item.id,
                                            type: item.type,
-                                           resumeSeconds: traktSessionID == nil ? nil : item.resumeSeconds,
-                                           videoID: traktSessionID == nil ? nil : item.state.videoId,
+                                            resumeSeconds: item.resumeSeconds,
+                                            videoID: item.state.videoId,
                                            traktSessionID: traktSessionID
                                        )
                                    })

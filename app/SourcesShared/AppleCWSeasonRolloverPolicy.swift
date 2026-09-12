@@ -1,5 +1,34 @@
 import Foundation
 
+/// A CW navigation hint selects an exact episode, not the first unwatched item in the whole series.
+/// A newer, first-frame-confirmed local playback replaces that hint. Finishing it advances forward;
+/// unwatched specials before it cannot pull the user back to season zero.
+enum DetailEpisodeTargetPolicy {
+    struct Target: Equatable {
+        let videoID: String
+        let isResume: Bool
+    }
+
+    static func newerPlaybackID(videoID: String?, savedAt: Date?, openedAt: Date) -> String? {
+        guard let videoID, !videoID.isEmpty, let savedAt, savedAt > openedAt else { return nil }
+        return videoID
+    }
+
+    static func preferred(orderedIDs: [String], initialVideoID: String?, initialResumeSeconds: Double?,
+                          newerPlaybackID: String?, localWatched: Set<String>, watched: Set<String>) -> Target? {
+        if let newerPlaybackID, let index = orderedIDs.firstIndex(of: newerPlaybackID) {
+            if !localWatched.contains(newerPlaybackID) {
+                return Target(videoID: newerPlaybackID, isResume: true)
+            }
+            let next = orderedIDs.dropFirst(index + 1).first { !watched.contains($0) }
+            return Target(videoID: next ?? newerPlaybackID, isResume: false)
+        }
+        guard let initialVideoID, orderedIDs.contains(initialVideoID) else { return nil }
+        let seconds = initialResumeSeconds ?? 0
+        return Target(videoID: initialVideoID, isResume: seconds.isFinite && seconds > 0)
+    }
+}
+
 /// A coordinate-bearing episode identity used by the Apple terminal successor policy. The policy never
 /// treats an id-only or partially decoded metadata row as proof of a complete series inventory.
 struct AppleCWSeriesEpisode: Equatable, Hashable {

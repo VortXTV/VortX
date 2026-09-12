@@ -30,6 +30,7 @@ struct DetailView: View {
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    @State private var resumeHintOpenedAt = Date()
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var profiles: ProfileStore
@@ -114,13 +115,21 @@ struct DetailView: View {
     /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
     /// every use because the detail page can remain mounted across sign-out or an account replacement.
     private var validInitialResumeSeconds: Double? {
+        guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialResumeSeconds
     }
 
     private var validInitialVideoID: String? {
+        guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialVideoID
+    }
+
+    private var newerPlaybackVideoID: String? {
+        let entry = LastStreamStore.entry(for: fencedMeta?.id ?? metaRequestID, profileID: profiles.activeID)
+        return DetailEpisodeTargetPolicy.newerPlaybackID(
+            videoID: entry?.videoId, savedAt: entry?.savedAt, openedAt: resumeHintOpenedAt)
     }
 
     var body: some View {
@@ -1020,8 +1029,8 @@ struct DetailView: View {
                                              orderedEpisodes: ordered,
                                              watched: watched,
                                              initialSeason: resumeSeasonHint(ordered: ordered, metaID: meta.id) ?? primary?.video.season,
-                                             onEpisodeMove: {
-                                                 focusDetailRegion(.top, using: proxy)
+                                             onSeasonPickerFocus: {
+                                                 proxy.scrollTo(CoreSeasonedEpisodes.seasonPickerAnchor, anchor: .center)
                                              })
                             .id("detailContent")
                         castSection
@@ -1697,8 +1706,8 @@ struct DetailView: View {
     /// `ordered` is the caller's already-sorted (season, episode, id) list, so the page sorts once instead of
     /// twice more inside this one helper.
     private func resumeSeasonHint(ordered: [CoreVideo], metaID: String) -> Int? {
-        if let validInitialVideoID,
-           let season = ordered.first(where: { $0.id == validInitialVideoID })?.season {
+        if let preferredID = newerPlaybackVideoID ?? validInitialVideoID,
+           let season = ordered.first(where: { $0.id == preferredID })?.season {
             return season
         }
         let videoId: String? = profiles.activeUsesEngineHistory
@@ -1714,12 +1723,15 @@ struct DetailView: View {
     /// the account that owns the data (see the resume comment below). Twin of iOSDetailView's version.
     private func seriesPrimaryEpisode(ordered: [CoreVideo], watched: Set<String>,
                                       localWatched: Set<String>, metaID: String) -> (video: CoreVideo, isResume: Bool)? {
-        if let validInitialVideoID,
-           let validInitialResumeSeconds,
-           validInitialResumeSeconds > 0,
-           let video = ordered.first(where: { $0.id == validInitialVideoID }) {
-            return (video, true)
+        if let preferred = DetailEpisodeTargetPolicy.preferred(
+            orderedIDs: ordered.map(\.id), initialVideoID: validInitialVideoID,
+            initialResumeSeconds: validInitialResumeSeconds, newerPlaybackID: newerPlaybackVideoID,
+            localWatched: localWatched, watched: watched),
+           let video = ordered.first(where: { $0.id == preferred.videoID }) {
+            return (video, preferred.isResume)
         }
+        // A partial inventory cannot authorize a different episode while the exact CW target is absent.
+        if newerPlaybackVideoID != nil || validInitialVideoID != nil { return nil }
         // Resume position: the engine's library entry is account level, so overlay
         // profiles resolve theirs from the profile overlay instead (the same
         // invariant as the ticks and the progress stripes).
@@ -1797,6 +1809,7 @@ struct DetailView: View {
 /// Series episodes grouped by season: a season selector, then the chosen season's episodes with
 /// thumbnails. Selecting an episode loads that episode's streams from the engine.
 struct CoreSeasonedEpisodes: View {
+    static let seasonPickerAnchor = "detailSeasonPicker"
     let meta: CoreMetaItem
     let videos: [CoreVideo]
     /// EVERY video ordered (season, episode, id), sorted ONCE by the parent page and handed down. Each row's
@@ -1807,9 +1820,9 @@ struct CoreSeasonedEpisodes: View {
     var orderedEpisodes: [CoreVideo] = []
     var watched: Set<String> = []
     var initialSeason: Int?
-    /// Optional bridge to the mounting detail page's hero focus graph. It is invoked only for the first
-    /// episode row's Up boundary; all deeper episode rows keep native tvOS list navigation.
-    var onEpisodeMove: (() -> Void)?
+    /// Scroll the season picker into the parent viewport before this view seats focus on its selected chip.
+    /// Only the first episode row requests this; deeper rows keep native previous-row navigation.
+    var onSeasonPickerFocus: (() -> Void)?
     @AppStorage("vortx.spoilerBlur") private var spoilerBlur = true   // observed so a Settings toggle redraws; effective value via SpoilerBlurSetting (user wins over the RemoteConfig fleet default)
     // Spoiler-safe mode (SourcePreferences.spoilerSafeKey): veil an UNWATCHED episode's art + synopsis until it
     // is revealed. On tvOS the reveal is FOCUS: the focused row (focusedEpisode == v.id) un-blurs + shows its
@@ -1826,6 +1839,8 @@ struct CoreSeasonedEpisodes: View {
     @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
     @State private var seasonClampPending = false   // the next season change is the programmatic validity clamp, not a real pick, so it must not lock the hint
     @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
+    @FocusState private var focusedSeason: Int?
+    @State private var seasonFocusRequest = 0
     /// A programmatic focus request that must SCROLL before it can land. The episode list is a `LazyVStack`,
     /// so a row far down the season does not exist until it is scrolled near; assigning `focusedEpisode`
     /// straight to it would silently do nothing. Setting this instead scrolls the row into existence first
@@ -1875,11 +1890,14 @@ struct CoreSeasonedEpisodes: View {
             // only home of the bulk watched menu (long press), so hiding them left
             // single-season shows with no season or series level mark-watched at all.
             if !seasons.isEmpty {
+                ScrollViewReader { chips in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: Theme.Space.sm) {
                         ForEach(seasons, id: \.self) { s in
                             Button { season = s } label: { Text(seasonLabel(s)) }
                                 .buttonStyle(ChipButtonStyle(selected: season == s))
+                                .focused($focusedSeason, equals: s)
+                                .id(s)
                                 .contextMenu {
                                     Button { core.markSeasonWatched(s, true, expected: detailTarget) } label: {
                                         Label("Mark \(seasonLabel(s)) Watched", systemImage: "checkmark.circle")
@@ -1910,6 +1928,16 @@ struct CoreSeasonedEpisodes: View {
                         }
                     }
                     .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.xs)
+                }
+                .id(Self.seasonPickerAnchor)
+                .onChange(of: seasonFocusRequest) {
+                    let selectedSeason = season
+                    guard seasons.contains(selectedSeason) else { return }
+                    chips.scrollTo(selectedSeason, anchor: .center)
+                    DispatchQueue.main.async {
+                        focusedSeason = selectedSeason
+                    }
+                }
                 }
             }
 
@@ -2061,18 +2089,19 @@ struct CoreSeasonedEpisodes: View {
     }
 
     /// The only row-level handler belongs to row zero. Its two owned directions have explicit destinations:
-    /// Up returns to the detail hero, while Down seats focus on row one by its stable CoreVideo id. This does
+    /// Up returns to the selected season chip, while Down seats focus on row one by its stable CoreVideo id. This does
     /// not rely on `onMoveCommand` propagation semantics for the first downward list movement.
     private func episodeMoveHandler() -> ((MoveCommandDirection) -> Void)? {
-        guard let onEpisodeMove else { return nil }
         return { direction in
             switch TVDetailEpisodeListFocusPolicy.destination(
                 for: direction,
                 fromEpisodeIndex: 0,
                 episodeCount: episodes.count
             ) {
-            case .hero:
-                onEpisodeMove()
+            case .seasonPicker:
+                guard !seasons.isEmpty else { return }
+                onSeasonPickerFocus?()
+                seasonFocusRequest &+= 1
             case .episode(let targetIndex):
                 guard episodes.indices.contains(targetIndex) else { return }
                 focusedEpisode = episodes[targetIndex].id

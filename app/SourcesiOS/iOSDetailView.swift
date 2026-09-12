@@ -362,6 +362,7 @@ struct iOSDetailView: View {
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    @State private var resumeHintOpenedAt = Date()
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
@@ -392,13 +393,21 @@ struct iOSDetailView: View {
     /// A remote Continue Watching offer remains readable only while its exact Trakt credential session is
     /// current. Detail views can stay mounted across sign-out, so this check belongs at every use site.
     private var validInitialResumeSeconds: Double? {
+        guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialResumeSeconds
     }
 
     private var validInitialVideoID: String? {
+        guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialVideoID
+    }
+
+    private var newerPlaybackVideoID: String? {
+        let entry = LastStreamStore.entry(for: meta?.id ?? metaRequestID, profileID: profiles.activeID)
+        return DetailEpisodeTargetPolicy.newerPlaybackID(
+            videoID: entry?.videoId, savedAt: entry?.savedAt, openedAt: resumeHintOpenedAt)
     }
 
     /// The pin context for this title - a movie pin or a show pin, both keyed by the meta id. The
@@ -2048,7 +2057,7 @@ struct iOSDetailView: View {
             if $0.video.id == validInitialVideoID, let validInitialResumeSeconds {
                 return validInitialResumeSeconds
             }
-            return $0.isResume ? primaryEpisodeResumeSeconds : nil
+            return $0.isResume ? primaryEpisodeResumeSeconds($0.video) : nil
         }
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             // Full-width primary episode CTA on its own line (matches the movie Play button), with the
@@ -2107,8 +2116,8 @@ struct iOSDetailView: View {
     /// you were last in even after that episode is marked watched. nil when there is no resume position. Mirrors
     /// the tvOS DetailView helper; seriesPrimaryEpisode still drives the Resume/Play button unchanged.
     private func resumeSeasonHint(_ videos: [CoreVideo]) -> Int? {
-        if let validInitialVideoID,
-           let season = sortedEpisodes(videos).first(where: { $0.id == validInitialVideoID })?.season {
+        if let preferredID = newerPlaybackVideoID ?? validInitialVideoID,
+           let season = sortedEpisodes(videos).first(where: { $0.id == preferredID })?.season {
             return season
         }
         guard let m = meta else { return nil }
@@ -2122,12 +2131,15 @@ struct iOSDetailView: View {
     private func seriesPrimaryEpisode(_ videos: [CoreVideo]) -> (video: CoreVideo, isResume: Bool)? {
         guard let m = meta else { return nil }
         let sorted = sortedEpisodes(videos)
-        if let validInitialVideoID,
-           let validInitialResumeSeconds,
-           validInitialResumeSeconds > 0,
-           let video = sorted.first(where: { $0.id == validInitialVideoID }) {
-            return (video, true)
+        if let preferred = DetailEpisodeTargetPolicy.preferred(
+            orderedIDs: sorted.map(\.id), initialVideoID: validInitialVideoID,
+            initialResumeSeconds: validInitialResumeSeconds, newerPlaybackID: newerPlaybackVideoID,
+            localWatched: localWatchedSet, watched: watchedSet),
+           let video = sorted.first(where: { $0.id == preferred.videoID }) {
+            return (video, preferred.isResume)
         }
+        // Wait for the requested identity instead of inventing S0E1 from a partial metadata response.
+        if newerPlaybackVideoID != nil || validInitialVideoID != nil { return nil }
         let watched = watchedSet
         // Engine-history profiles read the engine library entry; overlay profiles their own entry,
         // exactly as resume / progress resolve everywhere else.
@@ -2173,7 +2185,7 @@ struct iOSDetailView: View {
     /// The saved resume position (seconds) for the series' primary episode, respecting the per-profile
     /// invariant: engine-history profiles read the engine library item's `timeOffset`; overlay profiles
     /// read their own entry. Read-only. Nil when the parked episode isn't the primary or there is none.
-    private var primaryEpisodeResumeSeconds: Double? {
+    private func primaryEpisodeResumeSeconds(_ video: CoreVideo) -> Double? {
         guard let m = meta else { return nil }
         let saved: (videoId: String?, timeOffsetMs: Double) = {
             guard profiles.activeUsesEngineHistory else {
@@ -2183,7 +2195,7 @@ struct iOSDetailView: View {
             let state = core.metaDetails?.libraryItem?.state
             return (state?.videoId, state?.timeOffset ?? 0)
         }()
-        guard saved.timeOffsetMs > 0 else { return nil }
+        guard saved.timeOffsetMs > 0, saved.videoId == video.id else { return nil }
         return saved.timeOffsetMs / 1000
     }
 
