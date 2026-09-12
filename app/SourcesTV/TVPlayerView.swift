@@ -4306,6 +4306,8 @@ struct TVPlayerView: View {
         // in Dolby Vision and quality, so a manual switch to a non-DV source must clear DV mode and vice versa.
         let nextHint = StreamRanking.signature(stream)
         let nextHeaders = stream.requestHeaders
+        // The explicit viewer clock is authoritative: an old failed engine's pause flag is not user intent.
+        let viewerWasPaused = playbackDeadlineClock.isPaused
         let issuedToken = loadIntoPlayer(
             newURL, headers: nextHeaders, live: nextIsLive, contentHint: nextHint,
             resumeOrigin: resume
@@ -4330,6 +4332,12 @@ struct TVPlayerView: View {
             pendingAdvance?.issued = true
         } else if issuedToken == nil {
             return false
+        }
+        if let issuedToken {
+            queueIncomingTransportIntent(paused: viewerWasPaused)
+            bindIncomingTransportIntent(to: issuedToken)
+            // Suppress autoplay before first frame as well; the token-bound intent handles later ready echoes.
+            if viewerWasPaused { coordinator.player?.pause() }
         }
         if debridRef == nil { prepareTorrent(stream) }
         resetRuntimeForIssuedSourceSwitch(

@@ -52,6 +52,34 @@ private func containsInOrder(_ source: String?, _ needles: [String]) -> Bool {
 @MainActor @main
 enum RemuxItemEndPolicyTests {
     static func main() {
+        var tailBudget = VortXPublishedTailRecoveryBudget()
+        tailBudget.claim()
+        check("tail retry: immediately repeated failure cannot retry again", tailBudget.used)
+        for _ in 0..<40 { _ = tailBudget.observe(position: 844, eligible: true) }
+        check("tail retry: frozen callbacks do not rearm", tailBudget.used)
+        for value in 0..<30 { _ = tailBudget.observe(position: 844 + Double(value) / 4, eligible: false) }
+        check("tail retry: paused or unrestored time cannot rearm", tailBudget.used)
+        _ = tailBudget.observe(position: 1000, eligible: true)
+        _ = tailBudget.observe(position: 2000, eligible: true)
+        check("tail retry: seek discontinuity cannot rearm", tailBudget.used)
+        for value in 1...24 { _ = tailBudget.observe(position: 2000 + Double(value) / 4, eligible: true) }
+        check("tail retry: six seconds of restored forward playback permits a separate pause cycle", !tailBudget.used)
+        tailBudget.claim()
+        _ = tailBudget.observe(position: .nan, eligible: true)
+        check("tail retry: second cycle consumes budget and invalid time cannot rearm", tailBudget.used)
+        for value in 0...24 { _ = tailBudget.observe(position: 844 + Double(value) / 4, eligible: true) }
+        check("tail retry: second independently recovered cycle rearms", !tailBudget.used)
+        check("finalized producer: middle of title resumes, not EOF",
+              VortXRemuxItemEndPolicy.canResumeFinalizedWindow(position: 844, servedStart: 800, producedEdge: 2880)
+                && !VortXRemuxItemEndPolicy.isAtFinalizedEdge(position: 844, producedEdge: 2880))
+        check("finalized producer: actual end is EOF",
+              !VortXRemuxItemEndPolicy.canResumeFinalizedWindow(position: 2880, servedStart: 800, producedEdge: 2880)
+                && VortXRemuxItemEndPolicy.isAtFinalizedEdge(position: 2880, producedEdge: 2880))
+        check("finalized producer: evicted, missing, invalid windows never resume or fabricate EOF",
+              !VortXRemuxItemEndPolicy.canResumeFinalizedWindow(position: 700, servedStart: 800, producedEdge: 2880)
+                && !VortXRemuxItemEndPolicy.canResumeFinalizedWindow(position: 844, servedStart: nil, producedEdge: 2880)
+                && !VortXRemuxItemEndPolicy.isAtFinalizedEdge(position: .nan, producedEdge: 2880)
+                && !VortXRemuxItemEndPolicy.isAtFinalizedEdge(position: 0, producedEdge: 0))
         var deferred = VortXPlaybackEndNotificationPolicy.DeferredTerminal()
         deferred.reset(generation: 7)
         var deferredEOFLatch = VortXPlaybackTerminalLatch(generation: 7)
@@ -541,7 +569,8 @@ enum RemuxItemEndPolicyTests {
             "wiring: paused healthy status tail keeps an exact token-generation-mount event receipt",
             containsInOrder(statusFailure, [
                 "case .recoverablePublishedTail:",
-                "guard deferredEventOwnedRecovery == nil,",
+                "eventReceiptStillOwnsCurrentItem(deferred.receipt, item: item) { return }",
+                "deferredEventOwnedRecovery = nil",
                 "let receipt = makeEventOwnedRecoveryReceipt(for: item, loadToken: loadToken)",
                 "deferredEventOwnedRecovery = DeferredEventOwnedRecovery(",
             ])
@@ -551,6 +580,27 @@ enum RemuxItemEndPolicyTests {
                     "deferred.receipt.generation == itemGeneration",
                     "deferred.receipt.mountIdentity == playbackMountIdentity",
                 ]))
+
+        let failedEnd = sourceSection(engine, from: "@objc private func failedToEnd", to: "private func emit(")
+        check("wiring: paused failed-to-end coalesces healthy recovery before any terminal capture",
+              containsInOrder(failedEnd, ["if !playbackRequested", "switch currentRemuxItemEndDecision()",
+                "case .recoverablePublishedTail:",
+                "eventReceiptStillOwnsCurrentItem(deferred.receipt, item: failedItem) { return }",
+                "makeEventOwnedRecoveryReceipt(for: failedItem, loadToken: loadToken)",
+                "deferredEventOwnedRecovery = DeferredEventOwnedRecovery(", "return",
+                "case .remuxFailure(let reason):", "deferredTerminal.capture(.error(reason)",
+                "case .contentEOF:", "deferredTerminal.capture(.error(message)"]))
+        check("wiring: explicit Play and observation finalization share consumer-position validation",
+              containsInOrder(engine, ["func play() {", "case .contentEOF:", "resumeFinalizedEvent("])
+                && containsInOrder(engine, ["private func scheduleEventOwnedRecovery", "if current.failed",
+                    "deliverTerminal(", "if current.ended", "resumeFinalizedEvent("])
+                && containsInOrder(engine, ["private func resumeFinalizedEvent", "eventReceiptStillOwnsCurrentItem",
+                    "canResumeFinalizedWindow", "retryFreshItemOnHealthyMount", "isAtFinalizedEdge",
+                    "deliverTerminal(.eof"]))
+        check("wiring: tail budget rearm requires frame, playing intent, restored position and no seek",
+              containsInOrder(engine, ["publishedTailRecoveryBudget.observe(", "videoFrameEverProduced",
+                  "playbackRequested", "timeControlStatus == .playing", "pendingPlaybackIntent == nil",
+                  "!self.seekEndBoundary.isPending"]))
 
         let coreMediaRecovery = sourceSection(
             engine,

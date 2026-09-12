@@ -260,6 +260,17 @@ enum VortXRemuxItemEndPolicy {
     static let prematureEndReason = "Remux playback reached the published tail before the producer ended"
     static let producerFailedReason = "Remux producer reported a terminal failure"
 
+    /// Producer EOF is not consumer EOF. A paused, failed live item may still have finalized media ahead.
+    /// Only a position inside the retained window can use that same completed playlist for recovery.
+    static func canResumeFinalizedWindow(position: Double, servedStart: Double?, producedEdge: Double) -> Bool {
+        guard let servedStart, position.isFinite, servedStart.isFinite, producedEdge.isFinite else { return false }
+        return position >= servedStart && position >= 0 && producedEdge - position > 1
+    }
+
+    static func isAtFinalizedEdge(position: Double, producedEdge: Double) -> Bool {
+        position.isFinite && producedEdge.isFinite && producedEdge > 0 && position >= producedEdge - 1
+    }
+
     static func producerEnded(indexedHLS: Bool,
                               indexedEnd: Bool,
                               streamFinished: Bool,
@@ -275,6 +286,42 @@ enum VortXRemuxItemEndPolicy {
         if let concrete, !concrete.isEmpty { return .remuxFailure(concrete) }
         guard !producerEnded else { return .contentEOF }
         return .recoverablePublishedTail
+    }
+}
+
+/// A fresh item gets one published-tail retry until it proves sustained playback. Readiness, repeated
+/// notifications, paused ticks, and seek jumps are not recovery proof. Six seconds of small advancing
+/// media-clock samples after a usable frame lets a later, separate pause cycle recover again.
+struct VortXPublishedTailRecoveryBudget: Equatable, Sendable {
+    private(set) var used = false
+    private var lastPosition: Double?
+    private var advancingSeconds: Double = 0
+
+    mutating func claim() {
+        used = true
+        lastPosition = nil
+        advancingSeconds = 0
+    }
+
+    mutating func observe(position: Double, eligible: Bool) -> Bool {
+        guard used else { return false }
+        guard eligible, position.isFinite, position >= 0 else {
+            lastPosition = nil
+            advancingSeconds = 0
+            return false
+        }
+        defer { lastPosition = position }
+        guard let previous = lastPosition else { return false }
+        let delta = position - previous
+        guard delta > 0, delta <= 1 else {
+            advancingSeconds = 0
+            return false
+        }
+        advancingSeconds += delta
+        guard advancingSeconds >= 6 else { return false }
+        used = false
+        advancingSeconds = 0
+        return true
     }
 }
 

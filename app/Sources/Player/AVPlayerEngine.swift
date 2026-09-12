@@ -326,9 +326,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var hdrFallbackRetried = false
     /// True only while the current item is the explicit HDR-only recovery item.
     private var usingHDRFallbackItem = false
-    /// One fresh primary item on the same healthy producer is allowed for a premature published-tail receipt.
-    /// The producer is not restarted and a second receipt without producer completion fails honestly.
-    private var publishedTailItemRecoveryRetried = false
+    /// A fresh item must prove sustained playback before a separate published-tail failure can retry again.
+    private var publishedTailRecoveryBudget = VortXPublishedTailRecoveryBudget()
     /// One identity for each source/remux mount. HDR recovery advances the item generation while deliberately
     /// keeping this identity; a source-audio remount or hosted-to-local recovery advances both.
     private var playbackMountIdentity: UInt64 = 0
@@ -1148,7 +1147,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         isReady = false; didStart = false; pendingSeek = nil; fatalErrorEmitted = false
         if !sameLogicalRequest { playbackRequested = true }
         hdrFallbackRetried = false; usingHDRFallbackItem = false
-        publishedTailItemRecoveryRetried = false
+        publishedTailRecoveryBudget = VortXPublishedTailRecoveryBudget()
         if !isIntentRemount {
             pendingPlaybackIntent = nil
             remuxSeekRemountTarget = nil
@@ -1969,14 +1968,28 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
 
     /// AVPlayer can report item-end at the current edge of a still-growing HLS playlist. Replace only the item,
     /// never the healthy producer, and carry the same DV/HDR route, source playhead and media selections. One
-    /// replacement is allowed per mount so an actually stuck playlist cannot loop forever.
+    /// replacement is allowed until sustained playback proves recovery, so a stuck playlist cannot loop.
     private func retryFreshItemOnHealthyMount(reason: String,
-                                               claimsPublishedTailRetry: Bool) -> Bool {
-        guard (!claimsPublishedTailRetry || !publishedTailItemRecoveryRetried),
+                                               claimsPublishedTailRetry: Bool,
+                                               finalizedReceipt: EventOwnedRecoveryReceipt? = nil) -> Bool {
+        // A completed producer can still have unplayed media. Only the exact deferred consumer receipt
+        // and a retained, nonterminal playhead may admit this exception to the growing-mount requirement.
+        let canResumeFinalized: Bool
+        if let finalizedReceipt, let currentItem = item,
+           eventReceiptStillOwnsCurrentItem(finalizedReceipt, item: currentItem),
+           remuxHLSServer != nil {
+            let bounds = mountedPlayerWindowBounds
+            canResumeFinalized = VortXRemuxItemEndPolicy.canResumeFinalizedWindow(
+                position: currentItem.currentTime().seconds,
+                servedStart: bounds.servedStart, producedEdge: bounds.producedEdge)
+        } else {
+            canResumeFinalized = false
+        }
+        guard (!claimsPublishedTailRetry || !publishedTailRecoveryBudget.used),
               remuxHLSServer?.isMountHealthy == true || remuxRemoteMount?.isMountHealthy == true,
               let progress = remuxMountProgress,
               progress.initPublished,
-              !progress.ended,
+              !progress.ended || canResumeFinalized,
               !progress.failed,
               let currentItem = item,
               player.currentItem === currentItem,
@@ -1984,7 +1997,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
               let loadToken = activeLoadToken else { return false }
 
         pendingPlaybackIntent = beginPlaybackRemountIntent(from: currentItem)
-        if claimsPublishedTailRetry { publishedTailItemRecoveryRetried = true }
+        if claimsPublishedTailRetry { publishedTailRecoveryBudget.claim() }
         DiagnosticsLog.log(
             "avplayer",
             "healthy remux \(reason) -> same-mount item replacement "
@@ -2076,8 +2089,35 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             && seekRequestGeneration == receipt.seekRequestID
             && !fatalErrorEmitted
             && !terminalLatch.hasEmitted
-            && remuxHLSServer?.isMountHealthy == true
             && localRemuxPlaylistURL == (eventItem.asset as? AVURLAsset)?.url
+    }
+
+    /// Producer completion does not finish the viewer's episode. An exact deferred consumer receipt may
+    /// resume retained media on the same finalized playlist; only an actual tail position authorizes EOF.
+    private func resumeFinalizedEvent(
+        receipt: EventOwnedRecoveryReceipt,
+        eventItem: AVPlayerItem,
+        terminal: VortXPlaybackEndNotificationPolicy.Terminal,
+        claimsPublishedTailRetry: Bool
+    ) {
+        guard playbackRequested, eventReceiptStillOwnsCurrentItem(receipt, item: eventItem) else { return }
+        let bounds = mountedPlayerWindowBounds
+        let position = eventItem.currentTime().seconds
+        if VortXRemuxItemEndPolicy.canResumeFinalizedWindow(
+            position: position, servedStart: bounds.servedStart, producedEdge: bounds.producedEdge) {
+            if retryFreshItemOnHealthyMount(
+                reason: "paused consumer resumed finalized playlist",
+                claimsPublishedTailRetry: claimsPublishedTailRetry, finalizedReceipt: receipt) {
+                emit(MPVProperty.pause, false)
+                return
+            }
+        } else if VortXRemuxItemEndPolicy.isAtFinalizedEdge(
+            position: position, producedEdge: bounds.producedEdge) {
+            deliverTerminal(.eof, loadToken: receipt.loadToken, generation: receipt.generation)
+            return
+        }
+        // An evicted/unreadable position or failed recovery is an error, never proof to skip the episode.
+        deliverTerminal(terminal, loadToken: receipt.loadToken, generation: receipt.generation)
     }
 
     /// Wait through more than one segment-publication cadence. A new segment admits a same-mount item
@@ -2110,15 +2150,25 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 guard let eventItem,
                       self.eventReceiptStillOwnsCurrentItem(receipt, item: eventItem),
                       let current = self.remuxMountProgress,
-                      current.initPublished,
-                      !current.ended,
-                      !current.failed else { return }
+                      current.initPublished else { return }
                 guard self.playbackRequested else {
                     self.deferredEventOwnedRecovery = DeferredEventOwnedRecovery(
                         receipt: receipt,
                         terminal: terminal,
                         reason: reason,
                         claimsPublishedTailRetry: claimsPublishedTailRetry)
+                    return
+                }
+                if current.failed {
+                    self.deliverTerminal(.error(self.remuxHLSServer?.terminalFailureReason
+                        ?? VortXRemuxItemEndPolicy.producerFailedReason),
+                        loadToken: receipt.loadToken, generation: receipt.generation)
+                    return
+                }
+                if current.ended {
+                    self.eventOwnedRecoveryTask = nil
+                    self.resumeFinalizedEvent(receipt: receipt, eventItem: eventItem,
+                        terminal: terminal, claimsPublishedTailRetry: claimsPublishedTailRetry)
                     return
                 }
                 let bounds = self.mountedPlayerWindowBounds
@@ -2333,14 +2383,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             logTransport("play -> delivered deferred terminal")
             return
         }
+        if let deferred = deferredEventOwnedRecovery, let currentItem = item,
+           !eventReceiptStillOwnsCurrentItem(deferred.receipt, item: currentItem) {
+            deferredEventOwnedRecovery = nil
+        }
         if let deferred = deferredEventOwnedRecovery,
            let currentItem = item,
            let loadToken = activeLoadToken {
             deferredEventOwnedRecovery = nil
             switch currentRemuxItemEndDecision() {
             case .contentEOF:
-                deliverTerminal(.eof, loadToken: loadToken, generation: itemGeneration)
-                logTransport("play -> deferred event became clean EOF")
+                resumeFinalizedEvent(receipt: deferred.receipt, eventItem: currentItem,
+                    terminal: deferred.terminal, claimsPublishedTailRetry: deferred.claimsPublishedTailRetry)
             case .remuxFailure(let reason):
                 deliverTerminal(.error(reason), loadToken: loadToken, generation: itemGeneration)
                 logTransport("play -> deferred event became producer failure")
@@ -3966,6 +4020,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 // behind the same PerformanceMode-scaled interval the libmpv path uses (0.5s reduced, else
                 // 0.25s), so a constrained device is not doing an unconditional lock + O(ranges) loop 4x/sec.
                 self.pinPreferredPeakBitRateAfterFirstFrame(item, atClock: time.seconds)
+                if self.publishedTailRecoveryBudget.observe(
+                    position: time.seconds,
+                    eligible: self.videoFrameEverProduced && self.playbackRequested
+                        && self.player.timeControlStatus == .playing
+                        && self.pendingPlaybackIntent == nil && !self.seekEndBoundary.isPending) {
+                    DiagnosticsLog.log("avplayer", "published-tail retry rearmed after sustained restored playback")
+                }
                 // Diag-6 coupling retry (branch review finding 2): the first frame can beat the server's
                 // bitrate sample, so keep the bounded retry schedule ticking here until it lands or gives
                 // up. The call is a no-op once finished, and the generation check inside discards stale
@@ -4286,8 +4347,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if !playbackRequested {
                 switch currentRemuxItemEndDecision() {
                 case .recoverablePublishedTail:
-                    guard deferredEventOwnedRecovery == nil,
-                          let receipt = makeEventOwnedRecoveryReceipt(for: item, loadToken: loadToken) else {
+                    // KVO and failed-to-end may both report the same paused item. A second callback must
+                    // not install a terminal error that play() would consume ahead of this healthy recovery.
+                    if let deferred = deferredEventOwnedRecovery,
+                       eventReceiptStillOwnsCurrentItem(deferred.receipt, item: item) { return }
+                    deferredEventOwnedRecovery = nil
+                    guard let receipt = makeEventOwnedRecoveryReceipt(for: item, loadToken: loadToken) else {
                         let reason = ns?.localizedDescription ?? "item failed"
                         guard deferredTerminal.capture(.error(reason), generation: itemGeneration) else { return }
                         DiagnosticsLog.log("avplayer", "deferred uncorroborated status failure while paused generation=\(itemGeneration)")
@@ -4702,6 +4767,27 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
         let message = err?.localizedDescription ?? "Playback failed"
         if !playbackRequested {
+            switch currentRemuxItemEndDecision() {
+            case .recoverablePublishedTail:
+                if let deferred = deferredEventOwnedRecovery,
+                   eventReceiptStillOwnsCurrentItem(deferred.receipt, item: failedItem) { return }
+                deferredEventOwnedRecovery = nil
+                if let receipt = makeEventOwnedRecoveryReceipt(for: failedItem, loadToken: loadToken) {
+                    deferredEventOwnedRecovery = DeferredEventOwnedRecovery(
+                        receipt: receipt, terminal: .error(message),
+                        reason: "paused failed-to-end on healthy published tail",
+                        claimsPublishedTailRetry: true)
+                    let ns = err as NSError?
+                    let underlying = ns?.userInfo[NSUnderlyingErrorKey] as? NSError
+                    DiagnosticsLog.log("avplayer", "deferred event-owned failed-to-end recovery while paused generation=\(itemGeneration) code=\(ns?.code ?? 0) underlying=\(underlying?.code ?? 0) segments=\(receipt.progress.segmentCount) ended=\(receipt.progress.ended)")
+                    return
+                }
+            case .remuxFailure(let reason):
+                guard deferredTerminal.capture(.error(reason), generation: itemGeneration) else { return }
+                return
+            case .contentEOF:
+                break
+            }
             guard deferredTerminal.capture(.error(message), generation: itemGeneration) else { return }
             DiagnosticsLog.log(
                 "avplayer",

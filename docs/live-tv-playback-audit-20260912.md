@@ -65,3 +65,52 @@ no longer the saved source, and a bounded refetch did not return an unambiguous 
 No on-TV soak or visual subtitle verification is claimed for this new binary. Remote device access works,
 but this Mac has no valid signing identity/provisioning profile, so the unsigned IPA must be signed and
 sideloaded before the next test. Administrator authentication is not Apple application signing authority.
+
+## Overnight follow-up — local build 249
+
+### Paused DV failure: device-backed cause
+
+The device system archive records AVFoundation `-11866` with underlying CoreMedia `-12888` at
+02:46:42.050, followed by the app's paused failed-to-end receipt at 02:46:42.129. Apple identifies
+`-12888` as a playlist-unchanged condition in its
+[HLS performance session](https://devstreaming-cdn.apple.com/videos/wwdc/2018/502plwzfxg5p7w4na/502/502_measuring_and_optimizing_hls_performance.pdf).
+The local producer had parked at 90.504 seconds lead; after the deliberate 02:46:04 pause, the app
+served the same non-ended media playlist every six seconds through 02:46:42.
+
+The bounded producer and AVFoundation's growing-playlist freshness requirement conflict during a long
+pause. The app then compounded that expiry: `failedToEnd` unconditionally queued a terminal error,
+unlike its status-failure handler. On Play that terminal superseded healthy same-mount recovery.
+This is not evidence that TorBox was down, nor proof that all reported active-play stalls share this cause.
+
+### Corrected paths
+
+- A failed-to-end event while paused now classifies actual producer health and retains exact same-mount
+  recovery evidence. It never reloads or starts playback while held paused.
+- Duplicate KVO and failed-to-end callbacks coalesce instead of overriding recovery with a terminal error.
+- Published-tail retries rearm only after six seconds of small monotonic clock advances, a usable frame,
+  actual/requested playing transport and completed position restoration. Immediate repeated failures,
+  paused ticks, missing frames and seek jumps cannot create an unbounded replacement loop.
+- A producer finishing during paused recovery no longer means the viewer finished the episode. A position
+  inside the retained finalized window resumes using the same playlist and existing selection/DV/position
+  restoration; actual final-edge positions remain EOF, invalid/evicted positions remain errors.
+- Producer completion or failure during the bounded recovery observation is handled explicitly instead
+  of silently abandoning the observation and leaving the item stuck.
+- Normal TV source switches preserve explicit viewer pause intent only after load admission, bind it to
+  the accepted token, and suppress pre-ready autoplay. A failed retiring engine's pause flag is not treated
+  as viewer intent.
+
+The server still publishes only real media and true ENDLIST. No fake segments, fabricated sequence
+movement, disabled producer bounds, forced software decoding, or private-engine rebuild is included.
+
+### Verification
+
+- 75 remux terminal/pause/finalized-window/retry-budget checks pass with strict Swift concurrency and
+  warnings-as-errors, including source wiring checks. These are policy/contract tests, not a device soak.
+- Relative seek, source-switch transport and diagnostic-21 binge regressions pass.
+- Native subtitle bridge, decoder-receipt privacy tests and Apple remux recovery policy tests pass.
+- Independent Terra review of the complete production diff found no blocker.
+- Build/artifact provenance is recorded beside the local IPA after the final tvOS build completes.
+
+The separate 4K H.264 first-session failure remains unresolved. A fresh bounded attempt to retrieve the
+same AIOStreams candidate again returned only configuration/password error entries, not the failed media.
+No settings, credentials, add-on order or server configuration were changed to work around that response.
