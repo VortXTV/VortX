@@ -143,3 +143,47 @@ Muse Spark 1.3 Contributor was present in the OpenCode Go model catalog, but the
 returned no model response before timeout. No model-quality conclusion or successful external review is
 claimed. No fresh device diagnostics were pulled while the owner tested the previous IPA. These changes
 do not claim to resolve the separate 4K H.264 decoding/initial-frame defect or prove an on-device soak.
+
+## Fresh next-episode opening — Beta 15 / build 251
+
+The subsequent build-249 device receipt contains S3E2 → S3E3 admission at 11:15:53.669, FILE_LOADED at
+11:15:56.562, and first accepted position 4.046 at 11:15:57.145 with resume zero and auto-skip off.
+VideoToolbox was active; the existing SDR display mode was retained. No application seek preceded it.
+The app immediately committed that offset as the incoming episode. This is the concrete acceptance
+defect corrected here, not evidence that a user requested a four-second start.
+
+A bounded, credential-private retrieval found the matching 221,637,419-byte source. Its initial video
+and audio timestamps are zero, with video keyframes at 0, 2.002, 4.004, 6.006, and 8.008 seconds. Only
+the first 4 MiB was retained for local tests. The tested exact bundled GPL libmpv reports
+`v0.41.0-dev-g8c67647b5-dirty`, FFmpeg `n8.1.2`, and uses libplacebo ABI 371. The retained published vendor
+archive checksum matches the workflow pin. The build recipe's FFmpeg-9 comments do not establish the
+version inside that archive. An earlier test binary accidentally linked non-GPL mpv 0.41 and was rejected;
+its result is not used as verification.
+
+The matching file starts at zero on the Mac with that exact runtime, direct VideoToolbox,
+GPU-next/MoltenVK and AVFoundation audio, including same-handle replacement and the matching remote
+source. Consequently the TV-specific native loss of the opening frames is not reproduced or claimed
+root-caused. The separate 4K H.264 first-session failure remains an investigation item.
+
+Implemented a one-shot fresh-origin check for an explicitly configured zero-offset VOD replacement.
+It checks raw positions before UI throttling. A first positive position beyond one second issues one
+warm `seek 0 absolute+exact`; high ticks cannot commit the episode, update CW, or publish progress while
+the correction is pending. A seek event followed by a near-zero position proves the correction landed.
+It does not restart the file, change the decoder, flush caches, or change Pause/Play. Nonzero resumes,
+live, previews/trailers and unconfigured initial mounts are excluded. Manual/resume seeks supersede
+the check. Refused loads retain the prior state and unconsumed configuration; accepted loads own a
+fresh token. A rejected seek, eight-second deadline, or EOF before recovery becomes one source error,
+not successful completion or repeated rewind. Normal playback never re-arms the check.
+
+Controlled native tests deliberately requested start=4.046 to exercise this recovery, not to pretend
+the TV defect was reproduced: the exact seek returned position zero in 0.390 seconds playing and
+0.326 seconds paused, preserving `pause=no` and `pause=yes` respectively. Policy and source-wiring
+checks cover ownership, stale events, ordinary starts, explicit seeks, paused zero receipts, live and
+resume exclusions, failure/EOF handling, supersession, and one-shot command admission. Physical-TV
+verification remains necessary to confirm the observed opening now appears reliably on that device.
+
+Final gates: 59 fresh-origin policy/wiring checks, 105 existing integrity checks, 28 completion-evidence
+checks, both diagnostic-21/relative-seek Node contracts, 61 release-feed tests and the release-orchestration
+contracts pass. The final generic tvOS Release build succeeds after the review correction. Independent
+Terra review found no remaining blocker; a separate Luna release audit verified scope, filenames and
+Latest-beta markers. No native dependency or private-engine pin changed in this patch.

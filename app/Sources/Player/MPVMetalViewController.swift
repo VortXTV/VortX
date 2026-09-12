@@ -135,6 +135,11 @@ final class MPVMetalViewController: PlatformViewController {
     private let loadTokenLock = NSLock()
     private var loadProvenance = PlayerLoadProvenanceState()
     private var initializationFailure = MPVInitializationFailureState<PlayerLoadToken>()
+    // Protected by loadTokenLock: load admission, raw event reads, and explicit UI seeks all
+    // participate. An origin is one-shot configuration for the next load, never inherited.
+    private var requestedFreshOrigin: Double?
+    private var requestedFreshOriginGeneration: UInt64 = 0
+    private var freshOrigin = FreshPlaybackOriginPolicy<PlayerLoadToken>()
     /// One destructive cache flight per controller; all mutations occur on the main queue.
     private var cacheFlushFlight = CacheFlushSingleFlight<PlayerLoadToken>()
     /// The source inputs needed for the one bounded same-source retry after a proven false EOF. Kept per
@@ -1223,6 +1228,9 @@ final class MPVMetalViewController: PlatformViewController {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.invalidate()
         initializationFailure.invalidateLoad()
+        freshOrigin.supersede()
+        requestedFreshOrigin = nil
+        requestedFreshOriginGeneration &+= 1
     }
 
     private func callbackLoadToken(requiresLoadedFile: Bool = false) -> PlayerLoadToken? {
@@ -1357,6 +1365,12 @@ final class MPVMetalViewController: PlatformViewController {
     /// its UA into the next stream.
     private lazy var defaultUserAgent = getString("user-agent") ?? ""
 
+    func configureResumeOrigin(seconds: Double) {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        requestedFreshOrigin = seconds
+        requestedFreshOriginGeneration &+= 1
+    }
+
     @discardableResult
     func loadFile(
         _ url: URL,
@@ -1381,6 +1395,10 @@ final class MPVMetalViewController: PlatformViewController {
         // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
         // including internal reloads, so a queued callback can never become valid again through token reuse.
         let issuedToken = PlayerLoadToken()
+        loadTokenLock.lock()
+        let requestedOrigin = requestedFreshOrigin
+        let requestedOriginGeneration = requestedFreshOriginGeneration
+        loadTokenLock.unlock()
         // Keep the prior request's provenance until `loadfile replace` succeeds. The synchronous command can
         // reject before changing mpv's playlist; eagerly invalidating here would erase the still-playing
         // request and make a caller-restored pending episode impossible to commit. START_FILE is blocked by
@@ -1672,6 +1690,16 @@ final class MPVMetalViewController: PlatformViewController {
             entryID: entryID,
             token: issuedToken
         )
+        if commandResult >= 0 {
+            // Refused replacements do not consume configuration. A concurrent newer configure call
+            // belongs to a later load and must not be cleared by this command's admission.
+            if requestedFreshOriginGeneration == requestedOriginGeneration {
+                requestedFreshOrigin = nil
+            }
+            freshOrigin.begin(owner: issuedToken,
+                              requestedOrigin: preservingSeekEOFRecovery ? nil : requestedOrigin,
+                              live: live, preview: startMuted || probeChannel.description == "trailer")
+        }
         #if os(tvOS)
         if commandResult >= 0 {
             beginFramePresentationLoad()
@@ -2918,6 +2946,9 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// A viewer-controlled seek supersedes a cache-maintenance reanchor before it can reissue an old target.
     private func cancelCacheReanchorForExplicitSeek() {
+        loadTokenLock.lock()
+        freshOrigin.supersede()
+        loadTokenLock.unlock()
         #if os(tvOS)
         cancelSeekRefillWatchdog()
         lastOutOfWindowSeekTarget = nil
@@ -3974,6 +4005,11 @@ final class MPVMetalViewController: PlatformViewController {
                   PlayerLoadProvenanceState.accepts(
                     callbackToken: loadToken, activeToken: self.activeLoadToken
                   ) else { return }
+            self.failFreshOriginCorrection(owner: loadToken, reason: "EOF before opening position")
+            self.loadTokenLock.lock()
+            let originFailed = self.freshOrigin.hasFailed(owner: loadToken)
+            self.loadTokenLock.unlock()
+            guard !originFailed else { return }
             self.finishCacheFlushFlight(self.cacheFlushFlight.reset(owner: loadToken))
             #if os(tvOS)
             if let generation = self.framePresentationDiagnostics.currentGeneration() {
@@ -4071,6 +4107,49 @@ final class MPVMetalViewController: PlatformViewController {
     private var lastTimePosEmit: TimeInterval = 0
     /// Coalesces the buffered-ahead (`demuxer-cache-time`) emits to ~2 Hz for the grey scrubber band.
     private var lastCacheTimeEmit: TimeInterval = 0
+
+    /// Check raw positions before UI coalescing. In the affected TV receipt, a fresh next episode
+    /// first reported 4.046s with resume=0: accepting it immediately committed/skipped its opening.
+    /// Reanchor once on the already-warm decoder, without a load/restart, cache flush, or pause toggle.
+    private func acceptsFreshOriginPosition(_ value: Double, owner: PlayerLoadToken) -> Bool {
+        loadTokenLock.lock()
+        let decision = freshOrigin.observe(position: value, owner: owner)
+        loadTokenLock.unlock()
+        switch decision {
+        case .forward: return true
+        case .suppress: return false
+        case .recovered:
+            VXProbe.event(probeChannel, "fresh-origin recovered position=\(String(format: "%.3f", value))")
+            return true
+        case .correct:
+            VXProbe.event(probeChannel, "fresh-origin correcting unexpected first position=\(String(format: "%.3f", value)) target=0")
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.mpv != nil, self.activeLoadToken == owner else { return }
+                self.loadTokenLock.lock()
+                let admitted = self.freshOrigin.admitCorrection(owner: owner)
+                self.loadTokenLock.unlock()
+                guard admitted else { return } // an intervening user seek superseded it
+                self.command("seek", args: ["0", "absolute+exact"], returnValueCallback: { status in
+                    if status < 0 { self.failFreshOriginCorrection(owner: owner, reason: "seek rejected") }
+                })
+                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+                    self?.failFreshOriginCorrection(owner: owner, reason: "opening position not reached")
+                }
+            }
+            return false
+        }
+    }
+
+    /// A failed origin correction is a source error, never a successful episode or an EOF auto-advance.
+    private func failFreshOriginCorrection(owner: PlayerLoadToken, reason: String) {
+        guard mpv != nil, activeLoadToken == owner else { return }
+        loadTokenLock.lock()
+        let failed = freshOrigin.failCorrection(owner: owner)
+        loadTokenLock.unlock()
+        guard failed else { return }
+        VXProbe.event(probeChannel, "fresh-origin failed reason=\(reason)")
+        emit(MPVProperty.endFileError, "Could not start this episode from its opening. Try another source.", loadToken: owner)
+    }
 
     func readEvents() {
         queue.async { [weak self] in
@@ -4259,6 +4338,8 @@ final class MPVMetalViewController: PlatformViewController {
                             }
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
+                                guard let originOwner = self.callbackLoadToken(requiresLoadedFile: true),
+                                      self.acceptsFreshOriginPosition(value, owner: originOwner) else { break }
                                 let now = ProcessInfo.processInfo.systemUptime
                                 #if os(tvOS)
                                 self.maybeScheduleProactiveMemoryCheck(now: now)
@@ -4329,6 +4410,11 @@ final class MPVMetalViewController: PlatformViewController {
                         }
                     }
                 case MPV_EVENT_SEEK:
+                    if let owner = self.callbackLoadToken(requiresLoadedFile: true) {
+                        self.loadTokenLock.lock()
+                        self.freshOrigin.observedSeek(owner: owner)
+                        self.loadTokenLock.unlock()
+                    }
                     #if canImport(UIKit)
                     guard let loadToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }
                     DispatchQueue.main.async { [weak self] in

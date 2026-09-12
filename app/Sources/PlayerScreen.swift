@@ -3139,7 +3139,7 @@ struct PlayerScreen: View {
     }
 
     /// Every accepted same-source reload re-arms the generation-owned deferred seek. `resumeOrigin` alone is
-    /// meaningful to the native remux lane; libmpv intentionally ignores configureResumeOrigin.
+    /// used as the native remux origin; libmpv also records an explicit zero for its fresh-start check.
     @discardableResult
     private func loadRetryIntoPlayer(
         _ u: URL,

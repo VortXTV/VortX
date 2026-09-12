@@ -1,5 +1,68 @@
 import Foundation
 
+/// A caller-requested fresh VOD must not commit an unrequested, multi-second first position.
+/// This is deliberately not a resume watchdog: only an explicit zero origin is eligible, only
+/// the first positive tick can spend the correction, and a viewer/resume seek retires it.
+struct FreshPlaybackOriginPolicy<Token: Equatable> {
+    enum Decision: Equatable { case forward, suppress, correct, recovered }
+    private enum Phase { case inactive, firstPositive, awaitingCommand, awaitingSeek, awaitingOrigin, failed }
+    private var owner: Token?
+    private var phase = Phase.inactive
+    static var openingTolerance: Double { 1 }
+
+    mutating func begin(owner: Token, requestedOrigin: Double?, live: Bool, preview: Bool) {
+        self.owner = owner
+        phase = requestedOrigin == 0 && !live && !preview ? .firstPositive : .inactive
+    }
+
+    mutating func observe(position: Double, owner: Token) -> Decision {
+        guard self.owner == owner else { return .suppress }
+        guard position.isFinite, position >= 0 else { return .suppress }
+        switch phase {
+        case .inactive: return .forward
+        case .firstPositive:
+            // A paused/initial zero is not proof that the first *playing* frame starts at zero.
+            guard position > 0 else { return .forward }
+            if position <= Self.openingTolerance {
+                phase = .inactive
+                return .forward
+            }
+            phase = .awaitingCommand
+            return .correct
+        case .awaitingOrigin:
+            guard position <= Self.openingTolerance else { return .suppress }
+            phase = .inactive
+            return .recovered
+        case .awaitingCommand, .awaitingSeek, .failed: return .suppress
+        }
+    }
+
+    mutating func admitCorrection(owner: Token) -> Bool {
+        guard self.owner == owner, phase == .awaitingCommand else { return false }
+        phase = .awaitingSeek
+        return true
+    }
+
+    mutating func observedSeek(owner: Token) {
+        guard self.owner == owner, phase == .awaitingSeek else { return }
+        phase = .awaitingOrigin
+    }
+
+    mutating func supersede() { phase = .inactive }
+
+    mutating func failCorrection(owner: Token) -> Bool {
+        guard self.owner == owner else { return false }
+        switch phase {
+        case .awaitingCommand, .awaitingSeek, .awaitingOrigin:
+            phase = .failed
+            return true
+        default: return false
+        }
+    }
+
+    func hasFailed(owner: Token) -> Bool { self.owner == owner && phase == .failed }
+}
+
 /// A decoder EOF is not necessarily content completion: a truncated HTTP/torrent response can end cleanly
 /// after one frame. Only load-owned media telemetry is evidence here, never UI scrub/resume targets or CW
 /// persistence floors. Keep unknown-duration/live/trailer semantics unchanged and tolerate a small final tail.
