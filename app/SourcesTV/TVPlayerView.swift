@@ -1811,6 +1811,7 @@ struct TVPlayerView: View {
               assetSanityAttempt.isRejected(owner: loadToken) else { return }
         let originalResume = assetSanityRequestedResume
         let hasAlternative = nextUntriedStream() != nil
+        let viewerWasPaused = isPaused
         DiagnosticsLog.log(
             "player",
             "rejected mismatched asset token=\(loadToken) originalResume=\(Int(originalResume))s alternative=\(hasAlternative)"
@@ -1818,7 +1819,6 @@ struct TVPlayerView: View {
         loadTimeout?.cancel()
         recoveryDeadline?.cancel()
         recoveryDeadline = nil
-        coordinator.player?.pause()
         invalidateLocalTrickplayCapture()
         assetSanityDeferredStartToken = nil
         cancelAssetSanityObservationDeadline()
@@ -1838,11 +1838,18 @@ struct TVPlayerView: View {
                 resumeOverride: requestedResume,
                 allowBeyondFailureBudget: true
             ) {
+                // AVPlayer resets a new logical URL to play. Restore only a genuine viewer pause,
+                // after admission, so both engines preserve intent without pausing a playing replacement.
+                if viewerWasPaused { coordinator.player?.pause() }
                 return
             }
         case .showMismatch:
             break
         }
+        // A successful hop synchronously replaces the rejected file. Do not force pause before it:
+        // libmpv retains pause across loadfile, and its pause echo can become incoming episode intent.
+        // Only a terminal mismatch should leave the rejected asset held on screen.
+        coordinator.player?.pause()
         loadErrorMsg = "This source returned a stream that does not match the selected title."
         presentTerminalLoadFailure()
     }
@@ -9866,7 +9873,9 @@ struct TVPlayerView: View {
                 if VortXPreparedRemuxCallerPolicy.transportWarmPath(
                     preparedMode: preparedMode
                 ) == .prefixRange {
-                    result = try await BoundedRangeWarmup.fetch(request)
+                    result = try await BoundedRangeWarmup.fetch(
+                        request, limit: Self.nextEpisodeLibmpvWarmPrefixBytes
+                    )
                 } else {
                     result = nil
                 }

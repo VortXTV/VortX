@@ -105,6 +105,13 @@ private enum BoundedRangeWarmupTests {
 
     static func main() async {
         testOriginAndRedirectPolicy()
+        let tvPrefix = 32 << 20
+        let tvRange = "bytes 0-\(tvPrefix - 1)/4000000000"
+        expect(!BoundedRangeWarmup.acceptsRangeResponse(statusCode: 206, contentRange: tvRange),
+               "the old implicit 16MiB limit rejects a legitimate tvOS 32MiB warmup")
+        expect(BoundedRangeWarmup.acceptsRangeResponse(statusCode: 206, contentRange: tvRange,
+                                                       requestedLimit: tvPrefix),
+               "the explicit tvOS byte limit accepts its matching 32MiB response")
         expect(
             BoundedRangeWarmup.acceptsRangeResponse(
                 statusCode: 206,

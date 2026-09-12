@@ -1848,13 +1848,13 @@ struct PlayerScreen: View {
               assetSanityAttempt.isRejected(owner: loadToken) else { return }
         let originalResume = assetSanityRequestedResume
         let hasAlternative = nextUntriedStream() != nil
+        let viewerWasPaused = isPaused
         srcProbe(
             "rejected mismatched asset originalResume=\(Int(originalResume))s alternative=\(hasAlternative)"
         )
         loadTimeout?.cancel()
         recoveryDeadline?.cancel()
         recoveryDeadline = nil
-        coordinator.player?.pause()
         invalidateLocalTrickplayCapture()
         assetSanityDeferredStartToken = nil
         cancelAssetSanityObservationDeadline()
@@ -1872,11 +1872,15 @@ struct PlayerScreen: View {
                 resumeOverride: requestedResume,
                 allowBeyondFailureBudget: true
             ) {
+                if viewerWasPaused { coordinator.player?.pause() }
                 return
             }
         case .showMismatch:
             break
         }
+        // Keep the viewer's transport state across a synchronous source replacement. An implementation
+        // pause here would survive libmpv loadfile and freeze the valid replacement despite a full cache.
+        coordinator.player?.pause()
         loadErrorMsg = "This source returned a stream that does not match the selected title."
         presentTerminalLoadFailure()
     }
