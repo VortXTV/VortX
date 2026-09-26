@@ -47,20 +47,22 @@ struct VortXHLSWindow: Equatable, Sendable {
 /// O and H are a planning decomposition, not separately enforced runtime ceilings. Only aggregate physical
 /// admission at C is hard; aligned audio/subtitle resources and open-GOP state share that same aggregate cap.
 ///
-/// Both the byte window (W) and the time window apply ONLY at and behind the client's demonstrated fetch
-/// frontier, where they represent useful rewind history (root-cause report section 6: W previously also
-/// counted every segment produced AHEAD of the frontier before reserving anything behind it, so a large
-/// produced-ahead suffix could silently starve the whole rewind reservation - see `floor`'s own header for the
-/// exact fix). Segments ahead of the frontier are never evicted by this policy regardless of their volume: the
-/// demonstrated frontier remains the hard lower bound, so this policy never discards an unseen segment or
-/// splits a GOP. Their own volume is bounded separately, by `VortXRemuxProducerLeadPolicy`'s producer-lead
-/// pause/resume and the session spool's admission ceiling, which provides the hard physical bound and
-/// backpressures the producer independently of this window's own accounting.
+/// W is ONE publication share, partitioned between history and producer lead. Previously each side used all
+/// of W independently, allowing a 704 MiB playlist plus its legally retained predecessor in a 1 GiB spool.
+/// The producer then blocked at physical admission while AVPlayer drained the frozen tail. History and lead
+/// still have independent counters (future bytes must not erase rewind history). Their allocations plus a
+/// close-boundary allowance sum to W, because the producer can park only AFTER closing a segment. Additional
+/// allocator overshoot and auxiliary resources are planned in O/H; aggregate admission remains the
+/// hard bound. This is a planning envelope, not a promise that arbitrary oversized GOPs fit. Existing HLS
+/// resource deadlines remain intact; narrowing future publications never deletes an advertised URI early.
 enum VortXHLSConsumptionWindowPolicy {
     private static let mebibyte = 1024 * 1024
 
     static let ordinarySessionCapacityBytes = 1024 * mebibyte
     static let retainedWindowMaximumBytes = 352 * mebibyte
+    static let historyMaximumBytes = 128 * mebibyte
+    static let closedBoundaryAllowanceBytes = 64 * mebibyte
+    static let producerAheadMaximumBytes = retainedWindowMaximumBytes - historyMaximumBytes - closedBoundaryAllowanceBytes
     static let operationalReserveBytes = 256 * mebibyte
     static let safetyHeadroomBytes = 64 * mebibyte
     static let keepBehindSeconds: Double = 150
@@ -118,19 +120,8 @@ enum VortXHLSConsumptionWindowPolicy {
 
         for segment in window.segments.reversed() {
             guard segment.byteLength >= 0 else { return frontier }
-            // Segments AHEAD of the frontier (not yet displayed) can never be evicted by this floor - the
-            // `min(floor, frontier)` return below clamps to `frontier` regardless of anything computed here -
-            // so they must never consume the SAME budget this loop reserves for BEHIND-frontier rewind
-            // history. Before this guard, walking the reversed array visited every ahead-of-frontier segment
-            // FIRST (they have the highest IDs, so they sort to the front of `.reversed()`) and folded its
-            // bytes into `retainedBytes`, so a large produced-ahead suffix could exhaust
-            // `retainedWindowMaximumBytes` before the loop ever reached a single behind-frontier segment. That
-            // is the direct cause of the field "seek outside mounted window" failure on a ten-second rewind
-            // after several minutes of produced-ahead media: the 150-second rewind promise silently collapsed
-            // toward zero exactly when the produced-ahead suffix was largest. Ahead-of-frontier volume is
-            // bounded separately now, by `VortXRemuxProducerLeadPolicy`'s producer-lead pause/resume and the
-            // session spool's aggregate physical admission ceiling; this function is no longer where it is
-            // rationed.
+            // Future segments have their own producer allocation. Never evict unseen media or charge it to
+            // the history share; retain up to the smaller of the history byte budget and 150 seconds.
             guard segment.id <= frontier else { continue }
 
             let (nextBytes, byteOverflow) = retainedBytes.addingReportingOverflow(segment.byteLength)
@@ -138,7 +129,7 @@ enum VortXHLSConsumptionWindowPolicy {
             guard segment.duration.isFinite, segment.duration >= 0 else { return frontier }
             let nextSeconds = rewindSeconds + segment.duration
             guard nextSeconds.isFinite else { return frontier }
-            if nextSeconds > keepBehindSeconds || nextBytes > retainedWindowMaximumBytes { break }
+            if nextSeconds > keepBehindSeconds || nextBytes > historyMaximumBytes { break }
             rewindSeconds = nextSeconds
             retainedBytes = nextBytes
             floor = segment.id
@@ -764,6 +755,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
                 activationThresholdBytes: ceiling,
                 residentBackingCapacityBefore: residentBackingBefore,
                 residentBackingCapacityAfter: residentBackingAfter) {
+                if backpressureWait != nil { DiagnosticsLog.log("dv", "spool capacity resumed stage=append") }
                 forwardReceipt = receipt
                 break
             }
@@ -783,6 +775,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
                     return
                 }
             } else {
+                stage.logCapacityWait(requestedBytes: count)
                 backpressureWait = VortXHLSBackpressureWaitState(
                     now: now,
                     progress: progress)
@@ -2008,6 +2001,10 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
             return owner.backpressureProgressSnapshot
         }
 
+        fileprivate func logCapacityWait(requestedBytes: Int) {
+            owner?.logCapacityWait(stage: "append", requestedBytes: requestedBytes)
+        }
+
         fileprivate func requestAbort() {
             lock.lock()
             abortRequested = true
@@ -2643,6 +2640,19 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
         return currentAccounting
     }
 
+    /// One receipt per admission wait, never per retry poll. This distinguishes a full local spool from an
+    /// upstream read stall without recording URLs, credentials, titles or byte contents.
+    fileprivate func logCapacityWait(stage: String, requestedBytes: Int, transientBytes: Int = 0,
+                                     additionalBytes: Int = 0) {
+        lock.lock()
+        let a = currentAccounting
+        let earliest = entries.values.compactMap(\.retentionDeadline).min()
+        let frontier = backpressureFrontierGeneration
+        lock.unlock()
+        let waitSeconds = earliest.map { max(0, $0 - ProcessInfo.processInfo.systemUptime) } ?? -1
+        DiagnosticsLog.log("dv", "spool capacity wait stage=\(stage) physical=\(a.physicalBytes) cap=\(capacityBytes) final=\(a.finalBytes) open=\(a.openBytes) reserved=\(a.reservedBytes) auxiliary=\(a.auxiliaryBytes) transient=\(a.transientCopyBytes) requested=\(requestedBytes) additionalRequested=\(additionalBytes) closeTransient=\(transientBytes) frontier=\(frontier) firstExpirySeconds=\(Int(waitSeconds))")
+    }
+
     var backpressureProgressSnapshot: VortXHLSBackpressureProgress {
         lock.lock(); defer { lock.unlock() }
         return VortXHLSBackpressureProgress(
@@ -3141,6 +3151,7 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                 transientBytes: transientBytes
             ) {
             case .reserved:
+                if backpressureWait != nil { DiagnosticsLog.log("dv", "spool capacity resumed stage=close") }
                 break admissionLoop
             case .full:
                 // A close briefly duplicates the still-open suffix. At the physical ceiling this is the
@@ -3160,6 +3171,8 @@ final class VortXHLSSessionSpool: @unchecked Sendable {
                         return false
                     }
                 } else {
+                    logCapacityWait(stage: "close", requestedBytes: prefixBytes,
+                                    transientBytes: transientBytes, additionalBytes: additionalBytes)
                     backpressureWait = VortXHLSBackpressureWaitState(
                         now: now,
                         progress: progress)

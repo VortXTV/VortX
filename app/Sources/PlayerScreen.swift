@@ -1940,6 +1940,7 @@ struct PlayerScreen: View {
         }
         switch name {
         case MPVProperty.pausedForCache:
+            if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
             if let b = data as? Bool { buffering = b }
         case MPVProperty.videoParamsSigPeak:
             if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
@@ -2265,6 +2266,7 @@ struct PlayerScreen: View {
             // ignore non-finite / behind-playhead values so the band never runs backward or breaks the bar.
             if let d = data as? Double, d.isFinite, d >= currentTime { bufferedTime = d }
         case MPVProperty.pause:
+            if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
             // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
             // value, so gate every side effect on a real change: the scrobble pause/resume must fire once per
             // press, not twice (this also collapses the pre-existing KVO double-fire). The now-playing write is
@@ -2964,19 +2966,19 @@ struct PlayerScreen: View {
     /// Loading the immutable launch tuple first can first-frame a previous source before a deferred correction.
     private var mpvSurfacePlayback: (url: URL, headers: [String: String]?, audioSidecar: URL?, live: Bool, isDolbyVision: Bool) {
         #if os(iOS) || os(macOS)
-        let usesFallbackSource = avEngineFailed
+        let useActiveTuple = avEngineFailed || engineSurfaceUsesActiveTuple
         #else
-        let usesFallbackSource = false
+        let useActiveTuple = false
         #endif
-        let activeURL = usesFallbackSource ? (curURL ?? url) : url
-        let activeHeaders = usesFallbackSource ? curHeaders : headers
+        let activeURL = useActiveTuple ? (curURL ?? url) : url
+        let activeHeaders = useActiveTuple ? curHeaders : headers
         let input = playback(for: activeURL, headers: activeHeaders)
         return (
             input.url,
             input.headers,
             activeURL == url ? audioSidecarURL : nil,
-            usesFallbackSource ? isLive : initialIsLive,
-            StreamRanking.isDolbyVision(usesFallbackSource ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? ""))
+            useActiveTuple ? isLive : initialIsLive,
+            StreamRanking.isDolbyVision(useActiveTuple ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? ""))
         )
     }
 
@@ -4057,7 +4059,7 @@ struct PlayerScreen: View {
             currentTime = reconciliation.presentationSeconds
             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
             lastReported = max(lastReported, reconciliation.persistenceFloorSeconds)
-            coordinator.player?.seek(by: 0.1)
+            coordinator.player?.seekForResume(to: reconciliation.presentationSeconds + 0.1)
         }
     }
 
@@ -4134,7 +4136,9 @@ struct PlayerScreen: View {
                     loadFailed: loadFailed,
                     isLive: isLive,
                     duration: duration,
-                    buffering: buffering
+                    buffering: buffering,
+                    deferredResumeInFlight: postFrameResumeSeekWatchdogTarget != nil
+                        && postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
                 ) else {
                     lastObservedTime = -1
                     stalledTicks = 0

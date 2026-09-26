@@ -58,6 +58,7 @@ enum VortXRemuxProducerLeadPolicyTests {
         leavesThirtySecondTargetWhenBudgetAffordsIt()
         unknownBitrateKeepsCurrentBehaviour()
         extremeBitrateRespectsTheViableFloor()
+        affordableTargetBoundaries()
         coupledTargetPlusMarginNeverReachesTheCeilingAcrossFieldBitrates()
         completedCouplingIsInertUntilTheItemGenerationChanges()
         elapsedEvidencePhaseSamplesOnRealTimeAndReplacesFallback()
@@ -257,10 +258,10 @@ enum VortXRemuxProducerLeadPolicyTests {
         let affordableSeconds = Double(budget) * 8 / fieldBitsPerSecond
         check("field-bitrate target is capped below the unconstrained 30 s",
               target < VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
-        check("field-bitrate target leaves the full safety margin under the ceiling",
-              target + VortXRemuxForwardBufferCoupling.safetySeconds <= affordableSeconds)
-        check("field-bitrate target never falls under one full safety margin of media",
-              target >= VortXRemuxForwardBufferCoupling.minimumSteadyStateSeconds)
+        check("field-bitrate target reserves half the tight forward budget for refill headroom",
+              target <= affordableSeconds / 2)
+        check("field-bitrate target stays positive and below the preferred floor when necessary",
+              target > 0 && target <= VortXRemuxForwardBufferCoupling.minimumSteadyStateSeconds)
     }
 
     static func leavesThirtySecondTargetWhenBudgetAffordsIt() {
@@ -292,14 +293,21 @@ enum VortXRemuxProducerLeadPolicyTests {
             aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
             observedBitsPerSecond: 200_000_000,
             unconstrainedDuration: VortXRemuxForwardBufferCouplingStubs.unconstrainedSteadyStateSeconds)
-        check("200 Mb/s stream floors at the minimum viable target", target == 8)
+        let affordable = Double(VortXRemuxProducerLeadPolicy.maximumAheadBytes) * 8 / 200_000_000
+        check("200 Mb/s target is affordable rather than demanding an impossible eight seconds",
+              target == affordable / 2 && target > 0)
+        check("coupling must never increase an already smaller player target",
+              VortXRemuxForwardBufferCoupling.steadyStateDuration(
+                aheadByteBudget: VortXRemuxProducerLeadPolicy.maximumAheadBytes,
+                observedBitsPerSecond: fieldBitsPerSecond,
+                unconstrainedDuration: 4) == 4)
     }
 
     static func coupledTargetPlusMarginNeverReachesTheCeilingAcrossFieldBitrates() {
         // Across every bitrate where the margin itself still fits, target + safety must stay at or under
         // what the producer ceiling affords. That invariant is exactly "AVPlayer's ask can no longer exceed
         // production's legal supply".
-        for mbps in [50.0, 65.0, 86.44464, 98.0, 130.0] {
+        for mbps in [50.0, 65.0, 86.44464, 98.0, 130.0, 200.0, 500.0, 1_000.0] {
             let bps = mbps * 1_000_000
             let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
             let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
@@ -313,9 +321,22 @@ enum VortXRemuxProducerLeadPolicyTests {
                 check("\(mbps) Mb/s: target + safety <= ceiling-affordable seconds",
                       target + VortXRemuxForwardBufferCoupling.safetySeconds <= affordable + 0.000001)
             } else {
-                check("\(mbps) Mb/s (floored): floor stays within affordable seconds",
-                      target <= affordable)
+                check("\(mbps) Mb/s (tight budget): target leaves at least half the supply for headroom",
+                      target > 0 && target <= affordable / 2)
             }
+        }
+    }
+
+    static func affordableTargetBoundaries() {
+        let budget = VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        for affordable in [15.999, 16.0, 16.001, 19.999, 20.0, 20.001] {
+            let target = VortXRemuxForwardBufferCoupling.steadyStateDuration(
+                aheadByteBudget: budget,
+                observedBitsPerSecond: Double(budget) * 8 / affordable,
+                unconstrainedDuration: 30)
+            let expected = affordable < 16 ? affordable / 2 : (affordable < 20 ? 8 : affordable - 12)
+            check("\(affordable)s supply: target crosses soft-floor and safety boundaries continuously",
+                  abs(target - expected) < 0.000001 && target > 0 && target <= affordable)
         }
     }
 

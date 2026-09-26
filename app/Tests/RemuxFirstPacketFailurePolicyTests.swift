@@ -39,6 +39,7 @@ enum RemuxFirstPacketFailurePolicyTests {
         onlyTimeoutAndIOErrorRetry()
         prefixesRoundTripAndNeverCollide()
         cancelledMessageCarriesNoZeroPacketPrefix()
+        emptySourceRecoveryWaitsOnlyForItsOwnGeneration()
 
         print("===== FAILURES: \(failures) =====")
         exit(failures == 0 ? 0 : 1)
@@ -48,6 +49,38 @@ enum RemuxFirstPacketFailurePolicyTests {
         let c = RemuxFirstPacketFailure.classify(
             readResult: -541_478_725, avioEOF: false, avioError: 0, isCancelled: false)
         check("AVERROR_EOF rc alone classifies emptyEOF", c == .emptyEOF)
+    }
+
+    static func emptySourceRecoveryWaitsOnlyForItsOwnGeneration() {
+        let owner = EmptySourceRecoveryOwner(episodeGeneration: 1, sourceGeneration: 2,
+            videoID: "show:1:3", failedURL: URL(string: "https://example.invalid/empty")!, loadToken: 3)
+        func decide(current: EmptySourceRecoveryOwner<Int>? = nil, cancelled: Bool = false,
+                    paused: Bool = false, budget: Bool = true, candidate: Bool = false,
+                    settled: Bool = false, expired: Bool = false) -> EmptySourceRecoveryPolicy.Decision {
+            EmptySourceRecoveryPolicy.decision(owner: owner, current: current ?? owner,
+                cancelled: cancelled, viewerPaused: paused, hasHopBudget: budget,
+                candidateAvailable: candidate, sourcesSettled: settled, deadlineExpired: expired)
+        }
+        check("empty source waits for pending add-on results", decide() == .wait)
+        check("late playable candidate recovers without waiting for slow providers", decide(candidate: true) == .hop)
+        check("settled empty sources terminate", decide(settled: true) == .terminal)
+        check("hung contributor has a bounded deadline", decide(expired: true) == .terminal)
+        check("deadline still accepts an available candidate", decide(candidate: true, expired: true) == .hop)
+        check("budget exhaustion cannot start another hop", decide(budget: false, candidate: true) == .terminal)
+        check("viewer pause cannot auto-hop", decide(paused: true, candidate: true, expired: true) == .wait)
+        check("cancelled task cannot publish terminal state", decide(cancelled: true, expired: true) == .stale)
+        for changed in [
+            EmptySourceRecoveryOwner(episodeGeneration: 2, sourceGeneration: 2, videoID: owner.videoID, failedURL: owner.failedURL, loadToken: 3),
+            EmptySourceRecoveryOwner(episodeGeneration: 1, sourceGeneration: 3, videoID: owner.videoID, failedURL: owner.failedURL, loadToken: 3),
+            EmptySourceRecoveryOwner(episodeGeneration: 1, sourceGeneration: 2, videoID: "show:1:4", failedURL: owner.failedURL, loadToken: 3),
+            EmptySourceRecoveryOwner(episodeGeneration: 1, sourceGeneration: 2, videoID: owner.videoID, failedURL: URL(string: "https://example.invalid/new")!, loadToken: 3),
+            EmptySourceRecoveryOwner(episodeGeneration: 1, sourceGeneration: 2, videoID: owner.videoID, failedURL: owner.failedURL, loadToken: 4)
+        ] {
+            check("replacement identity invalidates late empty-source recovery", decide(current: changed, candidate: true) == .stale)
+        }
+        check("missing current load is stale", EmptySourceRecoveryPolicy.decision(owner: owner, current: nil,
+            cancelled: false, viewerPaused: false, hasHopBudget: true, candidateAvailable: true,
+            sourcesSettled: true, deadlineExpired: true) == .stale)
     }
 
     static func avioFeofAloneIsEOFEvenWithoutTheEOFReturnCode() {

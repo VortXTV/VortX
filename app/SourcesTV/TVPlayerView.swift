@@ -2,6 +2,20 @@ import SwiftUI
 import UIKit
 import os
 
+@MainActor private enum TVPlaybackIdleTimer {
+    static var lease = PlaybackIdleTimerLease<UUID>()
+
+    static func claim(_ owner: UUID) { lease.claim(owner) }
+    static func update(_ owner: UUID, preventIdle: Bool) {
+        guard lease.owns(owner) else { return }
+        UIApplication.shared.isIdleTimerDisabled = preventIdle
+    }
+    static func release(_ owner: UUID) {
+        guard lease.release(owner) else { return }
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+}
+
 /// Stable, opaque identities for the player's virtual accessibility rows. Async panel refreshes may reorder
 /// rows or change their detail text while VoiceOver is focused. Identity therefore uses the panel, semantic
 /// label, role, and same-label occurrence, never the mutable detail and never raw provider data in the output.
@@ -115,7 +129,7 @@ enum TVDirectAVStartRecoveryPolicy {
 
 /// A cold libmpv resume deliberately defers its absolute seek until the first frame because an early absolute
 /// seek empties the cache and can wedge video output. For the narrow direct-AV fallback case, a single tiny
-/// relative seek is safe (it does not arm that absolute-seek cache hold) and can wake an input that has opened
+/// recovery seek uses the no-cache-hold resume path and can wake an input that has opened
 /// but has not started decoding. It is never retried: an unframed source after this nudge is failed over.
 enum TVLibMPVStartupNudgePolicy {
     enum Decision: Equatable {
@@ -430,7 +444,7 @@ struct TVPlayerView: View {
     // ordinary warm-pipeline scrub, which is proven to render. Cleared at every fresh mount / teardown so it can
     // never leak onto the wrong mount.
     @State private var pendingLibmpvResumeSeek: Double? = nil
-    /// One bounded relative-seek nudge for the direct-AV fallback's cold libmpv resume only. Reset for every
+    /// One bounded no-cache-hold nudge for the direct-AV fallback's cold libmpv resume only. Reset for every
     /// new source/episode and at first frame; it must never become a periodic seek loop.
     @State private var libmpvStartupNudgeIssued = false
     @State private var appliedResume = false
@@ -681,6 +695,7 @@ struct TVPlayerView: View {
     @State private var avWatchdogArmedAt: Date?
     @State private var loadTimeout: Task<Void, Never>?
     @State private var playbackDeadlineClock = PlaybackActiveTimeClock()
+    @State private var playbackIdleTimerOwner = UUID()
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
     @State private var autoRetryTask: Task<Void, Never>?
@@ -692,6 +707,8 @@ struct TVPlayerView: View {
     @State private var sourceHops = 0                  // automatic source switches so far for this video
     @State private var refinding = false               // a terminal-failure "Re-find sources" is in flight
     @State private var refindTask: Task<Void, Never>? = nil   // bounded settle-then-retry after a re-find
+    @State private var emptySourceRecoveryTask: Task<Void, Never>?
+    @State private var emptySourceRecoveryOwner: EmptySourceRecoveryOwner<PlayerLoadToken>?
     @State private var triedYouTubeAppRescue = false   // #95: the YouTube-app trailer hand-off fires at most once per playback
     private let maxSourceHops = 4                      // a fully-dead title still errors out, just later
     // Whether the CURRENTLY loading source was explicitly chosen by the user (seeded from
@@ -1212,7 +1229,8 @@ struct TVPlayerView: View {
             // The AV surface is intentionally withheld while an account resume lookup is unresolved, so its
             // synchronous `makeHostView` cannot mount a remux at zero before the real origin arrives.
             if !useAVPlayerEngine || initialAVResumeOrigin != nil { startLoadTimeout() }
-            UIApplication.shared.isIdleTimerDisabled = true   // stop the Apple TV screensaver during playback
+            TVPlaybackIdleTimer.claim(playbackIdleTimerOwner)
+            refreshPlaybackIdleTimer()
             if let explicit = startAtSeconds {
                 // Trakt "Resume from <time>": the viewer tapped a position another device reported. Seek there
                 // WITHOUT consulting the engine/account resume, and leave the stored resume point untouched:
@@ -1286,6 +1304,8 @@ struct TVPlayerView: View {
         // Quality buttons must appear when they do. `streamsEpoch` bumps ONLY when the engine's ready-stream
         // set actually changed, so this is the exact, cheap edge the cached counts need: no per-body-pass walk,
         // and no waiting for the viewer to open a panel before the buttons show up.
+        .onChange(of: playbackDeadlineClock.isPaused) { _ in refreshPlaybackIdleTimer() }
+        .onChange(of: loadFailed) { _ in refreshPlaybackIdleTimer() }
         .onChange(of: core.streamsEpoch) { _ in
             refreshSourceOptionCounts()
             establishSubtitleTimingScopeIfAvailable()
@@ -1309,6 +1329,8 @@ struct TVPlayerView: View {
             hydrateDirectResumeSeriesInventory()
         }
         .onDisappear {
+            TVPlaybackIdleTimer.release(playbackIdleTimerOwner)
+            cancelEmptySourceRecovery()
             let integrityOwner = exitAcceptedLoadToken ?? coordinator.player?.activeLoadToken
             let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: integrityOwner)
             core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
@@ -1356,7 +1378,6 @@ struct TVPlayerView: View {
             // on the same engine - closing it on .background would kill background-resume without
             // preventing any leak (an app the system kills while suspended takes the server, and every
             // engine with it, down too). In-session leaks are covered by the switch / advance / exit paths.
-            UIApplication.shared.isIdleTimerDisabled = false   // let the screensaver resume once the player closes
         }
     }
 
@@ -1899,6 +1920,7 @@ struct TVPlayerView: View {
         }
         switch name {
         case MPVProperty.pausedForCache:
+            if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
             if let b = data as? Bool {
                 let startedBuffering = b && !buffering
                 buffering = b
@@ -1907,11 +1929,13 @@ struct TVPlayerView: View {
                 }
             }
         case MPVProperty.pause:
+            if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
             // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
             // value, so gate every side effect on a real change: the scrobble pause/resume, saveProgress and
             // reportProgress must fire once per press, not twice (this also collapses the pre-existing KVO
-            // double-fire). The idle-timer and now-playing writes are idempotent, so running them only on a
-            // real change is correct.
+            // double-fire). The idle timer instead belongs to viewer intent: startup/rebuffering and
+            // AV-to-MPV teardown may report pause=true even though the viewer still wants playback.
+            refreshPlaybackIdleTimer()
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
                 if b {
@@ -1921,14 +1945,13 @@ struct TVPlayerView: View {
                     resetRapidBufferingRecovery(reason: "user pause")
                     // EOF may have already admitted the next episode. Carry this late user pause into that
                     // replacement rather than letting its default-playing controller restart the series.
-                    if let pending = pendingAdvance {
+                    if playbackDeadlineClock.isPaused, let pending = pendingAdvance {
                         queueIncomingTransportIntent(paused: true)
                         if let token = pending.loadToken { bindIncomingTransportIntent(to: token) }
                     }
                 } else if let loadToken {
                     resumeAVPostReplacementFirstFrameDeadlineIfOwned(by: loadToken)
                 }
-                UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
                 // #157: reflect play/pause on the system card AT ONCE. The play head stops ticking while
                 // paused, so without this the published rate would stay at "playing" and the Control Center
                 // clock would keep running against a frozen picture.
@@ -2429,9 +2452,7 @@ struct TVPlayerView: View {
                 // engine that is guaranteed to fail the same way.
                 if !hasStartedPlaying, RemuxFirstPacketFailure.isTerminalZeroPacket(failureMessage) {
                     DiagnosticsLog.log("dv", "endFileError terminal zero-packet source -> hop instead of demote class=\(safeFailureClass(failureMessage))")
-                    if hopToNextSource(reason: "remux terminal zero-packet source") { return }
-                    if loadErrorMsg.isEmpty { loadErrorMsg = "This source did not produce playable media." }
-                    presentTerminalLoadFailure()
+                    recoverEmptySourceAfterSettlement()
                     return
                 }
                 if demoteAVPlayerToMPV() { return }
@@ -4118,6 +4139,7 @@ struct TVPlayerView: View {
             terminalAdvanceDeadlineTask = nil
         }
         if let issuedToken {
+            cancelEmptySourceRecovery()
             foregroundMountRevalidation.clear()
             clearPostFrameResumeSeekWatchdog()
             beginAssetSanityAttemptIfNeeded(
@@ -4214,7 +4236,8 @@ struct TVPlayerView: View {
         sourceHops = 0; exhaustedURLs = []
         nativeDebridFreshLinkRecovery.reset()
         if userInitiated {
-            avEngineFailed = false
+            // The mounted controller already accepted this load. Keep its engine; only an
+            // explicit engine switch may recreate the surface with a different controller.
             recoveryDeadline?.cancel(); recoveryDeadline = nil
             // The viewer picked this mount themselves: a fresh source gets a fresh mid-play budget. The
             // automatic lane deliberately does NOT reset here - `hopToNextSource` clears it only once its
@@ -4447,6 +4470,73 @@ struct TVPlayerView: View {
                                   debridCachedHashes: debridCachedHashes)
     }
 
+    private var currentEmptySourceRecoveryOwner: EmptySourceRecoveryOwner<PlayerLoadToken>? {
+        guard !leftPlayback, !loadFailed, let target = sourceTargetMeta,
+              let token = coordinator.player?.activeLoadToken else { return nil }
+        return EmptySourceRecoveryOwner(
+            episodeGeneration: episodeSwitchGeneration, sourceGeneration: sourceSwitchGeneration,
+            videoID: target.videoId, failedURL: curURL ?? url, loadToken: token)
+    }
+
+    private func cancelEmptySourceRecovery() {
+        emptySourceRecoveryTask?.cancel()
+        emptySourceRecoveryTask = nil
+        emptySourceRecoveryOwner = nil
+    }
+
+    /// The next episode's providers can still be responding when a prepared URL proves empty.
+    /// Wait only for that failed load's source generation; never demote/retry the same empty bytes.
+    private func recoverEmptySourceAfterSettlement() {
+        guard let owner = currentEmptySourceRecoveryOwner else {
+            loadErrorMsg = "This source did not produce playable media."
+            presentTerminalLoadFailure()
+            return
+        }
+        guard emptySourceRecoveryOwner != owner else { return }
+        cancelEmptySourceRecovery()
+        exhaustedURLs.insert(owner.failedURL)
+        emptySourceRecoveryOwner = owner
+        buffering = true
+        reconnecting = true
+        DiagnosticsLog.log("player", "empty-source recovery awaiting alternatives for exact load")
+        emptySourceRecoveryTask = Task { @MainActor in
+            defer {
+                if emptySourceRecoveryOwner == owner {
+                    emptySourceRecoveryOwner = nil
+                    emptySourceRecoveryTask = nil
+                }
+            }
+            let startedAt = playbackDeadlineNow
+            while !Task.isCancelled {
+                let elapsed = playbackDeadlineNow - startedAt
+                let progress = core.streamLoadProgress(forStreamId: owner.videoID)
+                let settled = StreamRanking.resolveSettled(
+                    currentSourceGroups, loaded: progress.loaded, total: progress.total,
+                    secondsSinceRequestStart: elapsed, rememberedQuality: curHint)
+                let decision = EmptySourceRecoveryPolicy.decision(
+                    owner: owner, current: currentEmptySourceRecoveryOwner,
+                    cancelled: Task.isCancelled, viewerPaused: playbackDeadlineClock.isPaused,
+                    hasHopBudget: sourceHops < maxSourceHops,
+                    candidateAvailable: nextUntriedStream() != nil, sourcesSettled: settled,
+                    deadlineExpired: elapsed >= StreamRanking.completeSetDeadline)
+                switch decision {
+                case .stale:
+                    return
+                case .hop:
+                    if hopToNextSource(reason: "remux terminal zero-packet source") { return }
+                    fallthrough
+                case .terminal:
+                    DiagnosticsLog.log("player", "empty-source recovery exhausted alternatives or admission refused")
+                    loadErrorMsg = "This source did not produce playable media. Choose another source or re-find sources."
+                    presentTerminalLoadFailure()
+                    return
+                case .wait:
+                    do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+                }
+            }
+        }
+    }
+
     /// The playing source is dead (its retry, stall, or warm-up budget ran out): mark it
     /// exhausted and hop to the next-best untried source automatically. Returns false when the
     /// hop budget is spent or nothing untried remains; the caller then shows the error overlay.
@@ -4501,9 +4591,18 @@ struct TVPlayerView: View {
         if let dying = currentStream, let dyingAddon = addonName(for: dying) {
             ProviderHealth.noteFailure(addonName: dyingAddon)
         }
-        guard (allowBeyondFailureBudget || sourceHops < maxSourceHops),
-              let stream = nextUntriedStream(),
-              let newURL = playableURL(for: stream) else { return false }
+        guard allowBeyondFailureBudget || sourceHops < maxSourceHops else {
+            DiagnosticsLog.log("player", "source hop unavailable: budget exhausted")
+            return false
+        }
+        guard let stream = nextUntriedStream() else {
+            DiagnosticsLog.log("player", "source hop unavailable: no untried playable candidate")
+            return false
+        }
+        guard let newURL = playableURL(for: stream) else {
+            DiagnosticsLog.log("player", "source hop unavailable: candidate URL unresolved")
+            return false
+        }
         // switchStream clears the budget (it doubles as the manual-pick path) and resumes at
         // currentTime; snapshot both around the call so the hop keeps its own bookkeeping and a
         // pre-start failure keeps the original resume offset.
@@ -5262,7 +5361,9 @@ struct TVPlayerView: View {
                     loadFailed: loadFailed,
                     isLive: isCurrentLiveStream,
                     duration: duration,
-                    buffering: buffering
+                    buffering: buffering,
+                    deferredResumeInFlight: postFrameResumeSeekWatchdogTarget != nil
+                        && postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
                 ) else {
                     // Mirrors iOS PlayerScreen.startStallWatchdog: -1 is the sentinel "not observing yet",
                     // not the last real position. Stamping currentTime here would let the FIRST tick after
@@ -5814,6 +5915,9 @@ struct TVPlayerView: View {
     /// later dismissal can each call this. Same shape as the debrid-crash straddle root cause
     /// (stop-before-dismiss): engine down first, then the surface state change.
     private func presentTerminalLoadFailure() {
+        cancelEmptySourceRecovery()
+        buffering = false
+        reconnecting = false
         TerminalLoadFailurePolicy.presentTerminal(
             retire: {
                 guard TerminalLoadFailurePolicy.shouldRetireBeforePublish(
@@ -5833,15 +5937,24 @@ struct TVPlayerView: View {
         playbackDeadlineClock.value(at: ProcessInfo.processInfo.systemUptime)
     }
 
+    /// Transient engine pauses must not let the TV sleep during a handoff or buffering. Explicit
+    /// viewer pauses and terminal failures do; late callbacks after disappearance cannot reacquire it.
+    private func refreshPlaybackIdleTimer() {
+        TVPlaybackIdleTimer.update(playbackIdleTimerOwner,
+            preventIdle: !leftPlayback && !loadFailed && !playbackDeadlineClock.isPaused)
+    }
+
     private func viewerPause() {
         guard coordinator.player != nil else { return }
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
+        refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(true)
         coordinator.player?.pause()
     }
 
     private func viewerPlay() {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(false)
         coordinator.player?.play()
     }
@@ -5857,10 +5970,11 @@ struct TVPlayerView: View {
     private func retryPlaybackByUser() {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         retryLoad()
+        refreshPlaybackIdleTimer()
     }
 
     private func viewerToggle() {
-        if isPaused { viewerPlay() } else { viewerPause() }
+        if playbackDeadlineClock.isPaused { viewerPlay() } else { viewerPause() }
     }
 
     /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
@@ -6027,7 +6141,7 @@ struct TVPlayerView: View {
         demoteFollowedDeadInput = false
         guard useAVPlayerEngine,
               let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return false }
-        let desiredPaused = isPaused
+        let desiredPaused = playbackDeadlineClock.isPaused
         captureRecoverySelections()
         queueIncomingTransportIntent(paused: desiredPaused)
         resetRapidBufferingRecovery(reason: "engine demote")
@@ -6262,7 +6376,7 @@ struct TVPlayerView: View {
             withAnimation { showOptions = false }; return
         }
         resetRapidBufferingRecovery(reason: "user engine switch")
-        let desiredPaused = isPaused
+        let desiredPaused = playbackDeadlineClock.isPaused
         captureRecoverySelections()
         queueIncomingTransportIntent(paused: desiredPaused)
         DiagnosticsLog.log("player", "user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
@@ -6486,15 +6600,16 @@ struct TVPlayerView: View {
             case .cancel:
                 break
             case .nudge:
-                // `seek(by:)` stays on libmpv's relative-seek path and therefore avoids the absolute-seek
-                // cache hold that the deferred-resume policy is protecting against. One tenth of a second is
-                // imperceptible, but it asks an opened demuxer to advance and matches the field observation
-                // that a manual scrub can release this exact cold-start wedge.
+                // Recovery is not a viewer scrub. The normal relative seek now arms an out-of-window
+                // cache hold too; use the no-hold resume command at the latest confirmed position instead.
                 libmpvStartupNudgeIssued = true
-                coordinator.player?.seek(by: 0.1)
+                if let position = coordinator.player?.playbackPositionSeconds,
+                   position.isFinite, position >= 0 {
+                    coordinator.player?.seekForResume(to: position + 0.1)
+                }
                 DiagnosticsLog.log(
                     "playback",
-                    "libmpv cold-resume no-frame -> one relative startup nudge; waiting 4s before source hop"
+                    "libmpv cold-resume no-frame -> one no-hold startup nudge; waiting 4s before source hop"
                 )
                 guard await waitForPlaybackTime(4) else { return }
                 guard !Task.isCancelled, !hasStartedPlaying,
@@ -6537,9 +6652,9 @@ struct TVPlayerView: View {
     /// playhead frozen at ~1s with paused-for-cache false, and the UI's currentTime optimistically pinned to
     /// the target by the in-flight guard). The plain stall ladder answers that with a same-source reload AT THE
     /// SAME OFFSET, which wedges again and re-arms the DV->HDR10 display switch every cycle (the observed
-    /// Harry Potter stall loop). If the seek has not landed within 12s, abandon the offset instead: a relative
-    /// +0.1s nudge (the same proven wedge release as the cold-start nudge) resumes playback from wherever the
-    /// source actually is. Presentation reconciles to the first proven engine position while persistence retains
+    /// Harry Potter stall loop). If the seek has not landed within 12s, abandon the offset instead: a
+    /// +0.1s no-cache-hold seek resumes playback from the last confirmed position rather than adding to a
+    /// still-pending absolute target inside the decoder. Presentation reconciles to the first proven engine position while persistence retains
     /// the valid resume floor, because one source's failed seek must not erase Continue Watching progress.
     private func clearPostFrameResumeSeekWatchdog() {
         postFrameResumeSeekWatchdog?.cancel()
@@ -6642,7 +6757,7 @@ struct TVPlayerView: View {
             currentTime = reconciliation.presentationSeconds
             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
             lastSaved = max(lastSaved, reconciliation.persistenceFloorSeconds)
-            coordinator.player?.seek(by: 0.1)
+            coordinator.player?.seekForResume(to: reconciliation.presentationSeconds + 0.1)
         }
     }
 
@@ -7040,7 +7155,7 @@ struct TVPlayerView: View {
         let retryEpisodeGeneration = episodeSwitchGeneration
         let retrySourceGeneration = sourceSwitchGeneration
         let resume = max(currentTime, suppressedResumeFloor ?? (resumeSeconds ?? 0))
-        let pausedIntent = isPaused
+        let pausedIntent = playbackDeadlineClock.isPaused
         captureRecoverySelections()
         queueIncomingTransportIntent(paused: pausedIntent)
         guard let recoveryID = nativeDebridFreshLinkRecovery.beginFreshLink(requestedEngine: requestedEngine) else {
@@ -7906,8 +8021,9 @@ struct TVPlayerView: View {
     /// A fallback surface receives the live source before its controller is constructed. Mounting the immutable
     /// launch tuple first can produce a frame for a previous episode and disarm the wrong watchdog.
     private var mpvSurfacePlayback: (url: URL, headers: [String: String]?, audioSidecar: URL?, live: Bool, isDolbyVision: Bool) {
-        let activeURL = avEngineFailed ? (curURL ?? url) : url
-        let activeHeaders = avEngineFailed ? curHeaders : headers
+        let useActiveTuple = avEngineFailed || engineSurfaceUsesActiveTuple
+        let activeURL = useActiveTuple ? (curURL ?? url) : url
+        let activeHeaders = useActiveTuple ? curHeaders : headers
         let input: (url: URL, headers: [String: String]?)
         if let activeHeaders, !activeHeaders.isEmpty,
            let proxied = StremioServer.proxiedURL(for: activeURL, headers: activeHeaders) {
@@ -7919,8 +8035,8 @@ struct TVPlayerView: View {
             input.url,
             input.headers,
             activeURL == url ? audioSidecarURL : nil,
-            avEngineFailed ? curIsLive : initialLiveMode,
-            StreamRanking.isDolbyVision(avEngineFailed ? (curHint ?? sourceHint ?? "") : (sourceHint ?? ""))
+            useActiveTuple ? curIsLive : initialLiveMode,
+            StreamRanking.isDolbyVision(useActiveTuple ? (curHint ?? sourceHint ?? "") : (sourceHint ?? ""))
         )
     }
 
@@ -8780,7 +8896,8 @@ struct TVPlayerView: View {
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
         watchedZoneSince = nil
         suppressedResumeFloor = nil
-        avEngineFailed = false
+        // Retain the engine that accepted the incoming episode. Clearing fallback here
+        // would unmount that controller and reopen AVPlayer with the launch episode.
         currentPickWasExplicit = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         currentPlaybackIsResume = false; resumeSourceReresolved = false
         nativeDebridFreshLinkRecovery.reset()
@@ -10128,6 +10245,8 @@ struct TVPlayerView: View {
         cancelDirectResumeInventoryRefresh()
         exitAcceptedLoadToken = assetSanityAccepted ? exitLoadToken : nil
         leftPlayback = true   // FIRST: a pending EOF last-chance backfill must never resurrect a player the user left
+        cancelEmptySourceRecovery()
+        refreshPlaybackIdleTimer()
         refindTask?.cancel(); refindTask = nil; refinding = false   // a settling re-find must not retry into a left player
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer pressing Back immediately
         invalidateEpisodeResolution()

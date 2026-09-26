@@ -1,5 +1,31 @@
 import Foundation
 
+/// A late add-on result may rescue an empty next-episode source, but never a replacement title or load.
+struct EmptySourceRecoveryOwner<Token: Equatable>: Equatable {
+    let episodeGeneration: Int
+    let sourceGeneration: Int
+    let videoID: String
+    let failedURL: URL
+    let loadToken: Token
+}
+
+enum EmptySourceRecoveryPolicy {
+    enum Decision: Equatable { case stale, wait, hop, terminal }
+
+    static func decision<Token: Equatable>(
+        owner: EmptySourceRecoveryOwner<Token>, current: EmptySourceRecoveryOwner<Token>?,
+        cancelled: Bool, viewerPaused: Bool, hasHopBudget: Bool,
+        candidateAvailable: Bool, sourcesSettled: Bool, deadlineExpired: Bool
+    ) -> Decision {
+        guard !cancelled, owner == current else { return .stale }
+        guard !viewerPaused else { return .wait }
+        guard hasHopBudget else { return .terminal }
+        // A proven-dead source does not need to wait for every provider if a replacement is already ready.
+        if candidateAvailable { return .hop }
+        return sourcesSettled || deadlineExpired ? .terminal : .wait
+    }
+}
+
 /// Classifies the FIRST `av_read_frame` failure the base-video timeline-origin pre-scan hits before it has
 /// mapped a single timestamped base-video packet (root-cause report section 3).
 ///

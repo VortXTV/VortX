@@ -133,6 +133,19 @@ struct PlaybackActiveTimeClock {
     }
 }
 
+/// The idle timer is process-wide. A disappearing old player may release only its own presentation,
+/// never a newer player's lease (SwiftUI can overlap disappear/appear during request replacement).
+struct PlaybackIdleTimerLease<Owner: Equatable> {
+    private var owner: Owner?
+    mutating func claim(_ owner: Owner) { self.owner = owner }
+    func owns(_ owner: Owner) -> Bool { self.owner == owner }
+    mutating func release(_ owner: Owner) -> Bool {
+        guard owns(owner) else { return false }
+        self.owner = nil
+        return true
+    }
+}
+
 /// Exact ownership for work that resolves an episode before a player command has been admitted.
 /// The owner includes every mutable selector that can supersede an in-flight resolve.
 struct EpisodeResolutionOwner: Equatable, Sendable {

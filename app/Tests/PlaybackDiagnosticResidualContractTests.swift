@@ -140,8 +140,14 @@ for (name, boundary, end) in [
 }
 
 private let loadIssuer = section(player, from: "private func loadIntoPlayer(", to: "/// Switch the playing source") ?? ""
+// Admission cleanup may also retire other load-owned work. Require the watchdog
+// retirement inside the accepted-token block, before binding any new attempt,
+// rather than requiring it to be the block's first source line.
+private let acceptedLoadCleanup = loadIssuer.range(
+    of: #"if let issuedToken \{[^{}]*?clearPostFrameResumeSeekWatchdog\(\)\s+beginAssetSanityAttemptIfNeeded\("#,
+    options: .regularExpression)
 check("every accepted load retires the old watchdog before queued native events; refusal preserves it",
-      loadIssuer.range(of: "if let issuedToken {\n            clearPostFrameResumeSeekWatchdog()") != nil
+      acceptedLoadCleanup != nil
         && loadIssuer.components(separatedBy: "clearPostFrameResumeSeekWatchdog()").count == 2)
 
 private let retryBody = section(player, from: "private func retryLoad(resetAutoRetries", to: "/// Live HLS providers") ?? ""

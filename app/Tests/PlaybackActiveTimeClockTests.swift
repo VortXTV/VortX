@@ -18,6 +18,20 @@ enum PlaybackActiveTimeClockTests {
         clock.setPaused(true, now: 420)
         clock.setPaused(false, now: 450)
         precondition(clock.value(at: 450) == 118)
+        var lease = PlaybackIdleTimerLease<Int>()
+        precondition(!lease.owns(1))
+        lease.claim(1)
+        precondition(lease.owns(1))
+        lease.claim(2) // replacement appears before the previous view's late disappearance
+        precondition(!lease.release(1) && lease.owns(2))
+        precondition(lease.release(2) && !lease.owns(2))
+        precondition(!lease.release(2)) // late callback cannot reacquire/release a disappeared view
+        lease.claim(3)
+        clock.setPaused(true, now: 451)
+        precondition(clock.isPaused && lease.owns(3)) // pause allows idle without losing presentation ownership
+        clock.setPaused(false, now: 452)
+        precondition(!clock.isPaused && lease.owns(3))
+        print("PASS idle ownership survives stale view teardown and explicit pause/resume")
         print("PASS active-time deadlines retain their exact unpaused budget across repeated pauses")
     }
 }

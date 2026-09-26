@@ -18,9 +18,11 @@ enum PlayerMidPlaybackStallPolicy {
         loadFailed: Bool,
         isLive: Bool,
         duration: Double,
-        buffering _: Bool
+        buffering _: Bool,
+        deferredResumeInFlight: Bool = false
     ) -> Bool {
         hasStartedPlaying
+            && !deferredResumeInFlight
             && !isPaused
             && !loadFailed
             && !isLive
