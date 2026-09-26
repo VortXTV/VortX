@@ -2372,6 +2372,12 @@ struct TVPlayerView: View {
             case .persistOutgoingCompletionOnly:
                 return
             }
+            // The remux failure and AVFoundation's resulting item failure can arrive separately.
+            // Once this exact empty load is waiting for alternatives, a second error must not
+            // reopen its dead URL through the ordinary decoder-demotion path.
+            if let owner = emptySourceRecoveryOwner, owner == currentEmptySourceRecoveryOwner {
+                return
+            }
             // Stale event from the just-dismounted AVPlayer engine after a user engine switch / demote: a KVO
             // .failed queued on the main thread can land AFTER the surface swap. Swallow it (and DON'T cancel
             // the fresh mpv load's watchdog) when the AV engine is no longer the mounted one, so it never burns
@@ -2503,6 +2509,9 @@ struct TVPlayerView: View {
                 handleMidPlayFailure((data as? String) ?? "", loadToken: loadToken)
             }
         case MPVProperty.endFileEof:
+            if let owner = emptySourceRecoveryOwner, owner == currentEmptySourceRecoveryOwner {
+                return
+            }
             if let loadToken, rejectPrematureEOFIfNeeded(loadToken: loadToken) { return }
             let terminalEOFAction = terminalAction(for: loadToken, kind: .eof)
             // A terminal action that persists a completion or parks a superseded terminal cannot advance or
@@ -4496,6 +4505,12 @@ struct TVPlayerView: View {
         cancelEmptySourceRecovery()
         exhaustedURLs.insert(owner.failedURL)
         emptySourceRecoveryOwner = owner
+        // This source has conclusively ended without media. Its no-frame/retry timers must not
+        // demote or reload the same bytes while this bounded alternative-source owner is active.
+        loadTimeout?.cancel(); loadTimeout = nil
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        autoRetryTask?.cancel(); autoRetryTask = nil
+        cancelAVPostReplacementFirstFrameDeadlineIfOwned(by: owner.loadToken)
         buffering = true
         reconnecting = true
         DiagnosticsLog.log("player", "empty-source recovery awaiting alternatives for exact load")

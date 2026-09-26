@@ -60,6 +60,17 @@ assert(emptyRecovery.includes("EmptySourceRecoveryPolicy.decision("));
 assert(emptyRecovery.includes("current: currentEmptySourceRecoveryOwner"));
 assert(emptyRecovery.includes("exhaustedURLs.insert(owner.failedURL)"));
 assert(emptyRecovery.includes("deadlineExpired: elapsed >= StreamRanking.completeSetDeadline"));
+for (const cancellation of ["loadTimeout?.cancel()", "avStartWatchdog?.cancel()", "autoRetryTask?.cancel()",
+    "cancelAVPostReplacementFirstFrameDeadlineIfOwned(by: owner.loadToken)"]) {
+    assert(emptyRecovery.indexOf(cancellation) >= 0 &&
+        emptyRecovery.indexOf(cancellation) < emptyRecovery.indexOf("emptySourceRecoveryTask = Task"),
+        "empty-source settlement must retire competing no-frame and retry paths");
+}
+const errors = section(tv, "case MPVProperty.endFileError:", "case MPVProperty.endFileEof:");
+assert(errors.includes("if let owner = emptySourceRecoveryOwner, owner == currentEmptySourceRecoveryOwner"),
+    "a second error for the same empty item cannot demote/reopen its URL while alternatives settle");
+assert(tv.includes("case MPVProperty.endFileEof:\n            if let owner = emptySourceRecoveryOwner, owner == currentEmptySourceRecoveryOwner"),
+    "an EOF following the empty-item failure must not retry or advance past the waiting episode");
 assert(section(tv, "private func presentTerminalLoadFailure()", "\n    /// The ordinary").includes("cancelEmptySourceRecovery()"));
 for (const file of ["app/SourcesTV/TVPlayerView.swift", "app/Sources/PlayerScreen.swift"]) {
     const source = fs.readFileSync(path.join(root, file), "utf8");
