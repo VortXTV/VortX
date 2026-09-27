@@ -11,6 +11,7 @@ private enum TrickplayUploadPolicyTests {
         testUHDHDRLocalCaptureEligibilityMatrix()
         testBackendQualifiedUHDHDRCaptureEligibility()
         testCommunityUploadRequiresRealDuration()
+        testRepeatedDurationDoesNotReconsiderUpload()
         testBackwardSeekRestartsCaptureCadence()
         testCaptureSessionIdentityBoundaries()
         testCommunityDurationRekeyPreservesSessionFramesWiring()
@@ -450,7 +451,12 @@ private enum TrickplayUploadPolicyTests {
             "a provisional-to-real community duration re-key must preserve time-indexed session frames"
         )
         expect(
-            communityConfigure.contains("if isRealDuration { maybeUploadProgressively() }")
+            communityConfigure.contains("if durationBecameReal { maybeUploadProgressively() }")
+                && sourceContainsInOrder(String(communityConfigure), [
+                    "TrickplayUploadPolicy.shouldReconsiderSameKeyDuration(",
+                    "hadRealDuration: hasRealDuration, incomingIsReal: isRealDuration)",
+                    "if isRealDuration { hasRealDuration = true }"
+                ])
                 && communityConfigure.contains("if hasRealDuration { maybeUploadProgressively() }"),
             "both same-bucket and bucket-changing real-duration arrivals must reconsider retained frames"
         )
@@ -460,6 +466,21 @@ private enum TrickplayUploadPolicyTests {
                 && !source.contains("guard CommunityTrickplay.isEnabled,\n              let key = communityKey"),
             "provisional duration can retain local frames and fetch, but no progressive, final, or retirement POST may be admitted"
         )
+    }
+
+    private static func testRepeatedDurationDoesNotReconsiderUpload() {
+        var known = false
+        var reconsiderations = 0
+        for isReal in [false, false, true] + Array(repeating: true, count: 14_400) {
+            if TrickplayUploadPolicy.shouldReconsiderSameKeyDuration(
+                hadRealDuration: known, incomingIsReal: isReal) { reconsiderations += 1 }
+            if isReal { known = true }
+        }
+        expect(reconsiderations == 1, "an hour of 4Hz duration ticks must admit only the first real-duration transition")
+        expect(!TrickplayUploadPolicy.shouldReconsiderSameKeyDuration(hadRealDuration: true, incomingIsReal: false),
+               "a provisional callback cannot revoke known real duration")
+        expect(TrickplayUploadPolicy.shouldReconsiderSameKeyDuration(hadRealDuration: false, incomingIsReal: true),
+               "a new content identity can confirm real duration independently")
     }
 
     private static func testSameMediaDiskCacheSurvivesRemount() {

@@ -322,7 +322,10 @@ jobs:
             echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved"
           }
           build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" core-only
-          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both
-          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv-x86" both x86_64
+          # The pinned NodeMobile tvOS simulator framework supports arm64 only, matching
+          # the protected release smoke lane. Lite has no NodeMobile and retains the
+          # independent Intel simulator link check against the universal engine stubs.
+          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both arm64
+          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite    "$RUNNER_TEMP/dd-tvlite-x86" core-only x86_64
           build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    both
           build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    core-only

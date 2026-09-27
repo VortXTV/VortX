@@ -197,6 +197,8 @@ final class ScrubThumbnailsStore: ObservableObject {
             }
             return
         }
+        let durationBecameReal = TrickplayUploadPolicy.shouldReconsiderSameKeyDuration(
+            hadRealDuration: hasRealDuration, incomingIsReal: isRealDuration)
         // Mark the real-duration arrival regardless of whether the key changes, so uploads unblock.
         if isRealDuration { hasRealDuration = true }
         // No-op if already keyed on this exact content key (idempotent across repeated calls). The real
@@ -205,7 +207,9 @@ final class ScrubThumbnailsStore: ObservableObject {
             // A real duration can land in the same bucket as the provisional
             // estimate. Retained local frames become uploadable at that moment,
             // so do not wait for another capture tick to reconsider them.
-            if isRealDuration { maybeUploadProgressively() }
+            // Repeated 2–4 Hz clock configuration is not new evidence. Checking on every tick caused
+            // thousands of identical skip logs and work even when no additional frame was captured.
+            if durationBecameReal { maybeUploadProgressively() }
             return
         }
         if communityKey != nil, !isRealDuration { return }   // keep the provisional key until the real one lands

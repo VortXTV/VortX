@@ -284,6 +284,12 @@ struct TrickplayLocalCaptureBreaker: Equatable, Sendable {
 /// failure, progressive decline, or material coverage growth. A declined progressive
 /// remains one-shot; a declined or stored teardown response is final for that key.
 struct TrickplayUploadPolicy {
+    /// Clock updates repeat the same real duration; only its first confirmation changes upload eligibility.
+    /// New captures and content-key changes have their own admission paths.
+    static func shouldReconsiderSameKeyDuration(hadRealDuration: Bool, incomingIsReal: Bool) -> Bool {
+        incomingIsReal && !hadRealDuration
+    }
+
     enum Kind: Equatable, Sendable {
         case progressive
         case final
