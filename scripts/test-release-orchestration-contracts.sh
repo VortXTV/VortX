@@ -209,8 +209,12 @@ require_grep "validation verifies StremioXCore stub marker" \
     'StremioXCore\.xcframework/STUB-CI-ONLY\.txt' "$VALIDATION_WF"
 require_grep "validation verifies VortxEngine stub marker" \
     'VortxEngine\.xcframework/STUB-CI-ONLY\.txt' "$VALIDATION_WF"
-require_grep "validation proves the x86_64 tvOS simulator link" \
-    'dd-tv-x86.*x86_64' "$VALIDATION_WF"
+require_grep "validation proves the supported Full tvOS arm64 simulator link" \
+    'dd-tv".*both arm64' "$VALIDATION_WF"
+require_grep "validation proves the Lite x86_64 tvOS simulator link" \
+    'dd-tvlite-x86.*core-only x86_64' "$VALIDATION_WF"
+require_grep "stub engine preserves the real nested module map destination" \
+    'header_dir="\$header_dir/vortx"' "$REPO_ROOT/scripts/build-stub-engine-xcframeworks.sh"
 require_grep "stub frameworks provide a universal simulator slice" \
     'tvos-arm64_x86_64-simulator.*x86_64-apple-tvos' "$REPO_ROOT/scripts/build-stub-engine-xcframeworks.sh"
 require_grep "stub framework plist declares x86_64 simulator support" \
@@ -231,6 +235,14 @@ require_grep "validation disables code signing for secretless builds" \
     'CODE_SIGNING_ALLOWED=NO' "$VALIDATION_WF"
 require_grep "validation verifies bundle IDs of produced apps" \
     'CFBundleIdentifier' "$VALIDATION_WF"
+require_grep "validation reads the macOS nested bundle plist" \
+    'info_plist="\$products_dir/Contents/Info.plist"' "$VALIDATION_WF"
+require_grep "validation inspects the macOS nested executable directory" \
+    'executable_dir="\$products_dir/Contents/MacOS"' "$VALIDATION_WF"
+require_grep "validation reads bundle metadata from the selected plist" \
+    'CFBundleExecutable.*"\$info_plist"' "$VALIDATION_WF"
+require_grep "validation resolves engine symbols from the selected executable" \
+    'nm -gU "\$executable_dir/\$exe"' "$VALIDATION_WF"
 require_grep "validation verifies Mach-O executables in produced apps" \
     'Mach-O' "$VALIDATION_WF"
 require_grep "validation verifies linked engine symbols are resolved" \

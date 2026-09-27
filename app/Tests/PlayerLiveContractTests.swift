@@ -263,6 +263,14 @@ enum PlayerLiveContractTests {
     }
 
     private static func testMidPlaybackStallPolicy() {
+        check("stall policy: unresolved resume owns recovery instead of reloading an optimistic UI position",
+              !PlayerMidPlaybackStallPolicy.shouldObserve(hasStartedPlaying: true, isPaused: false,
+                loadFailed: false, isLive: false, duration: 2_893, buffering: false,
+                deferredResumeInFlight: true))
+        check("stall policy: settled or stale resume no longer blocks ordinary recovery",
+              PlayerMidPlaybackStallPolicy.shouldObserve(hasStartedPlaying: true, isPaused: false,
+                loadFailed: false, isLive: false, duration: 2_893, buffering: false,
+                deferredResumeInFlight: false))
         check("stall policy: visible buffering after first frame remains observable",
               PlayerMidPlaybackStallPolicy.shouldObserve(
                 hasStartedPlaying: true,
@@ -4490,12 +4498,12 @@ enum PlayerLiveContractTests {
             to: "/// Show a brief player toast")
         check("wiring: paused AV demotion and both manual engine directions carry a token-fenced transport intent",
               sourceContainsInOrder(tvDemote, [
-                "let desiredPaused = isPaused",
+                "let desiredPaused = playbackDeadlineClock.isPaused",
                 "captureRecoverySelections()",
                 "queueIncomingTransportIntent(paused: desiredPaused)",
               ])
                   && sourceContainsInOrder(tvEngineSwitch, [
-                    "let desiredPaused = isPaused",
+                    "let desiredPaused = playbackDeadlineClock.isPaused",
                     "captureRecoverySelections()",
                     "queueIncomingTransportIntent(paused: desiredPaused)",
                   ])

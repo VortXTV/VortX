@@ -275,11 +275,15 @@ generate_stub_framework() {
     for spec in "${SDK_SPECS[@]}"; do
         IFS='|' read -r sdk slice_name triples <<<"$spec"
         local slice_dir="$fw_dir/$slice_name"
-        # Destination header dir is ALWAYS "Headers" inside the slice, mirroring the real
-        # frameworks; headers_rel only describes where the stub sources keep them.
-        mkdir -p "$slice_dir/Headers"
-        cp "$src_root/$headers_rel/"*.h "$slice_dir/Headers/"
-        cp "$src_root/$headers_rel/module.modulemap" "$slice_dir/Headers/module.modulemap"
+        # Keep VortxEngine's real Headers/vortx layout. Flattening both engines' module
+        # maps into Headers makes Xcode copy both to include/module.modulemap and fail.
+        local header_dir="$slice_dir/Headers"
+        if [[ "$name" == "VortxEngine" ]]; then
+            header_dir="$header_dir/vortx"
+        fi
+        mkdir -p "$header_dir"
+        cp "$src_root/$headers_rel/"*.h "$header_dir/"
+        cp "$src_root/$headers_rel/module.modulemap" "$header_dir/module.modulemap"
         # shellcheck disable=SC2086
         build_static_lib "$src_root" "$headers_rel" "$slice_dir/$lib_file" \
             "$(xcrun --sdk "$sdk" --show-sdk-path)" ${triples//,/ }

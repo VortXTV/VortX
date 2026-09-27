@@ -41,6 +41,10 @@ private enum DeferredResumeSeekReconciliationPolicyTests {
             ) == nil,
             "a superseded watchdog cannot reconcile a newer source generation"
         )
-        print("DeferredResumeSeekReconciliationPolicyTests: 4/4 passed")
+        let field = DeferredResumeSeekReconciliationPolicy.abandonment(targetSeconds: 483,
+            actualPositionSeconds: 2, landingToleranceSeconds: 5, watchdogStillOwnsGeneration: true)
+        precondition(field?.presentationSeconds == 2 && field?.persistenceFloorSeconds == 483)
+        precondition(field.map { $0.presentationSeconds + 0.1 } == 2.1)
+        print("DeferredResumeSeekReconciliationPolicyTests: 6/6 passed")
     }
 }

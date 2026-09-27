@@ -290,34 +290,48 @@ jobs:
           build_shell() {
             local scheme="$1" destination="$2" expected_bundle="$3" dd="$4" require_engines="$5" arch="${6:-}"
             echo "::group::xcodebuild $scheme"
+            # Keep code in the executable checked below, not Xcode's Debug preview trampoline/dylib pair.
             xcodebuild -project app/VortX.xcodeproj -scheme "$scheme" \
               -destination "$destination" \
               -derivedDataPath "$dd" \
-              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ${arch:+ARCHS=$arch ONLY_ACTIVE_ARCH=NO} \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO ENABLE_DEBUG_DYLIB=NO ${arch:+ARCHS=$arch ONLY_ACTIVE_ARCH=NO} \
               build
             echo '::endgroup::'
             local products_dir
-            products_dir="$(find "$dd/Build/Products" -type d -name '*.app' | head -n 1)"
+            products_dir="$(find "$dd/Build/Products" -type d -name '*.app' -prune -print | sed -n '1p')"
             [ -n "$products_dir" ] || { echo "::error::$scheme produced no .app"; exit 1; }
-            local bundle_id exe
-            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$products_dir/Info.plist")"
+            local bundle_id exe info_plist executable_dir
+            info_plist="$products_dir/Info.plist"
+            executable_dir="$products_dir"
+            if [ -f "$products_dir/Contents/Info.plist" ]; then
+              info_plist="$products_dir/Contents/Info.plist"
+              executable_dir="$products_dir/Contents/MacOS"
+            fi
+            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")"
             [ "$bundle_id" = "$expected_bundle" ] || { echo "::error::$scheme bundle id $bundle_id != $expected_bundle"; exit 1; }
-            exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$products_dir/Info.plist")"
-            file "$products_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
-            if ! nm -gU "$products_dir/$exe" | grep -q '_stremiox_core_schema_version'; then
+            exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
+            file "$executable_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
+            # Capture first: grep -q can close the pipe early and make nm fail with SIGPIPE under pipefail.
+            local defined_symbols undefined_symbols
+            defined_symbols="$(nm -gU "$executable_dir/$exe")"
+            undefined_symbols="$(nm -u "$executable_dir/$exe")"
+            if ! grep -q '_stremiox_core_schema_version' <<< "$defined_symbols"; then
               echo "::error::$scheme binary does not contain the linked engine symbol _stremiox_core_schema_version"; exit 1;
             fi
             if [ "$require_engines" = "both" ]; then
-              nm -gU "$products_dir/$exe" | grep -q '_vortx_init_runtime' \
+              grep -q '_vortx_init_runtime' <<< "$defined_symbols" \
                 || { echo "::error::$scheme binary does not contain the linked engine symbol _vortx_init_runtime"; exit 1; }
             fi
-            if nm -u "$products_dir/$exe" | grep -Eq '_stremiox_core_|_vortx_'; then
-              echo "::error::$scheme binary still has unresolved engine symbols"; nm -u "$products_dir/$exe" | grep -E '_stremiox_core_|_vortx_'; exit 1
+            if grep -Eq '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; then
+              echo "::error::$scheme binary still has unresolved engine symbols"; grep -E '_stremiox_core_|_vortx_' <<< "$undefined_symbols"; exit 1
             fi
             echo "ok: $scheme -> $(basename "$products_dir") bundle=$bundle_id executable=$exe engines resolved"
           }
           build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite     "$RUNNER_TEMP/dd-tvlite" core-only
-          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both
-          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv-x86" both x86_64
+          # The pinned NodeMobile tvOS simulator framework supports arm64 only, matching
+          # the protected release smoke lane. Lite has no NodeMobile and retains the
+          # independent Intel simulator link check against the universal engine stubs.
+          build_shell VortXTV       'generic/platform=tvOS Simulator' com.stremiox.tv         "$RUNNER_TEMP/dd-tv"     both arm64
+          build_shell VortXTVLite   'generic/platform=tvOS Simulator' com.stremiox.tv.lite    "$RUNNER_TEMP/dd-tvlite-x86" core-only x86_64
           build_shell VortXiOSNative 'generic/platform=iOS Simulator'  com.stremiox.app.native "$RUNNER_TEMP/dd-ios"    both
           build_shell VortXMac      'platform=macOS,arch=arm64'       com.stremiox.mac        "$RUNNER_TEMP/dd-mac"    core-only

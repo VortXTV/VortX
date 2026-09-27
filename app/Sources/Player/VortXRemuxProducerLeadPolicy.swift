@@ -18,11 +18,9 @@ import Foundation
 /// while `VortXHLSConsumptionWindowPolicy.floor` independently guarantees the behind-frontier history itself
 /// (see that type's own header for the two-pool accounting fix).
 enum VortXRemuxProducerLeadPolicy {
-    /// One ordinary on-device session has one current and one recently superseded retained window, plus the
-    /// operational and safety reservations: `2W + O + H = C`. An unseen producer tail may consume at most one
-    /// window share. This keeps a high-bitrate remux from consuming the bytes reserved for the just-replaced
-    /// playlist while AVPlayer is still legally entitled to read it.
-    static let maximumAheadBytes = VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes
+    /// The forward share of ONE retained generation; the history share is reserved separately within W.
+    /// Giving both sides all of W overcommits the spool before the predecessor's HLS grace expires.
+    static let maximumAheadBytes = VortXHLSConsumptionWindowPolicy.producerAheadMaximumBytes
     /// Stop producing once the produced tail is at least this far (in source seconds) ahead of the confirmed
     /// playhead.
     static let pauseAheadSeconds: Double = 90
@@ -81,25 +79,25 @@ enum VortXRemuxProducerLeadPolicy {
 ///
 /// The two sides were tuned independently and never checked against each other. After the first rendered
 /// frame, `VortXRemuxForwardBufferPolicy.steadyStateSeconds` told AVPlayer to hold THIRTY seconds of media,
-/// while `maximumAheadBytes` (352 MiB) lets the producer keep only what fits one retained window share. On
+/// while `maximumAheadBytes` lets the producer keep only its partition of one retained window share. On
 /// the Beta 25 field stream (~86.4 Mb/s, see `highThroughputProducerCannotConsumeTheRetainedWindowBudget`)
-/// that ceiling is ~34 s of media: after AVPlayer filled its own 30 s target, ONE more published segment
+/// the then-352 MiB ceiling was ~34 s of media: after AVPlayer filled its own 30 s target, ONE more published segment
 /// (~6-12 s of media at 4K bitrates) crossed the byte cap and parked production. The playlist then froze
 /// until the playhead consumed a full segment, AVPlayer tipped into
 /// `AVPlayerWaitingToMinimizeStallsReason` on any jitter, and the stall watchdog remounted the whole remux -
 /// sixteen-plus times in one episode (diag 6, ~323 s of visible buffering).
 ///
-/// The fix keeps the spool reservation algebra untouched (`maximumAheadBytes` stays exactly one window
-/// share, protecting the rewind floor) and instead sizes the player's ask to what production may legally
+/// The coupling sizes the player's ask to the actual forward partition, protecting the rewind floor and
+/// predecessor-generation reservation. The player's ask must fit what production may legally
 /// supply: target = affordable seconds - one conservative EXT-X-TARGETDURATION of fetch/granularity margin,
-/// floored so an extreme-bitrate stream still gets a viable target rather than zero.
+/// with a soft floor that cannot ask for more than half the affordable media at extreme bitrates.
 enum VortXRemuxForwardBufferCoupling {
     /// Fetch-latency + segment-granularity headroom demanded between the player target and the byte ceiling.
     /// One conservative EXT-X-TARGETDURATION (12 s here): a parked-gap of up to one target must never reach
     /// the playhead while AVPlayer still holds its full target.
     static let safetySeconds: TimeInterval = 12
-    /// Floor for extreme bitrates, where even the ceiling affords little more than the margin itself. Well
-    /// above the 4 s startup floor, so the coupled target never drops below proven-startable territory.
+    /// Preferred floor, not an unconditional minimum: when the producer cannot afford sixteen seconds,
+    /// ask for at most half its capacity. An impossible eight-second target can prevent rebuffering from ending.
     static let minimumSteadyStateSeconds: TimeInterval = 8
 
     /// Pure decision. Unknown bitrate or a non-positive budget fails OPEN to `unconstrainedDuration`
@@ -114,7 +112,8 @@ enum VortXRemuxForwardBufferCoupling {
         guard affordableSeconds.isFinite, affordableSeconds > 0 else { return unconstrainedDuration }
         let capped = affordableSeconds - safetySeconds
         guard capped < unconstrainedDuration else { return unconstrainedDuration }
-        return max(minimumSteadyStateSeconds, capped)
+        let affordableFloor = min(minimumSteadyStateSeconds, affordableSeconds / 2)
+        return min(unconstrainedDuration, max(affordableFloor, capped))
     }
 
     // MARK: Generation-owned evidence phase (branch review finding 2)
