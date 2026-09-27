@@ -235,6 +235,14 @@ require_grep "validation disables code signing for secretless builds" \
     'CODE_SIGNING_ALLOWED=NO' "$VALIDATION_WF"
 require_grep "validation verifies bundle IDs of produced apps" \
     'CFBundleIdentifier' "$VALIDATION_WF"
+require_grep "validation reads the macOS nested bundle plist" \
+    'info_plist="\$products_dir/Contents/Info.plist"' "$VALIDATION_WF"
+require_grep "validation inspects the macOS nested executable directory" \
+    'executable_dir="\$products_dir/Contents/MacOS"' "$VALIDATION_WF"
+require_grep "validation reads bundle metadata from the selected plist" \
+    'CFBundleExecutable.*"\$info_plist"' "$VALIDATION_WF"
+require_grep "validation resolves engine symbols from the selected executable" \
+    'nm -gU "\$executable_dir/\$exe"' "$VALIDATION_WF"
 require_grep "validation verifies Mach-O executables in produced apps" \
     'Mach-O' "$VALIDATION_WF"
 require_grep "validation verifies linked engine symbols are resolved" \

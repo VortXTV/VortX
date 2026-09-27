@@ -298,17 +298,23 @@ jobs:
               build
             echo '::endgroup::'
             local products_dir
-            products_dir="$(find "$dd/Build/Products" -type d -name '*.app' | head -n 1)"
+            products_dir="$(find "$dd/Build/Products" -type d -name '*.app' -prune -print | sed -n '1p')"
             [ -n "$products_dir" ] || { echo "::error::$scheme produced no .app"; exit 1; }
-            local bundle_id exe
-            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$products_dir/Info.plist")"
+            local bundle_id exe info_plist executable_dir
+            info_plist="$products_dir/Info.plist"
+            executable_dir="$products_dir"
+            if [ -f "$products_dir/Contents/Info.plist" ]; then
+              info_plist="$products_dir/Contents/Info.plist"
+              executable_dir="$products_dir/Contents/MacOS"
+            fi
+            bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")"
             [ "$bundle_id" = "$expected_bundle" ] || { echo "::error::$scheme bundle id $bundle_id != $expected_bundle"; exit 1; }
-            exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$products_dir/Info.plist")"
-            file "$products_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
+            exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist")"
+            file "$executable_dir/$exe" | grep -q 'Mach-O' || { echo "::error::$scheme executable is not Mach-O"; exit 1; }
             # Capture first: grep -q can close the pipe early and make nm fail with SIGPIPE under pipefail.
             local defined_symbols undefined_symbols
-            defined_symbols="$(nm -gU "$products_dir/$exe")"
-            undefined_symbols="$(nm -u "$products_dir/$exe")"
+            defined_symbols="$(nm -gU "$executable_dir/$exe")"
+            undefined_symbols="$(nm -u "$executable_dir/$exe")"
             if ! grep -q '_stremiox_core_schema_version' <<< "$defined_symbols"; then
               echo "::error::$scheme binary does not contain the linked engine symbol _stremiox_core_schema_version"; exit 1;
             fi
