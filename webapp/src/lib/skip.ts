@@ -1,6 +1,5 @@
-// Intro / outro skip segments from VortX's own keyless SkipDB worker (skip.vortx.tv), the same service the
-// native apps read. On a title's playback the player shows a "Skip Intro" / "Skip Outro" button while inside
-// a known segment. Read-only + keyless here; contribution stays in the apps' in-player editor.
+// Intro, recap, credits and preview segments from the same keyless service the native apps read.
+// Contribution stays in the apps' in-player editor.
 //
 // Read contract (mirrors SkipTimestampService in the Apple app): GET skip.vortx.tv/skip?key=<key> where the
 // key is imdb:tt<digits> for a movie, or imdb:tt<digits>:<season>:<episode> for an episode. The worker
@@ -12,18 +11,8 @@ import type { SkipSegment } from "./playerControls";
 const SKIP_HOST = "https://skip.vortx.tv";
 const SKIP_TIMEOUT_MS = 3500;
 
-/** One segment as the worker returns it (tolerant of a few field spellings the dump / apps use). */
-interface RawSkipSegment {
-  type?: string; // "intro" | "outro" | "recap" | "credits" | ...
-  category?: string;
-  startTime?: number;
-  endTime?: number;
-  start?: number;
-  end?: number;
-}
-
 interface SkipResponse {
-  segments?: RawSkipSegment[];
+  segments?: unknown;
 }
 
 /** Build the SkipDB read key for a title/episode. `id` is the display id (tt...) and season/episode are the
@@ -36,7 +25,7 @@ export function skipKey(id: string, season?: number, episode?: number): string |
   return season !== undefined && episode !== undefined ? `${base}:${season}:${episode}` : base;
 }
 
-/** Fetch intro / outro segments for a title/episode. Empty on any failure (fail-soft). */
+/** Fetch known segments for a title/episode. Empty on any failure (fail-soft). */
 export async function fetchSkipSegments(id: string, season?: number, episode?: number): Promise<SkipSegment[]> {
   const key = skipKey(id, season, episode);
   if (!key) return [];
@@ -49,22 +38,43 @@ export async function fetchSkipSegments(id: string, season?: number, episode?: n
     });
     if (!res.ok) return [];
     const data = (await res.json()) as SkipResponse;
-    return normalise(data.segments ?? []);
+    return normaliseSkipSegments(data.segments);
   } catch {
     return [];
   }
 }
 
-/** Normalise the worker's segments to the player's shape, keeping only well-formed intro / outro spans.
- *  Recap / credits map onto intro / outro respectively so they still surface a skip affordance. */
-function normalise(raw: RawSkipSegment[]): SkipSegment[] {
+function skipKind(label: string): SkipSegment["kind"] | null {
+  switch (label.trim().toLowerCase().replace(/[\s-]+/g, "_")) {
+    case "intro": case "opening": case "op": return "intro";
+    case "recap": case "previously": return "recap";
+    case "outro": case "credits": case "ending": case "closing": case "ed": return "credits";
+    case "preview": case "next_episode": return "preview";
+    default: return null;
+  }
+}
+
+export function skipLabel(kind: SkipSegment["kind"]): string {
+  return { intro: "Skip Intro", recap: "Skip Recap", credits: "Skip Credits", preview: "Skip Preview" }[kind];
+}
+
+/** The live endpoint sends a keyed object in milliseconds; older providers send an array in seconds.
+ *  Validate each entry independently so malformed or unknown segments cannot erase valid neighbours. */
+export function normaliseSkipSegments(raw: unknown): SkipSegment[] {
+  if (!raw || typeof raw !== "object") return [];
+  const entries: Array<[string, unknown]> = Array.isArray(raw)
+    ? raw.map((segment) => ["", segment]) : Object.entries(raw);
   const out: SkipSegment[] = [];
-  for (const s of raw) {
-    const start = typeof s.startTime === "number" ? s.startTime : s.start;
-    const end = typeof s.endTime === "number" ? s.endTime : s.end;
-    if (typeof start !== "number" || typeof end !== "number" || end <= start) continue;
-    const label = (s.type ?? s.category ?? "").toLowerCase();
-    const kind: "intro" | "outro" = label.includes("outro") || label.includes("credit") ? "outro" : "intro";
+  for (const [key, segment] of entries) {
+    if (!segment || typeof segment !== "object" || Array.isArray(segment)) continue;
+    const s = segment as Record<string, unknown>;
+    const start = typeof s.start_ms === "number" ? s.start_ms / 1000 : s.startTime ?? s.start;
+    const end = typeof s.end_ms === "number" ? s.end_ms / 1000 : s.endTime ?? s.end;
+    if (typeof start !== "number" || typeof end !== "number" || !Number.isFinite(start) ||
+        !Number.isFinite(end) || start < 0 || end <= start) continue;
+    const label = s.type ?? s.category ?? key;
+    const kind = typeof label === "string" ? skipKind(label) : null;
+    if (!kind) continue;
     out.push({ kind, start, end });
   }
   return out;
