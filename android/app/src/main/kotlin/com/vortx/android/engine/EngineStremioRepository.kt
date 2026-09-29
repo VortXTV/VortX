@@ -2372,6 +2372,10 @@ class EngineStremioRepository(
                 "This source type is not playable on Android yet.",
             )
         }
+    }.map { playable ->
+        playable.copy(subtitleMetadata = com.vortx.android.model.SubtitleRequestMetadata(
+            filename = source.filename, videoHash = source.videoHash, videoSize = source.videoSize,
+        ))
     }
 
     // ---- SD-1: Play a link / magnet ----

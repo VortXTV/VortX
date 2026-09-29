@@ -367,6 +367,8 @@ object SettingsBackup {
         "stremiox.autoLandscapeInPlayer" to SettingType.BOOL,
         "stremiox.keepPlayingInBackground" to SettingType.BOOL,
         "stremiox.communityTrickplay" to SettingType.BOOL,
+        "stremiox.tracks.preferAddonSubtitles" to SettingType.BOOL,
+        "stremiox.tracks.subOnlyPreferred" to SettingType.BOOL,
         "stremiox.forceSDRTonemap" to SettingType.BOOL,
         "vortx.player.badSourceAutoRetry" to SettingType.BOOL,
         "vortx.player.bufferTuning" to SettingType.BOOL,

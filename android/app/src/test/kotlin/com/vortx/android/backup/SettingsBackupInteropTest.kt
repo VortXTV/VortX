@@ -16,6 +16,17 @@ import java.util.Date
 
 class SettingsBackupInteropTest {
 
+    @Test
+    fun subtitleAddOnPreferencesRoundTripThroughAccountSettings() {
+        val values = mapOf<String, Any>("stremiox.tracks.preferAddonSubtitles" to true,
+            "stremiox.tracks.subOnlyPreferred" to false)
+        assertEquals(values, SettingsBackup.plistSettingsFrom(values))
+        val restored = SettingsBackup.settingsFromBlob(blobFromDomain(values))
+        assertEquals(SettingsBackup.BackupValue.Bool(true), restored?.get("stremiox.tracks.preferAddonSubtitles"))
+        assertEquals(SettingsBackup.BackupValue.Bool(false), restored?.get("stremiox.tracks.subOnlyPreferred"))
+        assertTrue(SettingsBackup.plistSettingsFrom(mapOf("stremiox.tracks.preferAddonSubtitles" to "true")).isEmpty())
+    }
+
     private val deniedKeys = listOf(
         "AppleLanguages",
         "NSNavLastRootDirectory",

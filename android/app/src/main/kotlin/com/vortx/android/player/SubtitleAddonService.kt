@@ -2,6 +2,7 @@ package com.vortx.android.player
 
 import com.vortx.android.model.InstalledAddon
 import com.vortx.android.model.MediaRef
+import com.vortx.android.model.SubtitleRequestMetadata
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -10,7 +11,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 
 /// One external subtitle offered by a subtitles add-on (e.g. an OpenSubtitles add-on). Mirrors Apple
 /// `AddonSubtitle` (SubtitleAddons.swift:4).
@@ -19,7 +19,11 @@ data class AddonSubtitle(
     val url: String,
     val lang: String,
     val addonName: String,
-)
+    val releaseName: String? = null,
+) {
+    val displayTitle: String get() = releaseName?.takeIf { it.isNotBlank() }
+        ?.let { "$addonName · $it" } ?: addonName
+}
 
 /// A minimal installed subtitle add-on to query: the base URL and a display name. Mirrors Apple
 /// `SubtitleAddonSource` (SubtitleAddons.swift:15).
@@ -79,16 +83,15 @@ object SubtitleAddonService {
     /// deduplicated by URL (Apple `fetch`, SubtitleAddons.swift:54: same route
     /// `{base}/subtitles/{type}/{videoId}.json`, same 15s per-source timeout, same fail-soft
     /// empty-on-error per add-on, same source-order concat + URL dedupe).
-    suspend fun fetch(sources: List<SubtitleAddonSource>, type: String, videoId: String): List<AddonSubtitle> {
+    suspend fun fetch(sources: List<SubtitleAddonSource>, type: String, videoId: String,
+                      metadata: SubtitleRequestMetadata = SubtitleRequestMetadata()): List<AddonSubtitle> {
         if (sources.isEmpty()) return emptyList()
-        val safeId = runCatching {
-            // Percent-encode the path segment but keep the id's `:` separators readable, matching
-            // Apple's `.urlPathAllowed` character set (which does not escape `:`).
-            URLEncoder.encode(videoId, "UTF-8").replace("+", "%20").replace("%3A", ":")
-        }.getOrDefault(videoId)
+        val path = metadata.resourcePath(type, videoId)
+        val legacyPath = SubtitleRequestMetadata().resourcePath(type, videoId)
+        val paths = if (path == legacyPath) listOf(path) else listOf(path, legacyPath)
         val collected = coroutineScope {
             sources.map { source ->
-                async(Dispatchers.IO) { fetchOne(source, type, safeId) }
+                async(Dispatchers.IO) { fetchOne(source, paths) }
             }.awaitAll()
         }
         val seen = mutableSetOf<String>()
@@ -97,36 +100,40 @@ object SubtitleAddonService {
 
     /// One add-on's `subtitles` response, or empty on ANY failure (bad URL, network error, non-2xx,
     /// malformed JSON) -- a flaky subtitle add-on must never break the player's track list.
-    private suspend fun fetchOne(source: SubtitleAddonSource, type: String, safeId: String): List<AddonSubtitle> =
+    private suspend fun fetchOne(source: SubtitleAddonSource, paths: List<String>): List<AddonSubtitle> =
         withContext(Dispatchers.IO) {
             runCatching {
-                val connection = URL("${source.baseUrl}/subtitles/$type/$safeId.json").openConnection() as HttpURLConnection
-                try {
-                    connection.requestMethod = "GET"
-                    connection.connectTimeout = FETCH_TIMEOUT_MS
-                    connection.readTimeout = FETCH_TIMEOUT_MS
-                    connection.instanceFollowRedirects = true
-                    if (connection.responseCode !in 200..299) return@runCatching emptyList()
-                    // WHY audit 07.5: add-on listings are tiny. Refuse a hostile/broken response above 1 MiB
-                    // instead of letting readText allocate without bound; the per-add-on failure stays soft.
-                    if (connection.contentLengthLong > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
-                    val bytes = connection.inputStream.use { input ->
-                        val out = java.io.ByteArrayOutputStream()
-                        val buffer = ByteArray(16 * 1024)
-                        var total = 0
-                        while (true) {
-                            val read = input.read(buffer)
-                            if (read < 0) break
-                            total += read
-                            if (total > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
-                            out.write(buffer, 0, read)
+                for ((attempt, path) in paths.withIndex()) {
+                    val connection = URL("${source.baseUrl.trimEnd('/')}/$path").openConnection() as HttpURLConnection
+                    try {
+                        connection.requestMethod = "GET"
+                        connection.connectTimeout = FETCH_TIMEOUT_MS
+                        connection.readTimeout = FETCH_TIMEOUT_MS
+                        connection.instanceFollowRedirects = true
+                        val status = connection.responseCode
+                        if (attempt == 0 && paths.size > 1 && status in listOf(404, 405)) continue
+                        if (status !in 200..299) return@runCatching emptyList()
+                        // Listings are tiny: enforce the cap even when Content-Length is absent or false.
+                        if (connection.contentLengthLong > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
+                        val bytes = connection.inputStream.use { input ->
+                            val out = java.io.ByteArrayOutputStream()
+                            val buffer = ByteArray(16 * 1024)
+                            var total = 0
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                total += read
+                                if (total > LISTING_RESPONSE_MAX_BYTES) return@runCatching emptyList()
+                                out.write(buffer, 0, read)
+                            }
+                            out.toByteArray()
                         }
-                        out.toByteArray()
+                        return@runCatching parseSubtitles(bytes.toString(Charsets.UTF_8), source.name)
+                    } finally {
+                        connection.disconnect()
                     }
-                    parseSubtitles(bytes.toString(Charsets.UTF_8), source.name)
-                } finally {
-                    connection.disconnect()
                 }
+                emptyList()
             }.getOrDefault(emptyList())
         }
 
@@ -139,13 +146,13 @@ object SubtitleAddonService {
         val out = mutableListOf<AddonSubtitle>()
         for (i in 0 until array.length()) {
             val sub = array.optJSONObject(i) ?: continue
-            val url = sub.optString("url")
-            if (url.isBlank()) continue
+            val url = (sub.opt("url") as? String)?.takeIf { it.isNotBlank() } ?: continue
             out += AddonSubtitle(
-                id = sub.optString("id").ifBlank { url },
+                id = (sub.opt("id") as? String)?.takeIf { it.isNotBlank() } ?: url,
                 url = url,
-                lang = sub.optString("lang").ifBlank { "und" },
+                lang = (sub.opt("lang") as? String)?.takeIf { it.isNotBlank() } ?: "und",
                 addonName = addonName,
+                releaseName = (sub.opt("subtitleFileName") as? String)?.takeIf { it.isNotBlank() },
             )
         }
         return out

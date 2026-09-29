@@ -214,7 +214,11 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
     private fun encodeTrackId(group: Int, track: Int): Int = group * 1000 + track
 
     override fun load(playable: Playable) {
-        _state.value = freshPlayerStateForLoad()
+        load(playable, playWhenReady = true)
+    }
+
+    private fun load(playable: Playable, playWhenReady: Boolean, remountPositionMs: Long? = null) {
+        _state.value = freshPlayerStateForLoad().copy(isPaused = !playWhenReady)
         lastPlayable = playable
         // A fresh stream starts with no chapters; the ID3 frames for the new file repopulate the store.
         chapterStore.clear()
@@ -271,8 +275,8 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                     listOf(audioSource) + createExternalSubtitleSources(subtitleConfigs, playable.communityJsTransport),
                 ),
             )
-            player.playWhenReady = true
-            admittedResumePosition(playable.startPositionMs)?.let(player::seekTo)
+            player.playWhenReady = playWhenReady
+            (remountPositionMs ?: admittedResumePosition(playable.startPositionMs))?.let(player::seekTo)
             player.prepare()
             return
         }
@@ -297,10 +301,10 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
                 createExternalSubtitleSources(subtitleConfigs, playable.communityJsTransport),
             ),
         )
-        player.playWhenReady = true
+        player.playWhenReady = playWhenReady
         // Both Exo load routes use the same resume-admission policy. A tail guard cannot run here because
         // Media3 does not know the duration until after prepare; it clamps a past-end seek once known.
-        admittedResumePosition(playable.startPositionMs)?.let(player::seekTo)
+        (remountPositionMs ?: admittedResumePosition(playable.startPositionMs))?.let(player::seekTo)
         player.prepare()
     }
 
@@ -399,12 +403,15 @@ class ExoPlayerEngine(context: Context) : PlayerEngine {
 
     override fun addExternalSubtitle(url: String) {
         val base = lastPlayable ?: return
+        if (normalizedExternalSubtitles(base).any { it.url == url }) return
         val updated = base.copy(externalSubtitles = base.externalSubtitles + url)
-        lastPlayable = updated
-        val resume = player.currentPosition
-        load(updated)
-        if (resume > 0L) player.seekTo(resume)
+        // Sidecars replace the Media3 item, not the viewer's intent. Capture before setMediaSource resets
+        // state; preserve even a zero/sub-five-second position instead of replaying the old resume target.
+        val intent = ExoSubtitleRemountIntent(player.currentPosition.coerceAtLeast(0L), player.playWhenReady)
+        load(updated, playWhenReady = intent.playWhenReady, remountPositionMs = intent.positionMs)
     }
+
+    internal data class ExoSubtitleRemountIntent(val positionMs: Long, val playWhenReady: Boolean)
 
     override fun setSubtitleDelay(seconds: Double) { /* not supported on ExoPlayer; mpv-only control */ }
 

@@ -59,12 +59,15 @@ object TrackSelector {
         audio: List<PlayerTrack>,
         subtitles: List<PlayerTrack>,
         preferences: TrackPreferences,
+        preferAddonSubtitles: Boolean = false,
+        matchAudioSub: Boolean = false,
     ): Boolean {
-        val gotPreferredAudio = firstMatch(audio, preferences.audioLanguages, preferences.rejectTerms) != null
+        val audioChain = if (matchAudioSub) preferences.subtitleLanguages else preferences.audioLanguages
+        val gotPreferredAudio = firstMatch(audio, audioChain, preferences.rejectTerms) != null
         // With preferred audio present, only the "always" policy shows full subtitles; off/forced-only must
         // not trigger a full external sub. Foreign-language content (no preferred audio) always wants them.
         if (gotPreferredAudio && preferences.forcedPolicy != TrackPreferences.ForcedPolicy.ALWAYS) return false
-        return firstMatch(subtitles, preferences.subtitleLanguages, preferences.rejectTerms) == null
+        return preferAddonSubtitles || firstMatch(subtitles, preferences.subtitleLanguages, preferences.rejectTerms) == null
     }
 
     /** First track whose language matches the priority list and whose title isn't rejected. */

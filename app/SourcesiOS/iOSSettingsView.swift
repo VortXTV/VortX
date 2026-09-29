@@ -99,6 +99,7 @@ struct iOSSettingsView: View {
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subOnlyPreferred) private var subOnlyPreferred = false
+    @AppStorage(TrackPreferences.Key.preferAddonSubtitles) private var preferAddonSubtitles = false
     @AppStorage(PGSOCRPolicy.overrideKey) private var recogniseImageSubtitles = true
     // "1" = the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
     @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
@@ -1826,6 +1827,10 @@ struct iOSSettingsView: View {
             .tint(Theme.Palette.accent).id("subForced-\(theme.accentID)")
             Toggle("Only show subtitles in my languages", isOn: $subOnlyPreferred)
                 .tint(Theme.Palette.accent)
+            Toggle("Prefer add-on subtitles", isOn: $preferAddonSubtitles)
+                .tint(Theme.Palette.accent)
+            Text("Use a matching add-on subtitle when available. Keep the built-in track if loading fails.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             Toggle("Recognize image subtitles", isOn: $recogniseImageSubtitles)
                 .tint(Theme.Palette.accent)
         } header: {

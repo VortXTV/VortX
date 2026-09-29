@@ -1036,8 +1036,15 @@ fun PlayerScreen(
     // it on the live engine (mpv `sub-add` / the ExoPlayer side-loaded track rebuild) and
     // auto-selects it once the engine reports the grown track list.
     var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
-    val mountedAddonSubs = remember(playbackSessionKey) { mutableSetOf<String>() }
-    var pendingSubSelectAbove by remember(playbackSessionKey) { mutableStateOf<Int?>(null) }
+    val mountedAddonSubs = remember(playbackSessionKey, engine) { mutableSetOf<String>() }
+    var pendingSubSelectAbove by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
+    var userPickedSubtitle by remember(playbackSessionKey) { mutableStateOf(false) }
+    fun mountAddonSubtitle(sub: AddonSubtitle) {
+        if (mountedAddonSubs.add(sub.url)) {
+            pendingSubSelectAbove = latestState.subtitleTracks.size
+            engine.addExternalSubtitle(sub.url)
+        }
+    }
     LaunchedEffect(playbackSessionKey) {
         if (currentPlayable.isTrailer) return@LaunchedEffect
         val ref = currentPlayable.mediaRef ?: return@LaunchedEffect
@@ -1047,7 +1054,7 @@ fun PlayerScreen(
         if (sources.isEmpty()) return@LaunchedEffect
         val store = TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context))
         addonSubtitles = TrackSelector.keepingPreferredSubtitleLanguages(
-            items = SubtitleAddonService.fetch(sources, type, videoId),
+            items = SubtitleAddonService.fetch(sources, type, videoId, currentPlayable.subtitleMetadata),
             enabled = store.subtitlesOnlyPreferred,
             preferredLanguages = store.current.subtitleLanguages,
             language = AddonSubtitle::lang,
@@ -1099,6 +1106,22 @@ fun PlayerScreen(
         val subId = pick.subtitleId
         if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
         autoSelectDone = true
+    }
+
+    var autoAddonSubtitleTried by remember(playbackSessionKey, engine) { mutableStateOf(false) }
+    val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
+    LaunchedEffect(playbackSessionKey, engine, autoSelectDone, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
+        if (!autoSelectDone || autoAddonSubtitleTried || userPickedSubtitle || addonSubtitles.isEmpty()) return@LaunchedEffect
+        if (!TrackSelector.wantsExternalSubtitle(latestState.audioTracks, latestState.subtitleTracks,
+                trackPreferences, preferAddonSubtitles, matchAudioSub)) {
+            autoAddonSubtitleTried = true
+            return@LaunchedEffect
+        }
+        val sub = trackPreferences.subtitleLanguages.asSequence().mapNotNull { language ->
+            addonSubtitles.firstOrNull { TrackSelector.matches(it.lang, language) }
+        }.firstOrNull() ?: return@LaunchedEffect
+        autoAddonSubtitleTried = true
+        mountAddonSubtitle(sub)
     }
 
     // Apply the persisted subtitle appearance to whichever engine is live (mpv sub-* properties / ExoPlayer
@@ -1618,7 +1641,12 @@ fun PlayerScreen(
             onSeek = { showControls(); engine.seekTo(it) },
             onSeekBy = { showControls(); engine.seekBy(it) },
             onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
-            onSelectSubtitle = { showControls(); engine.selectSubtitleTrack(it) },
+            onSelectSubtitle = {
+                showControls()
+                userPickedSubtitle = true
+                pendingSubSelectAbove = null
+                engine.selectSubtitleTrack(it)
+            },
             onSetSpeed = { newSpeed ->
                 showControls()
                 speed = newSpeed
@@ -1703,12 +1731,8 @@ fun PlayerScreen(
             addonSubtitles = addonSubtitles,
             onSelectAddonSubtitle = { sub ->
                 showControls()
-                // Mount once per URL: a re-pick of an already-mounted subtitle would only duplicate
-                // the track (it is selectable from the embedded list above once mounted).
-                if (mountedAddonSubs.add(sub.url)) {
-                    pendingSubSelectAbove = latestState.subtitleTracks.size
-                    engine.addExternalSubtitle(sub.url)
-                }
+                userPickedSubtitle = true
+                mountAddonSubtitle(sub)
             },
             // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
             // recomposition so the checkmarks reflect the current secondary-sid / sid after a pick.
@@ -1717,6 +1741,8 @@ fun PlayerScreen(
             secondarySubtitleId = engine.secondarySubtitleId,
             onSelectSecondarySubtitle = { id ->
                 showControls()
+                userPickedSubtitle = true
+                pendingSubSelectAbove = null
                 engine.setSecondarySubtitleTrack(id)
             },
             // Sleep timer. End-of-episode is offered only for a series episode (it stops the auto-advance).

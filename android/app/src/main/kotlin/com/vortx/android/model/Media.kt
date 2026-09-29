@@ -454,6 +454,8 @@ data class StreamSource(
     /// [filename] is the real file name; [notWebReady] flags a stream a plain HTML5 player can't handle.
     val bingeGroup: String? = null,
     val filename: String? = null,
+    val videoHash: String? = null,
+    val videoSize: Long? = null,
     val notWebReady: Boolean? = null,
     /// Per-stream HTTP request headers (`behaviorHints.proxyHeaders.request`): some add-ons front CDNs
     /// that 403 without a specific Referer / User-Agent. Decoded by the engine stream mapping
@@ -669,6 +671,8 @@ data class Playable(
     val playbackContext: PlaybackContext? = null,
     /** Ephemeral producer ownership for a progressive local source. Never serialized or logged. */
     val playbackLease: AutoCloseable? = null,
+    /** Subtitle lookup must use this file's hints even after a source or player switch. */
+    val subtitleMetadata: SubtitleRequestMetadata = SubtitleRequestMetadata(),
 ) {
     override fun toString(): String =
         "Playable(url=${redactedTransportUrl(url)}, title=$title, viaStreamingServer=$viaStreamingServer, " +

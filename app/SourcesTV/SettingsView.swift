@@ -70,6 +70,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.audio) private var prefAudioLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(TrackPreferences.Key.subOnlyPreferred) private var subOnlyPreferred = false
+    @AppStorage(TrackPreferences.Key.preferAddonSubtitles) private var preferAddonSubtitles = false
     @AppStorage(PGSOCRPolicy.overrideKey) private var recogniseImageSubtitles = true
     // When "1", the audio language chain mirrors the subtitle chain (the audio pickers hide); "0" = independent.
     @AppStorage("stremiox.matchAudioSub") private var matchAudioSubRaw = "0"
@@ -1225,6 +1226,13 @@ struct SettingsView: View {
             }
             .toggleStyle(.switch)
             .tint(Theme.Palette.accent)
+            Toggle(isOn: $preferAddonSubtitles) {
+                Text("Prefer add-on subtitles")
+                    .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .toggleStyle(.switch).tint(Theme.Palette.accent)
+            Text("Use a matching add-on subtitle when available. Keep the built-in track if loading fails.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             Text("The player auto-picks these when a title starts. Each language falls back to your second choice when a title has none in the first. Turn on Match audio to subtitle languages to drive both from one list. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow. Only show subtitles in my languages hides add-on and community subtitles in other languages from the in-player list (untagged-language subtitles always stay). Recognize image subtitles uses on-device text recognition to make PGS subtitles selectable during Dolby Vision playback. Turn it off if recognition affects performance. This setting stays on this device.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
