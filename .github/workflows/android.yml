@@ -152,6 +152,8 @@ jobs:
       # repos are a supply-chain hole; GitHub-owned actions/* stay on major tags).
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
 
       # No gradle-version here: the committed wrapper (android/gradle/wrapper/gradle-wrapper.properties)
       # is the single Gradle-version truth. setup-gradle is kept only for its build cache; the build

@@ -63,6 +63,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
 
       # android/app and android/mpv-seam both pin this version. The older 27.0.12077973 CI report
       # is not authoritative for this source tree: installing it would leave Gradle's pinned NDK absent.

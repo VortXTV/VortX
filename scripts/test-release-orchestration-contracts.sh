@@ -11,6 +11,7 @@ readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly RELEASE_WF="$REPO_ROOT/.github/workflows/android-release.yml"
 readonly VALIDATION_WF="$REPO_ROOT/.github/workflows/release-packaging-validation.yml"
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
+readonly CODEQL_WF="$REPO_ROOT/.github/workflows/codeql.yml"
 readonly APPLE_RELEASE_WF="$REPO_ROOT/.github/workflows/release-tvos.yml"
 readonly RECOVERY_WF="$REPO_ROOT/.github/workflows/recover-release-feed.yml"
 readonly ANDROID_AUGMENT_WF="$REPO_ROOT/.github/workflows/augment-android-release-feed.yml"
@@ -51,6 +52,16 @@ trigger_block() {
 
 [[ -f "$RELEASE_WF" ]] || fail "release workflow missing: $RELEASE_WF"
 [[ -f "$VALIDATION_WF" ]] || fail "secretless validation workflow missing: $VALIDATION_WF"
+
+# setup-android's default includes the removed standalone 'tools' package. Validate the actual
+# action block, not a matching comment elsewhere, in every SDK lane before any native build starts.
+for wf in "$ANDROID_CI_WF" "$RELEASE_WF" "$VALIDATION_WF" "$CODEQL_WF"; do
+    sdk_setup="$(awk '/uses: android-actions\/setup-android@/{active=1}
+        active && /^[[:space:]]*-[[:space:]]/{exit} active{print}' "$wf")"
+    require_grep "$(basename "$wf") installs supported explicit Android SDK packages" \
+        '^[[:space:]]+packages: "platform-tools platforms;android-36 build-tools;36\.0\.0"$' \
+        <(printf '%s\n' "$sdk_setup")
+done
 
 # --- Contract 1 (REL-02): artifacts are labeled by their real dimensions -------------------------
 

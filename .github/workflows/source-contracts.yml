@@ -5,14 +5,18 @@ on:
       - "app/**"
       - "webapp/**"
       - "scripts/test-subtitle-source-contracts.sh"
-      - ".github/workflows/source-contracts.yml"
+      - "scripts/test-release-orchestration-contracts.sh"
+      - "android/**/*.gradle.kts"
+      - ".github/workflows/**"
   push:
     branches: [main]
     paths:
       - "app/**"
       - "webapp/**"
       - "scripts/test-subtitle-source-contracts.sh"
-      - ".github/workflows/source-contracts.yml"
+      - "scripts/test-release-orchestration-contracts.sh"
+      - "android/**/*.gradle.kts"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 # Pure source/HTTP fixtures only: no private engine checkout, signing credentials or publication.
@@ -27,6 +31,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/test-release-orchestration-contracts.sh
       - run: bash scripts/test-subtitle-source-contracts.sh
   web:
     runs-on: ubuntu-24.04

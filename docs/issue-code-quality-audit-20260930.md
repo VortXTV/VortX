@@ -27,6 +27,9 @@ Apple Beta 16 and Android Beta 14 are different artifact baselines; Android pari
   rewriting an unrelated `tmdb:456` video. Platform-specific focus and player lifecycle remain separate.
 - **Regression gates:** native policy/HTTP fixture runner and secretless source-contract CI; web tests
   execute real detail actions with fixture transport, not just string searches.
+- **Android CI:** real packaging and security-analysis runs failed before compilation because the pinned
+  SDK setup action defaults to the removed standalone `tools` package. All four SDK lanes now request
+  supported platform/build tools explicitly; release contracts guard the action blocks against regression.
 
 ## Complete issue disposition
 
