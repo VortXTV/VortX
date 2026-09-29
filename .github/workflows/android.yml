@@ -1,8 +1,8 @@
 name: Build Android APK
 
-# CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
-# workflow IS the build feedback loop. It builds BOTH product flavors on every push that touches
-# android/, verifies each flavor produced an APK carrying BOTH engine .so's for every shipped ABI, and
+# CI-first Android artifact build. Local source/unit validation is also possible with a configured
+# SDK/JDK; this lane supplies the pinned private-engine packaging proof. It builds BOTH flavors when
+# an integration-branch push touches android/, verifies BOTH engine .so's for every shipped ABI, and
 # enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
 # libmpv native libs. The engine crates live in PRIVATE repos (moved out of the public tree in
 # 33ff9b5) and are fetched below at pinned commits; bumping an engine pin means editing this file,
@@ -14,8 +14,8 @@ name: Build Android APK
 # building PR heads here would hand any same-repo PR author's code a credential / private-source
 # exfiltration lane. Fork PRs never received secrets anyway, so their builds could only die at the
 # token preflight; nothing of value is lost. The dev flow is push-to-branch (which triggers this
-# workflow); PR validation of app-only changes belongs to a future SECRETLESS workflow (no engine
-# fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and never
+# workflow); PR contracts belong in separate SECRETLESS validation lanes, not in this engine build.
+# Do not re-add `pull_request` -- and never
 # `pull_request_target` -- to THIS workflow.
 
 # PRIVILEGED-LANE TRIGGER SURFACE. This job holds ENGINE_REPO_TOKEN plus the Trakt and SIMKL

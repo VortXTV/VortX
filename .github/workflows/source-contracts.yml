@@ -1,0 +1,45 @@
+name: Source and subtitle contracts
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - "webapp/**"
+      - "scripts/test-subtitle-source-contracts.sh"
+      - ".github/workflows/source-contracts.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "webapp/**"
+      - "scripts/test-subtitle-source-contracts.sh"
+      - ".github/workflows/source-contracts.yml"
+  workflow_dispatch:
+
+# Pure source/HTTP fixtures only: no private engine checkout, signing credentials or publication.
+permissions:
+  contents: read
+concurrency:
+  group: source-contracts-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  apple-policies:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/test-subtitle-source-contracts.sh
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.18.0"
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - run: npm install --global npm@11.17.0
+      - working-directory: webapp
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - working-directory: webapp
+        run: npm run typecheck && npm test && npm run build
