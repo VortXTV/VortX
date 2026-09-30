@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.debrid.DebridCoordinator
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridOwnerToken
@@ -61,6 +62,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -82,6 +85,33 @@ internal data class EpisodeSwitchSelectionLease(
         return true
     }
 }
+
+/**
+ * Immutable identity of a detail next-episode source warm-up.  The source itself is not enough to publish:
+ * a cancelled repository call may still complete normally after a profile, source target, or detail owner
+ * changes.  Every captured field must still match before this lease can be cached or consumed.
+ */
+internal data class WarmNextSourceLease(
+    val episodeId: String,
+    val source: StreamSource,
+    val profileId: String,
+    val owner: ContinueWatchingOwner,
+    val sourceRequest: SourceRequestFence.Token?,
+    val prewarmGeneration: Long,
+)
+
+internal fun acceptsWarmNextSourceLease(
+    lease: WarmNextSourceLease,
+    targetEpisodeId: String,
+    currentProfileId: String,
+    currentOwner: ContinueWatchingOwner,
+    currentSourceRequest: SourceRequestFence.Token?,
+    currentPrewarmGeneration: Long,
+): Boolean = lease.episodeId == targetEpisodeId &&
+    lease.profileId == currentProfileId &&
+    lease.owner == currentOwner &&
+    lease.sourceRequest === currentSourceRequest &&
+    lease.prewarmGeneration == currentPrewarmGeneration
 
 /** Bounds the fail-soft external-id mapping before a non-IMDb detail becomes terminally unavailable. */
 internal suspend fun <T> boundedDetailRecoveryLookup(
@@ -504,11 +534,27 @@ class DetailViewModel(
     /// Smart-Source episode tap, whose auto-pick stays exactly as it was.
     @Volatile private var pendingAdvanceHint: Pair<String?, String?>? = null
 
-    /// Next-episode PRELOAD cache (PLR-8): the pre-ranked best source for the next episode, keyed by its
-    /// episode id, populated off the live fence by [warmNextEpisode] and consumed once by [playNextEpisode]
-    /// so an accepted Up Next skips the source-assembly "Starting..." wait. Best-effort: a miss (never
-    /// warmed, superseded, or a different episode) falls straight through to the cold resolve.
-    @Volatile private var warmNextSourceByEpisode: Pair<String, StreamSource>? = null
+    /// Next-episode PRELOAD cache (PLR-8): the pre-ranked best source for the next episode, keyed by an
+    /// immutable profile/owner/source-request lease and consumed once by [playNextEpisode] so an accepted Up
+    /// Next skips the source-assembly "Starting..." wait. A monotonic generation is separate from the source
+    /// request because profile rebuild and ViewModel disposal can clear this cache while a non-cooperative
+    /// repository call is still returning; the old call must not repopulate it after the clear.
+    private val warmNextLock = Any()
+    private var warmNextGeneration = 0L
+    private var warmNextSourceByEpisode: WarmNextSourceLease? = null
+
+    private data class WarmNextCapture(
+        val episodeId: String,
+        val profileId: String,
+        val owner: ContinueWatchingOwner,
+        val sourceRequest: SourceRequestFence.Token?,
+        val prewarmGeneration: Long,
+    )
+
+    private sealed interface WarmNextPlan {
+        data object AlreadyWarm : WarmNextPlan
+        data class Fetch(val capture: WarmNextCapture) : WarmNextPlan
+    }
 
     /// Detail reactivity (see [CatalogRepository.detailUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
@@ -671,6 +717,7 @@ class DetailViewModel(
     /// `retryMeta`.
     fun retryMeta() {
         detailMutationFence.invalidate()
+        invalidateWarmNextSource()
         profileReloadJob?.cancel()
         sourceLoadJob?.cancel()
         cancelPlaybackResolveForSourceTargetInvalidation()
@@ -689,6 +736,7 @@ class DetailViewModel(
     /// false, so opening a detail page never auto-plays.
     fun selectEpisode(episodeId: String, userTap: Boolean = true) {
         if (_selectedEpisodeId.value == episodeId) return
+        invalidateWarmNextSource()
         _selectedEpisodeId.value = episodeId
         pendingAutoPick = userTap && sourcePrefs.autoPickBest
         startSourceLoad(episodeId)
@@ -761,6 +809,7 @@ class DetailViewModel(
 
     private fun rebuildForProfile(profileId: String) {
         detailMutationFence.invalidate()
+        invalidateWarmNextSource()
         sourceLoadJob?.cancel()
         cancelPlaybackResolveForSourceTargetInvalidation()
         profileReloadJob?.cancel()
@@ -778,7 +827,6 @@ class DetailViewModel(
         lastPlayedSource = null
         pendingAutoPick = false
         pendingAdvanceHint = null
-        warmNextSourceByEpisode = null
         failedHandlesByTarget.clear()
         sameSourceReresolved = false
         _streams.value = UiState.Loading
@@ -1829,6 +1877,87 @@ class DetailViewModel(
         return ordered[idx + 1]
     }
 
+    /** Invalidate every outstanding next-episode warm publication and its cached source. */
+    private fun invalidateWarmNextSource() = synchronized(warmNextLock) {
+        warmNextGeneration += 1L
+        warmNextSourceByEpisode = null
+    }
+
+    /**
+     * Claim the current warm target. A cached source is retained only when the complete immutable lease still
+     * matches; otherwise it is withdrawn and this call starts a new generation for the requested episode.
+     */
+    private fun beginWarmNext(episodeId: String): WarmNextPlan = synchronized(warmNextLock) {
+        val profileId = sourceSticky.currentProfileId()
+        val owner = repo.continueWatchingOwner()
+        val sourceRequest = sourceRequestFence.currentToken()
+        val cached = warmNextSourceByEpisode
+        if (cached != null && acceptsWarmNextSourceLease(
+                lease = cached,
+                targetEpisodeId = episodeId,
+                currentProfileId = profileId,
+                currentOwner = owner,
+                currentSourceRequest = sourceRequest,
+                currentPrewarmGeneration = warmNextGeneration,
+            )
+        ) {
+            WarmNextPlan.AlreadyWarm
+        } else {
+            if (cached != null) {
+                warmNextGeneration += 1L
+                warmNextSourceByEpisode = null
+            }
+            WarmNextPlan.Fetch(
+                WarmNextCapture(
+                    episodeId = episodeId,
+                    profileId = profileId,
+                    owner = owner,
+                    sourceRequest = sourceRequest,
+                    prewarmGeneration = warmNextGeneration,
+                ),
+            )
+        }
+    }
+
+    /** Read all mutable owner/fence state atomically with the warm generation. */
+    private fun isCurrentWarmNextCapture(capture: WarmNextCapture): Boolean = synchronized(warmNextLock) {
+        capture.profileId == sourceSticky.currentProfileId() &&
+            capture.owner == repo.continueWatchingOwner() &&
+            capture.sourceRequest === sourceRequestFence.currentToken() &&
+            capture.prewarmGeneration == warmNextGeneration
+    }
+
+    /** Publish only after the final active-state check, so a late non-cooperative result is a no-op. */
+    private fun publishWarmNext(capture: WarmNextCapture, source: StreamSource): Boolean =
+        synchronized(warmNextLock) {
+            if (!isCurrentWarmNextCapture(capture)) return@synchronized false
+            warmNextSourceByEpisode = WarmNextSourceLease(
+                episodeId = capture.episodeId,
+                source = source,
+                profileId = capture.profileId,
+                owner = capture.owner,
+                sourceRequest = capture.sourceRequest,
+                prewarmGeneration = capture.prewarmGeneration,
+            )
+            true
+        }
+
+    /** Consume a warm source only when its full lease is still current; every consume retires its generation. */
+    private fun consumeWarmNextSource(episodeId: String): StreamSource? = synchronized(warmNextLock) {
+        val cached = warmNextSourceByEpisode ?: return@synchronized null
+        val valid = acceptsWarmNextSourceLease(
+            lease = cached,
+            targetEpisodeId = episodeId,
+            currentProfileId = sourceSticky.currentProfileId(),
+            currentOwner = repo.continueWatchingOwner(),
+            currentSourceRequest = sourceRequestFence.currentToken(),
+            currentPrewarmGeneration = warmNextGeneration,
+        )
+        warmNextSourceByEpisode = null
+        warmNextGeneration += 1L
+        cached.source.takeIf { valid }
+    }
+
     /// Auto-advance to [nextEpisode]: select it and play its best-ranked source the moment its add-on
     /// groups land, via the same consume-once latch a Smart-Source episode tap uses -- but armed
     /// UNCONDITIONALLY (an Up Next the viewer accepted, or let count down, must play whether or not the
@@ -1848,27 +1977,48 @@ class DetailViewModel(
      */
     suspend fun warmNextEpisode(episodeId: String): Boolean {
         if (type != MediaType.SERIES) return false
-        if (warmNextSourceByEpisode?.first == episodeId) return true
+        currentCoroutineContext().ensureActive()
+        val plan = beginWarmNext(episodeId)
+        if (plan === WarmNextPlan.AlreadyWarm) return true
+        val capture = (plan as WarmNextPlan.Fetch).capture
         val detail = (_meta.value as? UiState.Success)?.data ?: return false
         val target = detail.videos.firstOrNull { it.id == episodeId } ?: return false
-        val groups = repo.streams(
+
+        // Capture every mutable ranking input before the one-shot fetch. If the profile/source owner changes
+        // while that fetch is in flight, the lease check below rejects the result rather than ranking with a
+        // different profile's sticky source or history context.
+        val rememberedQuality = lastPlayedSource?.let(StreamRanking::qualityLabel)
+        val wantedAddon = sourceSticky.preference(id)?.addon
+        val continuity = lastPlayedSource?.let(StreamRanking::signature)
+        val binge = lastPlayedSource?.bingeGroup
+        val pin = currentPin()
+        val sticky = sourceSticky.preference(id)
+        val prefs = lastCtx?.prefs ?: StreamRanking.reading()
+
+        val groupsResult = repo.streams(
             type = type,
             id = id,
             episodeId = target.id,
-            rememberedQuality = lastPlayedSource?.let(StreamRanking::qualityLabel),
-            wantedAddon = sourceSticky.preference(id)?.addon,
-        ).getOrNull()?.takeIf { list -> list.any { it.streams.isNotEmpty() } } ?: return false
+            rememberedQuality = rememberedQuality,
+            wantedAddon = wantedAddon,
+        )
+        // Some repositories do not make cancellation cooperative. Do not let their late normal return
+        // publish a source after this coroutine was cancelled or any of the captured owners changed.
+        currentCoroutineContext().ensureActive()
+        if (!isCurrentWarmNextCapture(capture)) return false
+        val groups = groupsResult.getOrNull()?.takeIf { list -> list.any { it.streams.isNotEmpty() } } ?: return false
         val best = StreamRanking.best(
             groups = groups,
-            continuity = lastPlayedSource?.let(StreamRanking::signature),
-            binge = lastPlayedSource?.bingeGroup,
-            pin = currentPin(),
-            sticky = sourceSticky.preference(id),
+            continuity = continuity,
+            binge = binge,
+            pin = pin,
+            sticky = sticky,
             providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-            prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+            prefs = prefs,
         ) ?: return false
-        warmNextSourceByEpisode = episodeId to best
-        return true
+        currentCoroutineContext().ensureActive()
+        if (!isCurrentWarmNextCapture(capture)) return false
+        return publishWarmNext(capture, best)
     }
 
     fun playNextEpisode() {
@@ -1879,8 +2029,7 @@ class DetailViewModel(
         // below. The fence is (re)begun for the target so play()'s token + episode identity are correct;
         // the reactive assembly still runs to populate the new episode's in-player source list, but playback
         // no longer waits on it.
-        val warm = warmNextSourceByEpisode?.takeIf { it.first == next.id }?.second
-        warmNextSourceByEpisode = null
+        val warm = consumeWarmNextSource(next.id)
         if (warm != null) {
             _selectedSeason.value = next.season
             _selectedEpisodeId.value = next.id
@@ -1897,6 +2046,9 @@ class DetailViewModel(
             playBest()
             return
         }
+        // Auto-advance assigns the target directly so it can carry the continuation hint; retire any
+        // in-flight warm publication just as [selectEpisode] does before replacing the visible episode.
+        invalidateWarmNextSource()
         _selectedEpisodeId.value = next.id
         pendingAutoPick = true
         startSourceLoad(next.id)
@@ -2177,6 +2329,7 @@ class DetailViewModel(
     /// their OWN scopes and must be closed explicitly to cancel any in-flight TorBox / Singularity fetch).
     override fun onCleared() {
         sourceSwitchCommitGate.invalidate()
+        invalidateWarmNextSource()
         super.onCleared()
         sourceModel.close()
         torbox.close()

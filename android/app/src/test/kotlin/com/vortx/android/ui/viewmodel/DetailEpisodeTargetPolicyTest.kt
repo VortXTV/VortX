@@ -1,14 +1,23 @@
 package com.vortx.android.ui.viewmodel
 
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.sources.SourceRequestFence
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class DetailEpisodeTargetPolicyTest {
     @Test
     fun `specials never outrank the first actual episode`() {
@@ -90,5 +99,97 @@ class DetailEpisodeTargetPolicyTest {
         assertFalse(fence.accepts(stale))
         val current = fence.begin()
         assertTrue(fence.accepts(current))
+    }
+
+    @Test
+    fun `warm source is retained only for the exact current owner and profile`() {
+        val sourceFence = SourceRequestFence("profile-a")
+        val request = sourceFence.begin("profile-a", "episode-2")
+        val owner = ContinueWatchingOwner("profile-a", "primary", "account-a", true, 11L)
+        val lease = WarmNextSourceLease(
+            episodeId = "episode-2",
+            source = StreamSource("source", "Addon", "WEB 1080p", url = "https://source"),
+            profileId = "profile-a",
+            owner = owner,
+            sourceRequest = request,
+            prewarmGeneration = 3L,
+        )
+
+        assertTrue(acceptsWarmNextSourceLease(lease, "episode-2", "profile-a", owner, request, 3L))
+        assertFalse(
+            acceptsWarmNextSourceLease(
+                lease,
+                "episode-2",
+                "profile-a",
+                owner.copy(revision = 12L),
+                request,
+                3L,
+            ),
+        )
+        assertFalse(
+            acceptsWarmNextSourceLease(
+                lease,
+                "episode-2",
+                "profile-b",
+                owner.copy(profileId = "profile-b", revision = 13L),
+                request,
+                3L,
+            ),
+        )
+    }
+
+    @Test
+    fun `warm source publication rejects a replaced target or disposed generation`() {
+        val sourceFence = SourceRequestFence("profile-a")
+        val request = sourceFence.begin("profile-a", "episode-2")
+        val owner = ContinueWatchingOwner("profile-a", "primary", "account-a", true, 11L)
+        val lease = WarmNextSourceLease(
+            episodeId = "episode-2",
+            source = StreamSource("source", "Addon", "WEB 1080p", url = "https://source"),
+            profileId = "profile-a",
+            owner = owner,
+            sourceRequest = request,
+            prewarmGeneration = 3L,
+        )
+
+        val replacementRequest = sourceFence.begin("profile-a", "episode-3")
+        assertFalse(acceptsWarmNextSourceLease(lease, "episode-3", "profile-a", owner, replacementRequest, 4L))
+        assertFalse(acceptsWarmNextSourceLease(lease, "episode-2", "profile-a", owner, request, 4L))
+    }
+
+    @Test
+    fun `delayed noncooperative completion after profile reset cannot publish`() = runTest {
+        val sourceFence = SourceRequestFence("profile-a")
+        val request = sourceFence.begin("profile-a", "episode-2")
+        val ownerA = ContinueWatchingOwner("profile-a", "primary", "account-a", true, 11L)
+        val ownerB = ContinueWatchingOwner("profile-b", "primary", "account-b", true, 12L)
+        val delayedSource = CompletableDeferred<StreamSource>()
+        val captured = WarmNextSourceLease(
+            episodeId = "episode-2",
+            source = StreamSource("placeholder", "Addon", "placeholder"),
+            profileId = "profile-a",
+            owner = ownerA,
+            sourceRequest = request,
+            prewarmGeneration = 3L,
+        )
+        var published: StreamSource? = null
+
+        val oldRequest = launch {
+            val source = delayedSource.await()
+            val candidate = captured.copy(source = source)
+            if (acceptsWarmNextSourceLease(candidate, "episode-2", "profile-b", ownerB, sourceFence.currentToken(), 4L)) {
+                published = source
+            }
+        }
+        runCurrent()
+
+        // The old repository completion is deliberately delivered after the owner reset; no cancellation
+        // cooperation is required for the lease to reject it.
+        sourceFence.invalidate("profile-b")
+        delayedSource.complete(StreamSource("late", "Addon", "late", url = "https://late"))
+        runCurrent()
+
+        assertTrue(oldRequest.isCompleted)
+        assertNull(published)
     }
 }
