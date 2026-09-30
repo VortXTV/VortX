@@ -2009,7 +2009,7 @@ enum PlayerLiveContractTests {
             capacityBytes: 32,
             chunkSize: 2,
             scavengeStaleSessions: false)
-        weak let releasedOwner = orphanSpool
+        let releasedOwner = { [weak orphanSpool] in orphanSpool }
         if let orphanStage = orphanSpool?.attachOpenStage(to: orphanBuffer) {
             append([0, 1, 2, 3], to: orphanBuffer)
             _ = orphanStage.arm(base: 1)
@@ -2024,7 +2024,7 @@ enum PlayerLiveContractTests {
                 orphanClaim.release()
                 let replacement = orphanStage.claim()
                 check("open stage owner loss: close does not consume and strand a claim after spool teardown",
-                      releasedOwner == nil && !closeWithoutOwner && replacement != nil)
+                      releasedOwner() == nil && !closeWithoutOwner && replacement != nil)
                 replacement?.release()
             } else {
                 check("open stage owner loss: exact claim is available", false)
