@@ -3795,31 +3795,31 @@ enum PlayerLiveContractTests {
         check("wiring: both AVPlayer demotions capture the engine-owned source target before stop",
               sourceContainsInOrder(playerScreenAVDemote, [
                 "pendingRequestedSourcePositionSeconds",
+                "prepareResumeSurfaceTransfer(engine: .libmpv",
                 "let quiescence = retiringAVPlayer.stopForMPVFallback()",
-                "engineRequestedResume",
               ])
                   && sourceContainsInOrder(tvPlayerAVDemote, [
                     "pendingRequestedSourcePositionSeconds",
+                    "prepareResumeSurfaceTransfer(engine: .libmpv",
                     "let quiescence = retiringAVPlayer.stopForMPVFallback()",
-                    "engineRequestedResume",
                   ]))
         let playerScreenDemotionUsesNewestEngineTarget = sourceContainsInOrder(
             playerScreenAVDemote,
             [
-                "if let engineRequestedResume {",
+                "if let engineRequestedResume, abandonedResumeRecovery?.owner != retiringAVPlayer.activeLoadToken {",
                 "suppressedResumeFloor = nil",
                 "resume = engineRequestedResume",
-                "} else if hasStartedPlaying {",
-                "resume = max(currentTime, suppressedResumeFloor ?? 0)",
+                "} else {",
+                "resume = retryResumeTarget()",
             ])
         let tvPlayerDemotionUsesNewestEngineTarget = sourceContainsInOrder(
             tvPlayerAVDemote,
             [
-                "if let engineRequestedResume {",
+                "if let engineRequestedResume, abandonedResumeRecovery?.owner != retiringAVPlayer.activeLoadToken {",
                 "suppressedResumeFloor = nil",
                 "reconcileResume = engineRequestedResume",
-                "} else if hasStartedPlaying {",
-                "reconcileResume = max(currentTime, suppressedResumeFloor ?? 0)",
+                "} else {",
+                "reconcileResume = recoveryResumeTarget()",
             ])
         check("wiring: backward MediaRemote targets survive failure demotion on both Apple surfaces",
               sourceContainsInOrder(playerScreenNowPlaying, [
@@ -3836,9 +3836,9 @@ enum PlayerLiveContractTests {
                   && tvPlayerDemotionUsesNewestEngineTarget)
         check("wiring: chapter and skip targets survive failure demotion on both Apple surfaces",
               playerScreenChapterRows?.contains(
-                "coordinator.player?.seek(to: ch.start)") == true
+                "issueSeek(to: ch.start, reason: \"chapter\")") == true
                   && tvPlayerChapterRows?.contains(
-                    "coordinator.player?.seek(to: ch.start)") == true
+                    "issueSeek(to: ch.start, reason: \"chapter\")") == true
                   && playerScreenSkipAction?.contains(
                     "issueSeek(to: segment.end, reason: \"skip\")") == true
                   && tvPlayerSkipAction?.contains(

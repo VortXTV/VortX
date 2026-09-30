@@ -15,6 +15,13 @@ Apple Beta 16 and Android Beta 14 are different artifact baselines; Android pari
   instead of repeatedly promoting the saved Continue Watching floor into a new failed seek. The saved
   floor remains protected; explicit user seeks supersede the owned abandonment. AVPlayer's logical
   remux-origin behavior remains separate from MPV runtime seekability.
+  The final specialist review closed the remaining retry-chain, fresh-provider-link, terminal Retry,
+  foreground and engine-surface boundaries: retirement is transferred only after exact same-source
+  admission; surface transfers are captured before stop and consumed before the first owned callback.
+  Raw positions belong to a load token and AV item generation. Same-episode source hops retain a separate
+  persistence-only floor without granting it retry authority; another episode inherits neither the
+  protection nor an old seek. Explicit chapter seeks use the same manual-seek entry point. Satisfying a
+  replacement's low remux origin cannot erase valid Continue Watching progress.
 - Native automatic skip uses actual playback deltas, defaults to 5 seconds for an unset preference, and
   offers Off/5/10/15/30 seconds. Existing explicit Off is preserved. Immediate Skip and X are distinct
   touch/remote/accessibility actions; X remains suppressed for that segment through seek/source changes.
@@ -72,13 +79,17 @@ Current follow-up verification (distinct from the historical patch results below
   Play APK also passes its GPL-library exclusion check. Debug signing is not release-signing evidence.
 - Apple parity contracts now run in CI and exercise the production skip countdown, account/history
   admission, subtitle rendering exclusion/background, first-frame/load ownership, and related policies.
-  Deferred-resume checks execute 17 production-policy cases and 11 TV/phone wiring contracts. Final
+  Deferred-resume checks execute 66 production-policy cases and 30 TV/phone wiring contracts, including
+  successive pre-frame retry failures, source hops, terminal stop/Retry, engine transfer, stale raw item
+  generations, refusal, explicit seeking and different-episode isolation. Final
   source-frozen tvOS, iOS, and native macOS arm64 Release builds all passed with signing disabled after
   the last account ownership correction; earlier builds are not substituted for those gates.
 - The final account-local mapper executes real JSON-decoded fixtures, and the guest-provenance gate
   executes 17 decisions/storage fixtures. CoreBridge publication-fence wiring checks also pass. Astra
   independently accepted the final canonical account/history boundary, including both Home adapters;
   independent playback and lifecycle reviews are source reviews, not physical playback receipts.
+  Astra also independently accepted the final canonical playback recovery state repair after two
+  consequential repair rounds; that acceptance does not substitute for the device/provider gates.
 - The first current-source GitHub run exposed an older-compiler type-check timeout in the Trakt alias
   union. That expression now accumulates an explicitly typed array in the identical order. The actual
   Continue Watching fold fixtures also run in CI, including newest-winner and transitive/late-bridge

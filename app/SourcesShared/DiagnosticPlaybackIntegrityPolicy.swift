@@ -318,13 +318,138 @@ enum DeferredResumeSeekReconciliationPolicy {
         let presentationSeconds: Double
         let persistenceFloorSeconds: Double
     }
-    struct OwnedAbandonment<Owner: Equatable> {
+    struct OwnedAbandonment<Owner: Equatable>: Equatable {
         let owner: Owner
         let decision: Abandonment
     }
 
+    enum Engine: Equatable { case avPlayer, libmpv }
+
+    struct MediaIdentity: Equatable {
+        let libraryID: String
+        let videoID: String
+    }
+
+    /// A different source can retire its decoder-owned abandonment while the same episode still needs
+    /// persistence protection. This media-owned value has NO authority to choose a playback destination.
+    struct RetiredPersistenceFloor: Equatable {
+        let media: MediaIdentity
+        let seconds: Double
+    }
+
+    static func recoveryEligibleFloor(
+        currentFloor: Double?, retirement: RetiredPersistenceFloor?, currentMedia: MediaIdentity?
+    ) -> Double? {
+        guard let currentFloor, let retirement, retirement.media == currentMedia,
+              currentFloor <= retirement.seconds else { return currentFloor }
+        return nil
+    }
+
+    static func persistenceFloorForSourceReplacement(
+        currentFloor: Double?, previousMedia: MediaIdentity?, nextMedia: MediaIdentity?
+    ) -> Double? {
+        guard let previousMedia, previousMedia == nextMedia else { return nil }
+        return currentFloor
+    }
+
+    static func retirementAfterMediaAdmission(
+        current: RetiredPersistenceFloor?, admittedMedia: MediaIdentity?
+    ) -> RetiredPersistenceFloor? {
+        guard current?.media == admittedMedia else { return nil }
+        return current
+    }
+
+    /// Initial SwiftUI surface loads bypass the caller's ordinary load gateway. A retirement may cross
+    /// that boundary only for the exact media/source transaction and the requested replacement engine.
+    struct SurfaceContext: Equatable {
+        let episodeGeneration: Int
+        let sourceGeneration: Int
+        let resumeGeneration: Int
+        let libraryID: String?
+        let videoID: String?
+        let sourceURL: URL
+        let headers: [String: String]?
+        let isLive: Bool
+        let engine: Engine
+    }
+
+    struct SurfaceTransfer<Owner: Equatable> {
+        let retiring: OwnedAbandonment<Owner>
+        let context: SurfaceContext
+    }
+
+    /// Refused admission changes nothing. Only an explicitly same-source retry can carry the retired
+    /// target to its replacement; a different source/episode receives no such recovery authority.
+    static func afterAdmission<Owner: Equatable>(
+        current: OwnedAbandonment<Owner>?, retiringOwner: Owner?, acceptedOwner: Owner?,
+        preservingSourceChain: Bool, recoveryOriginSeconds: Double
+    ) -> OwnedAbandonment<Owner>? {
+        guard let acceptedOwner else { return current }
+        guard preservingSourceChain, let current, current.owner == retiringOwner else { return nil }
+        let origin = recoveryOriginSeconds.isFinite && recoveryOriginSeconds >= 0
+            ? recoveryOriginSeconds : current.decision.presentationSeconds
+        return .init(owner: acceptedOwner, decision: .init(
+            presentationSeconds: origin,
+            persistenceFloorSeconds: current.decision.persistenceFloorSeconds
+        ))
+    }
+
+    static func surfaceTransfer<Owner: Equatable>(
+        current: OwnedAbandonment<Owner>?, retiringOwner: Owner?,
+        context: SurfaceContext, recoveryOriginSeconds: Double
+    ) -> SurfaceTransfer<Owner>? {
+        guard let retiringOwner,
+              let rebound = afterAdmission(current: current, retiringOwner: retiringOwner,
+                  acceptedOwner: retiringOwner, preservingSourceChain: true,
+                  recoveryOriginSeconds: recoveryOriginSeconds) else { return nil }
+        return .init(retiring: rebound, context: context)
+    }
+
+    /// Consume once on any first exact-token callback (including an error), or a proven mount receipt.
+    /// A later receipt is a no-op: it must not reset position telemetry already produced by that mount.
+    static func consumeSurfaceTransfer<Owner: Equatable>(
+        pending: inout SurfaceTransfer<Owner>?, observedOwner: Owner, activeOwner: Owner?,
+        context: SurfaceContext
+    ) -> OwnedAbandonment<Owner>? {
+        guard let transfer = pending, observedOwner == activeOwner,
+              observedOwner != transfer.retiring.owner, context == transfer.context else { return nil }
+        pending = nil
+        return .init(owner: observedOwner, decision: transfer.retiring.decision)
+    }
+
+    static func confirmedPosition<Owner: Equatable>(
+        seconds: Double, positionOwner: Owner?, currentOwner: Owner?,
+        positionMountGeneration: UInt64, currentMountGeneration: UInt64
+    ) -> Double {
+        guard let currentOwner, positionOwner == currentOwner,
+              positionMountGeneration == currentMountGeneration,
+              seconds.isFinite, seconds >= 0 else { return .nan }
+        return seconds
+    }
+
+    /// An intentional seek retires this owner's abandoned automatic target, including its floor's
+    /// eligibility as a future retry target. A stale marker cannot erase another mount's saved floor.
+    static func floorAfterUserSeek<Owner: Equatable>(
+        currentFloor: Double?, abandonment: OwnedAbandonment<Owner>?, currentOwner: Owner?
+    ) -> Double? {
+        guard let abandonment, abandonment.owner == currentOwner else { return currentFloor }
+        return nil
+    }
+
+    /// Satisfying a replacement's low logical origin does not satisfy the older saved resume. Retain
+    /// that owner's anti-regression floor until a real tick reaches it or the viewer chooses a seek.
+    static func floorAfterAutomaticResume<Owner: Equatable>(
+        currentFloor: Double?, abandonment: OwnedAbandonment<Owner>?, currentOwner: Owner?,
+        proposedFloor: Double?, retirement: RetiredPersistenceFloor? = nil, currentMedia: MediaIdentity? = nil
+    ) -> Double? {
+        let loadFloor = abandonment.flatMap { $0.owner == currentOwner ? $0.decision.persistenceFloorSeconds : nil }
+        let mediaFloor = retirement.flatMap { $0.media == currentMedia ? $0.seconds : nil }
+        guard loadFloor != nil || mediaFloor != nil else { return proposedFloor }
+        return max(currentFloor ?? 0, proposedFloor ?? 0, loadFloor ?? 0, mediaFloor ?? 0)
+    }
+
     /// A failed resume floor is persistence evidence, never a same-source reload origin. Keep an
-    /// explicit, load-owned abandonment until replacement so an optimistic UI target cannot re-arm it.
+    /// explicit, load-owned abandonment through same-source replacements so the UI cannot re-arm it.
     static func recoveryOrigin(
         presentationSeconds: Double,
         confirmedPositionSeconds: Double,
