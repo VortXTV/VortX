@@ -23,6 +23,8 @@ internal class BecauseYouWatchedModel(
     private var cachedRail: Catalog? = null
     private var inFlightSignature: String? = null
     private var requestGeneration = 0L
+    /** A profile UUID alone is not an ownership boundary: account/principal/history-slot changes can reuse it. */
+    private var activeOwnerKey: String? = null
 
     suspend fun refresh(
         continueWatching: List<MetaItem>,
@@ -37,13 +39,17 @@ internal class BecauseYouWatchedModel(
             .distinctBy(MetaItem::id)
             .take(MAX_SEEDS)
             .toList()
+        val ownerChanged = activeOwnerKey != null && activeOwnerKey != ownerKey
 
         // An empty history is authoritative: do not leave the previous owner's rail on screen. This path
         // also invalidates a still-running request through requestGeneration below.
         if (seeds.isEmpty()) {
             requestGeneration += 1
             inFlightSignature = null
-            return replace(null, null)
+            activeOwnerKey = ownerKey
+            val cleared = replace(null, null)
+            if (ownerChanged) onInvalidated()
+            return cleared
         }
 
         val owned = history.mapNotNullTo(linkedSetOf()) { it.id.takeIf(String::isNotBlank) }
@@ -56,10 +62,10 @@ internal class BecauseYouWatchedModel(
             append('|')
             append(owned.sorted().joinToString(","))
         }
-        if (signature == nextSignature && cachedRail != null) {
+        if (!ownerChanged && signature == nextSignature && cachedRail != null) {
             return BecauseYouWatchedRefresh(cachedRail, changed = false)
         }
-        if (inFlightSignature == nextSignature) {
+        if (!ownerChanged && inFlightSignature == nextSignature) {
             return BecauseYouWatchedRefresh(cachedRail, changed = false)
         }
 
@@ -70,10 +76,12 @@ internal class BecauseYouWatchedModel(
         // A changed owner or history must never display the previous owner's personalized row while the
         // replacement request is in flight. The generation check below prevents uncancellable provider work
         // from publishing after a later refresh wins.
-        if (signature != null && signature != nextSignature) {
+        if (ownerChanged || (signature != null && signature != nextSignature)) {
             cachedRail = null
+            if (ownerChanged) signature = null
             onInvalidated()
         }
+        activeOwnerKey = ownerKey
 
         val resolvedSeeds = try {
             coroutineScope {
@@ -152,6 +160,7 @@ internal class BecauseYouWatchedModel(
     fun clear(): BecauseYouWatchedRefresh {
         requestGeneration += 1
         inFlightSignature = null
+        activeOwnerKey = null
         return replace(null, null)
     }
 

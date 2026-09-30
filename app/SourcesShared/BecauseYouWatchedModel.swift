@@ -21,6 +21,9 @@ final class BecauseYouWatchedModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var requestGeneration: UInt64 = 0
     private var activeProfileID: UUID?
+    /// The profile UUID is not sufficient to identify the history owner: a signed-in account, local
+    /// history slot, or engine principal can change while the selected profile remains the same.
+    private var activeOwnerKey: String?
 
     /// Recompute from the active profile's recent watch/library titles. Calls are cheap when the exact
     /// relevant inputs are unchanged, but a watch-progress or watched-count mutation changes the signature.
@@ -33,12 +36,13 @@ final class BecauseYouWatchedModel: ObservableObject {
         let seeds = Self.eligibleSeeds(cw: cw, library: library)
         let signature = ownerKey + "|" + (profileID?.uuidString ?? "main") + "|" +
             Self.seedSignature(cw: cw, library: library)
+        let ownerChanged = activeProfileID != profileID || activeOwnerKey != ownerKey
 
-        if signature == lastSignature, rail != nil {
+        if !ownerChanged, signature == lastSignature, rail != nil {
             activeProfileID = profileID
             return
         }
-        if signature == inFlightSignature { return }
+        if !ownerChanged, signature == inFlightSignature { return }
 
         requestGeneration &+= 1
         let generation = requestGeneration
@@ -46,12 +50,13 @@ final class BecauseYouWatchedModel: ObservableObject {
         inFlightSignature = signature
 
         // Never display the previous owner's personalized row during a profile/account boundary. A
-        // same-profile retry may retain an existing rail until a non-empty replacement is ready.
-        if activeProfileID != profileID {
+        // same-owner retry may retain an existing rail until a non-empty replacement is ready.
+        if ownerChanged {
             rail = nil
             lastSignature = nil
         }
         activeProfileID = profileID
+        activeOwnerKey = ownerKey
 
         guard !seeds.isEmpty else {
             inFlightSignature = nil
@@ -65,7 +70,7 @@ final class BecauseYouWatchedModel: ObservableObject {
         let owned = Set((cw + library)
             .filter { !$0.id.isEmpty && $0.removed != true && $0.temp != true }
             .map(\.id))
-        loadTask = Task { [seeds, owned, signature, generation, profileID] in
+        loadTask = Task { [seeds, owned, signature, generation, profileID, ownerKey] in
             let built = await Self.build(seeds: seeds, owned: owned)
             guard !Task.isCancelled, self.requestGeneration == generation else { return }
 
@@ -83,6 +88,7 @@ final class BecauseYouWatchedModel: ObservableObject {
             self.rail = Self.preservingArtwork(in: built, from: self.rail)
             self.lastSignature = signature
             self.activeProfileID = profileID
+            self.activeOwnerKey = ownerKey
         }
     }
 
@@ -93,6 +99,7 @@ final class BecauseYouWatchedModel: ObservableObject {
         loadTask = nil
         inFlightSignature = nil
         activeProfileID = nil
+        activeOwnerKey = nil
         rail = nil
         lastSignature = nil
     }

@@ -120,6 +120,45 @@ class BecauseYouWatchedModelTest {
     }
 
     @Test
+    fun `same profile account change clears immediately through empty history and fences late old finish`() = runBlocking {
+        val oldOwnerGate = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+        val model = BecauseYouWatchedModel { seed ->
+            if (seed.id == "tt-old") oldOwnerGate.await()
+            listOf(item("tt-result-${seed.id}"))
+        }
+
+        model.refresh(
+            continueWatching = listOf(item("tt-initial")),
+            library = emptyList(),
+            ownerKey = "same-profile|account-a",
+        )
+        val oldRequest = async {
+            model.refresh(
+                continueWatching = listOf(item("tt-old")),
+                library = emptyList(),
+                ownerKey = "same-profile|account-a",
+                onInvalidated = { events += "history-clear" },
+            )
+        }
+        yield()
+        assertEquals(listOf("history-clear"), events)
+
+        val accountBoundary = model.refresh(
+            continueWatching = emptyList(),
+            library = emptyList(),
+            ownerKey = "same-profile|account-b",
+            onInvalidated = { events += "account-clear" },
+        )
+        assertEquals(null, accountBoundary.rail)
+        assertEquals(listOf("history-clear", "account-clear"), events)
+
+        oldOwnerGate.complete(Unit)
+        assertEquals(null, oldRequest.await().rail)
+        assertEquals(null, model.refresh(emptyList(), emptyList(), ownerKey = "same-profile|account-b").rail)
+    }
+
+    @Test
     fun `home helpers produce requested personalized ordering without duplicates`() {
         val addon = Catalog("addon", "Popular", listOf(item("tt0")))
         val top = withTopPicksRail(listOf(Catalog("continue", "Continue", listOf(item("tt1"))), addon), listOf(item("tt2")))
