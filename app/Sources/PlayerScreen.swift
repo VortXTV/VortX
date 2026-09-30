@@ -596,6 +596,7 @@ struct PlayerScreen: View {
     /// it before a later manual backward seek can look like a failed resume.
     @State private var postFrameResumeSeekWatchdogTarget: Double?
     @State private var postFrameResumeSeekWatchdogOwner: PlayerLoadToken?
+    @State private var abandonedResumeRecovery: DeferredResumeSeekReconciliationPolicy.OwnedAbandonment<PlayerLoadToken>?
     /// Latest provenance-accepted engine tick, recorded before presentation gates. The deferred-resume watchdog
     /// must reconcile against the real engine position, never the optimistic resume target shown in the UI.
     @State private var lastRawTimePos: Double = -1
@@ -2014,6 +2015,7 @@ struct PlayerScreen: View {
                     cancelAVReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)
                     directAVNoFrameRecovery = nil
                     firstFrameRenderedAt = ProcessInfo.processInfo.systemUptime
+                    midPlayFailureResume = nil   // a mount that is playing owns its own position again
                     // Deferred libmpv resume seek: the pipeline is now warm (first frame rendered), so this lands
                     // as an ordinary scrub instead of the cold pre-first-frame seek that wedged video output.
                     // AVPlayer never stashes one (its resume is a pre-mount remux origin), so this is a no-op there.
@@ -2025,10 +2027,13 @@ struct PlayerScreen: View {
                             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
                             lastReported = max(lastReported, suppressedResumeFloor ?? floor)
                         }
-                        coordinator.player?.seek(to: t)
-                        armPostFrameResumeSeekWatchdog(target: t)
+                        if permitsDecoderResumeSeek {
+                            coordinator.player?.seekForResume(to: t)
+                            armPostFrameResumeSeekWatchdog(target: t)
+                        } else {
+                            reconcileUnavailableResume(target: t, actualPosition: d, owner: event.loadToken)
+                        }
                     }
-                    midPlayFailureResume = nil   // a mount that is playing owns its own position again
                     // FIRST-FRAME COMMIT (binge-desync fix): the incoming episode's file actually
                     // rendered, so publish an in-flight advance NOW, before anything below
                     // (recordLastStream, the scrobble start) reads curMeta/curTitle - the store record
@@ -3116,6 +3121,7 @@ struct PlayerScreen: View {
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
         if let issuedToken {
+            abandonedResumeRecovery = nil
             foregroundMountRevalidation.clear()
             sourceSwitchGeneration &+= 1
             beginAssetSanityAttemptIfNeeded(
@@ -3151,7 +3157,7 @@ struct PlayerScreen: View {
             terminalRetiredOwner: terminalRetiredAssetSanityOwner,
             requestedResumeSeconds: assetSanityRequestedResume
         )
-        return RetryResumeTargetPolicy.target(
+        let target = RetryResumeTargetPolicy.target(
             isLive: isLive,
             hasStartedPlaying: hasStartedPlaying,
             currentTimeSeconds: currentTime,
@@ -3161,6 +3167,12 @@ struct PlayerScreen: View {
             activeRequestedResumeSeconds: midPlayFailureResume ?? activeRequestedResume,
             fallbackResumeSeconds: midPlayFailureResume ?? resumeSeconds,
             persistenceFloorSeconds: suppressedResumeFloor
+        )
+        return DeferredResumeSeekReconciliationPolicy.recoveryOrigin(
+            presentationSeconds: target,
+            confirmedPositionSeconds: lastRawTimePos,
+            abandonment: abandonedResumeRecovery?.decision,
+            abandonmentOwnerIsCurrent: abandonedResumeRecovery?.owner == activeLoadToken
         )
     }
 
@@ -4083,7 +4095,7 @@ struct PlayerScreen: View {
     /// viewer's last valid Continue Watching position.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         cancelPostFrameResumeSeekWatchdog()
-        let armedToken = coordinator.player?.activeLoadToken
+        guard let armedToken = coordinator.player?.activeLoadToken else { return }
         postFrameResumeSeekWatchdogTarget = target
         postFrameResumeSeekWatchdogOwner = armedToken
         postFrameResumeSeekWatchdog = Task { @MainActor in
@@ -4100,11 +4112,31 @@ struct PlayerScreen: View {
                 String(format: "deferred resume seek did not land in %ds (target %.1f, real pos %.1f): reconciling presentation while preserving the resume floor",
                        Int(postFrameResumeSeekWatchdogSeconds), target, reconciliation.presentationSeconds)
             )
-            pendingLibmpvResumeSeek = nil
-            cancelPostFrameResumeSeekWatchdog()
-            currentTime = reconciliation.presentationSeconds
-            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
-            lastReported = max(lastReported, reconciliation.persistenceFloorSeconds)
+            reconcileUnavailableResume(target: target, actualPosition: reconciliation.presentationSeconds, owner: armedToken)
+        }
+    }
+
+    private var permitsDecoderResumeSeek: Bool {
+        DecoderResumeSeekabilityPolicy.permitsSeek(
+            avPlayerActive: isAVPlayerActive, firstFrameRendered: hasStartedPlaying,
+            runtimeSeekable: isSeekable
+        )
+    }
+
+    private func reconcileUnavailableResume(target: Double, actualPosition: Double, owner: PlayerLoadToken) {
+        guard let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
+            targetSeconds: target, actualPositionSeconds: actualPosition, landingToleranceSeconds: 5,
+            watchdogStillOwnsGeneration: coordinator.player?.activeLoadToken == owner
+        ) else { return }
+        pendingLibmpvResumeSeek = nil
+        cancelPostFrameResumeSeekWatchdog()
+        abandonedResumeRecovery = .init(owner: owner, decision: reconciliation)
+        currentTime = reconciliation.presentationSeconds
+        midPlayFailureResume = reconciliation.presentationSeconds
+        suppressedResumeFloor = max(suppressedResumeFloor ?? 0, reconciliation.persistenceFloorSeconds)
+        lastReported = max(lastReported, reconciliation.persistenceFloorSeconds)
+        showEngineNotice("That resume point is unavailable for this source. Playing from the earliest available position.")
+        if permitsDecoderResumeSeek {
             coordinator.player?.seekForResume(to: reconciliation.presentationSeconds + 0.1)
         }
     }
@@ -4120,6 +4152,7 @@ struct PlayerScreen: View {
 
     /// A user seek supersedes either phase of the deferred resume transaction.
     private func cancelPendingResumeForUserSeek() {
+        abandonedResumeRecovery = nil
         let oldTarget = pendingLibmpvResumeSeek ?? postFrameResumeSeekWatchdogTarget
         guard let oldTarget else { return }
         pendingLibmpvResumeSeek = nil

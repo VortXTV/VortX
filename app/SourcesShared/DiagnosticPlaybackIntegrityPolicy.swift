@@ -318,6 +318,25 @@ enum DeferredResumeSeekReconciliationPolicy {
         let presentationSeconds: Double
         let persistenceFloorSeconds: Double
     }
+    struct OwnedAbandonment<Owner: Equatable> {
+        let owner: Owner
+        let decision: Abandonment
+    }
+
+    /// A failed resume floor is persistence evidence, never a same-source reload origin. Keep an
+    /// explicit, load-owned abandonment until replacement so an optimistic UI target cannot re-arm it.
+    static func recoveryOrigin(
+        presentationSeconds: Double,
+        confirmedPositionSeconds: Double,
+        abandonment: Abandonment?,
+        abandonmentOwnerIsCurrent: Bool
+    ) -> Double {
+        guard abandonmentOwnerIsCurrent, let abandonment else { return presentationSeconds }
+        if confirmedPositionSeconds.isFinite, confirmedPositionSeconds >= 0 {
+            return confirmedPositionSeconds
+        }
+        return abandonment.presentationSeconds
+    }
 
     /// Returns a reconciliation only for a finite, trustworthy engine position that is still materially below
     /// the requested target. A near-target tick is proof the seek landed; an absent/invalid raw position is not
@@ -341,6 +360,15 @@ enum DeferredResumeSeekReconciliationPolicy {
             presentationSeconds: actualPositionSeconds,
             persistenceFloorSeconds: targetSeconds
         )
+    }
+}
+
+/// A transient startup `seekable=false` is not enough to reject VOD resume. Once a frame exists,
+/// however, a non-seekable mpv mount cannot fulfill an absolute saved offset. AVPlayer remuxes use
+/// logical source origins even when their current HLS window is forward-only, so stay exempt here.
+enum DecoderResumeSeekabilityPolicy {
+    static func permitsSeek(avPlayerActive: Bool, firstFrameRendered: Bool, runtimeSeekable: Bool) -> Bool {
+        avPlayerActive || !firstFrameRendered || runtimeSeekable
     }
 }
 

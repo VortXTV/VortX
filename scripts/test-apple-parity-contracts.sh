@@ -5,6 +5,14 @@ cd "$repo_root"
 build_dir="$repo_root/app/build/apple-parity-contracts"
 mkdir -p "$build_dir"
 
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift \
+  app/Tests/DeferredResumeSeekReconciliationPolicyTests.swift -o "$build_dir/deferred-resume"
+"$build_dir/deferred-resume"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/TVDeferredResumeRecoveryWiringContractTests.swift -o "$build_dir/deferred-resume-wiring"
+"$build_dir/deferred-resume-wiring" "$repo_root"
+
 swiftc -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/SkipSegments.swift app/Tests/AutoSkipCountdownPolicyTests.swift \
   -o "$build_dir/auto-skip-policy"
@@ -30,6 +38,10 @@ swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift \
   app/Tests/BecauseYouWatchedHistoryPolicyContractTests.swift -o "$build_dir/watch-history"
 "$build_dir/watch-history" "$repo_root"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift \
+  app/Tests/BecauseYouWatchedHistoryReceiptContractTests.swift -o "$build_dir/watch-history-receipt"
+"$build_dir/watch-history-receipt" "$repo_root"
 swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Tests/BecauseYouWatchedCredentialBoundaryContractTests.swift -o "$build_dir/watch-credentials"
 "$build_dir/watch-credentials" "$repo_root"
