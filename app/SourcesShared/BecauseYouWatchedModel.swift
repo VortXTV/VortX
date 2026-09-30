@@ -222,7 +222,9 @@ final class BecauseYouWatchedModel: ObservableObject {
 
     /// Build the non-secret ownership key used by Apple Home call sites. `StremioAccount` intentionally
     /// does not republish `isSignedIn` for a true-to-true replacement, so its published email assignment
-    /// is included as a stable identity hint until the engine's settled uid/binding is available. No auth
+    /// is included as a stable identity hint until the engine's settled uid/binding is available. A nil
+    /// principal with a numeric authority generation is the explicit local-owner mode; unresolved remote
+    /// history keeps both values absent. No auth
     /// token or credential material belongs in this key.
     static func recommendationOwnerKey(
         profileKeychainAccount: String,

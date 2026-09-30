@@ -48,33 +48,46 @@ struct HomeView: View {
     }
 
     /// Non-secret account identity for personalized rails. The email publisher catches a Stremio
-    /// same-slot replacement even when `isSignedIn` remains true; the engine uid/binding generation
-    /// becomes authoritative once its account context settles.
+    /// same-slot replacement even when `isSignedIn` remains true; a settled Stremio UID or explicit
+    /// nil-UID local-owner generation becomes authoritative once that history context settles.
     private var becauseYouWatchedOwnerKey: String {
         let binding = core.settledActiveAccountBinding()
+        let localOwner = core.settledLocalHistoryOwner()
         return BecauseYouWatchedModel.recommendationOwnerKey(
             profileKeychainAccount: profiles.activeKeychainAccount,
             isSignedIn: account.isSignedIn,
             usesEngineHistory: profiles.activeUsesEngineHistory,
             accountEmail: account.email,
-            principal: binding?.uid,
-            authorityGeneration: binding?.generation,
+            principal: binding?.uid ?? localOwner?.uid,
+            authorityGeneration: binding?.generation ?? localOwner?.generation,
             credentialBoundaryGeneration: account.credentialBoundaryGeneration
         )
     }
 
     /// The engine snapshot is usable only after a settled binding and a newer published history
     /// revision. `BecauseYouWatchedModel` owns the post-boundary revision latch; this value carries the
-    /// exact non-secret binding and the publication receipt into that model.
+    /// exact non-secret binding and the durable publication receipt into that model. `changedFields` is
+    /// only the newest engine event, so it is intentionally not used as owner-history evidence here.
     private var becauseYouWatchedHistorySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot {
         let binding = core.settledActiveAccountBinding()
+        let localOwner = core.settledLocalHistoryOwner()
+        let receipt = core.lastAcceptedHistoryReceipt
+        let validReceipt = receipt.flatMap { candidate in
+            if let binding {
+                return candidate.owner.profileID == binding.profileID &&
+                    candidate.owner.keychainAccount == binding.keychainAccount &&
+                    candidate.owner.uid == binding.uid &&
+                    candidate.owner.generation == binding.generation ? candidate : nil
+            }
+            return candidate.owner == localOwner ? candidate : nil
+        }
         return .init(
-            owner: binding.map {
+            owner: validReceipt?.owner ?? binding.map {
                 .init(profileID: $0.profileID, keychainAccount: $0.keychainAccount,
                       uid: $0.uid, generation: $0.generation)
-            },
-            revision: core.revision,
-            changedFields: core.changedFields
+            } ?? localOwner,
+            revision: validReceipt?.revision ?? 0,
+            changedFields: validReceipt?.changedFields ?? []
         )
     }
 
@@ -192,9 +205,11 @@ struct HomeView: View {
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
-        .onChange(of: core.revision) { _ in
-            guard core.changedFields.contains("continue_watching_preview")
-                    || core.changedFields.contains("library") else { return }
+        // The old `.onChange(of: core.revision)` hook observed every board/meta event. Observe the
+        // durable history-receipt revision instead: Home first appearing after a board event reads the
+        // retained receipt above, while unrelated revisions do not fan out recommendation work.
+        .onChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in
+            guard core.lastAcceptedHistoryReceipt != nil else { return }
             seed()
             refreshTopPicks()
         }

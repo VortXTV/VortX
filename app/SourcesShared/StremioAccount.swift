@@ -184,9 +184,10 @@ extension PlaybackMutationTarget {
 @MainActor
 final class StremioAccount: ObservableObject {
     /// Posted after a successful credential replacement. The notification carries only a process-local
-    /// monotonic generation and whether the account was already signed in; it never carries the auth key,
-    /// email, or any other credential material. CoreBridge uses the true-to-true case to rotate its
-    /// settled binding because SwiftUI's `isSignedIn` publisher intentionally suppresses true -> true.
+    /// monotonic generation, prior sign-in state, and the non-secret profile/keychain owner identity; it
+    /// never carries the auth key, email, or any other credential material. CoreBridge uses the true-to-true
+    /// case to rotate its settled binding because SwiftUI's `isSignedIn` publisher intentionally suppresses
+    /// true -> true.
     nonisolated static let credentialBoundaryDidChange = Notification.Name("StremioAccount.credentialBoundaryDidChange")
 
     @Published var isSignedIn = false
@@ -207,20 +208,52 @@ final class StremioAccount: ObservableObject {
     private var tokenKey: String { ProfileStore.shared.activeKeychainAccount }
     private let emailKey = "stremiox.email"
     private let log = Logger(subsystem: "com.stremiox.app", category: "account")
+    /// An auth operation captures the active profile before its first await. ProfileStore increments
+    /// this local generation on every reload/sign-out/new sign-in, so a late response cannot write into
+    /// whichever profile happens to be selected when it resumes.
+    private struct AuthOperationContext: Equatable {
+        let profileID: UUID?
+        let keychainAccount: String
+        let generation: UInt64
+    }
+    private var authOperationGeneration: UInt64 = 0
 
     private var authKey: String? {
         get { Keychain.string(tokenKey) }
         set { Keychain.set(newValue, for: tokenKey) }
     }
 
+    private func captureAuthOperationContext() -> AuthOperationContext {
+        AuthOperationContext(
+            profileID: ProfileStore.shared.active?.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            generation: authOperationGeneration)
+    }
+
+    private func beginAuthOperation() -> AuthOperationContext {
+        authOperationGeneration &+= 1
+        return captureAuthOperationContext()
+    }
+
+    private func authOperationStillCurrent(_ context: AuthOperationContext) -> Bool {
+        authOperationGeneration == context.generation
+            && ProfileStore.shared.active?.id == context.profileID
+            && ProfileStore.shared.activeKeychainAccount == context.keychainAccount
+    }
+
     init() {
         email = Self.displayEmail()
         migrateTokenToKeychain()
-        if authKey != nil { isSignedIn = true; Task { await loadAddons() } }
+        let context = captureAuthOperationContext()
+        if Keychain.string(context.keychainAccount) != nil {
+            isSignedIn = true
+            Task { [weak self] in await self?.loadAddons(for: context) }
+        }
     }
 
     /// Re-read the session for the newly active profile (called after a profile switch).
     func reloadForActiveProfile() {
+        authOperationGeneration &+= 1
         signInError = nil
         streamSources = []
         addons = []
@@ -229,9 +262,10 @@ final class StremioAccount: ObservableObject {
         // assignment (even true→true), so an unconditional write here can re-enter any
         // `.onReceive($isSignedIn)` sink that calls back into this method, the loop that froze the
         // iOS sign-in. Assigning only on change keeps this method safe for any observer.
-        let signedIn = authKey != nil
+        let context = captureAuthOperationContext()
+        let signedIn = Keychain.string(context.keychainAccount) != nil
         if isSignedIn != signedIn { isSignedIn = signedIn }
-        if signedIn { Task { await loadAddons() } }
+        if signedIn { Task { [weak self] in await self?.loadAddons(for: context) } }
     }
 
     /// Own-account profiles carry their email; shared profiles show the primary account's.
@@ -261,8 +295,10 @@ final class StremioAccount: ObservableObject {
         }
         struct ErrObj: Decodable { let message: String? }
         guard !email.isEmpty, !password.isEmpty else { signInError = "Enter your email and password."; return }
+        let context = beginAuthOperation()
         do {
             let res: Res = try await post("login", body: Req(email: email, password: password))
+            guard authOperationStillCurrent(context) else { return }
             guard let key = res.result?.authKey else {
                 let msg = res.error?.message ?? "Sign-in failed"
                 signInError = msg
@@ -270,15 +306,21 @@ final class StremioAccount: ObservableObject {
                 return
             }
             let wasSignedIn = isSignedIn
-            authKey = key
+            // The active profile/keychain slot was captured before the await. Never resolve the
+            // destination dynamically from the profile selected after the response returned.
+            // Never use the old dynamic `authKey = key` destination after this await: the selected
+            // profile may have changed. Write only to the slot captured before the request started.
+            Keychain.set(key, for: context.keychainAccount)
+            guard authOperationStillCurrent(context) else { return }
             publishCredentialBoundary(wasSignedIn: wasSignedIn)
             // Publish the credential boundary before the email publisher so CoreBridge can rotate its
             // settled binding before Home performs its account-bound recommendation refresh.
-            setEmail(res.result?.user?.email ?? email)
+            setEmail(res.result?.user?.email ?? email, for: context)
             if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
             log.info("signed in ok")
-            await loadAddons()
+            await loadAddons(for: context)
         } catch {
+            guard authOperationStillCurrent(context) else { return }
             signInError = "Couldn't reach Stremio. Check your connection."
             log.error("signIn network error: \(error.localizedDescription, privacy: .public)")
         }
@@ -288,24 +330,33 @@ final class StremioAccount: ObservableObject {
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { signInError = "Sign-in failed."; return }
         signInError = nil
+        let context = beginAuthOperation()
         let wasSignedIn = isSignedIn
-        authKey = token
+        Keychain.set(token, for: context.keychainAccount)
+        guard authOperationStillCurrent(context) else { return }
         publishCredentialBoundary(wasSignedIn: wasSignedIn)
-        await backfillEmail()
+        await backfillEmail(for: context)
+        guard authOperationStillCurrent(context) else { return }
         if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
         log.info("signed in with link ok")
-        await loadAddons()
+        await loadAddons(for: context)
     }
 
     func signOut() {
+        authOperationGeneration &+= 1
         authKey = nil; isSignedIn = false; streamSources = []; addons = []
         setEmail(nil)
     }
 
-    private func setEmail(_ value: String?) {
+    private func setEmail(_ value: String?, for context: AuthOperationContext? = nil) {
+        if let context, !authOperationStillCurrent(context) { return }
         email = value
         let store = ProfileStore.shared
         if var profile = store.active, profile.usesOwnAccount {
+            if let context,
+               (profile.id != context.profileID || store.activeKeychainAccount != context.keychainAccount) {
+                return
+            }
             profile.email = value          // the bound account belongs to this profile only
             store.update(profile)
         } else {
@@ -323,18 +374,26 @@ final class StremioAccount: ObservableObject {
             object: nil,
             userInfo: [
                 "generation": generation,
-                "wasSignedIn": wasSignedIn
+                "wasSignedIn": wasSignedIn,
+                "profileID": ProfileStore.shared.active?.id.uuidString ?? "",
+                "keychainAccount": ProfileStore.shared.activeKeychainAccount
             ]
         )
         credentialBoundaryGeneration = generation
     }
 
     func loadAddons() async {
-        guard let key = authKey else { return }
+        await loadAddons(for: captureAuthOperationContext())
+    }
+
+    private func loadAddons(for context: AuthOperationContext) async {
+        guard authOperationStillCurrent(context),
+              let key = Keychain.string(context.keychainAccount), !key.isEmpty else { return }
         struct Req: Encodable { let authKey: String; let update = true }
         struct Res: Decodable { struct R: Decodable { let addons: [AddonDescriptor] }; let result: R? }
         do {
             let res: Res = try await post("addonCollectionGet", body: Req(authKey: key))
+            guard authOperationStillCurrent(context) else { return }
             let addons = res.result?.addons ?? []
             self.addons = addons
             // Keep the user's addon order (addonCollectionGet = their Stremio order) so the sources
@@ -342,20 +401,23 @@ final class StremioAccount: ObservableObject {
             streamSources = addons.filter { $0.providesStreams }
                 .map { StreamSource(base: $0.baseUrl, name: $0.manifest.name) }
             log.info("loaded \(self.addons.count) addons, \(self.streamSources.count) stream addons")
-            if email == nil { await backfillEmail() }   // older sessions saved no email
+            if email == nil { await backfillEmail(for: context) }   // older sessions saved no email
         } catch {
+            guard authOperationStillCurrent(context) else { return }
             // keep whatever we had, but surface why the refresh failed
             log.error("loadAddons failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
     /// Backfill the account email (for sessions that predate email capture).
-    private func backfillEmail() async {
-        guard let key = authKey else { return }
+    private func backfillEmail(for context: AuthOperationContext) async {
+        guard authOperationStillCurrent(context),
+              let key = Keychain.string(context.keychainAccount), !key.isEmpty else { return }
         struct Req: Encodable { let authKey: String }
         struct Res: Decodable { struct U: Decodable { let email: String? }; let result: U? }
-        if let res: Res = try? await post("getUser", body: Req(authKey: key)), let e = res.result?.email {
-            setEmail(e)
+        if let res: Res = try? await post("getUser", body: Req(authKey: key)),
+           authOperationStillCurrent(context), let e = res.result?.email {
+            setEmail(e, for: context)
         }
     }
 

@@ -42,6 +42,28 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var streamsEpoch = 0
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
+    /// The last account-owned history payload that was actually accepted for the currently settled
+    /// engine binding. `changedFields` is only the newest engine event and can be overwritten by a
+    /// board/meta receipt before Home first appears; this durable, owner-tagged receipt is the
+    /// recommendation admission proof. Main-queue writes only.
+    private(set) var lastAcceptedHistoryReceipt: BecauseYouWatchedHistoryPolicy.Snapshot?
+    private var acceptedHistoryReceiptRevision = 0
+    /// A signed-out engine can still expose the owner's local library. Keep that authority separate from
+    /// the remote Stremio binding: nil engine UID is valid only after this exact credential/profile capture
+    /// and, for imported-away profiles, the confirmed local recovery path.
+    private struct LocalHistoryAuthority: Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let authGeneration: UInt64
+        let credentialCapture: CredentialScopeRegistry.Capture
+        let publicationToken: PublicationToken
+        let owner: BecauseYouWatchedHistoryPolicy.Owner
+    }
+    private var localHistoryAuthority: LocalHistoryAuthority?
+    /// Imported-away recovery is intentionally fail-closed until signed-out engine state has been confirmed,
+    /// the local library has been loaded, and account-owned add-ons/library hydration has completed.
+    private var localHistoryRecoveryInFlight = false
+    private var localHistoryAuthorityGeneration: UInt64 = 0
     @Published private(set) var searchResults: [CoreMeta] = []
     @Published private(set) var searchIsLoading = false
     @Published private(set) var searchSuggestions: [CoreSearchSuggestion] = []
@@ -200,6 +222,7 @@ final class CoreBridge: ObservableObject {
         let profileID: UUID
         let keychainAccount: String
         let authGeneration: UInt64
+        let credentialCapture: CredentialScopeRegistry.Capture
         let publicationToken: PublicationToken
         let signedOutRequest: SignedOutRepairRequest
     }
@@ -270,7 +293,13 @@ final class CoreBridge: ObservableObject {
         ) { [weak self] note in
             guard let self,
                   let rawGeneration = note.userInfo?["generation"] as? NSNumber,
+                  let eventProfileID = note.userInfo?["profileID"] as? String,
+                  let eventKeychainAccount = note.userInfo?["keychainAccount"] as? String,
                   note.userInfo?["wasSignedIn"] as? Bool == true else { return }
+            // A same-slot credential event is accepted only for the profile/keychain identity that
+            // is still selected. A delayed A response must not rebind the newly selected B slot.
+            guard eventProfileID == ProfileStore.shared.active?.id.uuidString,
+                  eventKeychainAccount == ProfileStore.shared.activeKeychainAccount else { return }
             let generation = rawGeneration.uint64Value
             guard generation > self.lastCredentialBoundaryGeneration else { return }
             self.lastCredentialBoundaryGeneration = generation
@@ -319,6 +348,9 @@ final class CoreBridge: ObservableObject {
         // Seed Continue Watching through the SAME union path events use, so a cold / migrated device that
         // re-added its owner library at time 0 still paints the rail from OwnerResumeStore instead of blank
         // (#149), rather than only reflecting the engine's own (empty) continue_watching_preview here.
+        // A cold local-owner engine can have real persisted CW without emitting a new event. The shared
+        // rebuild path records this accepted seed exactly like the event path so recommendations do not
+        // wait forever for a second engine tick.
         rebuildContinueWatching(capturedPublicationToken: publicationToken)
         refreshAddons(capturedPublicationToken: publicationToken)
     }
@@ -894,6 +926,9 @@ final class CoreBridge: ObservableObject {
                         guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }
                         NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
                         self.logOut(rearmSignedOutRepair: false) // imported-away owns deterministic local recovery below
+                        // The logout receipt only proves the engine is signed out. Keep recommendation
+                        // admission closed until the exact local library/add-on hydration below completes.
+                        self.localHistoryRecoveryInFlight = true
                         // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
                         // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
                         // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
@@ -925,6 +960,18 @@ final class CoreBridge: ObservableObject {
                         guard self.importedAwayLocalRecoveryReady(localRecovery) else { return }
                         await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
                         guard self.importedAwayLocalRecoveryReady(localRecovery) else { return }
+                        self.localHistoryRecoveryInFlight = false
+                        // Hydration may have published the library/CW while local admission was deliberately
+                        // closed. Re-publish the current accepted state through the same receipt path now that
+                        // the exact signed-out recovery is complete; this is not a guessed UID or metadata seed.
+                        let recoveredPublicationToken = self.capturePublicationToken()
+                        if self.library != nil {
+                            self.recordAcceptedHistoryReceipt(
+                                fields: ["library"], publicationToken: recoveredPublicationToken)
+                        }
+                        self.rebuildContinueWatching(
+                            capturedPublicationToken: recoveredPublicationToken,
+                            recordsHistoryReceipt: true)
                         self.loadBoard()
                     } else {
                         NSLog("[CoreBridge] deferring engine Stremio-session unload: VortX doc unreachable this launch")
@@ -1177,6 +1224,9 @@ final class CoreBridge: ObservableObject {
             self.discoverPublishedFingerprint = nil
             self.library = nil
             self.metaDetails = nil
+            self.localHistoryAuthority = nil
+            self.lastAcceptedHistoryReceipt = nil
+            self.acceptedHistoryReceiptRevision = 0
         }
     }
 
@@ -2569,6 +2619,11 @@ final class CoreBridge: ObservableObject {
     }
 
     private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken) {
+        rebuildContinueWatching(capturedPublicationToken: publicationToken, recordsHistoryReceipt: true)
+    }
+
+    private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken,
+                                         recordsHistoryReceipt: Bool) {
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         let generation = continueWatchingRebuildGeneration
@@ -2579,7 +2634,8 @@ final class CoreBridge: ObservableObject {
         // `pruneFinished`, because a title Stremio reports as finished would otherwise be pruned away before
         // the floor could restore VortX's own in-progress position.
         let mayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn())
-        let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
+        let decodedPreview = decode(CoreCWPreview.self, field: "continue_watching_preview")
+        let preview = decodedPreview?.items ?? []
         let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -2600,7 +2656,37 @@ final class CoreBridge: ObservableObject {
                 : engine
             VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
             self.continueWatching = items
+            if recordsHistoryReceipt, decodedPreview != nil {
+                self.recordAcceptedHistoryReceipt(
+                    fields: ["continue_watching_preview"], publicationToken: publicationToken)
+            }
         }
+    }
+
+    /// Record an owner-tagged history receipt only after the decoded publication is accepted on main.
+    /// The remote binding/local-authority check is deliberately repeated here: an old worker completion
+    /// can arrive after the publication epoch is still unchanged but before a newer auth/profile
+    /// transition schedules its next work item.
+    private func recordAcceptedHistoryReceipt(
+        fields: Set<String>, publicationToken: PublicationToken
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let historyFields = fields.intersection(BecauseYouWatchedHistoryPolicy.historyFields)
+        guard !historyFields.isEmpty, publicationStillCurrent(publicationToken) else { return }
+        let owner: BecauseYouWatchedHistoryPolicy.Owner
+        if let binding = settledActiveAccountBinding() {
+            owner = .init(profileID: binding.profileID, keychainAccount: binding.keychainAccount,
+                          uid: binding.uid, generation: binding.generation)
+        } else if let localOwner = settledLocalHistoryOwner() {
+            owner = localOwner
+        } else {
+            return
+        }
+        acceptedHistoryReceiptRevision &+= 1
+        lastAcceptedHistoryReceipt = .init(
+            owner: owner,
+            revision: acceptedHistoryReceiptRevision,
+            changedFields: historyFields)
     }
 
     /// FLOOR each engine Continue Watching item against the VortX-owned position cached in `OwnerResumeStore`.
@@ -3263,6 +3349,87 @@ final class CoreBridge: ObservableObject {
         return binding
     }
 
+    /// The explicit local-owner authority for engine history when no Stremio principal is loaded. A nil UID
+    /// is meaningful here: the engine's signed-out on-disk library belongs to the selected owner profile,
+    /// but it is never evidence that an unresolved remote account is safe to use.
+    func settledLocalHistoryOwner() -> BecauseYouWatchedHistoryPolicy.Owner? {
+        let credentialCapture = CredentialScopeRegistry.shared.capture()
+        let credentialSettled: Bool
+        if case .signedOutDevice = credentialCapture.scope {
+            credentialSettled = true
+        } else {
+            // An account namespace is not authority merely because a transition selected it. Require the
+            // VortX session layer's authenticated-owner receipt before allowing local engine history.
+            credentialSettled = CredentialScopeRegistry.shared.isMigrationEligible(credentialCapture)
+        }
+        let profile = ProfileStore.shared.active
+        let tokenPresent = Keychain.string(ProfileStore.shared.activeKeychainAccount)?.isEmpty == false
+        let eligible = profile?.isOwner == true
+            && profile?.usesEngineHistory == true
+            && ProfileStore.shared.activeKeychainAccount.isEmpty == false
+            && !tokenPresent
+            && !isLoggedIn()
+            && currentUID() == nil
+            && !switchInFlight
+            && pendingAccountBinding == nil
+            && !awaitingAuthMigration
+            && !enginePublicationBlocked
+            && !localHistoryRecoveryInFlight
+            && localOnlyRecoveryAllowed(credentialCapture)
+            && credentialSettled
+            && CredentialScopeRegistry.shared.isCurrent(credentialCapture)
+
+        guard eligible, let profile else {
+            if localHistoryAuthority != nil {
+                localHistoryAuthority = nil
+                lastAcceptedHistoryReceipt = nil
+                acceptedHistoryReceiptRevision = 0
+            }
+            return nil
+        }
+
+        let publicationToken = capturePublicationToken()
+        let currentIdentity = LocalHistoryAuthority(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            authGeneration: authBindingGeneration,
+            credentialCapture: credentialCapture,
+            publicationToken: publicationToken,
+            owner: .init(profileID: profile.id,
+                         keychainAccount: ProfileStore.shared.activeKeychainAccount,
+                         uid: nil,
+                         generation: 0))
+        if let existing = localHistoryAuthority,
+           existing.profileID == currentIdentity.profileID,
+           existing.keychainAccount == currentIdentity.keychainAccount,
+           existing.authGeneration == currentIdentity.authGeneration,
+           existing.credentialCapture == currentIdentity.credentialCapture,
+           existing.publicationToken == currentIdentity.publicationToken {
+            return existing.owner
+        }
+
+        localHistoryAuthorityGeneration &+= 1
+        let owner = BecauseYouWatchedHistoryPolicy.Owner(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            uid: nil,
+            generation: localHistoryAuthorityGeneration)
+        // A different local capture/publication is a new owner boundary even when the profile and
+        // Keychain slot are unchanged. Retire any receipt from the prior local/remote epoch synchronously.
+        if lastAcceptedHistoryReceipt?.owner != owner {
+            lastAcceptedHistoryReceipt = nil
+            acceptedHistoryReceiptRevision = 0
+        }
+        localHistoryAuthority = .init(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            authGeneration: authBindingGeneration,
+            credentialCapture: credentialCapture,
+            publicationToken: publicationToken,
+            owner: owner)
+        return owner
+    }
+
     private static func credentialFingerprint(_ token: String) -> String {
         SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
@@ -3313,6 +3480,7 @@ final class CoreBridge: ObservableObject {
             profileID: profileID,
             keychainAccount: keychainAccount,
             authGeneration: authBindingGeneration,
+            credentialCapture: CredentialScopeRegistry.shared.capture(),
             publicationToken: capturePublicationToken(),
             signedOutRequest: signedOutRequest
         )
@@ -3324,6 +3492,7 @@ final class CoreBridge: ObservableObject {
               profile.usesEngineHistory,
               ProfileStore.shared.activeKeychainAccount == context.keychainAccount,
               authBindingGeneration == context.authGeneration,
+              CredentialScopeRegistry.shared.isCurrent(context.credentialCapture),
               publicationEpochMatches(context.publicationToken),
               Keychain.string(context.keychainAccount) == nil,
               !awaitingAuthMigration,
@@ -3376,6 +3545,9 @@ final class CoreBridge: ObservableObject {
         cancelAccountBindingVerification()
         retireSignedOutRepairRequest()
         invalidatePublicationEpoch()
+        // Any in-flight imported-away recovery belongs to the old profile/auth epoch. A later local
+        // owner may become eligible only after its own recovery publication is observed.
+        localHistoryRecoveryInFlight = false
         authBindingGeneration &+= 1
         pendingAccountBinding = nil
         settledAccountBinding = nil
@@ -3452,6 +3624,11 @@ final class CoreBridge: ObservableObject {
         publicationEpochLock.lock()
         publicationEpoch &+= 1
         publicationEpochLock.unlock()
+        // A new auth/profile/publication epoch cannot inherit the previous owner's history proof.
+        // Clear synchronously on main so Home cannot render the old receipt during the transition.
+        localHistoryAuthority = nil
+        lastAcceptedHistoryReceipt = nil
+        acceptedHistoryReceiptRevision = 0
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         continueWatchingRebuildLock.unlock()
@@ -3753,7 +3930,7 @@ final class CoreBridge: ObservableObject {
         if fields.contains("continue_watching_preview") {
             // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
             // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
-            rebuildContinueWatching(capturedPublicationToken: publicationToken)
+            rebuildContinueWatching(capturedPublicationToken: publicationToken, recordsHistoryReceipt: true)
             published = true
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
@@ -3865,6 +4042,10 @@ final class CoreBridge: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.publicationStillCurrent(publicationToken) else { return }
                 self.library = value
+                if value != nil {
+                    self.recordAcceptedHistoryReceipt(
+                        fields: ["library"], publicationToken: publicationToken)
+                }
             }
             published = true
             // A library change can change which owner titles belong in Continue Watching: the cold-recovery

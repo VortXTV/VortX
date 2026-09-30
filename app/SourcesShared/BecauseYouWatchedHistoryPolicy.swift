@@ -11,7 +11,9 @@ enum BecauseYouWatchedHistoryPolicy {
     struct Owner: Equatable {
         let profileID: UUID
         let keychainAccount: String
-        let uid: String
+        /// A non-nil UID proves a settled Stremio engine principal. `nil` is an explicit local-owner
+        /// authority (signed-out or imported-away VortX history), never a wildcard for an unresolved UID.
+        let uid: String?
         let generation: UInt64
     }
 
