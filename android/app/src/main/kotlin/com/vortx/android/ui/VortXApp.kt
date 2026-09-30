@@ -58,6 +58,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.DurableWatchReclaimCoordinator
+import com.vortx.android.data.DurableWatchedPlaybackReceipt
 import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
@@ -539,6 +540,26 @@ fun VortXApp(
                     )
                 }
             }
+            // These sinks capture THIS generation's coordinator before the player sees them. The player
+            // retains the exact callback per source/episode generation until its outer holder aggregate
+            // is fully released; neither sink may follow a later recomposition into a newer coordinator.
+            val reclaimCoordinatorForGeneration = watchedDownloadReclaim
+            val onDurableWatchReceipt = remember(reclaimCoordinatorForGeneration, appScope) {
+                { receipt: DurableWatchedPlaybackReceipt ->
+                    reclaimCoordinatorForGeneration?.let { capturedCoordinator ->
+                        appScope.launch(Dispatchers.IO) { capturedCoordinator.onDurableWatch(receipt) }
+                    }
+                    Unit
+                }
+            }
+            val onWatchedDownloadResourcesReleased = remember(reclaimCoordinatorForGeneration, appScope) {
+                {
+                    reclaimCoordinatorForGeneration?.let { capturedCoordinator ->
+                        appScope.launch(Dispatchers.IO) { capturedCoordinator.onResourcesReleased() }
+                    }
+                    Unit
+                }
+            }
             // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
             // [1] = duration. Reset when the history identity changes (new source, or a switched episode).
             val lastProgress = remember(historyIdentity) { longArrayOf(0L, 0L) }
@@ -649,7 +670,7 @@ fun VortXApp(
                 onDispose {
                     if (!historyPlayable.isTrailer) {
                         playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1]) { receipt ->
-                            appScope.launch(Dispatchers.IO) { watchedDownloadReclaim?.onDurableWatch(receipt) }
+                            onDurableWatchReceipt(receipt)
                         }
                     }
                 }
@@ -658,9 +679,7 @@ fun VortXApp(
                 PlayerScreen(
                     playable = playable,
                     engineOverride = playingEngineOverride,
-                    onResourcesReleased = {
-                        appScope.launch(Dispatchers.IO) { watchedDownloadReclaim?.onResourcesReleased() }
-                    },
+                    onResourcesReleased = onWatchedDownloadResourcesReleased,
                     // "Still watching?" binge boundary: how many episodes auto-advanced to reach this one.
                     autoAdvanceCount = autoAdvanceStreak[0],
                     onBingePrompted = { autoAdvanceStreak[0] = 0 },

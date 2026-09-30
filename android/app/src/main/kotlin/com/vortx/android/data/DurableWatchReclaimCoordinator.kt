@@ -47,16 +47,24 @@ private fun WatchedDownloadReclaimRequest.matches(context: PlaybackContext): Boo
         context.episode == episode
 
 /**
- * Counts actual decoder instances rather than lifecycle callbacks. Rebuilds may release one decoder
- * while binding another; only the final composition disposal, the closed lease, and zero bound decoders
- * together prove the local file is no longer in use.
+ * Counts every decoder and lease installed during one outer player mount. A source or episode
+ * replacement may dispose an old holder before it constructs a new one, so its request callback is
+ * retained as an immutable generation registration and is released only after the *outer* player has
+ * gone away and every holder from every replacement has finished. This deliberately trades immediate
+ * deletion after a replacement for proof that no current holder can still reference the local file.
  */
-internal class PlayerResourceReleaseGate(private val onReleased: () -> Unit) {
+internal class PlayerResourceReleaseGate {
     private val lock = Any()
     private var boundDecoders = 0
     private var boundLeases = 0
     private var sessionDisposed = false
     private var fired = false
+    private val releaseCallbacks = LinkedHashMap<Any, () -> Unit>()
+
+    /** Captures the callback once for this exact source/episode generation; it is never updated. */
+    fun registerReleaseCallback(generation: Any, onReleased: () -> Unit) = synchronized(lock) {
+        releaseCallbacks.putIfAbsent(generation, onReleased)
+    }
 
     fun decoderBound() = synchronized(lock) { boundDecoders += 1 }
     fun decoderReleased() = synchronized(lock) {
@@ -76,7 +84,7 @@ internal class PlayerResourceReleaseGate(private val onReleased: () -> Unit) {
     private fun releaseIfReady() {
         if (!fired && sessionDisposed && boundLeases == 0 && boundDecoders == 0) {
             fired = true
-            onReleased()
+            releaseCallbacks.values.forEach { it() }
         }
     }
 }

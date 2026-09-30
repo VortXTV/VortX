@@ -60,7 +60,8 @@ class DurableWatchReclaimCoordinatorTest {
     @Test
     fun `resource gate ignores destroy dispose races and waits for every decoder and lease`() {
         var released = 0
-        val gate = PlayerResourceReleaseGate { released += 1 }
+        val gate = PlayerResourceReleaseGate()
+        gate.registerReleaseCallback("original") { released += 1 }
         gate.decoderBound()
         gate.leaseBound()
 
@@ -76,6 +77,58 @@ class DurableWatchReclaimCoordinatorTest {
         gate.leaseReleased()
         gate.sessionDisposed()
         assertEquals(1, released)
+    }
+
+    @Test
+    fun `old source release cannot reclaim while replacement still owns the same local file`() {
+        var originalReclaims = 0
+        var replacementReclaims = 0
+        val gate = PlayerResourceReleaseGate()
+        gate.registerReleaseCallback("source-one") { originalReclaims += 1 }
+        gate.decoderBound()
+        gate.leaseBound()
+
+        // The outgoing source drops its holders, then an accepted replacement binds the same file.
+        gate.decoderReleased()
+        gate.leaseReleased()
+        gate.registerReleaseCallback("source-two") { replacementReclaims += 1 }
+        gate.decoderBound()
+        gate.sessionDisposed()
+
+        assertEquals(0, originalReclaims)
+        assertEquals(0, replacementReclaims)
+
+        gate.decoderReleased()
+        assertEquals(1, originalReclaims)
+        assertEquals(1, replacementReclaims)
+    }
+
+    @Test
+    fun `old episode teardown retains immutable callback and cannot release new coordinator`() {
+        var oldEpisodeReclaims = 0
+        var newEpisodeReclaims = 0
+        val gate = PlayerResourceReleaseGate()
+        gate.registerReleaseCallback("episode-one") { oldEpisodeReclaims += 1 }
+        gate.decoderBound()
+        gate.leaseBound()
+
+        // Ending the old episode is not outer-player disposal and must not invoke its successor.
+        gate.decoderReleased()
+        gate.leaseReleased()
+        assertEquals(0, oldEpisodeReclaims)
+        assertEquals(0, newEpisodeReclaims)
+
+        gate.registerReleaseCallback("episode-two") { newEpisodeReclaims += 1 }
+        gate.decoderBound()
+        gate.leaseBound()
+        gate.sessionDisposed()
+        gate.leaseReleased()
+        assertEquals(0, oldEpisodeReclaims)
+        assertEquals(0, newEpisodeReclaims)
+
+        gate.decoderReleased()
+        assertEquals(1, oldEpisodeReclaims)
+        assertEquals(1, newEpisodeReclaims)
     }
 
     private class Fixture {

@@ -182,7 +182,6 @@ fun PlayerScreen(
     val audioManager = remember(context) { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     val currentOnBack by rememberUpdatedState(onBack)
     val currentOnProgress by rememberUpdatedState(onProgress)
-    val currentOnResourcesReleased by rememberUpdatedState(onResourcesReleased)
     val currentOnError by rememberUpdatedState(onError)
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
@@ -440,8 +439,15 @@ fun PlayerScreen(
     // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
     // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
     val engineHolder = remember(playbackSessionKey, forceExoPlayer, enginePreference) { AtomicReference<PlayerEngine?>(null) }
-    val resourceReleaseGate = remember(playbackSessionKey) {
-        PlayerResourceReleaseGate { currentOnResourcesReleased() }
+    // This gate deliberately spans source and episode replacements inside one mounted player. Each
+    // generation registers its immutable host callback below; a release from an old generation must
+    // never be forwarded through a latest-value callback to the new generation's reclaim coordinator.
+    val resourceReleaseGate = remember(outerPlaybackSessionId) {
+        PlayerResourceReleaseGate()
+    }
+    DisposableEffect(resourceReleaseGate, playbackSessionKey) {
+        resourceReleaseGate.registerReleaseCallback(playbackSessionKey, onResourcesReleased)
+        onDispose { }
     }
     fun releaseBoundEngine() {
         engineHolder.getAndSet(null)?.let { engine ->
@@ -1279,7 +1285,9 @@ fun PlayerScreen(
     DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
     }
-    DisposableEffect(playbackSessionKey) {
+    // A final proof is scoped to the mounted player, not an accepted source/episode replacement.
+    // The gate still waits for every decoder and lease counted by the entire outer session.
+    DisposableEffect(outerPlaybackSessionId) {
         onDispose { resourceReleaseGate.sessionDisposed() }
     }
     // A replacement, back navigation, profile change, or composition teardown releases a native NZB producer.
