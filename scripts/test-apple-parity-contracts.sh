@@ -26,6 +26,13 @@ swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
 swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Tests/BecauseYouWatchedAccountOwnerCallsiteContractTests.swift -o "$build_dir/watch-account"
 "$build_dir/watch-account" "$repo_root"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift \
+  app/Tests/BecauseYouWatchedHistoryPolicyContractTests.swift -o "$build_dir/watch-history"
+"$build_dir/watch-history" "$repo_root"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/BecauseYouWatchedCredentialBoundaryContractTests.swift -o "$build_dir/watch-credentials"
+"$build_dir/watch-credentials" "$repo_root"
 swiftc -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/AVNativeSubtitleOverlayBridge.swift \
   app/Tests/AVNativeSubtitleOverlayBridgeTests.swift -o "$build_dir/native-subtitle-bridge"

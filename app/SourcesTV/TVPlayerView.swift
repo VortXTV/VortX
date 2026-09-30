@@ -8007,8 +8007,7 @@ struct TVPlayerView: View {
     /// so the player body re-renders when the pill appears/disappears, not per tick.
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
-        let promptAvailable = controlsHidden && panel == nil && !skipEditActive
-            && !stillWatchingPrompt && !loadFailed
+        let promptAvailable = controlsHidden && !showOptions && !stillWatching && !loadFailed
             && (skip?.kind == .credits || upNextRemaining == nil)
         let decision = AutoSkipCountdownPolicy.advance(
             state: &autoSkipCountdown,

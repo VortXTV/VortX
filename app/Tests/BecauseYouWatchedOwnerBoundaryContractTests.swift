@@ -53,8 +53,9 @@ check(refresh.contains("if !ownerChanged, signature == lastSignature, rail != ni
 check(refresh.contains("if ownerChanged {\n            rail = nil\n            lastSignature = nil\n        }") &&
         refresh.contains("activeOwnerKey = ownerKey\n\n        guard !seeds.isEmpty else"),
       "owner changes clear the visible rail before empty-history handling")
-check(refresh.contains("[seeds, owned, signature, generation, profileID, ownerKey]") &&
+check(refresh.contains("[seeds, owned, signature, generation, admissionGeneration, profileID, ownerKey]") &&
         refresh.contains("self.requestGeneration == generation") &&
+        refresh.contains("self.historyAdmission.isCurrent(admissionGeneration)") &&
         refresh.contains("self.activeOwnerKey = ownerKey"),
       "late recommendation responses remain fenced to their owner generation")
 check(clear.contains("activeOwnerKey = nil") && clear.contains("rail = nil"),
