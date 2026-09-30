@@ -3930,14 +3930,14 @@ enum PlayerLiveContractTests {
         check("wiring: first-frame proof and start timers are owned by the current logical load",
               tvPlayer?.contains(".hasProducedPlayableVideoFrame == true") == true
                   && tvPlayer?.contains(
-                      "TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(") == true
+                      "ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(") == true
                   && tvPlayer?.contains(
                       "capturedEpisodeGeneration: capturedEpisodeGeneration") == true
                   && tvPlayer?.contains(
                       "capturedLoadToken: capturedLoadToken") == true)
         check("wiring: generic source timeout cannot outrun a progressing remux watchdog",
               tvPlayer?.contains(
-                  "TVPlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(") == true
+                  "ApplePlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(") == true
                   && tvPlayer?.contains(
                       "remuxPendingOrMounted: avController?.remuxStartupSignal.pendingOrMounted == true") == true
                   && tvPlayer?.contains(
@@ -4472,7 +4472,7 @@ enum PlayerLiveContractTests {
         check("wiring: automatic recovery re-applies semantic audio once then falls back to TrackSelector",
               sourceContainsInOrder(autoTrackSelection, [
                   "if let pendingAudioReapply",
-                  "TVTrackRecoveryPolicy.audioAction",
+                  "AppleTrackRecoveryPolicy.audioAction",
                   "case let .reapply(id)",
                   "coordinator.player?.setAudioTrack(id)",
                   "case let .automatic(id)",

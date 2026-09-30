@@ -64,44 +64,6 @@ enum TVPlayerAccessibilityRowIdentityPolicy {
 }
 // END TVPlayerAccessibilityRowIdentityPolicy
 
-/// Pure startup decision for the tvOS AVPlayer watchdog. Kept outside `TVPlayerView` so the boundary cases can
-/// run in a standalone harness without compiling the full SwiftUI player surface.
-enum TVAVStartWatchdogPolicy {
-    static let remoteAttachSchedulingMarginSeconds: Double = 3
-
-    enum AwaitingMountDecision: Equatable {
-        case cancel
-        case keepWaiting
-        case monitorRemux
-        case demote
-    }
-
-    /// A direct AVPlayer start keeps its short deadline. A source whose route is expected to produce a remux
-    /// gets the bounded attach budget because the external engine sets `isRemuxMounted` asynchronously after
-    /// signalling. The instant that runtime truth appears, the caller moves to the progress-aware watchdog.
-    static func awaitingMountDecision(elapsed: Double,
-                                      ownerCurrent: Bool,
-                                      remuxMounted: Bool,
-                                      remuxExpected: Bool,
-                                      directTimeout: Double,
-                                      remuxAttachTimeout: Double) -> AwaitingMountDecision {
-        guard ownerCurrent else { return .cancel }
-        if remuxMounted { return .monitorRemux }
-        if elapsed < directTimeout { return .keepWaiting }
-        if remuxExpected, elapsed < remuxAttachTimeout { return .keepWaiting }
-        return .demote
-    }
-
-    /// Session creation and signalling are sequential bounded stages. The surface watchdog must cover both
-    /// real transport budgets plus a small scheduling margin, or it can demote a healthy remote mount first.
-    static func remoteAttachTimeout(controlResourceTimeout: Double,
-                                    signallingTimeout: Double) -> Double {
-        max(0, controlResourceTimeout)
-            + max(0, signallingTimeout)
-            + remoteAttachSchedulingMarginSeconds
-    }
-}
-
 /// The direct AVPlayer no-frame path is intentionally a two-engine, one-source check: AVFoundation gets its
 /// short opportunity first, then libmpv gets one bounded opportunity on the exact same source. If neither
 /// engine produces a frame, this is a source-level failure and the normal hop choke point must run rather than
@@ -146,69 +108,6 @@ enum TVLibMPVStartupNudgePolicy {
     ) -> Decision {
         guard recoveryRecorded, sourceStillCurrent, !firstFrameRendered else { return .cancel }
         return nudgeAlreadyIssued ? .hop : .nudge
-    }
-}
-
-/// Recovery choices arrive before either track list is guaranteed complete. Keep each semantic choice pending
-/// until its own media type can perform a real action; an early empty subtitle list must never turn a manual
-/// language pick into Off just because audio happened to arrive first.
-enum TVTrackRecoveryPolicy {
-    enum AudioAction: Equatable {
-        case retain
-        case reapply(Int)
-        case automatic(Int)
-    }
-
-    enum SubtitleAction: Equatable {
-        case retain
-        case selectEmbedded(Int)
-        case applyImmediately
-    }
-
-    static func audioAction(
-        choice: PlayerRecoveryAudioChoice,
-        tracks: [MPVTrack],
-        automaticID: Int?
-    ) -> AudioAction {
-        let candidates = tracks.map {
-            PlayerRecoveryAudioChoice.Candidate(
-                id: $0.id, language: $0.lang, title: $0.title, selectable: $0.isSelectable
-            )
-        }
-        guard candidates.contains(where: \.selectable) else { return .retain }
-        if let id = PlayerRecoveryAudioChoice.matchingID(for: choice, in: candidates) {
-            return .reapply(id)
-        }
-        return automaticID.map(AudioAction.automatic) ?? .retain
-    }
-
-    static func subtitleAction(
-        choice: SubtitleChoice,
-        tracks: [MPVTrack],
-        pooledChoiceAvailable: Bool
-    ) -> SubtitleAction {
-        switch choice {
-        case .off, .external:
-            return .applyImmediately
-        case .pooled:
-            return pooledChoiceAvailable ? .applyImmediately : .retain
-        case let .embedded(lang, title):
-            let normalizedLanguage = lang.lowercased()
-            let normalizedTitle = title.lowercased()
-            if let exact = tracks.first(where: {
-                $0.isSelectable
-                    && $0.lang.lowercased() == normalizedLanguage
-                    && $0.title.lowercased() == normalizedTitle
-            }) {
-                return .selectEmbedded(exact.id)
-            }
-            if let language = tracks.first(where: {
-                $0.isSelectable && $0.lang.lowercased() == normalizedLanguage
-            }) {
-                return .selectEmbedded(language.id)
-            }
-            return .retain
-        }
     }
 }
 
@@ -278,49 +177,6 @@ enum TVNativeDebridRecoveryStateMachine {
     }
 }
 // END native-debrid recovery switch state machine
-// END tvOS track recovery policy
-
-/// Pure ownership and first-frame gates shared by the 30-second source-hop timer and the event surface.
-/// Position zero is a valid rendered first frame for AVPlayer, while every timer must still prove it belongs
-/// to the exact episode, source, retry generation and logical player load that armed it.
-enum TVPlaybackStartPolicy {
-    static func hasStarted(positionSeconds: Double, avPlayerRenderedFrame: Bool) -> Bool {
-        positionSeconds > 0 || avPlayerRenderedFrame
-    }
-
-    static func shouldIgnoreIssuedAdvanceTick(
-        positionSeconds: Double,
-        avPlayerRenderedFrame: Bool
-    ) -> Bool {
-        positionSeconds <= 0 && !avPlayerRenderedFrame
-    }
-
-    /// A remux start has its own exact-owner, progress-aware watchdog. The generic source-hop timer must not
-    /// race it using AVPlayer's still-empty loaded ranges and tear down a mount whose mux counters are moving.
-    static func genericLoadTimeoutDefersToRemuxWatchdog(
-        avPlayerActive: Bool,
-        remuxPendingOrMounted: Bool
-    ) -> Bool {
-        avPlayerActive && remuxPendingOrMounted
-    }
-
-    static func loadTimeoutOwnerIsCurrent<Token: Equatable>(
-        capturedEpisodeGeneration: Int,
-        currentEpisodeGeneration: Int,
-        capturedSourceGeneration: Int,
-        currentSourceGeneration: Int,
-        capturedResumeGeneration: Int,
-        currentResumeGeneration: Int,
-        capturedLoadToken: Token?,
-        currentLoadToken: Token?
-    ) -> Bool {
-        let loadOwnerCurrent = capturedLoadToken == nil || capturedLoadToken == currentLoadToken
-        return capturedEpisodeGeneration == currentEpisodeGeneration
-            && capturedSourceGeneration == currentSourceGeneration
-            && capturedResumeGeneration == currentResumeGeneration
-            && loadOwnerCurrent
-    }
-}
 
 /// Full-screen libmpv player for tvOS. All remote input is handled at the UIKit level by a focusable
 /// `RemoteCatcher` (pressesBegan), and the control bar / options panel are driven by plain state with
@@ -665,7 +521,7 @@ struct TVPlayerView: View {
     // the client waits for classify/init signalling. Cover both real transport budgets plus scheduling margin
     // so the surface cannot demote a healthy mount before its own bounded startup work completes. Once mounted,
     // the normal progress-aware stall policy takes over.
-    private let avRemuxAttachWatchdogSeconds = TVAVStartWatchdogPolicy.remoteAttachTimeout(
+    private let avRemuxAttachWatchdogSeconds = AppleAVStartWatchdogPolicy.remoteAttachTimeout(
         controlResourceTimeout: VortXExternalEngine.controlResourceTimeoutSeconds,
         signallingTimeout: VortXRemoteRemuxMount.signallingTimeoutSeconds)
     // Progress-aware remux demote thresholds (the 0.3.13 field fix: a heavy 4K DV title that was still
@@ -2006,7 +1862,7 @@ struct TVPlayerView: View {
                         .hasProducedPlayableVideoFrame == true
                 if pendingAdvance?.issued == true,
                    event.loadToken == pendingAdvance?.loadToken,
-                   TVPlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
+                   ApplePlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
                     positionSeconds: d,
                     avPlayerRenderedFrame: avPlayerRenderedFrame
                    ) { return }
@@ -2016,7 +1872,7 @@ struct TVPlayerView: View {
                 // Skip only the start-of-playback block; the normal tick handling below still runs, and its
                 // attribution reads (`curMeta`) still name the outgoing episode - exactly what is playing.
                 let outgoingResolveTick = pendingAdvance != nil && pendingAdvance?.issued != true
-                if TVPlaybackStartPolicy.hasStarted(
+                if ApplePlaybackStartPolicy.hasStarted(
                     positionSeconds: d,
                     avPlayerRenderedFrame: avPlayerRenderedFrame),
                    !hasStartedPlaying, !outgoingResolveTick {            // playback actually began
@@ -5047,7 +4903,7 @@ struct TVPlayerView: View {
             pick.audio,
             remuxOwnsInitialSelection: remuxOwnsInitialAudio)
         if let pendingAudioReapply {
-            switch TVTrackRecoveryPolicy.audioAction(
+            switch AppleTrackRecoveryPolicy.audioAction(
                 choice: pendingAudioReapply,
                 tracks: audioTracks,
                 automaticID: automaticAudio
@@ -5082,7 +4938,7 @@ struct TVPlayerView: View {
                 } else {
                     pooledChoiceAvailable = false
                 }
-                switch TVTrackRecoveryPolicy.subtitleAction(
+                switch AppleTrackRecoveryPolicy.subtitleAction(
                     choice: choice,
                     tracks: subtitleTracks,
                     pooledChoiceAvailable: pooledChoiceAvailable
@@ -6019,7 +5875,7 @@ struct TVPlayerView: View {
             // handleStartTimeout immediately, and each hop arms+cancels the next, cascading through every source
             // in milliseconds ("Tried N sources") over a source that was actually still loading.
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
-                  TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                  ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
                       capturedEpisodeGeneration: capturedEpisodeGeneration,
                       currentEpisodeGeneration: episodeSwitchGeneration,
                       capturedSourceGeneration: capturedSourceGeneration,
@@ -6080,7 +5936,7 @@ struct TVPlayerView: View {
         }
         if isTorrentPlayback { warmUpTorrent(); return }   // a peerless torrent never errors; warm it up
         let avController = coordinator.player as? AVPlayerEngineController
-        if TVPlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(
+        if ApplePlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(
             avPlayerActive: avController != nil,
             remuxPendingOrMounted: avController?.remuxStartupSignal.pendingOrMounted == true
         ) {
@@ -6103,7 +5959,7 @@ struct TVPlayerView: View {
             loadTimeout = Task { @MainActor in
                 guard await waitForPlaybackTime(20) else { return }
                 guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
-                      TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                      ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
                           capturedEpisodeGeneration: capturedEpisodeGeneration,
                           currentEpisodeGeneration: episodeSwitchGeneration,
                           capturedSourceGeneration: capturedSourceGeneration,
@@ -6787,6 +6643,9 @@ struct TVPlayerView: View {
         // T16: key the HLS exemption off the CURRENTLY-playing stream, not the immutable launch url, so an
         // in-place switch to an HLS source is exempted and a switch away from one re-arms the watchdog.
         if PlayerEngineRouter.isHLS(curURL ?? url) { return }
+        let capturedEpisodeGeneration = episodeSwitchGeneration
+        let capturedSourceGeneration = sourceSwitchGeneration
+        let capturedResumeGeneration = resumeRetryGeneration
         avWatchdogArmedAt = Date()
         avStartWatchdog = Task { @MainActor in
             // The AVPlayer no-frame safety net (#76 b165/b166/b170, PROGRESS-AWARE since the 0.3.13 field
@@ -6817,18 +6676,28 @@ struct TVPlayerView: View {
             var lastHoldLogAt = armed
             while true {
                 guard await waitForPlaybackTime(0) else { return }
-                guard !Task.isCancelled, !hasStartedPlaying else { return }
+                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
+                      ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                        capturedEpisodeGeneration: capturedEpisodeGeneration,
+                        currentEpisodeGeneration: episodeSwitchGeneration,
+                        capturedSourceGeneration: capturedSourceGeneration,
+                        currentSourceGeneration: sourceSwitchGeneration,
+                        capturedResumeGeneration: capturedResumeGeneration,
+                        currentResumeGeneration: resumeRetryGeneration,
+                        capturedLoadToken: watchedLoadToken,
+                        currentLoadToken: (coordinator.player as? AVPlayerEngineController)?.activeLoadToken
+                      ) else { return }
                 let now = playbackDeadlineNow
                 let controller = coordinator.player as? AVPlayerEngineController
                 if watchedController == nil, let controller {
                     watchedController = controller
                     watchedLoadToken = controller.activeLoadToken
                 }
+                if watchedLoadToken == nil { watchedLoadToken = controller?.activeLoadToken }
                 let ownerCurrent: Bool
                 if let watchedController {
                     ownerCurrent = controller === watchedController
-                        && watchedLoadToken != nil
-                        && controller?.activeLoadToken == watchedLoadToken
+                        && (watchedLoadToken == nil || controller?.activeLoadToken == watchedLoadToken)
                 } else {
                     ownerCurrent = true
                 }
@@ -6837,7 +6706,7 @@ struct TVPlayerView: View {
                 let remuxExpectedNow = surfaceRemuxExpected
                     || (remuxSignal?.pendingOrMounted == true)
                 let elapsed = (now - armed)
-                let awaitingDecision = TVAVStartWatchdogPolicy.awaitingMountDecision(
+                let awaitingDecision = AppleAVStartWatchdogPolicy.awaitingMountDecision(
                     elapsed: elapsed,
                     ownerCurrent: ownerCurrent,
                     remuxMounted: mountedNow,

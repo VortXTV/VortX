@@ -1,28 +1,14 @@
-// Executable harness for the tvOS AVPlayer startup-watchdog phase transition.
-//
-// The policy and engine signal are dependency-free production declarations. Extract both exact declarations,
-// then compile them with this harness:
-//
-//   sed -n '/^enum TVAVStartWatchdogPolicy {/,/^\\/\\/\\/ The direct AVPlayer no-frame path/p' \
-//     app/SourcesTV/TVPlayerView.swift | sed '$d' > /tmp/tv-av-start-watchdog-policy.swift && \
-//   sed -n '/^enum TVPlaybackStartPolicy {/,/^\\/\\/\\/ Full-screen libmpv player/p' \
-//     app/SourcesTV/TVPlayerView.swift | sed '$d' >> /tmp/tv-av-start-watchdog-policy.swift && \
-//   sed -n '/^struct AVPlayerRemuxStartupSignal:/,/^\\/\\/ MARK: - Stall telemetry episode/p' \
-//     app/Sources/Player/AVPlayerEngine.swift | sed '$d' >> /tmp/tv-av-start-watchdog-policy.swift && \
-//   xcrun swiftc -strict-concurrency=complete -warnings-as-errors \
-//     -o /tmp/tv-av-start-watchdog-policy-test \
-//     /tmp/tv-av-start-watchdog-policy.swift \
-//     app/Tests/TVAVStartWatchdogPolicyTests.swift && \
-//   /tmp/tv-av-start-watchdog-policy-test
+// Executable harness for the shared Apple AVPlayer startup-watchdog phase transition.
+// Run with: bash scripts/test-apple-playback-recovery.sh
 //
 // This exercises the production decision, not a mirrored test implementation. Boundary pairs make changing
 // either timeout or reverting to a one-shot mount sample fail loudly.
 
 import Foundation
 
-private typealias Policy = TVAVStartWatchdogPolicy
+private typealias Policy = AppleAVStartWatchdogPolicy
 private typealias Signal = AVPlayerRemuxStartupSignal
-private typealias StartPolicy = TVPlaybackStartPolicy
+private typealias StartPolicy = ApplePlaybackStartPolicy
 
 @MainActor private var failures = 0
 
@@ -325,6 +311,27 @@ private enum TVAVStartWatchdogPolicyTests {
                 capturedLoadToken: Optional<Int>.none,
                 currentLoadToken: 7)
         )
+
+        for (label, path) in [
+            ("iOS/macOS", "app/Sources/PlayerScreen.swift"),
+            ("tvOS", "app/SourcesTV/TVPlayerView.swift")
+        ] {
+            let source = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+            check("\(label): first frame at zero is shared", source.contains("ApplePlaybackStartPolicy.hasStarted(")
+                && source.contains("hasProducedPlayableVideoFrame"))
+            check("\(label): load timers defer to the remux owner", source.contains("ApplePlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog("))
+            if let start = source.range(of: "private func startAVStartWatchdog()") {
+                let watchdog = String(source[start.lowerBound...])
+                check("\(label): current source owns HLS exemption", watchdog.contains("PlayerEngineRouter.isHLS(curURL ?? url)"))
+                check("\(label): startup phase polls current remux intent", watchdog.contains("AppleAVStartWatchdogPolicy.awaitingMountDecision(")
+                    && watchdog.contains("remuxStartupSignal") && watchdog.contains("while true"))
+                check("\(label): watchdog fences all three generations and token", watchdog.contains("ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(")
+                    && watchdog.contains("capturedEpisodeGeneration") && watchdog.contains("capturedSourceGeneration")
+                    && watchdog.contains("capturedResumeGeneration") && watchdog.contains("watchedLoadToken"))
+            } else {
+                check("\(label): startup watchdog is readable", false)
+            }
+        }
 
         print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")
         exit(failures == 0 ? 0 : 1)

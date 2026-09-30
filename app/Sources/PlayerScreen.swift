@@ -818,6 +818,9 @@ struct PlayerScreen: View {
     // Since the progress-aware rework this fixed wall only governs NON-remux AVPlayer mounts; a mounted remux
     // uses the stall/ceiling pair below (mirrors tvOS TVPlayerView).
     private let avStartWatchdogSeconds: Double = 20
+    private let avRemuxAttachWatchdogSeconds = AppleAVStartWatchdogPolicy.remoteAttachTimeout(
+        controlResourceTimeout: VortXExternalEngine.controlResourceTimeoutSeconds,
+        signallingTimeout: VortXRemoteRemuxMount.signallingTimeoutSeconds)
     private let avReplacementFirstFrameDeadlineSeconds: Double = 20
     // Progress-aware remux demote thresholds (the 0.3.13 field fix, tvOS twin in TVPlayerView): demote only on
     // a TRUE stall (no new muxed bytes / segments / classify-init flips for the whole window) or at a generous
@@ -1951,6 +1954,7 @@ struct PlayerScreen: View {
                 activeToken: coordinator.player?.activeLoadToken
                ) {
                 let d = event.seconds
+                guard d.isFinite, d >= 0 else { return }
                 lastRawTimePos = d
                 if pendingAdvance?.issued != true, supersededAdvance == nil {
                     committedLoadToken = event.loadToken
@@ -1958,8 +1962,12 @@ struct PlayerScreen: View {
                 let supersededTick = supersededAdvance?.pending.issued == true
                     && event.loadToken == supersededAdvance?.pending.loadToken
                 if supersededTick { return }
+                let renderedAVFrame = (coordinator.player as? AVPlayerEngineController)?
+                    .hasProducedPlayableVideoFrame == true
                 if pendingAdvance?.issued == true,
-                   event.loadToken == pendingAdvance?.loadToken, d <= 0 { return }
+                   event.loadToken == pendingAdvance?.loadToken,
+                   ApplePlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
+                       positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame) { return }
                 if let target = postFrameResumeSeekWatchdogTarget,
                    postFrameResumeSeekWatchdogOwner == event.loadToken,
                    abs(d - target) <= 5 {
@@ -1967,7 +1975,9 @@ struct PlayerScreen: View {
                     // watchdog before later manual seeking can make its old target appear to have failed.
                     cancelPostFrameResumeSeekWatchdog()
                 }
-                if d > 0, !hasStartedPlaying {      // playback actually began
+                if ApplePlaybackStartPolicy.hasStarted(
+                    positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame),
+                   !hasStartedPlaying {
                     if let pending = pendingAdvance {
                         guard pending.issued,
                               PlayerLoadProvenanceState.canCommit(
@@ -3598,14 +3608,33 @@ struct PlayerScreen: View {
         #endif
         lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
         srcProbe("start-watchdog ARMED (\(Int(seconds))s) bufferedEdge=\(String(format: "%.1f", bufferedTime))")
+        armOwnedLoadTimeout(seconds: seconds)
+    }
+
+    /// Every initial or buffer-grace timer belongs to the episode/source/retry that armed it.
+    private func armOwnedLoadTimeout(seconds: Double) {
+        loadTimeout?.cancel()
+        let capturedEpisodeGeneration = episodeSwitchGeneration
+        let capturedSourceGeneration = sourceSwitchGeneration
+        let capturedResumeGeneration = resumeRetryGeneration
+        let capturedLoadToken = coordinator.player?.activeLoadToken
         loadTimeout = Task { @MainActor in
             guard await waitForPlaybackTime(seconds) else { return }
             // A cancelled watchdog (superseded by a hop / reload / new load) must NOT fire: Task.sleep throws
             // CancellationError on cancel and `try?` swallows it, so without this guard the cancelled timer
             // runs handleStartTimeout immediately, and each hop arms+cancels the next, cascading through every
             // source in milliseconds ("Tried N sources") over a source that was actually still loading.
-            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-            srcProbe("start-watchdog FIRED (30s elapsed, no first frame) -> handleStartTimeout")
+            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
+                  ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                      capturedEpisodeGeneration: capturedEpisodeGeneration,
+                      currentEpisodeGeneration: episodeSwitchGeneration,
+                      capturedSourceGeneration: capturedSourceGeneration,
+                      currentSourceGeneration: sourceSwitchGeneration,
+                      capturedResumeGeneration: capturedResumeGeneration,
+                      currentResumeGeneration: resumeRetryGeneration,
+                      capturedLoadToken: capturedLoadToken,
+                      currentLoadToken: coordinator.player?.activeLoadToken) else { return }
+            srcProbe("start-watchdog FIRED (\(Int(seconds))s elapsed, no first frame) -> handleStartTimeout")
             handleStartTimeout()
         }
     }
@@ -3650,6 +3679,14 @@ struct PlayerScreen: View {
         // peerless loopback URL), so it would buffer forever with no recovery. Warm it up instead of
         // hopping/failing.
         if curIsTorrent { srcProbe("handleStartTimeout -> torrent warm up"); warmUpTorrent(); return }
+        let avController = coordinator.player as? AVPlayerEngineController
+        if ApplePlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(
+            avPlayerActive: avController != nil,
+            remuxPendingOrMounted: avController?.remuxStartupSignal.pendingOrMounted == true
+        ) {
+            DiagnosticsLog.log("dv", "generic load timeout deferred to exact-owner progress-aware remux watchdog")
+            return
+        }
         // Bytes still arriving on a slow (typically 4K remux) first-buffer: extend rather than give up.
         if bufferGraceUsed < maxBufferGraceExtensions, bufferedTime > lastBufferedAtWatchdog + 0.25 {
             bufferGraceUsed += 1
@@ -3659,12 +3696,7 @@ struct PlayerScreen: View {
             withAnimation { reconnecting = true }
             buffering = true
             lastBufferedAtWatchdog = bufferedTime
-            loadTimeout?.cancel()
-            loadTimeout = Task { @MainActor in
-                guard await waitForPlaybackTime(20) else { return }
-                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }   // cancelled re-arm must not fire (see start-watchdog)
-                handleStartTimeout()
-            }
+            armOwnedLoadTimeout(seconds: 20)
             return
         }
         // A no-frame timeout with no buffer progress can be an expired native-debrid transport URL. Refresh
@@ -4610,44 +4642,79 @@ struct PlayerScreen: View {
         // HLS start can legitimately take more than the short watchdog to first-frame. Never demote HLS on the
         // no-frame timer: a genuinely-dead HLS link is still recovered by AVPlayer's own .failed path. The
         // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
-        if PlayerEngineRouter.isHLS(url) { return }
+        if PlayerEngineRouter.isHLS(curURL ?? url) { return }
+        let capturedEpisodeGeneration = episodeSwitchGeneration
+        let capturedSourceGeneration = sourceSwitchGeneration
+        let capturedResumeGeneration = resumeRetryGeneration
         avWatchdogArmedAt = Date()
         avStartWatchdog = Task { @MainActor in
-            // Give the surface one render beat to mount the controller, then read the lane ONCE. Unlike tvOS
-            // (which arms after a synchronous mount) this chrome can arm before the controller exists; a late
-            // or absent controller reads remuxMounted=false and keeps today's fixed deadline, never a longer one.
-            guard await waitForPlaybackTime(1) else { return }
-            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-            guard let watchedController = coordinator.player as? AVPlayerEngineController,
-                  let watchedLoadToken = watchedController.activeLoadToken else { return }
-            let remuxMounted = watchedController.isRemuxMounted
-            if !remuxMounted {
-                guard await waitForPlaybackTime(avStartWatchdogSeconds - 1) else { return }
-                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-                guard let current = coordinator.player as? AVPlayerEngineController,
-                      current === watchedController,
-                      current.activeLoadToken == watchedLoadToken else { return }
-                NSLog("%@", "[Player] AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, demoting to libmpv in place")
-                srcProbe("AV start-watchdog FIRED (\(Int(avStartWatchdogSeconds))s, AVPlayer mounted but no frame) -> silent demote to libmpv")
-                demoteAVPlayerToMPV(silent: true)
-                return
-            }
-            // REMUX lane: PROGRESS-AWARE (the 0.3.13 field fix; tvOS twin in TVPlayerView). Poll the mount's
-            // monotonic progress counters at ~1 Hz; demote only on a TRUE stall (nothing moved for
-            // avRemuxStallDemoteSeconds) or at the hard ceiling. A slow-but-steadily-downloading 4K DV source
-            // keeps its true-DV session instead of being demoted to HDR10 + PCM by a fixed wall.
+            // A hosted remux mounts asynchronously. Poll until it attaches, then monitor input/output
+            // progress. A one-shot pre-mount sample must not send a healthy DV source to the direct timer.
             let armed = playbackDeadlineNow
+            let surfaceRemuxExpected = activeAVPlayerWouldRemux || activeAVPlayerWouldPlainRemux
+            var watchedController = coordinator.player as? AVPlayerEngineController
+            var watchedLoadToken = watchedController?.activeLoadToken
+            var monitoringRemux = false
             var lastProgressAt = armed
-            var last = watchedController.remuxMountProgress
+            var last: VortXMKVRemuxStream.MountProgress?
             var lastHoldLogAt = armed
             while true {
                 guard await waitForPlaybackTime(0) else { return }
-                guard await waitForPlaybackTime(1) else { return }
-                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
-                guard let current = coordinator.player as? AVPlayerEngineController,
-                      current === watchedController,
-                      current.activeLoadToken == watchedLoadToken else { return }
+                guard !Task.isCancelled, !hasStartedPlaying, !loadFailed,
+                      ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(
+                        capturedEpisodeGeneration: capturedEpisodeGeneration,
+                        currentEpisodeGeneration: episodeSwitchGeneration,
+                        capturedSourceGeneration: capturedSourceGeneration,
+                        currentSourceGeneration: sourceSwitchGeneration,
+                        capturedResumeGeneration: capturedResumeGeneration,
+                        currentResumeGeneration: resumeRetryGeneration,
+                        capturedLoadToken: watchedLoadToken,
+                        currentLoadToken: (coordinator.player as? AVPlayerEngineController)?.activeLoadToken
+                      ) else { return }
                 let now = playbackDeadlineNow
+                let current = coordinator.player as? AVPlayerEngineController
+                if watchedController == nil, let current {
+                    watchedController = current
+                    watchedLoadToken = current.activeLoadToken
+                }
+                if watchedLoadToken == nil { watchedLoadToken = current?.activeLoadToken }
+                let ownerCurrent = watchedController == nil || (
+                    current === watchedController
+                        && (watchedLoadToken == nil || current?.activeLoadToken == watchedLoadToken))
+                let remuxSignal = current?.remuxStartupSignal
+                let remuxExpectedNow = surfaceRemuxExpected || remuxSignal?.pendingOrMounted == true
+                let elapsed = now - armed
+                let awaitingDecision = AppleAVStartWatchdogPolicy.awaitingMountDecision(
+                    elapsed: elapsed, ownerCurrent: ownerCurrent,
+                    remuxMounted: remuxSignal?.mounted == true,
+                    remuxExpected: remuxExpectedNow,
+                    directTimeout: avStartWatchdogSeconds,
+                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds)
+                if awaitingDecision == .cancel { return }
+                if !monitoringRemux {
+                    switch awaitingDecision {
+                    case .cancel:
+                        return
+                    case .keepWaiting:
+                        try? await Task.sleep(for: .milliseconds(250))
+                        continue
+                    case .monitorRemux:
+                        monitoringRemux = true
+                        lastProgressAt = now
+                        last = current?.remuxMountProgress
+                        DiagnosticsLog.log("dv", "start watchdog transitioned to progress-aware remux monitoring (attached after \(String(format: "%.1f", elapsed))s)")
+                    case .demote:
+                        guard current != nil else { return }
+                        let reason = remuxExpectedNow
+                            ? "expected remux did not attach within \(Int(avRemuxAttachWatchdogSeconds))s"
+                            : "direct AVPlayer produced no frame within \(Int(avStartWatchdogSeconds))s"
+                        DiagnosticsLog.log("player", "AVPlayer start watchdog demoting (\(reason))")
+                        srcProbe("AV start-watchdog FIRED (\(reason)) -> silent demote to libmpv")
+                        demoteAVPlayerToMPV(silent: true)
+                        return
+                    }
+                }
+                guard let current else { return }
                 if let cur = current.remuxMountProgress {
                     // Progress = any monotonic counter moved since the last poll. A FAILED mount never counts;
                     // its demote belongs to the HLS-404 -> .failed path, and if that somehow never fires the
@@ -4674,7 +4741,7 @@ struct PlayerScreen: View {
                     switch AppleRemuxRecoveryPolicy.terminalDecision(
                         failed: terminal.failed,
                         inputProvablyDead: terminal.inputProvablyDead,
-                        ownerCurrent: coordinator.player is AVPlayerEngineController,
+                        ownerCurrent: ownerCurrent,
                         hasStartedPlaying: hasStartedPlaying
                     ) {
                     case .cancel:
@@ -4692,7 +4759,6 @@ struct PlayerScreen: View {
                         return
                     }
                 }
-                let elapsed = (now - armed)
                 let stalled = (now - lastProgressAt)
                 // W2-A: the input-side receipts ride the same line as the output counters, so the exportable
                 // trail shows WHY a stall was called dead (or not) instead of only that it was called.
@@ -4743,6 +4809,7 @@ struct PlayerScreen: View {
                     lastHoldLogAt = now
                     DiagnosticsLog.log("dv", "start watchdog holding: remux progressing (elapsed=\(Int(elapsed))s, quiet=\(Int(stalled))s, \(state))")
                 }
+                guard await waitForPlaybackTime(1) else { return }
             }
         }
     }
@@ -7637,6 +7704,9 @@ struct PlayerScreen: View {
             guard subtitlePoolRequests.finishFetch(requestID, published: true) else { return }
             pooledSubs = result.subs
             VXProbe.log("subs", "community subtitles listed count=\(result.subs.count)")
+            if pendingSubtitleReapply != nil {
+                autoSelectTracks(applyAutomaticSelections: false)
+            }
             // The pooled list can land AFTER autoSelectTracks already ran (and after an empty add-on list): give
             // the language-chain auto-select its turn on these candidates too (guards above keep it safe).
             autoSelectAddonSubtitleIfNeeded()
@@ -8846,7 +8916,7 @@ struct PlayerScreen: View {
     }
 
     /// Auto-pick the audio + subtitle track from the user's language preferences, once tracks are known.
-    private func autoSelectTracks() {
+    private func autoSelectTracks(applyAutomaticSelections: Bool = true) {
         let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
         let remuxOwnsInitialAudio =
             (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
@@ -8854,19 +8924,16 @@ struct PlayerScreen: View {
             pick.audio,
             remuxOwnsInitialSelection: remuxOwnsInitialAudio)
         if let pendingAudioReapply {
-            let candidates = audioTracks.map {
-                PlayerRecoveryAudioChoice.Candidate(
-                    id: $0.id, language: $0.lang, title: $0.title, selectable: $0.isSelectable
-                )
-            }
-            if candidates.contains(where: \.selectable) {
-                let recovered = PlayerRecoveryAudioChoice.matchingID(
-                    for: pendingAudioReapply, in: candidates
-                ) ?? automaticAudio
-                if let recovered { coordinator.player?.setAudioTrack(recovered) }
+            switch AppleTrackRecoveryPolicy.audioAction(
+                choice: pendingAudioReapply, tracks: audioTracks, automaticID: automaticAudio
+            ) {
+            case .retain:
+                break
+            case let .reapply(id), let .automatic(id):
+                coordinator.player?.setAudioTrack(id)
                 self.pendingAudioReapply = nil
             }
-        } else if let automaticAudio {
+        } else if applyAutomaticSelections, let automaticAudio {
             coordinator.player?.setAudioTrack(automaticAudio)
         }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
@@ -8874,10 +8941,33 @@ struct PlayerScreen: View {
         // override an explicit Off / language choice on the fresh mount. Only fall back to TrackSelector when
         // there was no explicit pick.
         if userPickedSubtitle {
-            if let choice = pendingSubtitleReapply { reapplySubtitleChoice(choice); pendingSubtitleReapply = nil }
+            if let choice = pendingSubtitleReapply {
+                let pooledChoiceAvailable: Bool
+                if case let .pooled(id) = choice,
+                   let pooled = pooledSubs.first(where: { $0.id == id }) {
+                    pooledChoiceAvailable = subtitleLoadingURL == nil
+                        && communityContentKey == pooled.contentKey
+                        && MoatConsent.contributeAndConsume
+                        && VortXSyncManager.shared.isSignedIn
+                } else {
+                    pooledChoiceAvailable = false
+                }
+                switch AppleTrackRecoveryPolicy.subtitleAction(
+                    choice: choice, tracks: subtitleTracks, pooledChoiceAvailable: pooledChoiceAvailable
+                ) {
+                case .retain:
+                    break
+                case let .selectEmbedded(id):
+                    coordinator.player?.setSubtitleTrack(id)
+                    pendingSubtitleReapply = nil
+                case .applyImmediately:
+                    reapplySubtitleChoice(choice)
+                    pendingSubtitleReapply = nil
+                }
+            }
             // else: an explicit pick with no snapshot to restore; leave the engine's current selection, never
             // auto-override it.
-        } else if let s = pick.subtitle {
+        } else if applyAutomaticSelections, let s = pick.subtitle {
             coordinator.player?.setSubtitleTrack(s)   // -1 = off
         }
         let audioSelectionLog = remuxOwnsInitialAudio
