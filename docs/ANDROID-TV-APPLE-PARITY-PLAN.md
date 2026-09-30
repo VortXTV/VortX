@@ -1,12 +1,44 @@
 # Android TV: match the Apple TV experience
 
-Status: planned after 0.4 Beta 1. This is not a claim that parity ships in Beta 1.
+Status: active implementation and acceptance record. The September 30 follow-up below is current;
+older dated sections preserve their historical release boundary, not a claim of completed parity.
+
+## September 30 implementation follow-up
+
+The current follow-up is based on reviewed main `6c74ae048`, not the preserved September 3 prototype.
+Android now has per-engine replacement ownership, pause-intent-preserving source transitions, and a
+single owned next-episode preparation task with bounded retry. Prepared detail sources are also fenced
+by the exact profile, account, title/episode request, and generation; a cancelled fetch cannot populate
+another profile's cache. Continue Watching episode targeting avoids unwatched specials unless explicitly
+selected, TV episode Up has an explicit previous-row/season boundary, and the source audio picker derives
+its language options from the actual list. Custom relation content types retain their routes.
+
+Intro/recap/credits/preview skipping now uses a playback-position countdown on both form factors. Settings
+offers Off, 5, 10, 15, and 30 seconds; new users default to 5 seconds and an existing explicit Off remains
+Off. Skip is immediate, X suppresses that segment for the episode, and remote Left/Right selects Skip/X.
+Pause, buffering, seek, source replacement, cast/PiP, lock, and exit cannot spend stale countdown time.
+Audio and subtitle default selections wait for their own inventories independently; explicit choices
+and subtitle Off cannot be replaced by a later inventory event.
+
+Watched-download cleanup is now wired only when exact durable watch evidence and complete outer-player
+resource release are available. It stays Off by default and fails closed for engine-backed history without
+a durable per-video receipt. Index/file cleanup is recoverable; corrupt or incomplete persisted indexes
+cannot authorize deletion. Watch-based recommendation seeds are scoped to the active history owner.
+
+Full passed 1,374 tests and Play passed 1,301, with no failures, errors, or skipped tests. Both debug APKs
+were rebuilt with the exact workflow-pinned native engines; all twelve packaged engine libraries have
+the correct ELF architecture and required JNI exports across the three supported ABIs. Play also passes
+its GPL-library exclusion check. This is source/build evidence, not a claim of complete Apple-style
+visual parity, a signed public release, or physical Shield/Fire TV playback proof.
+Signing/update continuity, screenshots, remote focus, sustained playback,
+HDR/audio output, and process-death recovery remain mandatory acceptance gates below. Do not replace this
+boundary with the historical percentage estimates in older runbooks.
 
 ## September 11 follow-up (bundled in Beta 14)
 
 Phone and TV now show add-on-declared Prequel, Sequel, and Related rails through the normal detail navigation. They use the currently loaded metadata, preserve movie/series IDs (including namespaced anime IDs on series routes), reject external/malformed links, remove self-links and duplicates, and remain hidden for live content. Both Android variants compile and pass their unit suites; physical TV focus testing remains required.
 
-Beta 13 remained an unpublished draft; this follow-up is included in Beta 14. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. Still outstanding: custom `anime`/other content-type routing without coercing types to movies, plus full visual and remote-navigation acceptance below.
+Beta 13 remained an unpublished draft; this follow-up is included in Beta 14. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. At that release, custom `anime`/other content-type routing without coercing types to movies was outstanding; the September 30 follow-up now implements those routes. Full visual and remote-navigation acceptance remains below.
 
 Also outstanding: rapid title selection can race asynchronous TMDB-to-IMDb lookups in phone and TV detail navigation. A later selection needs to cancel and supersede the earlier lookup, including direct relation selection; verify reversed completion order and page disposal before shipping that change.
 
