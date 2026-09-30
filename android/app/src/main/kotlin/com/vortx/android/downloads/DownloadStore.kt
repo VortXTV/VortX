@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URI
 
 /**
  * Device-local persistence for offline downloads. Android port of Apple `app/SourcesShared/DownloadStore.swift`.
@@ -37,6 +38,10 @@ import java.io.File
 object DownloadStore {
 
     private val hydrationGate = OneTimeHydrationGate()
+    private const val RECLAIM_TOMBSTONE_SUFFIX = ".reclaiming"
+    private val managedMediaFilename = Regex(
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(mp4|mkv|avi|mov|m4v|webm|ts|flv|wmv)$",
+    )
 
     /** Newest-first, matching Apple's `records` ordering, for direct consumption by the downloads list. */
     private val _records = MutableStateFlow<List<DownloadRecord>>(emptyList())
@@ -51,6 +56,7 @@ object DownloadStore {
             appContext = context.applicationContext
             ensureDownloadsDirectoryExists()
             loadLocked()
+            recoverReclaimArtifactsLocked()
         }
     }
 
@@ -124,22 +130,26 @@ object DownloadStore {
         _records.value = decoded.sortedByDescending { it.addedAt }
     }
 
-    /** Encode + write the index atomically (write to a temp then rename), matching Apple's `.atomic` write. */
-    private fun persistLocked() {
+    /**
+     * Encode + write the index atomically (write to a temp then rename), matching Apple's `.atomic` write.
+     *
+     * A failed rename is a FAILED write. Do not fall back to overwriting the live index: truncating it after
+     * media has moved into a reclaim tombstone is worse than retaining that tombstone for recovery.
+     */
+    private fun persistLocked(): Boolean {
         val array = JSONArray()
         _records.value.forEach { array.put(recordToJson(it)) }
-        runCatching {
+        return runCatching {
             ensureDownloadsDirectoryExists()
             val target = indexFile()
             val temp = File(target.parentFile, "index.json.tmp")
             temp.writeText(array.toString())
             if (!temp.renameTo(target)) {
-                // A rename inside one directory should not fail; fall back to a direct write rather than
-                // silently leaving a stale index behind.
-                target.writeText(array.toString())
                 temp.delete()
+                return@runCatching false
             }
-        }
+            true
+        }.getOrDefault(false)
     }
 
     // MARK: CRUD
@@ -198,21 +208,114 @@ object DownloadStore {
     }
 
     /**
-     * Remove a record AND its on-disk files. The caller ([DownloadManager]) is responsible for cancelling any live
-     * transfer first.
-     *
-     * BOTH the finished file and the [partFileFor] partial are unlinked: a cancelled in-flight download has only a
-     * `.part`, and leaving it behind would leak the whole partial transfer (potentially gigabytes) with no record
-     * left to ever reference or clean it up.
+     * Remove a record AND its bounded on-disk artifacts. The caller ([DownloadManager]) cancels any live transfer
+     * first. The file move and index commit use the same tombstone protocol as watched reclaim, so an index-write
+     * failure cannot leave an in-memory or rebooted row pointing at a permanently deleted file.
      */
     fun remove(id: String) {
         hydrationGate.withLock {
             val current = _records.value
             val record = current.firstOrNull { it.id == id } ?: return@withLock
-            runCatching { fileFor(record).delete() }
-            runCatching { partFileFor(record).delete() }
-            _records.value = current.filterNot { it.id == id }
-            persistLocked()
+            removeRecordLocked(current, record)
+        }
+    }
+
+    /** Safe, completed-only transaction used by the opt-in watched-download path. */
+    internal fun removeCompletedForWatchedReclaim(record: DownloadRecord): WatchedDownloadReclaimResult =
+        hydrationGate.withLock {
+            val current = _records.value
+            val live = current.firstOrNull { it.id == record.id && it.state == DownloadState.COMPLETED }
+                ?: return@withLock WatchedDownloadReclaimResult.NO_MATCHING_COMPLETED_DOWNLOAD
+            when (removeRecordLocked(current, live)) {
+                DownloadReclaimTransaction.Result.RECLAIMED -> WatchedDownloadReclaimResult.RECLAIMED
+                DownloadReclaimTransaction.Result.FILE_RENAME_FAILED -> WatchedDownloadReclaimResult.FILE_RENAME_FAILED
+                DownloadReclaimTransaction.Result.INDEX_WRITE_FAILED_ROLLED_BACK ->
+                    WatchedDownloadReclaimResult.INDEX_WRITE_FAILED_ROLLED_BACK
+                DownloadReclaimTransaction.Result.INDEX_WRITE_FAILED_RECOVERY_REQUIRED ->
+                    WatchedDownloadReclaimResult.INDEX_WRITE_FAILED_RECOVERY_REQUIRED
+            }
+        }
+
+    /** The selector must compare against an exact managed path, never a path from the JSON index unchecked. */
+    internal fun matchesManagedFileUri(record: DownloadRecord, rawUri: String): Boolean {
+        val media = managedFilesFor(record)?.media ?: return false
+        return runCatching {
+            val uri = URI(rawUri)
+            uri.scheme.equals("file", ignoreCase = true) && File(uri).canonicalFile == media.canonicalFile
+        }.getOrDefault(false)
+    }
+
+    private fun removeRecordLocked(
+        current: List<DownloadRecord>,
+        record: DownloadRecord,
+    ): DownloadReclaimTransaction.Result {
+        val files = managedFilesFor(record) ?: return DownloadReclaimTransaction.Result.FILE_RENAME_FAILED
+        val remaining = current.filterNot { it.id == record.id }
+        return DownloadReclaimTransaction().reclaim(
+            mediaFile = files.media,
+            tombstoneFile = files.tombstone,
+            stalePartFile = files.part,
+        ) {
+            _records.value = remaining
+            if (persistLocked()) {
+                true
+            } else {
+                _records.value = current
+                false
+            }
+        }
+    }
+
+    private data class ManagedFiles(val media: File, val part: File, val tombstone: File)
+
+    /**
+     * Validate every filename before deletion/rename. A corrupted or hostile index can still render a row, but it
+     * can never make this store touch a path outside its private Downloads directory.
+     */
+    private fun managedFilesFor(record: DownloadRecord): ManagedFiles? = runCatching {
+        val filename = record.localFilename
+        if (!managedMediaFilename.matches(filename) || !filename.startsWith("${record.id}.")) return@runCatching null
+        val directory = downloadsDirectory().canonicalFile
+        val media = File(directory, filename).canonicalFile
+        if (media.parentFile != directory || media.name != filename) return@runCatching null
+        ManagedFiles(
+            media = media,
+            part = File(directory, "$filename.part").canonicalFile,
+            tombstone = File(directory, "$filename$RECLAIM_TOMBSTONE_SUFFIX").canonicalFile,
+        ).takeIf { files ->
+            files.part.parentFile == directory && files.tombstone.parentFile == directory
+        }
+    }.getOrNull()
+
+    /**
+     * Complete an interrupted reclaim before publishing records. A tombstone with a live row is restored (or removed
+     * when the original already exists); a tombstone without a row is the post-index-commit residue and is deleted.
+     * Orphan parts are only removed when their exact UUID/media filename belongs to this managed directory.
+     */
+    private fun recoverReclaimArtifactsLocked() {
+        val directory = downloadsDirectory()
+        val recordsByFilename = _records.value.associateBy { it.localFilename }
+        directory.listFiles().orEmpty().forEach { file ->
+            val name = file.name
+            when {
+                name.endsWith(RECLAIM_TOMBSTONE_SUFFIX) -> {
+                    val mediaName = name.removeSuffix(RECLAIM_TOMBSTONE_SUFFIX)
+                    if (!managedMediaFilename.matches(mediaName)) return@forEach
+                    val record = recordsByFilename[mediaName]
+                    val media = File(directory, mediaName)
+                    DownloadReclaimTransaction().recoverTombstone(
+                        mediaFile = media,
+                        tombstoneFile = file,
+                        indexStillHasRecord = record != null,
+                    )
+                }
+                name.endsWith(".part") -> {
+                    val mediaName = name.removeSuffix(".part")
+                    if (!managedMediaFilename.matches(mediaName)) return@forEach
+                    val record = recordsByFilename[mediaName]
+                    if (record == null || record.state == DownloadState.COMPLETED) runCatching { file.delete() }
+                }
+            }
         }
     }
 
