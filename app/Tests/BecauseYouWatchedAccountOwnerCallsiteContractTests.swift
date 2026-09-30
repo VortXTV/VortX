@@ -56,9 +56,10 @@ enum BecauseYouWatchedAccountOwnerCallsiteContractTests {
                   "\(name) Home does not use the pre-fix slot/sign-in-only owner key")
         }
 
-        check(account.contains("authKey = key") &&
+        check(account.contains("Keychain.set(key, for: context.keychainAccount)") &&
+                account.contains("guard authOperationStillCurrent(context) else { return }") &&
                 account.contains("if !isSignedIn { isSignedIn = true }"),
-              "Stremio sign-in replaces credentials without relying on a true-to-true isSignedIn event")
+              "Stremio sign-in writes its captured credential slot without relying on a true-to-true event")
         check(!model.contains("Keychain.string") && !tv.contains("Keychain.string") && !ios.contains("Keychain.string"),
               "recommendation ownership never reads or embeds a raw Keychain token")
 

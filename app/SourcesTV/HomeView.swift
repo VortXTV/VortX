@@ -72,14 +72,15 @@ struct HomeView: View {
         let binding = core.settledActiveAccountBinding()
         let localOwner = core.settledLocalHistoryOwner()
         let receipt = core.lastAcceptedHistoryReceipt
-        let validReceipt = receipt.flatMap { candidate in
+        let validReceipt: BecauseYouWatchedHistoryPolicy.Snapshot? = receipt.flatMap { candidate in
+            guard let owner = candidate.owner else { return nil }
             if let binding {
-                return candidate.owner.profileID == binding.profileID &&
-                    candidate.owner.keychainAccount == binding.keychainAccount &&
-                    candidate.owner.uid == binding.uid &&
-                    candidate.owner.generation == binding.generation ? candidate : nil
+                return owner.profileID == binding.profileID &&
+                    owner.keychainAccount == binding.keychainAccount &&
+                    owner.uid == binding.uid &&
+                    owner.generation == binding.generation ? candidate : nil
             }
-            return candidate.owner == localOwner ? candidate : nil
+            return owner == localOwner ? candidate : nil
         }
         return .init(
             owner: validReceipt?.owner ?? binding.map {

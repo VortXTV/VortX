@@ -944,7 +944,8 @@ struct iOSHomeView: View {
         return items
     }
 
-    var body: some View {
+    @ViewBuilder
+    private var homeNavigation: some View {
         let renderedContinueWatching = continueWatchingRenderSnapshot
         NavigationStack(path: $path) {
             // The hero is the first scrolling element (an ambient billboard header), not a
@@ -1128,6 +1129,10 @@ struct iOSHomeView: View {
             }
             .iOSPlayerCover($player, account: account, core: core)
         }
+    }
+
+    private var homeHistoryObservers: some View {
+        homeNavigation
         // Home black-band follow-up: reclaim the last ~20pt window-titlebar strip so the billboard art
         // reaches y=0 like the Detail hero. The ScrollView-level ignore above reclaims the shell's floated
         // chrome band, but the NavigationStack still respects the window titlebar safe area, which a scroll
@@ -1196,6 +1201,10 @@ struct iOSHomeView: View {
             guard core.lastAcceptedHistoryReceipt != nil else { return }
             refreshTopPicks()
         }
+    }
+
+    private var homeAccountObservers: some View {
+        homeHistoryObservers
         // An overlay profile draws its Continue Watching from `profiles.cwItems` (bounded, exact id-set key
         // above), not the engine, so its own plays must also re-seed the hero and Top Picks (the engine-CW
         // onChange never fires for them).
@@ -1230,6 +1239,10 @@ struct iOSHomeView: View {
         // non-secret account-boundary generation is published by StremioAccount and is the refresh edge
         // for that replacement; CoreBridge rotates its settled binding before a history receipt is accepted.
         .onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }
+    }
+
+    var body: some View {
+        homeAccountObservers
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
@@ -1246,10 +1259,25 @@ struct iOSHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: SIMKLRailsModel.disconnectedNote)) { _ in simklRails.clear() }
         // A watchlist bookmark toggle feeds the Upcoming rails (refreshUpcoming folds it in), so rebuild them now.
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in refreshReleaseCalendar() }
-        .onDisappear {
-            hero.stop()
-            resumeHoardTask?.cancel()
-            resumeHoardTask = nil
+        .onDisappear(perform: stopHomeTasks)
+    }
+
+    private func stopHomeTasks() {
+        hero.stop()
+        resumeHoardTask?.cancel()
+        resumeHoardTask = nil
+    }
+
+    /// Keep the recommendation adapter separate from the large Home section switch so native Mac and
+    /// phone builds do not have to solve its nested optional/map/view-builder types in that expression.
+    @ViewBuilder
+    private var becauseYouWatchedHomeRail: some View {
+        if let rail = becauseYouWatched.rail {
+            let items: [RailItem] = rail.items.map {
+                RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
+            }
+            homeRail(PosterRail(title: rail.title, items: items,
+                                onTap: handleTap, showWatchedBadges: true))
         }
     }
 
@@ -1267,137 +1295,175 @@ struct iOSHomeView: View {
                 iOSCollectionsHub(model: collectionsHub)
             }
         case .topPicks:
-            // Local recommendations seeded from this profile's recent watch history (#0.3.9). Hidden when
-            // there's no TMDB key, no history to seed from, or no results.
-            if !topPicks.items.isEmpty {
-                homeRail(PosterRail(title: String(localized: "Top Picks for you"),
-                                    eyebrow: String(localized: "Based on what you watch"),
-                                    items: topPicks.items.map {
-                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                 poster: $0.poster, progress: 0)
-                                    },
-                                    onTap: handleTap, showWatchedBadges: true))
-            }
+            topPicksHomeRail
         case .becauseYouWatched:
-            // "Because you watched <title>": recommendations named after the most recent seed. Hidden when
-            // there's no TMDB key, no eligible history, or no results.
-            if let byw = becauseYouWatched.rail {
-                homeRail(PosterRail(title: byw.title,
-                                    items: byw.items.map {
-                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                 poster: $0.poster, progress: 0)
-                                    },
-                                    onTap: handleTap, showWatchedBadges: true))
-            }
+            becauseYouWatchedHomeRail
         case .traktWatchlist:
-            // Trakt watchlist as a client-side rail (opens the normal detail page by imdb id via handleTap).
-            // Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
-            if !traktRails.items.isEmpty {
-                homeRail(PosterRail(title: String(localized: "Trakt Watchlist"),
-                                    eyebrow: String(localized: "From Trakt"),
-                                    items: traktRails.items.map {
-                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                 poster: $0.poster, progress: 0)
-                                    },
-                                    onTap: handleTap, showWatchedBadges: true))
-            }
+            traktWatchlistHomeRail
         case .simklWatchlist:
-            // SIMKL plan-to-watch as a client-side rail (opens the normal detail page by imdb id via handleTap).
-            // Zero engine writes; hidden until SIMKL is connected (dormant with empty creds). The read-back
-            // half of SIMKL: before this the app only ever PUSHED to SIMKL and showed the user nothing.
-            if !simklRails.items.isEmpty {
-                homeRail(PosterRail(title: String(localized: "SIMKL Watchlist"),
-                                    eyebrow: String(localized: "From SIMKL"),
-                                    items: simklRails.items.map {
+            simklWatchlistHomeRail
+        case .mediaServers:
+            mediaServerHomeRails
+        case .upcomingEpisodes:
+            upcomingEpisodesHomeRail
+        case .upcomingMovies:
+            upcomingMoviesHomeRail
+        case .addonCatalogs:
+            addonCatalogHomeRails
+        case .editorialCollections:
+            editorialCollectionHomeRails
+        case .importedLists:
+            importedListHomeRails
+        }
+    }
+
+    // Solve each rail's mapping and conditional layout separately. The section dispatcher remains
+    // statically typed; splitting its expression avoids a Release compiler timeout on native macOS.
+    @ViewBuilder
+    private var topPicksHomeRail: some View {
+        // Local recommendations seeded from this profile's recent watch history (#0.3.9). Hidden when
+        // there's no TMDB key, no history to seed from, or no results.
+        if !topPicks.items.isEmpty {
+            homeRail(PosterRail(title: String(localized: "Top Picks for you"),
+                                eyebrow: String(localized: "Based on what you watch"),
+                                items: topPicks.items.map {
+                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                             poster: $0.poster, progress: 0)
+                                },
+                                onTap: handleTap, showWatchedBadges: true))
+        }
+    }
+
+    @ViewBuilder
+    private var traktWatchlistHomeRail: some View {
+        // Trakt watchlist as a client-side rail (opens the normal detail page by imdb id via handleTap).
+        // Zero engine writes; hidden until Trakt is connected (dormant with empty creds).
+        if !traktRails.items.isEmpty {
+            homeRail(PosterRail(title: String(localized: "Trakt Watchlist"),
+                                eyebrow: String(localized: "From Trakt"),
+                                items: traktRails.items.map {
+                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                             poster: $0.poster, progress: 0)
+                                },
+                                onTap: handleTap, showWatchedBadges: true))
+        }
+    }
+
+    @ViewBuilder
+    private var simklWatchlistHomeRail: some View {
+        // SIMKL plan-to-watch as a client-side rail (opens the normal detail page by imdb id via handleTap).
+        // Zero engine writes; hidden until SIMKL is connected (dormant with empty creds). The read-back
+        // half of SIMKL: before this the app only ever PUSHED to SIMKL and showed the user nothing.
+        if !simklRails.items.isEmpty {
+            homeRail(PosterRail(title: String(localized: "SIMKL Watchlist"),
+                                eyebrow: String(localized: "From SIMKL"),
+                                items: simklRails.items.map {
+                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                             poster: $0.poster, progress: 0)
+                                },
+                                onTap: handleTap, showWatchedBadges: true))
+        }
+    }
+
+    @ViewBuilder
+    private var mediaServerHomeRails: some View {
+        // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby
+        // servers, imdb-keyed cards that open the normal detail page. Hidden with no server.
+        ForEach(mediaServerRails.rails) { rail in
+            homeRail(PosterRail(title: rail.title,
+                                items: rail.items.map {
+                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                             poster: $0.poster, progress: 0)
+                                },
+                                onTap: handleTap))
+        }
+    }
+
+    @ViewBuilder
+    private var upcomingEpisodesHomeRail: some View {
+        // "Upcoming Episodes": the next-airing episode of each series in the library within the next 45
+        // days, soonest first. Each card is the SERIES with an "S2E5 · Jun 30" caption. Empty renders nothing.
+        if !releaseCalendar.upcoming.isEmpty {
+            homeRail(PosterRail(title: String(localized: "Upcoming Episodes"),
+                                eyebrow: String(localized: "Coming soon"),
+                                items: releaseCalendar.upcoming.map {
+                                    RailItem(id: $0.seriesId, type: "series", name: $0.seriesName,
+                                             poster: $0.video.thumbnail, progress: 0,
+                                             caption: "\($0.episodeLabel) · \($0.airDateLabel)")
+                                },
+                                onTap: handleTap))
+        }
+    }
+
+    @ViewBuilder
+    private var upcomingMoviesHomeRail: some View {
+        // "Upcoming Movies": library movies with a future release date in the next 45 days, soonest first;
+        // hidden when nothing is upcoming. Each card routes to the movie detail like any card.
+        if !releaseCalendar.upcomingMovies.isEmpty {
+            homeRail(PosterRail(title: String(localized: "Upcoming Movies"),
+                                eyebrow: String(localized: "Coming soon"),
+                                items: releaseCalendar.upcomingMovies.map {
+                                    RailItem(id: $0.id, type: "movie", name: $0.name,
+                                             poster: $0.poster, progress: 0, caption: $0.releaseDateLabel)
+                                },
+                                onTap: handleTap))
+        }
+    }
+
+    @ViewBuilder
+    private var addonCatalogHomeRails: some View {
+        // Each installed add-on catalog as a horizontal rail. Per-catalog order/hiding is owned by
+        // CatalogPreferences; this section moves the whole block. #95 horizontal + vertical pagination
+        // stay attached exactly as before.
+        ForEach(core.boardRows) { row in
+            if !row.items.isEmpty {
+                homeRail(PosterRail(title: row.title,
+                                    items: row.items.map {
+                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                 poster: $0.poster, progress: 0,
+                                                 background: $0.background, description: $0.description,
+                                                 releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
+                                                 genres: $0.genres)
+                                    },
+                                    onTap: handleTap, showWatchedBadges: true,
+                                    onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
+                    .onAppear {
+                        if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
+                            core.loadBoardNextPage()
+                        }
+                    }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var editorialCollectionHomeRails: some View {
+        // Editorial collections (B3, Nuvio-style): hand-curated Cinemeta-backed rails below the add-on
+        // rows. Each fails soft (an empty collection is dropped). Gated on the existing showCuratedRails.
+        if showCuratedRails {
+            ForEach(curated.collections) { collection in
+                homeRail(PosterRail(title: collection.title,
+                                    items: collection.items.map {
                                         RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                  poster: $0.poster, progress: 0)
                                     },
                                     onTap: handleTap, showWatchedBadges: true))
             }
-        case .mediaServers:
-            // "Recently added on <server>": client-side rails from the user's own Plex/Jellyfin/Emby
-            // servers, imdb-keyed cards that open the normal detail page. Hidden with no server.
-            ForEach(mediaServerRails.rails) { rail in
-                homeRail(PosterRail(title: rail.title,
-                                    items: rail.items.map {
+        }
+    }
+
+    @ViewBuilder
+    private var importedListHomeRails: some View {
+        // Imported lists (Integrations -> Import a list): each public Letterboxd / MDBList / Trakt list
+        // paints as its own Home row. Items are engine-safe ids, so a tap routes through the engine.
+        ForEach(imported.catalogs) { catalog in
+            if !catalog.isEmpty {
+                homeRail(PosterRail(title: catalog.title,
+                                    items: catalog.items.map {
                                         RailItem(id: $0.id, type: $0.type, name: $0.name,
                                                  poster: $0.poster, progress: 0)
                                     },
-                                    onTap: handleTap))
-            }
-        case .upcomingEpisodes:
-            // "Upcoming Episodes": the next-airing episode of each series in the library within the next 45
-            // days, soonest first. Each card is the SERIES with an "S2E5 · Jun 30" caption. Empty renders nothing.
-            if !releaseCalendar.upcoming.isEmpty {
-                homeRail(PosterRail(title: String(localized: "Upcoming Episodes"),
-                                    eyebrow: String(localized: "Coming soon"),
-                                    items: releaseCalendar.upcoming.map {
-                                        RailItem(id: $0.seriesId, type: "series", name: $0.seriesName,
-                                                 poster: $0.video.thumbnail, progress: 0,
-                                                 caption: "\($0.episodeLabel) · \($0.airDateLabel)")
-                                    },
-                                    onTap: handleTap))
-            }
-        case .upcomingMovies:
-            // "Upcoming Movies": library movies with a future release date in the next 45 days, soonest first;
-            // hidden when nothing is upcoming. Each card routes to the movie detail like any card.
-            if !releaseCalendar.upcomingMovies.isEmpty {
-                homeRail(PosterRail(title: String(localized: "Upcoming Movies"),
-                                    eyebrow: String(localized: "Coming soon"),
-                                    items: releaseCalendar.upcomingMovies.map {
-                                        RailItem(id: $0.id, type: "movie", name: $0.name,
-                                                 poster: $0.poster, progress: 0, caption: $0.releaseDateLabel)
-                                    },
-                                    onTap: handleTap))
-            }
-        case .addonCatalogs:
-            // Each installed add-on catalog as a horizontal rail. Per-catalog order/hiding is owned by
-            // CatalogPreferences; this section moves the whole block. #95 horizontal + vertical pagination
-            // stay attached exactly as before.
-            ForEach(core.boardRows) { row in
-                if !row.items.isEmpty {
-                    homeRail(PosterRail(title: row.title,
-                                        items: row.items.map {
-                                            RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                     poster: $0.poster, progress: 0,
-                                                     background: $0.background, description: $0.description,
-                                                     releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
-                                                     genres: $0.genres)
-                                        },
-                                        onTap: handleTap, showWatchedBadges: true,
-                                        onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
-                        .onAppear {
-                            if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
-                                core.loadBoardNextPage()
-                            }
-                        }
-                }
-            }
-        case .editorialCollections:
-            // Editorial collections (B3, Nuvio-style): hand-curated Cinemeta-backed rails below the add-on
-            // rows. Each fails soft (an empty collection is dropped). Gated on the existing showCuratedRails.
-            if showCuratedRails {
-                ForEach(curated.collections) { collection in
-                    homeRail(PosterRail(title: collection.title,
-                                        items: collection.items.map {
-                                            RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                     poster: $0.poster, progress: 0)
-                                        },
-                                        onTap: handleTap, showWatchedBadges: true))
-                }
-            }
-        case .importedLists:
-            // Imported lists (Integrations -> Import a list): each public Letterboxd / MDBList / Trakt list
-            // paints as its own Home row. Items are engine-safe ids, so a tap routes through the engine.
-            ForEach(imported.catalogs) { catalog in
-                if !catalog.isEmpty {
-                    homeRail(PosterRail(title: catalog.title,
-                                        items: catalog.items.map {
-                                            RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                     poster: $0.poster, progress: 0)
-                                        },
-                                        onTap: handleTap, showWatchedBadges: true))
-                }
+                                    onTap: handleTap, showWatchedBadges: true))
             }
         }
     }
@@ -1449,14 +1515,15 @@ struct iOSHomeView: View {
         let binding = core.settledActiveAccountBinding()
         let localOwner = core.settledLocalHistoryOwner()
         let receipt = core.lastAcceptedHistoryReceipt
-        let validReceipt = receipt.flatMap { candidate in
+        let validReceipt: BecauseYouWatchedHistoryPolicy.Snapshot? = receipt.flatMap { candidate in
+            guard let owner = candidate.owner else { return nil }
             if let binding {
-                return candidate.owner.profileID == binding.profileID &&
-                    candidate.owner.keychainAccount == binding.keychainAccount &&
-                    candidate.owner.uid == binding.uid &&
-                    candidate.owner.generation == binding.generation ? candidate : nil
+                return owner.profileID == binding.profileID &&
+                    owner.keychainAccount == binding.keychainAccount &&
+                    owner.uid == binding.uid &&
+                    owner.generation == binding.generation ? candidate : nil
             }
-            return candidate.owner == localOwner ? candidate : nil
+            return owner == localOwner ? candidate : nil
         }
         return .init(
             owner: validReceipt?.owner ?? binding.map {
