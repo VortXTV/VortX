@@ -211,6 +211,8 @@ class HomeViewModel internal constructor(
     private val scope: CoroutineScope get() = scopeOverride ?: viewModelScope
     private var collectJob: Job? = null
     private var personalizedJob: Job? = null
+    /** Monotonic guard for client-side rails; cancellation alone cannot stop a provider that ignores it. */
+    private var personalizedGeneration = 0L
     private var baseRows: List<Catalog> = emptyList()
     private var topPicksItems: List<MetaItem> = emptyList()
     private var sourceHasRows = false
@@ -253,7 +255,10 @@ class HomeViewModel internal constructor(
             }
         }
         scope.launch {
-            repo.ctxUpdates().drop(1).collectLatest {
+            // Detail-local watched ticks are not all ctx broadcasts. The repository's detail stream includes
+            // ctx/library changes plus meta_details progress, so recommendation seeds refresh after a play or
+            // watched toggle even when the Home board itself did not re-emit.
+            repo.detailUpdates().drop(1).collectLatest {
                 watchlistStore?.reload()
                 refreshPersonalizedRails()
             }
@@ -316,6 +321,8 @@ class HomeViewModel internal constructor(
     fun load() {
         collectJob?.cancel()
         personalizedJob?.cancel()
+        personalizedGeneration += 1
+        becauseYouWatched.clear()
         baseRows = emptyList()
         topPicksItems = emptyList()
         sourceHasRows = false
@@ -422,6 +429,8 @@ class HomeViewModel internal constructor(
 
     private fun refreshPersonalizedRails() {
         val owner = currentReleaseOwner()
+        val historyOwner = repo.continueWatchingOwner()
+        val generation = ++personalizedGeneration
         if (applyReleaseCalendar(releaseCalendar.activate(owner))) publishHome()
         val rows = baseRows
         personalizedJob?.cancel()
@@ -432,6 +441,12 @@ class HomeViewModel internal constructor(
             val library = libraryResult.getOrNull()?.items.orEmpty()
             val continueWatching = rows.firstOrNull { it.id == "continue" }?.items.orEmpty()
             val watchlist = watchlistStore?.items?.value.orEmpty()
+            fun requestIsCurrent(): Boolean =
+                generation == personalizedGeneration &&
+                    owner == currentReleaseOwner() &&
+                    historyOwner == repo.continueWatchingOwner()
+
+            if (!requestIsCurrent()) return@launch
             val topPicksWork = async {
                 topPicks.refresh(continueWatching, library) {
                     topPicksItems = emptyList()
@@ -439,10 +454,17 @@ class HomeViewModel internal constructor(
                 }
             }
             val becauseWork = async {
-                becauseYouWatched.refresh(continueWatching, library) {
-                    becauseYouWatchedRail = null
-                    publishHome()
-                }
+                becauseYouWatched.refresh(
+                    continueWatching = continueWatching,
+                    library = library,
+                    onInvalidated = {
+                        if (requestIsCurrent()) {
+                            becauseYouWatchedRail = null
+                            publishHome()
+                        }
+                    },
+                    ownerKey = personalizedOwnerKey(historyOwner),
+                )
             }
             val traktWork = async { traktRails.refresh() }
             val simklWork = async { simklRails.refresh() }
@@ -472,7 +494,7 @@ class HomeViewModel internal constructor(
             val trakt = traktWork.await()
             val simkl = simklWork.await()
             val media = mediaServerWork.await()
-            if (owner != currentReleaseOwner()) return@launch
+            if (!requestIsCurrent()) return@launch
             if (refreshed.changed) {
                 topPicksItems = refreshed.items
             }
@@ -511,6 +533,8 @@ class HomeViewModel internal constructor(
     /** Clear every owner-derived client rail before the replacement owner can render. */
     private fun clearOwnerPersonalizedRows() {
         personalizedJob?.cancel()
+        personalizedGeneration += 1
+        becauseYouWatched.clear()
         topPicksItems = emptyList()
         upcomingEpisodes = emptyList()
         upcomingMovies = emptyList()
@@ -518,6 +542,18 @@ class HomeViewModel internal constructor(
         simklWatchlist = emptyList()
         becauseYouWatchedRail = null
         mediaServerRails = emptyList()
+    }
+
+    private fun personalizedOwnerKey(owner: ContinueWatchingOwner): String = buildString {
+        append(owner.profileId)
+        append('|')
+        append(owner.accountSlot)
+        append('|')
+        append(owner.principal)
+        append('|')
+        append(owner.usesEngineHistory)
+        append('|')
+        append(owner.revision)
     }
 
     private fun publishHome() {

@@ -169,7 +169,11 @@ struct HomeView: View {
         }
         // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
         // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
-        .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }
+        // Overlay history is bounded, so observe the exact watched/progress fingerprint rather than only
+        // the first id. Interior mutations must refresh recommendations for the active local profile.
+        .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
+            seed(); refreshTopPicks()
+        }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
         .onChange(of: useTraktContinueWatching) { on in
             if on { TraktPlaybackShadow.shared.refreshNow() }
@@ -191,6 +195,7 @@ struct HomeView: View {
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
         .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
         .onChange(of: account.addons.count) { refreshReleaseCalendar() }
+        .onChange(of: account.isSignedIn) { _ in refreshTopPicks() }
         .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
         // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
         // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
@@ -208,7 +213,12 @@ struct HomeView: View {
     private func refreshTopPicks() {
         let localHistory = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)
-        becauseYouWatched.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
+        becauseYouWatched.refresh(
+            profileID: profiles.activeID,
+            cw: localHistory,
+            library: libraryItems,
+            ownerKey: "\(profiles.activeKeychainAccount)|\(account.isSignedIn)|\(profiles.activeUsesEngineHistory)",
+        )   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
         simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none

@@ -4,7 +4,10 @@ import com.vortx.android.model.Catalog
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -65,6 +68,58 @@ class BecauseYouWatchedModelTest {
     }
 
     @Test
+    fun `unwatched library titles do not become recommendation seeds`() = runBlocking {
+        val seeds = mutableListOf<String>()
+        val model = BecauseYouWatchedModel { seed ->
+            seeds += seed.id
+            listOf(item("tt-result-${seed.id}"))
+        }
+
+        model.refresh(
+            continueWatching = listOf(item("tt-watched")),
+            library = listOf(item("tt-saved", watched = false, progress = 0f)),
+        )
+
+        assertEquals(listOf("tt-watched"), seeds)
+    }
+
+    @Test
+    fun `watch progress mutation invalidates the cached rail`() = runBlocking {
+        var calls = 0
+        val model = BecauseYouWatchedModel { calls += 1; listOf(item("tt-result")) }
+        val first = item("tt1", progress = 0.1f)
+        val second = item("tt1", progress = 0.2f)
+
+        model.refresh(listOf(first), emptyList())
+        model.refresh(listOf(second), emptyList())
+
+        assertEquals(2, calls)
+    }
+
+    @Test
+    fun `late response from an old owner cannot replace the newest owner rail`() = runBlocking {
+        val oldOwnerGate = CompletableDeferred<Unit>()
+        val model = BecauseYouWatchedModel { seed ->
+            if (seed.id == "tt-old") oldOwnerGate.await()
+            listOf(item("tt-result-${seed.id}"))
+        }
+
+        val oldRequest = async {
+            model.refresh(listOf(item("tt-old")), emptyList(), ownerKey = "profile-a")
+        }
+        yield()
+        val newResult = model.refresh(listOf(item("tt-new")), emptyList(), ownerKey = "profile-b")
+        oldOwnerGate.complete(Unit)
+        oldRequest.await()
+
+        assertEquals(listOf("tt-result-tt-new"), newResult.rail?.items?.map(MetaItem::id))
+        assertEquals(
+            listOf("tt-result-tt-new"),
+            model.refresh(listOf(item("tt-new")), emptyList(), ownerKey = "profile-b").rail?.items?.map(MetaItem::id),
+        )
+    }
+
+    @Test
     fun `home helpers produce requested personalized ordering without duplicates`() {
         val addon = Catalog("addon", "Popular", listOf(item("tt0")))
         val top = withTopPicksRail(listOf(Catalog("continue", "Continue", listOf(item("tt1"))), addon), listOf(item("tt2")))
@@ -87,5 +142,10 @@ class BecauseYouWatchedModelTest {
         )
     }
 
-    private fun item(id: String, name: String = id) = MetaItem(id, MediaType.MOVIE, name)
+    private fun item(
+        id: String,
+        name: String = id,
+        watched: Boolean = true,
+        progress: Float = 0.5f,
+    ) = MetaItem(id, MediaType.MOVIE, name, progress = progress, watched = watched)
 }
