@@ -25,6 +25,7 @@ import Foundation
 // with `swift <file>`, where top-level code is legal. This one compiles the real TopShelfSnapshot.swift
 // beside it, and in a multi-file build top-level code has no home, so the entry point is explicit.
 @main
+@MainActor
 enum TopShelfSnapshotTests {
 
     static var failures = 0

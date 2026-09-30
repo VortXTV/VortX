@@ -1,6 +1,6 @@
 import Foundation
 
-/// Pure, Foundation-only policy for repairing Continue Watching artwork WITHOUT a new network call.
+/// Foundation-only artwork admission and caching policy with no third-party metadata lookup.
 ///
 /// HARD PRIVACY INVARIANT (preserved from the fold's original design): a private Trakt playback row
 /// must never drive a new third-party metadata or image request. Artwork may come only from:
@@ -13,6 +13,29 @@ import Foundation
 /// and `TraktPlaybackShadow` (join side) share one set of rules, and so the rules are testable with
 /// the system Swift toolchain.
 enum TraktArtworkPolicy {
+    /// Per-task redirect admission, shared by the private artwork fetch and its Foundation-only tests.
+    /// A resource deadline also applies, but must not be the only bound on a same-host redirect loop.
+    final class RedirectBudget: @unchecked Sendable {
+        static let maximumHops = 3
+        private let lock = NSLock()
+        private var counts: [Int: Int] = [:]
+
+        func admit(taskID: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let count = counts[taskID, default: 0]
+            guard count < Self.maximumHops else { return false }
+            counts[taskID] = count + 1
+            return true
+        }
+
+        func finish(taskID: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            counts.removeValue(forKey: taskID)
+        }
+    }
+
     /// A locally cached row usable for the artwork join (a projection of `CoreCWItem`).
     struct Candidate: Equatable, Sendable {
         let id: String

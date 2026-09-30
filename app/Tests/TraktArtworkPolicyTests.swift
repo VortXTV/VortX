@@ -245,6 +245,15 @@ struct TraktArtworkPolicyTestRunner {
         testSourceSuppliedArtworkIsHTTPSOnly()
         testAliasDedupeNeverContainsPrimary()
         testDecodesCachesWrittenBeforeAliasesExisted()
+        let redirects = TraktArtworkPolicy.RedirectBudget()
+        for hop in 1...TraktArtworkPolicy.RedirectBudget.maximumHops {
+            expect(redirects.admit(taskID: 1), "same first-party task admits bounded hop \(hop)")
+        }
+        expect(!redirects.admit(taskID: 1), "redirect loop stops after the exact hop budget")
+        expect(!redirects.admit(taskID: 1), "rejection cannot replenish a spent redirect budget")
+        expect(redirects.admit(taskID: 2), "another task has its own redirect budget")
+        redirects.finish(taskID: 1)
+        expect(redirects.admit(taskID: 1), "terminal task cleanup retires its redirect counter")
 
         if failures.isEmpty {
             print("PASS: \(checks) Trakt artwork policy checks")

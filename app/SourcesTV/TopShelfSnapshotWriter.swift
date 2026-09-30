@@ -38,6 +38,8 @@ enum TopShelfSnapshotWriter {
     /// initial URL is validated before the request starts; this delegate closes the privacy gap where a
     /// trusted CDN URL could redirect the app's private image fetch to an unrelated host.
     private final class ArtworkSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        private let redirects = TraktArtworkPolicy.RedirectBudget()
+
         func urlSession(
             _ session: URLSession,
             task: URLSessionTask,
@@ -46,11 +48,16 @@ enum TopShelfSnapshotWriter {
             completionHandler: @escaping (URLRequest?) -> Void
         ) {
             guard let url = request.url,
-                  TraktArtworkPolicy.isFirstPartyArtwork(url.absoluteString) else {
+                  TraktArtworkPolicy.isFirstPartyArtwork(url.absoluteString),
+                  redirects.admit(taskID: task.taskIdentifier) else {
                 completionHandler(nil)
                 return
             }
             completionHandler(request)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            redirects.finish(taskID: task.taskIdentifier)
         }
     }
 
