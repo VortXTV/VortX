@@ -393,6 +393,10 @@ struct TVPlayerView: View {
     @State private var chapterCount = 0          // embedded chapters, refreshed with the skip segments
     @State private var skipPillDismissedStart: Double?   // segment start whose pill Back dismissed: hides the pill without skipping; re-armed when the playhead leaves that segment
     @State private var autoSkipCountdown = AutoSkipCountdownState()
+    // The UIKit remote catcher owns physical focus, while this flag mirrors which virtual skip-pill action
+    // VoiceOver/Switch Control (or Left/Right + Select) has selected. The X action must remain reachable
+    // without allowing a center press to accidentally trigger the primary Skip action.
+    @State private var skipPillFocusedCancel = false
     /// Cumulative seek amount shown in a brief pill while seeking with the chrome HIDDEN (Netflix-style
     /// L/R seek that doesn't reveal the control bar). nil = no pill. Cleared after a short delay.
     @State private var hiddenSeekDelta: Double?
@@ -1024,6 +1028,7 @@ struct TVPlayerView: View {
             if stillWatching { stillWatchingOverlay }
         }
         .onAppear {
+            refreshAutoSkipSettings()
             VXProbeState.shared.setRoute("player")
             // #130 mitigation: hold a short background assertion while a loopback (torrent) stream plays, so a
             // quick app-switch away does not immediately suspend us and tear down the server listener. No-op
@@ -1123,6 +1128,9 @@ struct TVPlayerView: View {
             } else {
                 resumeSeconds = 0   // selftest / no library context, nothing to resume
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            refreshAutoSkipSettings()
         }
         .onReceive(NotificationCenter.default.publisher(for: HDRDisplayMode.userHintNotification)) { note in
             // HDRDisplayMode refused a display-mode switch because Match Dynamic Range is OFF (posted once
@@ -1990,11 +1998,13 @@ struct TVPlayerView: View {
                         pause: { viewerPause() },
                         togglePause: { viewerToggle() },
                         seekBy: { delta in
+                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
                             if handleDeferredResumeUserSeek(.relative(delta)) { return }
                             cancelPendingLibmpvResumeForUserSeek()
                             coordinator.player?.seek(by: delta)
                         },
                         seekTo: { position in
+                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
                             if handleDeferredResumeUserSeek(.absolute(position)) { return }
                             cancelPendingLibmpvResumeForUserSeek()
                             coordinator.player?.seek(to: position)
@@ -2529,11 +2539,28 @@ struct TVPlayerView: View {
                 default: break                                        // menu / playPause / up fall through
                 }
             }
+            // The visible X is a second action on the skip pill. The UIKit catcher owns physical focus, so
+            // mirror the two SwiftUI buttons here: Right focuses Cancel, Left returns to Skip, and Select
+            // activates the focused action. With no countdown (Settings = Off), normal hidden seeking remains.
+            if let seg = skipPillSegment, autoSkipRemaining(for: seg) != nil {
+                switch type {
+                case .leftArrow:
+                    skipPillFocusedCancel = false
+                    return
+                case .rightArrow:
+                    skipPillFocusedCancel = true
+                    return
+                case .select:
+                    if skipPillFocusedCancel { cancelAutomaticSkip(seg) } else { skipTo(seg) }
+                    return
+                default: break
+                }
+            }
             switch type {
             case .menu:
                 // Back consumes a visible skip pill (hide it, keep playing); it exits only when no
                 // transient prompt is up - the same dismiss-not-exit precedent as the Up Next band.
-                if let seg = skipPillSegment { skipPillDismissedStart = seg.start }
+                if let seg = skipPillSegment { cancelAutomaticSkip(seg) }
                 else { saveProgress(at: currentTime); leavePlayback() }
             case .playPause: toggle()
             case .select:
@@ -3902,6 +3929,9 @@ struct TVPlayerView: View {
                                 resumeOrigin: Double? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
+        // Every accepted source/rebind path funnels through this load command. Retire position telemetry from
+        // the outgoing decoder while preserving per-media cancel/completion memory in the policy state.
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         // Commit deferred-resume retirement only after native admission below. Refused loads retain
         // the current seek's deadline; both engines enqueue their callbacks on the main queue, so
         // an accepted load still retires it before any new-token event can reach this view.
@@ -4150,6 +4180,10 @@ struct TVPlayerView: View {
             if userInitiated { closePanel() }
             return false
         }
+        // A source replacement keeps the same media identity but cannot inherit a partially observed
+        // countdown from the old decoder/position stream. Preserve cancel/completion memory while fencing
+        // the pending decision; the new source will re-enter through the normal position callback.
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         // Continuity, binge-group and account ranking were snapshotted from the source being replaced.
         // Cancel that preparation so the next player tick ranks against the source that actually won.
         invalidateNextEpisodePreparation(reason: "source switch")
@@ -7930,6 +7964,17 @@ struct TVPlayerView: View {
         return "title:\(curTitle)"
     }
 
+    private func refreshAutoSkipSettings() {
+        let stored = AutoSkipSettings.delaySeconds()
+        guard stored != autoSkipDelaySeconds else { return }
+        autoSkipDelaySeconds = stored
+        skipPillFocusedCancel = false
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
+        // Off removes only the automatic countdown. The segment remains available for an immediate manual
+        // Skip action, matching the existing recap/credits behavior and avoiding a stale prompt transition.
+        updateCurrentSkip(at: currentTime)
+    }
+
     private func autoSkipRemaining(for segment: SkipSegment) -> Double? {
         guard autoSkipDelaySeconds > 0,
               !autoSkipCountdown.isSuppressed(for: segment),
@@ -7940,6 +7985,7 @@ struct TVPlayerView: View {
     private func cancelAutomaticSkip(_ segment: SkipSegment) {
         AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
         skipPillDismissedStart = segment.start
+        skipPillFocusedCancel = false
         DiagnosticsLog.log("playback", "automatic skip cancelled kind=\(segment.kind.rawValue) start=\(segment.start)")
     }
 
@@ -7971,10 +8017,14 @@ struct TVPlayerView: View {
             )
             issueSeek(to: target, reason: "automatic-skip")
             currentTime = target
+            skipPillFocusedCancel = false
             if currentSkip != nil { currentSkip = nil }
             return
         }
-        if skip?.start != currentSkip?.start { currentSkip = skip }
+        if skip?.start != currentSkip?.start {
+            currentSkip = skip
+            skipPillFocusedCancel = false
+        }
         // Re-arm a Back-dismissed pill once the playhead leaves that segment (seek-out, natural exit,
         // or a new file's spans): the dismissal is scoped to one continuous stay inside the segment.
         if let dismissed = skipPillDismissedStart, skip?.start != dismissed { skipPillDismissedStart = nil }
@@ -8028,6 +8078,7 @@ struct TVPlayerView: View {
     /// Jump past a skip segment to its end, updating the playhead so the pill clears immediately.
     private func skipTo(_ segment: SkipSegment) {
         AutoSkipCountdownPolicy.complete(state: &autoSkipCountdown, segment: segment)
+        skipPillFocusedCancel = false
         issueSeek(to: segment.end, reason: "skip")
         currentTime = segment.end
     }
@@ -8118,6 +8169,12 @@ struct TVPlayerView: View {
                                 .foregroundStyle(Theme.Palette.textPrimary)
                                 .frame(width: 34, height: 34)
                                 .contentShape(Circle())
+                                .overlay {
+                                    Circle().stroke(
+                                        Theme.Palette.accent,
+                                        lineWidth: skipPillFocusedCancel ? 2 : 0
+                                    )
+                                }
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Cancel automatic skip for \(segment.kind.rawValue)")
@@ -10387,6 +10444,9 @@ struct TVPlayerView: View {
     /// (an absolute `seek(to:)` arms the cache hold and empties the forward buffer, which a small hop must
     /// not), but they emit the same line for a complete trail. maybeResume logs its own resume line.
     private func issueSeek(to target: Double, reason: String) {
+        // Retire any countdown accumulated against the old playhead before issuing a user or automatic seek;
+        // cancellation/completion memory remains keyed to this media identity in the policy state.
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         if handleDeferredResumeUserSeek(.absolute(target)) { return }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user seek")
@@ -10398,6 +10458,7 @@ struct TVPlayerView: View {
     }
 
     private func seek(_ delta: Double) {
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         if handleDeferredResumeUserSeek(.relative(delta)) { flashControls(); return }
         cancelPendingLibmpvResumeForUserSeek()
         suppressRapidBufferingRecovery(reason: "user relative seek")
@@ -10915,6 +10976,23 @@ struct TVPlayerView: View {
             return items
         }
 
+        if controlsHidden, let segment = skipPillSegment {
+            var items: [RemoteCatcher.AccessibilityItem] = [
+                .init(id: "skip.primary", label: "\(segment.label) now",
+                      hint: "Skips this segment immediately",
+                      traits: skipPillFocusedCancel ? .button : [.button, .selected])
+            ]
+            if autoSkipRemaining(for: segment) != nil {
+                items.append(.init(
+                    id: "skip.cancel",
+                    label: "Cancel automatic skip for \(segment.kind.rawValue)",
+                    hint: "Hides this prompt and will not auto-skip this segment again",
+                    traits: skipPillFocusedCancel ? [.button, .selected] : .button
+                ))
+            }
+            return items
+        }
+
         if controlsHidden, upNextRemaining != nil || isCreditsUpNext {
             return [
                 .init(id: "up-next.play", label: "Play next episode now",
@@ -10952,6 +11030,10 @@ struct TVPlayerView: View {
         if stillWatching { return stillWatchingWantsStop ? "still-watching.stop" : "still-watching.continue" }
         if showOptions, panelRows.indices.contains(optionRow) {
             return "option.\(panelRows[optionRow].accessibilityID)"
+        }
+        if controlsHidden, let segment = skipPillSegment {
+            if skipPillFocusedCancel, autoSkipRemaining(for: segment) != nil { return "skip.cancel" }
+            return "skip.primary"
         }
         if controlsHidden, upNextRemaining != nil || isCreditsUpNext {
             return upNextWantsCredits ? "up-next.credits" : "up-next.play"
@@ -11024,6 +11106,16 @@ struct TVPlayerView: View {
             optionRow = index
             return
         }
+        if identity == "skip.primary" {
+            skipPillFocusedCancel = false
+            return
+        }
+        if identity == "skip.cancel" {
+            if let segment = skipPillSegment, autoSkipRemaining(for: segment) != nil {
+                skipPillFocusedCancel = true
+            }
+            return
+        }
         if let control = ([Control.close] + buttonRow + [.scrub]).first(where: {
             "control.\(controlAccessibilityID($0))" == identity
         }) {
@@ -11042,6 +11134,15 @@ struct TVPlayerView: View {
            let index = panelRows.firstIndex(where: { "option.\($0.accessibilityID)" == identity }) {
             optionRow = index
             activateOption()
+            return
+        }
+        if identity == "skip.primary", let segment = skipPillSegment {
+            skipTo(segment)
+            return
+        }
+        if identity == "skip.cancel", let segment = skipPillSegment,
+           autoSkipRemaining(for: segment) != nil {
+            cancelAutomaticSkip(segment)
             return
         }
         if let control = ([Control.close] + buttonRow + [.scrub]).first(where: {

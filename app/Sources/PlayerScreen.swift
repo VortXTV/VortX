@@ -1337,6 +1337,7 @@ struct PlayerScreen: View {
         #endif
         .tint(Theme.Palette.accent)
         .onAppear {
+            refreshAutoSkipSettings()
             playbackExited = false
             persistenceBlockedForExit = false
             // Diagnostic-only: this is the player surface, so the heartbeat reports the player route.
@@ -1418,6 +1419,9 @@ struct PlayerScreen: View {
             installMacKeyMonitor()
             observeMacFullScreen()
             #endif
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            refreshAutoSkipSettings()
         }
         .onDisappear {
             let assetSanityAccepted =
@@ -2099,11 +2103,13 @@ struct PlayerScreen: View {
                         pause: { viewerPause() },
                         togglePause: { viewerToggle() },
                         seekBy: { delta in
+                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
                             if handleDeferredResumeUserSeek(.relative(delta)) { return }
                             cancelPendingResumeForUserSeek()
                             coordinator.player?.seek(by: delta)
                         },
                         seekTo: { position in
+                            AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
                             if handleDeferredResumeUserSeek(.absolute(position)) { return }
                             cancelPendingResumeForUserSeek()
                             coordinator.player?.seek(to: position)
@@ -3033,6 +3039,9 @@ struct PlayerScreen: View {
                                 resumeOrigin: Double? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
+        // Every accepted source/rebind path funnels through this load command. Retire position telemetry from
+        // the outgoing decoder while preserving per-media cancel/completion memory in the policy state.
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         // ENGINE-AWARE playback tuple. The AVFoundation engine must receive the RAW stream url + headers:
         // it attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey) and the DV remux server takes them
         // directly, while the StremioServer proxy rewrite (playback(for:)) turns the host into 127.0.0.1,
@@ -5144,6 +5153,10 @@ struct PlayerScreen: View {
             if userInitiated { close() }
             return false
         }
+        // A source replacement keeps the same media identity but cannot inherit a partially observed
+        // countdown from the old decoder/position stream. Preserve cancel/completion memory while fencing
+        // the pending decision; the new source will re-enter through the normal position callback.
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         if !mediaGenerationAlreadyClaimed {
             let hadEpisodeResolution = episodeResolutionOwner != nil
             invalidateEpisodeResolution()
@@ -6671,6 +6684,10 @@ struct PlayerScreen: View {
     /// A9: single logged choke point for a seek so the exportable trail shows every jump (reason, from, to,
     /// duration). maybeResume / nudgeResume and the automatic-skip path log their own dedicated lines.
     private func issueSeek(to target: Double, reason: String) {
+        // A manual transport seek (and an automatic seek after its decision) retires any position-driven
+        // countdown that was built from the old playhead. Cancelled/completed segment memory lives in the
+        // policy, so this fencing does not make Back/X or a manual Skip forget the user's choice.
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         if handleDeferredResumeUserSeek(.absolute(target)) { return }
         cancelPendingResumeForUserSeek()
         DiagnosticsLog.log(
@@ -7352,10 +7369,18 @@ struct PlayerScreen: View {
     // MARK: - Skip intro / outro
 
     private var autoSkipMediaIdentity: String {
-        if let m = curMeta ?? Optional(meta) {
-            return "media:\(m.libraryId):\(m.videoId)"
-        }
-        return "title:\(title)"
+        let m = curMeta ?? meta
+        return "media:\(m.libraryId):\(m.videoId)"
+    }
+
+    private func refreshAutoSkipSettings() {
+        let stored = AutoSkipSettings.delaySeconds()
+        guard stored != autoSkipDelaySeconds else { return }
+        autoSkipDelaySeconds = stored
+        AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
+        // Re-evaluate the visible segment immediately. Off keeps the manual Skip affordance while removing
+        // the countdown; a newly selected delay starts from the current position, never from stale telemetry.
+        updateCurrentSkip(at: currentTime)
     }
 
     private func autoSkipRemaining(for segment: SkipSegment) -> Double? {
@@ -7450,7 +7475,7 @@ struct PlayerScreen: View {
                     time
                 )
             )
-            coordinator.player?.seek(to: target)
+            issueSeek(to: target, reason: "automatic-skip")
             currentTime = target
             if currentSkip != nil { withAnimation { currentSkip = nil } }
             return
