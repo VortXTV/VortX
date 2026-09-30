@@ -88,6 +88,10 @@ final class BecauseYouWatchedModel: ObservableObject {
     private var historyOwner: BecauseYouWatchedHistoryPolicy.Owner?
     private var historyMinimumRevision: Int?
     private var historySnapshotReady = false
+    /// A published account/email boundary may precede CoreBridge's settled binding rotation. If the
+    /// snapshot still names the old owner at that point, require a different binding before accepting
+    /// any later history receipt; otherwise an old-account event could relabel itself as the new email.
+    private var historyRequiresNewBinding = false
 
     /// Recompute from the active profile's recent watch/library titles. Calls are cheap when the exact
     /// relevant inputs are unchanged, but a watch-progress or watched-count mutation changes the signature.
@@ -105,6 +109,17 @@ final class BecauseYouWatchedModel: ObservableObject {
         let ownerChanged = activeProfileID != profileID || activeOwnerKey != ownerKey
 
         if ownerChanged {
+            let previousOwner = historyOwner
+            let previousOwnerKey = activeOwnerKey
+            let ownerChangedWithFreshHistory = usesEngineHistory
+                && previousOwner != nil
+                && historySnapshot?.owner != nil
+                && previousOwner != historySnapshot?.owner
+                && !(historySnapshot?.changedFields.isDisjoint(with: BecauseYouWatchedHistoryPolicy.historyFields) ?? true)
+            historyRequiresNewBinding = usesEngineHistory
+                && previousOwner != nil
+                && previousOwner == historySnapshot?.owner
+                && previousOwnerKey != ownerKey
             requestGeneration &+= 1
             loadTask?.cancel()
             loadTask = nil
@@ -115,11 +130,30 @@ final class BecauseYouWatchedModel: ObservableObject {
             activeOwnerKey = ownerKey
             historyOwner = historySnapshot?.owner
             historyMinimumRevision = historySnapshot?.revision
-            historySnapshotReady = false
-            historyInputReady = false
+            // The first valid B history event can be the same revision that makes the settled B binding
+            // observable. Accept that event when the prior owner was already known and the new exact
+            // owner differs; there is no old-A callback left to publish after CoreBridge's epoch fence.
+            historySnapshotReady = ownerChangedWithFreshHistory
+            historyInputReady = ownerChangedWithFreshHistory
         }
 
         if usesEngineHistory {
+            if historyRequiresNewBinding {
+                guard let snapshotOwner = historySnapshot?.owner,
+                      snapshotOwner != historyOwner else {
+                    historyInputReady = false
+                    loadTask?.cancel()
+                    loadTask = nil
+                    inFlightSignature = nil
+                    rail = nil
+                    lastSignature = nil
+                    return
+                }
+                // The binding/principal changed. The owner-boundary baseline was captured when this
+                // owner arrived, so the new owner still needs its own newer history receipt below.
+                historyOwner = snapshotOwner
+                historyRequiresNewBinding = false
+            }
             if historySnapshotReady {
                 // Keep a ready owner usable across unrelated engine revisions. A later owner change
                 // resets this latch above, before any old data can reach the recommender.
@@ -232,6 +266,7 @@ final class BecauseYouWatchedModel: ObservableObject {
         historyOwner = nil
         historyMinimumRevision = nil
         historySnapshotReady = false
+        historyRequiresNewBinding = false
         historyInputReady = false
         rail = nil
         lastSignature = nil
