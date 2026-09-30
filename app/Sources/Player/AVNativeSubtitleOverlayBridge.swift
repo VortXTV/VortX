@@ -4,7 +4,7 @@ import Foundation
 /// Uses AVFoundation's selected WebVTT rendition and cue clock, but renders through the app's existing
 /// styled overlay. Never selects a track, downloads subtitles, or changes global accessibility settings.
 @MainActor
-final class AVNativeSubtitleOverlayBridge: NSObject, @preconcurrency AVPlayerItemLegibleOutputPushDelegate {
+final class AVNativeSubtitleOverlayBridge: NSObject, AVPlayerItemLegibleOutputPushDelegate {
     static func canRenderInline(pipActive: Bool, pipTransitioning: Bool, externalPlayback: Bool) -> Bool {
         !pipActive && !pipTransitioning && !externalPlayback
     }
@@ -40,21 +40,31 @@ final class AVNativeSubtitleOverlayBridge: NSObject, @preconcurrency AVPlayerIte
         item = nil
     }
 
-    func legibleOutput(_ output: AVPlayerItemLegibleOutput,
-                       didOutputAttributedStrings strings: [NSAttributedString],
-                       nativeSampleBuffers nativeSamples: [Any], forItemTime itemTime: CMTime) {
-        guard active, output === self.output, item != nil else { return }
-        guard nativeSamples.isEmpty else { invalidate(); return } // Never hide an unsupported bitmap stream.
-        let text = strings.map(\.string).joined(separator: "\n")
-        if !text.isEmpty {
-            // Suppress BEFORE drawing: exactly one renderer owns this selected rendition.
-            output.suppressesPlayerRendering = true
+    nonisolated func legibleOutput(_ output: AVPlayerItemLegibleOutput,
+                                   didOutputAttributedStrings strings: [NSAttributedString],
+                                   nativeSampleBuffers nativeSamples: [Any], forItemTime itemTime: CMTime) {
+        // Only immutable Sendable values enter the actor closure, not attributed strings/native buffers.
+        let outputID = ObjectIdentifier(output)
+        let hasNativeSamples = !nativeSamples.isEmpty
+        let text = hasNativeSamples ? "" : strings.map(\.string).joined(separator: "\n")
+        // AVFoundation delivers every delegate message on the .main queue installed above. Keep the
+        // renderer handoff synchronous; an asynchronous hop could let a stale cue race item teardown.
+        MainActor.assumeIsolated {
+            guard active, outputID == ObjectIdentifier(self.output), item != nil else { return }
+            guard !hasNativeSamples else { invalidate(); return } // Never hide an unsupported bitmap stream.
+            if !text.isEmpty {
+                // Suppress BEFORE drawing: exactly one renderer owns this selected rendition.
+                self.output.suppressesPlayerRendering = true
+            }
+            render(text.isEmpty ? nil : text)
         }
-        render(text.isEmpty ? nil : text)
     }
 
-    func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) {
-        guard active, output === self.output else { return }
-        render(nil) // Seeks/direction changes must not retain the previous cue.
+    nonisolated func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) {
+        let outputID = ObjectIdentifier(output)
+        MainActor.assumeIsolated {
+            guard active, outputID == ObjectIdentifier(self.output) else { return }
+            render(nil) // Seeks/direction changes must not retain the previous cue.
+        }
     }
 }

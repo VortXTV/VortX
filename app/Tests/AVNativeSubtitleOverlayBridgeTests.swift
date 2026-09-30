@@ -18,6 +18,11 @@ enum AVNativeSubtitleOverlayBridgeTests {
         var rendered: [String?] = []
         let bridge = AVNativeSubtitleOverlayBridge(item: item, option: nil) { rendered.append($0) }
         precondition(!bridge.output.suppressesPlayerRendering, "No text evidence: retain native fallback")
+        let bridgeSource = try String(contentsOfFile: "app/Sources/Player/AVNativeSubtitleOverlayBridge.swift", encoding: .utf8)
+        precondition(bridgeSource.contains("output.setDelegate(self, queue: .main)"),
+                     "Synchronous main-actor callbacks require the explicit AVFoundation main delegate queue")
+        precondition(!bridgeSource.contains("@preconcurrency AVPlayerItemLegibleOutputPushDelegate"),
+                     "Delegate isolation uses explicit witnesses across SDKs, not an ineffective inherited Sendable annotation")
         let unrelated = AVPlayerItemLegibleOutput()
         bridge.legibleOutput(unrelated, didOutputAttributedStrings: [NSAttributedString(string: "stale")],
                              nativeSampleBuffers: [], forItemTime: .zero)

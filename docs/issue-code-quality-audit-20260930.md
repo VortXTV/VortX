@@ -83,6 +83,11 @@ Current follow-up verification (distinct from the historical patch results below
   union. That expression now accumulates an explicitly typed array in the identical order. The actual
   Continue Watching fold fixtures also run in CI, including newest-winner and transitive/late-bridge
   deduplication; a successful local compiler is not substituted for the rerun of the failing CI gate.
+- A subsequent older-SDK run rejected an ineffective inherited Sendable `@preconcurrency` annotation
+  in the native subtitle delegate. Explicit nonisolated witnesses now transfer only immutable output
+  identity/text/native-buffer-presence values into a synchronous main-actor assertion, supported by
+  the configured AVFoundation main delegate queue. No asynchronous cue hop or warning suppression was
+  added. Astra independently accepted the final adapter; its renderer/flush/teardown fixtures pass.
 - No new-source physical DV/receiver, live NNTP throughput, or Android remote/process-death acceptance
   receipt is claimed. The successful read-only TV copy is not an installation or playback test of this patch.
 
