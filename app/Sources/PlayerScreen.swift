@@ -978,8 +978,8 @@ struct PlayerScreen: View {
     @State private var upNextSuppressed = false           // user tapped Watch Credits: hide the band + don't auto-advance this episode
     @State private var apiSkipCandidates: [SegmentCandidate] = []
     @State private var currentSkip: SkipSegment?
-    @State private var autoSkippedStarts: Set<Double> = []   // segment starts already auto-skipped this episode
-    @AppStorage("stremiox.autoSkip") private var autoSkip = false
+    @State private var autoSkipCountdown = AutoSkipCountdownState()
+    @State private var autoSkipDelaySeconds = AutoSkipSettings.delaySeconds()
     @State private var skipFetchKey = ""
     @State private var skipFetchTask: Task<Void, Never>?
 
@@ -1223,7 +1223,11 @@ struct PlayerScreen: View {
             // so the two end-of-episode prompts never stack.
             // Suppressed while locked: the pill is a tap-to-seek affordance, and the whole point of the
             // lock is that no stray tap can move playback.
-            if let seg = currentSkip, !controlsVisible, !isLocked, panel == nil, !loadFailed, upNextRemaining == nil { skipPill(seg) }
+            if let seg = currentSkip,
+               !autoSkipCountdown.isSuppressed(for: seg),
+               !controlsVisible, !isLocked, panel == nil, !loadFailed, upNextRemaining == nil {
+                skipPill(seg)
+            }
 
             // Render controls UNCONDITIONALLY (just faded/non-interactive when hidden) so VoiceOver can
             // still reach them when auto-hidden - otherwise a hidden bar drops out of the a11y tree (#31).
@@ -1993,7 +1997,7 @@ struct PlayerScreen: View {
                             d,
                             isAVPlayerActive ? "avplayer" : "libmpv",
                             resumeSeconds,
-                            autoSkip ? "on" : "off"
+                            autoSkipDelaySeconds > 0 ? "on" : "off"
                         )
                     )
                     // [src-probe] FIRST FRAME: the overlay/spinner is about to clear and real playback begins.
@@ -7347,30 +7351,75 @@ struct PlayerScreen: View {
 
     // MARK: - Skip intro / outro
 
+    private var autoSkipMediaIdentity: String {
+        if let m = curMeta ?? Optional(meta) {
+            return "media:\(m.libraryId):\(m.videoId)"
+        }
+        return "title:\(title)"
+    }
+
+    private func autoSkipRemaining(for segment: SkipSegment) -> Double? {
+        guard autoSkipDelaySeconds > 0,
+              !autoSkipCountdown.isSuppressed(for: segment),
+              autoSkipCountdown.activeSegment == AutoSkipSegmentKey(segment: segment) else { return nil }
+        return max(0, autoSkipDelaySeconds - autoSkipCountdown.accruedPlaybackSeconds)
+    }
+
+    private func skipImmediately(_ segment: SkipSegment) {
+        AutoSkipCountdownPolicy.complete(state: &autoSkipCountdown, segment: segment)
+        Haptics.success()
+        issueSeek(to: segment.end, reason: "skip")
+        currentTime = segment.end
+        updateCurrentSkip(at: segment.end)
+    }
+
+    private func cancelAutomaticSkip(_ segment: SkipSegment) {
+        AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
+        DiagnosticsLog.log("playback", "automatic skip cancelled kind=\(segment.kind.rawValue) start=\(segment.start)")
+    }
+
     private func skipPill(_ segment: SkipSegment) -> some View {
         VStack {
             Spacer()
             HStack {
                 Spacer()
-                Button {
-                    Haptics.success()
-                    issueSeek(to: segment.end, reason: "skip")
-                    currentTime = segment.end
-                    updateCurrentSkip(at: segment.end)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
-                        Text(segment.label).fontWeight(.semibold)
+                HStack(spacing: 6) {
+                    Button { skipImmediately(segment) } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
+                            if let remaining = autoSkipRemaining(for: segment) {
+                                Text("\(segment.label) in \(max(1, Int(remaining.rounded(.up))))s")
+                                    .fontWeight(.semibold).monospacedDigit()
+                            } else {
+                                Text(segment.label).fontWeight(.semibold)
+                            }
+                        }
+                        .padding(.leading, 22).padding(.vertical, 12).padding(.trailing, 12)
+                        // Glass ember skip pill (mockup .skippill): warm glass with an ember hairline and ember
+                        // glyph, upgrading to Liquid Glass on OS 26. Ink label, ember icon.
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
+                                    fillAlpha: VortXGlass.barFillAlpha, shadow: .pill)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
+                        }
                     }
-                    .padding(.horizontal, 22).padding(.vertical, 12)
-                    // Glass ember skip pill (mockup .skippill): warm glass with an ember hairline and ember
-                    // glyph, upgrading to Liquid Glass on OS 26. Ink label, ember icon.
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
-                                fillAlpha: VortXGlass.barFillAlpha, shadow: .pill)
-                    .overlay {
-                        RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                            .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Skip \(segment.kind.rawValue) now")
+                    .accessibilityHint("Skips this segment immediately")
+
+                    if autoSkipRemaining(for: segment) != nil {
+                        Button { cancelAutomaticSkip(segment) } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                                .frame(width: 32, height: 32)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Cancel automatic skip for \(segment.kind.rawValue)")
+                        .accessibilityHint("Hides this prompt and will not auto-skip this segment again")
                     }
                 }
                 .padding(.trailing, 28).padding(.bottom, 40)
@@ -7381,22 +7430,28 @@ struct PlayerScreen: View {
 
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
-        // Auto-skip: when the playhead enters a NEW skip segment and the setting is on, seek past it once.
-        // Recording the start means a manual seek back into the same segment won't auto-skip it again.
-        if autoSkip, let skip, !autoSkippedStarts.contains(skip.start) {
-            autoSkippedStarts.insert(skip.start)
+        let decision = AutoSkipCountdownPolicy.advance(
+            state: &autoSkipCountdown,
+            mediaID: autoSkipMediaIdentity,
+            segment: skip,
+            position: time,
+            duration: duration,
+            playbackActive: hasStartedPlaying && !isPaused && !buffering,
+            delaySeconds: autoSkipDelaySeconds
+        )
+        if case .skip(_, let target, _) = decision, let skip {
             DiagnosticsLog.log(
                 "playback",
                 String(
                     format: "automatic skip kind=%@ start=%.3fs end=%.3fs observed=%.3fs",
                     skip.kind.rawValue,
                     skip.start,
-                    skip.end,
+                    target,
                     time
                 )
             )
-            coordinator.player?.seek(to: skip.end)
-            currentTime = skip.end
+            coordinator.player?.seek(to: target)
+            currentTime = target
             if currentSkip != nil { withAnimation { currentSkip = nil } }
             return
         }
@@ -7413,13 +7468,15 @@ struct PlayerScreen: View {
     }
     private func fetchSkipTimestamps() {
         guard let m = curMeta, SkipTimestampService.supports(metaId: m.libraryId) else {
-            skipFetchTask?.cancel(); apiSkipCandidates = []; skipFetchKey = ""; refreshSkipSegments(); return
+            skipFetchTask?.cancel(); apiSkipCandidates = []; skipFetchKey = ""
+            AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
+            refreshSkipSegments(); return
         }
         let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
         guard key != skipFetchKey else { return }
         if key != skipFetchKey { apiSkipCandidates = [] }
         skipFetchKey = key
-        autoSkippedStarts = []   // new episode: let its intro/credits auto-skip once
+        AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
         let dur = duration
         skipFetchTask?.cancel()
         skipFetchTask = Task { @MainActor in

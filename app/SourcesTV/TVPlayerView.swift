@@ -391,8 +391,8 @@ struct TVPlayerView: View {
     @State private var altSourceCount = 0        // playable streams loaded for this title / episode
     @State private var qualityOptionCount = 0    // distinct resolutions across those streams
     @State private var chapterCount = 0          // embedded chapters, refreshed with the skip segments
-    @State private var autoSkippedStarts: Set<Double> = []   // segment starts already auto-skipped this episode
     @State private var skipPillDismissedStart: Double?   // segment start whose pill Back dismissed: hides the pill without skipping; re-armed when the playhead leaves that segment
+    @State private var autoSkipCountdown = AutoSkipCountdownState()
     /// Cumulative seek amount shown in a brief pill while seeking with the chrome HIDDEN (Netflix-style
     /// L/R seek that doesn't reveal the control bar). nil = no pill. Cleared after a short delay.
     @State private var hiddenSeekDelta: Double?
@@ -663,7 +663,7 @@ struct TVPlayerView: View {
     @State private var sleepAtEpisodeEnd = false          // stop at episode end instead of auto-advancing
     @State private var sleepTask: Task<Void, Never>? = nil
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds ("10"/"15"/"30"), shared with iOS
-    @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
+    @State private var autoSkipDelaySeconds = AutoSkipSettings.delaySeconds()
     private var seekStepSeconds: Double { Double(seekStep) ?? 10 }
     @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
     @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
@@ -1894,7 +1894,7 @@ struct TVPlayerView: View {
                             d,
                             isAVPlayerActive ? "avplayer" : "libmpv",
                             startupResume,
-                            autoSkip ? "on" : "off"
+                            autoSkipDelaySeconds > 0 ? "on" : "off"
                         )
                     )
                     hasStartedPlaying = true
@@ -7923,27 +7923,54 @@ struct TVPlayerView: View {
 
     // MARK: - Skip intro / outro (chapter-derived; AniSkip crowd-sourced timings can feed the same model later)
 
+    private var autoSkipMediaIdentity: String {
+        if let m = curMeta ?? meta {
+            return "media:\(m.libraryId):\(m.videoId)"
+        }
+        return "title:\(curTitle)"
+    }
+
+    private func autoSkipRemaining(for segment: SkipSegment) -> Double? {
+        guard autoSkipDelaySeconds > 0,
+              !autoSkipCountdown.isSuppressed(for: segment),
+              autoSkipCountdown.activeSegment == AutoSkipSegmentKey(segment: segment) else { return nil }
+        return max(0, autoSkipDelaySeconds - autoSkipCountdown.accruedPlaybackSeconds)
+    }
+
+    private func cancelAutomaticSkip(_ segment: SkipSegment) {
+        AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
+        skipPillDismissedStart = segment.start
+        DiagnosticsLog.log("playback", "automatic skip cancelled kind=\(segment.kind.rawValue) start=\(segment.start)")
+    }
+
     /// The skip segment the playhead is currently inside, if any. Gated on `hasStartedPlaying` so a stale
     /// segment from the previous file never flashes during a load.
     /// Recompute the active skip span for a playhead value, assigning only on change
     /// so the player body re-renders when the pill appears/disappears, not per tick.
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
-        // Auto-skip: when the playhead enters a NEW skip segment and the setting is on, jump past it once.
-        // Recording the start means a manual seek back into the same segment won't auto-skip it again.
-        if autoSkip, let skip, !autoSkippedStarts.contains(skip.start) {
-            autoSkippedStarts.insert(skip.start)
+        let decision = AutoSkipCountdownPolicy.advance(
+            state: &autoSkipCountdown,
+            mediaID: autoSkipMediaIdentity,
+            segment: skip,
+            position: time,
+            duration: duration,
+            playbackActive: hasStartedPlaying && !isPaused && !buffering,
+            delaySeconds: autoSkipDelaySeconds
+        )
+        if case .skip(_, let target, _) = decision, let skip {
             DiagnosticsLog.log(
                 "playback",
                 String(
                     format: "automatic skip kind=%@ start=%.3fs end=%.3fs observed=%.3fs",
                     skip.kind.rawValue,
                     skip.start,
-                    skip.end,
+                    target,
                     time
                 )
             )
-            skipTo(skip)
+            issueSeek(to: target, reason: "automatic-skip")
+            currentTime = target
             if currentSkip != nil { currentSkip = nil }
             return
         }
@@ -7976,13 +8003,15 @@ struct TVPlayerView: View {
             // the per-episode auto-skip dedup + pill dismissal here too (the supported branch below already does).
             // Guard on the key so a same-episode re-fetch (a source switch re-fires the duration event) does not
             // clobber mid-episode; store the real key (not "") so the next unsupported episode is detectable.
-            if key != skipFetchKey { autoSkippedStarts = []; skipPillDismissedStart = nil }
+            if key != skipFetchKey { skipPillDismissedStart = nil }
             skipFetchKey = key
+            AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
             refreshSkipSegments()
             return
         }
-        if key != skipFetchKey { apiSkipCandidates = []; autoSkippedStarts = []; skipPillDismissedStart = nil }   // new episode: reset auto-skip + pill dismissal
+        if key != skipFetchKey { apiSkipCandidates = []; skipPillDismissedStart = nil }   // new episode: reset auto-skip + pill dismissal
         skipFetchKey = key
+        AutoSkipCountdownPolicy.bindMedia(&autoSkipCountdown, mediaID: autoSkipMediaIdentity)
         let dur = duration
         plog.info("skip: fetching key=\(key, privacy: .public) dur=\(Int(dur), privacy: .public)")
         skipFetchTask?.cancel()
@@ -7998,6 +8027,7 @@ struct TVPlayerView: View {
 
     /// Jump past a skip segment to its end, updating the playhead so the pill clears immediately.
     private func skipTo(_ segment: SkipSegment) {
+        AutoSkipCountdownPolicy.complete(state: &autoSkipCountdown, segment: segment)
         issueSeek(to: segment.end, reason: "skip")
         currentTime = segment.end
     }
@@ -8042,7 +8072,8 @@ struct TVPlayerView: View {
     /// corner, and not Back-dismissed for this segment.
     private var skipPillSegment: SkipSegment? {
         guard controlsHidden, let seg = currentSkip, upNextRemaining == nil, !isCreditsUpNext,
-              seg.start != skipPillDismissedStart else { return nil }
+              seg.start != skipPillDismissedStart,
+              !autoSkipCountdown.isSuppressed(for: seg) else { return nil }
         return seg
     }
 
@@ -8053,19 +8084,45 @@ struct TVPlayerView: View {
             Spacer()
             HStack {
                 Spacer()
-                HStack(spacing: Theme.Space.sm) {
-                    Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
-                    Text(segment.label).fontWeight(.semibold)
-                }
-                .padding(.horizontal, Theme.Space.xl).padding(.vertical, Theme.Space.md)
-                // Glass ember skip pill (mockup .skippill): warm glass with an ember hairline and ember
-                // glyph, upgrading to Liquid Glass on tvOS 26. Ink label, ember icon.
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
-                            fillAlpha: VortXGlass.barFillAlpha, shadow: .pill)
-                .overlay {
-                    RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                        .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
+                HStack(spacing: Theme.Space.xs) {
+                    Button { skipTo(segment) } label: {
+                        HStack(spacing: Theme.Space.sm) {
+                            Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
+                            if let remaining = autoSkipRemaining(for: segment) {
+                                Text("\(segment.label) in \(max(1, Int(remaining.rounded(.up))))s")
+                                    .fontWeight(.semibold).monospacedDigit()
+                            } else {
+                                Text(segment.label).fontWeight(.semibold)
+                            }
+                        }
+                        .padding(.leading, Theme.Space.xl).padding(.vertical, Theme.Space.md)
+                        .padding(.trailing, Theme.Space.sm)
+                        // Glass ember skip pill (mockup .skippill): warm glass with an ember hairline and ember
+                        // glyph, upgrading to Liquid Glass on tvOS 26. Ink label, ember icon.
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
+                                    fillAlpha: VortXGlass.barFillAlpha, shadow: .pill)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                .strokeBorder(Theme.Palette.accent.opacity(0.5), lineWidth: 1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Skip \(segment.kind.rawValue) now")
+                    .accessibilityHint("Skips this segment immediately")
+
+                    if autoSkipRemaining(for: segment) != nil {
+                        Button { cancelAutomaticSkip(segment) } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(Theme.Palette.textPrimary)
+                                .frame(width: 34, height: 34)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Cancel automatic skip for \(segment.kind.rawValue)")
+                        .accessibilityHint("Hides this prompt and will not auto-skip this segment again")
+                    }
                 }
                 .padding(Theme.Space.screenEdge * 1.5)
             }

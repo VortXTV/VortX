@@ -119,7 +119,9 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var autoplayTrailers by remember { mutableStateOf(trackStore.autoplayTrailers) }
     var trailerLanguage by remember { mutableStateOf(trackStore.trailerLanguage) }
     var trailerLanguageDialog by remember { mutableStateOf(false) }
-    var autoSkip by remember { mutableStateOf(PlaybackBehaviorSettings.autoSkip(appContext)) }
+    var autoSkipDelaySeconds by remember {
+        mutableStateOf(PlaybackBehaviorSettings.autoSkipDelaySeconds(appContext))
+    }
     var autoAddLibrary by remember { mutableStateOf(AutoAddLibrarySetting.isEnabled(appContext)) }
     var seekStep by remember { mutableStateOf(SeekStepSetting.current(appContext)) }
     var defaultVolume by remember { mutableStateOf(PlayerVolumeSettings.volume(appContext)) }
@@ -431,14 +433,25 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                         },
                     )
                 }
-                ToggleRow(
-                    label = "Skip automatically",
-                    detail = "Automatically jump past each detected intro, recap, credits, or preview once.",
-                    checked = autoSkip,
-                    onCheckedChange = {
-                        autoSkip = it
-                        PlaybackBehaviorSettings.setAutoSkip(appContext, it)
+                PickerRow(
+                    label = "Auto-skip intro, recap, credits & preview",
+                    options = listOf(
+                        0 to "Off",
+                        5 to "5 seconds",
+                        10 to "10 seconds",
+                        15 to "15 seconds",
+                        30 to "30 seconds",
+                    ).map { (seconds, label) -> seconds.toString() to label },
+                    selectedId = autoSkipDelaySeconds.toString(),
+                    onSelect = {
+                        val seconds = it.toIntOrNull() ?: return@PickerRow
+                        autoSkipDelaySeconds = seconds
+                        PlaybackBehaviorSettings.setAutoSkipDelaySeconds(appContext, seconds)
                     },
+                )
+                Text(
+                    "Waits for active playback before skipping each detected segment. Pause and buffering do not spend the countdown; Off keeps the manual Skip button.",
+                    style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
                 )
             }
 
