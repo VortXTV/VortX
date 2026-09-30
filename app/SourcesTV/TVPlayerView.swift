@@ -2533,9 +2533,9 @@ struct TVPlayerView: View {
                 case .leftArrow:  upNextWantsCredits = false; return   // focus Play Now
                 case .rightArrow: upNextWantsCredits = true;  return   // focus Watch Credits
                 case .select:
-                    if upNextWantsCredits { upNextSuppressed = true } else { requestManualEpisodeNavigation(.next) }
+                    if upNextWantsCredits { watchCredits() } else { requestManualEpisodeNavigation(.next) }
                     return
-                case .downArrow:  upNextSuppressed = true; return      // dismiss, keep watching
+                case .downArrow:  watchCredits(); return      // dismiss, keep watching
                 default: break                                        // menu / playPause / up fall through
                 }
             }
@@ -3932,6 +3932,7 @@ struct TVPlayerView: View {
         // Every accepted source/rebind path funnels through this load command. Retire position telemetry from
         // the outgoing decoder while preserving per-media cancel/completion memory in the policy state.
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
+        currentSkip = nil
         // Commit deferred-resume retirement only after native admission below. Refused loads retain
         // the current seek's deadline; both engines enqueue their callbacks on the main queue, so
         // an accepted load still retires it before any new-token event can reach this view.
@@ -4184,6 +4185,7 @@ struct TVPlayerView: View {
         // countdown from the old decoder/position stream. Preserve cancel/completion memory while fencing
         // the pending decision; the new source will re-enter through the normal position callback.
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
+        currentSkip = nil
         // Continuity, binge-group and account ranking were snapshotted from the source being replaced.
         // Cancel that preparation so the next player tick ranks against the source that actually won.
         invalidateNextEpisodePreparation(reason: "source switch")
@@ -7983,10 +7985,20 @@ struct TVPlayerView: View {
     }
 
     private func cancelAutomaticSkip(_ segment: SkipSegment) {
+        guard skipPillSegment == segment else { return }
         AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
         skipPillDismissedStart = segment.start
         skipPillFocusedCancel = false
         DiagnosticsLog.log("playback", "automatic skip cancelled kind=\(segment.kind.rawValue) start=\(segment.start)")
+    }
+
+    /// The Up Next band owns the credits corner; Watch Credits cancels that segment's automatic seek too.
+    private func watchCredits() {
+        guard hasStartedPlaying, !loadFailed else { return }
+        if let segment = currentSkip, segment.kind == .credits {
+            AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
+        }
+        upNextSuppressed = true
     }
 
     /// The skip segment the playhead is currently inside, if any. Gated on `hasStartedPlaying` so a stale
@@ -7995,13 +8007,17 @@ struct TVPlayerView: View {
     /// so the player body re-renders when the pill appears/disappears, not per tick.
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
+        let promptAvailable = controlsHidden && panel == nil && !skipEditActive
+            && !stillWatchingPrompt && !loadFailed
+            && (skip?.kind == .credits || upNextRemaining == nil)
         let decision = AutoSkipCountdownPolicy.advance(
             state: &autoSkipCountdown,
             mediaID: autoSkipMediaIdentity,
             segment: skip,
             position: time,
             duration: duration,
-            playbackActive: hasStartedPlaying && !isPaused && !buffering,
+            playbackActive: hasStartedPlaying && !isPaused && !buffering && promptAvailable
+                && (skip?.kind != .credits || !upNextSuppressed),
             delaySeconds: autoSkipDelaySeconds
         )
         if case .skip(_, let target, _) = decision, let skip {
@@ -8077,6 +8093,7 @@ struct TVPlayerView: View {
 
     /// Jump past a skip segment to its end, updating the playhead so the pill clears immediately.
     private func skipTo(_ segment: SkipSegment) {
+        guard skipPillSegment == segment else { return }
         AutoSkipCountdownPolicy.complete(state: &autoSkipCountdown, segment: segment)
         skipPillFocusedCancel = false
         issueSeek(to: segment.end, reason: "skip")
@@ -8122,7 +8139,8 @@ struct TVPlayerView: View {
     /// and the remote handler: chrome hidden, a segment active, the Up Next band not owning the
     /// corner, and not Back-dismissed for this segment.
     private var skipPillSegment: SkipSegment? {
-        guard controlsHidden, let seg = currentSkip, upNextRemaining == nil, !isCreditsUpNext,
+        guard hasStartedPlaying, !loadFailed, controlsHidden, let seg = currentSkip,
+              upNextRemaining == nil, !isCreditsUpNext,
               seg.start != skipPillDismissedStart,
               !autoSkipCountdown.isSuppressed(for: seg) else { return nil }
         return seg
@@ -8131,12 +8149,20 @@ struct TVPlayerView: View {
     /// The "Skip Intro / Skip Outro" pill, bottom-trailing. Shown only while watching (controls hidden);
     /// pressing Select skips it (see `handlePress`).
     private func skipPill(_ segment: SkipSegment) -> some View {
-        VStack {
+        let interactionMediaID = autoSkipMediaIdentity
+        let interactionEpoch = autoSkipCountdown.epoch
+        return VStack {
             Spacer()
             HStack {
                 Spacer()
                 HStack(spacing: Theme.Space.xs) {
-                    Button { skipTo(segment) } label: {
+                    Button {
+                        guard AutoSkipCountdownPolicy.isCurrent(
+                            state: autoSkipCountdown, mediaID: interactionMediaID,
+                            segment: segment, epoch: interactionEpoch
+                        ) else { return }
+                        skipTo(segment)
+                    } label: {
                         HStack(spacing: Theme.Space.sm) {
                             Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
                             if let remaining = autoSkipRemaining(for: segment) {
@@ -8163,11 +8189,17 @@ struct TVPlayerView: View {
                     .accessibilityHint("Skips this segment immediately")
 
                     if autoSkipRemaining(for: segment) != nil {
-                        Button { cancelAutomaticSkip(segment) } label: {
+                        Button {
+                            guard AutoSkipCountdownPolicy.isCurrent(
+                                state: autoSkipCountdown, mediaID: interactionMediaID,
+                                segment: segment, epoch: interactionEpoch
+                            ) else { return }
+                            cancelAutomaticSkip(segment)
+                        } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundStyle(Theme.Palette.textPrimary)
-                                .frame(width: 34, height: 34)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Circle())
                                 .overlay {
                                     Circle().stroke(
@@ -8203,7 +8235,11 @@ struct TVPlayerView: View {
                             Text(label).font(.title3.weight(.semibold))
                                 .foregroundStyle(Theme.Palette.textPrimary).lineLimit(1)
                         }
-                        if let r = upNextRemaining {
+                        if let segment = currentSkip, segment.kind == .credits,
+                           let remaining = autoSkipRemaining(for: segment) {
+                            Text("Skipping credits in \(max(1, Int(remaining.rounded(.up))))s")
+                                .font(.callout).foregroundStyle(Theme.Palette.textSecondary)
+                        } else if let r = upNextRemaining {
                             Text("Playing in \(r)s").font(.callout).foregroundStyle(Theme.Palette.textSecondary)
                         }
                     }
@@ -8616,7 +8652,8 @@ struct TVPlayerView: View {
     /// Seconds left until auto-advance, when the Up Next band should be on screen: a next episode queued,
     /// a real runtime, the play head in the final stretch, and the user hasn't chosen to watch the credits.
     private var upNextRemaining: Int? {
-        guard hasNextEpisode, !upNextSuppressed, duration > 60, currentTime > 0 else { return nil }
+        guard hasStartedPlaying, !loadFailed, hasNextEpisode, !upNextSuppressed,
+              duration > 60, currentTime > 0 else { return nil }
         let remaining = duration - currentTime
         guard remaining > 0, remaining <= 20 else { return nil }
         return Int(remaining.rounded(.up))
@@ -8627,7 +8664,8 @@ struct TVPlayerView: View {
     /// only appear in the last 20s, surfacing "after the credits were gone"). The last episode (no
     /// next) keeps its plain Skip pill. Its countdown line still appears only inside the last-20s window.
     private var isCreditsUpNext: Bool {
-        currentSkip?.kind == .credits && hasNextEpisode && !upNextSuppressed && duration > 60
+        hasStartedPlaying && !loadFailed && currentSkip?.kind == .credits
+            && hasNextEpisode && !upNextSuppressed && duration > 60
     }
     /// Label of the episode that plays next, for the Up Next band.
     private var nextEpisodeLabel: String? {
@@ -11157,8 +11195,12 @@ struct TVPlayerView: View {
         case "hidden.play-pause": toggle()
         case "still-watching.continue": continueStillWatching()
         case "still-watching.stop": stopStillWatching()
-        case "up-next.play": requestManualEpisodeNavigation(.next)
-        case "up-next.credits": upNextSuppressed = true
+        case "up-next.play":
+            guard controlsHidden, upNextRemaining != nil || isCreditsUpNext else { return }
+            requestManualEpisodeNavigation(.next)
+        case "up-next.credits":
+            guard controlsHidden, upNextRemaining != nil || isCreditsUpNext else { return }
+            watchCredits()
         default: break
         }
     }
@@ -11314,6 +11356,17 @@ private struct RemoteCatcher: UIViewControllerRepresentable {
             }
 
             let previous = Dictionary(uniqueKeysWithValues: accessibilityControls.map { ($0.stableID, $0) })
+            // VoiceOver may retain the element it was focused on after a prompt or panel disappears.
+            // Retire its callbacks instead of letting a stale control act on the next player state.
+            let liveIDs = Set(items.map(\.id))
+            for element in accessibilityControls where !liveIDs.contains(element.stableID) {
+                element.isAccessibilityElement = false
+                element.focusAction = nil
+                element.activateAction = nil
+                element.incrementAction = nil
+                element.decrementAction = nil
+                element.escapeAction = nil
+            }
             accessibilityControls = items.map { item in
                 let element = previous[item.id]
                     ?? ActionAccessibilityElement(stableID: item.id, accessibilityContainer: view as Any)

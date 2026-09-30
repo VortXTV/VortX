@@ -10,9 +10,9 @@
 
 import Foundation
 
-private var failures = 0
+@MainActor private var failures = 0
 
-private func check(_ condition: Bool, _ name: String) {
+@MainActor private func check(_ condition: Bool, _ name: String) {
     if condition {
         print("PASS  \(name)")
     } else {
@@ -21,7 +21,7 @@ private func check(_ condition: Bool, _ name: String) {
     }
 }
 
-private func source(_ path: String) -> String {
+@MainActor private func source(_ path: String) -> String {
     do {
         return try String(contentsOfFile: path, encoding: .utf8)
     } catch {
@@ -39,6 +39,7 @@ private func section(_ text: String, from start: String, to end: String) -> Stri
 }
 
 @main
+@MainActor
 enum AutoSkipCountdownWiringContractTests {
     static func main() {
         let player = source("app/Sources/PlayerScreen.swift")
@@ -76,6 +77,42 @@ enum AutoSkipCountdownWiringContractTests {
               "iOS accepted source/rebind loads fence stale countdown telemetry")
         check(tvLoad.contains("AutoSkipCountdownPolicy.invalidatePending"),
               "tvOS accepted source/rebind loads fence stale countdown telemetry")
+        check(playerLoad.contains("currentSkip = nil") && playerSwitch.contains("currentSkip = nil"),
+              "iOS source replacement immediately withdraws the outgoing skip segment")
+        check(tvLoad.contains("currentSkip = nil") && tvSwitch.contains("currentSkip = nil"),
+              "tvOS source replacement immediately withdraws the outgoing skip segment")
+        check(player.contains("if hasStartedPlaying, let seg = currentSkip"),
+              "iOS cannot render a skip prompt before the accepted file starts")
+        let tvPill = section(tv, from: "private var skipPillSegment:", to: "private func skipPill(")
+        check(tvPill.contains("guard hasStartedPlaying, !loadFailed"),
+              "tvOS visible and remote skip affordances require current started playback")
+        let playerManual = section(player, from: "private func skipImmediately(", to: "private func cancelAutomaticSkip(")
+        check(playerManual.contains("currentSkip == segment"),
+              "a stale iOS button closure cannot seek the outgoing segment")
+        let tvManual = section(tv, from: "private func skipTo(", to: "private func hiddenSeek(")
+        check(tvManual.contains("guard skipPillSegment == segment"),
+              "a stale tvOS button closure cannot seek the outgoing segment")
+        let playerCancel = section(player, from: "private func cancelAutomaticSkip(", to: "private func skipPill(")
+        let tvCancel = section(tv, from: "private func cancelAutomaticSkip(", to: "private func updateCurrentSkip(")
+        check(playerCancel.contains("currentSkip == segment"),
+              "iOS cancellation requires the current visible segment")
+        check(tvCancel.contains("guard skipPillSegment == segment"),
+              "tvOS cancellation requires the current visible and remote segment")
+        for (name, text) in [("iOS", player), ("tvOS", tv)] {
+            let pill = section(text, from: "private func skipPill(", to: "\n    ///")
+            check(pill.contains("let interactionMediaID = autoSkipMediaIdentity") &&
+                  pill.contains("let interactionEpoch = autoSkipCountdown.epoch") &&
+                  pill.components(separatedBy: "AutoSkipCountdownPolicy.isCurrent(").count == 3,
+                  "\(name) Skip and X closures capture immutable media and countdown ownership")
+            let watchCredits = section(text, from: "private func watchCredits()", to: "\n    private func")
+            check(watchCredits.contains("AutoSkipCountdownPolicy.cancel") &&
+                  watchCredits.contains("upNextSuppressed = true"),
+                  "\(name) Watch Credits cancels both the credits skip and auto-next band")
+            let update = section(text, from: "private func updateCurrentSkip(", to: "private func refreshSkipSegments()")
+            check(update.contains("&& promptAvailable") &&
+                  update.contains("skip?.kind != .credits || !upNextSuppressed"),
+                  "\(name) hidden prompts and Watch Credits cannot spend an automatic-skip countdown")
+        }
 
         let playerNowPlaying = section(player, from: "NowPlayingCenter.wireCommands(", to: "updateNowPlaying(at: d, force: true)")
         let tvNowPlaying = section(tv, from: "NowPlayingCenter.wireCommands(", to: "refreshNowPlaying(at: d, force: true)")
@@ -99,6 +136,16 @@ enum AutoSkipCountdownWiringContractTests {
               "tvOS accessibility activation routes X to cancellation")
         check(tvAccessibility.contains("identity == \"skip.primary\""),
               "tvOS accessibility keeps immediate Skip as a separate action")
+        let accessibilityPlay = section(tvAccessibility, from: "case \"up-next.play\":", to: "case \"up-next.credits\":")
+        let accessibilityCredits = section(tvAccessibility, from: "case \"up-next.credits\":", to: "default: break")
+        for (name, text) in [("Play Next", accessibilityPlay), ("Watch Credits", accessibilityCredits)] {
+            check(text.contains("guard controlsHidden, upNextRemaining != nil || isCreditsUpNext else { return }"),
+                  "tvOS stale accessibility \(name) requires a live Up Next band")
+        }
+        let catcher = section(tv, from: "func updateAccessibility(", to: "private func layoutAccessibilityControls()")
+        check(catcher.contains("for element in accessibilityControls where !liveIDs.contains(element.stableID)") &&
+              catcher.contains("element.activateAction = nil") && catcher.contains("element.focusAction = nil"),
+              "withdrawn accessibility elements cannot retain stale activation or focus callbacks")
 
         check(player.contains("UserDefaults.didChangeNotification") &&
               player.contains("refreshAutoSkipSettings()"),

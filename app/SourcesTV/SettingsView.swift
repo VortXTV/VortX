@@ -570,10 +570,10 @@ struct SettingsView: View {
                           (id: String(value), label: AutoSkipSettings.choiceLabels[value] ?? "\(value)s")
                       },
                       selection: Binding(
-                          get: { String(autoSkipDelaySeconds) },
+                          get: { String(Int(autoSkipDelaySeconds)) },
                           set: { value in
                               guard let seconds = Int(value) else { return }
-                              autoSkipDelaySeconds = seconds
+                              autoSkipDelaySeconds = Double(seconds)
                               AutoSkipSettings.setDelaySeconds(Double(seconds))
                           }
                       ))

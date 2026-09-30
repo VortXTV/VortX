@@ -1223,7 +1223,7 @@ struct PlayerScreen: View {
             // so the two end-of-episode prompts never stack.
             // Suppressed while locked: the pill is a tap-to-seek affordance, and the whole point of the
             // lock is that no stray tap can move playback.
-            if let seg = currentSkip,
+            if hasStartedPlaying, let seg = currentSkip,
                !autoSkipCountdown.isSuppressed(for: seg),
                !controlsVisible, !isLocked, panel == nil, !loadFailed, upNextRemaining == nil {
                 skipPill(seg)
@@ -3042,6 +3042,7 @@ struct PlayerScreen: View {
         // Every accepted source/rebind path funnels through this load command. Retire position telemetry from
         // the outgoing decoder while preserving per-media cancel/completion memory in the policy state.
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
+        currentSkip = nil
         // ENGINE-AWARE playback tuple. The AVFoundation engine must receive the RAW stream url + headers:
         // it attaches the headers itself (AVURLAssetHTTPHeaderFieldsKey) and the DV remux server takes them
         // directly, while the StremioServer proxy rewrite (playback(for:)) turns the host into 127.0.0.1,
@@ -5157,6 +5158,7 @@ struct PlayerScreen: View {
         // countdown from the old decoder/position stream. Preserve cancel/completion memory while fencing
         // the pending decision; the new source will re-enter through the normal position callback.
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
+        currentSkip = nil
         if !mediaGenerationAlreadyClaimed {
             let hadEpisodeResolution = episodeResolutionOwner != nil
             invalidateEpisodeResolution()
@@ -5610,7 +5612,8 @@ struct PlayerScreen: View {
     /// episode queued, a real runtime, the play head in the final stretch, and the user hasn't chosen to
     /// sit through the credits. nil hides the band. The EOF handler does the actual advance at 0.
     private var upNextRemaining: Int? {
-        guard canNextEpisode, !upNextSuppressed, !skipEditActive, duration > 60, currentTime > 0 else { return nil }
+        guard hasStartedPlaying, !loadFailed, canNextEpisode, !upNextSuppressed,
+              !skipEditActive, duration > 60, currentTime > 0 else { return nil }
         let remaining = duration - currentTime
         guard remaining > 0, remaining <= 20 else { return nil }
         return Int(remaining.rounded(.up))
@@ -5632,24 +5635,40 @@ struct PlayerScreen: View {
     /// The end-of-episode Up Next card: next-episode title, a countdown to auto-advance, and Play Now /
     /// Watch Credits. Shown bottom-trailing in the final stretch; touch/click, so no focus wiring needed.
     private var upNextBand: some View {
-        HStack(spacing: 14) {
+        let interactionMediaID = autoSkipMediaIdentity
+        let interactionEpoch = autoSkipCountdown.epoch
+        return HStack(spacing: 14) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("UP NEXT").font(.caption2.weight(.bold)).tracking(1).foregroundStyle(.white.opacity(0.7))
                 if let label = nextEpisodeLabel {
                     Text(label).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
                 }
-                if let r = upNextRemaining {
+                if let segment = currentSkip, segment.kind == .credits,
+                   let remaining = autoSkipRemaining(for: segment) {
+                    Text("Skipping credits in \(max(1, Int(remaining.rounded(.up))))s")
+                        .font(.caption).foregroundStyle(.white.opacity(0.7))
+                } else if let r = upNextRemaining {
                     Text("Playing in \(r)s").font(.caption).foregroundStyle(.white.opacity(0.7))
                 }
             }
             Spacer(minLength: 8)
-            Button { upNextSuppressed = true } label: {
+            Button {
+                guard hasStartedPlaying, !loadFailed,
+                      autoSkipMediaIdentity == interactionMediaID,
+                      autoSkipCountdown.epoch == interactionEpoch else { return }
+                watchCredits()
+            } label: {
                 Text("Watch Credits").font(.subheadline.weight(.semibold)).foregroundStyle(.white)
                     .padding(.horizontal, 14).padding(.vertical, 9)
                     .background(.white.opacity(0.18), in: Capsule())
             }
             .buttonStyle(.plain)
-            Button { goToNextEpisode() } label: {
+            Button {
+                guard hasStartedPlaying, !loadFailed,
+                      autoSkipMediaIdentity == interactionMediaID,
+                      autoSkipCountdown.epoch == interactionEpoch else { return }
+                goToNextEpisode()
+            } label: {
                 Label("Play Now", systemImage: "play.fill").font(.subheadline.weight(.semibold))
                     .foregroundStyle(Theme.Palette.onAccent)
                     .padding(.horizontal, 16).padding(.vertical, 9)
@@ -7369,8 +7388,10 @@ struct PlayerScreen: View {
     // MARK: - Skip intro / outro
 
     private var autoSkipMediaIdentity: String {
-        let m = curMeta ?? meta
-        return "media:\(m.libraryId):\(m.videoId)"
+        if let m = curMeta ?? recordMeta {
+            return "media:\(m.libraryId):\(m.videoId)"
+        }
+        return "url:\((curURL ?? url).absoluteString)"
     }
 
     private func refreshAutoSkipSettings() {
@@ -7391,6 +7412,7 @@ struct PlayerScreen: View {
     }
 
     private func skipImmediately(_ segment: SkipSegment) {
+        guard hasStartedPlaying, !loadFailed, !isLocked, currentSkip == segment else { return }
         AutoSkipCountdownPolicy.complete(state: &autoSkipCountdown, segment: segment)
         Haptics.success()
         issueSeek(to: segment.end, reason: "skip")
@@ -7399,17 +7421,36 @@ struct PlayerScreen: View {
     }
 
     private func cancelAutomaticSkip(_ segment: SkipSegment) {
+        guard hasStartedPlaying, !loadFailed, !isLocked, currentSkip == segment else { return }
         AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
         DiagnosticsLog.log("playback", "automatic skip cancelled kind=\(segment.kind.rawValue) start=\(segment.start)")
     }
 
+    /// Up Next replaces the credits pill, so its Watch Credits action must cancel the same countdown.
+    /// Otherwise the old five-second automatic seek would still jump to EOF behind the dismissed band.
+    private func watchCredits() {
+        guard hasStartedPlaying, !loadFailed else { return }
+        if let segment = currentSkip, segment.kind == .credits {
+            AutoSkipCountdownPolicy.cancel(state: &autoSkipCountdown, segment: segment)
+        }
+        upNextSuppressed = true
+    }
+
     private func skipPill(_ segment: SkipSegment) -> some View {
-        VStack {
+        let interactionMediaID = autoSkipMediaIdentity
+        let interactionEpoch = autoSkipCountdown.epoch
+        return VStack {
             Spacer()
             HStack {
                 Spacer()
                 HStack(spacing: 6) {
-                    Button { skipImmediately(segment) } label: {
+                    Button {
+                        guard AutoSkipCountdownPolicy.isCurrent(
+                            state: autoSkipCountdown, mediaID: interactionMediaID,
+                            segment: segment, epoch: interactionEpoch
+                        ) else { return }
+                        skipImmediately(segment)
+                    } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "forward.fill").foregroundStyle(Theme.Palette.accent)
                             if let remaining = autoSkipRemaining(for: segment) {
@@ -7435,11 +7476,17 @@ struct PlayerScreen: View {
                     .accessibilityHint("Skips this segment immediately")
 
                     if autoSkipRemaining(for: segment) != nil {
-                        Button { cancelAutomaticSkip(segment) } label: {
+                        Button {
+                            guard AutoSkipCountdownPolicy.isCurrent(
+                                state: autoSkipCountdown, mediaID: interactionMediaID,
+                                segment: segment, epoch: interactionEpoch
+                            ) else { return }
+                            cancelAutomaticSkip(segment)
+                        } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundStyle(Theme.Palette.textPrimary)
-                                .frame(width: 32, height: 32)
+                                .frame(width: 44, height: 44)
                                 .contentShape(Circle())
                         }
                         .buttonStyle(.plain)
@@ -7455,13 +7502,17 @@ struct PlayerScreen: View {
 
     private func updateCurrentSkip(at time: Double) {
         let skip = hasStartedPlaying ? skipSegments.first { time >= $0.start && time < $0.end } : nil
+        let promptAvailable = !controlsVisible && !isLocked && panel == nil && !skipEditActive
+            && !stillWatchingPrompt && !loadFailed
+            && (skip?.kind == .credits || upNextRemaining == nil)
         let decision = AutoSkipCountdownPolicy.advance(
             state: &autoSkipCountdown,
             mediaID: autoSkipMediaIdentity,
             segment: skip,
             position: time,
             duration: duration,
-            playbackActive: hasStartedPlaying && !isPaused && !buffering,
+            playbackActive: hasStartedPlaying && !isPaused && !buffering && promptAvailable
+                && (skip?.kind != .credits || !upNextSuppressed),
             delaySeconds: autoSkipDelaySeconds
         )
         if case .skip(_, let target, _) = decision, let skip {

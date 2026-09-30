@@ -7,9 +7,9 @@
 
 import Foundation
 
-private var failures = 0
+@MainActor private var failures = 0
 
-private func check(_ condition: Bool, _ name: String) {
+@MainActor private func check(_ condition: Bool, _ name: String) {
     if condition {
         print("PASS  \(name)")
     } else {
@@ -23,6 +23,7 @@ private func intro(start: Double = 5, end: Double = 42) -> SkipSegment {
 }
 
 @main
+@MainActor
 enum AutoSkipCountdownPolicyTests {
     static func main() {
         countdownUsesFiveActivePlaybackSeconds()
@@ -31,6 +32,7 @@ enum AutoSkipCountdownPolicyTests {
         seekOutsideInvalidatesPendingDecision()
         targetEndIsClampedToDuration()
         sourceRebindRetainsMediaMemoryButNewMediaResetsIt()
+        staleButtonOwnershipCannotAffectAnIdenticalSegment()
         settingsMigrationPreservesExplicitOffAndDefaultsNewInstallsOn()
 
         print("")
@@ -40,6 +42,35 @@ enum AutoSkipCountdownPolicyTests {
             print("\(failures) FAILED")
             Foundation.exit(1)
         }
+    }
+
+    private static func staleButtonOwnershipCannotAffectAnIdenticalSegment() {
+        let segment = intro()
+        var state = AutoSkipCountdownState()
+        _ = AutoSkipCountdownPolicy.advance(
+            state: &state, mediaID: "episode-A", segment: segment, position: 5,
+            playbackActive: true, delaySeconds: 5
+        )
+        let oldEpoch = state.epoch
+        _ = AutoSkipCountdownPolicy.advance(
+            state: &state, mediaID: "episode-B", segment: segment, position: 5,
+            playbackActive: true, delaySeconds: 5
+        )
+        check(!AutoSkipCountdownPolicy.isCurrent(
+            state: state, mediaID: "episode-A", segment: segment, epoch: oldEpoch
+        ), "an old button cannot act on an identical segment in a new episode")
+        let beforeRebind = state.epoch
+        AutoSkipCountdownPolicy.invalidatePending(state: &state, position: 5)
+        _ = AutoSkipCountdownPolicy.advance(
+            state: &state, mediaID: "episode-B", segment: segment, position: 5,
+            playbackActive: true, delaySeconds: 5
+        )
+        check(!AutoSkipCountdownPolicy.isCurrent(
+            state: state, mediaID: "episode-B", segment: segment, epoch: beforeRebind
+        ), "a same-media source rebind invalidates a previously rendered button")
+        check(AutoSkipCountdownPolicy.isCurrent(
+            state: state, mediaID: "episode-B", segment: segment, epoch: state.epoch
+        ), "the current rendered button retains its exact media and source epoch")
     }
 
     private static func countdownUsesFiveActivePlaybackSeconds() {
@@ -188,6 +219,13 @@ enum AutoSkipCountdownPolicyTests {
         AutoSkipSettings.setDelaySeconds(10, in: defaults)
         check(AutoSkipSettings.delaySeconds(in: defaults) == 10,
               "the configured delay is persisted independently of the legacy Bool")
+        for (value, expected) in [(Double.greatestFiniteMagnitude, 120.0),
+                                  (-Double.greatestFiniteMagnitude, 0.0),
+                                  (Double.infinity, 5.0), (Double.nan, 5.0)] {
+            AutoSkipSettings.setDelaySeconds(value, in: defaults)
+            check(AutoSkipSettings.delaySeconds(in: defaults) == expected,
+                  "synced delay \(value) is bounded without an integer conversion trap")
+        }
         defaults.removePersistentDomain(forName: suiteName)
     }
 }

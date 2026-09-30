@@ -363,6 +363,7 @@ object SettingsBackup {
         "stremiox.autoAddLibrary" to SettingType.BOOL,
         "stremiox.directLinksOnly" to SettingType.BOOL,
         "stremiox.autoSkip" to SettingType.BOOL,
+        "stremiox.autoSkipDelaySeconds" to SettingType.INT,
         "stremiox.autoplayTrailers" to SettingType.BOOL,
         "stremiox.autoLandscapeInPlayer" to SettingType.BOOL,
         "stremiox.keepPlayingInBackground" to SettingType.BOOL,

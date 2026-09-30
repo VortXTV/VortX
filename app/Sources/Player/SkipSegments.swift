@@ -64,13 +64,8 @@ enum AutoSkipSettings {
 
     private static func sanitized(_ seconds: Double) -> Int {
         guard seconds.isFinite else { return defaultDelaySeconds }
-        return Int(seconds.rounded()).clamped(to: 0...120)
-    }
-}
-
-private extension Int {
-    func clamped(to range: ClosedRange<Int>) -> Int {
-        Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
+        // Clamp before converting: a finite synced/custom value can still exceed Int's range.
+        return Int(Swift.min(Swift.max(seconds.rounded(), 0), 120))
     }
 }
 
@@ -177,20 +172,6 @@ enum AutoSkipCountdownPolicy {
             segment: key,
             remainingSeconds: max(0, safeDelay - state.accruedPlaybackSeconds)
         )
-    }
-
-    /// Alias for callers that prefer the state-machine verb used by the Android implementation.
-    static func step(
-        state: inout AutoSkipCountdownState,
-        mediaID: String,
-        segment: SkipSegment?,
-        position: Double,
-        duration: Double? = nil,
-        playbackActive: Bool,
-        delaySeconds: Double
-    ) -> AutoSkipCountdownDecision {
-        advance(state: &state, mediaID: mediaID, segment: segment, position: position,
-                duration: duration, playbackActive: playbackActive, delaySeconds: delaySeconds)
     }
 
     /// Permanently suppress automatic handling of this segment for the current media identity. A later

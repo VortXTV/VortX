@@ -121,24 +121,6 @@ object AutoSkipCountdownPolicy {
         )
     }
 
-    fun step(
-        state: AutoSkipCountdownState,
-        mediaId: String,
-        segment: SkipSegment?,
-        positionMs: Long,
-        durationMs: Long? = null,
-        playbackActive: Boolean,
-        delaySeconds: Double,
-    ): AutoSkipCountdownDecision = advance(
-        state = state,
-        mediaId = mediaId,
-        segment = segment,
-        positionMs = positionMs,
-        durationMs = durationMs,
-        playbackActive = playbackActive,
-        delaySeconds = delaySeconds,
-    )
-
     fun cancel(state: AutoSkipCountdownState, segment: SkipSegment) {
         state.cancelledSegments += AutoSkipSegmentKey(segment)
         state.accruedPlaybackMs = 0

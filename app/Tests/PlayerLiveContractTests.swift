@@ -3062,10 +3062,10 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "case .chapters:\n            let chs =",
             to: "case .sources:")
-        let playerScreenSkipPill = sourceSection(
+        let playerScreenSkipAction = sourceSection(
             playerScreen,
-            from: "private func skipPill(_ segment: SkipSegment)",
-            to: "private func updateCurrentSkip(at time: Double)")
+            from: "private func skipImmediately(_ segment: SkipSegment)",
+            to: "private func cancelAutomaticSkip(_ segment: SkipSegment)")
         let tvPlayerSkipAction = sourceSection(
             tvPlayer,
             from: "private func skipTo(_ segment: SkipSegment)",
@@ -3839,7 +3839,7 @@ enum PlayerLiveContractTests {
                 "coordinator.player?.seek(to: ch.start)") == true
                   && tvPlayerChapterRows?.contains(
                     "coordinator.player?.seek(to: ch.start)") == true
-                  && playerScreenSkipPill?.contains(
+                  && playerScreenSkipAction?.contains(
                     "issueSeek(to: segment.end, reason: \"skip\")") == true
                   && tvPlayerSkipAction?.contains(
                     "issueSeek(to: segment.end, reason: \"skip\")") == true
