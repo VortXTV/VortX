@@ -113,6 +113,7 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     var subtitleStyle by remember { mutableStateOf(SubtitleStyle.current(appContext)) }
     var trackPrefs by remember { mutableStateOf(trackStore.current) }
     var subtitlesOnlyPreferred by remember { mutableStateOf(trackStore.subtitlesOnlyPreferred) }
+    var preferAddonSubtitles by remember { mutableStateOf(trackStore.prefersAddonSubtitles) }
     var matchAudioSub by remember { mutableStateOf(trackStore.matchAudioSub) }
     var videoUpscaling by remember { mutableStateOf(trackStore.videoUpscaling) }
     var autoplayTrailers by remember { mutableStateOf(trackStore.autoplayTrailers) }
@@ -370,6 +371,12 @@ fun PlaybackSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 RejectTermsEditor(
                     terms = trackPrefs.rejectTerms,
                     onChange = { updateTracks(trackPrefs.copy(rejectTerms = it)) },
+                )
+                ToggleRow(
+                    label = "Prefer add-on subtitles",
+                    detail = "Use a matching add-on track when available; keep the built-in track if loading fails.",
+                    checked = preferAddonSubtitles,
+                    onCheckedChange = { preferAddonSubtitles = it; trackStore.prefersAddonSubtitles = it },
                 )
             }
 

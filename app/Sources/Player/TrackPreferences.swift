@@ -221,6 +221,7 @@ struct TrackPreferences: Equatable {
         static let reject = "stremiox.tracks.reject"
         /// Opt-in: list only add-on / community subtitles whose language is in the preferred subtitle chain.
         static let subOnlyPreferred = "stremiox.tracks.subOnlyPreferred"
+        static let preferAddonSubtitles = "stremiox.tracks.preferAddonSubtitles"
     }
 
     /// Opt-in filter: when ON, the player's subtitle panel lists ONLY the add-on and community subtitles whose
@@ -228,6 +229,10 @@ struct TrackPreferences: Equatable {
     /// Rides the settings-sync blob like the other `stremiox.tracks.*` keys. Read fresh on each panel build.
     static var subtitlesOnlyPreferred: Bool {
         UserDefaults.standard.bool(forKey: Key.subOnlyPreferred)
+    }
+
+    static var prefersAddonSubtitles: Bool {
+        UserDefaults.standard.bool(forKey: Key.preferAddonSubtitles)
     }
 
     /// Curated language choices for the settings UI (id is the stored ISO code).

@@ -10,11 +10,15 @@ enum SourcePresentationPolicyTests {
         precondition(SourcePresentationPolicy.text(name: " \n", description: nil, filename: "Episode.01.mkv") == ["Episode.01.mkv"])
         precondition(SourcePresentationPolicy.text(name: nil, description: nil, filename: nil).isEmpty)
         precondition(SourcePresentationPolicy.text(name: "same", description: "same", filename: nil) == ["same", "same"])
+        precondition(SourcePresentationPolicy.label(name: "  AIOStreams \n4K", description: "ignored") == "AIOStreams")
+        precondition(SourcePresentationPolicy.label(name: "\n", description: "  Episode 9 \nother") == "Episode 9")
+        precondition(SourcePresentationPolicy.label(name: nil, description: nil) == "Source")
+        precondition(SourcePresentationPolicy.label(name: " ", description: " \n") == "Source")
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 390, viewport: 800) == 624)
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 820, viewport: 1100) == 660)
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 800, viewport: 390) == 360)
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 0, viewport: 0) == 420)
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 390, viewport: .nan) == 420)
-        print("Source presentation: 10 checks passed")
+        print("Source presentation: 14 checks passed")
     }
 }

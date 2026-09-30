@@ -46,9 +46,9 @@ import Combine
 /// ENGINE-SLOT HONESTY: `loadMeta` targets the engine's single meta_details slot, the same slot the
 /// open detail page reads. Browsing to a DIFFERENT title while a batch runs can clobber that slot out
 /// from under the episode resolving at that moment: its stream groups then read empty and it is
-/// recorded as a FALSE "no source" skip. There is no wrong-file risk (groups are matched on the
-/// episode's own stream id, so ranking never sees another title's streams); the cost is only the
-/// visible skip, and re-running the batch re-attempts it. Same slot contention a manual resolve has.
+/// recovered with an exact-target reassert and a fresh settlement window. The total episode wait remains
+/// bounded to 60 seconds under repeated navigation. Raw groups require both title and episode ownership;
+/// auxiliary groups are already scoped to the captured job identity.
 ///
 /// Device-local only, like every download: nothing here writes account / libraryItem documents.
 @MainActor
@@ -320,38 +320,46 @@ final class BatchDownloadCoordinator: ObservableObject {
         }
         // Only load when this episode's streams aren't already resident (the user just had its source page
         // open): less churn on the shared meta slot, identical result.
-        let settlementStartedAt = Date()
-        if core.streamGroups(forStreamId: job.video.id).isEmpty { assertEpisodeLoad() }
+        let expected = MetaLoadTarget(metaID: job.seriesId, streamID: job.video.id)
+        var slotPolicy = BatchMetaSlotPolicy(expected: expected, now: ProcessInfo.processInfo.systemUptime,
+                                            settlementWindow: StreamRanking.completeSetDeadline)
+        if core.currentMetaLoadTarget != expected || core.streamGroups(forStreamId: job.video.id).isEmpty {
+            assertEpisodeLoad()
+        }
         var groups: [CoreStreamSourceGroup] = []
-        var lastAssertAt = Date()
         while true {
             if Task.isCancelled { return .cancelled }
+            let selected = core.metaDetails?.selected
+            let ownsPublishedSlot = core.currentMetaLoadTarget == expected
+                && selected?.metaPath.id == expected.metaID && selected?.streamPath?.id == expected.streamID
+            let rawGroups = ownsPublishedSlot ? core.streamGroups(forStreamId: job.video.id) : []
             // The manual `displayGroups` composition: TorBox search merged first, the community pool
             // second, THEN the Direct-links-only filter, so a search/pool torrent obeys the same rule
             // as an add-on's. Re-merged every iteration so contributor results landing mid-settle count.
             groups = iOSDisplayGroups(AuxiliarySourcePipeline.merged(
-                into: core.streamGroups(forStreamId: job.video.id),
+                into: rawGroups,
                 target: SourceIndexIdentity.publicationTarget(
                     job.identityRoles.selecting(currentVideoID: job.video.id),
                     season: job.video.season, episode: job.video.episode
                 ),
                 torBox: torboxSearch, sourceIndex: sourceIndex
             ))
-            let progress = core.streamLoadProgress(forStreamId: job.video.id)
-            // The engine has registered NO loadable for this episode (total == 0) and nothing is resident:
-            // the shared slot never actually switched to this episode (the #142 race). Re-assert the load,
-            // bounded to roughly every 2.5s, so a dropped or stale first-episode selection recovers instead
-            // of timing out to a FALSE "no source". A no-op once the episode's loadables register (total > 0),
-            // and skipped entirely once any groups (engine or contributor) are in hand.
-            if progress.total == 0, groups.isEmpty, Date().timeIntervalSince(lastAssertAt) > 2.5 {
-                lastAssertAt = Date()
+            let progress = ownsPublishedSlot ? core.streamLoadProgress(forStreamId: job.video.id) : (loaded: 0, total: 0)
+            let now = ProcessInfo.processInfo.systemUptime
+            let action = slotPolicy.update(requestedTarget: core.currentMetaLoadTarget,
+                                           registered: progress.total > 0 || !groups.isEmpty, now: now)
+            if action == .deadline { break }
+            if action == .reassert {
                 assertEpisodeLoad()
+                // Do not settle against the displaced payload on the same iteration as the reassert.
+                try? await Task.sleep(for: .milliseconds(250))
+                continue
             }
-            let elapsed = Date().timeIntervalSince(settlementStartedAt)
-            if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
+            let elapsed = now - slotPolicy.settlementStartedAt
+            if ownsPublishedSlot && StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                             secondsSinceRequestStart: elapsed,
                                             rememberedQuality: job.continuity) { break }
-            if elapsed >= StreamRanking.completeSetDeadline { break }
+            if elapsed >= StreamRanking.completeSetDeadline || now - slotPolicy.startedAt >= slotPolicy.maximumDuration { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard let best = StreamRanking.best(groups, continuity: job.continuity, pin: job.pin,

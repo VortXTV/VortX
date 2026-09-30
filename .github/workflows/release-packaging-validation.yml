@@ -59,6 +59,8 @@ jobs:
       # android.yml + android-release.yml, so packaging behavior observed here transfers.
       - name: Set up Android SDK
         uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: "platform-tools platforms;android-36 build-tools;36.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
@@ -67,6 +69,9 @@ jobs:
         run: |
           yes | sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Exercise signer parsing and strict verification fixtures
+        run: bash scripts/test-android-release-signing.sh
 
       # Ephemeral ad-hoc release identity: generated on THIS runner for THIS run only, never
       # committed, never used to publish, shredded below even on failure. A distinct CN (not
@@ -132,10 +137,10 @@ jobs:
           apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n1)"
           [ -x "$apksigner" ] || { echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
           expected_dn="CN=VortX CI Ad-hoc Release, O=VortXTV, C=US"
-          expected_fp="$("$JAVA_HOME/bin/keytool" -list -v \
+          expected_fp="$(LC_ALL=C "$JAVA_HOME/bin/keytool" -list -v \
             -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
             -storetype PKCS12 -storepass vortx-adhoc-ci-store -alias adhoc-release \
-            | sed -n 's/^SHA256:[[:space:]]*//p' | head -n1 | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+            | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -n1 | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
           [ -n "$expected_fp" ] || { echo "::error::could not derive the ad-hoc certificate fingerprint from the ephemeral keystore"; exit 1; }
           apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
           for apk in "${apks[@]}"; do
@@ -160,11 +165,15 @@ jobs:
             echo "ok: $apk carries a valid v2 ad-hoc signature bound to the run-local certificate"
           done
           bundle="$(ls android/app/build/outputs/bundle/playRelease/*.aab)"
-          jarsigner_out="$("$JAVA_HOME/bin/jarsigner" -verify -strict -verbose "$bundle" 2>&1)" \
+          # The signer is intentionally self-signed and run-local: trust ONLY this generated keystore,
+          # while retaining strict entry verification and the independent fingerprint/subject checks.
+          jarsigner_out="$(LC_ALL=C "$JAVA_HOME/bin/jarsigner" -verify -strict -verbose \
+            -keystore "$RUNNER_TEMP/adhoc-signing/adhoc-release.jks" \
+            -storepass vortx-adhoc-ci-store "$bundle" 2>&1)" \
             || { echo "::error::jarsigner strict verification failed for $bundle"; printf '%s\n' "$jarsigner_out"; exit 1; }
           grep -Eq '^jar verified.$' <<<"$jarsigner_out" \
             || { echo "::error::$bundle does not contain a verified JAR signature"; exit 1; }
-          bundle_out="$("$JAVA_HOME/bin/keytool" -printcert -jarfile "$bundle")"
+          bundle_out="$(LC_ALL=C "$JAVA_HOME/bin/keytool" -printcert -jarfile "$bundle")"
           if grep -Eiq 'CN[[:space:]]*=[[:space:]]*Android Debug|Android Debug' <<<"$bundle_out"; then
             echo "::error::$bundle is signed by an Android Debug certificate"; exit 1
           fi

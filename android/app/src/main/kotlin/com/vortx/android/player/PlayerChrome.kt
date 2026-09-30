@@ -828,7 +828,7 @@ fun PlayerChrome(
                     addonSubtitles.forEach { sub ->
                         add(
                             SheetOption(
-                                label = "${sub.lang} · ${sub.addonName}",
+                                label = "${sub.lang} · ${sub.displayTitle}",
                                 selected = false,
                                 isChoice = true,
                                 onPick = { onSelectAddonSubtitle(sub) },

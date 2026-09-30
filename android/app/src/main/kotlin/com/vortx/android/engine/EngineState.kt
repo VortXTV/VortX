@@ -1044,6 +1044,8 @@ internal object EngineState {
             vortxProvider = obj.optStringOrNull("vortxProvider"),
             bingeGroup = behaviorHints?.optStringOrNull("bingeGroup"),
             filename = behaviorHints?.optStringOrNull("filename"),
+            videoHash = behaviorHints?.optStringOrNull("videoHash"),
+            videoSize = behaviorHints?.optStringOrNull("videoSize")?.toLongOrNull(),
             notWebReady = if (behaviorHints != null && behaviorHints.has("notWebReady")) {
                 behaviorHints.optBoolean("notWebReady")
             } else {

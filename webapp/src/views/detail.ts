@@ -16,6 +16,7 @@ import {
   type RankedGroup,
 } from "../lib/streamRanking";
 import { fetchSkipSegments } from "../lib/skip";
+import { paginateSourceRows, sourceRows } from "../lib/sourcePaging";
 import { defaultSeason, episodesForSeason, isSeries, seasonsOf, sortedVideos } from "../lib/series";
 import { actionOf, escapeHtml, httpUrl } from "../lib/dom";
 import { icon } from "../lib/icons";
@@ -42,6 +43,7 @@ interface DetailState {
   streamsLoading: boolean;
   showAllSources: boolean;
   sourceFilter: string | null; // addon transport base, or null for "All"
+  sourcePage: number;
   pickerOpen: boolean;
   pickerTier: string | null;
   selectedSeason: number | null;
@@ -75,6 +77,7 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
     streamsLoading: false,
     showAllSources: false,
     sourceFilter: null,
+    sourcePage: 0,
     pickerOpen: false,
     pickerTier: null,
     selectedSeason: null,
@@ -85,8 +88,9 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
   };
   host.innerHTML = `<div class="detail"><div class="detail-loading">Loading…</div></div>`;
 
+  const openedState = state;
   const meta = await fetchMeta(addons, type, id);
-  if (!state) return; // navigated away while loading
+  if (state !== openedState) return; // a later title owns this surface now
   state.meta = meta;
   if (!meta) {
     host.innerHTML = `<div class="detail"><div class="detail-loading">Could not load this title.</div></div>`;
@@ -108,6 +112,7 @@ export async function openDetail(host: HTMLElement, installed: Addon[], type: st
  *  backend url stays null and the button falls back to the YouTube iframe embed (or hides if neither works).
  *  Fail-soft, aborted on navigation, repaints on arrival. */
 async function loadTrailer(meta: MetaItem): Promise<void> {
+  const owner = state;
   trailerAbort?.abort();
   trailerAbort = new AbortController();
   const lang = userTrailerLang(getSettings().audioLang);
@@ -115,7 +120,7 @@ async function loadTrailer(meta: MetaItem): Promise<void> {
   // Staleness is title identity only: the trailer is tied to the title, not to a stream fetch, so it must
   // NOT be gated on streamReqToken (a same-title stream refetch - e.g. opening an episode - bumps that and
   // would wrongly drop a valid trailer). Navigating away is covered by the meta.id check plus trailerAbort.
-  if (!state || state.meta?.id !== meta.id) return; // navigated away
+  if (!state || state !== owner || state.meta?.id !== meta.id) return;
   if (!url) return; // no backend trailer - keep whatever the iframe fallback offers
   state.trailerUrl = url;
   render();
@@ -123,9 +128,9 @@ async function loadTrailer(meta: MetaItem): Promise<void> {
 
 /** Fetch keyless "More Like This" titles (Cinemeta genre catalog). Fail-soft; repaints on arrival. */
 async function loadSimilar(meta: MetaItem): Promise<void> {
-  const token = streamReqToken; // tie to the current title; a new openDetail bumps this
+  const owner = state;
   const similar = await fetchSimilar(meta);
-  if (!state || state.meta?.id !== meta.id || token !== streamReqToken) return; // navigated away
+  if (!state || state !== owner || state.meta?.id !== meta.id) return;
   if (!similar.length) return;
   state.similar = similar;
   render();
@@ -136,9 +141,9 @@ async function loadRatings(meta: MetaItem): Promise<void> {
   const key = getSettings().mdblistKey;
   const imdb = imdbId(meta);
   if (!key || !imdb) return;
-  const token = streamReqToken; // tie to the current title; a new openDetail bumps this
+  const owner = state;
   const r = await fetchRatings(imdb, meta.type, key);
-  if (!state || state.meta?.id !== meta.id || token !== streamReqToken) return; // navigated away
+  if (!state || state !== owner || state.meta?.id !== meta.id) return;
   state.ratings = r;
   render();
 }
@@ -159,18 +164,28 @@ function rankedFiltered(): RankedGroup[] {
   return rankedGroups(filteredGroups(), getSettings().useAddonOrder);
 }
 
-/** Fetch streams for a movie or episode id, repainting when each add-on group resolves. */
-async function loadStreams(type: string, id: string): Promise<void> {
-  if (!state) return;
+/** Fetch streams for a movie or episode id; only the newest request may repaint the surface. */
+async function loadStreams(type: string, id: string): Promise<boolean> {
+  if (!state) return false;
+  const owner = state;
   const token = ++streamReqToken;
   state.streamsLoading = true;
+  state.sourcePage = 0;
   state.groups = [];
   render();
   const groups = await fetchStreams(addons, type, id);
-  if (!state || token !== streamReqToken) return; // navigated away, or a newer fetch superseded this one
+  if (state !== owner || token !== streamReqToken) return false;
   state.groups = groups;
   state.streamsLoading = false;
   render();
+  return true;
+}
+
+async function refreshStreams(): Promise<boolean> {
+  if (!state || state.streamsLoading) return true;
+  const targetId = state.openEpisode?.id ?? state.id;
+  await loadStreams(state.type, targetId);
+  return true;
 }
 
 /** Tear down the Detail surface (called by the router when leaving the route). */
@@ -195,6 +210,16 @@ export async function handleDetailClick(target: EventTarget | null): Promise<boo
       return playVariant(hit.node);
     case "play-stream":
       return playStreamRow(hit.node);
+    case "refresh-sources":
+      return refreshStreams();
+    case "source-page": {
+      const page = Number(hit.node.dataset.page);
+      if (Number.isInteger(page) && page >= 0) {
+        state.sourcePage = page;
+        render();
+      }
+      return true;
+    }
     case "play-trailer":
       return playTrailer();
     case "close-trailer":
@@ -219,6 +244,7 @@ export async function handleDetailClick(target: EventTarget | null): Promise<boo
       return true;
     case "filter":
       state.sourceFilter = hit.node.dataset.base || null;
+      state.sourcePage = 0;
       render();
       return true;
     case "select-season":
@@ -392,6 +418,7 @@ function heroActions(groups: RankedGroup[], extraActions: string): string {
   if (!top && !state.streamsLoading) {
     return `<div class="hero-actions">
       <button class="btn-primary is-disabled" disabled>${icon("play")}<span>No playable sources</span></button>
+      <button class="chip" data-action="refresh-sources">Refresh sources</button>
       ${extraActions}</div>`;
   }
   if (!top) {
@@ -411,6 +438,7 @@ function heroActions(groups: RankedGroup[], extraActions: string): string {
     <button class="chip${state.showAllSources ? " selected" : ""}" data-action="toggle-sources">${icon("sources")}<span>${
       state.showAllSources ? "Hide sources" : `Sources · ${streamCount}`
     }</span></button>
+    <button class="chip" data-action="refresh-sources" ${state.streamsLoading ? "disabled" : ""}>Refresh sources</button>
     ${extraActions}</div>`;
 }
 
@@ -479,8 +507,15 @@ function sourceList(groups: RankedGroup[], total: number): string {
         </div>`
       : "";
   const visible = groups.filter((g) => state!.sourceFilter === null || g.base === state!.sourceFilter);
-  const rows = visible.map((group) => group.streams.map((s, i) => streamRow(group, s, i)).join("")).join("");
-  return `${filterBar}<div class="streams">${rows}</div>`;
+  const page = paginateSourceRows(sourceRows(visible), state.sourcePage);
+  const rows = page.rows.map(({ group, stream, index }) => streamRow(group, stream, index)).join("");
+  const pageNav = page.pageCount > 1
+    ? `<nav class="source-filter source-pagination" aria-label="Source pages">
+        <button class="chip" data-action="source-page" data-page="${page.page - 1}" ${page.page === 0 ? "disabled" : ""}>Previous</button>
+        <span class="muted small" role="status">Sources ${page.first}–${page.last} of ${page.total}</span>
+        <button class="chip" data-action="source-page" data-page="${page.page + 1}" ${page.page === page.pageCount - 1 ? "disabled" : ""}>Next</button>
+      </nav>` : "";
+  return `${filterBar}<div class="streams">${rows}</div>${pageNav}`;
 }
 
 /** Classify a quality tag for chip coloring (resolution / source / HDR / audio / cached). */
@@ -829,7 +864,7 @@ async function playEpisodeById(videoId: string): Promise<void> {
   state.pickerOpen = false;
   state.pickerTier = null;
   render();
-  await loadStreams(state.type, episode.id);
+  if (!await loadStreams(state.type, episode.id)) return;
   const top = pickPreferred(rankedFiltered(), getSettings().preferredQuality);
   if (top) await playStream(top);
 }
@@ -908,8 +943,11 @@ async function openEpisode(node: HTMLElement): Promise<boolean> {
 
 async function closeEpisode(): Promise<boolean> {
   if (!state) return true;
+  streamReqToken++; // do not publish the closed episode's in-flight sources onto the series page
   state.openEpisode = null;
   state.groups = [];
+  state.streamsLoading = false;
+  state.sourcePage = 0;
   state.showAllSources = false;
   state.sourceFilter = null;
   state.pickerOpen = false;

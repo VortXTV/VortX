@@ -241,6 +241,19 @@ enum TrackSelectorAvailabilityTests {
             subtitleLanguages: ["en"],
             forcedPolicy: .forced,
             rejectTerms: [])
+        check("external preference: embedded match stays preferred by default",
+              !TrackSelector.wantsExternalSubtitle(audio: audio, subtitles: [text], preferences: preferences))
+        check("external preference: opt-in can replace an embedded language match",
+              TrackSelector.wantsExternalSubtitle(audio: audio, subtitles: [text], preferences: preferences,
+                                                   preferAddonSubtitles: true))
+        check("external preference: forced-only still prohibits a full add-on track",
+              !TrackSelector.wantsExternalSubtitle(audio: audio, subtitles: [text], preferences: forcedPreferences,
+                                                    preferAddonSubtitles: true))
+        let candidates = ["en", "tr-TR", "tur"]
+        check("external candidate: preferred-language priority wins over list order",
+              TrackSelector.preferredSubtitle(in: candidates, languages: ["tr", "en"], language: { $0 }) == "tr-TR")
+        check("external candidate: no match stays nil",
+              TrackSelector.preferredSubtitle(in: candidates, languages: ["ja"], language: { $0 }) == nil)
         let forcedBitmap = track(
             22,
             type: "sub",
@@ -276,7 +289,7 @@ enum TrackSelectorAvailabilityTests {
             functionBodyBeginsWithGuardReturn(
                 avSetter,
                 condition: "TrackSelector.shouldApplyAudioSelection(id, to: audioTracks)")
-                && avSetter?.contains("capturePlaybackIntent(from:") == true)
+                && avSetter?.contains("beginPlaybackRemountIntent(from:") == true)
         check(
             "audio wiring: MPV suppresses a selected-row no-op before seek-cache hold",
             functionBodyBeginsWithGuardReturn(

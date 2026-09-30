@@ -2,6 +2,7 @@ import type Hls from "hls.js";
 import { icon } from "./icons";
 import { escapeHtml } from "./dom";
 import { getSettings, updateSettings } from "./settings";
+import { skipLabel } from "./skip";
 
 // A full custom control chrome for the web player's <video>, replacing the bare native controls. Built in
 // the app's vanilla-DOM idiom (no player library, so ~0 extra bundle and it matches the design tokens):
@@ -45,10 +46,9 @@ const SUB_SIZES: Array<{ label: string; scale: number }> = [
 ];
 const HIDE_AFTER_MS = 3000;
 
-/** An intro / outro segment (seconds). While playback sits inside one, the chrome shows a Skip button that
- *  jumps to `end`. `kind` only drives the button label ("Skip Intro" vs "Skip Outro"). */
+/** A known segment in seconds. Its kind controls the skip button label, not playback completion. */
 export interface SkipSegment {
-  kind: "intro" | "outro";
+  kind: "intro" | "recap" | "credits" | "preview";
   start: number;
   end: number;
 }
@@ -313,7 +313,7 @@ export function mountControls(host: HTMLElement, video: HTMLVideoElement, ctx: P
     if (seg === activeSeg) return;
     activeSeg = seg;
     if (seg) {
-      skipBtn.textContent = seg.kind === "outro" ? "Skip Outro" : "Skip Intro";
+      skipBtn.textContent = skipLabel(seg.kind);
       skipBtn.hidden = false;
     } else {
       skipBtn.hidden = true;

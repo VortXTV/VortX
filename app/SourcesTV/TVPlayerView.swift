@@ -3327,7 +3327,7 @@ struct TVPlayerView: View {
                 rows.append(OptionRow(label: String(localized: "From add-ons"), isHeader: true))
                 for sub in languageAddon.prefix(60) {
                     let loading = subtitleLoadingURL == sub.url
-                    rows.append(OptionRow(label: sub.addonName,
+                    rows.append(OptionRow(label: sub.displayTitle,
                                           detail: loading ? String(localized: "Loading…") : String(localized: "Add-on")) {
                         // Non-blocking: download + sub-add happen off the main thread with a timeout, so a
                         // slow / hanging subtitle endpoint can't freeze the player. The row shows Loading…
@@ -3344,7 +3344,7 @@ struct TVPlayerView: View {
                         refreshTracksSoon()
                         let subtitleLoadToken = player.activeLoadToken
                         let subtitleVideoID = curMeta?.videoId
-                        player.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                        player.addExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang) { ok in
                             guard permitsSubtitlePublication(
                                 loadToken: subtitleLoadToken, videoID: subtitleVideoID
                             ) else { return }
@@ -4009,13 +4009,7 @@ struct TVPlayerView: View {
 
     /// A concise one-line label for a source: the first line of its name, else its description.
     private func sourceLabel(_ s: CoreStream) -> String {
-        func firstLine(_ t: String?) -> String {
-            (t ?? "").split(whereSeparator: \.isNewline).first.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
-        }
-        let name = firstLine(s.name)
-        if !name.isEmpty { return name }
-        let desc = firstLine(s.description)
-        return desc.isEmpty ? "Source" : desc
+        SourcePresentationPolicy.label(name: s.name, description: s.description)
     }
 
     /// Hand a stream to mpv, routing header-gated HTTP streams through the embedded server's
@@ -5131,7 +5125,7 @@ struct TVPlayerView: View {
         }) else { return .off }
         let selLang = sel.lang.lowercased()
         if let ext = addonSubs.first(where: { addedSubURLs.contains($0.url) && $0.lang.lowercased() == selLang }) {
-            return .external(url: ext.url, title: ext.addonName, lang: ext.lang)
+            return .external(url: ext.url, title: ext.displayTitle, lang: ext.lang)
         }
         if let p = pooledSubs.first(where: { addedPooledIDs.contains($0.id) && $0.lang.lowercased() == selLang }) {
             return .pooled(id: p.id)
@@ -7504,19 +7498,18 @@ struct TVPlayerView: View {
         }
         // Rewrite the tmdb: prefix of the query id to the resolved tt id when we have one; all other ids pass
         // through unchanged. "tmdb:456:1:2" -> "tt789:1:2".
-        let effectiveVideoId: String = {
-            guard m.libraryId.lowercased().hasPrefix("tmdb:"),
-                  let tt = CommunityTrickplay.cachedIMDbID(for: m.libraryId),
-                  m.videoId.hasPrefix(m.libraryId) else { return m.videoId }
-            return tt + m.videoId.dropFirst(m.libraryId.count)
-        }()
-        let key = "\(m.type):\(effectiveVideoId)"
+        let effectiveVideoId = SubtitleRequestMetadata.effectiveVideoID(
+            libraryID: m.libraryId, videoID: m.videoId,
+            cachedIMDbID: CommunityTrickplay.cachedIMDbID(for: m.libraryId))
+        let metadata = currentStream?.behaviorHints?.subtitleMetadata ?? .init()
+        let key = metadata.resourcePath(type: m.type, videoID: effectiveVideoId)
         guard key != addonSubsKey else { return }
         addonSubsKey = key
         addonSubs = []
         addedSubURLs = []
         Task { @MainActor in
-            let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: effectiveVideoId)
+            let subs = await SubtitleAddonService.fetch(sources: sources, type: m.type, videoId: effectiveVideoId,
+                                                       metadata: metadata)
             guard addonSubsKey == key else { return }   // episode changed / re-keyed mid-fetch
             addonSubs = subs
             if showOptions, panelShowsSubtitleList { refreshPanelRowsPreservingAccessibilityFocus() }
@@ -7542,16 +7535,14 @@ struct TVPlayerView: View {
         // add-on fetch off, missing the exact case the feature exists for. wantsExternalSubtitle already keeps
         // a real chain match (returns false) and respects the off / forced-only policies.
         let prefs = TrackPreferences.current
-        guard TrackSelector.wantsExternalSubtitle(audio: audioTracks, subtitles: subtitleTracks, preferences: prefs) else {
+        guard TrackSelector.wantsExternalSubtitle(audio: audioTracks, subtitles: subtitleTracks, preferences: prefs,
+                                                  preferAddonSubtitles: TrackPreferences.prefersAddonSubtitles) else {
             autoAddonSubTried = true
             return
         }
         // Tier 1 - installed subtitle add-ons. Walk the preference chain in priority order (same tolerant
         // language match the embedded selector uses, so "tur"/"tr-TR" still hit a "tr" preference).
-        var pick: AddonSubtitle?
-        for lang in prefs.subtitleLanguages {
-            if let s = addonSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pick = s; break }
-        }
+        let pick = TrackSelector.preferredSubtitle(in: addonSubs, languages: prefs.subtitleLanguages, language: \.lang)
         if let sub = pick {
             // Bind the engine BEFORE latching anything: in the engine demote/switch render gap
             // `coordinator.player` is nil, and an optional-chained call would swallow the completion,
@@ -7562,7 +7553,7 @@ struct TVPlayerView: View {
             subtitleLoadingURL = sub.url
             let subtitleLoadToken = player.activeLoadToken
             let subtitleVideoID = curMeta?.videoId
-            player.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+            player.addExternalSubtitle(url: sub.url, title: sub.displayTitle, lang: sub.lang) { ok in
                 guard permitsSubtitlePublication(loadToken: subtitleLoadToken, videoID: subtitleVideoID) else { return }
                 subtitleLoadingURL = nil
                 // Same still-live-engine gate as the manual row: never record an add the live engine never saw.
@@ -7576,10 +7567,7 @@ struct TVPlayerView: View {
             return
         }
         // Tier 2 - community-pooled subtitles, when no add-on had the chain language. Same tolerant match.
-        var pooledPick: SubtitlePoolClient.PooledSubtitle?
-        for lang in prefs.subtitleLanguages {
-            if let s = pooledSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pooledPick = s; break }
-        }
+        let pooledPick = TrackSelector.preferredSubtitle(in: pooledSubs, languages: prefs.subtitleLanguages, language: \.lang)
         if let sub = pooledPick {
             autoAddonSubTried = true
             VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community auto)")

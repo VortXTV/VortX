@@ -15,8 +15,8 @@ name: Release apps (iOS + tvOS + macOS)
 # app/scripts/*, the xcodegen'd build phases), so building PR heads here would hand any same-repo
 # PR author's code a credential / private-source exfiltration lane. Fork PRs never received
 # secrets anyway, so their builds could only fail early; nothing of value is lost. The dev flow is
-# push-to-branch; PR validation of app-only changes belongs to a future SECRETLESS workflow (no
-# engine fetch, no secrets in the job), out of scope here. Do not re-add `pull_request` -- and
+# push-to-branch; PR contracts run in separate SECRETLESS validation lanes (no engine fetch or secrets),
+# not in this release build. Do not re-add `pull_request` -- and
 # never `pull_request_target` -- to THIS workflow.
 
 on:

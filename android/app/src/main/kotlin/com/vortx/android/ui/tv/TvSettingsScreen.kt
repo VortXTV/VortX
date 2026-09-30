@@ -174,6 +174,7 @@ fun TvSettingsScreen(
     var autoAdd by remember { mutableStateOf(AutoAddLibrarySetting.isEnabled(appContext)) }
     var subtitleStyle by remember { mutableStateOf(SubtitleStyle.current(appContext)) }
     var subtitlesOnlyPreferred by remember { mutableStateOf(trackStore.subtitlesOnlyPreferred) }
+    var preferAddonSubtitles by remember { mutableStateOf(trackStore.prefersAddonSubtitles) }
     var videoUpscaling by remember { mutableStateOf(trackStore.videoUpscaling) }
     var autoSkip by remember { mutableStateOf(PlaybackBehaviorSettings.autoSkip(appContext)) }
     var directLinksOnly by remember {
@@ -758,6 +759,15 @@ fun TvSettingsScreen(
 
             if (show("subtitle", "subtitles", "external subtitles", "preferred")) item {
                 TvSettingsSection("External subtitles") {
+                    TvToggleRow(
+                        label = "Prefer add-on subtitles",
+                        detail = "Use a matching add-on track when available; keep the built-in track if loading fails.",
+                        checked = preferAddonSubtitles,
+                        onToggle = {
+                            preferAddonSubtitles = !preferAddonSubtitles
+                            trackStore.prefersAddonSubtitles = preferAddonSubtitles
+                        },
+                    )
                     TvToggleRow(
                         label = "Only preferred external subtitles",
                         detail = "Keep embedded tracks, but limit add-on subtitles to your preferred languages.",

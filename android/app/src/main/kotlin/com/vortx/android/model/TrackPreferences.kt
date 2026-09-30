@@ -181,6 +181,10 @@ class TrackPreferencesStore(
             prefs.edit().putBoolean(KEY_SUB_ONLY_PREFERRED, value).apply()
         }
 
+    var prefersAddonSubtitles: Boolean
+        get() = prefs.getBoolean(KEY_PREFER_ADDON_SUBTITLES, false)
+        set(value) { prefs.edit().putBoolean(KEY_PREFER_ADDON_SUBTITLES, value).apply() }
+
     /**
      * When ON, the auto-picked AUDIO track follows the preferred SUBTITLE language chain, so a viewer who
      * sets a subtitle language also gets audio in that language without maintaining two lists. Mirrors Apple
@@ -252,6 +256,7 @@ class TrackPreferencesStore(
         const val KEY_FORCED = "stremiox.tracks.forced"
         const val KEY_REJECT = "stremiox.tracks.reject"
         const val KEY_SUB_ONLY_PREFERRED = "stremiox.tracks.subOnlyPreferred"
+        const val KEY_PREFER_ADDON_SUBTITLES = "stremiox.tracks.preferAddonSubtitles"
         const val KEY_MATCH_AUDIO_SUB = "stremiox.matchAudioSub"
         const val KEY_AUTOPLAY_TRAILERS = "stremiox.autoplayTrailers"
         const val KEY_UPSCALING = "stremiox.videoUpscaling"

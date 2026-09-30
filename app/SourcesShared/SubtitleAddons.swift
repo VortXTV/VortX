@@ -1,11 +1,23 @@
 import Foundation
 
+extension CoreStreamBehaviorHints {
+    var subtitleMetadata: SubtitleRequestMetadata {
+        SubtitleRequestMetadata(filename: filename, videoHash: videoHash, videoSize: videoSize)
+    }
+}
+
 /// One external subtitle offered by a subtitles add-on (e.g. an OpenSubtitles add-on).
 struct AddonSubtitle: Identifiable, Equatable {
     let id: String
     let url: String
     let lang: String
     let addonName: String
+    var releaseName: String? = nil
+
+    var displayTitle: String {
+        guard let releaseName, !releaseName.isEmpty else { return addonName }
+        return "\(addonName) · \(releaseName)"
+    }
 }
 
 /// A minimal installed subtitle add-on: the base URL to query and a display name. Decouples the fetch from
@@ -24,8 +36,18 @@ enum SubtitleAddonService {
     private struct SubtitlesResponse: Decodable { let subtitles: [Sub]? }
     private struct Sub: Decodable {
         let id: String?
-        let url: String
+        let url: String?
         let lang: String?
+        let subtitleFileName: String?
+
+        enum CodingKeys: String, CodingKey { case id, url, lang, subtitleFileName }
+        init(from decoder: Decoder) throws {
+            let fields = try? decoder.container(keyedBy: CodingKeys.self)
+            id = try? fields?.decode(String.self, forKey: .id)
+            url = try? fields?.decode(String.self, forKey: .url)
+            lang = try? fields?.decode(String.self, forKey: .lang)
+            subtitleFileName = try? fields?.decode(String.self, forKey: .subtitleFileName)
+        }
     }
 
     /// The installed subtitle add-ons to query: the ENGINE store first (`core.addons`, authoritative since
@@ -51,28 +73,42 @@ enum SubtitleAddonService {
 
     /// All subtitles for `type/videoId` across the given subtitle add-ons, in source order,
     /// deduplicated by URL. videoId is a movie id or `id:season:episode`.
-    static func fetch(sources: [SubtitleAddonSource], type: String, videoId: String) async -> [AddonSubtitle] {
+    static func fetch(sources: [SubtitleAddonSource], type: String, videoId: String,
+                      metadata: SubtitleRequestMetadata = .init(),
+                      session: URLSession = .shared) async -> [AddonSubtitle] {
         guard !sources.isEmpty else { return [] }
-        let safeId = videoId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? videoId
+        let path = metadata.resourcePath(type: type, videoID: videoId)
+        let legacyPath = SubtitleRequestMetadata().resourcePath(type: type, videoID: videoId)
+        let paths = path == legacyPath ? [path] : [path, legacyPath]
 
         let collected: [[AddonSubtitle]] = await withTaskGroup(of: (Int, [AddonSubtitle]).self) { group in
             for (i, source) in sources.enumerated() {
                 group.addTask {
-                    guard let url = URL(string: "\(source.baseUrl)/subtitles/\(type)/\(safeId).json") else {
-                        return (i, [])
+                    for (attempt, resourcePath) in paths.enumerated() {
+                        guard !Task.isCancelled,
+                              let url = URL(string: "\(source.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/\(resourcePath)") else {
+                            return (i, [])
+                        }
+                        var req = URLRequest(url: url)
+                        req.timeoutInterval = 15
+                        guard let (data, resp) = try? await session.data(for: req),
+                              let http = resp as? HTTPURLResponse else { return (i, []) }
+                        // Older routers may only implement the ID-only route. Retry it once for a route
+                        // rejection, never for an empty successful result, auth failure or provider outage.
+                        if attempt == 0, paths.count > 1, [404, 405].contains(http.statusCode) { continue }
+                        guard (200..<300).contains(http.statusCode),
+                              let decoded = try? JSONDecoder().decode(SubtitlesResponse.self, from: data) else {
+                            return (i, [])
+                        }
+                        let subs = (decoded.subtitles ?? []).compactMap { sub -> AddonSubtitle? in
+                            guard let url = sub.url, !url.isEmpty else { return nil }
+                            return AddonSubtitle(id: sub.id ?? url, url: url,
+                                                 lang: sub.lang ?? "und", addonName: source.name,
+                                                 releaseName: sub.subtitleFileName)
+                        }
+                        return (i, subs)
                     }
-                    var req = URLRequest(url: url)
-                    req.timeoutInterval = 15
-                    guard let (data, resp) = try? await URLSession.shared.data(for: req),
-                          let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                          let decoded = try? JSONDecoder().decode(SubtitlesResponse.self, from: data) else {
-                        return (i, [])
-                    }
-                    let subs = (decoded.subtitles ?? []).map {
-                        AddonSubtitle(id: $0.id ?? $0.url, url: $0.url,
-                                      lang: $0.lang ?? "und", addonName: source.name)
-                    }
-                    return (i, subs)
+                    return (i, [])
                 }
             }
             var buckets = [[AddonSubtitle]](repeating: [], count: sources.count)

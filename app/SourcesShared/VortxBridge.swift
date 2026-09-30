@@ -255,6 +255,8 @@ enum VortxShadowRanking {
         if let b = s.behaviorHints {
             if let v = b.bingeGroup { hints["bingeGroup"] = v }
             if let v = b.filename { hints["filename"] = v }
+            if let v = b.videoHash { hints["videoHash"] = v }
+            if let v = b.videoSize { hints["videoSize"] = v }
             if let v = b.notWebReady { hints["notWebReady"] = v }
         }
         if !hints.isEmpty { d["behaviorHints"] = hints }

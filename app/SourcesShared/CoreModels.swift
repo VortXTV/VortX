@@ -1522,6 +1522,35 @@ struct CoreStreamBehaviorHints: Decodable, Equatable, Sendable {
     let bingeGroup: String?
     let filename: String?
     let proxyHeaders: CoreProxyHeaders?
+    let videoHash: String?
+    let videoSize: Int64?
+
+    enum CodingKeys: String, CodingKey {
+        case notWebReady, bingeGroup, filename, proxyHeaders, videoHash, videoSize
+    }
+
+    init(notWebReady: Bool? = nil, bingeGroup: String? = nil, filename: String? = nil,
+         proxyHeaders: CoreProxyHeaders? = nil, videoHash: String? = nil, videoSize: Int64? = nil) {
+        self.notWebReady = notWebReady
+        self.bingeGroup = bingeGroup
+        self.filename = filename
+        self.proxyHeaders = proxyHeaders
+        self.videoHash = videoHash
+        self.videoSize = videoSize
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        notWebReady = try values.decodeIfPresent(Bool.self, forKey: .notWebReady)
+        bingeGroup = try values.decodeIfPresent(String.self, forKey: .bingeGroup)
+        filename = try values.decodeIfPresent(String.self, forKey: .filename)
+        proxyHeaders = try values.decodeIfPresent(CoreProxyHeaders.self, forKey: .proxyHeaders)
+        videoHash = try? values.decode(String.self, forKey: .videoHash)
+        // Some add-ons serialize byte counts as strings. A bad optional hint must not hide the stream.
+        videoSize = (try? values.decode(Int64.self, forKey: .videoSize))
+            ?? (try? values.decode(String.self, forKey: .videoSize)).flatMap(Int64.init)
+    }
+
 }
 
 /// `behaviorHints.proxyHeaders`: per-stream HTTP headers, `request` applied on the way out.

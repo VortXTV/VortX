@@ -88,6 +88,21 @@ class ExoPlayerEngineStatePolicyTest {
     }
 
     @Test
+    fun `subtitle remount preserves paused and early playback intent`() {
+        val paused = ExoPlayerEngine.ExoSubtitleRemountIntent(2_000L, false)
+        assertEquals(2_000L, paused.positionMs)
+        assertFalse(paused.playWhenReady)
+        val playing = ExoPlayerEngine.ExoSubtitleRemountIntent(0L, true)
+        assertEquals(0L, playing.positionMs)
+        assertTrue(playing.playWhenReady)
+        val source = readSource("ExoPlayerEngine.kt")
+        assertTrue(source.contains("ExoSubtitleRemountIntent(player.currentPosition.coerceAtLeast(0L), player.playWhenReady)"))
+        assertTrue(source.contains("load(updated, playWhenReady = intent.playWhenReady, remountPositionMs = intent.positionMs)"))
+        assertEquals(2, source.split("player.playWhenReady = playWhenReady").size - 1)
+        assertFalse(source.contains("player.playWhenReady = true"))
+    }
+
+    @Test
     fun `trusted ordinary Media3 streams use a redirect-capable default factory`() {
         val source = readSource("ExoPlayerEngine.kt")
         val loadStart = source.indexOf("override fun load(playable: Playable)")

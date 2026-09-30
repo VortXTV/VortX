@@ -19,6 +19,12 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var continueWatching: [CoreCWItem] = []
     @Published private(set) var boardRows: [CoreBoardRow] = []
     @Published private(set) var metaDetails: CoreMetaDetails?
+    private let metaLoadTargetLock = NSLock()
+    private var requestedMetaLoadTarget: MetaLoadTarget?
+    /// Synchronous request identity; do not mistake the coalesced previous payload for current ownership.
+    var currentMetaLoadTarget: MetaLoadTarget? {
+        metaLoadTargetLock.withLock { requestedMetaLoadTarget }
+    }
     /// Request-owned terminal refresh receipt. Unlike a global meta event count, this can only be populated
     /// by the exact two-phase Apple CW refresh that invalidated the resident meta and then settled its own
     /// Load generation. This is a request-completion receipt, not a full-series completeness proof.
@@ -3595,6 +3601,17 @@ final class CoreBridge: ObservableObject {
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8) else { return false }
         beforeDispatch?()
+        // Track every metadata dispatch, including re-find and CW refresh, at the shared boundary.
+        // This is request ownership only: consumers still fence the published selection separately.
+        if field == "meta_details", topLevelAction == "Load",
+           let args = action["args"] as? [String: Any], args["model"] as? String == "MetaDetails",
+           let model = args["args"] as? [String: Any], let meta = model["metaPath"] as? [String: Any],
+           let id = meta["id"] as? String {
+            let streamID = (model["streamPath"] as? [String: Any])?["id"] as? String
+            metaLoadTargetLock.withLock { requestedMetaLoadTarget = MetaLoadTarget(metaID: id, streamID: streamID) }
+        } else if topLevelAction == "Unload", field == "meta_details" || field == nil {
+            metaLoadTargetLock.withLock { requestedMetaLoadTarget = nil }
+        }
         // [engine] narrate every dispatched action (its name + the field it targets) so the log shows
         // what we asked the engine to do. Gated + autoclosure: shipping builds build no string.
         VXProbe.log("engine", "dispatch \(Self.actionName(action))\(field.map { " -> \($0)" } ?? "")")

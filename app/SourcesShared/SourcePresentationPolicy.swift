@@ -2,6 +2,17 @@ import Foundation
 
 /// Preserve add-on-authored line breaks, emoji and labels. Parsed labels are an explicit compact mode.
 enum SourcePresentationPolicy {
+    static func label(name: String?, description: String?) -> String {
+        func firstLine(_ value: String?) -> String {
+            (value ?? "").split(whereSeparator: \.isNewline).first
+                .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+        }
+        let title = firstLine(name)
+        if !title.isEmpty { return title }
+        let detail = firstLine(description)
+        return detail.isEmpty ? "Source" : detail
+    }
+
     static func text(name: String?, description: String?, filename: String?) -> [String] {
         let authored = [name, description].compactMap { value -> String? in
             guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }

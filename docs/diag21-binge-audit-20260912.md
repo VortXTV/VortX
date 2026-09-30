@@ -32,6 +32,6 @@ The newly reported background problem remains open. Outline/shaded/box share the
 - Real synthetic NNTP wire/router tests passed raw, 7z and RAR streaming, byte ranges, seek, cancellation, idle reopen, and two-provider failover. Those fixtures do not prove live-provider sustained throughput.
 - Changed Swift surfaces parse successfully; no full app archive or physical Apple TV run was performed in this session.
 - Independent native Terra review of the revised source and regression test found no commit blockers; real-pause preservation was added during review. Native background-rule construction tests also pass, but do not verify rendered appearance.
-- OpenCode Go DeepSeek v4 Pro bounded review produced no response before its 120-second deadline; it is not a review receipt. The in-app ChatGPT browser was unavailable. Native independent review owns the actual patch review.
+- An additional bounded review produced no response before its 120-second deadline and is not counted as a review receipt. The completed independent review owns the actual patch review.
 
 Remaining: verify real next-episode playback with the patched build; diagnose any continuing local-NNTP invalid-response/idle-reopen failure; implement and validate reliable native subtitle appearance without reintroducing duplicate rendering. No release is represented by this source patch.
