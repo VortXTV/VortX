@@ -79,6 +79,10 @@ Current follow-up verification (distinct from the historical patch results below
   executes 17 decisions/storage fixtures. CoreBridge publication-fence wiring checks also pass. Astra
   independently accepted the final canonical account/history boundary, including both Home adapters;
   independent playback and lifecycle reviews are source reviews, not physical playback receipts.
+- The first current-source GitHub run exposed an older-compiler type-check timeout in the Trakt alias
+  union. That expression now accumulates an explicitly typed array in the identical order. The actual
+  Continue Watching fold fixtures also run in CI, including newest-winner and transitive/late-bridge
+  deduplication; a successful local compiler is not substituted for the rerun of the failing CI gate.
 - No new-source physical DV/receiver, live NNTP throughput, or Android remote/process-death acceptance
   receipt is claimed. The successful read-only TV copy is not an installation or playback test of this patch.
 

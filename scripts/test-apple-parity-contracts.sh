@@ -24,6 +24,10 @@ swiftc -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/TraktArtworkPolicy.swift app/SourcesShared/TraktContinueWatchingFold.swift \
   app/Tests/TraktArtworkPolicyTests.swift -o "$build_dir/trakt-artwork"
 "$build_dir/trakt-artwork"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/TraktArtworkPolicy.swift app/SourcesShared/TraktContinueWatchingFold.swift \
+  app/Tests/TraktContinueWatchingFoldTests.swift -o "$build_dir/trakt-history-fold"
+"$build_dir/trakt-history-fold"
 swiftc -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/TopShelfSnapshot.swift app/Tests/TopShelfSnapshotTests.swift \
   -o "$build_dir/top-shelf"
