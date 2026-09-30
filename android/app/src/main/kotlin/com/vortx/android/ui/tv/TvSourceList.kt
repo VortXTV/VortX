@@ -48,6 +48,7 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
+import com.vortx.android.ui.viewmodel.detailAudioLanguageOptions
 
 /// The 10-foot source-list DEPTH for the TV Detail page, the couch analogue of the phone
 /// [com.vortx.android.ui.screens.DetailScreen] `SourcesSection` and the mirror of Apple
@@ -379,6 +380,10 @@ private fun TvSourceControlsRow(
     onPlay: (StreamSource) -> Unit,
 ) {
     var audioOpen by remember { mutableStateOf(false) }
+    // The picker is a session filter over the sources currently assembled for this title.  Keep the
+    // settings list as a label fallback only: iterating it here used to advertise every configured
+    // language (including languages no add-on returned) and left the TV menu out of sync with the phone.
+    val audioLanguageOptions = detailAudioLanguageOptions(groups)
     LazyRow(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
@@ -433,7 +438,9 @@ private fun TvSourceControlsRow(
             Box {
                 TvFilterChip(
                     label = audioLanguageHint?.let { code ->
-                        TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second ?: code
+                        audioLanguageOptions.firstOrNull { it.first == code }?.second
+                            ?: TrackPreferences.commonLanguages.firstOrNull { it.first == code }?.second
+                            ?: code
                     } ?: "Audio",
                     selected = audioOpen || audioLanguageHint != null,
                     onClick = { audioOpen = true },
@@ -449,7 +456,7 @@ private fun TvSourceControlsRow(
                             onAudioLanguageHintChange(null)
                         },
                     )
-                    TrackPreferences.commonLanguages.forEach { (code, name) ->
+                    audioLanguageOptions.forEach { (code, name) ->
                         DropdownMenuItem(
                             text = { Text(if (audioLanguageHint == code) "✓ $name" else name) },
                             onClick = {

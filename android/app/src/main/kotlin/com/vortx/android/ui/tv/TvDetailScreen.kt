@@ -23,6 +23,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -218,8 +219,13 @@ private fun TvDetailContent(
     // Relation cards can fire several TMDB->IMDb requests before the first edge response returns.  Cancel
     // the superseded request and fence its result so a late prequel/sequel response cannot open the wrong
     // nested title.  Unsupported live/custom types are returned unchanged by the shared resolver.
-    val relatedLookupFence = remember { DetailNavigationFence() }
-    var relatedLookupJob by remember { mutableStateOf<Job?>(null) }
+    val relatedLookupFence = remember(detail.id, detail.type) { DetailNavigationFence() }
+    var relatedLookupJob by remember(detail.id, detail.type) { mutableStateOf<Job?>(null) }
+    // Cancellation is cooperative, while the edge client may be inside a blocking socket call. The
+    // invalidation fence closes that race when this title leaves the composition or changes identity.
+    DisposableEffect(relatedLookupFence) {
+        onDispose { relatedLookupFence.invalidate() }
+    }
     val openRelated: (MetaItem) -> Unit = { item ->
         val generation = relatedLookupFence.begin()
         relatedLookupJob?.cancel()

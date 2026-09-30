@@ -2258,6 +2258,12 @@ internal class DetailNavigationFence {
 
     @Synchronized
     fun accepts(capturedGeneration: Long): Boolean = capturedGeneration == generation
+
+    /** Invalidate work that outlives the detail surface (for example a blocking TMDB response). */
+    @Synchronized
+    fun invalidate() {
+        generation++
+    }
 }
 
 internal suspend fun resolveRelatedDetailTitle(item: MetaItem): MetaItem {

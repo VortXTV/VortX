@@ -1,6 +1,7 @@
 package com.vortx.android.ui.tv
 
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.io.File
 
@@ -24,7 +25,10 @@ class TvDetailSourcesActionContractTest {
         assertTrue(detail.contains("onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint"))
         assertTrue(sourceList.contains("label = audioLanguageHint"))
         assertTrue(sourceList.contains("onAudioLanguageHintChange(null)"))
-        assertTrue(sourceList.contains("TrackPreferences.commonLanguages"))
+        assertTrue(sourceList.contains("detailAudioLanguageOptions(groups)"))
+        assertTrue(sourceList.contains("audioLanguageOptions.forEach"))
+        assertTrue(sourceList.contains("TrackPreferences.commonLanguages.firstOrNull"))
+        assertFalse(sourceList.contains("TrackPreferences.commonLanguages.forEach"))
     }
 
     @Test

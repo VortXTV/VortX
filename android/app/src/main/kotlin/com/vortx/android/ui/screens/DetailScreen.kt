@@ -36,6 +36,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -401,8 +402,13 @@ fun DetailScreen(
     // Resolve a related-title card's `tmdb:` id to a `tt` id before opening it in the nested detail
     // overlay (the same fail-soft resolve the Person filmography grid uses); a lookup miss opens the
     // unresolved id so the page still appears, just sparser.
-    val relatedLookupFence = remember { DetailNavigationFence() }
-    var relatedLookupJob by remember { mutableStateOf<Job?>(null) }
+    val relatedLookupFence = remember(viewModel.routeType, viewModel.routeId) { DetailNavigationFence() }
+    var relatedLookupJob by remember(viewModel.routeType, viewModel.routeId) { mutableStateOf<Job?>(null) }
+    // A blocking HTTP lookup may outlive coroutine cancellation. Invalidate the fence when this detail
+    // route is replaced/closed so a late response cannot populate a now-unrelated nested title.
+    DisposableEffect(relatedLookupFence) {
+        onDispose { relatedLookupFence.invalidate() }
+    }
     val openRelated: (MetaItem) -> Unit = { item ->
         val generation = relatedLookupFence.begin()
         relatedLookupJob?.cancel()

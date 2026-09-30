@@ -79,4 +79,16 @@ class DetailEpisodeTargetPolicyTest {
         assertFalse(canResolveRelatedDetail(MediaType.TV))
         assertTrue(canResolveRelatedDetail(MediaType.SERIES))
     }
+
+    @Test
+    fun `relation fence invalidation blocks an in-flight result after detail leaves`() {
+        val fence = DetailNavigationFence()
+        val stale = fence.begin()
+
+        fence.invalidate()
+
+        assertFalse(fence.accepts(stale))
+        val current = fence.begin()
+        assertTrue(fence.accepts(current))
+    }
 }
