@@ -1,5 +1,11 @@
 package com.vortx.android.player
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+
 /**
  * Pure scheduling state for next-episode preparation.
  *
@@ -195,4 +201,62 @@ internal class NextEpisodePreloadPolicy {
         private fun saturatedAdd(value: Long, increment: Long): Long =
             if (value > Long.MAX_VALUE - increment) Long.MAX_VALUE else value + increment
     }
+}
+
+/**
+ * One mounted playback owner for cancellable next-episode source preparation.
+ *
+ * [NextEpisodePreloadPolicy] decides when preparation is admitted; this owner gives its suspended
+ * network work a lifecycle. Replacing a target or disposing the mounted player cancels the actual
+ * coroutine, rather than merely rejecting its eventual result. A completion is accepted only while
+ * its exact lease owns the task, so a resolver that catches cancellation cannot mark a newer target ready.
+ */
+internal class NextEpisodePreloadTaskOwner(
+    private val scope: CoroutineScope,
+) {
+    private data class Lease(val id: Long, val target: NextEpisodePreloadPolicy.Target)
+
+    private var nextId = 0L
+    private var active: Lease? = null
+    private var activeJob: Job? = null
+    private val lock = Any()
+
+    fun launch(
+        target: NextEpisodePreloadPolicy.Target,
+        prepare: suspend () -> Boolean,
+        onComplete: (Boolean) -> Unit,
+    ) = synchronized(lock) {
+        activeJob?.cancel()
+        val lease = Lease(++nextId, target)
+        active = lease
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val prepared = try {
+                prepare()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                false
+            }
+            if (isCurrent(lease)) onComplete(prepared)
+        }
+        activeJob = job
+        job.invokeOnCompletion {
+            synchronized(lock) {
+                if (active == lease) {
+                    active = null
+                    activeJob = null
+                }
+            }
+        }
+        job.start()
+    }
+
+    fun cancel() = synchronized(lock) {
+        nextId += 1L
+        active = null
+        activeJob?.cancel()
+        activeJob = null
+    }
+
+    private fun isCurrent(lease: Lease): Boolean = synchronized(lock) { active == lease }
 }

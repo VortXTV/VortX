@@ -47,6 +47,17 @@ class PlayerSourceSwitchingTest {
     }
 
     @Test
+    fun `manual retry reopens a quarantined revision before the next replacement starts`() {
+        val fence = PlayerTerminalFence()
+        assertTrue(fence.suppress(revision = 4L, replacementPending = true, terminal = true))
+        assertTrue(fence.suppress(revision = 4L, replacementPending = false, terminal = true))
+
+        fence.reopenManualRetry(revision = 4L)
+
+        assertFalse(fence.suppress(revision = 4L, replacementPending = false, terminal = true))
+    }
+
+    @Test
     fun `replacement playable preserves the captured position`() {
         val replacement = Playable(url = "https://cdn.example/new.mkv", title = "New")
 

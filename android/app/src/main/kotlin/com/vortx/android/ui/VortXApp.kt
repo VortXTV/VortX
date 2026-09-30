@@ -77,6 +77,7 @@ import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.NextEpisodePreloadPolicy
+import com.vortx.android.player.NextEpisodePreloadTaskOwner
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
@@ -577,10 +578,17 @@ fun VortXApp(
                 advanceVm?.playerEpisodeOptions().orEmpty()
             }
             // PLR-8 next-episode preload policy, owned per player session (reset when an episode is switched
-            // or advanced). Drives WHEN to warm the next episode's source; the warm itself is off-fence in
-            // the ViewModel. Invalidated on dispose so a stale attempt cannot survive the player closing.
+            // or advanced). The task owner makes the fetch itself player-owned: dispose and target replacement
+            // cancel its network work rather than merely fencing a stale completion.
             val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
-            DisposableEffect(historyIdentity) { onDispose { preloadPolicy.invalidate() } }
+            val preloadScope = rememberCoroutineScope()
+            val preloadTaskOwner = remember(historyIdentity) { NextEpisodePreloadTaskOwner(preloadScope) }
+            DisposableEffect(historyIdentity) {
+                onDispose {
+                    preloadTaskOwner.cancel()
+                    preloadPolicy.invalidate()
+                }
+            }
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
@@ -627,10 +635,18 @@ fun VortXApp(
                     episodeOptions = playerEpisodeOptions,
                     currentSource = advanceVm?.currentPlayerSource(),
                     onSwitchSource = advanceVm?.let { vm ->
+                        // Same-episode source picks retain a useful next-episode warm. The player-side
+                        // source authority cancels/supersedes the resolver itself.
                         { source -> vm.resolveSourceSwitch(source) }
                     },
                     onSwitchEpisode = advanceVm?.let { vm ->
-                        { episodeId -> vm.resolveEpisodeSwitch(episodeId) }
+                        { episodeId ->
+                            // A manual episode target makes the current warm irrelevant immediately.
+                            // The accepted transition re-keys the owner; a failed resolver may later
+                            // re-admit a fresh warm through the policy instead of keeping hidden I/O alive.
+                            preloadTaskOwner.cancel()
+                            vm.resolveEpisodeSwitch(episodeId)
+                        }
                     },
                     onEpisodeSwitched = { replacement, acceptedRevision ->
                         historyIdentity = advancePlayerEpisodeHistory(
@@ -652,10 +668,13 @@ fun VortXApp(
                         )
                         val now = android.os.SystemClock.elapsedRealtime()
                         val attempt = preloadPolicy.evaluate(target, pos, dur, now) ?: return@onWarmNext
-                        appScope.launch {
-                            val ok = vm.warmNextEpisode(next.id)
-                            preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
-                        }
+                        preloadTaskOwner.launch(
+                            target = target,
+                            prepare = { vm.warmNextEpisode(next.id) },
+                            onComplete = { ok ->
+                                preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
+                            },
+                        )
                     },
                     onBack = {
                         advanceVm?.abandonPlaybackResolve()

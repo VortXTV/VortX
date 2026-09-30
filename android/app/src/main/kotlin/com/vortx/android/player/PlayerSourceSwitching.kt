@@ -182,6 +182,11 @@ internal class PlayerTerminalFence {
         }
         return quarantinedRevision == revision
     }
+
+    /** A deliberate new picker choice supersedes a failed predecessor's terminal verdict. */
+    fun reopenManualRetry(revision: Long) {
+        if (quarantinedRevision == revision) quarantinedRevision = null
+    }
 }
 
 /// The current-season episodes for the in-player picker, in episode order, with the playing one selected.

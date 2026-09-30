@@ -769,7 +769,12 @@ fun PlayerScreen(
             resolver = { source -> resolver?.invoke(source) ?: Result.failure(IllegalStateException()) },
             currentState = { sourceSwitchState },
             latestPositionMs = { latestState.positionMs },
-            publishState = { sourceSwitchState = it },
+            publishState = { replacement ->
+                // Keep the old frame alive while resolving, then cut its audio at the linearized
+                // accepted replacement boundary. An already-paused viewer remains paused.
+                if (replacement.revision > sourceSwitchState.revision) engine.pause()
+                sourceSwitchState = replacement
+            },
         )
     }
     // In-player EPISODE switch resolver: same coordinator/authority machinery as the source switch, but
@@ -785,6 +790,7 @@ fun PlayerScreen(
             currentState = { sourceSwitchState },
             publishState = { accepted ->
                 val previous = sourceSwitchState
+                if (accepted.revision > previous.revision) engine.pause()
                 sourceSwitchState = accepted
                 acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->
                     currentOnEpisodeSwitched(replacement.playable, replacement.revision)
@@ -1699,6 +1705,7 @@ fun PlayerScreen(
                     resolver != null &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
+                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                         sourceSwitchState = beginPlayerSourceSwitch(
                             state = sourceSwitchState,
@@ -1717,6 +1724,7 @@ fun PlayerScreen(
                         currentRef.season == episode.season &&
                         currentRef.episode == episode.episode)
                 ) {
+                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                         sourceSwitchState = beginPlayerEpisodeSwitch(
                             state = sourceSwitchState,
