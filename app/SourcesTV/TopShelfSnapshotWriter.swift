@@ -8,11 +8,71 @@ import TVServices
 /// compiled into the extension, which is what keeps the extension free of the engine models.
 ///
 /// WHY IT LIVES HERE, at the Home model layer: the shelf mirrors the SAME profile-aware Continue
-/// Watching array Home renders (`profiles.activeUsesEngineHistory ? core.continueWatching :
-/// profiles.cwItems`), so it is published from the points that already recompute Home. It reads the
-/// shared singletons directly, so a call site is a bare `publishCurrent()` and the profile-aware
-/// selection rule is written down ONCE, here. Nothing in the watched / sync file set is touched.
+/// Watching selection Home renders. The owner profile goes through
+/// `TraktPlaybackShadow.continueWatchingSelection(fallback:libraryItems:)`, while an overlay profile
+/// stays on its own private local history. It reads the shared singletons directly, so a call site is a
+/// bare `publishCurrent()` and the profile-aware selection rule is written down ONCE, here. Nothing in
+/// the watched / sync file set is touched.
 enum TopShelfSnapshotWriter {
+
+    private typealias WarmCandidate = TopShelfSnapshot.PrivatePublicationPolicy.ArtworkInput
+
+    private struct ArtworkRowKey: Hashable, Sendable {
+        let id: String
+        let type: String
+    }
+
+    /// One in-flight private-art warm pass. An owner or artwork-set change cancels the previous pass and
+    /// advances `publicationGeneration`; a progress-only publication preserves it. The generation check
+    /// is the commit fence for out-of-order profile/auth refreshes. The pending queue is published before
+    /// this task starts.
+    @MainActor private static var warmTask: Task<Void, Never>?
+    @MainActor private static var publicationGeneration: UInt64 = 0
+    @MainActor private static var authBoundaryInstalled = false
+    @MainActor private static var lastPrivateSessionID: TraktSessionID?
+    @MainActor private static var lastPrivateArtworkInputs: [WarmCandidate]?
+    @MainActor private static var lastPrivatePublished: [TopShelfSnapshot.Item]?
+    @MainActor private static var lastPublishedSelectionSource: TraktPlaybackShadow.ContinueWatchingSource?
+
+    /// Redirects are admitted only while every hop remains an exact first-party Trakt image URL. The
+    /// initial URL is validated before the request starts; this delegate closes the privacy gap where a
+    /// trusted CDN URL could redirect the app's private image fetch to an unrelated host.
+    private final class ArtworkSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        private let redirects = TraktArtworkPolicy.RedirectBudget()
+
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url,
+                  TraktArtworkPolicy.isFirstPartyArtwork(url.absoluteString),
+                  redirects.admit(taskID: task.taskIdentifier) else {
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            redirects.finish(taskID: task.taskIdentifier)
+        }
+    }
+
+    /// Private, cookie-free image session. Trakt's CDN image bytes are written into the managed App Group
+    /// cache below; the extension later reads a local file URL and never re-fetches the raw CDN URL.
+    private static let artworkSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpMaximumConnectionsPerHost = 1
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 25
+        configuration.waitsForConnectivity = false
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        return URLSession(configuration: configuration, delegate: ArtworkSessionDelegate(), delegateQueue: nil)
+    }()
 
     /// User setting: mirror Continue Watching onto the tvOS Home screen's Top Shelf.
     ///
@@ -34,27 +94,112 @@ enum TopShelfSnapshotWriter {
     /// refresh writes nothing and wakes nothing. Safe to call from every Home re-seed.
     @MainActor
     static func publishCurrent() {
+        installAuthBoundaryObserver()
         // Setting OFF publishes an EMPTY shelf rather than skipping the write. The snapshot outlives
         // the process, so merely not refreshing would leave the last row sitting on the Home screen:
         // the exact thing the user just asked us to stop showing.
-        guard isEnabled else { publish([]); return }
+        guard isEnabled else {
+            cancelWarm(clearArtwork: true)
+            publish([])
+            return
+        }
 
         let profiles = ProfileStore.shared
-        // The SAME rule Home renders by: the owner profile rides the account's engine history, an
-        // overlay profile rides its own private synced history. Without this an overlay profile's
-        // shelf would show the owner's titles.
-        let cw = profiles.activeUsesEngineHistory ? CoreBridge.shared.continueWatching : profiles.cwItems
-        publish(items(from: cw))
+        // The SAME rule Home renders by: the owner profile rides the Trakt-aware account selection,
+        // while an overlay profile rides its own private synced history. Without this an overlay
+        // profile's shelf would show the owner's titles (or the owner's Trakt rows).
+        let selection: TraktPlaybackShadow.ContinueWatchingSelection
+        if profiles.activeUsesEngineHistory {
+            selection = TraktPlaybackShadow.shared.continueWatchingSelection(
+                fallback: CoreBridge.shared.continueWatching,
+                libraryItems: CoreBridge.shared.library?.catalog ?? []
+            )
+        } else {
+            selection = .init(items: profiles.cwItems, source: .local, sessionID: nil)
+        }
+        let pending = items(from: selection.items, source: selection.source)
+        // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
+        // finished, removed, or temporary seeds; those rows never render and must not consume one of the
+        // bounded eight private-image requests.
+        let sourceItems = Array(selection.items.lazy
+            .filter {
+                EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
+            }
+            .filter { $0.removed != true && $0.temp != true }
+            .prefix(TopShelfSnapshot.maxItems)
+            .map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) })
+
+        // A private Trakt row is published immediately with nil artwork. The only later replacement is
+        // a local file URL produced by the bounded first-party warm pass; joined third-party artwork is
+        // intentionally not sent to the system and never triggers a new request.
+        // The managed directory contains only private Trakt art. Clear it on every new selection so a
+        // toggle-off, overlay switch, or fallback to engine history cannot leave an unreferenced prior
+        // account's images behind in the shared container.
+        if selection.source == .trakt,
+           let sessionID = selection.sessionID,
+           TopShelfSnapshot.containerURL != nil,
+           lastPublishedSelectionSource == .trakt,
+           let previouslyPublished = lastPrivatePublished,
+           !TopShelfSnapshot.PrivatePublicationPolicy.requiresWarmRestart(
+               previousSessionRaw: lastPrivateSessionID?.rawValue,
+               currentSessionRaw: sessionID.rawValue,
+               previousArtworkInputs: lastPrivateArtworkInputs,
+               currentArtworkInputs: sourceItems
+           ) {
+            // Home re-seeds frequently. Progress/title changes are a new publication, not a new image
+            // owner: preserve managed file posters and the in-flight warm pass, then publish the fresh
+            // progress immediately. This avoids a CDN request and cache prune on every playback tick.
+            let updated = TopShelfSnapshot.PrivatePublicationPolicy.mergingCurrentProgress(
+                pending: pending,
+                previouslyPublished: previouslyPublished
+            )
+            lastPrivatePublished = updated
+            publish(updated)
+            return
+        }
+        cancelWarm(clearArtwork: true)
+        lastPublishedSelectionSource = selection.source
+        publish(pending)
+        guard selection.source == .trakt,
+              let sessionID = selection.sessionID,
+              TopShelfSnapshot.containerURL != nil else { return }
+
+        lastPrivateSessionID = sessionID
+        lastPrivateArtworkInputs = sourceItems
+        lastPrivatePublished = pending
+        let generation = publicationGeneration
+        warmTask = Task.detached(priority: .utility) {
+            await warmTraktArtwork(
+                sourceItems: sourceItems,
+                sessionID: sessionID,
+                generation: generation
+            )
+        }
     }
 
     /// Clear the shelf. Used when the shell can no longer vouch for what the shelf would say.
     @MainActor
-    static func clear() { publish([]) }
+    static func clear() {
+        cancelWarm(clearArtwork: true)
+        lastPublishedSelectionSource = nil
+        publish([])
+    }
 
     // MARK: Mapping
 
-    /// Flatten the engine's Continue Watching into the wire items.
+    /// Flatten the engine's local Continue Watching into the wire items. Kept as a compatibility overload
+    /// for existing call sites and tests; private Trakt rows use the source-aware overload below.
     static func items(from cw: [CoreCWItem]) -> [TopShelfSnapshot.Item] {
+        items(from: cw, source: .local)
+    }
+
+    /// Flatten one profile-aware Continue Watching selection into the wire items. A local engine row keeps
+    /// its existing raw HTTP(S) poster behavior. A Trakt selection starts with nil poster fields so a
+    /// third-party joined URL can never escape into the system Top Shelf.
+    static func items(
+        from cw: [CoreCWItem],
+        source: TraktPlaybackShadow.ContinueWatchingSource
+    ) -> [TopShelfSnapshot.Item] {
         cw.lazy
             // The rail's own prune rule. `CoreBridge` already applies `isFinished` before publishing
             // the rail, but the shelf re-applies it rather than trusting that, because a shelf is
@@ -72,7 +217,7 @@ enum TopShelfSnapshotWriter {
                     id: $0.id,
                     type: $0.type,
                     title: $0.name,
-                    poster: shelfPoster($0.poster),
+                    poster: shelfPoster($0.poster, source: source),
                     progress: shelfProgress($0.progress)
                 )
             }
@@ -92,7 +237,7 @@ enum TopShelfSnapshotWriter {
         return min(max(raw, 0), 1)
     }
 
-    /// The poster URL to hand the system.
+    /// The poster URL to hand the system for a LOCAL engine row.
     ///
     /// This is the RAW add-on / metahub poster, deliberately NOT routed through our own
     /// `poster.vortx.tv` baked-art service, for two independent reasons:
@@ -110,7 +255,15 @@ enum TopShelfSnapshotWriter {
     ///
     /// Returns nil for a non-http(s) URL. An item with no art still renders (title + progress), so a
     /// missing poster costs a tile's picture, never the row.
-    private static func shelfPoster(_ raw: String?) -> String? {
+    private static func shelfPoster(
+        _ raw: String?,
+        source: TraktPlaybackShadow.ContinueWatchingSource
+    ) -> String? {
+        // A Trakt row's poster is account-private input. Even if it joined a local catalog row, handing
+        // that URL to the system would let Top Shelf fetch a third party outside the app's ownership and
+        // would violate Trakt's cache-before-hotlink requirement. The warmer below admits only a validated
+        // first-party `*.trakt.tv/images/` URL and replaces it with a managed local file URL.
+        guard source == .local else { return nil }
         guard let raw, let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
               scheme == "https" || scheme == "http"
         else { return nil }
@@ -118,6 +271,158 @@ enum TopShelfSnapshotWriter {
     }
 
     // MARK: Publish
+
+    @MainActor
+    private static func installAuthBoundaryObserver() {
+        guard !authBoundaryInstalled else { return }
+        authBoundaryInstalled = true
+        TraktAuthBoundary.observe(key: "trakt-top-shelf") { emittedSessionID in
+            // The auth boundary is synchronous and may be announced from a credential worker. Hop to
+            // the main actor before touching the generation/task state or notifying TVServices. The
+            // emitted session is part of the event: an old callback must not clear a newer publication.
+            Task { @MainActor in
+                let observedGeneration = publicationGeneration
+                handleAuthBoundary(
+                    emittedSessionID: emittedSessionID,
+                    observedGeneration: observedGeneration
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private static func handleAuthBoundary(
+        emittedSessionID: TraktSessionID?,
+        observedGeneration: UInt64
+    ) {
+        guard observedGeneration == publicationGeneration,
+              TraktAuth.storedSessionID == emittedSessionID,
+              TopShelfSnapshot.PrivatePublicationPolicy.shouldClearObsoletePrivateOwner(
+                  emittedSessionRaw: emittedSessionID?.rawValue,
+                  currentSessionRaw: TraktAuth.storedSessionID?.rawValue,
+                  privateOwnerRaw: lastPrivateSessionID?.rawValue,
+                  publishedPrivateRows: lastPublishedSelectionSource == .trakt
+              ) else { return }
+
+        // Only an obsolete private owner is cleared. A stale auth event never reaches this branch, and a
+        // local overlay publication is left intact rather than replaced by an empty shelf.
+        cancelWarm(clearArtwork: true)
+        lastPublishedSelectionSource = nil
+        publish([])
+    }
+
+    @MainActor
+    private static func cancelWarm(clearArtwork: Bool) {
+        publicationGeneration &+= 1
+        warmTask?.cancel()
+        warmTask = nil
+        if clearArtwork {
+            lastPrivateSessionID = nil
+            lastPrivateArtworkInputs = nil
+            lastPrivatePublished = nil
+            lastPublishedSelectionSource = nil
+            TopShelfSnapshot.clearArtworkCache()
+        }
+    }
+
+    /// Fetch at most the eight selected private rows one at a time, then commit each response only while
+    /// the original account/profile publication still owns the generation. The Top Shelf gets a pending
+    /// title/progress queue immediately; a later commit merely fills local file URLs for successful art.
+    private static func warmTraktArtwork(
+        sourceItems: [WarmCandidate],
+        sessionID: TraktSessionID,
+        generation: UInt64
+    ) async {
+        var replacements: [ArtworkRowKey: String] = [:]
+
+        for candidate in sourceItems.prefix(TopShelfSnapshot.maxItems) {
+            guard !Task.isCancelled,
+                  let raw = candidate.poster,
+                  TraktArtworkPolicy.isFirstPartyArtwork(raw),
+                  let url = URL(string: raw),
+                  let data = await fetchTraktArtwork(from: url) else { continue }
+
+            // Store on the main actor so the ownership check and the file write are ordered with the auth
+            // boundary/profile publication. A stale task can therefore not write an old account's image
+            // after the boundary has cleared the managed directory.
+            let stored: (owned: Bool, url: URL?) = await MainActor.run {
+                guard generation == publicationGeneration,
+                      TraktAuth.storedSessionID == sessionID,
+                      isEnabled,
+                      lastPrivateSessionID == sessionID,
+                      lastPrivateArtworkInputs == sourceItems,
+                      lastPublishedSelectionSource == .trakt else { return (false, nil) }
+                return (true, TopShelfSnapshot.storeArtwork(data, for: raw))
+            }
+            guard stored.owned else { return }
+            if let localURL = stored.url {
+                replacements[ArtworkRowKey(id: candidate.id, type: candidate.type)] = localURL.absoluteString
+            }
+        }
+
+        guard !Task.isCancelled else { return }
+        let replacementURLs = replacements
+        await MainActor.run {
+            guard generation == publicationGeneration,
+                  TraktAuth.storedSessionID == sessionID,
+                  isEnabled,
+                  lastPrivateSessionID == sessionID,
+                  lastPrivateArtworkInputs == sourceItems,
+                  lastPublishedSelectionSource == .trakt,
+                  let current = lastPrivatePublished else { return }
+            let updated = current.map { item -> TopShelfSnapshot.Item in
+                guard let local = replacementURLs[ArtworkRowKey(id: item.id, type: item.type)] else {
+                    return item
+                }
+                return TopShelfSnapshot.Item(id: item.id, type: item.type, title: item.title, poster: local, progress: item.progress)
+            }
+            lastPrivatePublished = updated
+            publish(updated)
+        }
+    }
+
+    private static func fetchTraktArtwork(from url: URL) async -> Data? {
+        guard !Task.isCancelled,
+              TraktArtworkPolicy.isFirstPartyArtwork(url.absoluteString) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 20)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("image/*", forHTTPHeaderField: "Accept")
+        do {
+            let (bytes, response) = try await artworkSession.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  let finalURL = response.url,
+                  TraktArtworkPolicy.isFirstPartyArtwork(finalURL.absoluteString),
+                  TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+                      finalURLIsFirstParty: true,
+                      statusCode: http.statusCode,
+                      mimeType: http.mimeType,
+                      expectedContentLength: http.expectedContentLength,
+                      accumulatedBytes: 1
+                  ) else { return nil }
+            var data = Data()
+            if http.expectedContentLength > 0 {
+                data.reserveCapacity(min(Int(http.expectedContentLength), TopShelfSnapshot.maxArtworkBytes))
+            }
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                // Returning from the AsyncBytes sequence tears down this request; do not let an
+                // unknown-length response accumulate beyond the managed per-image bound.
+                guard data.count < TopShelfSnapshot.maxArtworkBytes else { return nil }
+                data.append(byte)
+            }
+            guard TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+                finalURLIsFirstParty: TraktArtworkPolicy.isFirstPartyArtwork(finalURL.absoluteString),
+                statusCode: http.statusCode,
+                mimeType: http.mimeType,
+                expectedContentLength: http.expectedContentLength,
+                accumulatedBytes: data.count
+            ) else { return nil }
+            return data
+        } catch {
+            return nil
+        }
+    }
 
     @MainActor
     private static func publish(_ items: [TopShelfSnapshot.Item]) {

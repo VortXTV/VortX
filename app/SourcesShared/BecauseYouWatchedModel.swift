@@ -1,123 +1,290 @@
 import SwiftUI
 
-/// "Because you watched X": a Home rail of titles TMDB recommends from the ACTIVE profile's most recent
-/// watches. It mirrors `TopPicksModel` exactly (same seed source, same "more like this" recommender via
-/// `AddonClient.tmdbSimilar`, same fail-soft + signature-cache discipline), but it NAMES the rail after
-/// the seed that drove it, so Home surfaces a personal "Because you watched <that title>" row instead of a
-/// generic recommendations rail.
+/// A profile-local "Because you watched" rail.
 ///
-/// Everything fails soft: no TMDB key, no eligible history, or a flaky network all leave `rail` nil, and
-/// the Home views hide a nil rail. Results are cached in memory and only recomputed when the seed set
-/// changes (a new watch) or the profile switches; a routine engine re-emit with the same recent titles
-/// does not refetch.
-///
-/// READ ONLY over watch history: `cw` (profile-aware Continue Watching) and `library` are passed in by the
-/// caller, exactly like `TopPicksModel`, so this model never reaches into engine/profile state and never
-/// writes a `libraryItem` or any account data. It is a pure transform + in-memory cache.
+/// The inputs are deliberately passed in by Home rather than read from the engine here. That keeps the
+/// rail on the same privacy boundary as Top Picks: an overlay profile only ever contributes its own local
+/// history/library, and an engine-backed profile only contributes the engine snapshot selected by Home.
+/// Every identifier is resolved through the existing TMDB/Cinemeta path before recommendations are fetched;
+/// an unknown catalog id is ignored instead of being guessed onto an unrelated title.
 @MainActor
 final class BecauseYouWatchedModel: ObservableObject {
-    /// The single rail to render (title + cards), or nil to hide. The title embeds the primary (most
-    /// recent) seed's name; the cards round-robin the recommendations of a few recent seeds so the rail
-    /// reflects the BREADTH of recent viewing, not a wall of clones of the single latest title.
     @Published private(set) var rail: CuratedCollection?
+    /// True only when the inputs most recently accepted by `refresh` belong to the current history
+    /// owner. Home uses this to keep Top Picks behind the same engine-account boundary.
+    private(set) var historyInputReady = false
 
-    /// At most this many recent titles seed the recommender (newest first), keeping the fan-out small.
     private static let maxSeeds = 4
-    /// At most this many cards in the rail.
     private static let maxItems = 20
 
-    /// The signature of the last successful build (profile id + ordered seed ids), so a routine engine
-    /// re-emit with the same recent titles doesn't refetch.
+    /// `lastSignature` describes the rail currently on screen. `inFlightSignature` prevents repeated Home
+    /// body emissions from starting another bounded fetch while the same request is still resolving.
     private var lastSignature: String?
+    private var inFlightSignature: String?
     private var loadTask: Task<Void, Never>?
+    private var requestGeneration: UInt64 = 0
+    private var activeProfileID: UUID?
+    /// The profile UUID is not sufficient to identify the history owner: a signed-in account, local
+    /// history slot, or engine principal can change while the selected profile remains the same.
+    private var activeOwnerKey: String?
+    /// Foundation-only owner/revision admission keeps account-boundary correctness independent from
+    /// SwiftUI and gives delayed recommendation work one reusable completion fence.
+    private var historyAdmission = BecauseYouWatchedHistoryAdmission()
 
-    /// Recompute from the active profile's recent watch/library titles. No-ops when the seed signature is
-    /// unchanged. Mirrors `TopPicksModel.refresh`.
-    func refresh(profileID: UUID?, cw: [CoreCWItem], library: [CoreCWItem]) {
-        // TMDB recommendations are the recommender; with no key there is nothing to surface (same gate as
-        // Top Picks / the streaming rails, so this rail hides unless the user configured a key).
-        guard ApiKeys.tmdbKey() != nil else { rail = nil; lastSignature = nil; return }
+    /// Recompute from the active profile's recent watch/library titles. Calls are cheap when the exact
+    /// relevant inputs are unchanged, but a watch-progress or watched-count mutation changes the signature.
+    func refresh(
+        profileID: UUID?,
+        cw: [CoreCWItem],
+        library: [CoreCWItem],
+        ownerKey: String = "",
+        usesEngineHistory: Bool = true,
+        activeKeychainAccount: String? = nil,
+        historySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot? = nil,
+    ) {
+        let signature = ownerKey + "|" + (profileID?.uuidString ?? "main") + "|" +
+            Self.seedSignature(cw: cw, library: library)
+        let ownerChanged = activeProfileID != profileID || activeOwnerKey != ownerKey
+
+        if ownerChanged {
+            retireRecommendationWork()
+            activeProfileID = profileID
+            activeOwnerKey = ownerKey
+        }
+
+        let admission = historyAdmission.evaluate(
+            usesEngineHistory: usesEngineHistory,
+            activeProfileID: profileID,
+            activeKeychainAccount: activeKeychainAccount ?? "",
+            ownerKey: ownerKey,
+            snapshot: historySnapshot
+        )
+        historyInputReady = historyAdmission.isReady
+        guard admission == .overlay || admission == .readyEngine else {
+            // Keep the owner identity/baseline in the production admission latch. The model-level work
+            // is retired synchronously, so an older recommendation completion cannot restore the rail
+            // while this owner is waiting for a settled history receipt.
+            retireRecommendationWork()
+            activeProfileID = profileID
+            activeOwnerKey = ownerKey
+            historyInputReady = false
+            return
+        }
 
         let seeds = Self.eligibleSeeds(cw: cw, library: library)
-        guard !seeds.isEmpty else { rail = nil; lastSignature = nil; return }
 
-        let signature = (profileID?.uuidString ?? "main") + "|" + seeds.map(\.id).joined(separator: ",")
-        if signature == lastSignature, rail != nil { return }
+        if !ownerChanged, signature == lastSignature, rail != nil {
+            activeProfileID = profileID
+            return
+        }
+        if !ownerChanged, signature == inFlightSignature { return }
 
-        // Exclude anything the profile already has (CW + library) so we never recommend owned titles.
-        let owned = Set((cw + library).map(\.id))
+        requestGeneration &+= 1
+        let generation = requestGeneration
+        let admissionGeneration = historyAdmission.generation
         loadTask?.cancel()
-        loadTask = Task {
+        inFlightSignature = signature
+
+        // Never display the previous owner's personalized row during a profile/account boundary. A
+        // same-owner retry may retain an existing rail until a non-empty replacement is ready.
+        if ownerChanged {
+            rail = nil
+            lastSignature = nil
+        }
+        activeProfileID = profileID
+        activeOwnerKey = ownerKey
+
+        guard !seeds.isEmpty else {
+            inFlightSignature = nil
+            rail = nil
+            lastSignature = nil
+            return
+        }
+
+        // Exclude everything the active profile already owns. Temporary and removed engine entries are not
+        // valid ownership evidence and are ignored on both the seed and exclusion paths.
+        let owned = Set((cw + library)
+            .filter { !$0.id.isEmpty && $0.removed != true && $0.temp != true }
+            .map(\.id))
+        loadTask = Task { [seeds, owned, signature, generation, admissionGeneration, profileID, ownerKey] in
             let built = await Self.build(seeds: seeds, owned: owned)
-            if Task.isCancelled { return }
-            // On a non-empty build keep the rail + signature. On an empty build (flaky network) leave
-            // whatever we already had rather than blanking a populated rail, but clear the signature so
-            // the next refresh retries.
-            if let built {
-                rail = built
-                lastSignature = signature
-            } else {
-                lastSignature = nil
+            guard !Task.isCancelled,
+                  self.requestGeneration == generation,
+                  self.historyAdmission.isCurrent(admissionGeneration) else { return }
+
+            self.inFlightSignature = nil
+            guard let built else {
+                // A transient network/provider failure must not replace a valid rail with an error/empty
+                // result. The next input mutation retries because the successful signature was not saved.
+                self.lastSignature = nil
+                return
             }
+
+            // If the response has the same card ids but a provider omitted artwork this time, preserve an
+            // already-valid poster from the previous rail. A newer, non-empty response still wins by id and
+            // order; this only prevents a late sparse artwork response from blanking a useful card.
+            self.rail = Self.preservingArtwork(in: built, from: self.rail)
+            self.lastSignature = signature
+            self.activeProfileID = profileID
+            self.activeOwnerKey = ownerKey
         }
     }
 
     /// Clear when the profile signs out or switches to one with no eligible history.
     func clear() {
-        loadTask?.cancel()
+        retireRecommendationWork()
+        activeProfileID = nil
+        activeOwnerKey = nil
+        historyAdmission.reset()
+        historyInputReady = false
         rail = nil
         lastSignature = nil
     }
 
-    // MARK: - Shared build (also used by HomeGroupsModel's nested-group path)
+    /// Retire visible recommendation work while Home has selected an engine profile whose account
+    /// binding is still unsettled. This is intentionally different from `clear()`: the production
+    /// history latch retains its owner/revision boundary so the first exact current-owner receipt can
+    /// restore admission even when no later unrelated engine event is emitted.
+    func retireForUnsettledHistory(
+        profileID: UUID?,
+        ownerKey: String,
+        historySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot?
+    ) {
+        retireRecommendationWork()
+        historyAdmission.retireForUnsettledHistory(ownerKey: ownerKey, snapshot: historySnapshot)
+        activeProfileID = profileID
+        activeOwnerKey = ownerKey
+        historyInputReady = false
+        rail = nil
+        lastSignature = nil
+    }
 
-    /// A recent-watch seed: its IMDb id, stremio type, and display name (the name drives the rail title).
-    struct Seed { let id: String; let type: String; let name: String }
+    private func retireRecommendationWork() {
+        requestGeneration &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+        inFlightSignature = nil
+        rail = nil
+        lastSignature = nil
+    }
+
+    // MARK: - Shared build (also used by HomeCollectionGroups' nested-group path)
+
+    /// A recent-watch seed: the original catalog id/type/name. The id is resolved immediately before the
+    /// recommendation request, so callers do not need to fabricate replacement identifiers.
+    struct Seed {
+        let id: String
+        let type: String
+        let name: String
+    }
 
     /// Pick up to `maxSeeds` eligible seeds newest-first: Continue Watching first (freshest intent), then
-    /// the library, keeping only IMDb ids (the recommender resolves IMDb ids), non-removed, de-duplicated.
+    /// library. A seed needs actual watch evidence (resume progress, watched count, or watched flag), cannot
+    /// be temporary/removed, and must use one of the identifier shapes the existing resolver understands.
     static func eligibleSeeds(cw: [CoreCWItem], library: [CoreCWItem]) -> [Seed] {
         var seen = Set<String>()
         return (cw + library)
-            .filter { $0.id.hasPrefix("tt") && $0.removed != true }
+            .filter { item in
+                !item.id.isEmpty && item.removed != true && item.temp != true &&
+                    hasWatchEvidence(item) && supportsResolution(item.id)
+            }
             .filter { seen.insert($0.id).inserted }
             .prefix(maxSeeds)
             .map { Seed(id: $0.id, type: $0.type, name: $0.name) }
     }
 
-    /// A stable signature of the current seed set, so a cache keyed on it (this model's `lastSignature`,
-    /// or `HomeGroupsModel`'s region+seed key) only rebuilds when the recent watches actually change.
+    /// A stable, profile-independent signature for recommendation-relevant local state. Include ownership
+    /// ids so a library mutation removes a newly-owned recommendation, and include watch state so a resume or
+    /// watched mutation can promote/reseed without relying on a coarse first-id observer.
     static func seedSignature(cw: [CoreCWItem], library: [CoreCWItem]) -> String {
-        eligibleSeeds(cw: cw, library: library).map(\.id).joined(separator: ",")
+        let history = cw + library
+        let seeds = eligibleSeeds(cw: cw, library: library)
+            .map { "\($0.type):\($0.id):\($0.name)" }
+            .joined(separator: ",")
+        let owned = history
+            .filter { !$0.id.isEmpty && $0.removed != true && $0.temp != true }
+            .map(\.id)
+            .sorted()
+            .joined(separator: ",")
+        let watchState = history
+            .filter { !$0.id.isEmpty && $0.removed != true && $0.temp != true }
+            .map(watchFingerprint)
+            .sorted()
+            .joined(separator: ",")
+        return "seeds=\(seeds)|owned=\(owned)|watch=\(watchState)"
     }
 
-    /// Build the rail straight from the raw CW + library (used by `HomeGroupsModel`'s nested-group path).
-    /// Returns nil with no TMDB key, no eligible history, or nothing resolved. Runs off the main actor.
+    /// Bounded Home observer key for overlay history (the profile store caps this collection at 30). It
+    /// includes progress and watched counters, not just ids, so an interior watch mutation refreshes the rail.
+    static func observationSignature(items: [CoreCWItem]) -> String {
+        items.map(watchFingerprint).joined(separator: "\u{1}")
+    }
+
+    /// Build the non-secret ownership key used by Apple Home call sites. `StremioAccount` intentionally
+    /// does not republish `isSignedIn` for a true-to-true replacement, so its published email assignment
+    /// is included as a stable identity hint until the engine's settled uid/binding is available. A nil
+    /// principal with a numeric authority generation is the explicit local-owner mode; unresolved remote
+    /// history keeps both values absent. No auth
+    /// token or credential material belongs in this key.
+    static func recommendationOwnerKey(
+        profileKeychainAccount: String,
+        isSignedIn: Bool,
+        usesEngineHistory: Bool,
+        accountEmail: String?,
+        principal: String?,
+        authorityGeneration: UInt64?,
+        credentialBoundaryGeneration: UInt64 = 0
+    ) -> String {
+        let email = accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "-"
+        let principal = principal?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "-"
+        let generation = authorityGeneration.map(String.init) ?? "-"
+        return [profileKeychainAccount, String(isSignedIn), String(usesEngineHistory), email,
+                principal, generation, String(credentialBoundaryGeneration)].joined(separator: "|")
+    }
+
+    /// Build the rail straight from raw CW + library (used by HomeCollectionGroups' nested-group path).
+    /// Resolver/recommendation failures remain fail-soft and return nil.
     static func build(cw: [CoreCWItem], library: [CoreCWItem]) async -> CuratedCollection? {
-        guard ApiKeys.tmdbKey() != nil else { return nil }
         let seeds = eligibleSeeds(cw: cw, library: library)
         guard !seeds.isEmpty else { return nil }
-        return await build(seeds: seeds, owned: Set((cw + library).map(\.id)))
+        let owned = Set((cw + library)
+            .filter { !$0.id.isEmpty && $0.removed != true && $0.temp != true }
+            .map(\.id))
+        return await build(seeds: seeds, owned: owned)
     }
 
-    /// Fetch "more like this" for every seed in parallel, then round-robin merge (one pick from each recent
-    /// watch in rotation), dropping owned + seed titles, de-duplicating, and capping. The title is the
-    /// primary (most recent) seed's name: "Because you watched <name>". Returns nil when nothing resolves.
-    /// Runs off the main actor. The merge mirrors `TopPicksModel.fetch`.
+    /// Resolve the bounded seed set, fetch each supported seed in parallel, then round-robin merge the
+    /// recommendation buckets. Results are stable by seed order, deduplicated, owned/self-filtered, and capped.
     static func build(seeds: [Seed], owned: Set<String>) async -> CuratedCollection? {
-        guard let primary = seeds.first else { return nil }
-        let perSeed: [[MetaPreview]] = await withTaskGroup(of: (Int, [MetaPreview]).self) { group in
+        let resolved: [(seed: Seed, imdbID: String)] = await withTaskGroup(
+            of: (Int, (Seed, String)?).self
+        ) { group in
             for (index, seed) in seeds.enumerated() {
                 group.addTask {
-                    (index, await AddonClient.tmdbSimilar(type: seed.type, imdbID: seed.id))
+                    guard let imdbID = await TMDBClient.imdbID(forCatalogID: seed.id, type: seed.type) else {
+                        return (index, nil)
+                    }
+                    return (index, (seed, imdbID))
                 }
             }
-            var buckets = [[MetaPreview]](repeating: [], count: seeds.count)
+            var ordered = [(Seed, String)?](repeating: nil, count: seeds.count)
+            for await (index, item) in group { ordered[index] = item }
+            return ordered.compactMap { $0 }.map { (seed: $0.0, imdbID: $0.1) }
+        }
+        guard !resolved.isEmpty else { return nil }
+
+        let perSeed: [[MetaPreview]] = await withTaskGroup(of: (Int, [MetaPreview]).self) { group in
+            for (index, entry) in resolved.enumerated() {
+                group.addTask {
+                    (index, await AddonClient.tmdbSimilar(type: entry.seed.type, imdbID: entry.imdbID))
+                }
+            }
+            var buckets = [[MetaPreview]](repeating: [], count: resolved.count)
             for await (index, recs) in group { buckets[index] = recs }
             return buckets
         }
 
-        let seedIDs = Set(seeds.map(\.id))
+        let seedIDs = Set(seeds.map(\.id) + resolved.map(\.imdbID))
         var merged: [MetaPreview] = []
         var added = Set<String>()
         let maxDepth = perSeed.map(\.count).max() ?? 0
@@ -130,9 +297,50 @@ final class BecauseYouWatchedModel: ObservableObject {
                 if merged.count >= maxItems { break outer }
             }
         }
-        guard !merged.isEmpty else { return nil }
+        guard !merged.isEmpty, let primary = resolved.first?.seed else { return nil }
 
         let title = String(localized: "Because you watched \(primary.name)")
-        return CuratedCollection(id: "becauseYouWatched.\(primary.id)", title: title, items: merged)
+        return CuratedCollection(
+            id: "becauseYouWatched.\(primary.id)",
+            title: title,
+            items: merged,
+        )
+    }
+
+    private static func hasWatchEvidence(_ item: CoreCWItem) -> Bool {
+        item.progress > 0 || item.isWatched || item.state.flaggedWatched > 0
+    }
+
+    private static func supportsResolution(_ id: String) -> Bool {
+        switch DetailMetaRecoveryPolicy.catalogIDShape(id) {
+        case .imdb, .tmdb, .tvdb, .kitsu:
+            return true
+        case .unsupported:
+            return false
+        }
+    }
+
+    private static func watchFingerprint(_ item: CoreCWItem) -> String {
+        "\(item.type):\(item.id):\(item.progress):\(item.state.lastWatched ?? ""):\(item.state.flaggedWatched):\(item.state.timesWatched)"
+    }
+
+    private static func preservingArtwork(
+        in newRail: CuratedCollection,
+        from previous: CuratedCollection?
+    ) -> CuratedCollection {
+        guard let previous else { return newRail }
+        let oldByID = Dictionary(uniqueKeysWithValues: previous.items.map { ($0.id, $0) })
+        let items = newRail.items.map { item -> MetaPreview in
+            guard item.poster == nil, let old = oldByID[item.id], old.poster != nil else { return item }
+            return MetaPreview(
+                id: item.id,
+                type: item.type,
+                name: item.name,
+                poster: old.poster,
+                posterShape: item.posterShape ?? old.posterShape,
+                popularity: item.popularity ?? old.popularity,
+            )
+        }
+        return CuratedCollection(id: newRail.id, title: newRail.title, items: items)
     }
 }

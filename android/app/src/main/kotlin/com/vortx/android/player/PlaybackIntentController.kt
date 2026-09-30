@@ -88,6 +88,17 @@ internal class PlaybackIntentController(
     @Synchronized
     fun setSourceTerminal(terminal: Boolean) = update(state.copy(sourceTerminal = terminal))
 
+    /**
+     * Admit an already-accepted replacement source without changing the viewer's play/pause decision.
+     *
+     * A source failure makes the outgoing source terminal, but a successful retry or manual source pick
+     * is a new transport opportunity. Clearing only that terminal verdict here deliberately preserves a
+     * manual pause (and every independent lifecycle/focus blocker), so replacing a paused source cannot
+     * unexpectedly start it.
+     */
+    @Synchronized
+    fun beginReplacementSource() = update(state.copy(sourceTerminal = false))
+
     @Synchronized
     fun snapshot(): PlaybackIntentState = state
 

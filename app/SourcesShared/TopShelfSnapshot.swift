@@ -49,26 +49,121 @@ enum TopShelfSnapshot {
 
     /// One Continue Watching entry, flattened to exactly what the Top Shelf can render and what a
     /// tap needs to route back into the app.
-    struct Item: Codable, Equatable {
+    struct Item: Codable, Equatable, Sendable {
         /// The engine library id (an imdb `tt…` id for most titles), used as the item's stable
         /// Top Shelf identifier and as the deep link's `id`.
         let id: String
         /// "movie" or "series".
         let type: String
         let title: String
-        /// Poster art URL. See `TopShelfSnapshotWriter` for why this is the RAW add-on/metahub poster
-        /// and deliberately not a signed `poster.vortx.tv` URL.
+        /// Poster art URL. Local engine rows keep their existing raw add-on/metahub URL; private Trakt
+        /// rows carry a `file://` URL into the managed App Group cache after the app warms the image.
+        /// Neither path is a signed `poster.vortx.tv` URL.
         let poster: String?
         /// 0…1 watch progress, matching `TVTopShelfSectionedItem.playbackProgress`'s required range.
         let progress: Double
     }
 
-    struct Payload: Codable, Equatable {
+    struct Payload: Codable, Equatable, Sendable {
         let version: Int
         /// Wall-clock write time. Diagnostics only; the extension does not expire on it, because a
         /// stale resume row is still a useful row and the app rewrites on every Home refresh anyway.
         let writtenAt: Date
         let items: [Item]
+    }
+
+    /// Pure state transitions used by the app-side private Trakt publisher. Keeping these rules in the
+    /// Foundation-only contract lets the standalone tests exercise the privacy boundary without linking
+    /// TVServices or the engine model, while the Top Shelf extension still compiles only this file.
+    enum PrivatePublicationPolicy {
+        /// The stable identity of one selected row. Playback progress is deliberately absent: a progress
+        /// tick must update the JSON row but must not cancel an in-flight image warm or prune its cache.
+        struct ArtworkInput: Equatable, Sendable {
+            let id: String
+            let type: String
+            let poster: String?
+        }
+
+        private struct RowKey: Hashable {
+            let id: String
+            let type: String
+        }
+
+        /// Restart warming only when ownership or the selected row/artwork set changes. Titles and
+        /// progress belong to the publication payload, not to the CDN/cache identity.
+        static func requiresWarmRestart(
+            previousSessionRaw: String?,
+            currentSessionRaw: String?,
+            previousArtworkInputs: [ArtworkInput]?,
+            currentArtworkInputs: [ArtworkInput]
+        ) -> Bool {
+            previousSessionRaw != currentSessionRaw
+                || previousArtworkInputs != currentArtworkInputs
+        }
+
+        /// Apply a fresh title/progress publication while retaining only previously generated managed
+        /// `file://` posters. A remote URL can never be carried forward through this merge.
+        static func mergingCurrentProgress(
+            pending: [Item],
+            previouslyPublished: [Item]
+        ) -> [Item] {
+            var managedPosters: [RowKey: String] = [:]
+            for item in previouslyPublished {
+                guard let poster = item.poster,
+                      let url = URL(string: poster),
+                      url.isFileURL else { continue }
+                managedPosters[RowKey(id: item.id, type: item.type)] = poster
+            }
+            return pending.map { item in
+                guard let poster = managedPosters[RowKey(id: item.id, type: item.type)] else {
+                    return item
+                }
+                return Item(
+                    id: item.id,
+                    type: item.type,
+                    title: item.title,
+                    poster: poster,
+                    progress: item.progress
+                )
+            }
+        }
+
+        /// An auth-boundary callback is relevant only while the emitted session is still the certified
+        /// current session. A stale callback for an old account cannot clear a newer private publication;
+        /// a current callback never clears a local overlay row.
+        static func shouldClearObsoletePrivateOwner(
+            emittedSessionRaw: String?,
+            currentSessionRaw: String?,
+            privateOwnerRaw: String?,
+            publishedPrivateRows: Bool
+        ) -> Bool {
+            guard emittedSessionRaw == currentSessionRaw,
+                  let privateOwnerRaw,
+                  privateOwnerRaw != currentSessionRaw else { return false }
+            return publishedPrivateRows
+        }
+
+        /// Validate response metadata before accepting a bounded byte stream. The writer supplies the
+        /// strict first-party-final-URL result from `TraktArtworkPolicy`; this helper owns status/MIME/
+        /// length accounting and is intentionally independent of URLSession.
+        static func acceptsArtworkResponse(
+            finalURLIsFirstParty: Bool,
+            statusCode: Int,
+            mimeType: String?,
+            expectedContentLength: Int64?,
+            accumulatedBytes: Int
+        ) -> Bool {
+            guard finalURLIsFirstParty,
+                  (200..<300).contains(statusCode),
+                  mimeType?.lowercased().hasPrefix("image/") == true,
+                  accumulatedBytes > 0,
+                  accumulatedBytes <= TopShelfSnapshot.maxArtworkBytes else { return false }
+            if let expectedContentLength,
+               expectedContentLength > Int64(TopShelfSnapshot.maxArtworkBytes) {
+                return false
+            }
+            return true
+        }
     }
 
     // MARK: Container
@@ -81,6 +176,69 @@ enum TopShelfSnapshot {
 
     private static var fileURL: URL? {
         containerURL?.appendingPathComponent(filename, isDirectory: false)
+    }
+
+    // MARK: Managed private artwork
+
+    /// Exact App Group subdirectory owned by the app's Trakt Top Shelf warmer. The extension only
+    /// reads the file URLs embedded in the JSON snapshot; it never enumerates or writes this folder.
+    /// Keeping the path here (instead of deriving it at each call site) makes the cleanup boundary
+    /// auditable: sign-out and account changes remove this directory and nothing above it.
+    static let artworkDirectoryName = "top-shelf-artwork"
+
+    /// Maximum bytes retained for one warmed poster. Trakt's normal 600x900 WebP/JPEG responses are
+    /// far below this; the bound prevents a malformed first-party response from consuming unbounded
+    /// shared-container storage before the image reaches the system shelf.
+    static let maxArtworkBytes = 12 * 1024 * 1024
+
+    private static var artworkDirectoryURL: URL? {
+        containerURL?.appendingPathComponent(artworkDirectoryName, isDirectory: true)
+    }
+
+    /// Deterministic, path-safe filename for one exact source URL. A short FNV-1a key avoids putting
+    /// query strings or title ids into a path while keeping the cache Foundation-only (the extension
+    /// target deliberately does not link CryptoKit). The source URL is never logged or serialized.
+    private static func artworkKey(_ sourceURL: String) -> String {
+        var hash: UInt64 = 14_695_981_039_346_656_037
+        for byte in sourceURL.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 1_099_511_628_211
+        }
+        return String(hash, radix: 16)
+    }
+
+    /// The local file URL for an exact source URL. This only computes a path; it does not create the
+    /// directory or touch disk. Callers must validate the source URL before requesting a path here.
+    static func localArtworkURL(for sourceURL: String) -> URL? {
+        guard !sourceURL.isEmpty, let directory = artworkDirectoryURL else { return nil }
+        let sourceExtension = URL(string: sourceURL)?.pathExtension.lowercased()
+        let allowedExtensions = Set(["jpg", "jpeg", "png", "webp", "heic", "avif", "gif"])
+        let fileExtension = sourceExtension.flatMap { allowedExtensions.contains($0) ? $0 : nil } ?? "image"
+        return directory.appendingPathComponent("\(artworkKey(sourceURL)).\(fileExtension)", isDirectory: false)
+    }
+
+    /// Persist one already-validated image response into the managed App Group cache. The write is
+    /// atomic so the Top Shelf extension can never observe a partially-written image. Failure is
+    /// intentionally silent: the row remains useful with title/progress and a missing poster.
+    @discardableResult
+    static func storeArtwork(_ data: Data, for sourceURL: String) -> URL? {
+        guard !data.isEmpty, data.count <= maxArtworkBytes,
+              let url = localArtworkURL(for: sourceURL),
+              let directory = artworkDirectoryURL else { return nil }
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    /// Remove only the managed Trakt artwork directory. This is cache cleanup, never account data;
+    /// still keep the target exact so a broken path can never broaden into the rest of the App Group.
+    static func clearArtworkCache() {
+        guard let directory = artworkDirectoryURL else { return }
+        try? FileManager.default.removeItem(at: directory)
     }
 
     // MARK: Read (extension side)

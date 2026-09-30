@@ -4,6 +4,7 @@ import com.vortx.android.model.MediaRef
 import com.vortx.android.model.Playable
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -42,8 +43,11 @@ class AutoSkipMediaIdentityTest {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
 
         assertTrue(source.contains("val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)"))
-        assertTrue(source.contains("val autoSkippedStarts = remember(autoSkipIdentity)"))
-        assertTrue(source.contains("AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)"))
+        assertTrue(source.contains("var autoSkipCountdown by remember(autoSkipIdentity)"))
+        assertTrue(source.contains("AutoSkipCountdownPolicy.advance("))
+        assertTrue(source.contains("AutoSkipCountdownPolicy.isCurrent("))
+        assertTrue(source.contains("AutoSkipCountdownPolicy.invalidatePending("))
+        assertFalse(source.contains("AutoSkipPolicy.target("))
     }
 
     private fun playable(url: String, ref: MediaRef?) = Playable(

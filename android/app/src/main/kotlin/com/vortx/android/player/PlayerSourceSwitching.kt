@@ -158,6 +158,37 @@ internal data class PlayerEpisodeChoice(
     val selected: Boolean,
 )
 
+/**
+ * A pending resolver is cancellable by selecting a different row. The selected row itself remains
+ * inert, but all other choices stay reachable so a slow or non-cooperative resolver cannot trap the
+ * viewer behind a "Switching" status message.
+ */
+internal fun playerReplacementChoiceEnabled(selected: Boolean): Boolean = !selected
+
+/**
+ * Quarantines a terminal callback observed while an old source is being replaced. If that replacement
+ * fails, the old revision stays visible but its EOF/error is still stale with respect to the viewer's
+ * selection and must not advance an episode or restart the automatic retry ladder. A successful
+ * replacement increments the revision, naturally admitting terminals from the new engine.
+ */
+internal class PlayerTerminalFence {
+    private var quarantinedRevision: Long? = null
+
+    fun suppress(revision: Long, replacementPending: Boolean, terminal: Boolean): Boolean {
+        if (!terminal) return false
+        if (replacementPending) {
+            quarantinedRevision = revision
+            return true
+        }
+        return quarantinedRevision == revision
+    }
+
+    /** A deliberate new picker choice supersedes a failed predecessor's terminal verdict. */
+    fun reopenManualRetry(revision: Long) {
+        if (quarantinedRevision == revision) quarantinedRevision = null
+    }
+}
+
 /// The current-season episodes for the in-player picker, in episode order, with the playing one selected.
 /// Empty for movies / an unmappable ref, so the chrome hides the control. Mirrors Apple's `.episodes` panel.
 internal fun playerEpisodeChoices(

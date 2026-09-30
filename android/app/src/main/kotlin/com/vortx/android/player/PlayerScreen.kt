@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.media.AudioAttributes
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
@@ -51,6 +53,10 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -66,6 +72,7 @@ import com.vortx.android.cast.CastEligibility
 import com.vortx.android.cast.CastOverlay
 import com.vortx.android.cast.CastRouteChooserSheet
 import com.vortx.android.cast.rememberCastManager
+import com.vortx.android.data.PlayerResourceReleaseGate
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
@@ -73,7 +80,10 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.audio.AudioRouteMonitor
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
-import com.vortx.android.skip.AutoSkipPolicy
+import com.vortx.android.skip.AutoSkipCountdownDecision
+import com.vortx.android.skip.AutoSkipCountdownPolicy
+import com.vortx.android.skip.AutoSkipCountdownState
+import com.vortx.android.skip.AutoSkipSegmentKey
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
@@ -88,6 +98,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -120,6 +131,8 @@ fun PlayerScreen(
     /// Live position/duration (ms) callback for progress writeback. The host wires it to the engine so
     /// Continue Watching updates; a no-op by default keeps the screen usable in isolation.
     onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    /** Fired once only after this screen's final decoder and every bound playback lease are released. */
+    onResourcesReleased: () -> Unit = {},
     /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
     /// to [onBack] (return to the detail page, which shows the sources).
     onError: () -> Unit = onBack,
@@ -188,6 +201,9 @@ fun PlayerScreen(
     val currentOnWarmNext by rememberUpdatedState(onWarmNext)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
+    // EOF/error received from the outgoing engine while a source replacement resolves must remain
+    // quarantined even if that resolver later fails and exposes the old revision again.
+    val sourceTerminalFence = remember(outerPlaybackSessionId) { PlayerTerminalFence() }
     // Every exit surface, including system Back while the engine is still connecting, funnels through
     // this one idempotent route. The outer shell still owns navigation state, but it must not receive a
     // second Back while the first callback is waiting for composition to remove this player.
@@ -235,7 +251,10 @@ fun PlayerScreen(
     }
     val currentPlayable = sourceSwitchState.playable
     val playbackSessionKey = sourceSwitchState.sessionKey
-    val playbackIntent = remember(playbackSessionKey) {
+    // Source/episode replacements are still the same viewing session. Keep the viewer's explicit
+    // play/pause decision across their accepted revision; otherwise a paused viewer selecting a new
+    // source gets a fresh default-"play" controller and the replacement starts unexpectedly.
+    val playbackIntent = remember(outerPlaybackSessionId) {
         val background = !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
         val pauseInBackground = !KeepPlayingBackgroundSetting.isEnabled(context)
         PlaybackIntentController(
@@ -247,6 +266,12 @@ fun PlayerScreen(
                 },
             ),
         )
+    }
+    // A successful inner replacement gets a fresh source terminal verdict while retaining the intent
+    // above. Initial playback is harmless (the controller starts non-terminal); failed sources remain
+    // terminal until an accepted replacement changes [playbackSessionKey].
+    LaunchedEffect(playbackSessionKey) {
+        playbackIntent.beginReplacementSource()
     }
     // Focus ownership exists before any engine construction, load, or bind. It is source-session scoped,
     // so an mpv -> Media3 replacement inherits the same blocker and never opens an unowned playback gap.
@@ -424,6 +449,22 @@ fun PlayerScreen(
     // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
     // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
     val engineHolder = remember(playbackSessionKey, forceExoPlayer, enginePreference) { AtomicReference<PlayerEngine?>(null) }
+    // This gate deliberately spans source and episode replacements inside one mounted player. Each
+    // generation registers its immutable host callback below; a release from an old generation must
+    // never be forwarded through a latest-value callback to the new generation's reclaim coordinator.
+    val resourceReleaseGate = remember(outerPlaybackSessionId) {
+        PlayerResourceReleaseGate()
+    }
+    DisposableEffect(resourceReleaseGate, playbackSessionKey) {
+        resourceReleaseGate.registerReleaseCallback(playbackSessionKey, onResourcesReleased)
+        onDispose { }
+    }
+    fun releaseBoundEngine() {
+        engineHolder.getAndSet(null)?.let { engine ->
+            engine.release()
+            resourceReleaseGate.decoderReleased()
+        }
+    }
     var builtEngine by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf<PlayerEngine?>(null) }
     LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         // A user engine switch resumes at the live position; every other rebuild loads the source at its
@@ -441,6 +482,7 @@ fun PlayerScreen(
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
                     engineHolder.set(it)
+                    resourceReleaseGate.decoderBound()
                     prepareAndLoadEngine(
                         it,
                         playableForEngine,
@@ -456,6 +498,7 @@ fun PlayerScreen(
             } ?: ExoPlayerEngine(context).also {
                 // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
                 engineHolder.set(it)
+                resourceReleaseGate.decoderBound()
                 prepareAndLoadEngine(
                     it,
                     playableForEngine,
@@ -469,6 +512,7 @@ fun PlayerScreen(
         } else {
             ExoPlayerEngine(context).also {
                 engineHolder.set(it)
+                resourceReleaseGate.decoderBound()
                 prepareAndLoadEngine(
                     it,
                     playableForEngine,
@@ -483,7 +527,7 @@ fun PlayerScreen(
         if (!isActive) {
             // The player left composition while the engine was still initializing; the dispose below
             // may already have run (and found the holder empty), so this tail owns the release.
-            engineHolder.getAndSet(null)?.release()
+            releaseBoundEngine()
             return@LaunchedEffect
         }
         // withContext above may have returned after ON_STOP. This is the final main-thread publication
@@ -502,7 +546,7 @@ fun PlayerScreen(
         )
     }
     DisposableEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
-        onDispose { engineHolder.getAndSet(null)?.release() }
+        onDispose { releaseBoundEngine() }
     }
 
     // PLAYER ORIENTATION LOCK + IMMERSIVE MODE. A video player presents landscape: request sensor
@@ -579,7 +623,7 @@ fun PlayerScreen(
                 }
                 // Release through the holder's single atomic claim, so a destroy-then-dispose pair can
                 // never double-release the same native engine.
-                Lifecycle.Event.ON_DESTROY -> engineHolder.getAndSet(null)?.release()
+                Lifecycle.Event.ON_DESTROY -> releaseBoundEngine()
                 else -> Unit
             }
         }
@@ -650,6 +694,70 @@ fun PlayerScreen(
 
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
+
+    // Automatic skip is a position-driven, media-scoped state machine. The state is keyed by the
+    // stable title/episode identity (not the source session or URL), so a same-media source failover
+    // retains cancel/completed memory while a new episode gets a clean lifecycle. Every transport seek
+    // below goes through the local choke point, which invalidates a pending countdown before moving the
+    // playhead. The policy itself is pure and never owns a wall-clock timer.
+    val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)
+    var autoSkipCountdown by remember(autoSkipIdentity) {
+        mutableStateOf(AutoSkipCountdownState())
+    }
+    var autoSkipDecision by remember(autoSkipIdentity) {
+        mutableStateOf<AutoSkipCountdownDecision>(AutoSkipCountdownDecision.Idle)
+    }
+    var autoSkipDelaySeconds by remember(autoSkipIdentity) {
+        mutableStateOf(PlaybackBehaviorSettings.autoSkipDelaySeconds(context.applicationContext))
+    }
+    var dismissedSkipStart by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
+    var skipPillFocusedCancel by remember(playbackSessionKey) { mutableStateOf(false) }
+
+    fun invalidateAutoSkipPending(positionMs: Long = latestState.positionMs) {
+        val next = autoSkipCountdown.detachedCopy()
+        AutoSkipCountdownPolicy.invalidatePending(next, positionMs)
+        autoSkipCountdown = next
+        autoSkipDecision = AutoSkipCountdownDecision.Idle
+        skipPillFocusedCancel = false
+    }
+
+    fun seekLocalTo(positionMs: Long) {
+        invalidateAutoSkipPending(engine.state.value.positionMs)
+        engine.seekTo(positionMs)
+    }
+
+    fun seekLocalBy(deltaMs: Long) {
+        invalidateAutoSkipPending(engine.state.value.positionMs)
+        engine.seekBy(deltaMs)
+    }
+
+    // Settings can change while the player remains mounted (including profile sync/restore). Keep one
+    // retained listener for the shared prefs file, refresh the delay immediately, and invalidate only the
+    // in-flight countdown; Off still leaves the manual Skip action available.
+    val autoSkipPreferences = context.applicationContext
+        .getSharedPreferences("vortx_settings", Context.MODE_PRIVATE)
+    DisposableEffect(autoSkipPreferences, autoSkipIdentity, playbackSessionKey, engine) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (
+                key == PlaybackBehaviorSettings.AUTO_SKIP_DELAY_SECONDS_KEY ||
+                    key == PlaybackBehaviorSettings.AUTO_SKIP_KEY
+            ) {
+                autoSkipDelaySeconds = PlaybackBehaviorSettings.autoSkipDelaySeconds(context.applicationContext)
+                invalidateAutoSkipPending(engine.state.value.positionMs)
+            }
+        }
+        autoSkipPreferences.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { autoSkipPreferences.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
+    // A source/session or engine replacement invalidates queued work but deliberately keeps the stable
+    // media's cancelled/completed sets. Switching is also fenced before the new source is accepted.
+    LaunchedEffect(playbackSessionKey, engine, forceExoPlayer, enginePreference) {
+        invalidateAutoSkipPending(engine.state.value.positionMs)
+    }
+    LaunchedEffect(sourceSwitchState.isSwitching) {
+        if (sourceSwitchState.isSwitching) invalidateAutoSkipPending(engine.state.value.positionMs)
+    }
 
     // DEFAULT VOLUME + MUTE applied to the live engine at load (Apple `applyPersistedVolume`): the mount
     // begins at the engine default (100%), so restore the viewer's chosen level. Keyed on the engine so a
@@ -725,11 +833,12 @@ fun PlayerScreen(
     LaunchedEffect(castState.isConnected) {
         if (castState.isConnected) {
             wasCasting = true
+            invalidateAutoSkipPending(engine.state.value.positionMs)
             playbackIntent.setBlocked(PlaybackBlocker.CAST, true)
         } else if (wasCasting) {
             wasCasting = false
             val resumeAt = castManager.lastKnownPositionMs
-            if (resumeAt > 0L) engine.seekTo(resumeAt)
+            if (resumeAt > 0L) seekLocalTo(resumeAt)
             playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
         }
     }
@@ -757,7 +866,12 @@ fun PlayerScreen(
             resolver = { source -> resolver?.invoke(source) ?: Result.failure(IllegalStateException()) },
             currentState = { sourceSwitchState },
             latestPositionMs = { latestState.positionMs },
-            publishState = { sourceSwitchState = it },
+            publishState = { replacement ->
+                // Keep the old frame alive while resolving, then cut its audio at the linearized
+                // accepted replacement boundary. An already-paused viewer remains paused.
+                if (replacement.revision > sourceSwitchState.revision) engine.pause()
+                sourceSwitchState = replacement
+            },
         )
     }
     // In-player EPISODE switch resolver: same coordinator/authority machinery as the source switch, but
@@ -773,6 +887,7 @@ fun PlayerScreen(
             currentState = { sourceSwitchState },
             publishState = { accepted ->
                 val previous = sourceSwitchState
+                if (accepted.revision > previous.revision) engine.pause()
                 sourceSwitchState = accepted
                 acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->
                     currentOnEpisodeSwitched(replacement.playable, replacement.revision)
@@ -967,11 +1082,70 @@ fun PlayerScreen(
     var gestureHud by remember(playbackSessionKey) { mutableStateOf<PlayerGestureHud?>(null) }
     LaunchedEffect(pip.isInPip) {
         if (pip.isInPip) {
+            invalidateAutoSkipPending(engine.state.value.positionMs)
             controlsVisible = false
             gestureHud = null
         } else {
             showControls()
         }
+    }
+
+    fun isCurrentAutoSkipAction(owner: AutoSkipActionOwner, segment: SkipSegment): Boolean {
+        val current = owner.engine.state.value
+        val positionSec = current.positionMs.coerceAtLeast(0L) / 1000.0
+        return builtEngine === owner.engine &&
+            engine === owner.engine &&
+            engineHolder.get() === owner.engine &&
+            playbackSessionKey == owner.sessionKey &&
+            autoSkipIdentity == owner.mediaId &&
+            autoSkipCountdown.activeSegment == AutoSkipSegmentKey(segment) &&
+            positionSec >= segment.start &&
+            positionSec < segment.end &&
+            !sourceSwitchState.isSwitching &&
+            !playerExitRequested &&
+            !controlsLocked &&
+            !pip.isInPip &&
+            !castState.isConnected &&
+            !effectiveError &&
+            !current.hasEnded &&
+            AutoSkipCountdownPolicy.isCurrent(
+                state = autoSkipCountdown,
+                mediaId = owner.mediaId,
+                segment = segment,
+                epoch = owner.epoch,
+            )
+    }
+
+    fun manualSkip(segment: SkipSegment, owner: AutoSkipActionOwner) {
+        if (!isCurrentAutoSkipAction(owner, segment)) return
+        val upperBound = latestState.durationMs.takeIf { it > 0L }
+        val target = (segment.end * 1000.0).roundToLong()
+            .coerceAtLeast(0L)
+            .let { candidate -> upperBound?.let { candidate.coerceAtMost(it) } ?: candidate }
+        // A manual action is terminal for this exact segment, but it still fences any queued automatic
+        // seek before the engine receives the viewer's target.
+        val next = autoSkipCountdown.detachedCopy()
+        AutoSkipCountdownPolicy.bindMedia(next, autoSkipIdentity)
+        AutoSkipCountdownPolicy.complete(next, segment)
+        AutoSkipCountdownPolicy.invalidatePending(next, latestState.positionMs)
+        engine.seekTo(target)
+        autoSkipCountdown = next
+        autoSkipDecision = AutoSkipCountdownDecision.Idle
+        skipPillFocusedCancel = false
+        dismissedSkipStart = null
+    }
+
+    fun cancelAutomaticSkip(segment: SkipSegment, owner: AutoSkipActionOwner) {
+        if (!isCurrentAutoSkipAction(owner, segment)) return
+        val next = autoSkipCountdown.detachedCopy()
+        AutoSkipCountdownPolicy.bindMedia(next, autoSkipIdentity)
+        AutoSkipCountdownPolicy.cancel(next, segment)
+        autoSkipCountdown = next
+        autoSkipDecision = AutoSkipCountdownDecision.Idle
+        skipPillFocusedCancel = false
+        // The same suppression memory also protects a source failover. This extra start marker preserves
+        // the existing TV hidden-chrome affordance semantics until the next segment is entered.
+        if (isTvPlayer) dismissedSkipStart = segment.start
     }
 
     // System MediaSession over the live engine: headset/Bluetooth transport, the Android TV
@@ -994,8 +1168,16 @@ fun PlayerScreen(
     // it would resolve and play foreign sources over this session's file (AND-DL-01). The error
     // overlay remains the recovery surface.
     var sourceFailureDispatched by remember(playbackSessionKey) { mutableStateOf(false) }
-    LaunchedEffect(effectiveError) {
-        if (!effectiveError || sourceFailureDispatched || isLocalSession) return@LaunchedEffect
+    LaunchedEffect(playbackSessionKey, effectiveError, sourceSwitchState.isSwitching, playerExitRequested) {
+        if (
+            !effectiveError || sourceFailureDispatched || isLocalSession ||
+                sourceTerminalFence.suppress(
+                    revision = sourceSwitchState.revision,
+                    replacementPending = sourceSwitchState.isSwitching,
+                    terminal = effectiveError,
+                ) ||
+                playerExitRequested
+        ) return@LaunchedEffect
         val dispatch = currentOnSourceFailed ?: return@LaunchedEffect
         sourceFailureDispatched = true
         dispatch(latestState.positionMs.coerceAtLeast(0L))
@@ -1038,7 +1220,6 @@ fun PlayerScreen(
     var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
     val mountedAddonSubs = remember(playbackSessionKey, engine) { mutableSetOf<String>() }
     var pendingSubSelectAbove by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
-    var userPickedSubtitle by remember(playbackSessionKey) { mutableStateOf(false) }
     fun mountAddonSubtitle(sub: AddonSubtitle) {
         if (mountedAddonSubs.add(sub.url)) {
             pendingSubSelectAbove = latestState.subtitleTracks.size
@@ -1073,11 +1254,10 @@ fun PlayerScreen(
         }
     }
 
-    // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
-    // reports its track list, pick the audio + subtitle track per the persisted TrackPreferences, exactly
-    // ONCE per load. This closes the "manual select only" parity gap. A nil audio pick leaves the engine's
-    // own default; a -1 subtitle pick means "off". Runs after the engine's own default selection, so it
-    // overrides toward the user's language chain (e.g. a Turkish-only preference beats a French dub, #76).
+    // Preference-driven auto track selection (the Android port of Apple TrackSelector). Audio and subtitle
+    // inventories can arrive independently, so each type gets one default decision once *its own*
+    // selectable inventory appears. A viewer's manual or external subtitle pick holds that type until this
+    // loaded engine is replaced; a late inventory must not clobber manual Off or a selected add-on track.
     val trackPreferences = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
     }
@@ -1086,12 +1266,15 @@ fun PlayerScreen(
     val matchAudioSub = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
     }
-    var autoSelectDone by remember(playbackSessionKey, engine) { mutableStateOf(false) }
-    LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks) {
-        if (autoSelectDone) return@LaunchedEffect
+    var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
+    LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks, trackSelectionPhases) {
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
-        if (audioTracks.isEmpty() && subtitleTracks.isEmpty()) return@LaunchedEffect
+        val defaults = trackSelectionPhases.automaticDefaults(
+            hasSelectableAudio = audioTracks.isNotEmpty(),
+            hasSelectableSubtitle = subtitleTracks.isNotEmpty(),
+        )
+        if (defaults.isEmpty) return@LaunchedEffect
         val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences, matchAudioSub)
         // Fidelity refinement: among same-language audio tracks, honour the channel layout the active
         // output route can render, the tie-break Apple's picker cannot make (TrackSelector.swift documents
@@ -1102,25 +1285,30 @@ fun PlayerScreen(
             trackPreferences.rejectTerms,
             com.vortx.android.player.audio.AudioRoute.current(context),
         )
-        audioId?.let { engine.selectAudioTrack(it) }
-        val subId = pick.subtitleId
-        if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
-        autoSelectDone = true
+        if (defaults.selectAudio) audioId?.let { engine.selectAudioTrack(it) }
+        if (defaults.selectSubtitle) {
+            val subId = pick.subtitleId
+            if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
+        }
+        trackSelectionPhases = trackSelectionPhases.apply(defaults)
     }
 
-    var autoAddonSubtitleTried by remember(playbackSessionKey, engine) { mutableStateOf(false) }
     val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
-    LaunchedEffect(playbackSessionKey, engine, autoSelectDone, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
-        if (!autoSelectDone || autoAddonSubtitleTried || userPickedSubtitle || addonSubtitles.isEmpty()) return@LaunchedEffect
+    LaunchedEffect(playbackSessionKey, engine, trackSelectionPhases, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
+        if (addonSubtitles.isEmpty() || !trackSelectionPhases.mayAttemptAddon(latestState.subtitleTracks.isNotEmpty())) {
+            return@LaunchedEffect
+        }
         if (!TrackSelector.wantsExternalSubtitle(latestState.audioTracks, latestState.subtitleTracks,
                 trackPreferences, preferAddonSubtitles, matchAudioSub)) {
-            autoAddonSubtitleTried = true
+            trackSelectionPhases = trackSelectionPhases.recordAddonAttempt()
             return@LaunchedEffect
         }
         val sub = trackPreferences.subtitleLanguages.asSequence().mapNotNull { language ->
             addonSubtitles.firstOrNull { TrackSelector.matches(it.lang, language) }
         }.firstOrNull() ?: return@LaunchedEffect
-        autoAddonSubtitleTried = true
+        // Reserve before mounting: the engine publishes a new inventory for the sidecar, which recomposes
+        // this effect. The reservation prevents a second automatic overlay for the same loaded engine.
+        trackSelectionPhases = trackSelectionPhases.recordAddonSelection()
         mountAddonSubtitle(sub)
     }
 
@@ -1139,7 +1327,6 @@ fun PlayerScreen(
     // TV skip-pill dismissal (Back-to-dismiss while the chrome is hidden): the `start` of the segment the
     // viewer waved off, so its pill stays hidden until the next segment. Reset per playback session and
     // cleared on a skip. Only ever set on TV (isTvPlayer); the phone leaves it null so the pill is unchanged.
-    var dismissedSkipStart by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
     LaunchedEffect(playbackSessionKey, playerState.durationMs > 0L) {
         val ref = currentPlayable.mediaRef
         val imdb = ref?.imdb
@@ -1156,19 +1343,102 @@ fun PlayerScreen(
         skipSegments = SegmentResolver.resolve(candidates, durationSec)
     }
 
-    // Keep the once-per-segment memory across same-episode source failover. A URL is source identity, not
-    // media identity; two failed sources for one episode must not cause the same intro to auto-skip twice.
-    val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)
-    val autoSkipEnabled = remember(autoSkipIdentity) {
-        PlaybackBehaviorSettings.autoSkip(context.applicationContext)
-    }
-    val autoSkippedStarts = remember(autoSkipIdentity) { mutableSetOf<Double>() }
-    LaunchedEffect(autoSkipEnabled, skipSegments, playerState.positionMs / 1000L) {
-        if (!autoSkipEnabled) return@LaunchedEffect
-        val target = AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)
-            ?: return@LaunchedEffect
-        autoSkippedStarts += target.start
-        engine.seekTo((target.end * 1000).toLong())
+    // Advance only from real engine telemetry. A paused, buffering, terminal, replacing, cast, PiP,
+    // locked, errored, or exiting player cannot spend countdown time. The decision is retained as Compose
+    // state so its actual five-second (or user-selected) remaining value drives the visible prompt.
+    LaunchedEffect(
+        autoSkipIdentity,
+        autoSkipDelaySeconds,
+        skipSegments,
+        playerState.positionMs,
+        playerState.isPaused,
+        playerState.isBuffering,
+        playerState.hasEnded,
+        effectiveError,
+        sourceSwitchState.isSwitching,
+        castState.isConnected,
+        pip.isInPip,
+        controlsLocked,
+        playerExitRequested,
+        engine,
+    ) {
+        val positionMs = latestState.positionMs.coerceAtLeast(0L)
+        val activeSegment = activeSkipSegment(skipSegments, positionMs)
+        val engineMounted = builtEngine === engine && engineHolder.get() === engine
+        val playbackActive = engineMounted &&
+            playbackIntent.snapshot().shouldPlay &&
+            !latestState.isPaused &&
+            !latestState.isBuffering &&
+            !latestState.hasEnded &&
+            !effectiveError &&
+            !sourceSwitchState.isSwitching &&
+            !castState.isConnected &&
+            !pip.isInPip &&
+            !controlsLocked &&
+            !playerExitRequested
+        val expectedMedia = autoSkipIdentity
+        val expectedSession = playbackSessionKey
+        val expectedEngine = engine
+        // Never mutate the object currently held by Compose. The policy mutates its state in place, so
+        // each telemetry sample gets a detached working copy and publishes that replacement atomically.
+        val nextCountdown = autoSkipCountdown.detachedCopy()
+        val decision = AutoSkipCountdownPolicy.advance(
+            state = nextCountdown,
+            mediaId = expectedMedia,
+            segment = activeSegment,
+            positionMs = positionMs,
+            durationMs = latestState.durationMs.takeIf { it > 0L },
+            playbackActive = playbackActive,
+            delaySeconds = autoSkipDelaySeconds.toDouble(),
+        )
+        autoSkipCountdown = nextCountdown
+        autoSkipDecision = decision
+
+        if (decision is AutoSkipCountdownDecision.Skip && activeSegment != null) {
+            // Re-check all ownership immediately before the seek. A source switch, user seek, engine
+            // replacement, or cast/PiP transition may have invalidated this decision since the sample.
+            val currentEngineState = expectedEngine.state.value
+            val currentPositionSec = currentEngineState.positionMs.coerceAtLeast(0L) / 1000.0
+            val stillCurrent = autoSkipCountdown.mediaId == expectedMedia &&
+                AutoSkipCountdownPolicy.isCurrent(
+                    state = autoSkipCountdown,
+                    mediaId = expectedMedia,
+                    segment = activeSegment,
+                    epoch = decision.epoch,
+                ) &&
+                playbackSessionKey == expectedSession &&
+                builtEngine === expectedEngine &&
+                engineHolder.get() === expectedEngine &&
+                playbackIntent.snapshot().shouldPlay &&
+                !currentEngineState.isPaused &&
+                !currentEngineState.isBuffering &&
+                !currentEngineState.hasEnded &&
+                currentPositionSec >= activeSegment.start &&
+                currentPositionSec < activeSegment.end &&
+                !effectiveError &&
+                !sourceSwitchState.isSwitching &&
+                !castState.isConnected &&
+                !pip.isInPip &&
+                !controlsLocked &&
+                !playerExitRequested &&
+                engineMounted &&
+                playbackActive
+            if (stillCurrent) {
+                expectedEngine.seekTo(decision.targetPositionMs)
+                val committedCountdown = autoSkipCountdown.detachedCopy()
+                if (
+                    AutoSkipCountdownPolicy.completeIfCurrent(
+                        state = committedCountdown,
+                        segment = activeSegment,
+                        epoch = decision.epoch,
+                    )
+                ) {
+                    autoSkipCountdown = committedCountdown
+                    autoSkipDecision = AutoSkipCountdownDecision.Idle
+                    skipPillFocusedCancel = false
+                }
+            }
+        }
     }
 
     // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:
@@ -1237,9 +1507,18 @@ fun PlayerScreen(
     DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
     }
+    // A final proof is scoped to the mounted player, not an accepted source/episode replacement.
+    // The gate still waits for every decoder and lease counted by the entire outer session.
+    DisposableEffect(outerPlaybackSessionId) {
+        onDispose { resourceReleaseGate.sessionDisposed() }
+    }
     // A replacement, back navigation, profile change, or composition teardown releases a native NZB producer.
     DisposableEffect(currentPlayable.playbackLease) {
-        onDispose { runCatching { currentPlayable.playbackLease?.close() } }
+        currentPlayable.playbackLease?.let { resourceReleaseGate.leaseBound() }
+        onDispose {
+            runCatching { currentPlayable.playbackLease?.close() }
+            resourceReleaseGate.leaseReleased()
+        }
     }
 
     // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
@@ -1256,9 +1535,17 @@ fun PlayerScreen(
     // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
     // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
     // auto-advance, whichever engine reported the EOF.
-    LaunchedEffect(playerState.hasEnded) {
+    LaunchedEffect(playbackSessionKey, playerState.hasEnded, sourceSwitchState.isSwitching, playerExitRequested) {
         val s = latestState
-        if (!playerState.hasEnded || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
+        if (
+            !playerState.hasEnded || s.hasError || stallError || runtimeMismatch ||
+                sourceTerminalFence.suppress(
+                    revision = sourceSwitchState.revision,
+                    replacementPending = sourceSwitchState.isSwitching,
+                    terminal = playerState.hasEnded,
+                ) ||
+                playerExitRequested
+        ) return@LaunchedEffect
         // A userForcedSource play skips the conversion (the viewer chose this exact file off the
         // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
         // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
@@ -1414,12 +1701,12 @@ fun PlayerScreen(
                     }
                     Key.MediaFastForward -> {
                         showControls()
-                        engine.seekBy(seekStepMs)
+                        seekLocalBy(seekStepMs)
                         return@onKeyEvent true
                     }
                     Key.MediaRewind -> {
                         showControls()
-                        engine.seekBy(-seekStepMs)
+                        seekLocalBy(-seekStepMs)
                         return@onKeyEvent true
                     }
                     else -> Unit
@@ -1445,21 +1732,43 @@ fun PlayerScreen(
                     // pill (rather than leaving the player), so the couch reaches the skip without raising the
                     // whole transport bar. The phone host passes isTvPlayer=false, so this is inert there and
                     // Back keeps its "leave the player" meaning.
-                    val posSec = latestState.positionMs / 1000.0
                     val activeSkip = if (isTvPlayer) {
-                        skipSegments.filter { posSec >= it.start && posSec < it.end }.minByOrNull { it.start }
+                        activeSkipSegment(skipSegments, latestState.positionMs)
                     } else {
                         null
                     }
-                    if (activeSkip != null && activeSkip.start != dismissedSkipStart) {
+                    val skipPillVisible = activeSkip != null &&
+                        activeSkip.start != dismissedSkipStart &&
+                        !autoSkipCountdown.isSuppressed(activeSkip)
+                    val countdownPromptVisible = skipPillVisible &&
+                        (autoSkipDecision as? AutoSkipCountdownDecision.Prompt)
+                            ?.segment == activeSkip?.let(::AutoSkipSegmentKey)
+                    val activeSkipOwner = activeSkip?.let {
+                        AutoSkipActionOwner(
+                            mediaId = autoSkipIdentity,
+                            sessionKey = playbackSessionKey,
+                            engine = engine,
+                            epoch = autoSkipCountdown.epoch,
+                        )
+                    }
+                    if (skipPillVisible) {
                         when (event.key) {
                             Key.Back, Key.Escape -> {
-                                dismissedSkipStart = activeSkip.start
+                                cancelAutomaticSkip(activeSkip!!, activeSkipOwner!!)
                                 return@onKeyEvent true
                             }
                             Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
-                                engine.seekTo((activeSkip.end * 1000).toLong())
-                                dismissedSkipStart = null
+                                if (countdownPromptVisible && skipPillFocusedCancel) {
+                                    cancelAutomaticSkip(activeSkip!!, activeSkipOwner!!)
+                                } else {
+                                    manualSkip(activeSkip!!, activeSkipOwner!!)
+                                }
+                                return@onKeyEvent true
+                            }
+                            Key.DirectionLeft, Key.DirectionRight -> if (countdownPromptVisible) {
+                                // With a live countdown, Left/Right chooses the primary action or the
+                                // reachable X; without a countdown (Off), those keys retain seek meaning.
+                                skipPillFocusedCancel = event.key == Key.DirectionRight
                                 return@onKeyEvent true
                             }
                             else -> Unit
@@ -1473,7 +1782,7 @@ fun PlayerScreen(
                     if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
                         val forward = event.key == Key.DirectionRight
                         val delta = if (forward) seekStepMs else -seekStepMs
-                        engine.seekBy(delta)
+                        seekLocalBy(delta)
                         // The pill shows the predicted target; the engine clamps the real seek to the file.
                         seekNudgeTargetMs = (latestState.positionMs + delta).coerceAtLeast(0L)
                         seekNudgeTick++
@@ -1525,7 +1834,7 @@ fun PlayerScreen(
                             onDoubleTap = { offset ->
                                 val forward = offset.x >= size.width / 2
                                 // The double-tap step follows the viewer's Skip step (Apple `stremiox.seekStep`).
-                                engine.seekBy(if (forward) seekStepMs else -seekStepMs)
+                                seekLocalBy(if (forward) seekStepMs else -seekStepMs)
                                 showControls()
                             },
                         )
@@ -1545,7 +1854,7 @@ fun PlayerScreen(
                         onVolumeFraction = { setPlayerVolume((it * 100.0)) },
                         onSeekCommit = { target ->
                             showControls()
-                            engine.seekTo(target)
+                            seekLocalTo(target)
                         },
                         onHud = { gestureHud = it },
                     )
@@ -1638,12 +1947,16 @@ fun PlayerScreen(
                     currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
                 )
             },
-            onSeek = { showControls(); engine.seekTo(it) },
-            onSeekBy = { showControls(); engine.seekBy(it) },
-            onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
+            onSeek = { showControls(); seekLocalTo(it) },
+            onSeekBy = { showControls(); seekLocalBy(it) },
+            onSelectAudio = {
+                showControls()
+                trackSelectionPhases = trackSelectionPhases.holdAudio()
+                engine.selectAudioTrack(it)
+            },
             onSelectSubtitle = {
                 showControls()
-                userPickedSubtitle = true
+                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 pendingSubSelectAbove = null
                 engine.selectSubtitleTrack(it)
             },
@@ -1669,9 +1982,9 @@ fun PlayerScreen(
                 val resolver = currentOnSwitchSource
                 if (
                     resolver != null &&
-                    !sourceSwitchState.isSwitching &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
+                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                         sourceSwitchState = beginPlayerSourceSwitch(
                             state = sourceSwitchState,
@@ -1686,11 +1999,11 @@ fun PlayerScreen(
                 val currentRef = sourceSwitchState.playable.mediaRef
                 if (
                     resolver != null &&
-                    !sourceSwitchState.isSwitching &&
                     !(currentRef?.isSeries == true &&
                         currentRef.season == episode.season &&
                         currentRef.episode == episode.episode)
                 ) {
+                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
                         sourceSwitchState = beginPlayerEpisodeSwitch(
                             state = sourceSwitchState,
@@ -1731,7 +2044,7 @@ fun PlayerScreen(
             addonSubtitles = addonSubtitles,
             onSelectAddonSubtitle = { sub ->
                 showControls()
-                userPickedSubtitle = true
+                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 mountAddonSubtitle(sub)
             },
             // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
@@ -1741,7 +2054,7 @@ fun PlayerScreen(
             secondarySubtitleId = engine.secondarySubtitleId,
             onSelectSecondarySubtitle = { id ->
                 showControls()
-                userPickedSubtitle = true
+                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 pendingSubSelectAbove = null
                 engine.setSecondarySubtitleTrack(id)
             },
@@ -1809,17 +2122,35 @@ fun PlayerScreen(
 
         // The Skip Intro / Skip Recap / Skip Credits affordance, drawn OVER the chrome (declared last) at
         // the bottom-right, clear of the transport bar. Shows only while the playhead sits inside a
-        // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same [seekTo] the
-        // scrubber does), so it works identically on libmpv and ExoPlayer.
+        // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same local seek
+        // fence the scrubber does), so it works identically on libmpv and ExoPlayer.
         // While locked, the skip affordance is withheld too: it is a tappable seek, exactly the class
         // of accidental input the lock exists to prevent. Withheld in PiP for the same reason the
         // chrome is: nothing in the small window is tappable by the app.
-        if (!controlsLocked && !pip.isInPip) {
+        if (
+            !controlsLocked &&
+            !pip.isInPip &&
+            !castState.isConnected &&
+            !effectiveError &&
+            !playerState.hasEnded &&
+            !sourceSwitchState.isSwitching &&
+            !playerExitRequested
+        ) {
+            val skipActionOwner = AutoSkipActionOwner(
+                mediaId = autoSkipIdentity,
+                sessionKey = playbackSessionKey,
+                engine = engine,
+                epoch = autoSkipCountdown.epoch,
+            )
             SkipButton(
                 segments = skipSegments,
                 positionMs = playerState.positionMs,
                 emberAccent = emberAccent,
-                onSkip = engine::seekTo,
+                decision = autoSkipDecision,
+                countdownState = autoSkipCountdown,
+                cancelFocused = skipPillFocusedCancel,
+                onSkip = { segment -> manualSkip(segment, skipActionOwner) },
+                onCancel = { segment -> cancelAutomaticSkip(segment, skipActionOwner) },
                 // TV Back-to-dismiss hides this segment's pill; null on phone leaves it always visible.
                 dismissedStart = dismissedSkipStart,
             )
@@ -1943,56 +2274,115 @@ fun PlayerScreen(
     }
 }
 
+private data class AutoSkipActionOwner(
+    val mediaId: String,
+    val sessionKey: PlayerPlaybackSessionKey,
+    val engine: PlayerEngine,
+    val epoch: Long,
+)
+
+private fun activeSkipSegment(segments: List<SkipSegment>, positionMs: Long): SkipSegment? {
+    val positionSec = positionMs.coerceAtLeast(0L) / 1000.0
+    return segments
+        .asSequence()
+        .filter { positionSec >= it.start && positionSec < it.end }
+        .minByOrNull { it.start }
+}
+
 /// The Skip Intro / Skip Recap / Skip Credits button. Renders only while the playhead is inside one of the
 /// resolved [segments]; a tap seeks to that segment's end (ms). Positioned bottom-right, above the
 /// transport bar, as ember glass matching the player's other badges. The active-segment recompute is keyed
 /// on the whole SECOND (not the raw ms position) so it re-derives at most once per second, not per frame.
+/// A live countdown gets a separate, reachable 48dp X action; Off keeps the manual Skip pill without X.
 @Composable
 private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
     segments: List<SkipSegment>,
     positionMs: Long,
     emberAccent: Color,
-    onSkip: (Long) -> Unit,
+    decision: AutoSkipCountdownDecision,
+    countdownState: AutoSkipCountdownState,
+    cancelFocused: Boolean,
+    onSkip: (SkipSegment) -> Unit,
+    onCancel: (SkipSegment) -> Unit,
     modifier: Modifier = Modifier,
     // The `start` of a segment the TV viewer dismissed with Back while the chrome was hidden; its pill stays
     // hidden until the next segment. Null (the phone default) never hides the pill.
     dismissedStart: Double? = null,
 ) {
     if (segments.isEmpty()) return
-    val positionSec = positionMs / 1000.0
-    // At most one segment applies at a time after the resolver's clamps (intro/recap sit early, credits/
-    // preview in the back half); if two overlapped, the earliest-starting wins so "Skip Intro" beats a
-    // stray late span.
-    val active = remember(segments, positionSec.toLong()) {
-        segments.filter { positionSec >= it.start && positionSec < it.end }.minByOrNull { it.start }
+    val active = remember(segments, positionMs / 1000L) {
+        activeSkipSegment(segments, positionMs)
     } ?: return
-    if (active.start == dismissedStart) return
-    // WHY audit 06.5: derive from the pill's existing whole-second tick so phone and TV count down cheaply.
-    val remainingSeconds = kotlin.math.ceil(active.end - positionSec).toInt().coerceAtLeast(1)
-    val displayLabel = "${active.label} - ${remainingSeconds}s"
+    if (active.start == dismissedStart || countdownState.isSuppressed(active)) return
+    val activeKey = AutoSkipSegmentKey(active)
+    val remainingSeconds = (decision as? AutoSkipCountdownDecision.Prompt)
+        ?.takeIf { it.segment == activeKey }
+        ?.remainingSeconds
+        ?.let { kotlin.math.ceil(it).toInt().coerceAtLeast(1) }
+    val displayLabel = remainingSeconds?.let { "${active.label} in ${it}s" } ?: active.label
+    val cancelActionSelected = remainingSeconds != null && cancelFocused
+    val primaryActionSelected = !cancelActionSelected
 
     Row(
         modifier = modifier
             .align(Alignment.BottomEnd)
             .padding(end = 20.dp, bottom = 96.dp)
-            .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
-            .clickable { onSkip((active.end * 1000).toLong()) }
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 0.dp, vertical = 0.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Icon(
-            imageVector = Icons.Filled.SkipNext,
-            contentDescription = displayLabel,
-            tint = Color.White,
-            modifier = Modifier.size(18.dp),
-        )
-        Text(
-            text = displayLabel,
-            color = Color.White,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 14.sp,
-        )
+        Row(
+            modifier = Modifier
+                .sizeIn(minHeight = 48.dp)
+                .vortxGlassProminent(
+                    shape = RoundedCornerShape(10.dp),
+                    tint = if (primaryActionSelected) emberAccent else emberAccent.copy(alpha = 0.45f),
+                )
+                .clickable(role = Role.Button) { onSkip(active) }
+                .semantics {
+                    contentDescription = displayLabel
+                    selected = primaryActionSelected
+                }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.SkipNext,
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = displayLabel,
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 14.sp,
+            )
+        }
+        if (remainingSeconds != null) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .vortxGlassProminent(
+                        shape = RoundedCornerShape(10.dp),
+                        tint = if (cancelActionSelected) emberAccent else emberAccent.copy(alpha = 0.45f),
+                    )
+                    .clickable(role = Role.Button) { onCancel(active) }
+                    .semantics {
+                        contentDescription = "Cancel automatic ${active.label.lowercase()}"
+                        selected = cancelActionSelected
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "×",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 24.sp,
+                )
+            }
+        }
     }
 }
 

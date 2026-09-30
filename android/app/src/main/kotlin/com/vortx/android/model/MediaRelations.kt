@@ -23,16 +23,50 @@ data class MediaRelation(val kind: Kind, val item: MetaItem) {
             val parts = path.removePrefix("/").split('/')
             if (parts.size != 3 || !parts[0].equals("detail", true)) return null
             if (parts.any { '?' in it || '#' in it }) return null
-            // Decode each path component once, keeping '+' literal and rejecting encoded slashes.
+            // Decode each path component once, keeping '+' literal. An encoded slash is still rejected
+            // after decoding so an opaque id cannot escape its one route component.
             fun decode(value: String): String? = runCatching { URI("x://local/$value").path.removePrefix("/") }.getOrNull()
             val rawType = decode(parts[1])?.lowercase(Locale.ROOT) ?: return null
-            // Android's typed detail router cannot yet preserve custom types (including "anime").
-            // Anime add-ons using the standard series route and namespaced IDs work unchanged.
-            val type = when (rawType) { "movie" -> MediaType.MOVIE; "series" -> MediaType.SERIES; else -> return null }
+            // Match Apple's route-token contract before applying Android's typed normalization. This keeps
+            // a malformed token such as `custom type` from becoming a valid anime route merely because its
+            // id happens to use a recognized scheme.
+            if (rawType.isEmpty() || rawType.any { !(it in 'a'..'z' || it in '0'..'9' || it == '_' || it == '-') }) {
+                return null
+            }
             val id = decode(parts[2]) ?: return null
-            if (id.isBlank() || id.any { it == '/' || it == '?' || it == '#' || it.isISOControl() }) return null
+            if (id.isBlank() || id.any { it == '/' || it.isISOControl() }) return null
+            val type = normalizeType(rawType, id) ?: return null
             return MediaRelation(kind, MetaItem(id = id, type = type, name = name.trim()))
         }
+
+        /**
+         * The shared Apple route keeps the add-on's type token verbatim. Android's detail route is typed,
+         * so normalize only values whose meaning is explicit or whose id carries an unambiguous scheme.
+         * In particular, an arbitrary custom type must not fall through to MOVIE: IMDb and bare TMDB ids do
+         * not tell us whether the target is a film or a show. Anime is a series in the detail/player model,
+         * matching Apple's anime-through-the-series-path behavior.
+         */
+        private fun normalizeType(rawType: String, id: String): MediaType? {
+            when (rawType) {
+                "movie" -> return MediaType.MOVIE
+                "series", "anime" -> return MediaType.SERIES
+                "channel", "channels" -> return MediaType.CHANNEL
+                "tv", "events", "event", "sport", "sports", "live", "linear", "iptv" -> {
+                    return MediaType.TV
+                }
+            }
+
+            val loweredId = id.lowercase(Locale.ROOT)
+            return when {
+                ANIME_ID_SCHEMES.any(loweredId::startsWith) -> MediaType.SERIES
+                loweredId.startsWith("tvdb:") -> MediaType.SERIES
+                loweredId.startsWith("tmdb:movie:") -> MediaType.MOVIE
+                loweredId.startsWith("tmdb:tv:") -> MediaType.SERIES
+                else -> null
+            }
+        }
+
+        private val ANIME_ID_SCHEMES = listOf("kitsu:", "anilist:", "mal:", "anidb:")
 
         fun visible(relations: List<MediaRelation>, selfIds: Set<String>): List<MediaRelation> =
             relations.filterNot { it.item.id in selfIds }.distinctBy { it.item.type to it.item.id }

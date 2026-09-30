@@ -11,6 +11,7 @@ import com.vortx.android.data.CatalogRepository
 import com.vortx.android.data.ContinueWatchingDismissal
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.ContinueWatchingSnapshot
+import com.vortx.android.data.DurableWatchedPlaybackReceipt
 import com.vortx.android.data.HomeSnapshot
 import com.vortx.android.data.HomeUpdate
 import com.vortx.android.data.PlaybackSessionToken
@@ -393,6 +394,8 @@ internal data class PlaybackHistorySession(
     val overlayMetaId: String?,
     val name: String?,
     val poster: String?,
+    /** Retained verbatim for a local-play durable receipt; never rebuilt from ambient engine state. */
+    val playbackContext: PlaybackContext? = null,
     /// True when the identity was bound EXPLICITLY from an immutable local [PlaybackContext] at
     /// begin time. Such a session never scrapes resident metadata, and its end must skip the
     /// resident-keyed MarkVideoAsWatched / MarkAsWatched belt-and-suspenders: after a stream-A then
@@ -2453,6 +2456,9 @@ class EngineStremioRepository(
         ) { token ->
             historyOwnerFence.mutate(expectedOwner = if (context != null) ownerToken else null) { owner ->
                 if (context != null) {
+                    check(context.owner == PlaybackContext.Owner(owner.profileId, owner.usesEngineHistory)) {
+                        "Local playback context owner changed before history session began."
+                    }
                     val route = historyRouteLocked(owner)
                     val engineRoute = route is HistoryRoute.Engine
                     if (engineRoute) {
@@ -2469,6 +2475,7 @@ class EngineStremioRepository(
                         overlayMetaId = if (route is HistoryRoute.Overlay) context.contentId else null,
                         name = context.title,
                         poster = context.poster,
+                        playbackContext = context,
                         localIdentityBound = true,
                     )
                 } else {
@@ -2550,7 +2557,14 @@ class EngineStremioRepository(
         session: PlaybackSessionToken,
         positionMs: Long,
         durationMs: Long,
-    ): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+    ): Result<Unit> = endPlaybackSessionWithDurableWatchReceipt(session, positionMs, durationMs).map { Unit }
+
+    override suspend fun endPlaybackSessionWithDurableWatchReceipt(
+        session: PlaybackSessionToken,
+        positionMs: Long,
+        durationMs: Long,
+    ): Result<DurableWatchedPlaybackReceipt?> = withContext(Dispatchers.Default) { runCatching {
+        var durableWatch: DurableWatchedPlaybackReceipt? = null
         playbackHistorySessions.finish(session) { active ->
             try {
                 historyOwnerFence.mutate(expectedOwner = active.owner) { owner ->
@@ -2560,25 +2574,33 @@ class EngineStremioRepository(
                             if (metaId != null && durationMs > 0L && positionMs >= 0L) {
                                 val videoId = active.videoId ?: metaId
                                 val type = active.type ?: MediaType.MOVIE.id
+                                val watched = positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD
                                 route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
-                                    overlay.recordProgress(
-                                        metaId = metaId,
-                                        videoId = videoId,
-                                        positionSeconds = positionMs / 1000.0,
-                                        durationSeconds = durationMs / 1000.0,
-                                        name = active.name ?: "",
-                                        type = type,
-                                        poster = active.poster,
-                                    )
-                                    if (positionMs.toDouble() / durationMs.toDouble() >= WATCHED_THRESHOLD) {
-                                        overlay.markWatched(
-                                            metaId,
-                                            videoId,
-                                            active.name ?: "",
-                                            type,
-                                            active.poster,
+                                    if (watched) {
+                                        if (overlay.recordFinishedWatchAndCommit(
+                                                metaId = metaId,
+                                                videoId = videoId,
+                                                positionSeconds = positionMs / 1000.0,
+                                                durationSeconds = durationMs / 1000.0,
+                                                name = active.name ?: "",
+                                                type = type,
+                                                poster = active.poster,
+                                            )
+                                        ) {
+                                            active.playbackContext?.let { context ->
+                                                durableWatch = DurableWatchedPlaybackReceipt(context = context, owner = owner)
+                                            }
+                                        }
+                                    } else {
+                                        overlay.recordProgress(
+                                            metaId = metaId,
+                                            videoId = videoId,
+                                            positionSeconds = positionMs / 1000.0,
+                                            durationSeconds = durationMs / 1000.0,
+                                            name = active.name ?: "",
+                                            type = type,
+                                            poster = active.poster,
                                         )
-                                        if (type != MediaType.SERIES.id) overlay.finishedWatching(metaId)
                                     }
                                 }
                             }
@@ -2612,8 +2634,29 @@ class EngineStremioRepository(
                 if (active.enginePlayerLoaded) StremioCoreNative.dispatch(EngineActions.unloadPlayer())
             }
         }
-        Unit
+        durableWatch
     } }
+
+    /**
+     * Engine dispatch is intentionally not treated as persistence proof: this app has no public exact
+     * per-video durable engine-history reader. Overlay receipts are re-read under the current owner fence,
+     * so an owner transition or explicit unwatch between terminal write and reclaim fails closed.
+     */
+    override fun reclaimAfterDurableWatchedPlaybackReceipt(
+        receipt: DurableWatchedPlaybackReceipt,
+        action: () -> Boolean,
+    ): Boolean =
+        runCatching {
+            historyOwnerFence.mutate(expectedOwner = receipt.owner) { owner ->
+                if (receipt.context.owner != PlaybackContext.Owner(owner.profileId, owner.usesEngineHistory)) return@mutate false
+                when (val route = historyRouteLocked(owner)) {
+                    is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                        if (overlay.hasCommittedWatchedVideo(receipt.context.contentId, receipt.context.videoId)) action() else false
+                    }
+                    HistoryRoute.Engine -> false
+                }
+            }
+        }.getOrDefault(false)
 
     /// Best-effort season/episode from a stremio series video id (`<metaId>:<season>:<episode>`): the
     /// trailing two colon-separated integers, or null when the id doesn't follow that shape. The engine's

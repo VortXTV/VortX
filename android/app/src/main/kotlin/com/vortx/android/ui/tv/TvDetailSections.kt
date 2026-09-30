@@ -20,10 +20,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -45,6 +49,7 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.PersonViewModel
+import kotlinx.coroutines.yield
 
 /// The 10-foot season picker + episode browser for the TV Detail page, the couch analogue of the phone
 /// `DetailScreen`'s `SeasonSelector` + `EpisodeRow` list and the mirror of Apple `app/SourcesTV/DetailView`.
@@ -64,6 +69,8 @@ fun TvSeasonEpisodeSection(
     detail: MetaDetail,
     selectedSeason: Int?,
     selectedEpisodeId: String?,
+    focusRestoreEpisodeId: String? = null,
+    focusRestoreRevision: Int = 0,
     onSelectSeason: (Int) -> Unit,
     onSelectEpisode: (String) -> Unit,
     onToggleWatched: (Episode, Boolean) -> Unit,
@@ -75,6 +82,16 @@ fun TvSeasonEpisodeSection(
     val activeSeason = selectedSeason ?: seasons.firstOrNull() ?: detail.videos.firstOrNull()?.season ?: 1
     val episodes = remember(detail.videos, activeSeason) {
         detail.videos.filter { it.season == activeSeason }.sortedBy { it.episode }
+    }
+    val seasonFocus = remember(activeSeason) { FocusRequester() }
+    val episodeFocusRequesters = remember(episodes.map { it.id }) {
+        episodes.map { FocusRequester() }
+    }
+    LaunchedEffect(focusRestoreEpisodeId, focusRestoreRevision, episodes) {
+        val index = focusRestoreEpisodeId?.let { id -> episodes.indexOfFirst { it.id == id } } ?: return@LaunchedEffect
+        if (index < 0) return@LaunchedEffect
+        yield()
+        runCatching { episodeFocusRequesters[index].requestFocus() }
     }
     val seasonAllWatched = episodes.isNotEmpty() && episodes.all { it.id in detail.watchedVideoIds }
 
@@ -100,6 +117,7 @@ fun TvSeasonEpisodeSection(
                         label = if (season > 0) "Season $season" else "Specials",
                         selected = season == activeSeason,
                         onClick = { onSelectSeason(season) },
+                        modifier = if (season == activeSeason) Modifier.focusRequester(seasonFocus) else Modifier,
                     )
                 }
             }
@@ -112,6 +130,7 @@ fun TvSeasonEpisodeSection(
                     label = if (seasonAllWatched) "Mark season unwatched" else "Mark season watched",
                     selected = false,
                     onClick = { onMarkSeasonWatched(activeSeason, !seasonAllWatched) },
+                    modifier = if (seasons.size <= 1) Modifier.focusRequester(seasonFocus) else Modifier,
                 )
             }
         }
@@ -120,7 +139,7 @@ fun TvSeasonEpisodeSection(
             contentPadding = PaddingValues(horizontal = TvDimens.edge),
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
-            itemsIndexed(episodes, key = { _, ep -> ep.id }) { _, episode ->
+            itemsIndexed(episodes, key = { _, ep -> ep.id }) { index, episode ->
                 val watched = episode.id in detail.watchedVideoIds
                 TvEpisodeCard(
                     episode = episode,
@@ -128,6 +147,8 @@ fun TvSeasonEpisodeSection(
                     isCurrent = episode.id == selectedEpisodeId,
                     onSelect = { onSelectEpisode(episode.id) },
                     onToggleWatched = { onToggleWatched(episode, !watched) },
+                    focusRequester = episodeFocusRequesters[index],
+                    upFocusRequester = if (index == 0) seasonFocus else episodeFocusRequesters[index - 1],
                 )
             }
         }
@@ -146,6 +167,8 @@ private fun TvEpisodeCard(
     isCurrent: Boolean,
     onSelect: () -> Unit,
     onToggleWatched: () -> Unit,
+    focusRequester: FocusRequester,
+    upFocusRequester: FocusRequester,
 ) {
     val colors = VortXTheme.colors
     Column(
@@ -154,7 +177,10 @@ private fun TvEpisodeCard(
     ) {
         Surface(
             onClick = onSelect,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(focusRequester)
+                .focusProperties { up = upFocusRequester },
             shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.card),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = colors.surface1,

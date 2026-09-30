@@ -47,6 +47,52 @@ struct HomeView: View {
         profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
     }
 
+    /// Non-secret account identity for personalized rails. The email publisher catches a Stremio
+    /// same-slot replacement even when `isSignedIn` remains true; a settled Stremio UID or explicit
+    /// nil-UID local-owner generation becomes authoritative once that history context settles.
+    private var becauseYouWatchedOwnerKey: String {
+        let binding = core.settledActiveAccountBinding()
+        let localOwner = core.acceptedLocalRecommendationHistory()?.receipt.owner
+        return BecauseYouWatchedModel.recommendationOwnerKey(
+            profileKeychainAccount: profiles.activeKeychainAccount,
+            isSignedIn: account.isSignedIn,
+            usesEngineHistory: profiles.activeUsesEngineHistory,
+            accountEmail: account.email,
+            principal: binding?.uid ?? localOwner?.uid,
+            authorityGeneration: binding?.generation ?? localOwner?.generation,
+            credentialBoundaryGeneration: account.credentialBoundaryGeneration
+        )
+    }
+
+    /// The engine snapshot is usable only after a settled binding and a newer published history
+    /// revision. `BecauseYouWatchedModel` owns the post-boundary revision latch; this value carries the
+    /// exact non-secret binding and the durable publication receipt into that model. `changedFields` is
+    /// only the newest engine event, so it is intentionally not used as owner-history evidence here.
+    private var becauseYouWatchedHistorySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot {
+        let binding = core.settledActiveAccountBinding()
+        let localSource = core.acceptedLocalRecommendationHistory()
+        let localOwner = localSource?.receipt.owner
+        let receipt = binding == nil ? localSource?.receipt : core.lastAcceptedHistoryReceipt
+        let validReceipt: BecauseYouWatchedHistoryPolicy.Snapshot? = receipt.flatMap { candidate in
+            guard let owner = candidate.owner else { return nil }
+            if let binding {
+                return owner.profileID == binding.profileID &&
+                    owner.keychainAccount == binding.keychainAccount &&
+                    owner.uid == binding.uid &&
+                    owner.generation == binding.generation ? candidate : nil
+            }
+            return owner == localOwner ? candidate : nil
+        }
+        return .init(
+            owner: validReceipt?.owner ?? binding.map {
+                .init(profileID: $0.profileID, keychainAccount: $0.keychainAccount,
+                      uid: $0.uid, generation: $0.generation)
+            } ?? localOwner,
+            revision: validReceipt?.revision ?? 0,
+            changedFields: validReceipt?.changedFields ?? []
+        )
+    }
+
     var body: some View {
         homeChangeHandlers
     }
@@ -161,15 +207,21 @@ struct HomeView: View {
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
-        .onChange(of: core.revision) { _ in
-            guard core.changedFields.contains("continue_watching_preview")
-                    || core.changedFields.contains("library") else { return }
+        // The old `.onChange(of: core.revision)` hook observed every board/meta event. Observe the
+        // durable history-receipt revision instead: Home first appearing after a board event reads the
+        // retained receipt above, while unrelated revisions do not fan out recommendation work.
+        .onChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in
+            guard core.lastAcceptedHistoryReceipt != nil else { return }
             seed()
             refreshTopPicks()
         }
         // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
         // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
-        .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }
+        // Overlay history is bounded, so observe the exact watched/progress fingerprint rather than only
+        // the first id. Interior mutations must refresh recommendations for the active local profile.
+        .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
+            seed(); refreshTopPicks()
+        }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
         .onChange(of: useTraktContinueWatching) { on in
             if on { TraktPlaybackShadow.shared.refreshNow() }
@@ -191,6 +243,15 @@ struct HomeView: View {
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
         .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
         .onChange(of: account.addons.count) { refreshReleaseCalendar() }
+        .onChange(of: account.isSignedIn) { _ in refreshTopPicks() }
+        .onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }
+        // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
+        // replacement. Email is published by the successful sign-in path, so observe that event directly.
+        .onReceive(account.$email) { _ in refreshTopPicks() }
+        // A same-slot credential replacement can retain the same email and isSignedIn=true. The
+        // non-secret account-boundary generation is published by StremioAccount and is the refresh edge
+        // for that replacement; CoreBridge rotates its settled binding before a history receipt is accepted.
+        .onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }
         .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
         // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
         // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
@@ -206,12 +267,67 @@ struct HomeView: View {
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
-        let localHistory = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
-        topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)
-        becauseYouWatched.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)   // "Because you watched <title>" rail; no-ops on an unchanged seed set
-        traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
-        simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
-        mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
+        // These independently owned rails do not require the engine-history recommendation receipt.
+        // Keep their throttled refreshes live even while personalized history admission is settling.
+        traktRails.refresh()
+        simklRails.refresh()
+        mediaServerRails.refresh()
+        let usesEngineHistory = profiles.activeUsesEngineHistory
+        let activeKeychainAccount = profiles.activeKeychainAccount
+        let historySnapshot = becauseYouWatchedHistorySnapshot
+        if usesEngineHistory {
+            // A selected B profile may coexist briefly with engine A while authentication settles. Do
+            // not even hand A's arrays to a personalized recommender; retire both personalized rails now.
+            guard let owner = historySnapshot.owner,
+                  owner.profileID == profiles.activeID,
+                  owner.keychainAccount == activeKeychainAccount else {
+                topPicks.clear()
+                becauseYouWatched.retireForUnsettledHistory(
+                    profileID: profiles.activeID,
+                    ownerKey: becauseYouWatchedOwnerKey,
+                    historySnapshot: historySnapshot
+                )
+                return
+            }
+        }
+
+        let localHistory: [CoreCWItem]
+        let localLibrary: [CoreCWItem]
+        if !usesEngineHistory {
+            localHistory = profiles.cwItems
+            localLibrary = profiles.libraryItems
+        } else if core.settledActiveAccountBinding() != nil {
+            localHistory = core.continueWatching
+            localLibrary = core.library?.catalog ?? []
+        } else {
+            // A local VortX account's resident engine may still contain another owner's rows. Only
+            // consume the values carried by its current source-owned receipt, never that resident union.
+            guard let source = core.acceptedLocalRecommendationHistory(),
+                  source.receipt.owner == historySnapshot.owner else {
+                topPicks.clear()
+                becauseYouWatched.retireForUnsettledHistory(
+                    profileID: profiles.activeID, ownerKey: becauseYouWatchedOwnerKey,
+                    historySnapshot: historySnapshot
+                )
+                return
+            }
+            localHistory = source.continueWatching
+            localLibrary = source.library
+        }
+        becauseYouWatched.refresh(
+            profileID: profiles.activeID,
+            cw: localHistory,
+            library: localLibrary,
+            ownerKey: becauseYouWatchedOwnerKey,
+            usesEngineHistory: usesEngineHistory,
+            activeKeychainAccount: activeKeychainAccount,
+            historySnapshot: historySnapshot
+        )   // "Because you watched <title>" rail; no-ops on an unchanged seed set
+        if becauseYouWatched.historyInputReady {
+            topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: localLibrary)
+        } else {
+            topPicks.clear()
+        }
     }
 
     /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases, derived

@@ -57,12 +57,16 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.DurableWatchReclaimCoordinator
+import com.vortx.android.data.DurableWatchedPlaybackReceipt
 import com.vortx.android.data.PlaybackSessionLifecycle
 import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.data.PreviewCatalogRepository
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.deeplink.VortXDeepLink
 import com.vortx.android.deeplink.VortXDeepLinkEvent
+import com.vortx.android.downloads.DownloadManager
+import com.vortx.android.downloads.WatchedDownloadReclaimRequest
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.LibraryAutoAdd
 import com.vortx.android.moat.WatchSignalClient
@@ -77,6 +81,7 @@ import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.DefaultEmber
 import com.vortx.android.player.NextEpisodePreloadPolicy
+import com.vortx.android.player.NextEpisodePreloadTaskOwner
 import com.vortx.android.player.MpvEngineFactory
 import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
@@ -152,6 +157,7 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /// Auto-add fires at ~60s of playback, matching Apple's `d >= 60` at PlayerScreen.swift:972 and
@@ -508,6 +514,52 @@ fun VortXApp(
                 mutableStateOf(PlayerEpisodeHistoryIdentity(playable))
             }
             val historyPlayable = historyIdentity.playable
+            // Capture the complete owner once with the immutable local context. The repository validates
+            // this same token when begin/end run; the reclaim coordinator rechecks it at its final flush.
+            val historyOwnerToken = remember(historyIdentity, repo) {
+                if (historyPlayable.isTrailer) null else repo.continueWatchingOwner()
+            }
+            val watchedDownloadReclaim = remember(historyIdentity, historyOwnerToken, appContext, repo) {
+                val context = historyPlayable.playbackContext
+                if (context == null || !historyPlayable.url.startsWith("file:") || historyOwnerToken == null) {
+                    null
+                } else {
+                    DurableWatchReclaimCoordinator(
+                        request = WatchedDownloadReclaimRequest.from(context, historyPlayable.url),
+                        capturedOwner = historyOwnerToken,
+                        verifyAndReclaim = { receipt, request ->
+                            repo.reclaimAfterDurableWatchedPlaybackReceipt(receipt) {
+                                if (!DownloadManager.isAutoDeleteWatchedEnabled(appContext)) {
+                                    false
+                                } else {
+                                    DownloadManager.reclaimWatchedDownloadAfterDurableWatchAndDecoderRelease(appContext, request)
+                                    true
+                                }
+                            }
+                        },
+                    )
+                }
+            }
+            // These sinks capture THIS generation's coordinator before the player sees them. The player
+            // retains the exact callback per source/episode generation until its outer holder aggregate
+            // is fully released; neither sink may follow a later recomposition into a newer coordinator.
+            val reclaimCoordinatorForGeneration = watchedDownloadReclaim
+            val onDurableWatchReceipt = remember(reclaimCoordinatorForGeneration, appScope) {
+                { receipt: DurableWatchedPlaybackReceipt ->
+                    reclaimCoordinatorForGeneration?.let { capturedCoordinator ->
+                        appScope.launch(Dispatchers.IO) { capturedCoordinator.onDurableWatch(receipt) }
+                    }
+                    Unit
+                }
+            }
+            val onWatchedDownloadResourcesReleased = remember(reclaimCoordinatorForGeneration, appScope) {
+                {
+                    reclaimCoordinatorForGeneration?.let { capturedCoordinator ->
+                        appScope.launch(Dispatchers.IO) { capturedCoordinator.onResourcesReleased() }
+                    }
+                    Unit
+                }
+            }
             // Freshest reported position/duration (ms) for the save-on-exit write: [0] = position,
             // [1] = duration. Reset when the history identity changes (new source, or a switched episode).
             val lastProgress = remember(historyIdentity) { longArrayOf(0L, 0L) }
@@ -577,10 +629,17 @@ fun VortXApp(
                 advanceVm?.playerEpisodeOptions().orEmpty()
             }
             // PLR-8 next-episode preload policy, owned per player session (reset when an episode is switched
-            // or advanced). Drives WHEN to warm the next episode's source; the warm itself is off-fence in
-            // the ViewModel. Invalidated on dispose so a stale attempt cannot survive the player closing.
+            // or advanced). The task owner makes the fetch itself player-owned: dispose and target replacement
+            // cancel its network work rather than merely fencing a stale completion.
             val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
-            DisposableEffect(historyIdentity) { onDispose { preloadPolicy.invalidate() } }
+            val preloadScope = rememberCoroutineScope()
+            val preloadTaskOwner = remember(historyIdentity) { NextEpisodePreloadTaskOwner(preloadScope) }
+            DisposableEffect(historyIdentity) {
+                onDispose {
+                    preloadTaskOwner.cancel()
+                    preloadPolicy.invalidate()
+                }
+            }
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
@@ -606,12 +665,13 @@ fun VortXApp(
                 // under the owner fence when the async begin runs -- any profile/account/principal/
                 // revision change in between fails closed instead of retargeting the session.
                 if (!historyPlayable.isTrailer) {
-                    val ownerToken = repo.continueWatchingOwner()
-                    playbackSessions.begin(playbackSession, historyPlayable.playbackContext, ownerToken)
+                    playbackSessions.begin(playbackSession, historyPlayable.playbackContext, historyOwnerToken)
                 }
                 onDispose {
                     if (!historyPlayable.isTrailer) {
-                        playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1])
+                        playbackSessions.end(playbackSession, lastProgress[0], lastProgress[1]) { receipt ->
+                            onDurableWatchReceipt(receipt)
+                        }
                     }
                 }
             }
@@ -619,6 +679,7 @@ fun VortXApp(
                 PlayerScreen(
                     playable = playable,
                     engineOverride = playingEngineOverride,
+                    onResourcesReleased = onWatchedDownloadResourcesReleased,
                     // "Still watching?" binge boundary: how many episodes auto-advanced to reach this one.
                     autoAdvanceCount = autoAdvanceStreak[0],
                     onBingePrompted = { autoAdvanceStreak[0] = 0 },
@@ -627,10 +688,18 @@ fun VortXApp(
                     episodeOptions = playerEpisodeOptions,
                     currentSource = advanceVm?.currentPlayerSource(),
                     onSwitchSource = advanceVm?.let { vm ->
+                        // Same-episode source picks retain a useful next-episode warm. The player-side
+                        // source authority cancels/supersedes the resolver itself.
                         { source -> vm.resolveSourceSwitch(source) }
                     },
                     onSwitchEpisode = advanceVm?.let { vm ->
-                        { episodeId -> vm.resolveEpisodeSwitch(episodeId) }
+                        { episodeId ->
+                            // A manual episode target makes the current warm irrelevant immediately.
+                            // The accepted transition re-keys the owner; a failed resolver may later
+                            // re-admit a fresh warm through the policy instead of keeping hidden I/O alive.
+                            preloadTaskOwner.cancel()
+                            vm.resolveEpisodeSwitch(episodeId)
+                        }
                     },
                     onEpisodeSwitched = { replacement, acceptedRevision ->
                         historyIdentity = advancePlayerEpisodeHistory(
@@ -652,10 +721,13 @@ fun VortXApp(
                         )
                         val now = android.os.SystemClock.elapsedRealtime()
                         val attempt = preloadPolicy.evaluate(target, pos, dur, now) ?: return@onWarmNext
-                        appScope.launch {
-                            val ok = vm.warmNextEpisode(next.id)
-                            preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
-                        }
+                        preloadTaskOwner.launch(
+                            target = target,
+                            prepare = { vm.warmNextEpisode(next.id) },
+                            onComplete = { ok ->
+                                preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
+                            },
+                        )
                     },
                     onBack = {
                         advanceVm?.abandonPlaybackResolve()

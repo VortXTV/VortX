@@ -67,6 +67,35 @@ class PlaybackIntentControllerTest {
         assertFalse(subject.snapshot().shouldPlay)
     }
 
+    @Test fun `accepted replacement clears only the old terminal verdict and preserves a manual pause`() {
+        val engine = RecordingEngine()
+        val subject = PlaybackIntentController()
+        subject.bind(engine)
+        subject.userPause()
+        subject.setSourceTerminal(true)
+
+        subject.beginReplacementSource()
+
+        assertFalse(subject.snapshot().userWantsPlay)
+        assertFalse(subject.snapshot().sourceTerminal)
+        assertFalse(subject.snapshot().shouldPlay)
+        assertEquals("pause", engine.actions.last())
+    }
+
+    @Test fun `accepted replacement resumes only when the viewer had wanted playback`() {
+        val engine = RecordingEngine()
+        val subject = PlaybackIntentController()
+        subject.bind(engine)
+        subject.setSourceTerminal(true)
+
+        subject.beginReplacementSource()
+
+        assertTrue(subject.snapshot().userWantsPlay)
+        assertFalse(subject.snapshot().sourceTerminal)
+        assertTrue(subject.snapshot().shouldPlay)
+        assertEquals("play", engine.actions.last())
+    }
+
     @Test fun `toggle follows displayed pause while focus blocker hides user intent`() {
         val subject = PlaybackIntentController()
         subject.setBlocked(PlaybackBlocker.AUDIO_FOCUS, true)

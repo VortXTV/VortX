@@ -42,6 +42,76 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var streamsEpoch = 0
     @Published private(set) var discover: CoreDiscover?
     @Published private(set) var library: CoreLibrary?
+    /// The last account-owned history payload that was actually accepted for the currently settled
+    /// engine binding. `changedFields` is only the newest engine event and can be overwritten by a
+    /// board/meta receipt before Home first appears; this durable, owner-tagged receipt is the
+    /// recommendation admission proof. Main-queue writes only.
+    private(set) var lastAcceptedHistoryReceipt: BecauseYouWatchedHistoryPolicy.Snapshot?
+    private var acceptedHistoryReceiptRevision = 0
+    private struct LocalHistoryHydrationContext: Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let authGeneration: UInt64
+        let credentialCapture: CredentialScopeRegistry.Capture
+        let publicationToken: PublicationToken
+    }
+    private struct LocalHistoryHydrationReceipt: Equatable {
+        let context: LocalHistoryHydrationContext
+        let publicationToken: PublicationToken
+    }
+    /// A signed-out engine can still expose the owner's local library. Keep that authority separate from
+    /// the remote Stremio binding: nil engine UID is valid only after this exact credential/profile capture
+    /// and, for imported-away profiles, the confirmed local recovery path.
+    private struct LocalHistoryAuthority: Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let authGeneration: UInt64
+        let credentialCapture: CredentialScopeRegistry.Capture
+        let publicationToken: PublicationToken
+        let owner: BecauseYouWatchedHistoryPolicy.Owner
+    }
+    /// Immutable recommendation inputs accepted from the exact current owner.  Account-local history
+    /// is admitted only from the decrypted VortX document snapshot; resident engine arrays are not used
+    /// to construct this value after an owner transition.
+    struct LocalRecommendationHistory {
+        let library: [CoreCWItem]
+        let continueWatching: [CoreCWItem]
+        let receipt: BecauseYouWatchedHistoryPolicy.Snapshot
+    }
+    private struct LocalRecommendationHistoryState {
+        let snapshot: LocalRecommendationHistory
+        let context: LocalHistoryHydrationContext?
+        let credentialCapture: CredentialScopeRegistry.Capture
+        let publicationToken: PublicationToken
+    }
+    private var localHistoryAuthority: LocalHistoryAuthority?
+    /// Imported-away recovery is intentionally fail-closed until signed-out engine state has been confirmed,
+    /// the local library has been loaded, and account-owned add-ons/library hydration has completed.
+    private var localHistoryRecoveryInFlight = false
+    private var localHistoryHydrationContext: LocalHistoryHydrationContext?
+    private var localHistoryHydrationReceipt: LocalHistoryHydrationReceipt?
+    private var localRecommendationHistoryState: LocalRecommendationHistoryState?
+    /// A signed-out device is a valid explicit local owner on first launch, but must not inherit the
+    /// previous VortX account's resident arrays after account -> guest.  Persist this non-secret boundary
+    /// so a relaunch cannot turn the old account's on-disk state into guest recommendations.
+    private static let localHistoryDeviceReceiptPendingKey = "stremiox.localHistory.deviceReceiptPending.v1"
+    private var localHistoryDeviceReceiptPending: Bool {
+        BecauseYouWatchedGuestProvenancePolicy.exclusionReceipt(
+            from: UserDefaults.standard.object(forKey: Self.localHistoryDeviceReceiptPendingKey)
+        ) != false
+    }
+
+    /// The sync boundary calls this before notifying observers, including before `shared` is created.
+    /// Never clear an account exclusion just because the registry starts signed out after a failed restore.
+    static func excludeAccountHistoryFromGuestRecommendations() {
+        UserDefaults.standard.set(true, forKey: localHistoryDeviceReceiptPendingKey)
+    }
+    private var lastObservedCredentialScope: CredentialScope?
+    private struct ImportedAwayColdLocalRecoveryContext: Equatable {
+        let hydration: LocalHistoryHydrationContext
+        let credentialFingerprint: String
+    }
+    private var localHistoryAuthorityGeneration: UInt64 = 0
     @Published private(set) var searchResults: [CoreMeta] = []
     @Published private(set) var searchIsLoading = false
     @Published private(set) var searchSuggestions: [CoreSearchSuggestion] = []
@@ -161,6 +231,12 @@ final class CoreBridge: ObservableObject {
     private var authBindingGeneration: UInt64 = 0
     private var accountBindingVerificationTask: Task<Void, Never>?
     private var rejectedAccountBindingGeneration: UInt64?
+    /// Same-slot sign-in replaces the Keychain credential while `isSignedIn` stays true. The account
+    /// boundary notification is non-secret and this monotonic latch makes the rebind exactly-once even
+    /// when a UI observer also refreshes Home in the same turn.
+    private var credentialBoundaryObserver: NSObjectProtocol?
+    private var credentialScopeObserver: NSObjectProtocol?
+    private var lastCredentialBoundaryGeneration: UInt64 = 0
     /// Rust delivers NewState on its own worker.  Auth/profile state belongs to main, so workers must
     /// never read it directly.  They capture this lock-backed, immutable epoch and main validates it
     /// immediately before a decoded snapshot is published or used for a deferred engine mutation.
@@ -195,6 +271,7 @@ final class CoreBridge: ObservableObject {
         let profileID: UUID
         let keychainAccount: String
         let authGeneration: UInt64
+        let credentialCapture: CredentialScopeRegistry.Capture
         let publicationToken: PublicationToken
         let signedOutRequest: SignedOutRepairRequest
     }
@@ -257,12 +334,71 @@ final class CoreBridge: ObservableObject {
         return ProfileSync.libraryImportedFromStremio(authKey: token) && !ProfileSync.alsoSyncToStremio
     }
 
-    private init() {}
+    private init() {
+        // Seed the observer's previous scope from the registry, rather than treating the first note seen
+        // after CoreBridge construction as an unrelated initial bind.  This preserves the account -> guest
+        // boundary even when the bridge is lazily created after the account session has already settled.
+        let initialScope = CredentialScopeRegistry.shared.capture().scope
+        lastObservedCredentialScope = initialScope
+        if case .account = initialScope {
+            Self.excludeAccountHistoryFromGuestRecommendations()
+        }
+        credentialScopeObserver = NotificationCenter.default.addObserver(
+            forName: VortXSyncManager.credentialScopeDidChangeNote,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let rawGeneration = note.userInfo?["generation"] as? NSNumber else { return }
+            let capture = CredentialScopeRegistry.shared.capture()
+            guard capture.generation == rawGeneration.uint64Value else { return }
+            let previousScope = self.lastObservedCredentialScope
+            self.credentialScopeDidChange(capture, previousScope: previousScope)
+            self.lastObservedCredentialScope = capture.scope
+        }
+        credentialBoundaryObserver = NotificationCenter.default.addObserver(
+            forName: StremioAccount.credentialBoundaryDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let rawGeneration = note.userInfo?["generation"] as? NSNumber,
+                  let eventProfileID = note.userInfo?["profileID"] as? String,
+                  let eventKeychainAccount = note.userInfo?["keychainAccount"] as? String,
+                  note.userInfo?["wasSignedIn"] as? Bool == true else { return }
+            // A same-slot credential event is accepted only for the profile/keychain identity that
+            // is still selected. A delayed A response must not rebind the newly selected B slot.
+            guard eventProfileID == ProfileStore.shared.active?.id.uuidString,
+                  eventKeychainAccount == ProfileStore.shared.activeKeychainAccount else { return }
+            let generation = rawGeneration.uint64Value
+            guard generation > self.lastCredentialBoundaryGeneration else { return }
+            self.lastCredentialBoundaryGeneration = generation
+            // Rebind before the next history receipt can be admitted. This path is intentionally
+            // deduplicated by the process-local generation and does not log or transport credentials.
+            self.signedInWithLegacyAuthKey()
+        }
+    }
 
     /// Hydrate the engine from persisted storage and start the event loop. Idempotent.
+    @MainActor
     func start() {
         guard !started else { return }
         started = true
+        let initialCapture = CredentialScopeRegistry.shared.capture()
+        let isSignedOutDevice: Bool
+        if case .signedOutDevice = initialCapture.scope { isSignedOutDevice = true }
+        else { isSignedOutDevice = false }
+        let exclusion = BecauseYouWatchedGuestProvenancePolicy.exclusionReceipt(
+            from: UserDefaults.standard.object(forKey: Self.localHistoryDeviceReceiptPendingKey))
+        // This proof must precede makeDir/engine initialization. Existing, unreadable, or account-tainted
+        // storage cannot become guest recommendation history merely because its account failed to restore.
+        if exclusion == nil, isSignedOutDevice,
+           BecauseYouWatchedGuestProvenancePolicy.canEstablishCleanDevice(
+            exclusionReceipt: exclusion, isSignedOutDevice: isSignedOutDevice,
+            storageIsKnownFresh: BecauseYouWatchedGuestProvenancePolicy.storageIsKnownFresh(at: Self.storageDirURL)
+           ) {
+            UserDefaults.standard.set(false, forKey: Self.localHistoryDeviceReceiptPendingKey)
+        }
         let storageDir = Self.makeDir(at: Self.storageDirURL)
         let cacheDir = Self.makeDir(.cachesDirectory, "stremio-core-http")
         // The pointer is passed through but never dereferenced on the way back: the C callback
@@ -298,6 +434,9 @@ final class CoreBridge: ObservableObject {
         // Seed Continue Watching through the SAME union path events use, so a cold / migrated device that
         // re-added its owner library at time 0 still paints the rail from OwnerResumeStore instead of blank
         // (#149), rather than only reflecting the engine's own (empty) continue_watching_preview here.
+        // A cold local-owner engine can have real persisted CW without emitting a new event. The shared
+        // rebuild path records this accepted seed exactly like the event path so recommendations do not
+        // wait forever for a second engine tick.
         rebuildContinueWatching(capturedPublicationToken: publicationToken)
         refreshAddons(capturedPublicationToken: publicationToken)
     }
@@ -873,6 +1012,9 @@ final class CoreBridge: ObservableObject {
                         guard self.importedAwayBootstrapStillCurrent(importedAwayContext) else { return }
                         NSLog("[CoreBridge] imported to VortX + opt-out: unloading the engine's Stremio session")
                         self.logOut(rearmSignedOutRepair: false) // imported-away owns deterministic local recovery below
+                        // The logout receipt only proves the engine is signed out. Keep recommendation
+                        // admission closed until the exact local library/add-on hydration below completes.
+                        self.localHistoryRecoveryInFlight = true
                         // The Logout invalidated the Stremio token server-side, so the retained Keychain token is
                         // dead. Clear it: it is useless, and keeping it would keep scheduleSessionRepair trying to
                         // re-auth a dead session. "Connect Stremio" / alsoSyncToStremio is a fresh sign-in.
@@ -897,12 +1039,18 @@ final class CoreBridge: ObservableObject {
                             NSLog("[CoreBridge] imported-away local recovery aborted: signed-out ctx receipt timed out")
                             return
                         }
+                        // The signed-out ctx receipt fences the Stremio session only.  Start the
+                        // account-document hydration context after that boundary so its immutable
+                        // source snapshot cannot be attributed to the pre-Logout owner.
+                        guard let hydration = self.beginLocalHistoryHydration() else { return }
                         // Logout invalidated the launch timer with the old Stremio context.  The now
                         // confirmed signed-out local context gets one fresh, token-fenced repair opportunity.
                         self.scheduleSessionRepair()
                         await self.loadLibraryAndAwait()
                         guard self.importedAwayLocalRecoveryReady(localRecovery) else { return }
-                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                        guard self.localHistoryHydrationStillCurrent(hydration) else { return }
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(
+                            credentialCapture: hydration.credentialCapture)
                         guard self.importedAwayLocalRecoveryReady(localRecovery) else { return }
                         self.loadBoard()
                     } else {
@@ -930,8 +1078,10 @@ final class CoreBridge: ObservableObject {
             // missing owned add-ons), so a healthy engine is a no-op and a failed/empty account pull does nothing.
             // Then run the one-time library import so the token-load can stop on the next launch (data-safe:
             // capture-then-record, never destroys; a no-op once the per-account flag is set).
+            let vortxCredentialCapture = CredentialScopeRegistry.shared.capture()
             Task { @MainActor in
-                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(
+                    credentialCapture: vortxCredentialCapture)
                 if hasStremioToken, let stremioToken {
                     await VortXSyncManager.shared.importOwnerLibraryFromStremioOnce(stremioToken: stremioToken)
                 }
@@ -940,22 +1090,57 @@ final class CoreBridge: ObservableObject {
             loadBoard() // refresh the board now too; addons were already hydrated from the engine's own storage
             return       // scheduleSessionRepair() is now called once from start() for ALL paths
         }
-        guard hasStremioToken, let stremioToken, !importedAway else {
-            // Either genuinely signed out (no token), OR post-import + opt-out: do NOT seed the engine with the
-            // Stremio token. Account-owns-everything: hydrate the VortX account's owned add-ons + recover the
-            // owner library BEFORE loading the board, so the device shows the account's add-ons + sources +
-            // library instead of only Cinemeta. Idempotent + never-zero guarded inside the sync manager (a
-            // failed/empty account pull does nothing). loadBoard runs once hydration kicks the ctx event, and
-            // again here so a no-account-doc device still gets the default browsable Home.
-            NSLog("[CoreBridge] engine stays signed out of Stremio (%@)",
-                  hasStremioToken ? "library imported to VortX; token retained but not loaded" : "no token in Keychain")
+        if importedAway {
+            // The engine is already signed out, but the imported Stremio token remains in its slot. Do
+            // not treat that retained token as local-history authority. Require the exact settled VortX
+            // owner capture, keep admission closed while the owned document hydrates, and only then
+            // re-publish the current library/CW through the owner-tagged receipt path.
+            guard let coldRecovery = captureImportedAwayColdLocalRecoveryContext() else {
+                NSLog("[CoreBridge] imported-away cold local recovery deferred: owner is not settled")
+                loadBoard()
+                return
+            }
+            NSLog("[CoreBridge] engine stays signed out of Stremio (imported local owner recovery)")
             Task { @MainActor in
-                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                guard self.importedAwayColdLocalRecoveryStillCurrent(coldRecovery) else { return }
+                await self.loadLibraryAndAwait()
+                guard self.importedAwayColdLocalRecoveryStillCurrent(coldRecovery) else { return }
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(
+                    credentialCapture: coldRecovery.hydration.credentialCapture)
+                guard self.importedAwayColdLocalRecoveryStillCurrent(coldRecovery) else { return }
+                guard self.importedAwayColdLocalRecoveryReady(coldRecovery) else {
+                    self.loadBoard()
+                    return
+                }
                 self.loadBoard()
             }
             // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
-            // profile) so a signed-out Home is a real, browsable landing screen (backdrop hero + rails),
-            // not an empty "please sign in" page. Discover already loads signed-out; Home should too.
+            // profile) so a signed-out Home remains browsable while personalized history is fenced.
+            loadBoard()
+            return
+        }
+        guard hasStremioToken, let stremioToken else {
+            // A signed-out VortX account needs the same exact account-owned hydration proof as the
+            // imported-away path; a guest signed-out device remains immediately usable from its local
+            // engine state. A failed/empty account pull never certifies the resident library.
+            if let hydration = beginLocalHistoryHydration() {
+                Task { @MainActor in
+                    guard self.localHistoryHydrationStillCurrent(hydration) else { return }
+                    await self.loadLibraryAndAwait()
+                    guard self.localHistoryHydrationStillCurrent(hydration) else { return }
+                    await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(
+                        credentialCapture: hydration.credentialCapture)
+                    guard self.localHistoryHydrationStillCurrent(hydration) else { return }
+                    self.loadBoard()
+                }
+            } else {
+                Task { @MainActor in
+                    await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    self.loadBoard()
+                }
+            }
+            // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
+            // profile) so a signed-out Home is a real, browsable landing screen.
             loadBoard()
             return
         }
@@ -981,6 +1166,7 @@ final class CoreBridge: ObservableObject {
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         let publicationToken = capturePublicationToken()
+        let credentialCapture = CredentialScopeRegistry.shared.capture()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.sessionRepairWork?.cancel()
@@ -1009,10 +1195,15 @@ final class CoreBridge: ObservableObject {
                 // genuinely-logged-out or degraded device.
                 Task { @MainActor in
                     guard repairGeneration == self.sessionRepairGeneration,
-                          self.publicationStillCurrent(publicationToken) else { return }
-                    await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                          self.publicationStillCurrent(publicationToken),
+                          CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
+                    // Legacy API spelling: await VortXSyncManager.shared.hydrateEngineFromOwnedAddons().
+                    // This repair uses the captured owner namespace below.
+                    await VortXSyncManager.shared.hydrateEngineFromOwnedAddons(
+                        credentialCapture: credentialCapture)
                     guard repairGeneration == self.sessionRepairGeneration,
-                          self.publicationStillCurrent(publicationToken) else { return }
+                          self.publicationStillCurrent(publicationToken),
+                          CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
                     // Re-establish a live Stremio session to reconcile on top of the hydrated floor ONLY when a
                     // usable token exists AND this device is NOT migrated-and-opted-out. Wave 4 (Finding 2): an
                     // importedAway device must NEVER re-auth Stremio here, or it would defeat the import with a
@@ -1156,6 +1347,12 @@ final class CoreBridge: ObservableObject {
             self.discoverPublishedFingerprint = nil
             self.library = nil
             self.metaDetails = nil
+            self.localHistoryAuthority = nil
+            self.localHistoryHydrationContext = nil
+            self.localHistoryHydrationReceipt = nil
+            self.localRecommendationHistoryState = nil
+            self.lastAcceptedHistoryReceipt = nil
+            self.acceptedHistoryReceiptRevision = 0
         }
     }
 
@@ -2548,6 +2745,13 @@ final class CoreBridge: ObservableObject {
     }
 
     private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken) {
+        rebuildContinueWatching(capturedPublicationToken: publicationToken, recordsHistoryReceipt: true)
+    }
+
+    private func rebuildContinueWatching(capturedPublicationToken publicationToken: PublicationToken,
+                                         recordsHistoryReceipt: Bool,
+                                         capturedCredentialCapture: CredentialScopeRegistry.Capture? = nil) {
+        let credentialCapture = capturedCredentialCapture ?? CredentialScopeRegistry.shared.capture()
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         let generation = continueWatchingRebuildGeneration
@@ -2558,14 +2762,17 @@ final class CoreBridge: ObservableObject {
         // `pruneFinished`, because a title Stremio reports as finished would otherwise be pruned away before
         // the floor could restore VortX's own in-progress position.
         let mayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn())
-        let preview = decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
+        let decodedPreview = decode(CoreCWPreview.self, field: "continue_watching_preview")
+        let preview = decodedPreview?.items ?? []
         let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.continueWatchingRebuildLock.lock()
             let isLatest = generation == self.continueWatchingRebuildGeneration
             self.continueWatchingRebuildLock.unlock()
-            guard isLatest, self.publicationStillCurrent(publicationToken) else { return }
+            guard isLatest,
+                  self.publicationStillCurrent(publicationToken),
+                  CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
             // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
             // profile rides `profiles.cwItems` and ignores this published value entirely.
             let ownerProfile = ProfileStore.shared.active?.isOwner == true
@@ -2579,6 +2786,57 @@ final class CoreBridge: ObservableObject {
                 : engine
             VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
             self.continueWatching = items
+            if recordsHistoryReceipt, decodedPreview != nil {
+                self.recordAcceptedHistoryReceipt(
+                    fields: ["continue_watching_preview"],
+                    publicationToken: publicationToken,
+                    credentialCapture: credentialCapture)
+            }
+        }
+    }
+
+    /// Record an owner-tagged history receipt only after the decoded publication is accepted on main.
+    /// The remote binding/local-authority check is deliberately repeated here: an old worker completion
+    /// can arrive after the publication epoch is still unchanged but before a newer auth/profile
+    /// transition schedules its next work item.
+    private func recordAcceptedHistoryReceipt(
+        fields: Set<String>,
+        publicationToken: PublicationToken,
+        credentialCapture suppliedCredentialCapture: CredentialScopeRegistry.Capture? = nil
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        let historyFields = fields.intersection(BecauseYouWatchedHistoryPolicy.historyFields)
+        let credentialCapture = suppliedCredentialCapture ?? CredentialScopeRegistry.shared.capture()
+        guard !historyFields.isEmpty,
+              publicationStillCurrent(publicationToken),
+              CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
+        let owner: BecauseYouWatchedHistoryPolicy.Owner
+        if let binding = settledActiveAccountBinding() {
+            owner = .init(profileID: binding.profileID, keychainAccount: binding.keychainAccount,
+                          uid: binding.uid, generation: binding.generation)
+        } else if let localOwner = settledLocalHistoryOwner(credentialCapture: credentialCapture) {
+            owner = localOwner
+        } else {
+            return
+        }
+        acceptedHistoryReceiptRevision &+= 1
+        lastAcceptedHistoryReceipt = .init(
+            owner: owner,
+            revision: acceptedHistoryReceiptRevision,
+            changedFields: historyFields)
+        // Initial signed-out device history is an explicit local-owner source.  It is never used after an
+        // account -> guest boundary until a new device receipt is established; that boundary is persisted
+        // above so an old resident account array cannot be relabelled as guest on relaunch.
+        if case .signedOutDevice = credentialCapture.scope,
+           !localHistoryDeviceReceiptPending {
+            localRecommendationHistoryState = LocalRecommendationHistoryState(
+                snapshot: LocalRecommendationHistory(
+                    library: library?.catalog ?? [],
+                    continueWatching: continueWatching,
+                    receipt: lastAcceptedHistoryReceipt!),
+                context: nil,
+                credentialCapture: credentialCapture,
+                publicationToken: publicationToken)
         }
     }
 
@@ -3242,6 +3500,150 @@ final class CoreBridge: ObservableObject {
         return binding
     }
 
+    /// The explicit local-owner authority for engine history when no Stremio principal is loaded. A nil UID
+    /// is meaningful here: the engine's signed-out on-disk library belongs to the selected owner profile,
+    /// but it is never evidence that an unresolved remote account is safe to use.
+    func settledLocalHistoryOwner() -> BecauseYouWatchedHistoryPolicy.Owner? {
+        settledLocalHistoryOwner(credentialCapture: nil)
+    }
+
+    /// Return the immutable, source-owned recommendation inputs only while their exact credential,
+    /// profile, publication epoch, and hydration receipt are still current.  A board/meta event cannot
+    /// replace this value, and an owner boundary retires it synchronously.
+    @MainActor
+    func acceptedLocalRecommendationHistory() -> LocalRecommendationHistory? {
+        guard let history = localRecommendationHistoryState,
+              CredentialScopeRegistry.shared.isCurrent(history.credentialCapture),
+              publicationEpochMatches(history.publicationToken),
+              !localHistoryRecoveryInFlight,
+              !enginePublicationBlocked,
+              localHistoryAuthority?.owner == history.snapshot.receipt.owner else { return nil }
+        if let context = history.context {
+            guard context.credentialCapture == history.credentialCapture,
+                  localHistoryHydrationReceiptStillCurrent(context) else { return nil }
+        } else {
+            guard case .signedOutDevice = history.credentialCapture.scope,
+                  !localHistoryDeviceReceiptPending else { return nil }
+        }
+        return history.snapshot
+    }
+
+    private func settledLocalHistoryOwner(
+        credentialCapture suppliedCredentialCapture: CredentialScopeRegistry.Capture? = nil
+    ) -> BecauseYouWatchedHistoryPolicy.Owner? {
+        let credentialCapture = suppliedCredentialCapture ?? CredentialScopeRegistry.shared.capture()
+        let credentialSettled: Bool
+        let deviceHistoryIsProven: Bool
+        if case .signedOutDevice = credentialCapture.scope {
+            credentialSettled = true
+            deviceHistoryIsProven = !localHistoryDeviceReceiptPending
+        } else {
+            // An account namespace is not authority merely because a transition selected it. Require the
+            // VortX session layer's authenticated-owner receipt before allowing local engine history.
+            credentialSettled = CredentialScopeRegistry.shared.isMigrationEligible(credentialCapture)
+            deviceHistoryIsProven = true   // source-owned account snapshots do not borrow guest history
+        }
+        let profile = ProfileStore.shared.active
+        let tokenPresent = Keychain.string(ProfileStore.shared.activeKeychainAccount)?.isEmpty == false
+        let accountHydrationReady: Bool
+        if case .signedOutDevice = credentialCapture.scope {
+            accountHydrationReady = true
+        } else if let context = localHistoryHydrationContext,
+                  context.credentialCapture == credentialCapture {
+            accountHydrationReady = localHistoryHydrationReceiptStillCurrent(context)
+        } else {
+            accountHydrationReady = false
+        }
+        let importedAwayReady: Bool
+        if importedAwayFromStremio {
+            if let context = localHistoryHydrationContext,
+               context.credentialCapture == credentialCapture,
+               let token = Keychain.string(context.keychainAccount), !token.isEmpty {
+                let cold = ImportedAwayColdLocalRecoveryContext(
+                    hydration: context,
+                    credentialFingerprint: Self.credentialFingerprint(token))
+                importedAwayReady = importedAwayColdLocalRecoveryReady(cold)
+            } else {
+                importedAwayReady = false
+            }
+        } else {
+            importedAwayReady = true
+        }
+        let eligible = profile?.isOwner == true
+            && profile?.usesEngineHistory == true
+            && ProfileStore.shared.activeKeychainAccount.isEmpty == false
+            // A retained Stremio token is not local-history authority unless this exact profile is in
+            // the imported-away recovery path. The previous `(!tokenPresent || importedAwayReady)` form
+            // treated every ordinary token as eligible because `importedAwayReady` defaults true when
+            // `importedAwayFromStremio` is false.
+            && (!tokenPresent || (importedAwayFromStremio && importedAwayReady))
+            && !isLoggedIn()
+            && currentUID() == nil
+            && !switchInFlight
+            && pendingAccountBinding == nil
+            && !awaitingAuthMigration
+            && !enginePublicationBlocked
+            && !localHistoryRecoveryInFlight
+            && localOnlyRecoveryAllowed(credentialCapture)
+            && credentialSettled
+            && deviceHistoryIsProven
+            && accountHydrationReady
+            && importedAwayReady
+            && CredentialScopeRegistry.shared.isCurrent(credentialCapture)
+
+        guard eligible, let profile else {
+            if localHistoryAuthority != nil {
+                localHistoryAuthority = nil
+                localRecommendationHistoryState = nil
+                lastAcceptedHistoryReceipt = nil
+                acceptedHistoryReceiptRevision = 0
+            }
+            return nil
+        }
+
+        let publicationToken = capturePublicationToken()
+        let currentIdentity = LocalHistoryAuthority(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            authGeneration: authBindingGeneration,
+            credentialCapture: credentialCapture,
+            publicationToken: publicationToken,
+            owner: .init(profileID: profile.id,
+                         keychainAccount: ProfileStore.shared.activeKeychainAccount,
+                         uid: nil,
+                         generation: 0))
+        if let existing = localHistoryAuthority,
+           existing.profileID == currentIdentity.profileID,
+           existing.keychainAccount == currentIdentity.keychainAccount,
+           existing.authGeneration == currentIdentity.authGeneration,
+           existing.credentialCapture == currentIdentity.credentialCapture,
+           existing.publicationToken == currentIdentity.publicationToken {
+            return existing.owner
+        }
+
+        localHistoryAuthorityGeneration &+= 1
+        let owner = BecauseYouWatchedHistoryPolicy.Owner(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            uid: nil,
+            generation: localHistoryAuthorityGeneration)
+        // A different local capture/publication is a new owner boundary even when the profile and
+        // Keychain slot are unchanged. Retire any receipt from the prior local/remote epoch synchronously.
+        if lastAcceptedHistoryReceipt?.owner != owner {
+            localRecommendationHistoryState = nil
+            lastAcceptedHistoryReceipt = nil
+            acceptedHistoryReceiptRevision = 0
+        }
+        localHistoryAuthority = .init(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            authGeneration: authBindingGeneration,
+            credentialCapture: credentialCapture,
+            publicationToken: publicationToken,
+            owner: owner)
+        return owner
+    }
+
     private static func credentialFingerprint(_ token: String) -> String {
         SHA256.hash(data: Data(token.utf8)).map { String(format: "%02x", $0) }.joined()
     }
@@ -3292,6 +3694,7 @@ final class CoreBridge: ObservableObject {
             profileID: profileID,
             keychainAccount: keychainAccount,
             authGeneration: authBindingGeneration,
+            credentialCapture: CredentialScopeRegistry.shared.capture(),
             publicationToken: capturePublicationToken(),
             signedOutRequest: signedOutRequest
         )
@@ -3303,6 +3706,7 @@ final class CoreBridge: ObservableObject {
               profile.usesEngineHistory,
               ProfileStore.shared.activeKeychainAccount == context.keychainAccount,
               authBindingGeneration == context.authGeneration,
+              CredentialScopeRegistry.shared.isCurrent(context.credentialCapture),
               publicationEpochMatches(context.publicationToken),
               Keychain.string(context.keychainAccount) == nil,
               !awaitingAuthMigration,
@@ -3317,6 +3721,186 @@ final class CoreBridge: ObservableObject {
               signedOutRepairRequest == nil,
               confirmedSignedOutRepairRequest == context.signedOutRequest,
               !isLoggedIn(), currentUID() == nil else { return false }
+        return true
+    }
+
+    /// A VortX account namespace change is a history boundary even when the selected profile and
+    /// Stremio slot stay the same.  The sync manager posts this after its owner registry changes;
+    /// invalidate the engine publication epoch synchronously so a queued A decode cannot be accepted
+    /// as B. Account-local history stays closed until the exact new account's hydrate completion receipt
+    /// arrives.  This boundary deliberately does not reset the resident engine: a failed or empty account
+    /// document must preserve the existing never-zero local state, while the recommendation accessor stays
+    /// closed until a source-owned snapshot is accepted.
+    private func credentialScopeDidChange(
+        _ capture: CredentialScopeRegistry.Capture,
+        previousScope: CredentialScope?
+    ) {
+        guard CredentialScopeRegistry.shared.isCurrent(capture) else { return }
+        invalidatePublicationEpoch()
+        localHistoryHydrationContext = nil
+        localHistoryHydrationReceipt = nil
+
+        if case .signedOutDevice = capture.scope {
+            let wasAccount = previousScope.map { scope in
+                if case .account = scope { return true }
+                return false
+            } ?? false
+            if wasAccount {
+                Self.excludeAccountHistoryFromGuestRecommendations()
+            }
+        } else if case .account = capture.scope {
+            Self.excludeAccountHistoryFromGuestRecommendations()
+        }
+
+        guard case .account = capture.scope,
+              started,
+              CredentialScopeRegistry.shared.isMigrationEligible(capture),
+              !isLoggedIn(), currentUID() == nil else {
+            localHistoryRecoveryInFlight = false
+            return
+        }
+
+        localHistoryHydrationContext = beginLocalHistoryHydration()
+        localHistoryRecoveryInFlight = localHistoryHydrationContext != nil
+    }
+
+    private func captureLocalHistoryHydrationContext() -> LocalHistoryHydrationContext? {
+        let credentialCapture = CredentialScopeRegistry.shared.capture()
+        guard case .account = credentialCapture.scope,
+              CredentialScopeRegistry.shared.isMigrationEligible(credentialCapture),
+              !isLoggedIn(), currentUID() == nil,
+              !switchInFlight,
+              pendingAccountBinding == nil,
+              !awaitingAuthMigration,
+              let profile = ProfileStore.shared.active,
+              profile.isOwner,
+              profile.usesEngineHistory,
+              !ProfileStore.shared.activeKeychainAccount.isEmpty,
+              localOnlyRecoveryAllowed(credentialCapture) else { return nil }
+        guard !enginePublicationBlocked else { return nil }
+        return LocalHistoryHydrationContext(
+            profileID: profile.id,
+            keychainAccount: ProfileStore.shared.activeKeychainAccount,
+            authGeneration: authBindingGeneration,
+            credentialCapture: credentialCapture,
+            publicationToken: capturePublicationToken())
+    }
+
+    private func beginLocalHistoryHydration() -> LocalHistoryHydrationContext? {
+        if let current = localHistoryHydrationContext,
+           localHistoryHydrationStillCurrent(current) {
+            localHistoryRecoveryInFlight = true
+            localHistoryHydrationReceipt = nil
+            return current
+        }
+        guard let context = captureLocalHistoryHydrationContext() else {
+            return nil
+        }
+        localHistoryHydrationContext = context
+        localHistoryHydrationReceipt = nil
+        localHistoryRecoveryInFlight = true
+        return context
+    }
+
+    private func localHistoryHydrationStillCurrent(_ context: LocalHistoryHydrationContext) -> Bool {
+        guard localHistoryHydrationContext == context,
+              let profile = ProfileStore.shared.active,
+              profile.id == context.profileID,
+              profile.isOwner,
+              profile.usesEngineHistory,
+              ProfileStore.shared.activeKeychainAccount == context.keychainAccount,
+              authBindingGeneration == context.authGeneration,
+              CredentialScopeRegistry.shared.isCurrent(context.credentialCapture),
+              publicationEpochMatches(context.publicationToken),
+              !isLoggedIn(), currentUID() == nil,
+              !switchInFlight,
+              pendingAccountBinding == nil,
+              !awaitingAuthMigration,
+              !enginePublicationBlocked,
+              localOnlyRecoveryAllowed(context.credentialCapture) else { return false }
+        return true
+    }
+
+    private func localHistoryHydrationReceiptStillCurrent(_ context: LocalHistoryHydrationContext) -> Bool {
+        guard let receipt = localHistoryHydrationReceipt,
+              receipt.context == context,
+              localHistoryHydrationStillCurrent(context),
+              publicationEpochMatches(receipt.publicationToken) else { return false }
+        return true
+    }
+
+    /// Called by the VortX sync manager only after a real account document completed owned add-on/library
+    /// hydration.  The callback carries the exact capture used for every awaited read and the immutable
+    /// document-owned recommendation inputs, so a newer account cannot certify the prior account's resident
+    /// engine state.  An empty array is a valid successful source snapshot; failed/empty pulls never call this.
+    @MainActor
+    func recordOwnedHistoryHydration(
+        credentialCapture: CredentialScopeRegistry.Capture,
+        library: [CoreCWItem],
+        continueWatching: [CoreCWItem]
+    ) {
+        guard let context = localHistoryHydrationContext,
+              context.credentialCapture == credentialCapture,
+              localHistoryHydrationStillCurrent(context) else { return }
+        localHistoryHydrationReceipt = LocalHistoryHydrationReceipt(
+            context: context,
+            publicationToken: capturePublicationToken())
+        let wasInFlight = localHistoryRecoveryInFlight
+        localHistoryRecoveryInFlight = false
+        guard let owner = settledLocalHistoryOwner(credentialCapture: credentialCapture) else {
+            localHistoryHydrationReceipt = nil
+            localHistoryRecoveryInFlight = wasInFlight
+            return
+        }
+
+        acceptedHistoryReceiptRevision &+= 1
+        let receipt = BecauseYouWatchedHistoryPolicy.Snapshot(
+            owner: owner,
+            revision: acceptedHistoryReceiptRevision,
+            changedFields: ["library", "continue_watching_preview"])
+        lastAcceptedHistoryReceipt = receipt
+        localRecommendationHistoryState = LocalRecommendationHistoryState(
+            snapshot: LocalRecommendationHistory(
+                library: library,
+                continueWatching: continueWatching,
+                receipt: receipt),
+            context: context,
+            credentialCapture: credentialCapture,
+            publicationToken: capturePublicationToken())
+
+        if started {
+            rebuildContinueWatching(
+                capturedPublicationToken: capturePublicationToken(),
+                recordsHistoryReceipt: false,
+                capturedCredentialCapture: credentialCapture)
+        }
+    }
+
+    private func captureImportedAwayColdLocalRecoveryContext() -> ImportedAwayColdLocalRecoveryContext? {
+        guard importedAwayFromStremio,
+              let context = beginLocalHistoryHydration(),
+              let token = Keychain.string(context.keychainAccount), !token.isEmpty else { return nil }
+        return ImportedAwayColdLocalRecoveryContext(
+            hydration: context,
+            credentialFingerprint: Self.credentialFingerprint(token))
+    }
+
+    private func importedAwayColdLocalRecoveryStillCurrent(
+        _ context: ImportedAwayColdLocalRecoveryContext
+    ) -> Bool {
+        guard localHistoryHydrationStillCurrent(context.hydration),
+              importedAwayFromStremio,
+              let token = Keychain.string(context.hydration.keychainAccount), !token.isEmpty,
+              Self.credentialFingerprint(token) == context.credentialFingerprint else { return false }
+        return true
+    }
+
+    private func importedAwayColdLocalRecoveryReady(
+        _ context: ImportedAwayColdLocalRecoveryContext
+    ) -> Bool {
+        guard importedAwayColdLocalRecoveryStillCurrent(context),
+              !localHistoryRecoveryInFlight,
+              localHistoryHydrationReceiptStillCurrent(context.hydration) else { return false }
         return true
     }
 
@@ -3355,6 +3939,9 @@ final class CoreBridge: ObservableObject {
         cancelAccountBindingVerification()
         retireSignedOutRepairRequest()
         invalidatePublicationEpoch()
+        // Any in-flight imported-away recovery belongs to the old profile/auth epoch. A later local
+        // owner may become eligible only after its own recovery publication is observed.
+        localHistoryRecoveryInFlight = false
         authBindingGeneration &+= 1
         pendingAccountBinding = nil
         settledAccountBinding = nil
@@ -3431,6 +4018,15 @@ final class CoreBridge: ObservableObject {
         publicationEpochLock.lock()
         publicationEpoch &+= 1
         publicationEpochLock.unlock()
+        // A new auth/profile/publication epoch cannot inherit the previous owner's history proof.
+        // Clear synchronously on main so Home cannot render the old receipt during the transition.
+        localHistoryAuthority = nil
+        localHistoryRecoveryInFlight = false
+        localHistoryHydrationContext = nil
+        localHistoryHydrationReceipt = nil
+        localRecommendationHistoryState = nil
+        lastAcceptedHistoryReceipt = nil
+        acceptedHistoryReceiptRevision = 0
         continueWatchingRebuildLock.lock()
         continueWatchingRebuildGeneration &+= 1
         continueWatchingRebuildLock.unlock()
@@ -3685,9 +4281,10 @@ final class CoreBridge: ObservableObject {
         // friends) as changed on every library tick for free, so an idle device woke every `revision` observer
         // several times a minute to re-render identical state. Bump only when something was really published.
         var published = false
-        // This callback is on Rust's worker thread.  Capture only the lock-backed publication
-        // epoch here; all main-owned auth/profile checks happen in the eventual main closure.
+        // This callback is on Rust's worker thread. Capture the lock-backed publication epoch and
+        // VortX credential namespace here; all main-owned checks happen in the eventual main closure.
         let publicationToken = capturePublicationToken()
+        let credentialCapture = CredentialScopeRegistry.shared.capture()
 
         // Legacy authKey migration + account-switch completion both depend on `ctx` landing while logged in.
         // Their state (awaitingAuthMigration, switchInFlight, switchFromUID) is ALSO written on the MAIN thread
@@ -3732,7 +4329,10 @@ final class CoreBridge: ObservableObject {
         if fields.contains("continue_watching_preview") {
             // Publish the engine preview UNIONED with the OwnerResumeStore recovery, not the bare preview, so a
             // migrated / cold device (whose preview is empty at time 0) still fills the rail (#149).
-            rebuildContinueWatching(capturedPublicationToken: publicationToken)
+            rebuildContinueWatching(
+                capturedPublicationToken: publicationToken,
+                recordsHistoryReceipt: true,
+                capturedCredentialCapture: credentialCapture)
             published = true
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
@@ -3842,8 +4442,16 @@ final class CoreBridge: ObservableObject {
             let value = decode(CoreLibrary.self, field: "library")
             VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                guard let self,
+                      self.publicationStillCurrent(publicationToken),
+                      CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
                 self.library = value
+                if value != nil {
+                    self.recordAcceptedHistoryReceipt(
+                        fields: ["library"],
+                        publicationToken: publicationToken,
+                        credentialCapture: credentialCapture)
+                }
             }
             published = true
             // A library change can change which owner titles belong in Continue Watching: the cold-recovery
@@ -3852,7 +4460,7 @@ final class CoreBridge: ObservableObject {
             // UNION OwnerResumeStore. Skipped during playback: the rail is not visible then, and a real
             // progress save emits its own continue_watching_preview event (which rebuilds), so nothing is lost
             // while sparing the ~20s progress-save churn (#147).
-            if !playerWasActive { rebuildContinueWatching(capturedPublicationToken: publicationToken) }
+            if !playerWasActive { rebuildContinueWatching(capturedPublicationToken: publicationToken, recordsHistoryReceipt: true, capturedCredentialCapture: credentialCapture) }
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
             // button state) reflects the change immediately without waiting for a page reload.

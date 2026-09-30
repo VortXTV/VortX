@@ -613,6 +613,8 @@ object AutoAddLibrarySetting {
 object PlaybackBehaviorSettings {
     const val DIRECT_LINKS_ONLY_KEY = "stremiox.directLinksOnly"
     const val AUTO_SKIP_KEY = "stremiox.autoSkip"
+    const val AUTO_SKIP_DELAY_SECONDS_KEY = "stremiox.autoSkipDelaySeconds"
+    const val DEFAULT_AUTO_SKIP_DELAY_SECONDS = 5
 
     fun directLinksOnly(context: Context): Boolean = prefs(context).getBoolean(DIRECT_LINKS_ONLY_KEY, false)
 
@@ -620,10 +622,41 @@ object PlaybackBehaviorSettings {
         prefs(context).edit().putBoolean(DIRECT_LINKS_ONLY_KEY, enabled).apply()
     }
 
-    fun autoSkip(context: Context): Boolean = prefs(context).getBoolean(AUTO_SKIP_KEY, false)
+    /**
+     * Returns the countdown delay in seconds. A virgin install has no key and defaults to five seconds;
+     * an older install with an explicit false Bool migrates to Off, while an older true Bool migrates to
+     * the new five-second countdown. The delay key becomes authoritative after this one-time migration.
+     */
+    fun autoSkipDelaySeconds(context: Context): Int {
+        val preferences = prefs(context)
+        if (!preferences.contains(AUTO_SKIP_DELAY_SECONDS_KEY)) {
+            val legacy = runCatching { preferences.getBoolean(AUTO_SKIP_KEY, false) }.getOrNull()
+            if (preferences.contains(AUTO_SKIP_KEY) && legacy != null) {
+                val migrated = if (legacy) DEFAULT_AUTO_SKIP_DELAY_SECONDS else 0
+                preferences.edit().putInt(AUTO_SKIP_DELAY_SECONDS_KEY, migrated).apply()
+                return migrated
+            }
+            return DEFAULT_AUTO_SKIP_DELAY_SECONDS
+        }
+        return preferences.getInt(AUTO_SKIP_DELAY_SECONDS_KEY, DEFAULT_AUTO_SKIP_DELAY_SECONDS)
+            .coerceIn(0, 120)
+    }
+
+    /** Compatibility read for callers not yet moved to the countdown API. */
+    fun autoSkip(context: Context): Boolean = autoSkipDelaySeconds(context) > 0
 
     fun setAutoSkip(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(AUTO_SKIP_KEY, enabled).apply()
+        setAutoSkipDelaySeconds(context, if (enabled) DEFAULT_AUTO_SKIP_DELAY_SECONDS else 0)
+    }
+
+    fun setAutoSkipDelaySeconds(context: Context, seconds: Int) {
+        val normalized = seconds.coerceIn(0, 120)
+        prefs(context).edit()
+            .putInt(AUTO_SKIP_DELAY_SECONDS_KEY, normalized)
+            // Keep the historical key coherent for older builds and account restore readers. It is not
+            // authoritative once the delay key exists, so legacy false remains a durable Off choice.
+            .putBoolean(AUTO_SKIP_KEY, normalized > 0)
+            .apply()
     }
 }
 

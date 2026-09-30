@@ -25,6 +25,7 @@ import Foundation
 // with `swift <file>`, where top-level code is legal. This one compiles the real TopShelfSnapshot.swift
 // beside it, and in a multi-file build top-level code has no home, so the entry point is explicit.
 @main
+@MainActor
 enum TopShelfSnapshotTests {
 
     static var failures = 0
@@ -130,6 +131,166 @@ if let data = try? encoder.encode(TopShelfSnapshot.Payload(version: 99, writtenA
 } else {
     check(false, "foreign-version payload decodes for the gate check")
 }
+
+// MARK: Managed private artwork path
+
+section("private Trakt artwork gets an exact managed App Group file URL")
+
+let traktArtworkSource = "https://media.trakt.tv/images/movies/000/001/posters/medium/poster.jpg.webp"
+if let managed = TopShelfSnapshot.localArtworkURL(for: traktArtworkSource),
+   let container = TopShelfSnapshot.containerURL {
+    let managedRoot = container.appendingPathComponent(TopShelfSnapshot.artworkDirectoryName, isDirectory: true).path
+    check(managed.path.hasPrefix(managedRoot + "/"), "private artwork stays below the exact managed App Group directory")
+    check(managed.pathExtension == "webp", "the managed file preserves a safe image extension")
+    check(TopShelfSnapshot.localArtworkURL(for: traktArtworkSource) == managed,
+          "the same source URL maps to a stable local file")
+    check(TopShelfSnapshot.localArtworkURL(for: "https://media.trakt.tv/images/movies/000/002/posters/medium/poster.jpg.webp") != managed,
+          "different source URLs do not collide in the managed path")
+} else {
+    // Unsigned Apple builds legitimately have no App Group. The API's nil result is the documented
+    // fail-soft path; the extension then falls back to the static Top Shelf image.
+    check(TopShelfSnapshot.containerURL == nil, "an unprovisioned App Group makes the local artwork URL nil")
+}
+
+// MARK: Private publication policy
+
+section("private publication policy separates progress from artwork ownership")
+
+let stableArtwork = [
+    TopShelfSnapshot.PrivatePublicationPolicy.ArtworkInput(
+        id: "tt0111161",
+        type: "movie",
+        poster: traktArtworkSource
+    )
+]
+let changedProgress = [
+    TopShelfSnapshot.Item(
+        id: "tt0111161",
+        type: "movie",
+        title: "A Title",
+        poster: nil,
+        progress: 0.88
+    )
+]
+let previouslyPublished = [
+    TopShelfSnapshot.Item(
+        id: "tt0111161",
+        type: "movie",
+        title: "A Title",
+        poster: "file:///private/var/top-shelf-artwork/poster.webp",
+        progress: 0.42
+    )
+]
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.requiresWarmRestart(
+        previousSessionRaw: "session-a",
+        currentSessionRaw: "session-a",
+        previousArtworkInputs: stableArtwork,
+        currentArtworkInputs: stableArtwork
+    ),
+    "a progress-only refresh does not restart artwork warming"
+)
+let mergedProgress = TopShelfSnapshot.PrivatePublicationPolicy.mergingCurrentProgress(
+    pending: changedProgress,
+    previouslyPublished: previouslyPublished
+)
+check(mergedProgress.first?.progress == 0.88, "a progress-only refresh publishes the new progress")
+check(mergedProgress.first?.poster == previouslyPublished.first?.poster,
+      "a progress-only refresh preserves the managed local poster")
+check(
+    TopShelfSnapshot.PrivatePublicationPolicy.requiresWarmRestart(
+        previousSessionRaw: "session-a",
+        currentSessionRaw: "session-a",
+        previousArtworkInputs: stableArtwork,
+        currentArtworkInputs: [
+            .init(id: "tt0111161", type: "movie", poster: "https://media.trakt.tv/images/movies/changed.webp")
+        ]
+    ),
+    "an artwork URL change restarts warming and permits bounded cache pruning"
+)
+
+section("private auth boundaries cannot clear a newer session or local rows")
+
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.shouldClearObsoletePrivateOwner(
+        emittedSessionRaw: "session-old",
+        currentSessionRaw: "session-new",
+        privateOwnerRaw: "session-new",
+        publishedPrivateRows: true
+    ),
+    "an old auth-boundary event cannot clear a newer private publication"
+)
+check(
+    TopShelfSnapshot.PrivatePublicationPolicy.shouldClearObsoletePrivateOwner(
+        emittedSessionRaw: "session-new",
+        currentSessionRaw: "session-new",
+        privateOwnerRaw: "session-old",
+        publishedPrivateRows: true
+    ),
+    "a current boundary clears an obsolete private owner"
+)
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.shouldClearObsoletePrivateOwner(
+        emittedSessionRaw: "session-new",
+        currentSessionRaw: "session-new",
+        privateOwnerRaw: "session-old",
+        publishedPrivateRows: false
+    ),
+    "a current Trakt boundary leaves local overlay rows intact"
+)
+
+section("private image response policy bounds redirects and bytes")
+
+check(
+    TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+        finalURLIsFirstParty: true,
+        statusCode: 200,
+        mimeType: "image/webp",
+        expectedContentLength: 64,
+        accumulatedBytes: 64
+    ),
+    "a bounded first-party image response is accepted"
+)
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+        finalURLIsFirstParty: false,
+        statusCode: 200,
+        mimeType: "image/webp",
+        expectedContentLength: 64,
+        accumulatedBytes: 64
+    ),
+    "a redirect whose final URL is not first-party is rejected"
+)
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+        finalURLIsFirstParty: true,
+        statusCode: 200,
+        mimeType: "image/webp",
+        expectedContentLength: Int64(TopShelfSnapshot.maxArtworkBytes) + 1,
+        accumulatedBytes: 1
+    ),
+    "a declared body larger than the cap is rejected before reading"
+)
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+        finalURLIsFirstParty: true,
+        statusCode: 200,
+        mimeType: "image/webp",
+        expectedContentLength: nil,
+        accumulatedBytes: TopShelfSnapshot.maxArtworkBytes + 1
+    ),
+    "an unknown-length body crossing the cap is rejected"
+)
+check(
+    !TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+        finalURLIsFirstParty: true,
+        statusCode: 200,
+        mimeType: "text/html",
+        expectedContentLength: 64,
+        accumulatedBytes: 64
+    ),
+    "a non-image response is rejected"
+)
 
 // MARK: Degrade path
 

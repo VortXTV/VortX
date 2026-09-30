@@ -2,6 +2,7 @@ package com.vortx.android.downloads
 
 import android.content.Context
 import android.text.format.Formatter
+import android.util.AtomicFile
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -10,6 +11,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.net.URI
 
 /**
  * Device-local persistence for offline downloads. Android port of Apple `app/SourcesShared/DownloadStore.swift`.
@@ -37,6 +39,10 @@ import java.io.File
 object DownloadStore {
 
     private val hydrationGate = OneTimeHydrationGate()
+    private const val RECLAIM_TOMBSTONE_SUFFIX = ".reclaiming"
+    private val managedMediaFilename = Regex(
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(mp4|mkv|avi|mov|m4v|webm|ts|flv|wmv)$",
+    )
 
     /** Newest-first, matching Apple's `records` ordering, for direct consumption by the downloads list. */
     private val _records = MutableStateFlow<List<DownloadRecord>>(emptyList())
@@ -50,7 +56,9 @@ object DownloadStore {
         hydrationGate.hydrate {
             appContext = context.applicationContext
             ensureDownloadsDirectoryExists()
-            loadLocked()
+            // Only a fully decoded index proves which tombstones belong to committed removals. Missing and corrupt
+            // indexes preserve every reclaim artifact for manual/forensic recovery instead of guessing it is safe.
+            if (DownloadIndexHydration.authorizesArtifactRecovery(loadLocked())) recoverReclaimArtifactsLocked()
         }
     }
 
@@ -64,7 +72,7 @@ object DownloadStore {
      */
     fun downloadsDirectory(): File {
         val context = requireNotNull(appContext) { "DownloadStore.init(context) must run before any file access" }
-        return File(context.filesDir, "Downloads")
+        return DownloadDirectoryPolicy.trustedDownloadsDirectory(context.filesDir)
     }
 
     private fun indexFile(): File = File(downloadsDirectory(), "index.json")
@@ -104,6 +112,10 @@ object DownloadStore {
         if (!dir.exists() && !dir.mkdirs() && !dir.isDirectory) {
             throw java.io.IOException("Could not create Downloads directory at ${dir.absolutePath}")
         }
+        // Re-check after mkdir: canonical validation must guard the root itself, not just filenames below it.
+        if (!dir.isDirectory || dir.canonicalFile != dir) {
+            throw java.io.IOException("Downloads directory is redirected outside app files storage")
+        }
     }
 
     /**
@@ -114,32 +126,41 @@ object DownloadStore {
 
     // MARK: Persistence
 
-    private fun loadLocked() {
+    private fun loadLocked(): DownloadIndexHydration.Receipt<List<DownloadRecord>> {
         val file = indexFile()
-        if (!file.isFile) return
-        val decoded = runCatching {
-            val array = JSONArray(file.readText())
-            (0 until array.length()).mapNotNull { i -> recordFromJson(array.optJSONObject(i) ?: return@mapNotNull null) }
-        }.getOrNull() ?: return
-        _records.value = decoded.sortedByDescending { it.addedAt }
-    }
-
-    /** Encode + write the index atomically (write to a temp then rename), matching Apple's `.atomic` write. */
-    private fun persistLocked() {
-        val array = JSONArray()
-        _records.value.forEach { array.put(recordToJson(it)) }
-        runCatching {
-            ensureDownloadsDirectoryExists()
-            val target = indexFile()
-            val temp = File(target.parentFile, "index.json.tmp")
-            temp.writeText(array.toString())
-            if (!temp.renameTo(target)) {
-                // A rename inside one directory should not fail; fall back to a direct write rather than
-                // silently leaving a stale index behind.
-                target.writeText(array.toString())
-                temp.delete()
+        return DownloadIndexHydration.readAtomically(
+            indexFile = file,
+            openRead = { AtomicFile(file).openRead() },
+            decode = ::decodeIndexRecords,
+        ).also { receipt ->
+            if (receipt is DownloadIndexHydration.Receipt.Loaded) {
+                _records.value = receipt.value.sortedByDescending { it.addedAt }
             }
         }
+    }
+
+    /**
+     * Encode + durably replace the index through [AtomicFile]. Its write path retains the prior file until the new
+     * bytes are flushed (`fd.sync`) and finalized, so a process death cannot turn a media tombstone into a claimed
+     * committed deletion merely because a direct index overwrite was torn.
+     */
+    private fun persistLocked(): Boolean {
+        val array = JSONArray()
+        _records.value.forEach { array.put(recordToJson(it)) }
+        return runCatching {
+            ensureDownloadsDirectoryExists()
+            val atomic = AtomicFile(indexFile())
+            val output = atomic.startWrite()
+            try {
+                output.write(array.toString().toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+                atomic.finishWrite(output)
+                true
+            } catch (failure: Throwable) {
+                atomic.failWrite(output)
+                false
+            }
+        }.getOrDefault(false)
     }
 
     // MARK: CRUD
@@ -198,21 +219,125 @@ object DownloadStore {
     }
 
     /**
-     * Remove a record AND its on-disk files. The caller ([DownloadManager]) is responsible for cancelling any live
-     * transfer first.
-     *
-     * BOTH the finished file and the [partFileFor] partial are unlinked: a cancelled in-flight download has only a
-     * `.part`, and leaving it behind would leak the whole partial transfer (potentially gigabytes) with no record
-     * left to ever reference or clean it up.
+     * Remove a record AND its bounded on-disk artifacts. The caller ([DownloadManager]) cancels any live transfer
+     * first. The file move and index commit use the same tombstone protocol as watched reclaim, so an index-write
+     * failure cannot leave an in-memory or rebooted row pointing at a permanently deleted file.
      */
     fun remove(id: String) {
         hydrationGate.withLock {
             val current = _records.value
             val record = current.firstOrNull { it.id == id } ?: return@withLock
-            runCatching { fileFor(record).delete() }
-            runCatching { partFileFor(record).delete() }
-            _records.value = current.filterNot { it.id == id }
-            persistLocked()
+            removeRecordLocked(current, record)
+        }
+    }
+
+    /** Safe, completed-only transaction used by the opt-in watched-download path. */
+    internal fun removeCompletedForWatchedReclaim(record: DownloadRecord): WatchedDownloadReclaimResult =
+        hydrationGate.withLock {
+            val current = _records.value
+            val live = current.firstOrNull { it.id == record.id && it.state == DownloadState.COMPLETED }
+                ?: return@withLock WatchedDownloadReclaimResult.NO_MATCHING_COMPLETED_DOWNLOAD
+            // The policy selected [record] from an earlier snapshot. Recheck the entire immutable row before
+            // moving bytes: a late event may share an id yet no longer name the same file/media after a lifecycle
+            // transition, and must become a harmless no-op.
+            if (!DownloadWatchedReclaimPolicy.matchesCapturedCompletedRecord(record, live)) {
+                return@withLock WatchedDownloadReclaimResult.NO_MATCHING_COMPLETED_DOWNLOAD
+            }
+            when (removeRecordLocked(current, live)) {
+                DownloadReclaimTransaction.Result.RECLAIMED -> WatchedDownloadReclaimResult.RECLAIMED
+                DownloadReclaimTransaction.Result.FILE_RENAME_FAILED -> WatchedDownloadReclaimResult.FILE_RENAME_FAILED
+                DownloadReclaimTransaction.Result.INDEX_WRITE_FAILED_ROLLED_BACK ->
+                    WatchedDownloadReclaimResult.INDEX_WRITE_FAILED_ROLLED_BACK
+                DownloadReclaimTransaction.Result.INDEX_WRITE_FAILED_RECOVERY_REQUIRED ->
+                    WatchedDownloadReclaimResult.INDEX_WRITE_FAILED_RECOVERY_REQUIRED
+            }
+        }
+
+    /** The selector must compare against an exact managed path, never a path from the JSON index unchecked. */
+    internal fun matchesManagedFileUri(record: DownloadRecord, rawUri: String): Boolean {
+        val media = managedFilesFor(record)?.media ?: return false
+        return runCatching {
+            val uri = URI(rawUri)
+            uri.scheme.equals("file", ignoreCase = true) && File(uri).canonicalFile == media.canonicalFile
+        }.getOrDefault(false)
+    }
+
+    private fun removeRecordLocked(
+        current: List<DownloadRecord>,
+        record: DownloadRecord,
+    ): DownloadReclaimTransaction.Result {
+        val files = managedFilesFor(record) ?: return DownloadReclaimTransaction.Result.FILE_RENAME_FAILED
+        val remaining = current.filterNot { it.id == record.id }
+        return DownloadReclaimTransaction().reclaim(
+            mediaFile = files.media,
+            tombstoneFile = files.tombstone,
+            stalePartFile = files.part,
+        ) {
+            _records.value = remaining
+            if (persistLocked()) {
+                true
+            } else {
+                _records.value = current
+                false
+            }
+        }
+    }
+
+    private data class ManagedFiles(val media: File, val part: File, val tombstone: File)
+
+    /**
+     * Validate every filename before deletion/rename. A corrupted or hostile index can still render a row, but it
+     * can never make this store touch a path outside its private Downloads directory.
+     */
+    private fun managedFilesFor(record: DownloadRecord): ManagedFiles? = runCatching {
+        val filename = record.localFilename
+        if (!managedMediaFilename.matches(filename) || !filename.startsWith("${record.id}.")) return@runCatching null
+        val directory = downloadsDirectory().canonicalFile
+        val media = File(directory, filename).canonicalFile
+        if (media.parentFile != directory || media.name != filename) return@runCatching null
+        ManagedFiles(
+            media = media,
+            part = File(directory, "$filename.part").canonicalFile,
+            tombstone = File(directory, "$filename$RECLAIM_TOMBSTONE_SUFFIX").canonicalFile,
+        ).takeIf { files ->
+            files.part.parentFile == directory && files.tombstone.parentFile == directory
+        }
+    }.getOrNull()
+
+    /**
+     * Complete an interrupted reclaim before publishing records. A tombstone with a live row is restored (or removed
+     * when the original already exists); a tombstone without a row is the post-index-commit residue and is deleted.
+     * Orphan parts are only removed when their exact UUID/media filename belongs to this managed directory.
+     */
+    private fun recoverReclaimArtifactsLocked() {
+        val directory = downloadsDirectory().canonicalFile
+        val recordsByFilename = _records.value.associateBy { it.localFilename }
+        directory.listFiles().orEmpty().forEach { file ->
+            val name = file.name
+            // A valid-looking filename can still be a symlink. Canonical validation prevents recovery cleanup from
+            // traversing it to an arbitrary target outside the managed owner directory.
+            val canonicalArtifact = runCatching { file.canonicalFile }.getOrNull() ?: return@forEach
+            if (canonicalArtifact.parentFile != directory || canonicalArtifact.name != name) return@forEach
+            when {
+                name.endsWith(RECLAIM_TOMBSTONE_SUFFIX) -> {
+                    val mediaName = name.removeSuffix(RECLAIM_TOMBSTONE_SUFFIX)
+                    if (!managedMediaFilename.matches(mediaName)) return@forEach
+                    val record = recordsByFilename[mediaName]
+                    val media = runCatching { File(directory, mediaName).canonicalFile }.getOrNull() ?: return@forEach
+                    if (media.parentFile != directory || media.name != mediaName) return@forEach
+                    DownloadReclaimTransaction().recoverTombstone(
+                        mediaFile = media,
+                        tombstoneFile = canonicalArtifact,
+                        indexStillHasRecord = record != null,
+                    )
+                }
+                name.endsWith(".part") -> {
+                    val mediaName = name.removeSuffix(".part")
+                    if (!managedMediaFilename.matches(mediaName)) return@forEach
+                    val record = recordsByFilename[mediaName]
+                    if (record == null || record.state == DownloadState.COMPLETED) runCatching { canonicalArtifact.delete() }
+                }
+            }
         }
     }
 
@@ -340,7 +465,7 @@ object DownloadStore {
     }
 
     internal fun recordFromJson(json: JSONObject): DownloadRecord? {
-        val id = json.optString("id").takeIf { it.isNotEmpty() } ?: return null
+        val id = json.optString("id").takeIf { it.isNotBlank() } ?: return null
         val headers = json.optJSONObject("headers")?.let { obj ->
             obj.keys().asSequence().associateWith { obj.optString(it) }
         }
@@ -383,6 +508,55 @@ object DownloadStore {
             taskIdentifier = if (json.has("taskIdentifier")) json.optInt("taskIdentifier") else null,
         )
     }
+
+    /**
+     * An index is trustworthy only when EVERY JSON array member decodes into one distinct persisted row. Silently
+     * dropping a bad member would make a corrupt index look like a successful removal and authorize tombstone cleanup.
+     * [recordFromJson] retains its legacy defaults, so older valid rows remain accepted without weakening completeness.
+     */
+    internal fun decodeIndexRecords(index: String): List<DownloadRecord> {
+        val array = JSONArray(index)
+        val seenIds = HashSet<String>(array.length())
+        return List(array.length()) { position ->
+            val row = array.optJSONObject(position)
+                ?: throw IllegalArgumentException("Download index row $position is not an object")
+            requireCanonicalHydrationFields(row, position)
+            val record = recordFromJson(row)
+                ?: throw IllegalArgumentException("Download index row $position is not decodable")
+            if (!hasManagedCanonicalIdentity(record)) {
+                throw IllegalArgumentException("Download index row $position has invalid managed identity")
+            }
+            if (!seenIds.add(record.id)) {
+                throw IllegalArgumentException("Download index contains duplicate id ${record.id}")
+            }
+            record
+        }
+    }
+
+    /**
+     * These are the fields every Android writer has emitted since downloads were introduced. Do not add optional
+     * capability/owner/transfer fields here: their absence is legitimate on older rows and [recordFromJson] preserves
+     * those defaults. Required identity/state fields, however, must not be guessed while recovery can delete bytes.
+     */
+    private fun requireCanonicalHydrationFields(row: JSONObject, position: Int) {
+        val required = listOf("id", "contentId", "videoId", "type", "name", "remoteURL", "localFilename", "state")
+        if (required.any { key -> row.requiredNonBlankString(key) == null }) {
+            throw IllegalArgumentException("Download index row $position is missing a required field")
+        }
+        val state = requireNotNull(row.requiredNonBlankString("state"))
+        if (DownloadState.entries.none { it.wireValue == state }) {
+            throw IllegalArgumentException("Download index row $position has invalid state")
+        }
+        if (row.requiredNonBlankString("type") !in setOf("movie", "series")) {
+            throw IllegalArgumentException("Download index row $position has invalid type")
+        }
+    }
+
+    private fun hasManagedCanonicalIdentity(record: DownloadRecord): Boolean =
+        managedMediaFilename.matches(record.localFilename) && record.localFilename.startsWith("${record.id}.")
+
+    private fun JSONObject.requiredNonBlankString(key: String): String? =
+        (opt(key) as? String)?.takeIf { it.isNotBlank() }
 
     /** `optString` returns "" for an absent key, which would turn a null poster/error into an empty string. */
     private fun JSONObject.optStringOrNull(key: String): String? =

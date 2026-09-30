@@ -17,6 +17,33 @@ class MediaRelationsTest {
         assertEquals(MediaRelation.Kind.SEQUEL, result.kind)
         assertEquals("tt123", parse("https://web.stremio.com/#/detail/movie/tt123")!!.item.id)
         assertEquals("kitsu%3A123", parse("stremio:///detail/series/kitsu%253A123")!!.item.id)
+        // The Apple parser treats the decoded id as opaque. A query-looking value is safe when its
+        // question mark was encoded in the route path, and must not be mistaken for a URL query.
+        assertEquals(
+            "kitsu:4726?part=1",
+            parse("stremio:///detail/anime/kitsu%3A4726%3Fpart%3D1")!!.item.id,
+        )
+    }
+
+    @Test fun explicitAnimeAndUsableCustomRoutesNormalizeWithoutMovieFallback() {
+        assertEquals(
+            MediaType.SERIES,
+            parse("stremio:///detail/anime/anilist%3A11061")!!.item.type,
+        )
+        assertEquals(
+            MediaType.SERIES,
+            parse("stremio:///detail/custom/kitsu%3A460")!!.item.type,
+        )
+        assertEquals(
+            MediaType.MOVIE,
+            parse("stremio:///detail/custom/tmdb%3Amovie%3A550")!!.item.type,
+        )
+        assertEquals(
+            MediaType.SERIES,
+            parse("stremio:///detail/custom/tmdb%3Atv%3A1399")!!.item.type,
+        )
+        assertNull(parse("stremio:///detail/custom/tt1234567"))
+        assertNull(parse("stremio:///detail/custom/opaque-id"))
     }
 
     @Test fun rejectsExternalOrAmbiguousRoutesWithoutConvertingCustomTypesToMovies() {
@@ -31,7 +58,7 @@ class MediaRelationsTest {
             "stremio:///detail/movie/tt1#x", "stremio:///detail/movie/tt%2F1",
             "stremio:///detail/movie/tt%001", "stremio:///detail/movie/tt%ZZ",
             "stremio:///detail/movie/", "stremio:///detail/movie/tt1/extra",
-            "stremio:///detail/anime/kitsu:1", "stremio:///detail/custom/1",
+            "stremio:///detail/custom%20type/kitsu%3A1",
         ).forEach { assertNull(it, parse(it)) }
         assertNull(parse("stremio:///detail/movie/tt1", "next"))
         assertNull(parse("stremio:///detail/movie/tt1", name = "  "))

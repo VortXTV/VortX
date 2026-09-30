@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.debrid.DebridCoordinator
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridOwnerToken
@@ -29,7 +30,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
-import com.vortx.android.model.orderedBySeasonEpisode
+import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.player.PlaybackBehaviorSettings
@@ -61,6 +62,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -82,6 +85,33 @@ internal data class EpisodeSwitchSelectionLease(
         return true
     }
 }
+
+/**
+ * Immutable identity of a detail next-episode source warm-up.  The source itself is not enough to publish:
+ * a cancelled repository call may still complete normally after a profile, source target, or detail owner
+ * changes.  Every captured field must still match before this lease can be cached or consumed.
+ */
+internal data class WarmNextSourceLease(
+    val episodeId: String,
+    val source: StreamSource,
+    val profileId: String,
+    val owner: ContinueWatchingOwner,
+    val sourceRequest: SourceRequestFence.Token?,
+    val prewarmGeneration: Long,
+)
+
+internal fun acceptsWarmNextSourceLease(
+    lease: WarmNextSourceLease,
+    targetEpisodeId: String,
+    currentProfileId: String,
+    currentOwner: ContinueWatchingOwner,
+    currentSourceRequest: SourceRequestFence.Token?,
+    currentPrewarmGeneration: Long,
+): Boolean = lease.episodeId == targetEpisodeId &&
+    lease.profileId == currentProfileId &&
+    lease.owner == currentOwner &&
+    lease.sourceRequest === currentSourceRequest &&
+    lease.prewarmGeneration == currentPrewarmGeneration
 
 /** Bounds the fail-soft external-id mapping before a non-IMDb detail becomes terminally unavailable. */
 internal suspend fun <T> boundedDetailRecoveryLookup(
@@ -480,6 +510,12 @@ class DetailViewModel(
     /// (episode/continuity/contentId) with only the pin + prefs refreshed, re-ranking the open list.
     private var lastCtx: SourceListModel.Context? = null
 
+    /// The immutable source-selection identity currently allowed to publish.  This advances for episode,
+    /// profile, refresh, and transient audio changes; a matching title/episode is not enough to authorize a
+    /// stale assembly because the ranking preferences may have changed underneath it.
+    @Volatile
+    private var sourceSelectionRevision = DetailSourceSelectionRevision(0L, null)
+
     /// Smart Source Selection auto-pick once-latch: armed when the viewer TAPS an episode while
     /// [SourcePreferencesStore.autoPickBest] is on (never on the initial programmatic selection), consumed
     /// exactly once when that episode's add-on groups land. Apple's `didAutoPick` latch inverted
@@ -498,11 +534,27 @@ class DetailViewModel(
     /// Smart-Source episode tap, whose auto-pick stays exactly as it was.
     @Volatile private var pendingAdvanceHint: Pair<String?, String?>? = null
 
-    /// Next-episode PRELOAD cache (PLR-8): the pre-ranked best source for the next episode, keyed by its
-    /// episode id, populated off the live fence by [warmNextEpisode] and consumed once by [playNextEpisode]
-    /// so an accepted Up Next skips the source-assembly "Starting..." wait. Best-effort: a miss (never
-    /// warmed, superseded, or a different episode) falls straight through to the cold resolve.
-    @Volatile private var warmNextSourceByEpisode: Pair<String, StreamSource>? = null
+    /// Next-episode PRELOAD cache (PLR-8): the pre-ranked best source for the next episode, keyed by an
+    /// immutable profile/owner/source-request lease and consumed once by [playNextEpisode] so an accepted Up
+    /// Next skips the source-assembly "Starting..." wait. A monotonic generation is separate from the source
+    /// request because profile rebuild and ViewModel disposal can clear this cache while a non-cooperative
+    /// repository call is still returning; the old call must not repopulate it after the clear.
+    private val warmNextLock = Any()
+    private var warmNextGeneration = 0L
+    private var warmNextSourceByEpisode: WarmNextSourceLease? = null
+
+    private data class WarmNextCapture(
+        val episodeId: String,
+        val profileId: String,
+        val owner: ContinueWatchingOwner,
+        val sourceRequest: SourceRequestFence.Token?,
+        val prewarmGeneration: Long,
+    )
+
+    private sealed interface WarmNextPlan {
+        data object AlreadyWarm : WarmNextPlan
+        data class Fetch(val capture: WarmNextCapture) : WarmNextPlan
+    }
 
     /// Detail reactivity (see [CatalogRepository.detailUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
@@ -547,6 +599,10 @@ class DetailViewModel(
                     token != null &&
                     st.requestGeneration == token.generation &&
                     st.streamId == token.targetId &&
+                    acceptsDetailSourceSelection(
+                        DetailSourceSelectionRevision(st.requestGeneration, _sourceAudioLanguageHint.value),
+                        sourceSelectionRevision,
+                    ) &&
                     sourceRequestFence.accepts(token, sourceSticky.currentProfileId())
                 ) {
                     _streams.value = UiState.Success(st.groups)
@@ -661,6 +717,7 @@ class DetailViewModel(
     /// `retryMeta`.
     fun retryMeta() {
         detailMutationFence.invalidate()
+        invalidateWarmNextSource()
         profileReloadJob?.cancel()
         sourceLoadJob?.cancel()
         cancelPlaybackResolveForSourceTargetInvalidation()
@@ -679,6 +736,7 @@ class DetailViewModel(
     /// false, so opening a detail page never auto-plays.
     fun selectEpisode(episodeId: String, userTap: Boolean = true) {
         if (_selectedEpisodeId.value == episodeId) return
+        invalidateWarmNextSource()
         _selectedEpisodeId.value = episodeId
         pendingAutoPick = userTap && sourcePrefs.autoPickBest
         startSourceLoad(episodeId)
@@ -692,6 +750,7 @@ class DetailViewModel(
         } else {
             sourceRequestFence.begin(profileId, episodeId)
         }
+        sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, _sourceAudioLanguageHint.value)
         sourceLoadJob?.cancel()
         if (forceRefresh) torbox.reset(token.generation, clearCache = true)
         sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token, forceRefresh) }
@@ -750,6 +809,7 @@ class DetailViewModel(
 
     private fun rebuildForProfile(profileId: String) {
         detailMutationFence.invalidate()
+        invalidateWarmNextSource()
         sourceLoadJob?.cancel()
         cancelPlaybackResolveForSourceTargetInvalidation()
         profileReloadJob?.cancel()
@@ -767,7 +827,6 @@ class DetailViewModel(
         lastPlayedSource = null
         pendingAutoPick = false
         pendingAdvanceHint = null
-        warmNextSourceByEpisode = null
         failedHandlesByTarget.clear()
         sameSourceReresolved = false
         _streams.value = UiState.Loading
@@ -843,6 +902,7 @@ class DetailViewModel(
             requestGeneration = request.generation,
         )
         val ctx = buildContext(episodeId, contentId, request, advanceHint)
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         lastCtx = ctx
         sourceModel.setContext(ctx)
         _pinUi.value = readPinUi()
@@ -1120,9 +1180,17 @@ class DetailViewModel(
     fun setSourceAudioLanguageHint(language: String?) {
         val normalized = language?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         if (_sourceAudioLanguageHint.value == normalized) return
+        // The picker is session-only, but it still changes the immutable ranking input.  Advance the same
+        // source request fence used for episode changes so an in-flight assembly for the old language cannot
+        // repaint the list after the viewer has selected a new one.  Keep the current groups visible while
+        // the coalesced SourceListModel rebuilds against the new context.
+        val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), _selectedEpisodeId.value)
+        sourceLoadJob?.cancel()
         _sourceAudioLanguageHint.value = normalized
+        sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, normalized)
         lastCtx?.let { ctx ->
             val updated = ctx.copy(
+                requestGeneration = token.generation,
                 prefs = sourcePrefs.snapshot(
                     detailSourceAudioLanguages(normalized, trackPrefs.current.audioLanguages),
                     isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
@@ -1130,6 +1198,12 @@ class DetailViewModel(
             )
             lastCtx = updated
             sourceModel.setContext(updated)
+        }
+        if (lastCtx == null) {
+            // A picker can be opened while the first source request is still installing its context.  Keep
+            // the new language authoritative by restarting that request rather than leaving the model on its
+            // empty initial context.
+            startSourceLoad(_selectedEpisodeId.value)
         }
     }
 
@@ -1797,10 +1871,91 @@ class DetailViewModel(
         if (type != MediaType.SERIES) return null
         val detail = (_meta.value as? UiState.Success)?.data ?: return null
         val currentId = _selectedEpisodeId.value ?: return null
-        val ordered = detail.videos.orderedBySeasonEpisode
+        val ordered = detailEpisodeTargetOrder(detail.videos)
         val idx = ordered.indexOfFirst { it.id == currentId }
         if (idx < 0 || idx + 1 >= ordered.size) return null
         return ordered[idx + 1]
+    }
+
+    /** Invalidate every outstanding next-episode warm publication and its cached source. */
+    private fun invalidateWarmNextSource() = synchronized(warmNextLock) {
+        warmNextGeneration += 1L
+        warmNextSourceByEpisode = null
+    }
+
+    /**
+     * Claim the current warm target. A cached source is retained only when the complete immutable lease still
+     * matches; otherwise it is withdrawn and this call starts a new generation for the requested episode.
+     */
+    private fun beginWarmNext(episodeId: String): WarmNextPlan = synchronized(warmNextLock) {
+        val profileId = sourceSticky.currentProfileId()
+        val owner = repo.continueWatchingOwner()
+        val sourceRequest = sourceRequestFence.currentToken()
+        val cached = warmNextSourceByEpisode
+        if (cached != null && acceptsWarmNextSourceLease(
+                lease = cached,
+                targetEpisodeId = episodeId,
+                currentProfileId = profileId,
+                currentOwner = owner,
+                currentSourceRequest = sourceRequest,
+                currentPrewarmGeneration = warmNextGeneration,
+            )
+        ) {
+            WarmNextPlan.AlreadyWarm
+        } else {
+            if (cached != null) {
+                warmNextGeneration += 1L
+                warmNextSourceByEpisode = null
+            }
+            WarmNextPlan.Fetch(
+                WarmNextCapture(
+                    episodeId = episodeId,
+                    profileId = profileId,
+                    owner = owner,
+                    sourceRequest = sourceRequest,
+                    prewarmGeneration = warmNextGeneration,
+                ),
+            )
+        }
+    }
+
+    /** Read all mutable owner/fence state atomically with the warm generation. */
+    private fun isCurrentWarmNextCapture(capture: WarmNextCapture): Boolean = synchronized(warmNextLock) {
+        capture.profileId == sourceSticky.currentProfileId() &&
+            capture.owner == repo.continueWatchingOwner() &&
+            capture.sourceRequest === sourceRequestFence.currentToken() &&
+            capture.prewarmGeneration == warmNextGeneration
+    }
+
+    /** Publish only after the final active-state check, so a late non-cooperative result is a no-op. */
+    private fun publishWarmNext(capture: WarmNextCapture, source: StreamSource): Boolean =
+        synchronized(warmNextLock) {
+            if (!isCurrentWarmNextCapture(capture)) return@synchronized false
+            warmNextSourceByEpisode = WarmNextSourceLease(
+                episodeId = capture.episodeId,
+                source = source,
+                profileId = capture.profileId,
+                owner = capture.owner,
+                sourceRequest = capture.sourceRequest,
+                prewarmGeneration = capture.prewarmGeneration,
+            )
+            true
+        }
+
+    /** Consume a warm source only when its full lease is still current; every consume retires its generation. */
+    private fun consumeWarmNextSource(episodeId: String): StreamSource? = synchronized(warmNextLock) {
+        val cached = warmNextSourceByEpisode ?: return@synchronized null
+        val valid = acceptsWarmNextSourceLease(
+            lease = cached,
+            targetEpisodeId = episodeId,
+            currentProfileId = sourceSticky.currentProfileId(),
+            currentOwner = repo.continueWatchingOwner(),
+            currentSourceRequest = sourceRequestFence.currentToken(),
+            currentPrewarmGeneration = warmNextGeneration,
+        )
+        warmNextSourceByEpisode = null
+        warmNextGeneration += 1L
+        cached.source.takeIf { valid }
     }
 
     /// Auto-advance to [nextEpisode]: select it and play its best-ranked source the moment its add-on
@@ -1822,27 +1977,48 @@ class DetailViewModel(
      */
     suspend fun warmNextEpisode(episodeId: String): Boolean {
         if (type != MediaType.SERIES) return false
-        if (warmNextSourceByEpisode?.first == episodeId) return true
+        currentCoroutineContext().ensureActive()
+        val plan = beginWarmNext(episodeId)
+        if (plan === WarmNextPlan.AlreadyWarm) return true
+        val capture = (plan as WarmNextPlan.Fetch).capture
         val detail = (_meta.value as? UiState.Success)?.data ?: return false
         val target = detail.videos.firstOrNull { it.id == episodeId } ?: return false
-        val groups = repo.streams(
+
+        // Capture every mutable ranking input before the one-shot fetch. If the profile/source owner changes
+        // while that fetch is in flight, the lease check below rejects the result rather than ranking with a
+        // different profile's sticky source or history context.
+        val rememberedQuality = lastPlayedSource?.let(StreamRanking::qualityLabel)
+        val wantedAddon = sourceSticky.preference(id)?.addon
+        val continuity = lastPlayedSource?.let(StreamRanking::signature)
+        val binge = lastPlayedSource?.bingeGroup
+        val pin = currentPin()
+        val sticky = sourceSticky.preference(id)
+        val prefs = lastCtx?.prefs ?: StreamRanking.reading()
+
+        val groupsResult = repo.streams(
             type = type,
             id = id,
             episodeId = target.id,
-            rememberedQuality = lastPlayedSource?.let(StreamRanking::qualityLabel),
-            wantedAddon = sourceSticky.preference(id)?.addon,
-        ).getOrNull()?.takeIf { list -> list.any { it.streams.isNotEmpty() } } ?: return false
+            rememberedQuality = rememberedQuality,
+            wantedAddon = wantedAddon,
+        )
+        // Some repositories do not make cancellation cooperative. Do not let their late normal return
+        // publish a source after this coroutine was cancelled or any of the captured owners changed.
+        currentCoroutineContext().ensureActive()
+        if (!isCurrentWarmNextCapture(capture)) return false
+        val groups = groupsResult.getOrNull()?.takeIf { list -> list.any { it.streams.isNotEmpty() } } ?: return false
         val best = StreamRanking.best(
             groups = groups,
-            continuity = lastPlayedSource?.let(StreamRanking::signature),
-            binge = lastPlayedSource?.bingeGroup,
-            pin = currentPin(),
-            sticky = sourceSticky.preference(id),
+            continuity = continuity,
+            binge = binge,
+            pin = pin,
+            sticky = sticky,
             providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-            prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+            prefs = prefs,
         ) ?: return false
-        warmNextSourceByEpisode = episodeId to best
-        return true
+        currentCoroutineContext().ensureActive()
+        if (!isCurrentWarmNextCapture(capture)) return false
+        return publishWarmNext(capture, best)
     }
 
     fun playNextEpisode() {
@@ -1853,8 +2029,7 @@ class DetailViewModel(
         // below. The fence is (re)begun for the target so play()'s token + episode identity are correct;
         // the reactive assembly still runs to populate the new episode's in-player source list, but playback
         // no longer waits on it.
-        val warm = warmNextSourceByEpisode?.takeIf { it.first == next.id }?.second
-        warmNextSourceByEpisode = null
+        val warm = consumeWarmNextSource(next.id)
         if (warm != null) {
             _selectedSeason.value = next.season
             _selectedEpisodeId.value = next.id
@@ -1871,6 +2046,9 @@ class DetailViewModel(
             playBest()
             return
         }
+        // Auto-advance assigns the target directly so it can carry the continuation hint; retire any
+        // in-flight warm publication just as [selectEpisode] does before replacing the visible episode.
+        invalidateWarmNextSource()
         _selectedEpisodeId.value = next.id
         pendingAutoPick = true
         startSourceLoad(next.id)
@@ -2030,7 +2208,7 @@ class DetailViewModel(
 
     private fun primaryEpisodeOf(detail: MetaDetail): Pair<Episode, Boolean>? {
         if (detail.videos.isEmpty()) return null
-        val sorted = sortedEpisodes(detail.videos)
+        val sorted = detailEpisodeTargetOrder(detail.videos)
         val lib = detail.libraryItem
         if (lib != null && lib.timeOffsetMs > 0 && lib.videoId != null) {
             val resumeVideo = sorted.firstOrNull { it.id == lib.videoId }
@@ -2146,14 +2324,12 @@ class DetailViewModel(
         )
     }
 
-    private fun sortedEpisodes(videos: List<Episode>): List<Episode> =
-        videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
-
     /// Tear down the assembly pipeline + contributor lanes when the screen goes away. [SourceListModel.close]
     /// stops the coalescer (it runs on [viewModelScope], which is cancelled anyway, but the contributors own
     /// their OWN scopes and must be closed explicitly to cancel any in-flight TorBox / Singularity fetch).
     override fun onCleared() {
         sourceSwitchCommitGate.invalidate()
+        invalidateWarmNextSource()
         super.onCleared()
         sourceModel.close()
         torbox.close()
@@ -2201,6 +2377,92 @@ class DetailViewModel(
         /// unchanged.
         const val CACHED_ID_SUFFIX = "\u0000cached"
     }
+}
+
+/**
+ * Immutable ownership for one assembled detail-source selection.  The source model does not know about
+ * Compose's transient audio picker, so the ViewModel carries the picker choice through the same monotonic
+ * request generation as an episode change.  A late assembly can therefore never publish into a newer
+ * language selection, even when the title and episode are unchanged.
+ */
+internal data class DetailSourceSelectionRevision(
+    val requestGeneration: Long,
+    val audioLanguage: String?,
+)
+
+internal fun acceptsDetailSourceSelection(
+    captured: DetailSourceSelectionRevision,
+    current: DetailSourceSelectionRevision,
+): Boolean = captured == current
+
+/**
+ * A detail relation may be represented by a TMDB/TVDB/Kitsu id, but only the two media types understood by
+ * the TMDB bridge may be converted to IMDb.  Live/custom/anime-like types stay opaque until their own route
+ * understands them; treating every unknown type as a movie silently opens the wrong title.
+ */
+internal fun canResolveRelatedDetail(type: MediaType): Boolean =
+    type == MediaType.MOVIE || type == MediaType.SERIES
+
+internal class DetailNavigationFence {
+    private var generation = 0L
+
+    @Synchronized
+    fun begin(): Long = ++generation
+
+    @Synchronized
+    fun accepts(capturedGeneration: Long): Boolean = capturedGeneration == generation
+
+    /** Invalidate work that outlives the detail surface (for example a blocking TMDB response). */
+    @Synchronized
+    fun invalidate() {
+        generation++
+    }
+}
+
+internal suspend fun resolveRelatedDetailTitle(item: MetaItem): MetaItem {
+    if (item.id.startsWith("tt") || !canResolveRelatedDetail(item.type)) return item
+    val resolved = boundedDetailRecoveryLookup(timeoutMs = 6_000L) {
+        TMDBPersonClient.imdbId(item.id, item.type)
+    }
+    return if (resolved.isNullOrBlank() || !resolved.startsWith("tt")) item else item.copy(id = resolved)
+}
+
+/**
+ * Detail's target policy intentionally ignores season-zero specials whenever a title has actual episodes.
+ * Specials remain available in the episode browser; they simply cannot hijack Continue Watching's primary
+ * resume/next target ahead of the first real episode.
+ */
+internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
+    val ordered = videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
+    val actualEpisodes = ordered.filter { it.season > 0 }
+    return actualEpisodes.ifEmpty { ordered }
+}
+
+/**
+ * Audio choices advertised by the sources currently on screen.  The traversal deliberately preserves the
+ * assembled group/stream order (which is the app's add-on order in add-on-order mode) and only exposes a
+ * language after at least one actual source advertises it.  The saved settings list supplies labels, never
+ * the option set, so a source picker cannot offer a checked-but-unavailable language.
+ */
+internal fun detailAudioLanguageOptions(groups: List<StreamGroup>): List<Pair<String, String>> {
+    val labels = TrackPreferences.commonLanguages.toMap()
+    val codes = LinkedHashSet<String>()
+    groups.forEach { group ->
+        group.streams.forEach { source ->
+            val text = listOfNotNull(source.title, source.description, source.quality).joinToString(" ")
+            val lowered = text.lowercase()
+            StreamRanking.languageCodesAdvertised(text)
+                .filterNot { code ->
+                    // These ranker tokens describe burned-in subtitles, not the audio track.  Keep them out
+                    // of the picker so a "Korean subs" source cannot masquerade as a Korean dub option.
+                    (code == "ko" && lowered.contains("korsub")) ||
+                        (code == "fr" && lowered.contains("vostfr")) ||
+                        (code == "pt" && lowered.contains("legendado"))
+                }
+                .forEach { code -> codes += code }
+        }
+    }
+    return codes.map { code -> code to (labels[code] ?: code.uppercase()) }
 }
 
 /// Playback request state for the detail page. Resolving covers the engine round-trip (streaming

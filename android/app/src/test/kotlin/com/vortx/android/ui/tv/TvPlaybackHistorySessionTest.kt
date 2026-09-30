@@ -40,6 +40,7 @@ class TvPlaybackHistorySessionTest {
                     residentResumeMs = positionMs
                     residentWatched = durationMs > 0L &&
                         positionMs.toDouble() / durationMs.toDouble() >= 0.90
+                    null
                 },
             )
             val trailer = TvPlaybackHistorySession(
@@ -91,6 +92,7 @@ class TvPlaybackHistorySessionTest {
                 if (token.generation == 1L) allowFirstEnd.await()
                 if (token == activeToken) activeToken = null
                 events += "end-${token.generation}-finish"
+                null
             },
         )
         val first = TvPlaybackHistorySession(
@@ -174,7 +176,7 @@ class TvPlaybackHistorySessionTest {
                 PlaybackSessionToken(++generation)
             },
             reportSession = { _, _, _ -> },
-            endSession = { _, _, _ -> },
+            endSession = { _, _, _ -> null },
         )
 
         // A downloaded episode carries its full identity; begin() must hand EXACTLY that immutable

@@ -1,6 +1,6 @@
 import Foundation
 
-/// Pure, Foundation-only policy for repairing Continue Watching artwork WITHOUT a new network call.
+/// Foundation-only artwork admission and caching policy with no third-party metadata lookup.
 ///
 /// HARD PRIVACY INVARIANT (preserved from the fold's original design): a private Trakt playback row
 /// must never drive a new third-party metadata or image request. Artwork may come only from:
@@ -13,6 +13,29 @@ import Foundation
 /// and `TraktPlaybackShadow` (join side) share one set of rules, and so the rules are testable with
 /// the system Swift toolchain.
 enum TraktArtworkPolicy {
+    /// Per-task redirect admission, shared by the private artwork fetch and its Foundation-only tests.
+    /// A resource deadline also applies, but must not be the only bound on a same-host redirect loop.
+    final class RedirectBudget: @unchecked Sendable {
+        static let maximumHops = 3
+        private let lock = NSLock()
+        private var counts: [Int: Int] = [:]
+
+        func admit(taskID: Int) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let count = counts[taskID, default: 0]
+            guard count < Self.maximumHops else { return false }
+            counts[taskID] = count + 1
+            return true
+        }
+
+        func finish(taskID: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            counts.removeValue(forKey: taskID)
+        }
+    }
+
     /// A locally cached row usable for the artwork join (a projection of `CoreCWItem`).
     struct Candidate: Equatable, Sendable {
         let id: String
@@ -23,9 +46,13 @@ enum TraktArtworkPolicy {
 
     // MARK: - Source-supplied artwork (no request involved)
 
-    /// Trakt's image payload omits the URL scheme, so accept a valid host/path and normalize it
-    /// to HTTPS. Explicit non-HTTPS schemes, userinfo, scheme-relative URLs, relative paths, and
-    /// bare filenames are rejected. This performs no lookup or network access.
+    /// Trakt's image payload omits the URL scheme, so accept only a documented first-party Trakt
+    /// image URL and normalize it to HTTPS. The host/path gate is intentionally narrow: a private
+    /// playback row is allowed to carry art only when Trakt itself supplied an HTTPS CDN URL under
+    /// `*.trakt.tv/images/`. This prevents a row from smuggling an arbitrary third-party URL into a
+    /// private card or the Top Shelf cache. Explicit non-HTTPS schemes, userinfo, non-default ports,
+    /// scheme-relative URLs, relative paths, and bare filenames are rejected. This performs no lookup
+    /// or network access.
     static func sourceSuppliedArtwork(_ value: String?) -> String? {
         guard let value,
               !value.isEmpty,
@@ -46,15 +73,36 @@ enum TraktArtworkPolicy {
             candidate = "https://" + value
         }
 
-        guard let components = URLComponents(string: candidate),
+        return validatedFirstPartyArtwork(candidate)
+    }
+
+    /// Whether an already-normalized URL is a first-party Trakt CDN image URL.
+    ///
+    /// This is separate from `sourceSuppliedArtwork(_:)` because callers that receive a joined local
+    /// poster must not normalize or otherwise rewrite it. A `true` result means the caller may use
+    /// the exact supplied string for a normal cache-backed image load; a `false` result keeps the
+    /// caller on the warm-only local-art path.
+    static func isFirstPartyArtwork(_ value: String?) -> Bool {
+        guard let value, !value.isEmpty, !value.contains(where: { $0.isWhitespace }) else { return false }
+        return validatedFirstPartyArtwork(value) != nil
+    }
+
+    private static func validatedFirstPartyArtwork(_ value: String) -> String? {
+        guard let components = URLComponents(string: value),
               components.scheme?.lowercased() == "https",
-              let host = components.host,
-              !host.isEmpty,
+              let host = components.host?.lowercased(),
+              host.count > ".trakt.tv".count,
+              host.hasSuffix(".trakt.tv"),
               components.user == nil,
               components.password == nil,
+              components.port == nil || components.port == 443,
+              components.fragment == nil,
+              components.path.lowercased().hasPrefix("/images/"),
               let url = components.url,
-              url.host != nil else { return nil }
-        return candidate
+              url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == host
+        else { return nil }
+        return value
     }
 
     /// Extract artwork from the documented Trakt `images` object, if present. Trakt image values

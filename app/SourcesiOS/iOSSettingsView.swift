@@ -146,7 +146,7 @@ struct iOSSettingsView: View {
     // resolves (see dvRemuxBinding). Mirrors SourcesTV/SettingsView.
     @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemuxStored: Bool?
     #endif
-    @AppStorage("stremiox.autoSkip") private var autoSkip = false
+    @State private var autoSkipDelaySeconds = AutoSkipSettings.delaySeconds()
     @AppStorage(CommunityTrickplay.settingKey) private var communityTrickplay = true   // share/fetch scrub previews
     // Give-to-get master switch: contribute + consume the whole community data pool. Default ON. Off = out of
     // the pool entirely (no contribute, no consume of any moat feature). See MoatConsent.
@@ -731,8 +731,19 @@ struct iOSSettingsView: View {
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
             }
-            Toggle("Auto-skip intro & credits", isOn: $autoSkip)
-                .tint(Theme.Palette.accent)
+            Picker("Auto-skip intro, recap & credits", selection: Binding(
+                get: { autoSkipDelaySeconds },
+                set: { value in
+                    autoSkipDelaySeconds = value
+                    AutoSkipSettings.setDelaySeconds(Double(value))
+                }
+            )) {
+                ForEach(AutoSkipSettings.choices, id: \.self) { value in
+                    Text(AutoSkipSettings.choiceLabels[value] ?? "\(value)s").tag(value)
+                }
+            }
+            Text("Waits for active playback before skipping each detected intro, recap, preview, or credits segment. Pause and buffering do not spend the countdown; Off keeps the manual Skip button.")
+                .font(.caption).foregroundStyle(.secondary)
             Picker("Skip timestamps source", selection: $skipProvider) {
                 Text("TheIntroDB").tag("theintrodb")
                 Text("SkipDB").tag("skipdb")

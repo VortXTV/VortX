@@ -20,7 +20,7 @@ class PlaybackSessionLifecycle internal constructor(
     private val scope: CoroutineScope,
     private val beginSession: suspend (PlaybackContext?, ContinueWatchingOwner?) -> PlaybackSessionToken?,
     private val reportSession: suspend (PlaybackSessionToken, Long, Long) -> Unit,
-    private val endSession: suspend (PlaybackSessionToken, Long, Long) -> Unit,
+    private val endSession: suspend (PlaybackSessionToken, Long, Long) -> DurableWatchedPlaybackReceipt?,
 ) {
     constructor(repository: CatalogRepository, scope: CoroutineScope) : this(
         scope = scope,
@@ -31,7 +31,7 @@ class PlaybackSessionLifecycle internal constructor(
             repository.reportProgress(token, positionMs, durationMs)
         },
         endSession = { token, positionMs, durationMs ->
-            repository.endPlaybackSession(token, positionMs, durationMs)
+            repository.endPlaybackSessionWithDurableWatchReceipt(token, positionMs, durationMs).getOrNull()
         },
     )
 
@@ -59,10 +59,15 @@ class PlaybackSessionLifecycle internal constructor(
         scope.launch { reportSession(token, positionMs, durationMs) }
     }
 
-    fun end(handle: Handle, positionMs: Long, durationMs: Long) {
+    fun end(
+        handle: Handle,
+        positionMs: Long,
+        durationMs: Long,
+        onDurableWatch: (DurableWatchedPlaybackReceipt) -> Unit = {},
+    ) {
         enqueue {
             val token = handle.token.getAndSet(null) ?: return@enqueue
-            endSession(token, positionMs, durationMs)
+            endSession(token, positionMs, durationMs)?.let(onDurableWatch)
         }
     }
 

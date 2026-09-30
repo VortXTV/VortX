@@ -80,9 +80,16 @@ enum TraktContinueWatchingFold {
             // Preserve the newest row's progress/name/artwork, but accumulate every identity
             // seen across duplicate rows so transitive A-B-C aliases cannot yield duplicate cards.
             var winner = kept[duplicateIndex]
+            var aliases: [String] = winner.aliases ?? []
+            aliases.append(candidate.id)
+            aliases.append(contentsOf: candidate.aliases ?? [])
+            for index in duplicateIndices {
+                let duplicate = kept[index]
+                aliases.append(duplicate.id)
+                aliases.append(contentsOf: duplicate.aliases ?? [])
+            }
             winner.aliases = TraktArtworkPolicy.dedupedAliases(
-                (winner.aliases ?? []) + [candidate.id] + (candidate.aliases ?? [])
-                    + duplicateIndices.flatMap { [kept[$0].id] + (kept[$0].aliases ?? []) },
+                aliases,
                 primary: winner.id
             )
             kept[duplicateIndex] = winner

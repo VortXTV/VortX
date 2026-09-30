@@ -42,10 +42,10 @@ import java.util.concurrent.Executor
  *    the equivalent would be a Media3 `DownloadService` writing an opaque cache, which is a different architecture
  *    from this subsystem's `<id>.<ext>` flat file + `index.json` record schema. So Android takes the SAME honest
  *    failure Apple's tvOS/macOS branch takes. See [isHLSPlaylistURL].
- *  * **Auto-delete watched downloads** (Apple's opt-in `autoDeleteWatchedDefaultsKey` sweep). It is driven by the
- *    app-wide finished-watched signal `WatchedIndex.ids`, and `WatchedIndex` is NOT ported to Android (it is a
- *    genuinely-absent row on the parity map). Porting the sweep now would mean writing a feature whose trigger can
- *    never fire, so it waits for WatchedIndex.
+ *  * **Auto-delete watched downloads** is opt-in and only accepts a history-owned,
+ *    [WatchedDownloadReclaimRequest] after that exact watched write committed and the local decoder released its
+ *    file. It deliberately does not read `WatchedIndex`: that series-level Home badge becomes true after any
+ *    episode and would over-delete the rest of a show.
  *  * **The batch coordinator** (`iOSBatchDownloadCoordinator.swift`, "download season 2"). It sits on top of THIS
  *    core plus the ranking settle loop and the contributor merges; it is its own unit.
  *
@@ -81,12 +81,10 @@ object DownloadManager {
      * cross-device settings rather than the device-local [PREFS] file (max-concurrent / queue order live
      * there). Default OFF, on Apple's EXACT key so the choice round-trips across devices.
      *
-     * The reclaim SWEEP itself (delete a completed download once its title is finished-watched) is NOT wired
-     * here yet: Android's [com.vortx.android.library.WatchedIndex] is a per-profile Home-badge helper that
-     * marks a SERIES watched as soon as any episode ticks, so wiring it naively would over-delete a
-     * part-watched show's episodes. The safe per-episode finished-watched signal Apple reads is a separate
-     * port; the toggle persists + syncs now and gates the sweep once that signal exists. Deleting a user's
-     * file on a false positive is the failure mode this defers.
+     * The manager exposes a strict reclaim API, but the history/player owners must wire its trigger: this package
+     * cannot prove a watch write in a different persistence layer and must never infer it from elapsed time, EOF,
+     * or the broad [com.vortx.android.library.WatchedIndex] series badge. See
+     * [reclaimWatchedDownloadAfterDurableWatchAndDecoderRelease].
      */
     const val AUTO_DELETE_WATCHED_KEY = "vortx.downloads.autoDeleteWatched"
     private const val SHARED_SETTINGS_FILE = "vortx_settings"
@@ -166,11 +164,14 @@ object DownloadManager {
         context.applicationContext.getSharedPreferences(SHARED_SETTINGS_FILE, Context.MODE_PRIVATE)
 
     /** Whether watched downloads should be auto-deleted (SET-11). Synced, default OFF. */
-    fun isAutoDeleteWatchedEnabled(context: Context): Boolean =
+    fun isAutoDeleteWatchedEnabled(context: Context): Boolean = synchronized(lock) {
         sharedSettings(context).getBoolean(AUTO_DELETE_WATCHED_KEY, false)
+    }
 
     fun setAutoDeleteWatchedEnabled(context: Context, enabled: Boolean) {
-        sharedSettings(context).edit().putBoolean(AUTO_DELETE_WATCHED_KEY, enabled).apply()
+        DownloadAutoDeleteWatchedAdmission.setEnabled(lock, enabled) {
+            sharedSettings(context).edit().putBoolean(AUTO_DELETE_WATCHED_KEY, it).apply()
+        }
     }
 
     @Volatile
@@ -412,6 +413,41 @@ object DownloadManager {
             pruneQueueOrder()
             fillAvailableSlots()
         }
+    }
+
+    /**
+     * Reclaim one local download after TWO external facts are already true:
+     *
+     *  1. the immutable [WatchedDownloadReclaimRequest] was written as watched by its own profile/history store;
+     *  2. that player's decoder released [WatchedDownloadReclaimRequest.localFileUri].
+     *
+     * The caller must invoke this from the durable-write completion path followed by the real player-release
+     * callback; calling on EOF, progress thresholds, timers, or while a decoder is still open violates this
+     * contract. No active-profile lookup occurs here: a profile switch after playback begins must not reinterpret
+     * the old session's ownership. The store validates exact content/video/type/title/season/episode and the exact
+     * canonical managed file before its tombstone/index transaction runs.
+     */
+    fun reclaimWatchedDownloadAfterDurableWatchAndDecoderRelease(
+        context: Context,
+        request: WatchedDownloadReclaimRequest,
+    ): WatchedDownloadReclaimResult = DownloadAutoDeleteWatchedAdmission.admit(
+        lock = lock,
+        isEnabled = { sharedSettings(context).getBoolean(AUTO_DELETE_WATCHED_KEY, false) },
+        disabled = { WatchedDownloadReclaimResult.DISABLED },
+    ) {
+        if (request.owner.profileId.isBlank() || !request.localFileUri.startsWith("file:")) {
+            return@admit WatchedDownloadReclaimResult.INVALID_REQUEST
+        }
+        val record = DownloadWatchedReclaimPolicy.matchingCompletedRecord(
+            enabled = true,
+            request = request,
+            records = DownloadStore.records.value,
+            hasMatchingManagedFile = { candidate -> DownloadStore.matchesManagedFileUri(candidate, request.localFileUri) },
+        ) ?: return@admit WatchedDownloadReclaimResult.NO_MATCHING_COMPLETED_DOWNLOAD
+
+        val result = DownloadStore.removeCompletedForWatchedReclaim(record)
+        if (result == WatchedDownloadReclaimResult.RECLAIMED) pruneQueueOrder()
+        result
     }
 
     // MARK: Queue manager (concurrency cap + reorder)

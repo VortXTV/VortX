@@ -201,6 +201,53 @@ class WatchOverlayStore(
     }
 
     /**
+     * Terminal LOCAL-play write: publish progress plus this exact watched video in one synchronous
+     * SharedPreferences commit. The engine calls this off the UI thread while holding the owner/profile
+     * fence. A false result is intentionally not recoverable as a durable-watch receipt.
+     */
+    internal fun recordFinishedWatchAndCommit(
+        metaId: String,
+        videoId: String,
+        positionSeconds: Double,
+        durationSeconds: Double,
+        name: String,
+        type: String,
+        poster: String?,
+    ): Boolean {
+        if (!overlayActive() || durationSeconds <= 0.0 || positionSeconds < 0.0) return false
+        val id = activeProfileId ?: return false
+        val previous = watch[metaId] ?: WatchEntry(videoId = videoId, name = name, type = type, poster = poster)
+        val watched = if (previous.watchedVideoIds.contains(videoId)) previous.watchedVideoIds else previous.watchedVideoIds + videoId
+        val entry = previous.copy(
+            videoId = videoId,
+            timeOffsetMs = if (type == MediaType.SERIES.id) (positionSeconds * 1000).roundToInt() else 0,
+            durationMs = (durationSeconds * 1000).roundToInt(),
+            lastWatched = isoNow(),
+            name = name.ifEmpty { previous.name },
+            type = type.ifEmpty { previous.type },
+            poster = poster ?: previous.poster,
+            watchedVideoIds = watched,
+        )
+        val snapshot = watch + (metaId to entry)
+        if (!saveCommitted(id, snapshot)) return false
+        watch = snapshot
+        onOverlayChanged(watch)
+        schedulePush(id)
+        return true
+    }
+
+    /**
+     * Recheck BOTH the live active map and its persisted counterpart for exactly one watched video.
+     * An intervening unwatch clears the live map before its asynchronous ordinary persistence completes,
+     * while the disk read prevents a synthetic in-memory acknowledgement from authorizing reclaim.
+     */
+    internal fun hasCommittedWatchedVideo(metaId: String, videoId: String): Boolean {
+        val id = activeProfileId ?: return false
+        if (!overlayActive() || !watch[metaId].orEmptyWatched().contains(videoId)) return false
+        return load(id)[metaId].orEmptyWatched().contains(videoId)
+    }
+
+    /**
      * Save a title to the overlay library without marking it watched (the "Add to Library" button).
      * A no-op when already tracked, so an add never clobbers existing progress. Mirrors Apple
      * `addLibraryEntry`.
@@ -297,6 +344,9 @@ class WatchOverlayStore(
         prefs.edit().putString(cacheKey(profileId), WatchEntry.encodeMap(map)).apply()
     }
 
+    private fun saveCommitted(profileId: String, map: Map<String, WatchEntry>): Boolean =
+        prefs.edit().putString(cacheKey(profileId), WatchEntry.encodeMap(map)).commit()
+
     /** Drop a removed profile's cache. Called by [ProfileStore.remove]. */
     fun clearCache(profileId: String) {
         prefs.edit().remove(cacheKey(UserProfile.normalizeId(profileId))).apply()
@@ -315,3 +365,5 @@ class WatchOverlayStore(
         fun isoNow(): String = ISO.format(Instant.now())
     }
 }
+
+private fun WatchEntry?.orEmptyWatched(): List<String> = this?.watchedVideoIds ?: emptyList()

@@ -94,7 +94,7 @@ struct SettingsView: View {
     @AppStorage(PlayerEngineRouter.dvRemuxKey) private var dvRemuxStored: Bool?
     /// The "Play in" menu, resolved once per appearance (see refreshExternalPlayerChoices).
     @State private var externalPlayerChoices: [(String, String)] = []
-    @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
+    @State private var autoSkipDelaySeconds = AutoSkipSettings.delaySeconds()
     // Trailer language (D11): the ISO-639-1 code the trailer picker prefers when choosing the YouTube id. Empty
     // = follow the app UI language (the default). Read by TMDBClient.preferredTrailerLanguages / trailerLanguageBaseCode.
     @AppStorage("stremiox.trailerLanguage") private var trailerLanguage = ""
@@ -565,8 +565,20 @@ struct SettingsView: View {
             Text("Using a Mac for this lives under Streaming Server.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
-            choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
-                      selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
+            choiceRow(String(localized: "Auto-skip intro, recap & credits"),
+                      AutoSkipSettings.choices.map { value in
+                          (id: String(value), label: AutoSkipSettings.choiceLabels[value] ?? "\(value)s")
+                      },
+                      selection: Binding(
+                          get: { String(Int(autoSkipDelaySeconds)) },
+                          set: { value in
+                              guard let seconds = Int(value) else { return }
+                              autoSkipDelaySeconds = Double(seconds)
+                              AutoSkipSettings.setDelaySeconds(Double(seconds))
+                          }
+                      ))
+            Text("Waits for active playback before skipping each detected intro, recap, preview, or credits segment. Pause and buffering do not spend the countdown; Off keeps the manual Skip button.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             choiceRow(String(localized: "Skip timestamps source"), [("theintrodb", "TheIntroDB"), ("skipdb", "SkipDB"), ("both", "Both")],
                       selection: $skipProvider)
             NavigationLink { SkipKeysView() } label: {

@@ -17,6 +17,20 @@ import java.util.Date
 class SettingsBackupInteropTest {
 
     @Test
+    fun autoSkipDelayAndLegacyFlagRoundTripWithTheirExactTypes() {
+        val values = mapOf<String, Any>(
+            "stremiox.autoSkipDelaySeconds" to 15,
+            "stremiox.autoSkip" to false,
+        )
+        assertEquals(values.mapValues { (_, value) -> if (value is Int) value.toLong() else value },
+            SettingsBackup.plistSettingsFrom(values))
+        val restored = SettingsBackup.settingsFromBlob(blobFromDomain(values))
+        assertEquals(SettingsBackup.BackupValue.IntValue(15), restored?.get("stremiox.autoSkipDelaySeconds"))
+        assertEquals(SettingsBackup.BackupValue.Bool(false), restored?.get("stremiox.autoSkip"))
+        assertTrue(SettingsBackup.plistSettingsFrom(mapOf("stremiox.autoSkipDelaySeconds" to "15")).isEmpty())
+    }
+
+    @Test
     fun subtitleAddOnPreferencesRoundTripThroughAccountSettings() {
         val values = mapOf<String, Any>("stremiox.tracks.preferAddonSubtitles" to true,
             "stremiox.tracks.subOnlyPreferred" to false)

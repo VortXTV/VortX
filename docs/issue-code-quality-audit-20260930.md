@@ -5,6 +5,103 @@ All 52 issues open at the start of this audit were checked against their bodies,
 current source. A source-addressed report is **not** the same as a newly reproduced, device-verified fix.
 Apple Beta 16 and Android Beta 14 are different artifact baselines; Android parity is not complete.
 
+## Current follow-up on reviewed main `6c74ae048`
+
+- Apple players share first-rendered-frame startup admission, load/seek/source deadline ownership and
+  staged track restoration. A valid zero-second AVPlayer frame is not discarded; iOS/Mac continuously
+  monitor asynchronous remux attachment instead of making a single early check that can demote it.
+- Failed deferred resumes now retire the exact load's logical target as well as its watchdog. The tvOS
+  player observes runtime seekability, and both Apple surfaces recover at a confirmed decoder position
+  instead of repeatedly promoting the saved Continue Watching floor into a new failed seek. The saved
+  floor remains protected; explicit user seeks supersede the owned abandonment. AVPlayer's logical
+  remux-origin behavior remains separate from MPV runtime seekability.
+  The final specialist review closed the remaining retry-chain, fresh-provider-link, terminal Retry,
+  foreground and engine-surface boundaries: retirement is transferred only after exact same-source
+  admission; surface transfers are captured before stop and consumed before the first owned callback.
+  Raw positions belong to a load token and AV item generation. Same-episode source hops retain a separate
+  persistence-only floor without granting it retry authority; another episode inherits neither the
+  protection nor an old seek. Explicit chapter seeks use the same manual-seek entry point. Satisfying a
+  replacement's low remux origin cannot erase valid Continue Watching progress.
+- Native automatic skip uses actual playback deltas, defaults to 5 seconds for an unset preference, and
+  offers Off/5/10/15/30 seconds. Existing explicit Off is preserved. Immediate Skip and X are distinct
+  touch/remote/accessibility actions; X remains suppressed for that segment through seek/source changes.
+  Watch Credits also cancels the credits countdown. Withdrawn TV accessibility controls are retired so
+  a retained Play Next/Watch Credits element cannot navigate or suppress binge playback after its card
+  disappears. The obsolete immediate-skip policy was removed rather than maintained alongside this path.
+- **#229 / #164:** Trakt artwork joins owner-scoped cached metadata and first-party playback images.
+  Top Shelf persists managed image files, preserves valid artwork on progress-only updates, fences account
+  switches, bounds download bytes, and admits at most three exact-host redirects. Private Trakt history
+  does not drive new third-party metadata lookups. Physical artwork presentation is still unverified.
+- Android source/player replacement, single-task prewarming, CW episode selection, TV Up focus,
+  actual-source language options, custom relation routes, and separate audio/subtitle inventory defaults
+  were implemented and independently reviewed. The previous single track-ready flag could strand later
+  subtitle inventory after audio arrived first; explicit track choices now own their type.
+- Download cleanup now has exact durable watched receipts, immutable owner/request callbacks, an aggregate
+  outer-session resource gate, and recoverable atomic index/file transactions. It is Off by default. Missing
+  engine-backed per-video durability proof, unreadable/incomplete indexes, noncanonical file ownership,
+  owner changes, and unreleased decoder/lease resources all reject reclamation.
+- Shared Apple regression gates now execute the native subtitle renderer-exclusion/expiry behavior and
+  both embedded-background attributes. These retain the earlier subtitle fix; this patch does not claim
+  it discovered a new subtitle-rendering root cause.
+- Account-local watch suggestions now use immutable inputs from the exact decrypted account document,
+  not a resident engine union that may still belong to a previous account. Profile, credential capture,
+  auth/publication epoch and hydration receipts fence both Home consumers. JSON numeric zero/one remain
+  valid watch positions; genuine Boolean wire values are rejected. Ordinary library membership is not
+  manufactured into watch evidence.
+- Guest-history provenance is explicit and persistent: binding an account excludes its resident history
+  from later guest recommendations, including a failed cold account restore. Missing/corrupt provenance
+  and existing/unreadable storage fail closed; only a known-fresh guest storage directory can establish
+  its initial receipt before engine startup. Existing library/history is not deleted to satisfy this gate.
+  Trakt, SIMKL and media-server rails refresh independently while personalized history settles.
+
+The complete overnight diagnostic was reread: 18,757 lines. A later read-only copy from the paired Apple
+TV succeeded and its entire 12,192-line probe log was read too. The fresh receipt identifies installed
+build 251 (Beta 15), not this follow-up source. It shows sustained hardware MPV playback, successful
+pause/resume and episode handoffs, but no active AVPlayer/DV, NNTP, or controlled AIOStreams/Debridio
+failure pair. A next-episode origin correction still reports its pre-correction first-frame position;
+that is a targeted old-build retest seam, not proof of a new current-source cause. These logs cannot
+establish that all provider-specific buffering, DV fallback, NNTP throughput, or frame pacing is solved.
+
+The accompanying always-on log was also read in full: 2,791 lines. It records eight failed deferred-resume
+reconciliations in a Continue Watching attempt at roughly 1,510 seconds, with successive first frames near
+1.12 seconds and repeated reloads of the unavailable target. Current source retained that logical target
+after clearing the timer; the shared retry selector could additionally restore it from the protected
+progress floor. The owned recovery-origin change above addresses those demonstrated defects. This is
+not evidence that the source was missing HTTP Range support or that TorBox was down. The same old-build
+log also contains successful DV playback and binge handoffs, not a universal DV failure.
+
+Current follow-up verification (distinct from the historical patch results below):
+
+- Android Full: 1,374 tests; Play: 1,301 tests. All 2,675 passed without failures, errors, or skipped tests.
+- Both debug APKs were rebuilt with the exact workflow-pinned native engines and fail-closed engine
+  requirements. Their actual ZIP contents contain both engine libraries for arm64-v8a, armeabi-v7a,
+  and x86_64; ELF architecture and required JNI exports were checked for all twelve libraries. The
+  Play APK also passes its GPL-library exclusion check. Debug signing is not release-signing evidence.
+- Apple parity contracts now run in CI and exercise the production skip countdown, account/history
+  admission, subtitle rendering exclusion/background, first-frame/load ownership, and related policies.
+  Deferred-resume checks execute 66 production-policy cases and 30 TV/phone wiring contracts, including
+  successive pre-frame retry failures, source hops, terminal stop/Retry, engine transfer, stale raw item
+  generations, refusal, explicit seeking and different-episode isolation. Final
+  source-frozen tvOS, iOS, and native macOS arm64 Release builds all passed with signing disabled after
+  the last account ownership correction; earlier builds are not substituted for those gates.
+- The final account-local mapper executes real JSON-decoded fixtures, and the guest-provenance gate
+  executes 17 decisions/storage fixtures. CoreBridge publication-fence wiring checks also pass. Astra
+  independently accepted the final canonical account/history boundary, including both Home adapters;
+  independent playback and lifecycle reviews are source reviews, not physical playback receipts.
+  Astra also independently accepted the final canonical playback recovery state repair after two
+  consequential repair rounds; that acceptance does not substitute for the device/provider gates.
+- The first current-source GitHub run exposed an older-compiler type-check timeout in the Trakt alias
+  union. That expression now accumulates an explicitly typed array in the identical order. The actual
+  Continue Watching fold fixtures also run in CI, including newest-winner and transitive/late-bridge
+  deduplication; a successful local compiler is not substituted for the rerun of the failing CI gate.
+- A subsequent older-SDK run rejected an ineffective inherited Sendable `@preconcurrency` annotation
+  in the native subtitle delegate. Explicit nonisolated witnesses now transfer only immutable output
+  identity/text/native-buffer-presence values into a synchronous main-actor assertion, supported by
+  the configured AVFoundation main delegate queue. No asynchronous cue hop or warning suppression was
+  added. Astra independently accepted the final adapter; its renderer/flush/teardown fixtures pass.
+- No new-source physical DV/receiver, live NNTP throughput, or Android remote/process-death acceptance
+  receipt is claimed. The successful read-only TV copy is not an installation or playback test of this patch.
+
 ## Changes in this patch
 
 - **#224:** exact-file subtitle requests carry the selected source's supplied filename, video hash and
@@ -44,10 +141,11 @@ Apple Beta 16 and Android Beta 14 are different artifact baselines; Android pari
 hardware, provider or cross-device confirmation is missing. “Partial/feature” identifies actual work
 still absent, not something being described as merely awaiting testing.
 
-### Apple and playback — 17 issues
+### Apple and playback — 18 issues
 
 | Issue | Area | Disposition |
 | --- | --- | --- |
+| #229 | Trakt CW / Top Shelf artwork | Source repairs implemented and reviewed here: source-owned artwork, managed files, owner/redirect/size fencing. Physical TV presentation remains unverified. |
 | #225 | iOS login dismissal | Source-addressed with a one-shot sign-in callback; iOS 27 reproduction still needed. |
 | #224 | Exact-file add-on subtitles and preference | Implemented here; native HTTP, encoding, preference and remount tests. Provider/device rendering still needs confirmation. |
 | #223 | Premature end / next episode | Earlier identity-fenced EOF fixes retained; current physical playback confirmation required. |
@@ -66,10 +164,11 @@ still absent, not something being described as merely awaiting testing.
 | #146 | Scroll-to-top affordance | Existing implementation present. |
 | #76 | DV / HDR behavior | Beta 16 routing/remux repairs retained; sustained DV pause/seek/overnight playback is not proven by source tests. |
 
-### Sync, integrations and product work — 23 issues
+### Sync, integrations and product work — 22 issues
 
 | Issue | Area | Disposition |
 | --- | --- | --- |
+| #230 | Current waiting engine builds | Waiting runs target earlier main source, not this follow-up. Do not approve stale artifacts as a substitute for a reviewed current-source build. |
 | #226 | Windows release | No current Windows release artifact; platform work remains. |
 | #220 | Plex PIN/link flow | Current PIN/link fixes and contracts exist; live Plex confirmation remains. |
 | #215 | Profile discovery isolation | Schema and contract implementation present. |
@@ -77,8 +176,6 @@ still absent, not something being described as merely awaiting testing.
 | #205 | Add-on resurrection/order | Tombstones, ordered hydration and explicit-import handling exist; cross-device convergence still needs verification. |
 | #204 | Audio language picker | Current Apple implementation and contracts present. |
 | #203 | French phrase translation | Phrase-first matching and strings present; broader localization is not implied complete. |
-| #198 | Waiting release approvals | Five obsolete runs cancelled after ancestor/artifact checks; protected engine approval gate unchanged. |
-| #197 | Old approval alert | All five listed runs already cancelled; stale alert resolved. |
 | #196 | IPTV | Current flows exist; report lacks a current provider/manifest/playback receipt. |
 | #187 | Trakt multi-device token refresh | Recovery implementation exists; real multi-device provider behavior still needs confirmation. |
 | #165 | Non-IMDb metadata | TMDB/TVDB/Kitsu fallback and bounded terminal retry present. |
@@ -116,9 +213,11 @@ still absent, not something being described as merely awaiting testing.
 No old player or engine branch was blindly merged into current main. The unfinished Android watched-download
 reclamation work is not safe to port wholesale: its local-playback guard suppresses the completion it should
 handle, a watch write can be non-durable, and failed index persistence cannot restore a file already deleted.
-Finishing that feature requires exact immutable profile/content/episode ownership, durable watch evidence,
-recoverable file/index transactions and executable failure-path tests. The current toggle remains unwired;
-this audit does not call it complete.
+The current follow-up re-derived its safe implementation rather than importing that branch wholesale:
+immutable profile/content/episode ownership, durable overlay watch evidence, aggregate player-resource
+release, recoverable file/index transactions, and executable failure-path tests are wired. Engine-backed
+history still fails closed without an exact durable per-video receipt. The earlier branch is not thereby
+approved, and this does not claim remote/multi-device download jobs are implemented.
 
 ## Competitor ideas adopted and deliberately not copied
 
@@ -145,7 +244,7 @@ subtitle priority/Off/Forced and late/early metadata preemption, empty deadlines
 Web tests execute refresh deduplication, source-page click identity, filter reset, stale metadata and
 superseded next-episode callbacks.
 
-Local verification of the final source passed:
+Historical verification of the initial audit patch (not substituted for the follow-up gates above):
 
 - iPhone and tvOS Release builds; native macOS arm64 Release build, all with signing disabled.
 - Android Play: 1,227 unit tests; Full: 1,300 unit tests, with no failures, errors or skipped tests.
@@ -159,7 +258,8 @@ workflow provisions the pinned SDK/NDK and uses a manual Kotlin compile; that la
 setup repair. Moving the source pin earlier cannot supply a missing runner package. Managed analysis
 has not been disabled, and no native, signing or release gate was relaxed to make its check green.
 
-No fresh physical TV playback log was obtained in this audit: the device-container copy timed out. This patch
-does not claim an overnight DV, receiver-audio or live-provider throughput pass. Local Mac universal linking
-also requires an x86_64 engine slice not present in the local vendor cache; arm64 validation must be reported
-separately from universal release validation. No new release or signing/feed change is part of this patch.
+The initial historical audit's device-container copy timed out; the follow-up receipt is documented above.
+Neither audit claims an overnight DV, receiver-audio or live-provider throughput pass for the new source.
+Local Mac universal linking also requires an x86_64 engine slice not present in the local vendor cache;
+arm64 validation must be reported separately from universal release validation. No new release or
+signing/feed change is part of this patch.

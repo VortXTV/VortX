@@ -10,6 +10,8 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -34,9 +36,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.foundation.rememberScrollState
@@ -47,6 +51,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -117,10 +122,15 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.theme.vortxGlassToast
 import com.vortx.android.ui.viewmodel.DetailViewModel
+import com.vortx.android.ui.viewmodel.DetailNavigationFence
 import com.vortx.android.ui.viewmodel.PersonViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
+import com.vortx.android.ui.viewmodel.detailAudioLanguageOptions
+import com.vortx.android.ui.viewmodel.resolveRelatedDetailTitle
 import com.vortx.android.ui.viewmodel.rememberReplacingViewModelStoreOwner
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -171,6 +181,8 @@ fun DetailScreen(
     val metaUnavailable by viewModel.metaUnavailable.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val episodeFocusRequesters = remember { mutableStateMapOf<String, FocusRequester>() }
+    var restoreEpisodeFocusId by remember(title) { mutableStateOf<String?>(null) }
 
     // WARM-THE-PICK-ON-DETAIL-OPEN. Once the source groups for the current title/episode are in memory,
     // warm the connection to the ranked direct winner (header + seek index) so a tap-to-play starts faster.
@@ -247,6 +259,19 @@ fun DetailScreen(
             modifier = modifier,
         )
         return
+    }
+
+    // Returning from a player route, or a failed source resolve, must return the viewer to the episode they
+    // were working on rather than dropping focus at the top of the LazyColumn.  The request is deferred until
+    // the row is composed again (LazyColumn may have recycled it while the player was visible).
+    LaunchedEffect(playback, restoreEpisodeFocusId) {
+        val episodeId = restoreEpisodeFocusId ?: return@LaunchedEffect
+        if (playback is Playback.Idle || playback is Playback.Failed) {
+            delay(80)
+            episodeFocusRequesters[episodeId]?.let { requester ->
+                runCatching { requester.requestFocus() }
+            }
+        }
     }
 
     // View-local TMDB cast + synopsis-fallback enrichment, mirroring the Apple detail views' `loadCredits`:
@@ -377,10 +402,19 @@ fun DetailScreen(
     // Resolve a related-title card's `tmdb:` id to a `tt` id before opening it in the nested detail
     // overlay (the same fail-soft resolve the Person filmography grid uses); a lookup miss opens the
     // unresolved id so the page still appears, just sparser.
-    val openSimilar: (MetaItem) -> Unit = { item ->
-        scope.launch {
-            val tt = TMDBPersonClient.imdbId(item.id, item.type)
-            titleTarget = if (tt != null) item.copy(id = tt) else item
+    val relatedLookupFence = remember(viewModel.routeType, viewModel.routeId) { DetailNavigationFence() }
+    var relatedLookupJob by remember(viewModel.routeType, viewModel.routeId) { mutableStateOf<Job?>(null) }
+    // A blocking HTTP lookup may outlive coroutine cancellation. Invalidate the fence when this detail
+    // route is replaced/closed so a late response cannot populate a now-unrelated nested title.
+    DisposableEffect(relatedLookupFence) {
+        onDispose { relatedLookupFence.invalidate() }
+    }
+    val openRelated: (MetaItem) -> Unit = { item ->
+        val generation = relatedLookupFence.begin()
+        relatedLookupJob?.cancel()
+        relatedLookupJob = scope.launch {
+            val resolved = resolveRelatedDetailTitle(item)
+            if (relatedLookupFence.accepts(generation)) titleTarget = resolved
         }
     }
 
@@ -565,6 +599,10 @@ fun DetailScreen(
                         .filter { it.season == (selectedSeason ?: m.data.videos.first().season) }
                         .sortedBy { it.episode }
                     items(episodes, key = { it.id }) { episode ->
+                        val episodeFocus = remember(episode.id) { FocusRequester() }
+                        LaunchedEffect(episode.id, episodeFocus) {
+                            episodeFocusRequesters[episode.id] = episodeFocus
+                        }
                         val currentForSources = episode.id == selectedEpisodeId
                         val watched = episode.id in m.data.watchedVideoIds
                         // DET spoiler-safe veil (read-only against watched state): an unwatched, not-yet-
@@ -580,6 +618,7 @@ fun DetailScreen(
                             watched = watched,
                             progress = episodeProgress(episode, m.data),
                             onClick = {
+                                restoreEpisodeFocusId = episode.id
                                 if (veiled) {
                                     // Reveal first: a veiled row's first tap never jumps into a spoilery
                                     // source list. Session-only; never writes a watched tick.
@@ -593,6 +632,7 @@ fun DetailScreen(
                                 }
                             },
                             onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
+                            focusRequester = episodeFocus,
                             thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
                             modifier = Modifier
                                 .padding(horizontal = VortXTheme.spacing.edge)
@@ -618,7 +658,7 @@ fun DetailScreen(
                             SimilarRail(
                                 type = m.data.type,
                                 titles = relations.map { it.item },
-                                onOpen = { titleTarget = it },
+                                onOpen = openRelated,
                                 heading = kind.label,
                             )
                         }
@@ -630,13 +670,13 @@ fun DetailScreen(
                     listOf("Previous (Release Order)" to previous, "Next (Release Order)" to next)
                         .forEach { (heading, neighbor) ->
                             if (neighbor != null) item {
-                                SimilarRail(MediaType.MOVIE, listOf(neighbor), openSimilar, heading)
+                                SimilarRail(MediaType.MOVIE, listOf(neighbor), openRelated, heading)
                             }
                         }
                     item {
                         CollectionRail(
                             collection = collection,
-                            onOpen = openSimilar,
+                            onOpen = openRelated,
                         )
                     }
                 }
@@ -647,7 +687,7 @@ fun DetailScreen(
                         SimilarRail(
                             type = m.data.type,
                             titles = similarItems,
-                            onOpen = openSimilar,
+                            onOpen = openRelated,
                         )
                     }
                 }
@@ -986,6 +1026,7 @@ private fun RatingsTokenStrip(ratings: MdbListRatings, modifier: Modifier = Modi
 /// reflecting the engine's saved state. For a series the button label/target follows
 /// [primaryEpisode] (Resume S1 E3 vs Play S1 E1); the movie-level watched toggle rides the same
 /// checkmark affordance the episode rows use, exposed here as a small icon on the Library chip's row.
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ActionsCluster(
     m: MetaDetail,
@@ -1033,77 +1074,69 @@ private fun ActionsCluster(
             loading = resolving,
             leadingIcon = if (!resolving) VortXIcons.playFill else null,
         )
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-            item {
-                DetailPlayerChoiceChip(
-                    choices = launchPlayerChoices,
-                    selected = launchEnginePreference,
-                    onSelect = onSelectLaunchEngine,
-                )
-            }
-            item {
-                Chip(
-                    label = if (inLibrary) "Saved" else "Save",
-                    selected = inLibrary,
-                    leadingIcon = if (inLibrary) VortXIcons.bookmarkFill else VortXIcons.bookmark,
-                    onClick = onToggleLibrary,
-                )
-            }
+        // Keep Watch in its own full-width CTA row.  Secondary controls use a wrapping flow so a narrow
+        // phone never compresses labels into a clipped horizontal strip or creates a second scroll surface.
+        FlowRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+        ) {
+            DetailPlayerChoiceChip(
+                choices = launchPlayerChoices,
+                selected = launchEnginePreference,
+                onSelect = onSelectLaunchEngine,
+            )
+            Chip(
+                label = if (inLibrary) "Saved" else "Save",
+                selected = inLibrary,
+                leadingIcon = if (inLibrary) VortXIcons.bookmarkFill else VortXIcons.bookmark,
+                onClick = onToggleLibrary,
+            )
             if (WatchlistStore.isSafeId(m.id)) {
-                item {
-                    Chip(
-                        label = if (watchlisted) "In Watchlist" else "Watchlist",
-                        selected = watchlisted,
-                        leadingIcon = VortXIcons.starFill,
-                        onClick = onToggleWatchlist,
-                    )
-                }
-            }
-            item {
                 Chip(
-                    label = "Sources",
-                    selected = sourcesOpen,
-                    leadingIcon = VortXIcons.listBullet,
-                    onClick = onToggleSources,
+                    label = if (watchlisted) "In Watchlist" else "Watchlist",
+                    selected = watchlisted,
+                    leadingIcon = VortXIcons.starFill,
+                    onClick = onToggleWatchlist,
                 )
             }
+            Chip(
+                label = "Sources",
+                selected = sourcesOpen,
+                leadingIcon = VortXIcons.listBullet,
+                onClick = onToggleSources,
+            )
             // DET-14: a secondary "Play from start" beside the primary Resume, shown only when a saved
             // resume position exists. Plays the SAME best stream from 0:00 without clearing the stored
             // resume point (the primary Resume still seeks there). Hidden for a fresh title and while a
             // resolve is in flight, so it can never be a dead press.
             if (playFromStartEnabled) {
-                item {
-                    Chip(
-                        label = "Play from start",
-                        selected = false,
-                        leadingIcon = VortXIcons.playFill,
-                        onClick = onPlayFromStart,
-                    )
-                }
+                Chip(
+                    label = "Play from start",
+                    selected = false,
+                    leadingIcon = VortXIcons.playFill,
+                    onClick = onPlayFromStart,
+                )
             }
             // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a miss).
             // Shown only when the meta carries a YouTube trailer id. Plays through the shared player pipeline.
             if (hasTrailer) {
-                item {
-                    Chip(
-                        label = "Trailer",
-                        selected = false,
-                        leadingIcon = VortXIcons.playRectangle,
-                        onClick = onTrailer,
-                    )
-                }
+                Chip(
+                    label = "Trailer",
+                    selected = false,
+                    leadingIcon = VortXIcons.playRectangle,
+                    onClick = onTrailer,
+                )
             }
             // Movie-level watched toggle (a series marks watched per-episode/season via the
             // SeasonSelector's chips instead, since there's no single "the" episode here).
             if (m.videos.isEmpty()) {
-                item {
-                    Chip(
-                        label = if (isWatched) "Watched" else "Mark Watched",
-                        selected = isWatched,
-                        leadingIcon = VortXIcons.checkmarkCircle,
-                        onClick = onToggleWatched,
-                    )
-                }
+                Chip(
+                    label = if (isWatched) "Watched" else "Mark Watched",
+                    selected = isWatched,
+                    leadingIcon = VortXIcons.checkmarkCircle,
+                    onClick = onToggleWatched,
+                )
             }
         }
         if (trailerLanguageChips.isNotEmpty()) {
@@ -1694,6 +1727,9 @@ private fun SourcesSection(
             is UiState.Success -> {
                 val groups = state.data
                 val total = groups.sumOf { it.streams.size }
+                val effectiveSourceFilter = sourceFilter?.takeIf { addon -> groups.any { it.addon == addon } }
+                val filteredGroups = groups.filter { effectiveSourceFilter == null || it.addon == effectiveSourceFilter }
+                val availableAudioLanguages = detailAudioLanguageOptions(filteredGroups)
                 // Header + the "Re-find" escape hatch: re-query the add-ons fresh so an expired/dead source
                 // (or an empty result) is replaced. All the work lives in [DetailViewModel.refreshSources];
                 // this only calls [onRefresh]. Disabled mid-resolve so a re-find can't race an in-flight play.
@@ -1721,13 +1757,13 @@ private fun SourcesSection(
                         ) {
                             Chip(
                                 label = "All ($total)",
-                                selected = sourceFilter == null,
+                                selected = effectiveSourceFilter == null,
                                 onClick = { sourceFilter = null },
                             )
                             groups.forEach { group ->
                                 Chip(
                                     label = "${group.addon} (${group.streams.size})",
-                                    selected = sourceFilter == group.addon,
+                                    selected = effectiveSourceFilter == group.addon,
                                     onClick = { sourceFilter = group.addon },
                                 )
                             }
@@ -1750,7 +1786,9 @@ private fun SourcesSection(
                         // flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A second nested
                         // DropdownMenu is the Compose idiom for the tvOS two-step quality dialog. Plays the
                         // chosen variant straight through [onPlay]. Hidden until at least one tier resolves.
-                        val tiers = StreamRanking.tiers(groups)
+                        // Quality choices are built from the active add-on filter, so a visible option always
+                        // maps to a source the viewer can actually play in the selected provider scope.
+                        val tiers = StreamRanking.tiers(filteredGroups)
                         if (tiers.isNotEmpty()) {
                             Box {
                                 Chip(
@@ -1780,7 +1818,7 @@ private fun SourcesSection(
                                         onClick = { qualityTier = null },
                                     )
                                     if (activeTier != null) {
-                                        StreamRanking.variantOptions(groups, activeTier).forEach { (label, source) ->
+                                        StreamRanking.variantOptions(filteredGroups, activeTier).forEach { (label, source) ->
                                             DropdownMenuItem(
                                                 text = { Text(label) },
                                                 onClick = {
@@ -1815,7 +1853,7 @@ private fun SourcesSection(
                                         onAudioLanguageHintChange(null)
                                     },
                                 )
-                                TrackPreferences.commonLanguages.forEach { (code, name) ->
+                                availableAudioLanguages.forEach { (code, name) ->
                                     DropdownMenuItem(
                                         text = { Text(if (audioLanguageHint == code) "✓ $name" else name) },
                                         onClick = {
@@ -1828,7 +1866,7 @@ private fun SourcesSection(
                         }
                         // Copy every playable (direct / debrid / HLS) link for pasting into a debrid panel or
                         // another player; shown only when at least one source carries a copyable URL.
-                        val links = copyableSourceLinks(groups)
+                        val links = copyableSourceLinks(filteredGroups)
                         if (links.isNotEmpty()) {
                             Chip(
                                 label = "Copy all links",
@@ -1854,7 +1892,7 @@ private fun SourcesSection(
                 // window caps how many rows are built at once (a popular title returns thousands); "Show more"
                 // grows it. Collapsed groups emit a header only and spend no budget (Apple's `windowedPlan`).
                 // Groups + streams are already ranked best-first by the assembly; sort reorders WITHIN a group.
-                val filtered = groups.filter { sourceFilter == null || it.addon == sourceFilter }
+                val filtered = filteredGroups
                 var budget = renderLimit
                 var shownRows = 0
                 filtered.forEach { group ->

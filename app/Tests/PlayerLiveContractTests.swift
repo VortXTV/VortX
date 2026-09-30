@@ -2009,7 +2009,7 @@ enum PlayerLiveContractTests {
             capacityBytes: 32,
             chunkSize: 2,
             scavengeStaleSessions: false)
-        weak let releasedOwner = orphanSpool
+        let releasedOwner = { [weak orphanSpool] in orphanSpool }
         if let orphanStage = orphanSpool?.attachOpenStage(to: orphanBuffer) {
             append([0, 1, 2, 3], to: orphanBuffer)
             _ = orphanStage.arm(base: 1)
@@ -2024,7 +2024,7 @@ enum PlayerLiveContractTests {
                 orphanClaim.release()
                 let replacement = orphanStage.claim()
                 check("open stage owner loss: close does not consume and strand a claim after spool teardown",
-                      releasedOwner == nil && !closeWithoutOwner && replacement != nil)
+                      releasedOwner() == nil && !closeWithoutOwner && replacement != nil)
                 replacement?.release()
             } else {
                 check("open stage owner loss: exact claim is available", false)
@@ -3062,10 +3062,10 @@ enum PlayerLiveContractTests {
             tvPlayer,
             from: "case .chapters:\n            let chs =",
             to: "case .sources:")
-        let playerScreenSkipPill = sourceSection(
+        let playerScreenSkipAction = sourceSection(
             playerScreen,
-            from: "private func skipPill(_ segment: SkipSegment)",
-            to: "private func updateCurrentSkip(at time: Double)")
+            from: "private func skipImmediately(_ segment: SkipSegment)",
+            to: "private func cancelAutomaticSkip(_ segment: SkipSegment)")
         let tvPlayerSkipAction = sourceSection(
             tvPlayer,
             from: "private func skipTo(_ segment: SkipSegment)",
@@ -3795,31 +3795,31 @@ enum PlayerLiveContractTests {
         check("wiring: both AVPlayer demotions capture the engine-owned source target before stop",
               sourceContainsInOrder(playerScreenAVDemote, [
                 "pendingRequestedSourcePositionSeconds",
+                "prepareResumeSurfaceTransfer(engine: .libmpv",
                 "let quiescence = retiringAVPlayer.stopForMPVFallback()",
-                "engineRequestedResume",
               ])
                   && sourceContainsInOrder(tvPlayerAVDemote, [
                     "pendingRequestedSourcePositionSeconds",
+                    "prepareResumeSurfaceTransfer(engine: .libmpv",
                     "let quiescence = retiringAVPlayer.stopForMPVFallback()",
-                    "engineRequestedResume",
                   ]))
         let playerScreenDemotionUsesNewestEngineTarget = sourceContainsInOrder(
             playerScreenAVDemote,
             [
-                "if let engineRequestedResume {",
+                "if let engineRequestedResume, abandonedResumeRecovery?.owner != retiringAVPlayer.activeLoadToken {",
                 "suppressedResumeFloor = nil",
                 "resume = engineRequestedResume",
-                "} else if hasStartedPlaying {",
-                "resume = max(currentTime, suppressedResumeFloor ?? 0)",
+                "} else {",
+                "resume = retryResumeTarget()",
             ])
         let tvPlayerDemotionUsesNewestEngineTarget = sourceContainsInOrder(
             tvPlayerAVDemote,
             [
-                "if let engineRequestedResume {",
+                "if let engineRequestedResume, abandonedResumeRecovery?.owner != retiringAVPlayer.activeLoadToken {",
                 "suppressedResumeFloor = nil",
                 "reconcileResume = engineRequestedResume",
-                "} else if hasStartedPlaying {",
-                "reconcileResume = max(currentTime, suppressedResumeFloor ?? 0)",
+                "} else {",
+                "reconcileResume = recoveryResumeTarget()",
             ])
         check("wiring: backward MediaRemote targets survive failure demotion on both Apple surfaces",
               sourceContainsInOrder(playerScreenNowPlaying, [
@@ -3836,10 +3836,10 @@ enum PlayerLiveContractTests {
                   && tvPlayerDemotionUsesNewestEngineTarget)
         check("wiring: chapter and skip targets survive failure demotion on both Apple surfaces",
               playerScreenChapterRows?.contains(
-                "coordinator.player?.seek(to: ch.start)") == true
+                "issueSeek(to: ch.start, reason: \"chapter\")") == true
                   && tvPlayerChapterRows?.contains(
-                    "coordinator.player?.seek(to: ch.start)") == true
-                  && playerScreenSkipPill?.contains(
+                    "issueSeek(to: ch.start, reason: \"chapter\")") == true
+                  && playerScreenSkipAction?.contains(
                     "issueSeek(to: segment.end, reason: \"skip\")") == true
                   && tvPlayerSkipAction?.contains(
                     "issueSeek(to: segment.end, reason: \"skip\")") == true
@@ -3930,14 +3930,14 @@ enum PlayerLiveContractTests {
         check("wiring: first-frame proof and start timers are owned by the current logical load",
               tvPlayer?.contains(".hasProducedPlayableVideoFrame == true") == true
                   && tvPlayer?.contains(
-                      "TVPlaybackStartPolicy.loadTimeoutOwnerIsCurrent(") == true
+                      "ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(") == true
                   && tvPlayer?.contains(
                       "capturedEpisodeGeneration: capturedEpisodeGeneration") == true
                   && tvPlayer?.contains(
                       "capturedLoadToken: capturedLoadToken") == true)
         check("wiring: generic source timeout cannot outrun a progressing remux watchdog",
               tvPlayer?.contains(
-                  "TVPlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(") == true
+                  "ApplePlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(") == true
                   && tvPlayer?.contains(
                       "remuxPendingOrMounted: avController?.remuxStartupSignal.pendingOrMounted == true") == true
                   && tvPlayer?.contains(
@@ -4472,7 +4472,7 @@ enum PlayerLiveContractTests {
         check("wiring: automatic recovery re-applies semantic audio once then falls back to TrackSelector",
               sourceContainsInOrder(autoTrackSelection, [
                   "if let pendingAudioReapply",
-                  "TVTrackRecoveryPolicy.audioAction",
+                  "AppleTrackRecoveryPolicy.audioAction",
                   "case let .reapply(id)",
                   "coordinator.player?.setAudioTrack(id)",
                   "case let .automatic(id)",

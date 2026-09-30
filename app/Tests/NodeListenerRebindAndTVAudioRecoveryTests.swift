@@ -1,18 +1,5 @@
-// Executable policy and source-contract tests for post-suspension listener recovery and tvOS same-source
-// remount selection retention.
-//
-//   { printf '%s\n' 'import Foundation'; \
-//     sed -n '/^enum NodeListenerRebindPolicy {/,/^\/\/ END Node listener rebind policy$/p' \
-//       app/Sources/NodeServer.swift | sed '$d'; \
-//     sed -n '/^enum TVTrackRecoveryPolicy {/,/^\/\/ END tvOS track recovery policy$/p' \
-//       app/SourcesTV/TVPlayerView.swift | sed '$d'; } > /tmp/node-listener-rebind-policy.swift && \
-//   xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
-//     /tmp/node-listener-rebind-policy.swift \
-//     app/Sources/Player/MPVTrack.swift \
-//     app/Sources/Player/PlayerStallPolicy.swift \
-//     app/Tests/NodeListenerRebindAndTVAudioRecoveryTests.swift \
-//     -o /tmp/node-listener-rebind-and-tv-audio-recovery-test && \
-//   /tmp/node-listener-rebind-and-tv-audio-recovery-test
+// Executable policy and source-contract tests for post-suspension listener recovery and shared Apple
+// same-source remount selection retention. Run with: bash scripts/test-apple-playback-recovery.sh
 
 import Foundation
 
@@ -134,22 +121,26 @@ private enum NodeListenerRebindAndTVAudioRecoveryTests {
         let manualAudio = PlayerRecoveryAudioChoice(language: " EN ", title: "Main Mix")
         let audioTracks = [MPVTrack(id: 8, type: "audio", title: "main mix", lang: "en", selected: false)]
         let subtitleTracks = [MPVTrack(id: 17, type: "sub", title: "English", lang: "en", selected: false)]
-        check("audio-first staged arrival retains pending embedded subtitle", TVTrackRecoveryPolicy.subtitleAction(
+        check("audio-first staged arrival retains pending embedded subtitle", AppleTrackRecoveryPolicy.subtitleAction(
             choice: .embedded(lang: "en", title: "English"), tracks: [], pooledChoiceAvailable: false) == .retain)
-        check("audio-first staged arrival restores manual audio", TVTrackRecoveryPolicy.audioAction(
+        check("audio-first staged arrival restores manual audio", AppleTrackRecoveryPolicy.audioAction(
             choice: manualAudio, tracks: audioTracks, automaticID: nil) == .reapply(8))
-        check("later subtitle arrival restores exact embedded selection", TVTrackRecoveryPolicy.subtitleAction(
+        check("later subtitle arrival restores exact embedded selection", AppleTrackRecoveryPolicy.subtitleAction(
             choice: .embedded(lang: "en", title: "English"), tracks: subtitleTracks, pooledChoiceAvailable: false) == .selectEmbedded(17))
-        check("subtitle-first staged arrival retains pending manual audio", TVTrackRecoveryPolicy.audioAction(
+        check("subtitle-first staged arrival retains pending manual audio", AppleTrackRecoveryPolicy.audioAction(
             choice: manualAudio, tracks: [], automaticID: nil) == .retain)
-        check("subtitle-first staged arrival restores subtitle", TVTrackRecoveryPolicy.subtitleAction(
+        check("subtitle-first staged arrival restores subtitle", AppleTrackRecoveryPolicy.subtitleAction(
             choice: .embedded(lang: "en", title: "English"), tracks: subtitleTracks, pooledChoiceAvailable: false) == .selectEmbedded(17))
-        check("later audio arrival restores exact manual audio", TVTrackRecoveryPolicy.audioAction(
+        check("later audio arrival restores exact manual audio", AppleTrackRecoveryPolicy.audioAction(
             choice: manualAudio, tracks: audioTracks, automaticID: nil) == .reapply(8))
-        check("manual subtitle Off is actionable before track discovery", TVTrackRecoveryPolicy.subtitleAction(
+        check("manual subtitle Off is actionable before track discovery", AppleTrackRecoveryPolicy.subtitleAction(
             choice: .off, tracks: [], pooledChoiceAvailable: false) == .applyImmediately)
-        check("manual external subtitle is actionable before track discovery", TVTrackRecoveryPolicy.subtitleAction(
+        check("manual external subtitle is actionable before track discovery", AppleTrackRecoveryPolicy.subtitleAction(
             choice: .external(url: "https://example.invalid/sub.vtt", title: "English", lang: "en"), tracks: [], pooledChoiceAvailable: false) == .applyImmediately)
+        check("manual pool choice is retained before pool arrival", AppleTrackRecoveryPolicy.subtitleAction(
+            choice: .pooled(id: 42), tracks: [], pooledChoiceAvailable: false) == .retain)
+        check("later pool arrival makes manual choice actionable", AppleTrackRecoveryPolicy.subtitleAction(
+            choice: .pooled(id: 42), tracks: [], pooledChoiceAvailable: true) == .applyImmediately)
 
         let tvSourcePath = "app/SourcesTV/TVPlayerView.swift"
         guard let tvSource = try? String(contentsOfFile: tvSourcePath, encoding: .utf8),
