@@ -5,9 +5,29 @@ import java.lang.reflect.Proxy
 import kotlinx.coroutines.test.TestScope
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class WatchOverlayStoreContinueWatchingTest {
+    @Test
+    fun terminalWatchedCommitFailureProducesNoDurableExactVideo() {
+        val store = WatchOverlayStore(preferences(commitSucceeds = false), scope = TestScope())
+        store.activate("overlay", usesEngineHistory = false)
+
+        assertFalse(
+            store.recordFinishedWatchAndCommit(
+                metaId = "imdb:tt0108778",
+                videoId = "imdb:tt0108778:3:1",
+                positionSeconds = 95.0,
+                durationSeconds = 100.0,
+                name = "Friends",
+                type = "series",
+                poster = null,
+            ),
+        )
+        assertFalse(store.hasCommittedWatchedVideo("imdb:tt0108778", "imdb:tt0108778:3:1"))
+    }
+
     @Test
     fun watchedMutationRefreshesExistingRowClockButAnUnchangedMarkDoesNotChurnIt() {
         val prefs = preferences()
@@ -104,7 +124,7 @@ class WatchOverlayStoreContinueWatchingTest {
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun preferences(): SharedPreferences {
+    private fun preferences(commitSucceeds: Boolean = true): SharedPreferences {
         val values = linkedMapOf<String, Any?>()
         lateinit var prefs: SharedPreferences
         prefs = Proxy.newProxyInstance(
@@ -115,7 +135,7 @@ class WatchOverlayStoreContinueWatchingTest {
                 "getString" -> values[args!![0]] as? String ?: args[1]
                 "getAll" -> values.toMap()
                 "contains" -> values.containsKey(args!![0])
-                "edit" -> editor(values)
+                "edit" -> editor(values, commitSucceeds)
                 "registerOnSharedPreferenceChangeListener", "unregisterOnSharedPreferenceChangeListener" -> Unit
                 "toString" -> "WatchOverlayTestPreferences"
                 "hashCode" -> System.identityHashCode(prefs)
@@ -127,7 +147,7 @@ class WatchOverlayStoreContinueWatchingTest {
     }
 
     @Suppress("UNCHECKED_CAST")
-    private fun editor(values: MutableMap<String, Any?>): SharedPreferences.Editor {
+    private fun editor(values: MutableMap<String, Any?>, commitSucceeds: Boolean): SharedPreferences.Editor {
         lateinit var editor: SharedPreferences.Editor
         val updates = linkedMapOf<String, Any?>()
         val removals = linkedSetOf<String>()
@@ -140,7 +160,13 @@ class WatchOverlayStoreContinueWatchingTest {
                 "remove" -> { removals += args!![0] as String; editor }
                 "clear" -> { removals += values.keys; editor }
                 "apply" -> { removals.forEach(values::remove); values.putAll(updates); Unit }
-                "commit" -> { removals.forEach(values::remove); values.putAll(updates); true }
+                "commit" -> {
+                    if (!commitSucceeds) false else {
+                        removals.forEach(values::remove)
+                        values.putAll(updates)
+                        true
+                    }
+                }
                 "toString" -> "WatchOverlayTestEditor"
                 "hashCode" -> System.identityHashCode(editor)
                 "equals" -> editor === args?.firstOrNull()

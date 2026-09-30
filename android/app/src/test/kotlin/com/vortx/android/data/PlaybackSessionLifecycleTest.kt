@@ -30,6 +30,7 @@ class PlaybackSessionLifecycleTest {
                 events += "end-${token.generation}-start"
                 allowEnd.await()
                 events += "end-${token.generation}-finish"
+                null
             },
         )
         val first = lifecycle.newHandle()
@@ -58,7 +59,7 @@ class PlaybackSessionLifecycleTest {
                 PlaybackSessionToken(++generation)
             },
             reportSession = { _, _, _ -> },
-            endSession = { _, _, _ -> },
+            endSession = { _, _, _ -> null },
         )
 
         val streamedHandle = lifecycle.newHandle()
@@ -99,7 +100,7 @@ class PlaybackSessionLifecycleTest {
                 PlaybackSessionToken(++generation)
             },
             reportSession = { _, _, _ -> },
-            endSession = { _, _, _ -> },
+            endSession = { _, _, _ -> null },
         )
 
         val localToken = fixedOwner(revision = 1L)

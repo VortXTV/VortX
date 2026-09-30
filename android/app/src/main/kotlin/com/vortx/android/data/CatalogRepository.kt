@@ -63,6 +63,16 @@ value class PlaybackSessionToken internal constructor(internal val generation: L
     }
 }
 
+/**
+ * Exact, owner-bound proof that a LOCAL session's watched state was committed by its history store.
+ * It intentionally says nothing about engine dispatches: a caller may reclaim local bytes only after
+ * an implementation can prove this one [context.videoId] is durable for this one complete [owner].
+ */
+data class DurableWatchedPlaybackReceipt(
+    val context: PlaybackContext,
+    val owner: ContinueWatchingOwner,
+)
+
 private val LOCAL_CONTINUE_WATCHING_OWNER = ContinueWatchingOwner(
     profileId = "local",
     accountSlot = "local",
@@ -407,6 +417,27 @@ interface CatalogRepository {
         positionMs: Long,
         durationMs: Long,
     ): Result<Unit> = Result.success(Unit)
+
+    /**
+     * Same terminal operation as [endPlaybackSession], with an optional exact durable-watch receipt.
+     * The default deliberately returns no receipt so repositories without a durable per-video reader
+     * cannot accidentally authorize destructive download cleanup.
+     */
+    suspend fun endPlaybackSessionWithDurableWatchReceipt(
+        session: PlaybackSessionToken,
+        positionMs: Long,
+        durationMs: Long,
+    ): Result<DurableWatchedPlaybackReceipt?> = endPlaybackSession(session, positionMs, durationMs).map { null }
+
+    /**
+     * Run [action] only while the complete receipt owner and exact persisted video are still current.
+     * Implementations must fail closed; keeping the action inside their owner fence prevents a profile
+     * transition from slipping between a check and destructive download cleanup.
+     */
+    fun reclaimAfterDurableWatchedPlaybackReceipt(
+        receipt: DurableWatchedPlaybackReceipt,
+        action: () -> Boolean,
+    ): Boolean = false
 
     // ---- S05: Detail watched-state + library mutations ----
     //

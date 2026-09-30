@@ -120,6 +120,8 @@ fun PlayerScreen(
     /// Live position/duration (ms) callback for progress writeback. The host wires it to the engine so
     /// Continue Watching updates; a no-op by default keeps the screen usable in isolation.
     onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    /** Fired once only after this screen's final decoder and every bound playback lease are released. */
+    onResourcesReleased: () -> Unit = {},
     /// Called when the source fails unrecoverably: the host returns to the ranked source list. Defaults
     /// to [onBack] (return to the detail page, which shows the sources).
     onError: () -> Unit = onBack,
@@ -179,6 +181,7 @@ fun PlayerScreen(
     val audioManager = remember(context) { context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
     val currentOnBack by rememberUpdatedState(onBack)
     val currentOnProgress by rememberUpdatedState(onProgress)
+    val currentOnResourcesReleased by rememberUpdatedState(onResourcesReleased)
     val currentOnError by rememberUpdatedState(onError)
     val currentOnEnded by rememberUpdatedState(onEnded)
     val currentOnSourceFailed by rememberUpdatedState(onSourceFailed)
@@ -436,6 +439,15 @@ fun PlayerScreen(
     // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
     // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
     val engineHolder = remember(playbackSessionKey, forceExoPlayer, enginePreference) { AtomicReference<PlayerEngine?>(null) }
+    val resourceReleaseGate = remember(playbackSessionKey) {
+        PlayerResourceReleaseGate { currentOnResourcesReleased() }
+    }
+    fun releaseBoundEngine() {
+        engineHolder.getAndSet(null)?.let { engine ->
+            engine.release()
+            resourceReleaseGate.decoderReleased()
+        }
+    }
     var builtEngine by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf<PlayerEngine?>(null) }
     LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
         // A user engine switch resumes at the live position; every other rebuild loads the source at its
@@ -453,6 +465,7 @@ fun PlayerScreen(
             withContext(Dispatchers.Default + NonCancellable) {
                 MpvEngineFactory.create(context)?.also {
                     engineHolder.set(it)
+                    resourceReleaseGate.decoderBound()
                     prepareAndLoadEngine(
                         it,
                         playableForEngine,
@@ -468,6 +481,7 @@ fun PlayerScreen(
             } ?: ExoPlayerEngine(context).also {
                 // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
                 engineHolder.set(it)
+                resourceReleaseGate.decoderBound()
                 prepareAndLoadEngine(
                     it,
                     playableForEngine,
@@ -481,6 +495,7 @@ fun PlayerScreen(
         } else {
             ExoPlayerEngine(context).also {
                 engineHolder.set(it)
+                resourceReleaseGate.decoderBound()
                 prepareAndLoadEngine(
                     it,
                     playableForEngine,
@@ -495,7 +510,7 @@ fun PlayerScreen(
         if (!isActive) {
             // The player left composition while the engine was still initializing; the dispose below
             // may already have run (and found the holder empty), so this tail owns the release.
-            engineHolder.getAndSet(null)?.release()
+            releaseBoundEngine()
             return@LaunchedEffect
         }
         // withContext above may have returned after ON_STOP. This is the final main-thread publication
@@ -514,7 +529,7 @@ fun PlayerScreen(
         )
     }
     DisposableEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
-        onDispose { engineHolder.getAndSet(null)?.release() }
+        onDispose { releaseBoundEngine() }
     }
 
     // PLAYER ORIENTATION LOCK + IMMERSIVE MODE. A video player presents landscape: request sensor
@@ -591,7 +606,7 @@ fun PlayerScreen(
                 }
                 // Release through the holder's single atomic claim, so a destroy-then-dispose pair can
                 // never double-release the same native engine.
-                Lifecycle.Event.ON_DESTROY -> engineHolder.getAndSet(null)?.release()
+                Lifecycle.Event.ON_DESTROY -> releaseBoundEngine()
                 else -> Unit
             }
         }
@@ -1263,9 +1278,16 @@ fun PlayerScreen(
     DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
     }
+    DisposableEffect(playbackSessionKey) {
+        onDispose { resourceReleaseGate.sessionDisposed() }
+    }
     // A replacement, back navigation, profile change, or composition teardown releases a native NZB producer.
     DisposableEffect(currentPlayable.playbackLease) {
-        onDispose { runCatching { currentPlayable.playbackLease?.close() } }
+        currentPlayable.playbackLease?.let { resourceReleaseGate.leaseBound() }
+        onDispose {
+            runCatching { currentPlayable.playbackLease?.close() }
+            resourceReleaseGate.leaseReleased()
+        }
     }
 
     // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up
