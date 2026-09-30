@@ -8,6 +8,9 @@ on:
       - "scripts/test-apple-playback-recovery.sh"
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-release-orchestration-contracts.sh"
+      - "scripts/verify-android-release-version.sh"
+      - "scripts/tests/test_android_release_version.py"
+      - "workers/vortx-appcast/**"
       - "android/**/*.gradle.kts"
       - ".github/workflows/**"
   push:
@@ -19,6 +22,9 @@ on:
       - "scripts/test-apple-playback-recovery.sh"
       - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-release-orchestration-contracts.sh"
+      - "scripts/verify-android-release-version.sh"
+      - "scripts/tests/test_android_release_version.py"
+      - "workers/vortx-appcast/**"
       - "android/**/*.gradle.kts"
       - ".github/workflows/**"
   workflow_dispatch:
@@ -36,6 +42,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash scripts/test-release-orchestration-contracts.sh
+      - run: python3 scripts/tests/test_android_release_version.py
+      - run: node --test workers/vortx-appcast/test/index.test.mjs
       - run: bash scripts/test-subtitle-source-contracts.sh
       - run: bash scripts/test-apple-playback-recovery.sh
       - run: bash scripts/test-apple-parity-contracts.sh

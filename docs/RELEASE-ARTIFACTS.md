@@ -43,6 +43,13 @@ certificate SHA-256. Each release ships `SHA256SUMS` (per-artifact SHA-256) and
 `SIGNING_PROVENANCE.txt` (signer verification output plus release tag commit, source commit, and
 workflow run URL) so every published byte is traceable to a tag and a run.
 
+Android version identity is separate from the Apple build. After signing verification,
+`verify-android-release-version.sh` inspects both APK manifests with SDK `aapt2` and the Play AAB
+manifest with pinned, SHA-256-verified Google bundletool. All three must match the unique numeric
+`versionCode` and `versionName` in Gradle and package `com.vortx.android`. Only then are the
+`Android versionCode:` and `Android versionName:` records added to `SIGNING_PROVENANCE.txt`.
+Feed augmentation requires those immutable records; it must never substitute an Apple build.
+
 ## Secretless pull-request validation
 
 `.github/workflows/release-packaging-validation.yml` runs on every pull request with zero secret

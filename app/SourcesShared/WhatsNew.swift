@@ -5,15 +5,15 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.12"
+    static let version = "0.4.0-beta.17"
     static let highlights: [String] = [
-        "Interrupted AVPlayer seeks recover the requested position instead of silently losing their recovery owner. Paused seeks update both the position and subtitle cue from the actual landing.",
-        "Refused Apple TV retries preserve the current surface and resume watchdog. Player changes and fresh-link recovery keep the active source, headers, episode, and transport intent.",
-        "Startup avoids resetting an already-valid decoder surface. Apple devices try direct VideoToolbox then hardware copy-back before software; explicit overrides are preserved.",
-        "Add-on order and removal intent survive stale or partial sync. Source groups follow your order, mirroring-off changes stay local, and QR pairing retains its relay authority.",
-        "Continue Watching, library progress, and watched actions merge with account/profile ownership. Late episode and hero artwork publishes, and Trakt thumbnails gain URL and alias repairs.",
-        "Save prioritized NNTP servers, search NZBGeek/Newznab directly, and open supplied prequel/sequel links or known collection neighbors. Active NNTP reads renew their inactivity deadline.",
-        "Apple-only build 245. Physical-device DV, sustained NNTP throughput, frame pacing, and the separate iOS pre-player crash report are not claimed universally resolved. Android packages and broader UI parity remain follow-up work."
+        "Failed saved resume targets retire through source and player replacements instead of repeatedly reopening the same unavailable position. A real first frame at 0:00 is accepted, and explicit seeks retain ownership.",
+        "Automatic intro, recap and credits skipping now offers Off, 5, 10, 15 and 30 seconds. Skip immediately or cancel the countdown with X; paused and buffering time cannot spend the countdown.",
+        "Android source changes preserve Play/Pause intent. Next-episode prewarming is cancellable and scoped to the current viewer and episode; Continue Watching targeting, episode focus and independent track restoration are repaired.",
+        "Subtitle requests include the selected file metadata where available and tolerate malformed individual results. Late track inventories cannot override manual subtitle Off.",
+        "Watch-based suggestions and Trakt/Top Shelf artwork are tied to the active account/profile. Progress-only updates retain valid artwork rather than erasing it.",
+        "Batch downloads recover from displaced metadata requests. Optional Android watched-download cleanup stays Off by default and requires durable watched evidence, released player resources and recoverable file/index updates.",
+        "Apple build 253 and signed Android version code 238. Physical-device DV, NNTP throughput and frame pacing still need fresh testing; the Mac/iPhone redesign and full Android visual/feature parity are not claimed complete."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses

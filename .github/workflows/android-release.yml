@@ -224,6 +224,8 @@ jobs:
           shopt -s nullglob
           version="$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' android/app/build.gradle.kts | head -n1)"
           test -n "$version" || { echo "::error::could not read Android versionName"; exit 1; }
+          version_code="$(sed -n 's/^[[:space:]]*versionCode = \([0-9][0-9]*\)[[:space:]]*$/\1/p' android/app/build.gradle.kts)"
+          [[ "$version_code" =~ ^[1-9][0-9]*$ ]] || { echo "::error::expected exactly one numeric Android versionCode"; exit 1; }
           full=(android/app/build/outputs/apk/full/release/*.apk)
           play=(android/app/build/outputs/apk/play/release/*.apk)
           bundle=(android/app/build/outputs/bundle/playRelease/*.aab)
@@ -233,10 +235,21 @@ jobs:
           cp "${full[0]}" "dist/VortX-${version}-full-mpv-universal.apk"
           cp "${play[0]}" "dist/VortX-${version}-play-media3-universal.apk"
           cp "${bundle[0]}" "dist/VortX-${version}-play-media3.aab"
+          # Google's bundletool inspects the protobuf AAB manifest. Pin and hash-check the
+          # executable before using it; do not infer Android build identity from Apple metadata.
+          curl --fail --location --connect-timeout 10 --max-time 90 --retry 2 \
+            https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar \
+            --output "$RUNNER_TEMP/bundletool.jar"
+          echo "a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29  $RUNNER_TEMP/bundletool.jar" | sha256sum --check
           scripts/verify-android-release-signing.sh verify \
             "dist/VortX-${version}-full-mpv-universal.apk" \
             "dist/VortX-${version}-play-media3-universal.apk" \
             "dist/VortX-${version}-play-media3.aab" | tee dist/SIGNING_PROVENANCE.txt
+          BUNDLETOOL_JAR="$RUNNER_TEMP/bundletool.jar" bash scripts/verify-android-release-version.sh \
+            "$version_code" "$version" \
+            "dist/VortX-${version}-full-mpv-universal.apk" \
+            "dist/VortX-${version}-play-media3-universal.apk" \
+            "dist/VortX-${version}-play-media3.aab" | tee -a dist/SIGNING_PROVENANCE.txt
           {
             echo "release tag: $RELEASE_TAG"
             echo "release tag commit: $RELEASE_TAG_COMMIT"

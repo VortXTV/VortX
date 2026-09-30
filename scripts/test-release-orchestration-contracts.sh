@@ -19,6 +19,7 @@ readonly ROOT_GRADLE_BUILD="$REPO_ROOT/android/build.gradle.kts"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly MPV_SEAM_BUILD="$REPO_ROOT/android/mpv-seam/build.gradle.kts"
 readonly ARTIFACTS_DOC="$REPO_ROOT/docs/RELEASE-ARTIFACTS.md"
+readonly VERSION_CHECK="$REPO_ROOT/scripts/verify-android-release-version.sh"
 readonly CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 
 fail() {
@@ -96,6 +97,17 @@ for stale in '-phone\.apk' '-tv\.apk'; do
     fi
 done
 ok "no phone/tv artifact labels remain under .github/workflows"
+
+require_grep "release binds Android version to all packaged manifests" \
+    'bash scripts/verify-android-release-version.sh' "$RELEASE_WF"
+require_grep "AAB metadata inspector is digest-pinned" \
+    'a099cfa1543f55593bc2ed16a70a7c67fe54b1747bb7301f37fdfd6d91028e29.*sha256sum --check' "$RELEASE_WF"
+require_grep "version evidence inspects protobuf AAB version code" \
+    'xpath=.*/manifest/@android:versionCode' "$VERSION_CHECK"
+require_grep "version evidence requires two APKs and one AAB" \
+    'apk_count.*= 2.*bundle_count.*= 1' "$VERSION_CHECK"
+require_grep "secretless packaging runs version evidence fixtures" \
+    'python3 scripts/tests/test_android_release_version.py' "$VALIDATION_WF"
 
 require_grep "SHA256SUMS covers the full-mpv universal APK" \
     'full-mpv-universal\.apk' "$RELEASE_WF"

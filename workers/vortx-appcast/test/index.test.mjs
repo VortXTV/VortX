@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, createHmac, webcrypto } from "node:crypto";
 import { test } from "node:test";
 
@@ -138,7 +139,7 @@ function signedRequest(path, payload) {
   });
 }
 
-function androidAugmentation(receipt, operationId = "augment-android-test") {
+function androidAugmentation(receipt, operationId = "augment-android-test", versionCode = 238) {
   const version = receipt.manifest.version;
   const tag = receipt.manifest.tag;
   const fullName = `VortX-${version}-full-mpv-universal.apk`;
@@ -155,6 +156,8 @@ function androidAugmentation(receipt, operationId = "augment-android-test") {
     `release tag: ${tag}`,
     `release tag commit: ${receipt.manifest.sourceCommit}`,
     `source commit: ${receipt.manifest.sourceCommit}`,
+    `Android versionCode: ${versionCode}`,
+    `Android versionName: ${version}`,
     "",
   ].join("\n");
   const releaseAsset = (assetId, name, size, digestValue) => ({
@@ -612,6 +615,180 @@ test("consecutive Apple-only promotions retain only the last verified Android sp
     action: "rollback", expectedCurrentGeneration: beta2.manifest.generation, restoreGeneration: beta1Android.manifest.generation,
   }), env)).status, 200);
   assert.equal((await env.__state.storage.get("active")).manifest.generation, beta1Android.manifest.generation);
+});
+
+test("authenticated active receipt exposes canonical Apple appcast and verified inherited Android", async () => {
+  const env = environment(new MemoryKV());
+  const beta1 = makeReceipt({ releaseId: "235", build: 252, tag: "v0.4.0-beta.16" });
+  const beta2 = makeReceipt({ releaseId: "236", build: 253, tag: "v0.4.0-beta.17" });
+  for (const receipt of [beta1, beta2]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-beta16", releaseId: beta1.manifest.releaseId,
+    generation: beta1.manifest.generation, expectedActiveGeneration: null,
+  }), env)).status, 200);
+  const beta1Active = structuredClone(await env.__state.storage.get("active"));
+  const beta1Augmentation = androidAugmentation(beta1, "augment-beta16");
+  beta1Augmentation.expectedReceiptSha256 = beta1Active.receiptSha256;
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", beta1Augmentation), env)).status, 200);
+  const beta1Android = structuredClone(await env.__state.storage.get("active"));
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-beta17", releaseId: beta2.manifest.releaseId,
+    generation: beta2.manifest.generation, expectedActiveGeneration: beta1Android.manifest.generation,
+  }), env)).status, 200);
+
+  const read = await worker.fetch(signedRequest("/__release/receipt", { action: "read-active-receipt" }), env);
+  assert.equal(read.status, 200);
+  const evidence = await read.json();
+  const responseBytes = Buffer.from(JSON.stringify(evidence));
+  const extractedAppcast = execFileSync("jq", ["-jer", ".active.appcastText"], { input: responseBytes });
+  const extractedSource = execFileSync("jq", ["-jer", ".active.sourceText"], { input: responseBytes });
+  assert.equal(evidence.active.manifest.build, 253);
+  assert.equal(evidence.active.manifest.android, null);
+  assert.deepEqual(extractedAppcast, Buffer.from(evidence.active.appcastText));
+  assert.deepEqual(extractedSource, Buffer.from(evidence.active.sourceText));
+  assert.equal(sha256(extractedAppcast), evidence.active.manifest.appcastSha256);
+  assert.equal(sha256(extractedSource), evidence.active.manifest.sourceSha256);
+  assert.equal(JSON.parse(evidence.active.appcastText).android, null);
+  assert.equal(evidence.inheritedAndroidState, "valid");
+  assert.deepEqual(evidence.inheritedAndroid, JSON.parse(beta1Android.appcastText).android);
+
+  const beta2Augmentation = androidAugmentation(beta2, "augment-beta17", 239);
+  beta2Augmentation.expectedReceiptSha256 = evidence.active.receiptSha256;
+  const response = await worker.fetch(signedRequest("/__release/receipt", beta2Augmentation), env);
+  assert.equal(response.status, 200, await response.text());
+  const active = await env.__state.storage.get("active");
+  assert.equal(active.manifest.build, 253);
+  assert.equal(active.manifest.android.full.build, 239);
+  assert.equal(active.manifest.android.full.versionCode, 239);
+  assert.equal(active.manifest.android.play.build, 239);
+});
+
+test("Android augmentation rejects malformed inherited state and non-increasing actual versionCode", async () => {
+  const setup = async (versionCode = null) => {
+    const env = environment(new MemoryKV());
+    const beta1 = makeReceipt({ releaseId: "235", build: 252, tag: "v0.4.0-beta.16" });
+    const beta2 = makeReceipt({ releaseId: "236", build: 253, tag: "v0.4.0-beta.17" });
+    for (const receipt of [beta1, beta2]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+      action: "promote", operationId: `promote-${Math.random()}`, releaseId: beta1.manifest.releaseId,
+      generation: beta1.manifest.generation, expectedActiveGeneration: null,
+    }), env)).status, 200);
+    const firstActive = structuredClone(await env.__state.storage.get("active"));
+    const firstAugment = androidAugmentation(beta1, `augment-${Math.random()}`);
+    firstAugment.expectedReceiptSha256 = firstActive.receiptSha256;
+    if (versionCode !== null) {
+      firstAugment.evidence.provenanceText = firstAugment.evidence.provenanceText.replace("Android versionCode: 238", `Android versionCode: ${versionCode}`);
+      firstAugment.evidence.assets.provenance.size = Buffer.byteLength(firstAugment.evidence.provenanceText);
+      firstAugment.evidence.assets.provenance.sha256 = sha256(firstAugment.evidence.provenanceText);
+    }
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", firstAugment), env)).status, 200);
+    const androidActive = structuredClone(await env.__state.storage.get("active"));
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+      action: "promote", operationId: `promote-${Math.random()}`, releaseId: beta2.manifest.releaseId,
+      generation: beta2.manifest.generation, expectedActiveGeneration: androidActive.manifest.generation,
+    }), env)).status, 200);
+    const current = structuredClone(await env.__state.storage.get("active"));
+    const augmentation = androidAugmentation(beta2, `augment-${Math.random()}`);
+    augmentation.expectedReceiptSha256 = current.receiptSha256;
+    return { env, beta2, augmentation, current };
+  };
+
+  const malformed = await setup();
+  const predecessor = await malformed.env.__state.storage.get(`rollback:${malformed.current.manifest.generation}`);
+  predecessor.appcastText = predecessor.appcastText.replace('"engine": "mpv"', '"engine": "invalid"');
+  await malformed.env.__state.storage.put(`rollback:${malformed.current.manifest.generation}`, predecessor);
+  const read = await worker.fetch(signedRequest("/__release/receipt", { action: "read-active-receipt" }), malformed.env);
+  assert.equal(read.status, 409);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", malformed.augmentation), malformed.env)).status, 409);
+  assert.equal((await malformed.env.__state.storage.get("active")).manifest.generation, malformed.current.manifest.generation);
+
+  const staleCode = await setup(238);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", staleCode.augmentation), staleCode.env)).status, 409);
+  assert.equal((await staleCode.env.__state.storage.get("active")).manifest.generation, staleCode.current.manifest.generation);
+});
+
+test("Android augmentation rejects absent, invalid, conflicting, or mismatched version markers", async () => {
+  for (const mutate of [
+    (value) => value.replace("Android versionCode: 238\n", ""),
+    (value) => value.replace("Android versionCode: 238", "Android versionCode: 238.5"),
+    (value) => value.replace("Android versionCode: 238", "Android versionCode: 9007199254740993"),
+    (value) => value.replace("Android versionCode: 238", "Android versionCode: 238\nAndroid versionCode: 239"),
+    (value) => value.replace("Android versionCode: 238", "Android versionCode: 238\n  Android versionCode: 239"),
+    (value) => value.replace("Android versionName: 0.3.15", "Android versionName: 0.3.16"),
+    (value) => value.replace("Android versionName: 0.3.15", "Android versionName: 0.3.15\nAndroid versionName: 0.3.15"),
+  ]) {
+    const env = environment(new MemoryKV());
+    const receipt = makeReceipt({ releaseId: "315", build: 253, tag: "v0.3.15" });
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+      action: "promote", operationId: `promote-${Math.random()}`, releaseId: receipt.manifest.releaseId,
+      generation: receipt.manifest.generation, expectedActiveGeneration: null,
+    }), env)).status, 200);
+    const augmentation = androidAugmentation(receipt, `augment-${Math.random()}`);
+    augmentation.expectedReceiptSha256 = (await env.__state.storage.get("active")).receiptSha256;
+    augmentation.evidence.provenanceText = mutate(augmentation.evidence.provenanceText);
+    augmentation.evidence.assets.provenance.size = Buffer.byteLength(augmentation.evidence.provenanceText);
+    augmentation.evidence.assets.provenance.sha256 = sha256(augmentation.evidence.provenanceText);
+    assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 409);
+    assert.equal((await env.__state.storage.get("active")).manifest.generation, receipt.manifest.generation);
+  }
+});
+
+test("Android versionCode is artifact-bound and independent from the Apple build number", async () => {
+  const env = environment(new MemoryKV());
+  const receipt = makeReceipt({ releaseId: "317", build: 253, tag: "v0.4.0-beta.17" });
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-versioncode-independent", releaseId: receipt.manifest.releaseId,
+    generation: receipt.manifest.generation, expectedActiveGeneration: null,
+  }), env)).status, 200);
+  const active = structuredClone(await env.__state.storage.get("active"));
+  const augmentation = androidAugmentation(receipt, "augment-versioncode-independent", 238);
+  augmentation.expectedReceiptSha256 = active.receiptSha256;
+  const response = await worker.fetch(signedRequest("/__release/receipt", augmentation), env);
+  assert.equal(response.status, 200, await response.text());
+  const augmented = await env.__state.storage.get("active");
+  assert.equal(augmented.manifest.build, 253);
+  assert.equal(augmented.manifest.android.full.build, 238);
+  assert.equal(augmented.manifest.android.full.versionCode, 238);
+});
+
+test("Apple 254 retains the verified Android 238 from Apple 253 without treating Apple builds as Android codes", async () => {
+  const env = environment(new MemoryKV());
+  const beta17 = makeReceipt({ releaseId: "317", build: 253, tag: "v0.4.0-beta.17" });
+  const beta18 = makeReceipt({ releaseId: "318", build: 254, tag: "v0.4.0-beta.18" });
+  for (const receipt of [beta17, beta18]) assert.equal((await worker.fetch(signedRequest("/__release/receipt", receipt), env)).status, 200);
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-253", releaseId: beta17.manifest.releaseId,
+    generation: beta17.manifest.generation, expectedActiveGeneration: null,
+  }), env)).status, 200);
+  const apple253 = structuredClone(await env.__state.storage.get("active"));
+  const augmentation = androidAugmentation(beta17, "augment-253-android-238", 238);
+  augmentation.expectedReceiptSha256 = apple253.receiptSha256;
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", augmentation), env)).status, 200);
+  const android238 = structuredClone(await env.__state.storage.get("active"));
+  assert.equal(android238.manifest.build, 253);
+  assert.equal(android238.manifest.android.full.build, 238);
+
+  assert.equal((await worker.fetch(signedRequest("/__release/receipt", {
+    action: "promote", operationId: "promote-254", releaseId: beta18.manifest.releaseId,
+    generation: beta18.manifest.generation, expectedActiveGeneration: android238.manifest.generation,
+  }), env)).status, 200);
+  const publicAppcast = await worker.fetch(new Request("https://vortx.tv/appcast.json"), env);
+  assert.equal(publicAppcast.status, 200);
+  const inherited = (await publicAppcast.json()).android;
+  assert.deepEqual(inherited, JSON.parse(android238.appcastText).android);
+  assert.equal(inherited.full.build, 238);
+  assert.equal(inherited.full.versionCode, 238);
+
+  const corrupt = await env.__state.storage.get(`rollback:${beta18.manifest.generation}`);
+  corrupt.manifest.android.full.versionCode = 239;
+  corrupt.appcastText = `${JSON.stringify({ ...JSON.parse(corrupt.appcastText), android: corrupt.manifest.android }, null, 2)}\n`;
+  await env.__state.storage.put(`rollback:${beta18.manifest.generation}`, corrupt);
+  const read = await worker.fetch(signedRequest("/__release/receipt", { action: "read-active-receipt" }), env);
+  assert.equal(read.status, 409);
+  const failClosed = await worker.fetch(new Request("https://vortx.tv/appcast.json"), env);
+  assert.equal((await failClosed.json()).android, null);
 });
 
 test("Apple-only appcast fails closed to null Android for missing, cyclic, or malformed predecessors", async () => {

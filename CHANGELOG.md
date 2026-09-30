@@ -4,6 +4,19 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.4.0-beta.17 - Resume recovery, binge playback, skip controls, and Android fixes
+
+Apple build **253**, Android version code **238**. Includes the completed changes since Beta 16:
+failed-resume retirement across replacement chains, real first-frame admission at zero, configurable
+5/10/15/30-second automatic skipping with Off and Cancel, Android player/source/prewarm ownership,
+episode targeting and track-inventory fixes, recoverable opt-in watched-download cleanup, account-owned
+watch suggestions, Trakt/Top Shelf artwork, file-matched subtitles, bounded batch metadata recovery,
+web source paging and live skip parsing, and artifact-bound Android update metadata.
+
+See [the full Beta 17 notes](docs/releases/0.4.0-beta.17.md) for behavior, installation, tests and limits.
+Fresh device/provider testing, the Mac/iPhone redesign and full Android visual/feature parity remain
+open; this entry does not claim blanket playback closure.
+
 ## 0.4.0-beta.12 - Apple playback recovery, add-on sync, and Usenet
 
 **Install this over any earlier build.** Beta 12 brings together the Apple fixes and features landed since Beta 10: playback-state recovery, more reliable add-on ordering and watch-state sync, artwork repairs, multiple Usenet servers, direct NZB indexers, and related titles. Apple build **245**.
