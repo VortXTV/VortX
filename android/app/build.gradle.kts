@@ -93,6 +93,9 @@ android {
     // carry that pin). targetSdk now tracks compileSdk (S01: Android-16-baseline session) -- both at
     // 36. minSdk stays 26 (already above Media3 1.9's floor of 23; covers phones and Android TV).
     compileSdk = 36
+    // Resolve the native toolchain before defaultConfig/flavor configuration. Keep the pin
+    // synchronized with :mpv-seam and the explicit SDK installation in CI.
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "com.vortx.android"
@@ -469,9 +472,6 @@ android {
     sourceSets.named("main") {
         jniLibs.srcDir(jniLibsOutDir)
     }
-    // ndkVersion pins the NDK the cargo-ndk linker uses. Keep in sync with the NDK CI installs.
-    ndkVersion = "27.2.12479018"
-
     // The bounded community-provider host is a separate C library. It deliberately does not share
     // symbols or build output with the Rust engine JNI library above.
     externalNativeBuild {

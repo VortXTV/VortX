@@ -63,6 +63,24 @@ for wf in "$ANDROID_CI_WF" "$RELEASE_WF" "$VALIDATION_WF" "$CODEQL_WF"; do
         <(printf '%s\n' "$sdk_setup")
 done
 
+# Native configuration must see the same pinned NDK before defaultConfig or flavors can resolve
+# a CXX model. A later second android block must not silently leave earlier configuration on AGP's
+# default version. Installation is still required separately; this is not an autobuild workaround.
+readonly NDK_PIN="27.2.12479018"
+app_ndk_pin="$(awk '/^android \{/{active=1}
+    active && /^[[:space:]]+defaultConfig \{/{exit}
+    active && /^[[:space:]]+ndkVersion[[:space:]]*=/{print $3}' "$GRADLE_BUILD")"
+[[ "$app_ndk_pin" = "\"$NDK_PIN\"" ]] || fail "app NDK pin must precede its first defaultConfig"
+[[ "$(grep -Ec '^[[:space:]]*ndkVersion[[:space:]]*=' "$GRADLE_BUILD")" -eq 1 ]] \
+    || fail "app must declare exactly one NDK pin"
+ok "app declares one pinned NDK before native variant configuration"
+require_grep "mpv seam uses the same pinned NDK" \
+    "^[[:space:]]+ndkVersion = \"${NDK_PIN//./\\.}\"$" "$MPV_SEAM_BUILD"
+for wf in "$ANDROID_CI_WF" "$RELEASE_WF" "$VALIDATION_WF" "$CODEQL_WF"; do
+    require_grep "$(basename "$wf") installs the pinned native toolchain" \
+        "sdkmanager \"ndk;${NDK_PIN//./\\.}\"" "$wf"
+done
+
 # --- Contract 1 (REL-02): artifacts are labeled by their real dimensions -------------------------
 
 require_grep "staging emits the full-mpv universal APK name" \
@@ -192,6 +210,17 @@ require_grep "validation requires exactly one APK PEM signer certificate" \
 require_grep "validation rejects Android Debug certificates" 'Android Debug' "$VALIDATION_WF"
 require_grep "validation uses strict jarsigner verification on the AAB" \
     'jarsigner" -verify -strict' "$VALIDATION_WF"
+require_grep "validation runs signer parsing and strict-verification fixtures" \
+    'bash scripts/test-android-release-signing\.sh' "$VALIDATION_WF"
+adhoc_fp_parser="$(awk '/expected_fp=/{active=1} active{print} active && /head -n1/{exit}' "$VALIDATION_WF")"
+grep -Fq "sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p'" <<<"$adhoc_fp_parser" \
+    || fail "validation ephemeral-keystore fingerprint parser ignores indented SHA256 lines"
+ok "validation ephemeral-keystore fingerprint parser admits real keytool indentation"
+adhoc_bundle_verification="$(awk '/jarsigner_out=/{active=1} active{print}
+    active && /bundle.*2>\&1/{exit}' "$VALIDATION_WF")"
+require_grep "validation binds strict self-signed verification to the generated keystore" \
+    '-keystore "\$RUNNER_TEMP/adhoc-signing/adhoc-release\.jks"' \
+    <(printf '%s\n' "$adhoc_bundle_verification")
 require_grep "validation enforces the GPL boundary on the play flavor" \
     'GPL native library found in play release APK' "$VALIDATION_WF"
 require_grep "validation generates an explicitly non-debug ad-hoc identity" \

@@ -30,6 +30,13 @@ Apple Beta 16 and Android Beta 14 are different artifact baselines; Android pari
 - **Android CI:** real packaging and security-analysis runs failed before compilation because the pinned
   SDK setup action defaults to the removed standalone `tools` package. All four SDK lanes now request
   supported platform/build tools explicitly; release contracts guard the action blocks against regression.
+- **Packaging verification:** accept indentation in real `keytool -list` fingerprints and bind strict
+  self-signed AAB verification to the generated run-local keystore. APK v2, exact signer, subject,
+  unsigned-entry rejection and production certificate pins remain mandatory. Real JDK fixtures cover
+  fingerprint parsing against certificate DER bytes and rejection of partially unsigned bundles.
+- **Native toolchain:** declare the existing Android NDK pin before native variant configuration and
+  guard consistency with the mpv seam and all four explicit CI installation lanes. This does not install
+  an NDK on GitHub's separate managed Code Quality runner or bypass release/native requirements.
 
 ## Complete issue disposition
 
@@ -145,6 +152,12 @@ Local verification of the final source passed:
 - Web type checking, 52 tests and production build, using the repository's npm 11.17.0 pin.
 - Strict-concurrency Swift HTTP/policy fixtures for subtitles, metadata-slot recovery, source presentation
   and track selection. The new secretless CI lane repeats these fixtures and the web checks.
+
+GitHub's separate managed Code Quality Java/Kotlin autobuild also fails on the baseline main commit:
+its runner has no usable Android NDK and cannot fetch the package manifests. The explicit security
+workflow provisions the pinned SDK/NDK and uses a manual Kotlin compile; that lane passed after the SDK
+setup repair. Moving the source pin earlier cannot supply a missing runner package. Managed analysis
+has not been disabled, and no native, signing or release gate was relaxed to make its check green.
 
 No fresh physical TV playback log was obtained in this audit: the device-container copy timed out. This patch
 does not claim an overnight DV, receiver-audio or live-provider throughput pass. Local Mac universal linking

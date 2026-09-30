@@ -173,6 +173,20 @@ if [[ -x "$jdk_home/bin/jar" && -x "$jdk_home/bin/keytool" && -x "$jdk_home/bin/
         -storepass changeit \
         -keypass changeit \
         "$real_dir/complete.aab" release >/dev/null 2>&1
+    # Real keytool -list output indents fingerprints. Compare the validation lane's parser against
+    # the certificate DER bytes, independently of keytool's human-readable fingerprint formatting.
+    LC_ALL=C "$jdk_home/bin/keytool" -exportcert -keystore "$real_dir/test.jks" \
+        -storepass changeit -alias release -file "$real_dir/signer.der" >/dev/null 2>&1
+    derived_fp="$(LC_ALL=C "$jdk_home/bin/keytool" -list -v -keystore "$real_dir/test.jks" \
+        -storepass changeit -alias release | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' \
+        | head -n1 | tr -d ' :' | tr '[:lower:]' '[:upper:]')"
+    der_fp="$(shasum -a 256 "$real_dir/signer.der" | awk '{print toupper($1)}')"
+    [[ "$derived_fp" = "$der_fp" ]] || fail "indented ephemeral-keystore fingerprint parser does not match DER SHA-256"
+    printf 'ok: real indented keytool fingerprint matches certificate DER bytes\n'
+    adhoc_output="$(LC_ALL=C "$jdk_home/bin/jarsigner" -verify -strict -verbose \
+        -keystore "$real_dir/test.jks" -storepass changeit "$real_dir/complete.aab" 2>&1)"
+    grep -Eq '^jar verified\.$' <<<"$adhoc_output" || fail "run-local trust did not strictly verify the fully signed fixture"
+    printf 'ok: strict self-signed fixture verification trusts only the generated keystore\n'
     complete_output="$(expect_failure "real complete AAB with non-pinned signer" env \
         APKSIGNER_BIN="$workdir/bin/apksigner" \
         JARSIGNER_BIN="$jdk_home/bin/jarsigner" \
@@ -184,6 +198,10 @@ if [[ -x "$jdk_home/bin/jar" && -x "$jdk_home/bin/keytool" && -x "$jdk_home/bin/
     cp "$real_dir/complete.aab" "$real_dir/partial.aab"
     printf 'unsigned payload\n' > "$real_dir/unsigned-entry.txt"
     "$jdk_home/bin/jar" --update --file "$real_dir/partial.aab" -C "$real_dir" unsigned-entry.txt
+    expect_failure "run-local trust cannot admit unsigned entries" \
+        "$jdk_home/bin/jarsigner" -verify -strict -verbose -keystore "$real_dir/test.jks" \
+        -storepass changeit "$real_dir/partial.aab" >/dev/null
+    printf 'ok: run-local trust still rejects a partially unsigned AAB\n'
     partial_output="$(expect_failure "real partially unsigned AAB" env \
         APKSIGNER_BIN="$workdir/bin/apksigner" \
         JARSIGNER_BIN="$jdk_home/bin/jarsigner" \
