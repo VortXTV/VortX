@@ -760,6 +760,11 @@ struct PosterCard: View {
                 Group {
                     if landscape {
                         LandscapeArt(id: id, type: type, title: displayTitle, poster: PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth, radius: catalogPrefs.posterRadius.radius)
+                    } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster) {
+                        // Trakt's documented first-party CDN art is safe to fetch through the normal
+                        // cache-backed loader. Keep the exact validated URL from the row: do not wrap it
+                        // in PosterArtwork, which could enrich a private title through another service.
+                        PosterArt(displayPoster, width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     } else if privateArtwork {
                         WarmPosterArt(poster: displayPoster, width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     } else {

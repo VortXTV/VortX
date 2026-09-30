@@ -4462,6 +4462,11 @@ struct PosterCardiOS: View {
                 Group {
                     if landscape {
                         LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                    } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster ?? fallbackArt) {
+                        // Trakt's documented first-party CDN art may use the normal cache-backed loader.
+                        // Preserve the exact validated row URL and skip PosterArtwork enrichment: private
+                        // playback rows must never trigger a third-party metadata/image join.
+                        CachedPosterImage(url: displayPoster ?? fallbackArt)
                     } else if privateArtwork {
                         WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
                     } else {

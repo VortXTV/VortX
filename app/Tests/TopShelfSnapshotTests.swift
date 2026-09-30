@@ -131,6 +131,26 @@ if let data = try? encoder.encode(TopShelfSnapshot.Payload(version: 99, writtenA
     check(false, "foreign-version payload decodes for the gate check")
 }
 
+// MARK: Managed private artwork path
+
+section("private Trakt artwork gets an exact managed App Group file URL")
+
+let traktArtworkSource = "https://media.trakt.tv/images/movies/000/001/posters/medium/poster.jpg.webp"
+if let managed = TopShelfSnapshot.localArtworkURL(for: traktArtworkSource),
+   let container = TopShelfSnapshot.containerURL {
+    let managedRoot = container.appendingPathComponent(TopShelfSnapshot.artworkDirectoryName, isDirectory: true).path
+    check(managed.path.hasPrefix(managedRoot + "/"), "private artwork stays below the exact managed App Group directory")
+    check(managed.pathExtension == "webp", "the managed file preserves a safe image extension")
+    check(TopShelfSnapshot.localArtworkURL(for: traktArtworkSource) == managed,
+          "the same source URL maps to a stable local file")
+    check(TopShelfSnapshot.localArtworkURL(for: "https://media.trakt.tv/images/movies/000/002/posters/medium/poster.jpg.webp") != managed,
+          "different source URLs do not collide in the managed path")
+} else {
+    // Unsigned Apple builds legitimately have no App Group. The API's nil result is the documented
+    // fail-soft path; the extension then falls back to the static Top Shelf image.
+    check(TopShelfSnapshot.containerURL == nil, "an unprovisioned App Group makes the local artwork URL nil")
+}
+
 // MARK: Degrade path
 
 section("degrades safely with no usable App Group container")

@@ -155,17 +155,29 @@ private func testSourceSuppliedArtworkIsHTTPSOnly() {
            "scheme-relative URLs are rejected")
     expect(TraktArtworkPolicy.sourceSuppliedArtwork("https://user:pass@walter.trakt.tv/poster.jpg") == nil,
            "userinfo-bearing URLs are rejected")
-    expect(TraktArtworkPolicy.sourceSuppliedArtwork("walter.trakt.tv/poster.jpg?x=1") != nil,
-           "scheme-less host/path with query is accepted")
+    expect(TraktArtworkPolicy.sourceSuppliedArtwork("walter.trakt.tv/images/poster.jpg?x=1") != nil,
+           "scheme-less first-party image host/path with query is accepted")
+    expect(TraktArtworkPolicy.sourceSuppliedArtwork("https://img.example/images/poster.jpg") == nil,
+           "third-party image hosts are rejected")
+    expect(TraktArtworkPolicy.sourceSuppliedArtwork("https://media.trakt.tv.evil.example/images/poster.jpg") == nil,
+           "spoofed Trakt suffix hosts are rejected")
+    expect(TraktArtworkPolicy.sourceSuppliedArtwork("https://media.trakt.tv:8443/images/poster.jpg") == nil,
+           "non-default ports are rejected")
+    expect(TraktArtworkPolicy.sourceSuppliedArtwork("https://media.trakt.tv/poster.jpg") == nil,
+           "non-image paths are rejected")
+    expect(TraktArtworkPolicy.isFirstPartyArtwork("https://media.trakt.tv/images/poster.jpg"),
+           "a normalized first-party URL is safe for the normal cache-backed loader")
+    expect(!TraktArtworkPolicy.isFirstPartyArtwork("https://img.example/images/poster.jpg"),
+           "a joined third-party URL stays on the warm-only path")
     expect(TraktArtworkPolicy.sourceSuppliedArtwork("") == nil, "empty values are rejected")
     expect(TraktArtworkPolicy.sourceSuppliedArtwork(nil) == nil, "nil values are rejected")
 
     // Through the fold: only a source-supplied https URL can set the seed poster; anything else,
     // including a plausible http image or a relative tmdb-style path, stays nil.
     let httpsSeed = TraktContinueWatchingFold.fold(
-        jsonRows("[\(movieRow(ids: "\"imdb\": \"tt1111111\"", poster: "https://img.example/poster.jpg"))]")
+        jsonRows("[\(movieRow(ids: "\"imdb\": \"tt1111111\"", poster: "https://media.trakt.tv/images/poster.jpg"))]")
     ).first
-    expectEqual(httpsSeed?.poster, "https://img.example/poster.jpg",
+    expectEqual(httpsSeed?.poster, "https://media.trakt.tv/images/poster.jpg",
                 "a row-supplied https poster is carried into the seed")
     let httpSeed = TraktContinueWatchingFold.fold(
         jsonRows("[\(movieRow(ids: "\"imdb\": \"tt1111111\"", poster: "http://img.example/poster.jpg"))]")
@@ -215,12 +227,12 @@ private func testDecodesCachesWrittenBeforeAliasesExisted() {
     let seed = TraktContinueWatchingSeed(
         id: "tt2222222", type: "series", name: "New", progress: 20,
         pausedAt: "2026-09-10T11:00:00.000Z", runtimeMinutes: 45, videoID: "tt2222222:1:2",
-        poster: "https://img.example/s.jpg", aliases: ["tmdb:tv:22", "tmdb:22"]
+        poster: "https://media.trakt.tv/images/s.jpg", aliases: ["tmdb:tv:22", "tmdb:22"]
     )
     let data = try? JSONEncoder().encode(seed)
     let back = try? JSONDecoder().decode(TraktContinueWatchingSeed.self, from: data ?? Data())
     expectEqual(back?.aliases, ["tmdb:tv:22", "tmdb:22"], "aliases survive an encode/decode round trip")
-    expectEqual(back?.poster, "https://img.example/s.jpg", "poster survives an encode/decode round trip")
+    expectEqual(back?.poster, "https://media.trakt.tv/images/s.jpg", "poster survives an encode/decode round trip")
 }
 
 @main

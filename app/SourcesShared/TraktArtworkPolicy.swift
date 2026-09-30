@@ -23,9 +23,13 @@ enum TraktArtworkPolicy {
 
     // MARK: - Source-supplied artwork (no request involved)
 
-    /// Trakt's image payload omits the URL scheme, so accept a valid host/path and normalize it
-    /// to HTTPS. Explicit non-HTTPS schemes, userinfo, scheme-relative URLs, relative paths, and
-    /// bare filenames are rejected. This performs no lookup or network access.
+    /// Trakt's image payload omits the URL scheme, so accept only a documented first-party Trakt
+    /// image URL and normalize it to HTTPS. The host/path gate is intentionally narrow: a private
+    /// playback row is allowed to carry art only when Trakt itself supplied an HTTPS CDN URL under
+    /// `*.trakt.tv/images/`. This prevents a row from smuggling an arbitrary third-party URL into a
+    /// private card or the Top Shelf cache. Explicit non-HTTPS schemes, userinfo, non-default ports,
+    /// scheme-relative URLs, relative paths, and bare filenames are rejected. This performs no lookup
+    /// or network access.
     static func sourceSuppliedArtwork(_ value: String?) -> String? {
         guard let value,
               !value.isEmpty,
@@ -46,15 +50,36 @@ enum TraktArtworkPolicy {
             candidate = "https://" + value
         }
 
-        guard let components = URLComponents(string: candidate),
+        return validatedFirstPartyArtwork(candidate)
+    }
+
+    /// Whether an already-normalized URL is a first-party Trakt CDN image URL.
+    ///
+    /// This is separate from `sourceSuppliedArtwork(_:)` because callers that receive a joined local
+    /// poster must not normalize or otherwise rewrite it. A `true` result means the caller may use
+    /// the exact supplied string for a normal cache-backed image load; a `false` result keeps the
+    /// caller on the warm-only local-art path.
+    static func isFirstPartyArtwork(_ value: String?) -> Bool {
+        guard let value, !value.isEmpty, !value.contains(where: { $0.isWhitespace }) else { return false }
+        return validatedFirstPartyArtwork(value) != nil
+    }
+
+    private static func validatedFirstPartyArtwork(_ value: String) -> String? {
+        guard let components = URLComponents(string: value),
               components.scheme?.lowercased() == "https",
-              let host = components.host,
-              !host.isEmpty,
+              let host = components.host?.lowercased(),
+              host.count > ".trakt.tv".count,
+              host.hasSuffix(".trakt.tv"),
               components.user == nil,
               components.password == nil,
+              components.port == nil || components.port == 443,
+              components.fragment == nil,
+              components.path.lowercased().hasPrefix("/images/"),
               let url = components.url,
-              url.host != nil else { return nil }
-        return candidate
+              url.scheme?.lowercased() == "https",
+              url.host?.lowercased() == host
+        else { return nil }
+        return value
     }
 
     /// Extract artwork from the documented Trakt `images` object, if present. Trakt image values
