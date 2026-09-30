@@ -131,10 +131,8 @@ object DownloadStore {
         return DownloadIndexHydration.readAtomically(
             indexFile = file,
             openRead = { AtomicFile(file).openRead() },
-        ) { index ->
-            val array = JSONArray(index)
-            (0 until array.length()).mapNotNull { i -> recordFromJson(array.optJSONObject(i) ?: return@mapNotNull null) }
-        }.also { receipt ->
+            decode = ::decodeIndexRecords,
+        ).also { receipt ->
             if (receipt is DownloadIndexHydration.Receipt.Loaded) {
                 _records.value = receipt.value.sortedByDescending { it.addedAt }
             }
@@ -467,7 +465,7 @@ object DownloadStore {
     }
 
     internal fun recordFromJson(json: JSONObject): DownloadRecord? {
-        val id = json.optString("id").takeIf { it.isNotEmpty() } ?: return null
+        val id = json.optString("id").takeIf { it.isNotBlank() } ?: return null
         val headers = json.optJSONObject("headers")?.let { obj ->
             obj.keys().asSequence().associateWith { obj.optString(it) }
         }
@@ -509,6 +507,26 @@ object DownloadStore {
             retryNote = json.optStringOrNull("retryNote"),
             taskIdentifier = if (json.has("taskIdentifier")) json.optInt("taskIdentifier") else null,
         )
+    }
+
+    /**
+     * An index is trustworthy only when EVERY JSON array member decodes into one distinct persisted row. Silently
+     * dropping a bad member would make a corrupt index look like a successful removal and authorize tombstone cleanup.
+     * [recordFromJson] retains its legacy defaults, so older valid rows remain accepted without weakening completeness.
+     */
+    internal fun decodeIndexRecords(index: String): List<DownloadRecord> {
+        val array = JSONArray(index)
+        val seenIds = HashSet<String>(array.length())
+        return List(array.length()) { position ->
+            val row = array.optJSONObject(position)
+                ?: throw IllegalArgumentException("Download index row $position is not an object")
+            val record = recordFromJson(row)
+                ?: throw IllegalArgumentException("Download index row $position is not decodable")
+            if (!seenIds.add(record.id)) {
+                throw IllegalArgumentException("Download index contains duplicate id ${record.id}")
+            }
+            record
+        }
     }
 
     /** `optString` returns "" for an absent key, which would turn a null poster/error into an empty string. */

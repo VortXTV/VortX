@@ -5,7 +5,9 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -91,6 +93,58 @@ class DownloadIndexHydrationTest {
             DownloadIndexHydration.Receipt.Unreadable,
             DownloadIndexHydration.readAtomically(index, openRead = { index.inputStream() }) { it },
         )
+    }
+
+    @Test
+    fun `valid JSON with an undecodable row is unreadable rather than silently shrunk`() = inTemporaryDirectory { directory ->
+        val index = File(directory, "index.json").apply {
+            writeText(JSONArray().put(validRow("one")).put(JSONObject().put("id", "   ")).toString())
+        }
+
+        assertEquals(
+            DownloadIndexHydration.Receipt.Unreadable,
+            readAtomicRecords(index),
+        )
+    }
+
+    @Test
+    fun `valid JSON with duplicate record ids is unreadable rather than silently coalesced`() = inTemporaryDirectory { directory ->
+        val index = File(directory, "index.json").apply {
+            writeText(JSONArray().put(validRow("same")).put(validRow("same")).toString())
+        }
+
+        assertEquals(
+            DownloadIndexHydration.Receipt.Unreadable,
+            readAtomicRecords(index),
+        )
+    }
+
+    @Test
+    fun `complete legacy row remains decodable with absent newer fields`() {
+        val legacy = DownloadStore.decodeIndexRecords(JSONArray().put(validRow("legacy")).toString()).single()
+
+        assertEquals("legacy", legacy.id)
+        assertNull(legacy.isDolbyVision)
+        assertNull(legacy.isAtmos)
+        assertNull(legacy.transferGeneration)
+    }
+
+    private fun readAtomicRecords(index: File): DownloadIndexHydration.Receipt<List<com.vortx.android.model.DownloadRecord>> =
+        DownloadIndexHydration.readAtomically(
+            indexFile = index,
+            openRead = { index.inputStream() },
+            decode = DownloadStore::decodeIndexRecords,
+        )
+
+    private fun validRow(id: String): JSONObject = JSONObject().apply {
+        put("id", id)
+        put("contentId", "content-$id")
+        put("videoId", "video-$id")
+        put("type", "movie")
+        put("name", "Title $id")
+        put("remoteURL", "https://example.invalid/$id.mp4")
+        put("localFilename", "$id.mp4")
+        put("state", "completed")
     }
 
     private fun inTemporaryDirectory(block: (File) -> Unit) {
