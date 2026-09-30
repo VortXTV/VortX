@@ -71,7 +71,9 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Exercise signer parsing and strict verification fixtures
-        run: bash scripts/test-android-release-signing.sh
+        run: |
+          bash scripts/test-android-release-signing.sh
+          python3 scripts/tests/test_android_release_version.py
 
       # Ephemeral ad-hoc release identity: generated on THIS runner for THIS run only, never
       # committed, never used to publish, shredded below even on failure. A distinct CN (not
