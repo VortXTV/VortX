@@ -188,6 +188,9 @@ fun PlayerScreen(
     val currentOnWarmNext by rememberUpdatedState(onWarmNext)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
+    // EOF/error received from the outgoing engine while a source replacement resolves must remain
+    // quarantined even if that resolver later fails and exposes the old revision again.
+    val sourceTerminalFence = remember(outerPlaybackSessionId) { PlayerTerminalFence() }
     // Every exit surface, including system Back while the engine is still connecting, funnels through
     // this one idempotent route. The outer shell still owns navigation state, but it must not receive a
     // second Back while the first callback is waiting for composition to remove this player.
@@ -235,7 +238,10 @@ fun PlayerScreen(
     }
     val currentPlayable = sourceSwitchState.playable
     val playbackSessionKey = sourceSwitchState.sessionKey
-    val playbackIntent = remember(playbackSessionKey) {
+    // Source/episode replacements are still the same viewing session. Keep the viewer's explicit
+    // play/pause decision across their accepted revision; otherwise a paused viewer selecting a new
+    // source gets a fresh default-"play" controller and the replacement starts unexpectedly.
+    val playbackIntent = remember(outerPlaybackSessionId) {
         val background = !lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
         val pauseInBackground = !KeepPlayingBackgroundSetting.isEnabled(context)
         PlaybackIntentController(
@@ -247,6 +253,12 @@ fun PlayerScreen(
                 },
             ),
         )
+    }
+    // A successful inner replacement gets a fresh source terminal verdict while retaining the intent
+    // above. Initial playback is harmless (the controller starts non-terminal); failed sources remain
+    // terminal until an accepted replacement changes [playbackSessionKey].
+    LaunchedEffect(playbackSessionKey) {
+        playbackIntent.beginReplacementSource()
     }
     // Focus ownership exists before any engine construction, load, or bind. It is source-session scoped,
     // so an mpv -> Media3 replacement inherits the same blocker and never opens an unowned playback gap.
@@ -994,8 +1006,16 @@ fun PlayerScreen(
     // it would resolve and play foreign sources over this session's file (AND-DL-01). The error
     // overlay remains the recovery surface.
     var sourceFailureDispatched by remember(playbackSessionKey) { mutableStateOf(false) }
-    LaunchedEffect(effectiveError) {
-        if (!effectiveError || sourceFailureDispatched || isLocalSession) return@LaunchedEffect
+    LaunchedEffect(playbackSessionKey, effectiveError, sourceSwitchState.isSwitching, playerExitRequested) {
+        if (
+            !effectiveError || sourceFailureDispatched || isLocalSession ||
+                sourceTerminalFence.suppress(
+                    revision = sourceSwitchState.revision,
+                    replacementPending = sourceSwitchState.isSwitching,
+                    terminal = effectiveError,
+                ) ||
+                playerExitRequested
+        ) return@LaunchedEffect
         val dispatch = currentOnSourceFailed ?: return@LaunchedEffect
         sourceFailureDispatched = true
         dispatch(latestState.positionMs.coerceAtLeast(0L))
@@ -1256,9 +1276,17 @@ fun PlayerScreen(
     // (-> the error surface + the host's retry ladder) instead of an ended signal. This is what makes
     // "play a 10-second junk file to its end" structurally unable to mark an episode watched or
     // auto-advance, whichever engine reported the EOF.
-    LaunchedEffect(playerState.hasEnded) {
+    LaunchedEffect(playbackSessionKey, playerState.hasEnded, sourceSwitchState.isSwitching, playerExitRequested) {
         val s = latestState
-        if (!playerState.hasEnded || s.hasError || stallError || runtimeMismatch) return@LaunchedEffect
+        if (
+            !playerState.hasEnded || s.hasError || stallError || runtimeMismatch ||
+                sourceTerminalFence.suppress(
+                    revision = sourceSwitchState.revision,
+                    replacementPending = sourceSwitchState.isSwitching,
+                    terminal = playerState.hasEnded,
+                ) ||
+                playerExitRequested
+        ) return@LaunchedEffect
         // A userForcedSource play skips the conversion (the viewer chose this exact file off the
         // manual fallback; its end is their end) -- but its progress writes were still junk-gated, so
         // even a forced junk file reaches here UNWATCHED and the advance is the viewer's own doing.
@@ -1669,7 +1697,6 @@ fun PlayerScreen(
                 val resolver = currentOnSwitchSource
                 if (
                     resolver != null &&
-                    !sourceSwitchState.isSwitching &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
                     sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
@@ -1686,7 +1713,6 @@ fun PlayerScreen(
                 val currentRef = sourceSwitchState.playable.mediaRef
                 if (
                     resolver != null &&
-                    !sourceSwitchState.isSwitching &&
                     !(currentRef?.isSeries == true &&
                         currentRef.season == episode.season &&
                         currentRef.episode == episode.episode)

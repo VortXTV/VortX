@@ -21,6 +21,32 @@ import org.junit.Test
 
 class PlayerSourceSwitchingTest {
     @Test
+    fun `a pending replacement leaves another source and episode choice available to supersede it`() {
+        assertTrue(playerReplacementChoiceEnabled(selected = false))
+        assertFalse(playerReplacementChoiceEnabled(selected = true))
+
+        val coordinator = PlayerSourceSwitchCoordinator()
+        val outer = coordinator.replaceOuterSession()
+        val first = coordinator.request(outer)
+        val replacement = coordinator.request(outer)
+
+        assertFalse(coordinator.isCurrent(first))
+        assertTrue(coordinator.isCurrent(replacement))
+    }
+
+    @Test
+    fun `terminal from an old source stays quarantined when its replacement fails`() {
+        val fence = PlayerTerminalFence()
+
+        assertTrue(fence.suppress(revision = 4L, replacementPending = true, terminal = true))
+        // The unsuccessful replacement leaves revision 4 mounted. Its EOF must remain unable to
+        // advance the episode after the picker returns to the old source.
+        assertTrue(fence.suppress(revision = 4L, replacementPending = false, terminal = true))
+        // An accepted replacement owns revision 5 and may report its own terminal normally.
+        assertFalse(fence.suppress(revision = 5L, replacementPending = false, terminal = true))
+    }
+
+    @Test
     fun `replacement playable preserves the captured position`() {
         val replacement = Playable(url = "https://cdn.example/new.mkv", title = "New")
 
