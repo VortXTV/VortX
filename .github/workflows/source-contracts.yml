@@ -6,6 +6,7 @@ on:
       - "webapp/**"
       - "scripts/test-subtitle-source-contracts.sh"
       - "scripts/test-apple-playback-recovery.sh"
+      - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-release-orchestration-contracts.sh"
       - "android/**/*.gradle.kts"
       - ".github/workflows/**"
@@ -16,6 +17,7 @@ on:
       - "webapp/**"
       - "scripts/test-subtitle-source-contracts.sh"
       - "scripts/test-apple-playback-recovery.sh"
+      - "scripts/test-apple-parity-contracts.sh"
       - "scripts/test-release-orchestration-contracts.sh"
       - "android/**/*.gradle.kts"
       - ".github/workflows/**"
@@ -36,6 +38,7 @@ jobs:
       - run: bash scripts/test-release-orchestration-contracts.sh
       - run: bash scripts/test-subtitle-source-contracts.sh
       - run: bash scripts/test-apple-playback-recovery.sh
+      - run: bash scripts/test-apple-parity-contracts.sh
   web:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

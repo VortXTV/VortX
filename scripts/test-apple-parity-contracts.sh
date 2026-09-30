@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+build_dir="$repo_root/app/build/apple-parity-contracts"
+mkdir -p "$build_dir"
+
+swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/Sources/Player/SkipSegments.swift app/Tests/AutoSkipCountdownPolicyTests.swift \
+  -o "$build_dir/auto-skip-policy"
+"$build_dir/auto-skip-policy"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/AutoSkipCountdownWiringContractTests.swift -o "$build_dir/auto-skip-wiring"
+"$build_dir/auto-skip-wiring"
+swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/TraktArtworkPolicy.swift app/SourcesShared/TraktContinueWatchingFold.swift \
+  app/Tests/TraktArtworkPolicyTests.swift -o "$build_dir/trakt-artwork"
+"$build_dir/trakt-artwork"
+swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/TopShelfSnapshot.swift app/Tests/TopShelfSnapshotTests.swift \
+  -o "$build_dir/top-shelf"
+"$build_dir/top-shelf"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/BecauseYouWatchedOwnerBoundaryContractTests.swift -o "$build_dir/watch-owner"
+"$build_dir/watch-owner" "$repo_root"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/BecauseYouWatchedAccountOwnerCallsiteContractTests.swift -o "$build_dir/watch-account"
+"$build_dir/watch-account" "$repo_root"
+swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/Sources/Player/AVNativeSubtitleOverlayBridge.swift \
+  app/Tests/AVNativeSubtitleOverlayBridgeTests.swift -o "$build_dir/native-subtitle-bridge"
+"$build_dir/native-subtitle-bridge"
+swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/Sources/Player/AVEmbeddedSubtitleBackground.swift \
+  app/Tests/AVEmbeddedSubtitleBackgroundTests.swift -o "$build_dir/native-subtitle-background"
+"$build_dir/native-subtitle-background"
+swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/Sources/Player/DVPlaybackPolicy.swift app/Sources/Player/VortXRemuxBuffer.swift \
+  app/Sources/Player/PlayerStallPolicy.swift app/Sources/Player/VortXHLSSeekAnchorState.swift \
+  app/Sources/Player/AudioLanguagePolicy.swift app/Sources/Player/MultiAudioPolicy.swift \
+  app/Sources/Player/SubtitleRenditionPolicy.swift app/Tests/PlayerLiveContractTests.swift \
+  -o "$build_dir/player-live"
+"$build_dir/player-live"

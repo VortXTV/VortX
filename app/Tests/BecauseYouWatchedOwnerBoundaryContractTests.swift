@@ -1,15 +1,15 @@
 // Standalone source contract for the Apple Because You Watched owner boundary.
 //
 // Run from repository root:
-//   swiftc -warnings-as-errors -o /tmp/because-you-watched-owner-contract \
+//   swiftc -parse-as-library -warnings-as-errors -o /tmp/because-you-watched-owner-contract \
 //     app/Tests/BecauseYouWatchedOwnerBoundaryContractTests.swift && \
 //   /tmp/because-you-watched-owner-contract .
 
 import Foundation
 
-private var failures = 0
+@MainActor private var failures = 0
 
-private func check(_ condition: Bool, _ name: String) {
+@MainActor private func check(_ condition: Bool, _ name: String) {
     if condition { print("PASS  \(name)") }
     else { failures += 1; print("FAIL  \(name)") }
 }
@@ -30,6 +30,10 @@ private func body(_ signature: String, in source: String) -> String? {
     return nil
 }
 
+@main
+@MainActor
+enum BecauseYouWatchedOwnerBoundaryContractTests {
+static func main() {
 let root = CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath
 let path = URL(fileURLWithPath: root).appendingPathComponent("app/SourcesShared/BecauseYouWatchedModel.swift")
 guard let source = try? String(contentsOf: path, encoding: .utf8) else {
@@ -62,3 +66,5 @@ if failures == 0 {
 }
 print("\(failures) TEST(S) FAILED")
 exit(1)
+}
+}
