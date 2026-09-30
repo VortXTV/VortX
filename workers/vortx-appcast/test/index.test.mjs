@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, createHmac, webcrypto } from "node:crypto";
 import { test } from "node:test";
 
@@ -638,8 +639,15 @@ test("authenticated active receipt exposes canonical Apple appcast and verified 
   const read = await worker.fetch(signedRequest("/__release/receipt", { action: "read-active-receipt" }), env);
   assert.equal(read.status, 200);
   const evidence = await read.json();
+  const responseBytes = Buffer.from(JSON.stringify(evidence));
+  const extractedAppcast = execFileSync("jq", ["-jer", ".active.appcastText"], { input: responseBytes });
+  const extractedSource = execFileSync("jq", ["-jer", ".active.sourceText"], { input: responseBytes });
   assert.equal(evidence.active.manifest.build, 253);
   assert.equal(evidence.active.manifest.android, null);
+  assert.deepEqual(extractedAppcast, Buffer.from(evidence.active.appcastText));
+  assert.deepEqual(extractedSource, Buffer.from(evidence.active.sourceText));
+  assert.equal(sha256(extractedAppcast), evidence.active.manifest.appcastSha256);
+  assert.equal(sha256(extractedSource), evidence.active.manifest.sourceSha256);
   assert.equal(JSON.parse(evidence.active.appcastText).android, null);
   assert.equal(evidence.inheritedAndroidState, "valid");
   assert.deepEqual(evidence.inheritedAndroid, JSON.parse(beta1Android.appcastText).android);

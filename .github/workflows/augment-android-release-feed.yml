@@ -164,8 +164,8 @@ jobs:
             .active.manifest.android == null and .inheritedAndroidState != "active" and
             (.inheritedAndroidState == "none" or .inheritedAndroidState == "valid")
           ' <<<"$ACTIVE_RECEIPT" >/dev/null || { echo '::error::authenticated active receipt or inherited Android evidence differs from the requested Apple-only generation'; exit 1; }
-          jq -er '.active.appcastText' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/canonical-appcast.json"
-          jq -er '.active.sourceText' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/canonical-source.json"
+          jq -jer '.active.appcastText' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/canonical-appcast.json"
+          jq -jer '.active.sourceText' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/canonical-source.json"
           [ "$(sha256sum "$RUNNER_TEMP/canonical-appcast.json" | awk '{print $1}')" = "$EXPECTED_APPCAST_SHA" ]
           [ "$(sha256sum "$RUNNER_TEMP/canonical-source.json" | awk '{print $1}')" = "$EXPECTED_SOURCE_SHA" ]
           jq -e --arg tag "$TAG" '._generatedFromTag == $tag and .android == null' "$RUNNER_TEMP/canonical-appcast.json" >/dev/null
