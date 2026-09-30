@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
 import android.media.AudioAttributes
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Lock
@@ -51,6 +53,9 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -74,7 +79,10 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.player.audio.AudioRouteMonitor
 import com.vortx.android.player.extras.KeepPlayingBackgroundSetting
-import com.vortx.android.skip.AutoSkipPolicy
+import com.vortx.android.skip.AutoSkipCountdownDecision
+import com.vortx.android.skip.AutoSkipCountdownPolicy
+import com.vortx.android.skip.AutoSkipCountdownState
+import com.vortx.android.skip.AutoSkipSegmentKey
 import com.vortx.android.skip.SegmentResolver
 import com.vortx.android.skip.SkipSegment
 import com.vortx.android.skip.SkipTimestampService
@@ -89,6 +97,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
+import kotlin.math.roundToLong
 
 /// Fullscreen player. It no longer owns a specific engine: [PlayerEngineRouter] picks the engine for
 /// this [playable] (libmpv PRIMARY, ExoPlayer for Dolby Vision / Atmos passthrough and as the fail-soft
@@ -685,6 +694,106 @@ fun PlayerScreen(
     val playerState by engine.state.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(playerState)
 
+    // Automatic skip is a position-driven, media-scoped state machine. The state is keyed by the
+    // stable title/episode identity (not the source session or URL), so a same-media source failover
+    // retains cancel/completed memory while a new episode gets a clean lifecycle. Every transport seek
+    // below goes through the local choke point, which invalidates a pending countdown before moving the
+    // playhead. The policy itself is pure and never owns a wall-clock timer.
+    val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)
+    var autoSkipCountdown by remember(autoSkipIdentity) {
+        mutableStateOf(AutoSkipCountdownState())
+    }
+    var autoSkipDecision by remember(autoSkipIdentity) {
+        mutableStateOf<AutoSkipCountdownDecision>(AutoSkipCountdownDecision.Idle)
+    }
+    var autoSkipDelaySeconds by remember(autoSkipIdentity) {
+        mutableStateOf(PlaybackBehaviorSettings.autoSkipDelaySeconds(context.applicationContext))
+    }
+    var dismissedSkipStart by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
+    var skipPillFocusedCancel by remember(playbackSessionKey) { mutableStateOf(false) }
+
+    fun publishAutoSkipCountdownState() {
+        // The policy mutates its pure state in place. Copying its sets after each mutation gives Compose
+        // a new observable value, so the prompt's remaining seconds and X visibility actually recompose.
+        autoSkipCountdown = autoSkipCountdown.copy(
+            cancelledSegments = autoSkipCountdown.cancelledSegments.toMutableSet(),
+            completedSegments = autoSkipCountdown.completedSegments.toMutableSet(),
+        )
+    }
+
+    fun invalidateAutoSkipPending(positionMs: Long = latestState.positionMs) {
+        AutoSkipCountdownPolicy.invalidatePending(autoSkipCountdown, positionMs)
+        publishAutoSkipCountdownState()
+        autoSkipDecision = AutoSkipCountdownDecision.Idle
+        skipPillFocusedCancel = false
+    }
+
+    fun seekLocalTo(positionMs: Long) {
+        invalidateAutoSkipPending(engine.state.value.positionMs)
+        engine.seekTo(positionMs)
+    }
+
+    fun seekLocalBy(deltaMs: Long) {
+        invalidateAutoSkipPending(engine.state.value.positionMs)
+        engine.seekBy(deltaMs)
+    }
+
+    fun manualSkip(segment: SkipSegment) {
+        AutoSkipCountdownPolicy.bindMedia(autoSkipCountdown, autoSkipIdentity)
+        val upperBound = latestState.durationMs.takeIf { it > 0L }
+        val target = (segment.end * 1000.0).roundToLong()
+            .coerceAtLeast(0L)
+            .let { candidate -> upperBound?.let { candidate.coerceAtMost(it) } ?: candidate }
+        // A manual action is terminal for this exact segment, but it still fences any queued automatic
+        // seek before the engine receives the viewer's target.
+        AutoSkipCountdownPolicy.complete(autoSkipCountdown, segment)
+        AutoSkipCountdownPolicy.invalidatePending(autoSkipCountdown, latestState.positionMs)
+        publishAutoSkipCountdownState()
+        autoSkipDecision = AutoSkipCountdownDecision.Idle
+        skipPillFocusedCancel = false
+        dismissedSkipStart = null
+        engine.seekTo(target)
+    }
+
+    fun cancelAutomaticSkip(segment: SkipSegment) {
+        AutoSkipCountdownPolicy.bindMedia(autoSkipCountdown, autoSkipIdentity)
+        AutoSkipCountdownPolicy.cancel(autoSkipCountdown, segment)
+        publishAutoSkipCountdownState()
+        autoSkipDecision = AutoSkipCountdownDecision.Idle
+        skipPillFocusedCancel = false
+        // The same suppression memory also protects a source failover. This extra start marker preserves
+        // the existing TV hidden-chrome affordance semantics until the next segment is entered.
+        if (isTvPlayer) dismissedSkipStart = segment.start
+    }
+
+    // Settings can change while the player remains mounted (including profile sync/restore). Keep one
+    // retained listener for the shared prefs file, refresh the delay immediately, and invalidate only the
+    // in-flight countdown; Off still leaves the manual Skip action available.
+    val autoSkipPreferences = context.applicationContext
+        .getSharedPreferences("vortx_settings", Context.MODE_PRIVATE)
+    DisposableEffect(autoSkipPreferences, autoSkipIdentity) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (
+                key == PlaybackBehaviorSettings.AUTO_SKIP_DELAY_SECONDS_KEY ||
+                    key == PlaybackBehaviorSettings.AUTO_SKIP_KEY
+            ) {
+                autoSkipDelaySeconds = PlaybackBehaviorSettings.autoSkipDelaySeconds(context.applicationContext)
+                invalidateAutoSkipPending(engine.state.value.positionMs)
+            }
+        }
+        autoSkipPreferences.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { autoSkipPreferences.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
+    // A source/session or engine replacement invalidates queued work but deliberately keeps the stable
+    // media's cancelled/completed sets. Switching is also fenced before the new source is accepted.
+    LaunchedEffect(playbackSessionKey, engine, forceExoPlayer, enginePreference) {
+        invalidateAutoSkipPending(engine.state.value.positionMs)
+    }
+    LaunchedEffect(sourceSwitchState.isSwitching) {
+        if (sourceSwitchState.isSwitching) invalidateAutoSkipPending(engine.state.value.positionMs)
+    }
+
     // DEFAULT VOLUME + MUTE applied to the live engine at load (Apple `applyPersistedVolume`): the mount
     // begins at the engine default (100%), so restore the viewer's chosen level. Keyed on the engine so a
     // source switch / fail-soft demotion (which re-mount the engine) re-applies it. Idempotent per engine.
@@ -759,11 +868,12 @@ fun PlayerScreen(
     LaunchedEffect(castState.isConnected) {
         if (castState.isConnected) {
             wasCasting = true
+            invalidateAutoSkipPending(engine.state.value.positionMs)
             playbackIntent.setBlocked(PlaybackBlocker.CAST, true)
         } else if (wasCasting) {
             wasCasting = false
             val resumeAt = castManager.lastKnownPositionMs
-            if (resumeAt > 0L) engine.seekTo(resumeAt)
+            if (resumeAt > 0L) seekLocalTo(resumeAt)
             playbackIntent.setBlocked(PlaybackBlocker.CAST, false)
         }
     }
@@ -1007,6 +1117,7 @@ fun PlayerScreen(
     var gestureHud by remember(playbackSessionKey) { mutableStateOf<PlayerGestureHud?>(null) }
     LaunchedEffect(pip.isInPip) {
         if (pip.isInPip) {
+            invalidateAutoSkipPending(engine.state.value.positionMs)
             controlsVisible = false
             gestureHud = null
         } else {
@@ -1187,7 +1298,6 @@ fun PlayerScreen(
     // TV skip-pill dismissal (Back-to-dismiss while the chrome is hidden): the `start` of the segment the
     // viewer waved off, so its pill stays hidden until the next segment. Reset per playback session and
     // cleared on a skip. Only ever set on TV (isTvPlayer); the phone leaves it null so the pill is unchanged.
-    var dismissedSkipStart by remember(playbackSessionKey) { mutableStateOf<Double?>(null) }
     LaunchedEffect(playbackSessionKey, playerState.durationMs > 0L) {
         val ref = currentPlayable.mediaRef
         val imdb = ref?.imdb
@@ -1204,19 +1314,80 @@ fun PlayerScreen(
         skipSegments = SegmentResolver.resolve(candidates, durationSec)
     }
 
-    // Keep the once-per-segment memory across same-episode source failover. A URL is source identity, not
-    // media identity; two failed sources for one episode must not cause the same intro to auto-skip twice.
-    val autoSkipIdentity = autoSkipMediaIdentity(currentPlayable)
-    val autoSkipEnabled = remember(autoSkipIdentity) {
-        PlaybackBehaviorSettings.autoSkip(context.applicationContext)
-    }
-    val autoSkippedStarts = remember(autoSkipIdentity) { mutableSetOf<Double>() }
-    LaunchedEffect(autoSkipEnabled, skipSegments, playerState.positionMs / 1000L) {
-        if (!autoSkipEnabled) return@LaunchedEffect
-        val target = AutoSkipPolicy.target(skipSegments, latestState.positionMs, autoSkippedStarts)
-            ?: return@LaunchedEffect
-        autoSkippedStarts += target.start
-        engine.seekTo((target.end * 1000).toLong())
+    // Advance only from real engine telemetry. A paused, buffering, terminal, replacing, cast, PiP,
+    // locked, errored, or exiting player cannot spend countdown time. The decision is retained as Compose
+    // state so its actual five-second (or user-selected) remaining value drives the visible prompt.
+    LaunchedEffect(
+        autoSkipIdentity,
+        autoSkipDelaySeconds,
+        skipSegments,
+        playerState.positionMs,
+        playerState.isPaused,
+        playerState.isBuffering,
+        playerState.hasEnded,
+        effectiveError,
+        sourceSwitchState.isSwitching,
+        castState.isConnected,
+        pip.isInPip,
+        controlsLocked,
+        playerExitRequested,
+        engine,
+    ) {
+        val positionMs = latestState.positionMs.coerceAtLeast(0L)
+        val activeSegment = activeSkipSegment(skipSegments, positionMs)
+        val playbackActive = playbackIntent.snapshot().shouldPlay &&
+            !latestState.isPaused &&
+            !latestState.isBuffering &&
+            !latestState.hasEnded &&
+            !effectiveError &&
+            !sourceSwitchState.isSwitching &&
+            !castState.isConnected &&
+            !pip.isInPip &&
+            !controlsLocked &&
+            !playerExitRequested
+        val expectedMedia = autoSkipIdentity
+        val expectedSession = playbackSessionKey
+        val expectedEngine = engine
+        val decision = AutoSkipCountdownPolicy.advance(
+            state = autoSkipCountdown,
+            mediaId = expectedMedia,
+            segment = activeSegment,
+            positionMs = positionMs,
+            durationMs = latestState.durationMs.takeIf { it > 0L },
+            playbackActive = playbackActive,
+            delaySeconds = autoSkipDelaySeconds.toDouble(),
+        )
+        publishAutoSkipCountdownState()
+        autoSkipDecision = decision
+
+        if (decision is AutoSkipCountdownDecision.Skip && activeSegment != null) {
+            // Re-check all ownership immediately before the seek. A source switch, user seek, engine
+            // replacement, or cast/PiP transition may have invalidated this decision since the sample.
+            val stillCurrent = autoSkipCountdown.mediaId == expectedMedia &&
+                AutoSkipCountdownPolicy.isCurrent(
+                    state = autoSkipCountdown,
+                    mediaId = expectedMedia,
+                    segment = activeSegment,
+                    epoch = decision.epoch,
+                ) &&
+                playbackSessionKey == expectedSession &&
+                builtEngine === expectedEngine &&
+                playbackIntent.snapshot().shouldPlay &&
+                !latestState.isPaused &&
+                !latestState.isBuffering &&
+                !latestState.hasEnded &&
+                !effectiveError &&
+                !sourceSwitchState.isSwitching &&
+                !castState.isConnected &&
+                !pip.isInPip &&
+                !controlsLocked &&
+                !playerExitRequested
+            if (stillCurrent) {
+                expectedEngine.seekTo(decision.targetPositionMs)
+                autoSkipDecision = AutoSkipCountdownDecision.Idle
+                skipPillFocusedCancel = false
+            }
+        }
     }
 
     // Community trickplay (shared scrub previews). Three seams, all fail-soft, all keyed per title:
@@ -1479,12 +1650,12 @@ fun PlayerScreen(
                     }
                     Key.MediaFastForward -> {
                         showControls()
-                        engine.seekBy(seekStepMs)
+                        seekLocalBy(seekStepMs)
                         return@onKeyEvent true
                     }
                     Key.MediaRewind -> {
                         showControls()
-                        engine.seekBy(-seekStepMs)
+                        seekLocalBy(-seekStepMs)
                         return@onKeyEvent true
                     }
                     else -> Unit
@@ -1510,21 +1681,35 @@ fun PlayerScreen(
                     // pill (rather than leaving the player), so the couch reaches the skip without raising the
                     // whole transport bar. The phone host passes isTvPlayer=false, so this is inert there and
                     // Back keeps its "leave the player" meaning.
-                    val posSec = latestState.positionMs / 1000.0
                     val activeSkip = if (isTvPlayer) {
-                        skipSegments.filter { posSec >= it.start && posSec < it.end }.minByOrNull { it.start }
+                        activeSkipSegment(skipSegments, latestState.positionMs)
                     } else {
                         null
                     }
-                    if (activeSkip != null && activeSkip.start != dismissedSkipStart) {
+                    val skipPillVisible = activeSkip != null &&
+                        activeSkip.start != dismissedSkipStart &&
+                        !autoSkipCountdown.isSuppressed(activeSkip)
+                    val countdownPromptVisible = skipPillVisible &&
+                        (autoSkipDecision as? AutoSkipCountdownDecision.Prompt)
+                            ?.segment == activeSkip?.let(::AutoSkipSegmentKey)
+                    if (skipPillVisible) {
                         when (event.key) {
                             Key.Back, Key.Escape -> {
-                                dismissedSkipStart = activeSkip.start
+                                cancelAutomaticSkip(activeSkip!!)
                                 return@onKeyEvent true
                             }
                             Key.Enter, Key.NumPadEnter, Key.DirectionCenter -> {
-                                engine.seekTo((activeSkip.end * 1000).toLong())
-                                dismissedSkipStart = null
+                                if (countdownPromptVisible && skipPillFocusedCancel) {
+                                    cancelAutomaticSkip(activeSkip!!)
+                                } else {
+                                    manualSkip(activeSkip!!)
+                                }
+                                return@onKeyEvent true
+                            }
+                            Key.DirectionLeft, Key.DirectionRight -> if (countdownPromptVisible) {
+                                // With a live countdown, Left/Right chooses the primary action or the
+                                // reachable X; without a countdown (Off), those keys retain seek meaning.
+                                skipPillFocusedCancel = event.key == Key.DirectionRight
                                 return@onKeyEvent true
                             }
                             else -> Unit
@@ -1538,7 +1723,7 @@ fun PlayerScreen(
                     if (event.key == Key.DirectionLeft || event.key == Key.DirectionRight) {
                         val forward = event.key == Key.DirectionRight
                         val delta = if (forward) seekStepMs else -seekStepMs
-                        engine.seekBy(delta)
+                        seekLocalBy(delta)
                         // The pill shows the predicted target; the engine clamps the real seek to the file.
                         seekNudgeTargetMs = (latestState.positionMs + delta).coerceAtLeast(0L)
                         seekNudgeTick++
@@ -1590,7 +1775,7 @@ fun PlayerScreen(
                             onDoubleTap = { offset ->
                                 val forward = offset.x >= size.width / 2
                                 // The double-tap step follows the viewer's Skip step (Apple `stremiox.seekStep`).
-                                engine.seekBy(if (forward) seekStepMs else -seekStepMs)
+                                seekLocalBy(if (forward) seekStepMs else -seekStepMs)
                                 showControls()
                             },
                         )
@@ -1610,7 +1795,7 @@ fun PlayerScreen(
                         onVolumeFraction = { setPlayerVolume((it * 100.0)) },
                         onSeekCommit = { target ->
                             showControls()
-                            engine.seekTo(target)
+                            seekLocalTo(target)
                         },
                         onHud = { gestureHud = it },
                     )
@@ -1703,8 +1888,8 @@ fun PlayerScreen(
                     currentlyPaused = latestState.isPaused || !playbackIntent.snapshot().shouldPlay,
                 )
             },
-            onSeek = { showControls(); engine.seekTo(it) },
-            onSeekBy = { showControls(); engine.seekBy(it) },
+            onSeek = { showControls(); seekLocalTo(it) },
+            onSeekBy = { showControls(); seekLocalBy(it) },
             onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
             onSelectSubtitle = {
                 showControls()
@@ -1874,17 +2059,28 @@ fun PlayerScreen(
 
         // The Skip Intro / Skip Recap / Skip Credits affordance, drawn OVER the chrome (declared last) at
         // the bottom-right, clear of the transport bar. Shows only while the playhead sits inside a
-        // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same [seekTo] the
-        // scrubber does), so it works identically on libmpv and ExoPlayer.
+        // resolved segment; a tap seeks to the segment end. Engine-agnostic (drives the same local seek
+        // fence the scrubber does), so it works identically on libmpv and ExoPlayer.
         // While locked, the skip affordance is withheld too: it is a tappable seek, exactly the class
         // of accidental input the lock exists to prevent. Withheld in PiP for the same reason the
         // chrome is: nothing in the small window is tappable by the app.
-        if (!controlsLocked && !pip.isInPip) {
+        if (
+            !controlsLocked &&
+            !pip.isInPip &&
+            !castState.isConnected &&
+            !effectiveError &&
+            !playerState.hasEnded &&
+            !sourceSwitchState.isSwitching &&
+            !playerExitRequested
+        ) {
             SkipButton(
                 segments = skipSegments,
                 positionMs = playerState.positionMs,
                 emberAccent = emberAccent,
-                onSkip = engine::seekTo,
+                decision = autoSkipDecision,
+                countdownState = autoSkipCountdown,
+                onSkip = ::manualSkip,
+                onCancel = ::cancelAutomaticSkip,
                 // TV Back-to-dismiss hides this segment's pill; null on phone leaves it always visible.
                 dismissedStart = dismissedSkipStart,
             )
@@ -2008,56 +2204,93 @@ fun PlayerScreen(
     }
 }
 
+private fun activeSkipSegment(segments: List<SkipSegment>, positionMs: Long): SkipSegment? {
+    val positionSec = positionMs.coerceAtLeast(0L) / 1000.0
+    return segments
+        .asSequence()
+        .filter { positionSec >= it.start && positionSec < it.end }
+        .minByOrNull { it.start }
+}
+
 /// The Skip Intro / Skip Recap / Skip Credits button. Renders only while the playhead is inside one of the
 /// resolved [segments]; a tap seeks to that segment's end (ms). Positioned bottom-right, above the
 /// transport bar, as ember glass matching the player's other badges. The active-segment recompute is keyed
 /// on the whole SECOND (not the raw ms position) so it re-derives at most once per second, not per frame.
+/// A live countdown gets a separate, reachable 48dp X action; Off keeps the manual Skip pill without X.
 @Composable
 private fun androidx.compose.foundation.layout.BoxScope.SkipButton(
     segments: List<SkipSegment>,
     positionMs: Long,
     emberAccent: Color,
-    onSkip: (Long) -> Unit,
+    decision: AutoSkipCountdownDecision,
+    countdownState: AutoSkipCountdownState,
+    onSkip: (SkipSegment) -> Unit,
+    onCancel: (SkipSegment) -> Unit,
     modifier: Modifier = Modifier,
     // The `start` of a segment the TV viewer dismissed with Back while the chrome was hidden; its pill stays
     // hidden until the next segment. Null (the phone default) never hides the pill.
     dismissedStart: Double? = null,
 ) {
     if (segments.isEmpty()) return
-    val positionSec = positionMs / 1000.0
-    // At most one segment applies at a time after the resolver's clamps (intro/recap sit early, credits/
-    // preview in the back half); if two overlapped, the earliest-starting wins so "Skip Intro" beats a
-    // stray late span.
-    val active = remember(segments, positionSec.toLong()) {
-        segments.filter { positionSec >= it.start && positionSec < it.end }.minByOrNull { it.start }
+    val active = remember(segments, positionMs / 1000L) {
+        activeSkipSegment(segments, positionMs)
     } ?: return
-    if (active.start == dismissedStart) return
-    // WHY audit 06.5: derive from the pill's existing whole-second tick so phone and TV count down cheaply.
-    val remainingSeconds = kotlin.math.ceil(active.end - positionSec).toInt().coerceAtLeast(1)
-    val displayLabel = "${active.label} - ${remainingSeconds}s"
+    if (active.start == dismissedStart || countdownState.isSuppressed(active)) return
+    val activeKey = AutoSkipSegmentKey(active)
+    val remainingSeconds = (decision as? AutoSkipCountdownDecision.Prompt)
+        ?.takeIf { it.segment == activeKey }
+        ?.remainingSeconds
+        ?.let { kotlin.math.ceil(it).toInt().coerceAtLeast(1) }
+    val displayLabel = remainingSeconds?.let { "${active.label} in ${it}s" } ?: active.label
 
     Row(
         modifier = modifier
             .align(Alignment.BottomEnd)
             .padding(end = 20.dp, bottom = 96.dp)
-            .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
-            .clickable { onSkip((active.end * 1000).toLong()) }
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 0.dp, vertical = 0.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Icon(
-            imageVector = Icons.Filled.SkipNext,
-            contentDescription = displayLabel,
-            tint = Color.White,
-            modifier = Modifier.size(18.dp),
-        )
-        Text(
-            text = displayLabel,
-            color = Color.White,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 14.sp,
-        )
+        Row(
+            modifier = Modifier
+                .sizeIn(minHeight = 48.dp)
+                .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+                .clickable(role = Role.Button) { onSkip(active) }
+                .semantics { contentDescription = displayLabel }
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Icon(
+                imageVector = Icons.Filled.SkipNext,
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(18.dp),
+            )
+            Text(
+                text = displayLabel,
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 14.sp,
+            )
+        }
+        if (remainingSeconds != null) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .vortxGlassProminent(shape = RoundedCornerShape(10.dp), tint = emberAccent)
+                    .clickable(role = Role.Button) { onCancel(active) }
+                    .semantics { contentDescription = "Cancel automatic ${active.label.lowercase()}" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "×",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 24.sp,
+                )
+            }
+        }
     }
 }
 

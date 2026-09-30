@@ -102,6 +102,43 @@ class AutoSkipCountdownPolicyTest {
     }
 
     @Test
+    fun `same media source rebind retains cancellation while a new episode resets it`() {
+        val state = AutoSkipCountdownState()
+        AutoSkipCountdownPolicy.advance(
+            state,
+            "episode-cancel-rebind",
+            intro,
+            5_000,
+            playbackActive = true,
+            delaySeconds = 5.0,
+        )
+        AutoSkipCountdownPolicy.cancel(state, intro)
+        AutoSkipCountdownPolicy.bindMedia(state, "episode-cancel-rebind")
+        assertEquals(
+            AutoSkipCountdownDecision.Idle,
+            AutoSkipCountdownPolicy.advance(
+                state,
+                "episode-cancel-rebind",
+                intro,
+                6_000,
+                playbackActive = true,
+                delaySeconds = 5.0,
+            ),
+        )
+        AutoSkipCountdownPolicy.bindMedia(state, "episode-cancel-new")
+        assertTrue(
+            AutoSkipCountdownPolicy.advance(
+                state,
+                "episode-cancel-new",
+                intro,
+                5_000,
+                playbackActive = true,
+                delaySeconds = 5.0,
+            ) is AutoSkipCountdownDecision.Prompt,
+        )
+    }
+
+    @Test
     fun `saved false and Off delay do not auto-skip`() {
         val state = AutoSkipCountdownState()
         assertEquals(
