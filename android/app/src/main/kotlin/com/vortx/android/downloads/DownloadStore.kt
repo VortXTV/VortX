@@ -58,7 +58,7 @@ object DownloadStore {
             ensureDownloadsDirectoryExists()
             // Only a fully decoded index proves which tombstones belong to committed removals. Missing and corrupt
             // indexes preserve every reclaim artifact for manual/forensic recovery instead of guessing it is safe.
-            if (loadLocked() is DownloadIndexHydration.Receipt.Loaded) recoverReclaimArtifactsLocked()
+            if (DownloadIndexHydration.authorizesArtifactRecovery(loadLocked())) recoverReclaimArtifactsLocked()
         }
     }
 
@@ -520,14 +520,43 @@ object DownloadStore {
         return List(array.length()) { position ->
             val row = array.optJSONObject(position)
                 ?: throw IllegalArgumentException("Download index row $position is not an object")
+            requireCanonicalHydrationFields(row, position)
             val record = recordFromJson(row)
                 ?: throw IllegalArgumentException("Download index row $position is not decodable")
+            if (!hasManagedCanonicalIdentity(record)) {
+                throw IllegalArgumentException("Download index row $position has invalid managed identity")
+            }
             if (!seenIds.add(record.id)) {
                 throw IllegalArgumentException("Download index contains duplicate id ${record.id}")
             }
             record
         }
     }
+
+    /**
+     * These are the fields every Android writer has emitted since downloads were introduced. Do not add optional
+     * capability/owner/transfer fields here: their absence is legitimate on older rows and [recordFromJson] preserves
+     * those defaults. Required identity/state fields, however, must not be guessed while recovery can delete bytes.
+     */
+    private fun requireCanonicalHydrationFields(row: JSONObject, position: Int) {
+        val required = listOf("id", "contentId", "videoId", "type", "name", "remoteURL", "localFilename", "state")
+        if (required.any { key -> row.requiredNonBlankString(key) == null }) {
+            throw IllegalArgumentException("Download index row $position is missing a required field")
+        }
+        val state = requireNotNull(row.requiredNonBlankString("state"))
+        if (DownloadState.entries.none { it.wireValue == state }) {
+            throw IllegalArgumentException("Download index row $position has invalid state")
+        }
+        if (row.requiredNonBlankString("type") !in setOf("movie", "series")) {
+            throw IllegalArgumentException("Download index row $position has invalid type")
+        }
+    }
+
+    private fun hasManagedCanonicalIdentity(record: DownloadRecord): Boolean =
+        managedMediaFilename.matches(record.localFilename) && record.localFilename.startsWith("${record.id}.")
+
+    private fun JSONObject.requiredNonBlankString(key: String): String? =
+        (opt(key) as? String)?.takeIf { it.isNotBlank() }
 
     /** `optString` returns "" for an absent key, which would turn a null poster/error into an empty string. */
     private fun JSONObject.optStringOrNull(key: String): String? =

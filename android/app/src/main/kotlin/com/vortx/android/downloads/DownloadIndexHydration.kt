@@ -19,6 +19,9 @@ internal object DownloadIndexHydration {
         data class Loaded<T>(val value: T) : Receipt<T>()
     }
 
+    /** Only a complete, successfully decoded index may decide that a reclaim artifact is committed residue. */
+    fun authorizesArtifactRecovery(receipt: Receipt<*>): Boolean = receipt is Receipt.Loaded<*>
+
     fun <T> read(indexFile: File, readAndDecode: (File) -> T): Receipt<T> {
         if (!indexFile.exists()) return Receipt.Missing
         if (!indexFile.isFile) return Receipt.Unreadable

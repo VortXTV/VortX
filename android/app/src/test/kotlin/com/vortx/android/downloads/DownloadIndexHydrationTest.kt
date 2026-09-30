@@ -7,6 +7,7 @@ import java.nio.file.StandardCopyOption
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -98,7 +99,7 @@ class DownloadIndexHydrationTest {
     @Test
     fun `valid JSON with an undecodable row is unreadable rather than silently shrunk`() = inTemporaryDirectory { directory ->
         val index = File(directory, "index.json").apply {
-            writeText(JSONArray().put(validRow("one")).put(JSONObject().put("id", "   ")).toString())
+            writeText(JSONArray().put(validRow()).put(JSONObject().put("id", "   ")).toString())
         }
 
         assertEquals(
@@ -110,7 +111,7 @@ class DownloadIndexHydrationTest {
     @Test
     fun `valid JSON with duplicate record ids is unreadable rather than silently coalesced`() = inTemporaryDirectory { directory ->
         val index = File(directory, "index.json").apply {
-            writeText(JSONArray().put(validRow("same")).put(validRow("same")).toString())
+            writeText(JSONArray().put(validRow()).put(validRow()).toString())
         }
 
         assertEquals(
@@ -120,13 +121,42 @@ class DownloadIndexHydrationTest {
     }
 
     @Test
-    fun `complete legacy row remains decodable with absent newer fields`() {
-        val legacy = DownloadStore.decodeIndexRecords(JSONArray().put(validRow("legacy")).toString()).single()
+    fun `complete legacy schema row remains decodable with absent newer fields`() {
+        val legacy = DownloadStore.decodeIndexRecords(JSONArray().put(validRow()).toString()).single()
 
-        assertEquals("legacy", legacy.id)
+        assertEquals(ID_A, legacy.id)
         assertNull(legacy.isDolbyVision)
         assertNull(legacy.isAtmos)
         assertNull(legacy.transferGeneration)
+    }
+
+    @Test
+    fun `missing or invalid canonical fields make index unreadable and preserve reclaim artifact`() {
+        val badRows = listOf<(JSONObject) -> Unit>(
+            { it.remove("localFilename") },
+            { it.put("localFilename", "$ID_B.mkv") },
+            { it.put("localFilename", "$ID_A.txt") },
+            { it.remove("state") },
+            { it.put("state", "finished") },
+            { it.remove("contentId") },
+            { it.remove("videoId") },
+            { it.remove("name") },
+            { it.remove("remoteURL") },
+            { it.put("type", "other") },
+        )
+
+        badRows.forEach { corrupt -> inTemporaryDirectory { directory ->
+            val index = File(directory, "index.json")
+            val tombstone = File(directory, "$ID_A.mkv.reclaiming").apply { writeText("recoverable bytes") }
+            val row = validRow().also(corrupt)
+            index.writeText(JSONArray().put(row).toString())
+
+            val receipt = readAtomicRecords(index)
+
+            assertEquals(DownloadIndexHydration.Receipt.Unreadable, receipt)
+            assertFalse(DownloadIndexHydration.authorizesArtifactRecovery(receipt))
+            assertTrue("an unreadable index must retain the only recoverable media copy", tombstone.isFile)
+        } }
     }
 
     private fun readAtomicRecords(index: File): DownloadIndexHydration.Receipt<List<com.vortx.android.model.DownloadRecord>> =
@@ -136,7 +166,7 @@ class DownloadIndexHydrationTest {
             decode = DownloadStore::decodeIndexRecords,
         )
 
-    private fun validRow(id: String): JSONObject = JSONObject().apply {
+    private fun validRow(id: String = ID_A): JSONObject = JSONObject().apply {
         put("id", id)
         put("contentId", "content-$id")
         put("videoId", "video-$id")
@@ -150,5 +180,10 @@ class DownloadIndexHydrationTest {
     private fun inTemporaryDirectory(block: (File) -> Unit) {
         val directory = Files.createTempDirectory("vortx-download-index").toFile()
         block(directory)
+    }
+
+    private companion object {
+        const val ID_A = "11111111-1111-1111-1111-111111111111"
+        const val ID_B = "22222222-2222-2222-2222-222222222222"
     }
 }
