@@ -156,6 +156,25 @@ final class BecauseYouWatchedModel: ObservableObject {
         items.map(watchFingerprint).joined(separator: "\u{1}")
     }
 
+    /// Build the non-secret ownership key used by Apple Home call sites. `StremioAccount` intentionally
+    /// does not republish `isSignedIn` for a true-to-true replacement, so its published email assignment
+    /// is included as a stable identity hint until the engine's settled uid/binding is available. No auth
+    /// token or credential material belongs in this key.
+    static func recommendationOwnerKey(
+        profileKeychainAccount: String,
+        isSignedIn: Bool,
+        usesEngineHistory: Bool,
+        accountEmail: String?,
+        principal: String?,
+        authorityGeneration: UInt64?
+    ) -> String {
+        let email = accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "-"
+        let principal = principal?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "-"
+        let generation = authorityGeneration.map(String.init) ?? "-"
+        return [profileKeychainAccount, String(isSignedIn), String(usesEngineHistory), email,
+                principal, generation].joined(separator: "|")
+    }
+
     /// Build the rail straight from raw CW + library (used by HomeCollectionGroups' nested-group path).
     /// Resolver/recommendation failures remain fail-soft and return nil.
     static func build(cw: [CoreCWItem], library: [CoreCWItem]) async -> CuratedCollection? {

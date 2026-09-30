@@ -1215,6 +1215,10 @@ struct iOSHomeView: View {
         // once they arrive (same input set as the notification sweep).
         .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
         .onChange(of: account.isSignedIn) { _ in refreshTopPicks() }
+        .onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }
+        // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
+        // replacement. Email is published by the successful sign-in path, so observe that event directly.
+        .onReceive(account.$email) { _ in refreshTopPicks() }
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
@@ -1409,6 +1413,21 @@ struct iOSHomeView: View {
         path.append(FeaturedHeroItem.from(rail: item))
     }
 
+    /// Non-secret account identity for personalized rails. The email publisher catches a Stremio
+    /// same-slot replacement even when `isSignedIn` remains true; the engine uid/binding generation
+    /// becomes authoritative once its account context settles.
+    private var becauseYouWatchedOwnerKey: String {
+        let binding = core.settledActiveAccountBinding()
+        return BecauseYouWatchedModel.recommendationOwnerKey(
+            profileKeychainAccount: profiles.activeKeychainAccount,
+            isSignedIn: account.isSignedIn,
+            usesEngineHistory: profiles.activeUsesEngineHistory,
+            accountEmail: account.email,
+            principal: binding?.uid ?? core.currentUID(),
+            authorityGeneration: binding?.generation
+        )
+    }
+
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
@@ -1419,7 +1438,7 @@ struct iOSHomeView: View {
             profileID: profiles.activeID,
             cw: cw,
             library: library,
-            ownerKey: "\(profiles.activeKeychainAccount)|\(account.isSignedIn)|\(profiles.activeUsesEngineHistory)",
+            ownerKey: becauseYouWatchedOwnerKey,
         )   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
         simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds

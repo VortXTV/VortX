@@ -47,6 +47,21 @@ struct HomeView: View {
         profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
     }
 
+    /// Non-secret account identity for personalized rails. The email publisher catches a Stremio
+    /// same-slot replacement even when `isSignedIn` remains true; the engine uid/binding generation
+    /// becomes authoritative once its account context settles.
+    private var becauseYouWatchedOwnerKey: String {
+        let binding = core.settledActiveAccountBinding()
+        return BecauseYouWatchedModel.recommendationOwnerKey(
+            profileKeychainAccount: profiles.activeKeychainAccount,
+            isSignedIn: account.isSignedIn,
+            usesEngineHistory: profiles.activeUsesEngineHistory,
+            accountEmail: account.email,
+            principal: binding?.uid ?? core.currentUID(),
+            authorityGeneration: binding?.generation
+        )
+    }
+
     var body: some View {
         homeChangeHandlers
     }
@@ -196,6 +211,10 @@ struct HomeView: View {
         .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
         .onChange(of: account.addons.count) { refreshReleaseCalendar() }
         .onChange(of: account.isSignedIn) { _ in refreshTopPicks() }
+        .onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }
+        // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
+        // replacement. Email is published by the successful sign-in path, so observe that event directly.
+        .onReceive(account.$email) { _ in refreshTopPicks() }
         .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
         // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
         // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
@@ -217,7 +236,7 @@ struct HomeView: View {
             profileID: profiles.activeID,
             cw: localHistory,
             library: libraryItems,
-            ownerKey: "\(profiles.activeKeychainAccount)|\(account.isSignedIn)|\(profiles.activeUsesEngineHistory)",
+            ownerKey: becauseYouWatchedOwnerKey,
         )   // "Because you watched <title>" rail; no-ops on an unchanged seed set
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
         simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
