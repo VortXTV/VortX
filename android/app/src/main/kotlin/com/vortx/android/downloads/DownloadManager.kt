@@ -164,11 +164,14 @@ object DownloadManager {
         context.applicationContext.getSharedPreferences(SHARED_SETTINGS_FILE, Context.MODE_PRIVATE)
 
     /** Whether watched downloads should be auto-deleted (SET-11). Synced, default OFF. */
-    fun isAutoDeleteWatchedEnabled(context: Context): Boolean =
+    fun isAutoDeleteWatchedEnabled(context: Context): Boolean = synchronized(lock) {
         sharedSettings(context).getBoolean(AUTO_DELETE_WATCHED_KEY, false)
+    }
 
     fun setAutoDeleteWatchedEnabled(context: Context, enabled: Boolean) {
-        sharedSettings(context).edit().putBoolean(AUTO_DELETE_WATCHED_KEY, enabled).apply()
+        DownloadAutoDeleteWatchedAdmission.setEnabled(lock, enabled) {
+            sharedSettings(context).edit().putBoolean(AUTO_DELETE_WATCHED_KEY, it).apply()
+        }
     }
 
     @Volatile
@@ -427,17 +430,20 @@ object DownloadManager {
     fun reclaimWatchedDownloadAfterDurableWatchAndDecoderRelease(
         context: Context,
         request: WatchedDownloadReclaimRequest,
-    ): WatchedDownloadReclaimResult = synchronized(lock) {
-        if (!isAutoDeleteWatchedEnabled(context)) return@synchronized WatchedDownloadReclaimResult.DISABLED
+    ): WatchedDownloadReclaimResult = DownloadAutoDeleteWatchedAdmission.admit(
+        lock = lock,
+        isEnabled = { sharedSettings(context).getBoolean(AUTO_DELETE_WATCHED_KEY, false) },
+        disabled = { WatchedDownloadReclaimResult.DISABLED },
+    ) {
         if (request.owner.profileId.isBlank() || !request.localFileUri.startsWith("file:")) {
-            return@synchronized WatchedDownloadReclaimResult.INVALID_REQUEST
+            return@admit WatchedDownloadReclaimResult.INVALID_REQUEST
         }
         val record = DownloadWatchedReclaimPolicy.matchingCompletedRecord(
             enabled = true,
             request = request,
             records = DownloadStore.records.value,
             hasMatchingManagedFile = { candidate -> DownloadStore.matchesManagedFileUri(candidate, request.localFileUri) },
-        ) ?: return@synchronized WatchedDownloadReclaimResult.NO_MATCHING_COMPLETED_DOWNLOAD
+        ) ?: return@admit WatchedDownloadReclaimResult.NO_MATCHING_COMPLETED_DOWNLOAD
 
         val result = DownloadStore.removeCompletedForWatchedReclaim(record)
         if (result == WatchedDownloadReclaimResult.RECLAIMED) pruneQueueOrder()

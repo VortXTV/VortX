@@ -72,7 +72,7 @@ object DownloadStore {
      */
     fun downloadsDirectory(): File {
         val context = requireNotNull(appContext) { "DownloadStore.init(context) must run before any file access" }
-        return File(context.filesDir, "Downloads")
+        return DownloadDirectoryPolicy.trustedDownloadsDirectory(context.filesDir)
     }
 
     private fun indexFile(): File = File(downloadsDirectory(), "index.json")
@@ -112,6 +112,10 @@ object DownloadStore {
         if (!dir.exists() && !dir.mkdirs() && !dir.isDirectory) {
             throw java.io.IOException("Could not create Downloads directory at ${dir.absolutePath}")
         }
+        // Re-check after mkdir: canonical validation must guard the root itself, not just filenames below it.
+        if (!dir.isDirectory || dir.canonicalFile != dir) {
+            throw java.io.IOException("Downloads directory is redirected outside app files storage")
+        }
     }
 
     /**
@@ -124,8 +128,11 @@ object DownloadStore {
 
     private fun loadLocked(): DownloadIndexHydration.Receipt<List<DownloadRecord>> {
         val file = indexFile()
-        return DownloadIndexHydration.read(file) { index ->
-            val array = JSONArray(index.readText())
+        return DownloadIndexHydration.readAtomically(
+            indexFile = file,
+            openRead = { AtomicFile(file).openRead() },
+        ) { index ->
+            val array = JSONArray(index)
             (0 until array.length()).mapNotNull { i -> recordFromJson(array.optJSONObject(i) ?: return@mapNotNull null) }
         }.also { receipt ->
             if (receipt is DownloadIndexHydration.Receipt.Loaded) {
