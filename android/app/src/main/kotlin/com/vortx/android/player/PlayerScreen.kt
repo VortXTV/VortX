@@ -1197,7 +1197,6 @@ fun PlayerScreen(
     var addonSubtitles by remember(playbackSessionKey) { mutableStateOf<List<AddonSubtitle>>(emptyList()) }
     val mountedAddonSubs = remember(playbackSessionKey, engine) { mutableSetOf<String>() }
     var pendingSubSelectAbove by remember(playbackSessionKey, engine) { mutableStateOf<Int?>(null) }
-    var userPickedSubtitle by remember(playbackSessionKey) { mutableStateOf(false) }
     fun mountAddonSubtitle(sub: AddonSubtitle) {
         if (mountedAddonSubs.add(sub.url)) {
             pendingSubSelectAbove = latestState.subtitleTracks.size
@@ -1232,11 +1231,10 @@ fun PlayerScreen(
         }
     }
 
-    // Preference-driven auto track selection (the Android port of Apple TrackSelector): once the engine
-    // reports its track list, pick the audio + subtitle track per the persisted TrackPreferences, exactly
-    // ONCE per load. This closes the "manual select only" parity gap. A nil audio pick leaves the engine's
-    // own default; a -1 subtitle pick means "off". Runs after the engine's own default selection, so it
-    // overrides toward the user's language chain (e.g. a Turkish-only preference beats a French dub, #76).
+    // Preference-driven auto track selection (the Android port of Apple TrackSelector). Audio and subtitle
+    // inventories can arrive independently, so each type gets one default decision once *its own*
+    // selectable inventory appears. A viewer's manual or external subtitle pick holds that type until this
+    // loaded engine is replaced; a late inventory must not clobber manual Off or a selected add-on track.
     val trackPreferences = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).current
     }
@@ -1245,12 +1243,15 @@ fun PlayerScreen(
     val matchAudioSub = remember(playbackSessionKey) {
         TrackPreferencesStore(context, PerformanceMode.isConstrainedDevice(context)).matchAudioSub
     }
-    var autoSelectDone by remember(playbackSessionKey, engine) { mutableStateOf(false) }
-    LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks) {
-        if (autoSelectDone) return@LaunchedEffect
+    var trackSelectionPhases by remember(playbackSessionKey, engine) { mutableStateOf(TrackSelectionPhases()) }
+    LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, playerState.subtitleTracks, trackSelectionPhases) {
         val audioTracks = latestState.audioTracks
         val subtitleTracks = latestState.subtitleTracks
-        if (audioTracks.isEmpty() && subtitleTracks.isEmpty()) return@LaunchedEffect
+        val defaults = trackSelectionPhases.automaticDefaults(
+            hasSelectableAudio = audioTracks.isNotEmpty(),
+            hasSelectableSubtitle = subtitleTracks.isNotEmpty(),
+        )
+        if (defaults.isEmpty) return@LaunchedEffect
         val pick = TrackSelector.select(audioTracks, subtitleTracks, trackPreferences, matchAudioSub)
         // Fidelity refinement: among same-language audio tracks, honour the channel layout the active
         // output route can render, the tie-break Apple's picker cannot make (TrackSelector.swift documents
@@ -1261,25 +1262,30 @@ fun PlayerScreen(
             trackPreferences.rejectTerms,
             com.vortx.android.player.audio.AudioRoute.current(context),
         )
-        audioId?.let { engine.selectAudioTrack(it) }
-        val subId = pick.subtitleId
-        if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
-        autoSelectDone = true
+        if (defaults.selectAudio) audioId?.let { engine.selectAudioTrack(it) }
+        if (defaults.selectSubtitle) {
+            val subId = pick.subtitleId
+            if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
+        }
+        trackSelectionPhases = trackSelectionPhases.apply(defaults)
     }
 
-    var autoAddonSubtitleTried by remember(playbackSessionKey, engine) { mutableStateOf(false) }
     val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
-    LaunchedEffect(playbackSessionKey, engine, autoSelectDone, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
-        if (!autoSelectDone || autoAddonSubtitleTried || userPickedSubtitle || addonSubtitles.isEmpty()) return@LaunchedEffect
+    LaunchedEffect(playbackSessionKey, engine, trackSelectionPhases, addonSubtitles, playerState.audioTracks, playerState.subtitleTracks) {
+        if (addonSubtitles.isEmpty() || !trackSelectionPhases.mayAttemptAddon(latestState.subtitleTracks.isNotEmpty())) {
+            return@LaunchedEffect
+        }
         if (!TrackSelector.wantsExternalSubtitle(latestState.audioTracks, latestState.subtitleTracks,
                 trackPreferences, preferAddonSubtitles, matchAudioSub)) {
-            autoAddonSubtitleTried = true
+            trackSelectionPhases = trackSelectionPhases.recordAddonAttempt()
             return@LaunchedEffect
         }
         val sub = trackPreferences.subtitleLanguages.asSequence().mapNotNull { language ->
             addonSubtitles.firstOrNull { TrackSelector.matches(it.lang, language) }
         }.firstOrNull() ?: return@LaunchedEffect
-        autoAddonSubtitleTried = true
+        // Reserve before mounting: the engine publishes a new inventory for the sidecar, which recomposes
+        // this effect. The reservation prevents a second automatic overlay for the same loaded engine.
+        trackSelectionPhases = trackSelectionPhases.recordAddonSelection()
         mountAddonSubtitle(sub)
     }
 
@@ -1890,10 +1896,14 @@ fun PlayerScreen(
             },
             onSeek = { showControls(); seekLocalTo(it) },
             onSeekBy = { showControls(); seekLocalBy(it) },
-            onSelectAudio = { showControls(); engine.selectAudioTrack(it) },
+            onSelectAudio = {
+                showControls()
+                trackSelectionPhases = trackSelectionPhases.holdAudio()
+                engine.selectAudioTrack(it)
+            },
             onSelectSubtitle = {
                 showControls()
-                userPickedSubtitle = true
+                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 pendingSubSelectAbove = null
                 engine.selectSubtitleTrack(it)
             },
@@ -1981,7 +1991,7 @@ fun PlayerScreen(
             addonSubtitles = addonSubtitles,
             onSelectAddonSubtitle = { sub ->
                 showControls()
-                userPickedSubtitle = true
+                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 mountAddonSubtitle(sub)
             },
             // Secondary (dual) subtitles: mpv-only; the ids are re-read from the live engine on each
@@ -1991,7 +2001,7 @@ fun PlayerScreen(
             secondarySubtitleId = engine.secondarySubtitleId,
             onSelectSecondarySubtitle = { id ->
                 showControls()
-                userPickedSubtitle = true
+                trackSelectionPhases = trackSelectionPhases.holdSubtitle()
                 pendingSubSelectAbove = null
                 engine.setSecondarySubtitleTrack(id)
             },
