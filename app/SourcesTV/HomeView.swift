@@ -58,7 +58,8 @@ struct HomeView: View {
             usesEngineHistory: profiles.activeUsesEngineHistory,
             accountEmail: account.email,
             principal: binding?.uid,
-            authorityGeneration: binding?.generation
+            authorityGeneration: binding?.generation,
+            credentialBoundaryGeneration: account.credentialBoundaryGeneration
         )
     }
 
@@ -230,6 +231,10 @@ struct HomeView: View {
         // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
         // replacement. Email is published by the successful sign-in path, so observe that event directly.
         .onReceive(account.$email) { _ in refreshTopPicks() }
+        // A same-slot credential replacement can retain the same email and isSignedIn=true. The
+        // non-secret account-boundary generation is published by StremioAccount and is the refresh edge
+        // for that replacement; CoreBridge rotates its settled binding before a history receipt is accepted.
+        .onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }
         .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
         // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
         // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
@@ -255,7 +260,11 @@ struct HomeView: View {
                   owner.profileID == profiles.activeID,
                   owner.keychainAccount == activeKeychainAccount else {
                 topPicks.clear()
-                becauseYouWatched.clear()
+                becauseYouWatched.retireForUnsettledHistory(
+                    profileID: profiles.activeID,
+                    ownerKey: becauseYouWatchedOwnerKey,
+                    historySnapshot: historySnapshot
+                )
                 return
             }
         }

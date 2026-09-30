@@ -183,11 +183,20 @@ extension PlaybackMutationTarget {
 /// chosen stream addon. The token + addon URLs (which carry debrid keys) stay on-device only.
 @MainActor
 final class StremioAccount: ObservableObject {
+    /// Posted after a successful credential replacement. The notification carries only a process-local
+    /// monotonic generation and whether the account was already signed in; it never carries the auth key,
+    /// email, or any other credential material. CoreBridge uses the true-to-true case to rotate its
+    /// settled binding because SwiftUI's `isSignedIn` publisher intentionally suppresses true -> true.
+    nonisolated static let credentialBoundaryDidChange = Notification.Name("StremioAccount.credentialBoundaryDidChange")
+
     @Published var isSignedIn = false
     @Published var email: String?                       // shown on the Settings/Account screen
     @Published var streamSources: [StreamSource] = []   // stream addons (base + name), for tagging/filtering
     @Published var addons: [AddonDescriptor] = []       // for the Addons screen
     @Published var signInError: String?
+    /// Non-secret account-boundary revision for same-slot replacements. This is deliberately separate from
+    /// `isSignedIn`, whose true -> true assignment is suppressed to avoid re-entrant login observers.
+    @Published private(set) var credentialBoundaryGeneration: UInt64 = 0
 
     /// Convenience: just the stream-addon base URLs (count shown in Settings, etc.).
     var streamAddonBases: [String] { streamSources.map(\.base) }
@@ -260,7 +269,11 @@ final class StremioAccount: ObservableObject {
                 log.error("signIn failed: \(msg, privacy: .public)")
                 return
             }
+            let wasSignedIn = isSignedIn
             authKey = key
+            publishCredentialBoundary(wasSignedIn: wasSignedIn)
+            // Publish the credential boundary before the email publisher so CoreBridge can rotate its
+            // settled binding before Home performs its account-bound recommendation refresh.
             setEmail(res.result?.user?.email ?? email)
             if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
             log.info("signed in ok")
@@ -275,7 +288,9 @@ final class StremioAccount: ObservableObject {
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { signInError = "Sign-in failed."; return }
         signInError = nil
+        let wasSignedIn = isSignedIn
         authKey = token
+        publishCredentialBoundary(wasSignedIn: wasSignedIn)
         await backfillEmail()
         if !isSignedIn { isSignedIn = true }   // guard the @Published write so true->true can't re-fire observers
         log.info("signed in with link ok")
@@ -296,6 +311,22 @@ final class StremioAccount: ObservableObject {
         } else {
             UserDefaults.standard.setValue(value, forKey: emailKey)
         }
+    }
+
+    private func publishCredentialBoundary(wasSignedIn: Bool) {
+        // Dispatch the CoreBridge rebind notification before publishing the SwiftUI-visible revision.
+        // Home may refresh from either surface, so this ordering guarantees the rebind has at least
+        // started before any owner-key change can reach the recommendation model.
+        let generation = credentialBoundaryGeneration &+ 1
+        NotificationCenter.default.post(
+            name: Self.credentialBoundaryDidChange,
+            object: nil,
+            userInfo: [
+                "generation": generation,
+                "wasSignedIn": wasSignedIn
+            ]
+        )
+        credentialBoundaryGeneration = generation
     }
 
     func loadAddons() async {

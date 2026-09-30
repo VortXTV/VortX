@@ -1,118 +1,19 @@
 // Deterministic policy proof for the Apple Home recommendation owner boundary.
 //
 // Run from repository root:
-//   swiftc -parse-as-library -warnings-as-errors -o /tmp/because-you-watched-history-policy \
+//   swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+//     -o /tmp/because-you-watched-history-policy \
+//     app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift \
 //     app/Tests/BecauseYouWatchedHistoryPolicyContractTests.swift && \
 //   /tmp/because-you-watched-history-policy .
 
 import Foundation
 
-private struct Owner: Equatable {
-    let profileID: UUID
-    let keychainAccount: String
-    let uid: String
-    let generation: UInt64
-}
-
-private struct Snapshot {
-    let owner: Owner?
-    let revision: Int
-    let changedFields: Set<String>
-}
-
-/// A tiny deterministic stand-in for the model's owner/revision latch. It intentionally records both
-/// network launches and a generation-fenced delayed completion so this test proves behavior, not only
-/// source spelling. The production policy is source-checked below because the full Home model also owns
-/// SwiftUI, TMDB, and Core model dependencies.
-private struct RecommendationHarness {
-    private(set) var rail: [String] = ["A-recommendation"]
-    private(set) var networkLaunches = 0
-    private(set) var generation: UInt64 = 1
-    private var owner: Owner?
-    private var ownerKey: String?
-    private var baselineRevision: Int?
-    private var ready = false
-    private var requiresNewBinding = false
-
-    mutating func refresh(
-        usesEngineHistory: Bool,
-        activeProfileID: UUID?,
-        activeKeychainAccount: String,
-        ownerKey: String,
-        snapshot: Snapshot?,
-        seeds: [String]
-    ) -> UInt64? {
-        let ownerChanged = self.ownerKey != ownerKey
-        if ownerChanged {
-            let previousOwner = owner
-            let previousOwnerKey = self.ownerKey
-            let ownerChangedWithFreshHistory = usesEngineHistory
-                && previousOwner != nil
-                && snapshot?.owner != nil
-                && previousOwner != snapshot?.owner
-                && !(snapshot?.changedFields.isDisjoint(with: ["library", "continue_watching_preview"]) ?? true)
-            let requiresNewBinding = usesEngineHistory
-                && previousOwner != nil
-                && previousOwner == snapshot?.owner
-                && previousOwnerKey != ownerKey
-            generation &+= 1
-            owner = snapshot?.owner
-            self.ownerKey = ownerKey
-            baselineRevision = snapshot?.revision
-            ready = ownerChangedWithFreshHistory
-            rail = []
-            self.requiresNewBinding = requiresNewBinding
-        }
-
-        if !usesEngineHistory {
-            ready = true
-        } else {
-            if requiresNewBinding {
-                guard let snapshotOwner = snapshot?.owner,
-                      snapshotOwner != owner else {
-                    ready = false
-                    rail = []
-                    return nil
-                }
-                owner = snapshotOwner
-                self.requiresNewBinding = false
-            }
-            guard let snapshot, let owner = snapshot.owner,
-                  owner.profileID == activeProfileID,
-                  owner.keychainAccount == activeKeychainAccount else {
-                ready = false
-                rail = []
-                return nil
-            }
-            if !ready,
-               let baselineRevision,
-               snapshot.revision > baselineRevision,
-               !snapshot.changedFields.isDisjoint(with: ["library", "continue_watching_preview"]) {
-                ready = true
-            }
-            guard ready else {
-                rail = []
-                return nil
-            }
-        }
-
-        guard !seeds.isEmpty else {
-            rail = []
-            return nil
-        }
-        networkLaunches += 1
-        rail = ["fresh-recommendation"]
-        return generation
-    }
-
-    mutating func complete(generation completedGeneration: UInt64, cards: [String]) {
-        guard completedGeneration == generation else { return }
-        rail = cards
-    }
-}
-
 @main
+@MainActor
 private struct BecauseYouWatchedHistoryPolicyContractTests {
+    private typealias Policy = BecauseYouWatchedHistoryPolicy
+    private typealias Admission = BecauseYouWatchedHistoryAdmission
     private static var failures = 0
 
     private static func check(_ condition: Bool, _ name: String) {
@@ -125,37 +26,47 @@ private struct BecauseYouWatchedHistoryPolicyContractTests {
         return try? String(contentsOf: path, encoding: .utf8)
     }
 
+    private static func snapshot(
+        _ owner: Policy.Owner?,
+        revision: Int,
+        changedFields: Set<String> = []
+    ) -> Policy.Snapshot {
+        .init(owner: owner, revision: revision, changedFields: changedFields)
+    }
+
     static func main() {
         let root = CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath
-        guard let model = read(root, "app/SourcesShared/BecauseYouWatchedModel.swift"),
+        guard let policySource = read(root, "app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift"),
+              let model = read(root, "app/SourcesShared/BecauseYouWatchedModel.swift"),
               let tv = read(root, "app/SourcesTV/HomeView.swift"),
               let ios = read(root, "app/SourcesiOS/iOSRootView.swift") else {
             print("FAIL  could not read Apple recommendation sources")
             exit(1)
         }
 
-        check(model.contains("enum BecauseYouWatchedHistoryPolicy") &&
-                model.contains("case awaitingHistorySnapshot") &&
-                model.contains("snapshot.revision > minimumRevision") &&
-                model.contains("historyFields"),
-              "production policy requires a post-boundary published history revision")
-        check(model.contains("historyInputReady = false") &&
-                model.contains("historyRequiresNewBinding") &&
-                model.contains("snapshotOwner != historyOwner") &&
-                model.contains("ownerChangedWithFreshHistory") &&
-                model.contains("loadTask?.cancel()") &&
-                model.contains("rail = nil"),
-              "unsettled engine input retires the rail and cancels recommendation work")
+        check(policySource.contains("enum BecauseYouWatchedHistoryPolicy") &&
+                policySource.contains("struct BecauseYouWatchedHistoryAdmission") &&
+                policySource.contains("acceptsFirstCurrentOwnerReceipt") &&
+                policySource.contains("retireForUnsettledHistory"),
+              "production policy and owner/revision admission state are Foundation-only and reusable")
+        check(model.contains("historyAdmission.evaluate") &&
+                model.contains("historyInputReady = historyAdmission.isReady") &&
+                model.contains("historyAdmission.isCurrent(admissionGeneration)") &&
+                model.contains("retireRecommendationWork()") &&
+                model.contains("func retireForUnsettledHistory"),
+              "BecauseYouWatchedModel consumes the production admission state")
+
         for (name, source) in [("tvOS", tv), ("iOS", ios)] {
             check(source.contains("BecauseYouWatchedHistoryPolicy.Snapshot"),
                   "\(name) Home carries a settled-owner history snapshot")
             check(source.contains("owner.profileID == profiles.activeID") &&
                     source.contains("owner.keychainAccount == activeKeychainAccount") &&
-                    source.contains("becauseYouWatched.clear()"),
-                  "\(name) Home clears and returns while the engine owner is unsettled")
+                    source.contains("becauseYouWatched.retireForUnsettledHistory"),
+                  "\(name) Home preserves the admission boundary while engine ownership is unsettled")
             check(source.contains("historySnapshot: historySnapshot") &&
-                    source.contains("if becauseYouWatched.historyInputReady"),
-                  "\(name) Home gates recommendation consumers on the same history proof")
+                    source.contains("if becauseYouWatched.historyInputReady") &&
+                    source.contains("account.$credentialBoundaryGeneration"),
+                  "\(name) Home gates consumers and observes same-slot account boundaries")
         }
         check(ios.contains(".onChange(of: core.revision) { _ in") &&
                 ios.contains("core.changedFields.contains(\"continue_watching_preview\")"),
@@ -163,100 +74,123 @@ private struct BecauseYouWatchedHistoryPolicyContractTests {
 
         let profileA = UUID()
         let profileB = UUID()
-        let ownerA = Owner(profileID: profileA, keychainAccount: "stremiox.auth",
-                           uid: "A-uid", generation: 10)
-        let ownerB = Owner(profileID: profileB, keychainAccount: "stremiox.auth",
-                           uid: "B-uid", generation: 11)
+        let ownerA = Policy.Owner(profileID: profileA, keychainAccount: "stremiox.auth",
+                                  uid: "A-uid", generation: 10)
+        let ownerB = Policy.Owner(profileID: profileB, keychainAccount: "stremiox.auth",
+                                  uid: "B-uid", generation: 11)
+        let ownerBForSameSlot = Policy.Owner(profileID: profileA, keychainAccount: "stremiox.auth",
+                                             uid: "B-uid", generation: 11)
         let history = Set(["library"])
-        var harness = RecommendationHarness()
 
-        // Establish an A rail, then replace it with B's email while the binding is nil. The old A UID
-        // is deliberately absent from the snapshot, so no seed/network work may cross that gap.
-        _ = harness.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                            activeKeychainAccount: "stremiox.auth",
-                            ownerKey: "account-a",
-                            snapshot: Snapshot(owner: ownerA, revision: 100, changedFields: []),
-                            seeds: ["ttA"])
-        let aLaunch = harness.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                                      activeKeychainAccount: "stremiox.auth",
-                                      ownerKey: "account-a",
-                                      snapshot: Snapshot(owner: ownerA, revision: 101, changedFields: history),
-                                      seeds: ["ttA"])
-        check(harness.networkLaunches == 1 && !harness.rail.isEmpty,
+        // Initial Home appearance: a current owner plus its first history receipt is immediately usable;
+        // an unrelated second engine event is not required.
+        var initial = Admission()
+        let initialDecision = initial.evaluate(
+            usesEngineHistory: true, activeProfileID: profileB,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-binding",
+            snapshot: snapshot(ownerB, revision: 10, changedFields: history)
+        )
+        check(initialDecision == .readyEngine && initial.isReady,
+              "initial exact owner plus first history receipt is immediately usable")
+
+        // Establish an A owner and deliberately retain a delayed completion token. An unsettled clear
+        // must retire that token and keep the old owner from being relabelled as B.
+        var admission = Admission()
+        _ = admission.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
+            snapshot: snapshot(ownerA, revision: 100)
+        )
+        let aDecision = admission.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
+            snapshot: snapshot(ownerA, revision: 101, changedFields: history)
+        )
+        let delayedA = admission.generation
+        check(aDecision == .readyEngine && admission.isReady,
               "a settled owner becomes eligible only after its history publication")
-        let delayedA = harness.refresh(usesEngineHistory: true, activeProfileID: profileB,
-                                       activeKeychainAccount: "stremiox.auth",
-                                       ownerKey: "account-b-email",
-                                       snapshot: Snapshot(owner: nil, revision: 102, changedFields: []),
-                                       seeds: ["ttA"])
-        check(delayedA == nil && harness.networkLaunches == 1 && harness.rail.isEmpty,
-              "B email plus resident A history with nil binding clears without network or seeds")
 
-        // A late A completion cannot repopulate the cleared rail after the B boundary.
-        harness.complete(generation: aLaunch ?? 0, cards: ["late-A"])
-        check(harness.rail.isEmpty,
-              "late A recommendation completion cannot rebuild the post-switch rail")
+        admission.retireForUnsettledHistory(ownerKey: "account-b-pending", snapshot: nil)
+        check(!admission.isReady && !admission.isCurrent(delayedA),
+              "unsettled clear retires the delayed A completion immediately")
 
-        // Same-slot replacement can publish B's email while the old A binding is still visible. That
-        // event must not make a later A history receipt eligible under B's owner key.
-        var sameSlot = RecommendationHarness()
-        _ = sameSlot.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                             activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
-                             snapshot: Snapshot(owner: ownerA, revision: 200, changedFields: []),
-                             seeds: ["ttA"])
-        let sameSlotA = sameSlot.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                                         activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
-                                         snapshot: Snapshot(owner: ownerA, revision: 201, changedFields: history),
-                                         seeds: ["ttA"])
-        let replacement = sameSlot.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                                           activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-email",
-                                           snapshot: Snapshot(owner: ownerA, revision: 202, changedFields: history),
-                                           seeds: ["ttA"])
-        check(replacement == nil && sameSlot.networkLaunches == 1 && sameSlot.rail.isEmpty,
-              "same-slot email replacement cannot relabel a settled A binding as B")
-        sameSlot.complete(generation: sameSlotA ?? 0, cards: ["late-A"])
-        check(sameSlot.rail.isEmpty,
-              "same-slot delayed A completion remains retired after the email boundary")
+        let staleA = admission.evaluate(
+            usesEngineHistory: true, activeProfileID: profileB,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-pending",
+            snapshot: snapshot(ownerA, revision: 102, changedFields: history)
+        )
+        check(staleA == .awaitingHistorySnapshot && !admission.isReady,
+              "resident A history cannot be relabelled as B while binding is pending")
 
-        // When the new settled binding and its first library receipt are observed together, the new
-        // owner is allowed immediately; waiting for a second unrelated engine tick would starve Home.
-        var atomicBinding = RecommendationHarness()
-        _ = atomicBinding.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                                  activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
-                                  snapshot: Snapshot(owner: ownerA, revision: 300, changedFields: []),
-                                  seeds: ["ttA"])
-        _ = atomicBinding.refresh(usesEngineHistory: true, activeProfileID: profileA,
-                                  activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
-                                  snapshot: Snapshot(owner: ownerA, revision: 301, changedFields: history),
-                                  seeds: ["ttA"])
-        let atomicLaunch = atomicBinding.refresh(usesEngineHistory: true, activeProfileID: profileB,
-                                                 activeKeychainAccount: "stremiox.auth",
-                                                 ownerKey: "account-b-binding",
-                                                 snapshot: Snapshot(owner: ownerB, revision: 302, changedFields: history),
-                                                 seeds: ["ttB"])
-        check(atomicLaunch != nil && atomicBinding.networkLaunches == 2,
-              "new settled binding plus its first published history receipt is immediately usable")
+        // The first exact B receipt is allowed even when it shares the boundary revision with the clear.
+        let bDecision = admission.evaluate(
+            usesEngineHistory: true, activeProfileID: profileB,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-binding",
+            snapshot: snapshot(ownerB, revision: 102, changedFields: history)
+        )
+        check(bDecision == .readyEngine && admission.isReady,
+              "first exact B history receipt after a clear restores admission without a second tick")
 
-        // A valid B binding still waits for B's own published library/CW receipt, then is allowed.
-        _ = harness.refresh(usesEngineHistory: true, activeProfileID: profileB,
-                            activeKeychainAccount: "stremiox.auth",
-                            ownerKey: "account-b-binding",
-                            snapshot: Snapshot(owner: ownerB, revision: 103, changedFields: []),
-                            seeds: ["ttB"])
-        let bLaunch = harness.refresh(usesEngineHistory: true, activeProfileID: profileB,
-                                      activeKeychainAccount: "stremiox.auth",
-                                      ownerKey: "account-b-binding",
-                                      snapshot: Snapshot(owner: ownerB, revision: 104, changedFields: history),
-                                      seeds: ["ttB"])
-        check(bLaunch != nil && harness.networkLaunches == 2,
-              "exact settled B owner plus a fresh history receipt is allowed")
+        // Same-slot true -> true replacement: the non-secret owner key changes while the old binding is
+        // still visible. The exact old owner is held pending, and only B's bound receipt can reopen it.
+        var sameSlot = Admission()
+        _ = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
+            snapshot: snapshot(ownerA, revision: 200)
+        )
+        _ = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-a",
+            snapshot: snapshot(ownerA, revision: 201, changedFields: history)
+        )
+        let replacement = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-email",
+            snapshot: snapshot(ownerA, revision: 202, changedFields: history)
+        )
+        check(replacement == .awaitingHistorySnapshot && !sameSlot.isReady,
+              "same-slot owner replacement blocks the resident A receipt")
+        let duplicateOld = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-email",
+            snapshot: snapshot(ownerA, revision: 203, changedFields: history)
+        )
+        check(duplicateOld == .awaitingHistorySnapshot && !sameSlot.isReady,
+              "repeated old-owner receipts do not advance the replacement latch")
+        let replacementReady = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-binding",
+            snapshot: snapshot(ownerBForSameSlot, revision: 204, changedFields: history)
+        )
+        check(replacementReady == .readyEngine && sameSlot.isReady,
+              "same-slot replacement opens only after the exact B binding receipt")
 
-        // Overlay history is already profile-scoped and remains available without any Stremio binding.
-        let overlayLaunch = harness.refresh(usesEngineHistory: false, activeProfileID: profileB,
-                                            activeKeychainAccount: "stremiox.auth", ownerKey: "overlay",
-                                            snapshot: nil,
-                                            seeds: ["local-overlay"])
-        check(overlayLaunch != nil && harness.networkLaunches == 3,
+        // A ready-owner mismatch must invalidate old work, and the next valid current-owner receipt must
+        // restore historyInputReady rather than leaving the model permanently latched false.
+        let beforeMismatch = sameSlot.generation
+        let mismatch = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-binding",
+            snapshot: snapshot(nil, revision: 205)
+        )
+        check(mismatch == .unsettledEngine && !sameSlot.isReady && sameSlot.generation > beforeMismatch,
+              "ready-owner mismatch invalidates the admission generation")
+        let recovered = sameSlot.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "account-b-binding",
+            snapshot: snapshot(ownerBForSameSlot, revision: 205, changedFields: history)
+        )
+        check(recovered == .readyEngine && sameSlot.isReady,
+              "a valid receipt after mismatch restores readiness")
+
+        var overlay = Admission()
+        let overlayDecision = overlay.evaluate(
+            usesEngineHistory: false, activeProfileID: profileB,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "overlay",
+            snapshot: nil
+        )
+        check(overlayDecision == .overlay && overlay.isReady,
               "overlay local history remains usable without Stremio login")
 
         if failures == 0 {

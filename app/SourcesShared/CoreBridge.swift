@@ -161,6 +161,11 @@ final class CoreBridge: ObservableObject {
     private var authBindingGeneration: UInt64 = 0
     private var accountBindingVerificationTask: Task<Void, Never>?
     private var rejectedAccountBindingGeneration: UInt64?
+    /// Same-slot sign-in replaces the Keychain credential while `isSignedIn` stays true. The account
+    /// boundary notification is non-secret and this monotonic latch makes the rebind exactly-once even
+    /// when a UI observer also refreshes Home in the same turn.
+    private var credentialBoundaryObserver: NSObjectProtocol?
+    private var lastCredentialBoundaryGeneration: UInt64 = 0
     /// Rust delivers NewState on its own worker.  Auth/profile state belongs to main, so workers must
     /// never read it directly.  They capture this lock-backed, immutable epoch and main validates it
     /// immediately before a decoded snapshot is published or used for a deferred engine mutation.
@@ -257,7 +262,23 @@ final class CoreBridge: ObservableObject {
         return ProfileSync.libraryImportedFromStremio(authKey: token) && !ProfileSync.alsoSyncToStremio
     }
 
-    private init() {}
+    private init() {
+        credentialBoundaryObserver = NotificationCenter.default.addObserver(
+            forName: StremioAccount.credentialBoundaryDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let rawGeneration = note.userInfo?["generation"] as? NSNumber,
+                  note.userInfo?["wasSignedIn"] as? Bool == true else { return }
+            let generation = rawGeneration.uint64Value
+            guard generation > self.lastCredentialBoundaryGeneration else { return }
+            self.lastCredentialBoundaryGeneration = generation
+            // Rebind before the next history receipt can be admitted. This path is intentionally
+            // deduplicated by the process-local generation and does not log or transport credentials.
+            self.signedInWithLegacyAuthKey()
+        }
+    }
 
     /// Hydrate the engine from persisted storage and start the event loop. Idempotent.
     func start() {

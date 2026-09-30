@@ -1226,6 +1226,10 @@ struct iOSHomeView: View {
         // StremioAccount deliberately suppresses true -> true isSignedIn publication during a same-slot
         // replacement. Email is published by the successful sign-in path, so observe that event directly.
         .onReceive(account.$email) { _ in refreshTopPicks() }
+        // A same-slot credential replacement can retain the same email and isSignedIn=true. The
+        // non-secret account-boundary generation is published by StremioAccount and is the refresh edge
+        // for that replacement; CoreBridge rotates its settled binding before a history receipt is accepted.
+        .onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
@@ -1431,7 +1435,8 @@ struct iOSHomeView: View {
             usesEngineHistory: profiles.activeUsesEngineHistory,
             accountEmail: account.email,
             principal: binding?.uid,
-            authorityGeneration: binding?.generation
+            authorityGeneration: binding?.generation,
+            credentialBoundaryGeneration: account.credentialBoundaryGeneration
         )
     }
 
@@ -1463,7 +1468,11 @@ struct iOSHomeView: View {
                   owner.profileID == profiles.activeID,
                   owner.keychainAccount == activeKeychainAccount else {
                 topPicks.clear()
-                becauseYouWatched.clear()
+                becauseYouWatched.retireForUnsettledHistory(
+                    profileID: profiles.activeID,
+                    ownerKey: becauseYouWatchedOwnerKey,
+                    historySnapshot: historySnapshot
+                )
                 return
             }
         }
