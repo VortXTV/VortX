@@ -43,9 +43,11 @@ enum BecauseYouWatchedAccountOwnerCallsiteContractTests {
         for (name, source) in [("tvOS", tv), ("iOS", ios)] {
             check(source.contains("BecauseYouWatchedModel.recommendationOwnerKey("),
                   "\(name) Home uses the shared account-aware owner key")
-            check(source.contains("principal: binding?.uid ?? core.currentUID()") &&
+            check(source.contains("principal: binding?.uid") &&
                     source.contains("authorityGeneration: binding?.generation"),
-                  "\(name) Home includes the settled principal and authority generation")
+                  "\(name) Home uses only the settled principal and authority generation")
+            check(!source.contains("principal: binding?.uid ?? core.currentUID()"),
+                  "\(name) Home never falls back to the resident engine UID for recommendation ownership")
             check(source.contains(".onChange(of: becauseYouWatchedOwnerKey) { _ in refreshTopPicks() }"),
                   "\(name) Home refreshes when the settled owner key changes")
             check(source.contains(".onReceive(account.$email) { _ in refreshTopPicks() }"),

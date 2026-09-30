@@ -57,8 +57,23 @@ struct HomeView: View {
             isSignedIn: account.isSignedIn,
             usesEngineHistory: profiles.activeUsesEngineHistory,
             accountEmail: account.email,
-            principal: binding?.uid ?? core.currentUID(),
+            principal: binding?.uid,
             authorityGeneration: binding?.generation
+        )
+    }
+
+    /// The engine snapshot is usable only after a settled binding and a newer published history
+    /// revision. `BecauseYouWatchedModel` owns the post-boundary revision latch; this value carries the
+    /// exact non-secret binding and the publication receipt into that model.
+    private var becauseYouWatchedHistorySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot {
+        let binding = core.settledActiveAccountBinding()
+        return .init(
+            owner: binding.map {
+                .init(profileID: $0.profileID, keychainAccount: $0.keychainAccount,
+                      uid: $0.uid, generation: $0.generation)
+            },
+            revision: core.revision,
+            changedFields: core.changedFields
         )
     }
 
@@ -230,14 +245,37 @@ struct HomeView: View {
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
-        let localHistory = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
-        topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: libraryItems)
+        let usesEngineHistory = profiles.activeUsesEngineHistory
+        let activeKeychainAccount = profiles.activeKeychainAccount
+        let historySnapshot = becauseYouWatchedHistorySnapshot
+        if usesEngineHistory {
+            // A selected B profile may coexist briefly with engine A while authentication settles. Do
+            // not even hand A's arrays to a personalized recommender; retire both personalized rails now.
+            guard let owner = historySnapshot.owner,
+                  owner.profileID == profiles.activeID,
+                  owner.keychainAccount == activeKeychainAccount else {
+                topPicks.clear()
+                becauseYouWatched.clear()
+                return
+            }
+        }
+
+        let localHistory = usesEngineHistory ? core.continueWatching : profiles.cwItems
+        let localLibrary = usesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         becauseYouWatched.refresh(
             profileID: profiles.activeID,
             cw: localHistory,
-            library: libraryItems,
+            library: localLibrary,
             ownerKey: becauseYouWatchedOwnerKey,
+            usesEngineHistory: usesEngineHistory,
+            activeKeychainAccount: activeKeychainAccount,
+            historySnapshot: historySnapshot
         )   // "Because you watched <title>" rail; no-ops on an unchanged seed set
+        if becauseYouWatched.historyInputReady {
+            topPicks.refresh(profileID: profiles.activeID, cw: localHistory, library: localLibrary)
+        } else {
+            topPicks.clear()
+        }
         traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
         simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
         mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none

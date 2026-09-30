@@ -1,5 +1,60 @@
 import SwiftUI
 
+/// The minimum proof Home needs before it may hand engine-owned watch history to a personalized
+/// recommender.  A settled UID alone is not enough: the engine can still have the previous account's
+/// published library in memory until the post-auth `library`/`continue_watching_preview` receipt lands.
+/// Keep this value small and value-only so it can be exercised without a CoreBridge or network harness.
+enum BecauseYouWatchedHistoryPolicy {
+    static let historyFields: Set<String> = ["library", "continue_watching_preview"]
+
+    struct Owner: Equatable {
+        let profileID: UUID
+        let keychainAccount: String
+        let uid: String
+        let generation: UInt64
+    }
+
+    struct Snapshot: Equatable {
+        let owner: Owner?
+        let revision: Int
+        let changedFields: Set<String>
+    }
+
+    enum Decision: Equatable {
+        case overlay
+        case unsettledEngine
+        case awaitingHistorySnapshot
+        case readyEngine
+    }
+
+    /// Decide whether a call may use engine-backed watch history.
+    ///
+    /// `minimumRevision` is captured when the Home owner boundary changes.  Requiring a strictly newer
+    /// revision carrying an actual history field prevents a stale A snapshot from being relabelled as B
+    /// merely because B's authenticated UID is now settled.  Overlay history deliberately bypasses this
+    /// engine receipt requirement because it is already scoped to the selected local profile.
+    static func decision(
+        usesEngineHistory: Bool,
+        activeProfileID: UUID?,
+        activeKeychainAccount: String,
+        snapshot: Snapshot?,
+        minimumRevision: Int?
+    ) -> Decision {
+        guard usesEngineHistory else { return .overlay }
+        guard let snapshot, let owner = snapshot.owner,
+              owner.profileID == activeProfileID,
+              owner.keychainAccount == activeKeychainAccount else {
+            return .unsettledEngine
+        }
+        guard let minimumRevision,
+              snapshot.revision > minimumRevision,
+              !snapshot.changedFields.isDisjoint(with: historyFields) else {
+            return .awaitingHistorySnapshot
+        }
+        return .readyEngine
+    }
+}
+
 /// A profile-local "Because you watched" rail.
 ///
 /// The inputs are deliberately passed in by Home rather than read from the engine here. That keeps the
@@ -10,6 +65,9 @@ import SwiftUI
 @MainActor
 final class BecauseYouWatchedModel: ObservableObject {
     @Published private(set) var rail: CuratedCollection?
+    /// True only when the inputs most recently accepted by `refresh` belong to the current history
+    /// owner. Home uses this to keep Top Picks behind the same engine-account boundary.
+    private(set) var historyInputReady = false
 
     private static let maxSeeds = 4
     private static let maxItems = 20
@@ -24,6 +82,12 @@ final class BecauseYouWatchedModel: ObservableObject {
     /// The profile UUID is not sufficient to identify the history owner: a signed-in account, local
     /// history slot, or engine principal can change while the selected profile remains the same.
     private var activeOwnerKey: String?
+    /// Engine history is not usable until a published history field arrives after the current owner
+    /// boundary.  This is intentionally model-local: Home can clear the personalized rail immediately
+    /// without making CoreBridge expose recommendation-specific state.
+    private var historyOwner: BecauseYouWatchedHistoryPolicy.Owner?
+    private var historyMinimumRevision: Int?
+    private var historySnapshotReady = false
 
     /// Recompute from the active profile's recent watch/library titles. Calls are cheap when the exact
     /// relevant inputs are unchanged, but a watch-progress or watched-count mutation changes the signature.
@@ -32,11 +96,76 @@ final class BecauseYouWatchedModel: ObservableObject {
         cw: [CoreCWItem],
         library: [CoreCWItem],
         ownerKey: String = "",
+        usesEngineHistory: Bool = true,
+        activeKeychainAccount: String? = nil,
+        historySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot? = nil,
     ) {
-        let seeds = Self.eligibleSeeds(cw: cw, library: library)
         let signature = ownerKey + "|" + (profileID?.uuidString ?? "main") + "|" +
             Self.seedSignature(cw: cw, library: library)
         let ownerChanged = activeProfileID != profileID || activeOwnerKey != ownerKey
+
+        if ownerChanged {
+            requestGeneration &+= 1
+            loadTask?.cancel()
+            loadTask = nil
+            inFlightSignature = nil
+            rail = nil
+            lastSignature = nil
+            activeProfileID = profileID
+            activeOwnerKey = ownerKey
+            historyOwner = historySnapshot?.owner
+            historyMinimumRevision = historySnapshot?.revision
+            historySnapshotReady = false
+            historyInputReady = false
+        }
+
+        if usesEngineHistory {
+            if historySnapshotReady {
+                // Keep a ready owner usable across unrelated engine revisions. A later owner change
+                // resets this latch above, before any old data can reach the recommender.
+                guard let snapshot = historySnapshot,
+                      snapshot.owner == historyOwner,
+                      snapshot.owner?.profileID == profileID,
+                      snapshot.owner?.keychainAccount == activeKeychainAccount else {
+                    historyInputReady = false
+                    rail = nil
+                    lastSignature = nil
+                    return
+                }
+            } else {
+                let decision = BecauseYouWatchedHistoryPolicy.decision(
+                    usesEngineHistory: true,
+                    activeProfileID: profileID,
+                    activeKeychainAccount: activeKeychainAccount ?? "",
+                    snapshot: historySnapshot,
+                    minimumRevision: historyMinimumRevision
+                )
+                guard decision == .readyEngine else {
+                    // Keep the owner identity/baseline so repeated Home body emissions do not move the
+                    // baseline forward and accidentally make an old snapshot look fresh.  The rail and
+                    // any in-flight work are retired synchronously at the boundary.
+                    loadTask?.cancel()
+                    loadTask = nil
+                    inFlightSignature = nil
+                    historyInputReady = false
+                    rail = nil
+                    lastSignature = nil
+                    return
+                }
+                historySnapshotReady = true
+                historyInputReady = true
+            }
+        } else {
+            // Local overlay history is already scoped by ProfileStore; no Stremio binding or engine
+            // receipt is required. Reset engine-only readiness so a later owner-profile return starts a
+            // new post-boundary proof instead of inheriting this overlay's state.
+            historyOwner = nil
+            historyMinimumRevision = nil
+            historySnapshotReady = false
+            historyInputReady = true
+        }
+
+        let seeds = Self.eligibleSeeds(cw: cw, library: library)
 
         if !ownerChanged, signature == lastSignature, rail != nil {
             activeProfileID = profileID
@@ -100,6 +229,10 @@ final class BecauseYouWatchedModel: ObservableObject {
         inFlightSignature = nil
         activeProfileID = nil
         activeOwnerKey = nil
+        historyOwner = nil
+        historyMinimumRevision = nil
+        historySnapshotReady = false
+        historyInputReady = false
         rail = nil
         lastSignature = nil
     }
