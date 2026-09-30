@@ -52,6 +52,10 @@ enum class WatchedDownloadReclaimResult {
 
 /** Side-effect-free selector; every identity field is deliberately exact (including nullable episode fields). */
 internal object DownloadWatchedReclaimPolicy {
+    /** A later lifecycle snapshot is eligible only when it is byte-for-byte the row originally selected. */
+    fun matchesCapturedCompletedRecord(captured: DownloadRecord, current: DownloadRecord): Boolean =
+        current.state == DownloadState.COMPLETED && current == captured
+
     fun matchingCompletedRecord(
         enabled: Boolean,
         request: WatchedDownloadReclaimRequest,

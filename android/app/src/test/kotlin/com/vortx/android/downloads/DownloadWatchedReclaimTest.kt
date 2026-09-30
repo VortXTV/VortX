@@ -57,6 +57,25 @@ class DownloadWatchedReclaimTest {
     }
 
     @Test
+    fun `late reclaim must retain the exact captured completed row`() {
+        val captured = record(id = ID_A)
+
+        assertTrue(DownloadWatchedReclaimPolicy.matchesCapturedCompletedRecord(captured, captured))
+        assertFalse(
+            DownloadWatchedReclaimPolicy.matchesCapturedCompletedRecord(
+                captured,
+                captured.copy(localFilename = "$ID_A.mp4"),
+            ),
+        )
+        assertFalse(
+            DownloadWatchedReclaimPolicy.matchesCapturedCompletedRecord(
+                captured,
+                captured.copy(state = DownloadState.PAUSED),
+            ),
+        )
+    }
+
+    @Test
     fun `rename failure preserves media and never writes the index`() = withFiles { media, tombstone, part ->
         val files = FakeFileOps(media, part, renameResults = listOf(false))
         var writes = 0
