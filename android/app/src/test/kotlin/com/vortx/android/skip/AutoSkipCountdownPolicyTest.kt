@@ -1,6 +1,8 @@
 package com.vortx.android.skip
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -33,6 +35,43 @@ class AutoSkipCountdownPolicyTest {
             AutoSkipCountdownDecision.Skip(AutoSkipSegmentKey(intro), 42_000, state.epoch),
             completed,
         )
+        assertFalse(state.isSuppressed(intro))
+    }
+
+    @Test
+    fun `skip candidate is not completed until the guarded seek commits`() {
+        val state = AutoSkipCountdownState()
+        AutoSkipCountdownPolicy.advance(state, "episode-commit", intro, 5_000, playbackActive = true, delaySeconds = 1.0)
+        val candidate = AutoSkipCountdownPolicy.advance(
+            state,
+            "episode-commit",
+            intro,
+            6_000,
+            playbackActive = true,
+            delaySeconds = 1.0,
+        )
+        assertTrue(candidate is AutoSkipCountdownDecision.Skip)
+        assertFalse(state.isSuppressed(intro))
+        assertTrue(
+            AutoSkipCountdownPolicy.completeIfCurrent(
+                state,
+                intro,
+                (candidate as AutoSkipCountdownDecision.Skip).epoch,
+            ),
+        )
+        assertTrue(state.isSuppressed(intro))
+    }
+
+    @Test
+    fun `detached policy copy leaves the observable source state untouched`() {
+        val source = AutoSkipCountdownState(mediaId = "episode-copy")
+        val working = source.detachedCopy()
+
+        AutoSkipCountdownPolicy.cancel(working, intro)
+
+        assertFalse(source.isSuppressed(intro))
+        assertTrue(working.isSuppressed(intro))
+        assertNotEquals(source, working)
     }
 
     @Test
@@ -43,6 +82,32 @@ class AutoSkipCountdownPolicyTest {
         assertEquals(AutoSkipCountdownDecision.Prompt(AutoSkipSegmentKey(intro), 5.0), paused)
         val buffering = AutoSkipCountdownPolicy.advance(state, "episode-pause", intro, 5_000, playbackActive = false, delaySeconds = 5.0)
         assertEquals(AutoSkipCountdownDecision.Prompt(AutoSkipSegmentKey(intro), 5.0), buffering)
+    }
+
+    @Test
+    fun `pause after an eligible candidate keeps a prompt and never commits`() {
+        val state = AutoSkipCountdownState()
+        AutoSkipCountdownPolicy.advance(state, "episode-paused-candidate", intro, 5_000, playbackActive = true, delaySeconds = 1.0)
+        assertTrue(
+            AutoSkipCountdownPolicy.advance(
+                state,
+                "episode-paused-candidate",
+                intro,
+                6_000,
+                playbackActive = true,
+                delaySeconds = 1.0,
+            ) is AutoSkipCountdownDecision.Skip,
+        )
+        val paused = AutoSkipCountdownPolicy.advance(
+            state,
+            "episode-paused-candidate",
+            intro,
+            6_000,
+            playbackActive = false,
+            delaySeconds = 1.0,
+        )
+        assertTrue(paused is AutoSkipCountdownDecision.Prompt)
+        assertFalse(state.isSuppressed(intro))
     }
 
     @Test
@@ -77,12 +142,25 @@ class AutoSkipCountdownPolicyTest {
     }
 
     @Test
+    fun `stale owner epoch cannot commit an identical segment after seek and reentry`() {
+        val state = AutoSkipCountdownState()
+        AutoSkipCountdownPolicy.advance(state, "episode-identical", intro, 5_000, playbackActive = true, delaySeconds = 5.0)
+        val staleEpoch = state.epoch
+        AutoSkipCountdownPolicy.invalidatePending(state, 90_000)
+        AutoSkipCountdownPolicy.advance(state, "episode-identical", intro, 5_000, playbackActive = true, delaySeconds = 1.0)
+
+        assertFalse(AutoSkipCountdownPolicy.completeIfCurrent(state, intro, staleEpoch))
+        assertFalse(state.isSuppressed(intro))
+    }
+
+    @Test
     fun `automatic target is clamped to media duration`() {
         val longIntro = intro.copy(end = 110.0)
         val state = AutoSkipCountdownState()
         AutoSkipCountdownPolicy.advance(state, "episode-end", longIntro, 5_000, 100_000, playbackActive = true, delaySeconds = 1.0)
         val decision = AutoSkipCountdownPolicy.advance(state, "episode-end", longIntro, 6_000, 100_000, playbackActive = true, delaySeconds = 1.0)
         assertEquals(AutoSkipCountdownDecision.Skip(AutoSkipSegmentKey(longIntro), 100_000, state.epoch), decision)
+        assertFalse(state.isSuppressed(longIntro))
     }
 
     @Test
@@ -149,5 +227,13 @@ class AutoSkipCountdownPolicyTest {
             AutoSkipCountdownDecision.Prompt(AutoSkipSegmentKey(intro), 5.0),
             AutoSkipCountdownPolicy.advance(state, "episode-default", intro, 5_000, playbackActive = true, delaySeconds = 5.0),
         )
+    }
+
+    @Test
+    fun `manual completion remains available when automatic delay is Off`() {
+        val state = AutoSkipCountdownState()
+        AutoSkipCountdownPolicy.advance(state, "episode-manual-off", intro, 5_000, playbackActive = true, delaySeconds = 0.0)
+        AutoSkipCountdownPolicy.complete(state, intro)
+        assertTrue(state.isSuppressed(intro))
     }
 }

@@ -27,6 +27,19 @@ data class AutoSkipCountdownState(
     val cancelledSegments: MutableSet<AutoSkipSegmentKey> = mutableSetOf(),
     val completedSegments: MutableSet<AutoSkipSegmentKey> = mutableSetOf(),
 ) {
+    /**
+     * Returns a detached mutable copy for a pure-policy transition.
+     *
+     * Player UI state stores this value in a structural-equality Compose state holder. The policy mutates
+     * its sets while advancing, so callers must mutate this detached copy and publish the replacement;
+     * mutating the value already held by Compose would make the subsequent structurally-equal assignment
+     * invisible to recomposition.
+     */
+    fun detachedCopy(): AutoSkipCountdownState = copy(
+        cancelledSegments = cancelledSegments.toMutableSet(),
+        completedSegments = completedSegments.toMutableSet(),
+    )
+
     fun isSuppressed(segment: SkipSegment): Boolean {
         val key = AutoSkipSegmentKey(segment)
         return key in cancelledSegments || key in completedSegments
@@ -95,9 +108,7 @@ object AutoSkipCountdownPolicy {
             return AutoSkipCountdownDecision.Idle
         }
         val delayMs = (safeDelaySeconds * 1000.0).roundToLong().coerceAtLeast(1L)
-        if (state.accruedPlaybackMs >= delayMs) {
-            state.completedSegments += key
-            state.epoch += 1
+        if (playbackActive && state.accruedPlaybackMs >= delayMs) {
             return AutoSkipCountdownDecision.Skip(
                 segment = key,
                 targetPositionMs = clampedEnd(segment.end, durationMs, segment.start),
@@ -138,6 +149,18 @@ object AutoSkipCountdownPolicy {
         state.completedSegments += AutoSkipSegmentKey(segment)
         state.accruedPlaybackMs = 0
         state.epoch += 1
+    }
+
+    /** Commits an automatic candidate only after the caller has accepted and issued its guarded seek. */
+    fun completeIfCurrent(
+        state: AutoSkipCountdownState,
+        segment: SkipSegment,
+        epoch: Long,
+    ): Boolean {
+        val mediaId = state.mediaId ?: return false
+        if (!isCurrent(state, mediaId, segment, epoch)) return false
+        complete(state, segment)
+        return true
     }
 
     /** Invalidates queued work while preserving per-media cancel/completion memory. */

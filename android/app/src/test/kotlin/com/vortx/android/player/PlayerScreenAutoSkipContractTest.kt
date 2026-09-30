@@ -13,6 +13,9 @@ class PlayerScreenAutoSkipContractTest {
 
         assertTrue(screen.contains("AutoSkipCountdownPolicy.advance("))
         assertTrue(screen.contains("AutoSkipCountdownPolicy.isCurrent("))
+        assertTrue(screen.contains("AutoSkipCountdownPolicy.completeIfCurrent("))
+        assertTrue(screen.contains("val nextCountdown = autoSkipCountdown.detachedCopy()"))
+        assertTrue(screen.contains("val engineMounted = builtEngine === engine && engineHolder.get() === engine"))
         assertTrue(screen.contains("builtEngine === expectedEngine"))
         assertTrue(screen.contains("playbackSessionKey == expectedSession"))
         assertTrue(screen.contains("!latestState.isPaused"))
@@ -34,12 +37,15 @@ class PlayerScreenAutoSkipContractTest {
         assertTrue(screen.contains("fun seekLocalTo(positionMs: Long)"))
         assertTrue(screen.contains("fun seekLocalBy(deltaMs: Long)"))
         assertTrue(screen.contains("fun invalidateAutoSkipPending"))
+        assertTrue(screen.contains("AutoSkipActionOwner"))
+        assertTrue(screen.contains("isCurrentAutoSkipAction(owner, segment)"))
         assertTrue(screen.contains("onSeek = { showControls(); seekLocalTo(it) }"))
         assertTrue(screen.contains("onSeekBy = { showControls(); seekLocalBy(it) }"))
         assertTrue(screen.contains("onSeekCommit = { target ->"))
         assertTrue(screen.contains("seekLocalTo(target)"))
         assertTrue(screen.contains("if (resumeAt > 0L) seekLocalTo(resumeAt)"))
         assertTrue(screen.contains("SharedPreferences.OnSharedPreferenceChangeListener"))
+        assertTrue(screen.contains("DisposableEffect(autoSkipPreferences, autoSkipIdentity, playbackSessionKey, engine)"))
         assertTrue(screen.contains("PlaybackBehaviorSettings.AUTO_SKIP_DELAY_SECONDS_KEY"))
     }
 
@@ -47,12 +53,14 @@ class PlayerScreenAutoSkipContractTest {
     fun `skip pill exposes manual action and separate cancel semantics`() {
         val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
 
-        assertTrue(screen.contains("AutoSkipCountdownPolicy.complete(autoSkipCountdown, segment)"))
-        assertTrue(screen.contains("AutoSkipCountdownPolicy.cancel(autoSkipCountdown, segment)"))
-        assertTrue(screen.contains("onCancel = ::cancelAutomaticSkip"))
+        assertTrue(screen.contains("AutoSkipCountdownPolicy.complete(next, segment)"))
+        assertTrue(screen.contains("AutoSkipCountdownPolicy.cancel(next, segment)"))
+        assertTrue(screen.contains("onCancel = { segment -> cancelAutomaticSkip(segment, skipActionOwner) }"))
         assertTrue(screen.contains("countdownState.isSuppressed(active)"))
         assertTrue(screen.contains(".size(48.dp)"))
         assertTrue(screen.contains("contentDescription = \"Cancel automatic \${active.label.lowercase()}\""))
+        assertTrue(screen.contains("selected = cancelActionSelected"))
+        assertTrue(screen.contains("cancelFocused = skipPillFocusedCancel"))
         assertTrue(screen.contains("Key.DirectionLeft, Key.DirectionRight -> if (countdownPromptVisible)"))
         assertTrue(screen.contains("skipPillFocusedCancel = event.key == Key.DirectionRight"))
     }
