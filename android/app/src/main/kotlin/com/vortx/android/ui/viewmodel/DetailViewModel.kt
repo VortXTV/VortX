@@ -29,7 +29,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
-import com.vortx.android.model.orderedBySeasonEpisode
+import com.vortx.android.model.TrackPreferences
 import com.vortx.android.model.TrackPreferencesStore
 import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.player.PlaybackBehaviorSettings
@@ -480,6 +480,12 @@ class DetailViewModel(
     /// (episode/continuity/contentId) with only the pin + prefs refreshed, re-ranking the open list.
     private var lastCtx: SourceListModel.Context? = null
 
+    /// The immutable source-selection identity currently allowed to publish.  This advances for episode,
+    /// profile, refresh, and transient audio changes; a matching title/episode is not enough to authorize a
+    /// stale assembly because the ranking preferences may have changed underneath it.
+    @Volatile
+    private var sourceSelectionRevision = DetailSourceSelectionRevision(0L, null)
+
     /// Smart Source Selection auto-pick once-latch: armed when the viewer TAPS an episode while
     /// [SourcePreferencesStore.autoPickBest] is on (never on the initial programmatic selection), consumed
     /// exactly once when that episode's add-on groups land. Apple's `didAutoPick` latch inverted
@@ -547,6 +553,10 @@ class DetailViewModel(
                     token != null &&
                     st.requestGeneration == token.generation &&
                     st.streamId == token.targetId &&
+                    acceptsDetailSourceSelection(
+                        DetailSourceSelectionRevision(st.requestGeneration, _sourceAudioLanguageHint.value),
+                        sourceSelectionRevision,
+                    ) &&
                     sourceRequestFence.accepts(token, sourceSticky.currentProfileId())
                 ) {
                     _streams.value = UiState.Success(st.groups)
@@ -692,6 +702,7 @@ class DetailViewModel(
         } else {
             sourceRequestFence.begin(profileId, episodeId)
         }
+        sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, _sourceAudioLanguageHint.value)
         sourceLoadJob?.cancel()
         if (forceRefresh) torbox.reset(token.generation, clearCache = true)
         sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token, forceRefresh) }
@@ -843,6 +854,7 @@ class DetailViewModel(
             requestGeneration = request.generation,
         )
         val ctx = buildContext(episodeId, contentId, request, advanceHint)
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         lastCtx = ctx
         sourceModel.setContext(ctx)
         _pinUi.value = readPinUi()
@@ -1120,9 +1132,17 @@ class DetailViewModel(
     fun setSourceAudioLanguageHint(language: String?) {
         val normalized = language?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         if (_sourceAudioLanguageHint.value == normalized) return
+        // The picker is session-only, but it still changes the immutable ranking input.  Advance the same
+        // source request fence used for episode changes so an in-flight assembly for the old language cannot
+        // repaint the list after the viewer has selected a new one.  Keep the current groups visible while
+        // the coalesced SourceListModel rebuilds against the new context.
+        val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), _selectedEpisodeId.value)
+        sourceLoadJob?.cancel()
         _sourceAudioLanguageHint.value = normalized
+        sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, normalized)
         lastCtx?.let { ctx ->
             val updated = ctx.copy(
+                requestGeneration = token.generation,
                 prefs = sourcePrefs.snapshot(
                     detailSourceAudioLanguages(normalized, trackPrefs.current.audioLanguages),
                     isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
@@ -1130,6 +1150,12 @@ class DetailViewModel(
             )
             lastCtx = updated
             sourceModel.setContext(updated)
+        }
+        if (lastCtx == null) {
+            // A picker can be opened while the first source request is still installing its context.  Keep
+            // the new language authoritative by restarting that request rather than leaving the model on its
+            // empty initial context.
+            startSourceLoad(_selectedEpisodeId.value)
         }
     }
 
@@ -1797,7 +1823,7 @@ class DetailViewModel(
         if (type != MediaType.SERIES) return null
         val detail = (_meta.value as? UiState.Success)?.data ?: return null
         val currentId = _selectedEpisodeId.value ?: return null
-        val ordered = detail.videos.orderedBySeasonEpisode
+        val ordered = detailEpisodeTargetOrder(detail.videos)
         val idx = ordered.indexOfFirst { it.id == currentId }
         if (idx < 0 || idx + 1 >= ordered.size) return null
         return ordered[idx + 1]
@@ -2030,7 +2056,7 @@ class DetailViewModel(
 
     private fun primaryEpisodeOf(detail: MetaDetail): Pair<Episode, Boolean>? {
         if (detail.videos.isEmpty()) return null
-        val sorted = sortedEpisodes(detail.videos)
+        val sorted = detailEpisodeTargetOrder(detail.videos)
         val lib = detail.libraryItem
         if (lib != null && lib.timeOffsetMs > 0 && lib.videoId != null) {
             val resumeVideo = sorted.firstOrNull { it.id == lib.videoId }
@@ -2146,9 +2172,6 @@ class DetailViewModel(
         )
     }
 
-    private fun sortedEpisodes(videos: List<Episode>): List<Episode> =
-        videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
-
     /// Tear down the assembly pipeline + contributor lanes when the screen goes away. [SourceListModel.close]
     /// stops the coalescer (it runs on [viewModelScope], which is cancelled anyway, but the contributors own
     /// their OWN scopes and must be closed explicitly to cancel any in-flight TorBox / Singularity fetch).
@@ -2201,6 +2224,86 @@ class DetailViewModel(
         /// unchanged.
         const val CACHED_ID_SUFFIX = "\u0000cached"
     }
+}
+
+/**
+ * Immutable ownership for one assembled detail-source selection.  The source model does not know about
+ * Compose's transient audio picker, so the ViewModel carries the picker choice through the same monotonic
+ * request generation as an episode change.  A late assembly can therefore never publish into a newer
+ * language selection, even when the title and episode are unchanged.
+ */
+internal data class DetailSourceSelectionRevision(
+    val requestGeneration: Long,
+    val audioLanguage: String?,
+)
+
+internal fun acceptsDetailSourceSelection(
+    captured: DetailSourceSelectionRevision,
+    current: DetailSourceSelectionRevision,
+): Boolean = captured == current
+
+/**
+ * A detail relation may be represented by a TMDB/TVDB/Kitsu id, but only the two media types understood by
+ * the TMDB bridge may be converted to IMDb.  Live/custom/anime-like types stay opaque until their own route
+ * understands them; treating every unknown type as a movie silently opens the wrong title.
+ */
+internal fun canResolveRelatedDetail(type: MediaType): Boolean =
+    type == MediaType.MOVIE || type == MediaType.SERIES
+
+internal class DetailNavigationFence {
+    private var generation = 0L
+
+    @Synchronized
+    fun begin(): Long = ++generation
+
+    @Synchronized
+    fun accepts(capturedGeneration: Long): Boolean = capturedGeneration == generation
+}
+
+internal suspend fun resolveRelatedDetailTitle(item: MetaItem): MetaItem {
+    if (item.id.startsWith("tt") || !canResolveRelatedDetail(item.type)) return item
+    val resolved = boundedDetailRecoveryLookup(timeoutMs = 6_000L) {
+        TMDBPersonClient.imdbId(item.id, item.type)
+    }
+    return if (resolved.isNullOrBlank() || !resolved.startsWith("tt")) item else item.copy(id = resolved)
+}
+
+/**
+ * Detail's target policy intentionally ignores season-zero specials whenever a title has actual episodes.
+ * Specials remain available in the episode browser; they simply cannot hijack Continue Watching's primary
+ * resume/next target ahead of the first real episode.
+ */
+internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
+    val ordered = videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
+    val actualEpisodes = ordered.filter { it.season > 0 }
+    return actualEpisodes.ifEmpty { ordered }
+}
+
+/**
+ * Audio choices advertised by the sources currently on screen.  The traversal deliberately preserves the
+ * assembled group/stream order (which is the app's add-on order in add-on-order mode) and only exposes a
+ * language after at least one actual source advertises it.  The saved settings list supplies labels, never
+ * the option set, so a source picker cannot offer a checked-but-unavailable language.
+ */
+internal fun detailAudioLanguageOptions(groups: List<StreamGroup>): List<Pair<String, String>> {
+    val labels = TrackPreferences.commonLanguages.toMap()
+    val codes = LinkedHashSet<String>()
+    groups.forEach { group ->
+        group.streams.forEach { source ->
+            val text = listOfNotNull(source.title, source.description, source.quality).joinToString(" ")
+            val lowered = text.lowercase()
+            StreamRanking.languageCodesAdvertised(text)
+                .filterNot { code ->
+                    // These ranker tokens describe burned-in subtitles, not the audio track.  Keep them out
+                    // of the picker so a "Korean subs" source cannot masquerade as a Korean dub option.
+                    (code == "ko" && lowered.contains("korsub")) ||
+                        (code == "fr" && lowered.contains("vostfr")) ||
+                        (code == "pt" && lowered.contains("legendado"))
+                }
+                .forEach { code -> codes += code }
+        }
+    }
+    return codes.map { code -> code to (labels[code] ?: code.uppercase()) }
 }
 
 /// Playback request state for the detail page. Resolving covers the engine round-trip (streaming

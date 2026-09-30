@@ -65,7 +65,10 @@ import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
+import com.vortx.android.ui.viewmodel.DetailNavigationFence
 import com.vortx.android.ui.viewmodel.Playback
+import com.vortx.android.ui.viewmodel.resolveRelatedDetailTitle
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -199,11 +202,32 @@ private fun TvDetailContent(
     val hasTrailer = detail.trailerYouTubeId != null
     val trailerModifier = if (hasTrailer) Modifier.focusRequester(secondaryFocus) else Modifier
     val saveModifier = if (hasTrailer) Modifier else Modifier.focusRequester(secondaryFocus)
+    val scope = rememberCoroutineScope()
 
     // Selected season/episode come from the SAME [DetailViewModel] the phone drives, so choosing a season or
     // episode below retargets the hero Watch/Resume + the source list, exactly as the phone screen does.
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
+    var focusRestoreEpisodeId by remember(detail.id) { mutableStateOf<String?>(null) }
+    var focusRestoreRevision by remember(detail.id) { mutableStateOf(0) }
+    LaunchedEffect(playback) {
+        if (focusRestoreEpisodeId != null && playback is Playback.Failed) focusRestoreRevision++
+        if (focusRestoreEpisodeId != null && playback is Playback.Idle) focusRestoreRevision++
+    }
+
+    // Relation cards can fire several TMDB->IMDb requests before the first edge response returns.  Cancel
+    // the superseded request and fence its result so a late prequel/sequel response cannot open the wrong
+    // nested title.  Unsupported live/custom types are returned unchanged by the shared resolver.
+    val relatedLookupFence = remember { DetailNavigationFence() }
+    var relatedLookupJob by remember { mutableStateOf<Job?>(null) }
+    val openRelated: (MetaItem) -> Unit = { item ->
+        val generation = relatedLookupFence.begin()
+        relatedLookupJob?.cancel()
+        relatedLookupJob = scope.launch {
+            val resolved = resolveRelatedDetailTitle(item)
+            if (relatedLookupFence.accepts(generation)) onOpenTitle(resolved)
+        }
+    }
 
     // Source-list depth state, from the SAME [DetailViewModel] the phone drives: the remembered sort, the
     // effective pin, and the transient offline-download notice. The couch source list re-ranks / re-badges off
@@ -265,7 +289,6 @@ private fun TvDetailContent(
     }
 
     val scrollState = rememberScrollState()
-    val scope = rememberCoroutineScope()
 
     // A tapped cast tile takes over the whole detail body with the Person page, mirroring the phone overlay.
     val openPerson = personTarget
@@ -511,8 +534,12 @@ private fun TvDetailContent(
                     detail = detail,
                     selectedSeason = selectedSeason,
                     selectedEpisodeId = selectedEpisodeId,
+                    focusRestoreEpisodeId = focusRestoreEpisodeId,
+                    focusRestoreRevision = focusRestoreRevision,
                     onSelectSeason = viewModel::selectSeason,
                     onSelectEpisode = { episodeId ->
+                        focusRestoreEpisodeId = episodeId
+                        focusRestoreRevision++
                         viewModel.selectEpisode(episodeId)
                         scope.launch { scrollState.animateScrollTo(0) }
                     },
@@ -544,7 +571,7 @@ private fun TvDetailContent(
                     TvSimilarRail(
                         type = detail.type,
                         titles = relations.map { it.item },
-                        onOpen = onOpenTitle,
+                        onOpen = openRelated,
                         heading = kind.label,
                         modifier = Modifier.padding(top = TvDimens.rowGap),
                     )
@@ -560,24 +587,14 @@ private fun TvDetailContent(
                         if (neighbor != null) TvSimilarRail(
                             type = MediaType.MOVIE,
                             titles = listOf(neighbor),
-                            onOpen = { item ->
-                                scope.launch {
-                                    val tt = TMDBPersonClient.imdbId(item.id, item.type)
-                                    onOpenTitle(if (tt != null) item.copy(id = tt) else item)
-                                }
-                            },
+                            onOpen = openRelated,
                             heading = heading,
                             modifier = Modifier.padding(top = TvDimens.rowGap),
                         )
                     }
                 TvCollectionRail(
                     collection = collection,
-                    onOpen = { item ->
-                        scope.launch {
-                            val tt = TMDBPersonClient.imdbId(item.id, item.type)
-                            onOpenTitle(if (tt != null) item.copy(id = tt) else item)
-                        }
-                    },
+                    onOpen = openRelated,
                     modifier = Modifier.padding(top = TvDimens.rowGap),
                 )
             }
@@ -589,12 +606,7 @@ private fun TvDetailContent(
                 TvSimilarRail(
                     type = detail.type,
                     titles = similarItems,
-                    onOpen = { item ->
-                        scope.launch {
-                            val tt = TMDBPersonClient.imdbId(item.id, item.type)
-                            onOpenTitle(if (tt != null) item.copy(id = tt) else item)
-                        }
-                    },
+                    onOpen = openRelated,
                     modifier = Modifier.padding(top = TvDimens.rowGap, bottom = TvDimens.edge),
                 )
             }
