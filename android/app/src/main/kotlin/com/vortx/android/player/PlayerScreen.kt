@@ -66,6 +66,7 @@ import com.vortx.android.cast.CastEligibility
 import com.vortx.android.cast.CastOverlay
 import com.vortx.android.cast.CastRouteChooserSheet
 import com.vortx.android.cast.rememberCastManager
+import com.vortx.android.data.PlayerResourceReleaseGate
 import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable

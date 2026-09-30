@@ -1,6 +1,7 @@
 package com.vortx.android.data
 
 import com.vortx.android.downloads.WatchedDownloadReclaimRequest
+import com.vortx.android.model.PlaybackContext
 
 /**
  * One local-play cleanup latch. It intentionally accepts facts in either order, but invokes [verifyAndReclaim]
