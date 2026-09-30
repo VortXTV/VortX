@@ -156,14 +156,38 @@ jobs:
           done
           grep -Fx "release tag: $TAG" "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" >/dev/null
 
+          ACTIVE_RECEIPT_BODY="$(jq -cn --arg action read-active-receipt '{action:$action}')"
+          ACTIVE_RECEIPT="$(signed_post "$ACTIVE_RECEIPT_BODY")"
+          jq -e --arg generation "$EXPECTED_ACTIVE" --arg receipt "$EXPECTED_RECEIPT_SHA" --arg source "$EXPECTED_SOURCE_SHA" --arg appcast "$EXPECTED_APPCAST_SHA" '
+            .active.manifest.generation == $generation and .active.receiptSha256 == $receipt and
+            .active.manifest.sourceSha256 == $source and .active.manifest.appcastSha256 == $appcast and
+            .active.manifest.android == null and .inheritedAndroidState != "active" and
+            (.inheritedAndroidState == "none" or .inheritedAndroidState == "valid")
+          ' <<<"$ACTIVE_RECEIPT" >/dev/null || { echo '::error::authenticated active receipt or inherited Android evidence differs from the requested Apple-only generation'; exit 1; }
+          jq -er '.active.appcastText' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/canonical-appcast.json"
+          jq -er '.active.sourceText' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/canonical-source.json"
+          [ "$(sha256sum "$RUNNER_TEMP/canonical-appcast.json" | awk '{print $1}')" = "$EXPECTED_APPCAST_SHA" ]
+          [ "$(sha256sum "$RUNNER_TEMP/canonical-source.json" | awk '{print $1}')" = "$EXPECTED_SOURCE_SHA" ]
+          jq -e --arg tag "$TAG" '._generatedFromTag == $tag and .android == null' "$RUNNER_TEMP/canonical-appcast.json" >/dev/null
+          jq -er '.inheritedAndroidState' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/inherited-android-state"
+          jq -c '.inheritedAndroid' <<<"$ACTIVE_RECEIPT" > "$RUNNER_TEMP/inherited-android.json"
+
           for ROUTE in altstore.json vortx-altstore.json appcast.json; do
             curl --fail-with-body --connect-timeout 5 --max-time 20 -sS -D "$RUNNER_TEMP/before-$ROUTE.headers" "https://vortx.tv/$ROUTE" -o "$RUNNER_TEMP/before-$ROUTE"
             grep -Fqi "x-vortx-feed-generation: $EXPECTED_ACTIVE" "$RUNNER_TEMP/before-$ROUTE.headers"
           done
           cmp -s "$RUNNER_TEMP/before-altstore.json" "$RUNNER_TEMP/before-vortx-altstore.json"
           [ "$(sha256sum "$RUNNER_TEMP/before-altstore.json" | awk '{print $1}')" = "$EXPECTED_SOURCE_SHA" ]
-          [ "$(sha256sum "$RUNNER_TEMP/before-appcast.json" | awk '{print $1}')" = "$EXPECTED_APPCAST_SHA" ]
-          jq -e --arg tag "$TAG" '._generatedFromTag == $tag and .android == null' "$RUNNER_TEMP/before-appcast.json" >/dev/null
+          jq -S 'del(.android)' "$RUNNER_TEMP/canonical-appcast.json" > "$RUNNER_TEMP/canonical-apple-appcast.json"
+          jq -S 'del(.android)' "$RUNNER_TEMP/before-appcast.json" > "$RUNNER_TEMP/public-apple-appcast.json"
+          cmp -s "$RUNNER_TEMP/canonical-apple-appcast.json" "$RUNNER_TEMP/public-apple-appcast.json" || { echo '::error::public appcast Apple entries differ from the authenticated active receipt'; exit 1; }
+          if [ "$(cat "$RUNNER_TEMP/inherited-android-state")" = "valid" ]; then
+            jq -S '.android' "$RUNNER_TEMP/before-appcast.json" > "$RUNNER_TEMP/public-inherited-android.json"
+            jq -S . "$RUNNER_TEMP/inherited-android.json" > "$RUNNER_TEMP/expected-inherited-android.json"
+            cmp -s "$RUNNER_TEMP/expected-inherited-android.json" "$RUNNER_TEMP/public-inherited-android.json" || { echo '::error::public inherited Android entry differs from authenticated predecessor evidence'; exit 1; }
+          else
+            jq -e '.android == null' "$RUNNER_TEMP/before-appcast.json" >/dev/null || { echo '::error::public appcast has Android without a verified predecessor'; exit 1; }
+          fi
 
           jq -n --arg action augment-android --arg operationId "augment-android:$RELEASE_ID:$EXPECTED_ACTIVE" --arg releaseId "$RELEASE_ID" --arg releaseTag "$TAG" --arg generation "$EXPECTED_ACTIVE" --arg receipt "$EXPECTED_RECEIPT_SHA" --arg source "$EXPECTED_SOURCE_SHA" --arg appcast "$EXPECTED_APPCAST_SHA" --slurpfile full "$RUNNER_TEMP/full-asset.json" --slurpfile play "$RUNNER_TEMP/play-asset.json" --slurpfile checksum "$RUNNER_TEMP/checksum-asset.json" --slurpfile provenance "$RUNNER_TEMP/provenance-asset.json" --rawfile checksumText "$RUNNER_TEMP/SHA256SUMS-android.txt" --rawfile provenanceText "$RUNNER_TEMP/SIGNING_PROVENANCE.txt" '{action:$action,operationId:$operationId,releaseId:$releaseId,releaseTag:$releaseTag,expectedActiveGeneration:$generation,expectedReceiptSha256:$receipt,expectedSourceSha256:$source,expectedAppcastSha256:$appcast,evidence:{assets:{full:$full[0],play:$play[0],checksum:$checksum[0],provenance:$provenance[0]},checksumText:$checksumText,provenanceText:$provenanceText}}' > "$RUNNER_TEMP/augment.json"
           SIGNATURE="$(openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary < "$RUNNER_TEMP/augment.json" | od -An -tx1 | tr -d ' \n')"

@@ -20,6 +20,19 @@ staged generations, the active generation, exact rollback snapshots, and an appe
 receipt. KV is deliberately not an authority for release state. Android is `null` until a signed
 artifact with a signer, build, URL, size, and digest is added to the release contract.
 
+The protected Android augmentation workflow reads the canonical active receipt through the
+HMAC-authenticated `read-active-receipt` action. This is distinct from the public appcast route,
+which can overlay a verified Android entry inherited from an earlier release while the active
+Apple receipt still records `android: null`. The read returns the active receipt and its stored
+predecessor Android state; augmentation proceeds only when Apple source/appcast/receipt digests
+match the supplied CAS values and the public Apple fields match the canonical appcast. Android
+`build` and `versionCode` come from exactly one signed-provenance `Android versionCode: N` marker,
+bound alongside exactly one `Android versionName: X.Y.Z` marker. Legacy predecessor entries without
+an explicit `versionCode` remain usable but are not treated as evidence of a numeric Android code.
+The protected `Inspect active release feed receipt` workflow reports only the active release
+identity and receipt/source/appcast digests needed to dispatch that CAS-bound augmentation; it
+does not print or persist the raw receipt or signing secret.
+
 The protected publisher may explicitly designate a strict `vX.Y.Z-beta.N` tag as Latest after
 checking the exact release-body channel marker. Its authenticated receipt then has
 `prerelease: false`, and the appcast must agree. The Worker accepts that bounded channel alongside

@@ -192,7 +192,37 @@ function provenanceBindsAPK(provenanceText, name) {
   return section.split(/\r?\n/).some((line) => line.trim().toUpperCase() === `SIGNER SHA-256: ${fingerprint}`);
 }
 
-async function buildAndroidAugmentation(payload, current) {
+async function findInheritedAndroid(current, storage) {
+  const seen = new Set([current.manifest.generation]);
+  let candidate = current;
+  for (let hop = 0; hop < MAX_ANDROID_PREDECESSOR_HOPS; hop += 1) {
+    const generation = candidate.manifest?.generation;
+    if (typeof generation !== "string") {
+      throw new Error("Android predecessor chain is malformed");
+    }
+    const promotion = await storage.get(`${AUDIT_PREFIX}promote:${generation}`);
+    const predecessor = await storage.get(`${ROLLBACK_PREFIX}${generation}`);
+    if (!predecessor) {
+      if (promotion?.previousGeneration) throw new Error("Android predecessor snapshot is missing");
+      return { state: "none", android: null };
+    }
+    const predecessorGeneration = predecessor.manifest?.generation;
+    if (typeof predecessorGeneration !== "string" || seen.has(predecessorGeneration)) {
+      throw new Error("Android predecessor chain is malformed");
+    }
+    if (promotion?.previousGeneration && promotion.previousGeneration !== predecessorGeneration) {
+      throw new Error("Android predecessor snapshot does not match its promotion audit");
+    }
+    seen.add(predecessorGeneration);
+    if (predecessor.manifest?.android != null) {
+      return { state: "valid", android: inheritedAndroid(predecessor.appcastText, predecessor.manifest) };
+    }
+    candidate = predecessor;
+  }
+  throw new Error("Android predecessor chain exceeds the supported history");
+}
+
+async function buildAndroidAugmentation(payload, current, storage) {
   if (!current?.manifest || !current.receiptSha256) throw new Error("Android augmentation requires a durable active receipt");
   if (
     payload.expectedActiveGeneration !== current.manifest.generation ||
@@ -226,6 +256,22 @@ async function buildAndroidAugmentation(payload, current) {
   if (new TextEncoder().encode(androidChecksumText).byteLength !== checksumAsset.size || await sha256(androidChecksumText) !== checksumAsset.sha256) throw new Error("Android checksum evidence bytes do not match the immutable release asset");
   if (new TextEncoder().encode(provenanceText).byteLength !== provenanceAsset.size || await sha256(provenanceText) !== provenanceAsset.sha256) throw new Error("Android provenance evidence bytes do not match the immutable release asset");
   if (checksumRecord(androidChecksumText, names.full) !== fullAsset.sha256 || checksumRecord(androidChecksumText, names.play) !== playAsset.sha256) throw new Error("Android APK digests do not match checksum evidence");
+  const versionCodeMarkers = provenanceText.match(/^[ \t]*Android versionCode:.*$/gm) || [];
+  const versionNameMarkers = provenanceText.match(/^[ \t]*Android versionName:.*$/gm) || [];
+  if (versionCodeMarkers.length !== 1 || versionNameMarkers.length !== 1) throw new Error("Android provenance must contain exactly one versionCode and versionName marker");
+  const versionCodeMatch = versionCodeMarkers[0].match(/^Android versionCode: (\d+)$/);
+  const versionNameMatch = versionNameMarkers[0].match(/^Android versionName: ([^\r\n]+)$/);
+  if (!versionCodeMatch || !versionNameMatch) throw new Error("Android versionCode and versionName markers are malformed");
+  const versionCode = Number(versionCodeMatch[1]);
+  if (!Number.isSafeInteger(versionCode) || versionCode <= 0) throw new Error("Android versionCode must be a positive safe integer");
+  if (versionNameMatch[1] !== version) throw new Error("Android versionName does not match the release version");
+
+  const previousAndroid = await findInheritedAndroid(current, storage);
+  const priorCodes = previousAndroid.state === "valid"
+    ? [previousAndroid.android.full?.versionCode, previousAndroid.android.play?.versionCode].filter((value) => value !== undefined && value !== null)
+    : [];
+  if (priorCodes.some((value) => !Number.isSafeInteger(Number(value)) || Number(value) <= 0)) throw new Error("inherited Android versionCode metadata is invalid");
+  if (priorCodes.some((value) => Number(value) >= versionCode)) throw new Error("Android versionCode must exceed the previous verified Android versionCode");
   if (
     !provenanceBindsAPK(provenanceText, names.full) ||
     !provenanceBindsAPK(provenanceText, names.play) ||
@@ -237,7 +283,8 @@ async function buildAndroidAugmentation(payload, current) {
   const androidEntry = (flavor, engine, asset) => ({
     tag,
     version,
-    build: Number(current.manifest.build),
+    build: versionCode,
+    versionCode,
     name: current.manifest.name,
     notes: current.manifest.notes,
     prerelease: Boolean(current.manifest.prerelease),
@@ -311,10 +358,18 @@ function inheritedAndroid(appcastText, manifest) {
   };
   for (const [flavor, requirement] of Object.entries(requirements)) {
     const entry = android[flavor];
-    if (!entry || entry.flavor !== flavor || entry.engine !== requirement.engine || entry.applicationId !== "com.vortx.android" || entry.artifactType !== "apk" || entry.signed !== true || entry.tag !== manifest.tag || entry.version !== manifest.version || Number(entry.build) !== Number(manifest.build) || entry.name !== manifest.name || entry.notes !== manifest.notes || Boolean(entry.prerelease) !== Boolean(manifest.prerelease) || entry.url !== releaseAssetURL(manifest.tag, requirement.name) || !Number.isInteger(Number(entry.size)) || Number(entry.size) <= 0 || digest(entry.sha256, `predecessor Android ${flavor} sha256`) !== entry.sha256 || entry.signer !== ANDROID_SIGNER_SHA256) {
+    const build = Number(entry?.build);
+    const versionCode = entry?.versionCode == null ? null : Number(entry.versionCode);
+    const invalidCode = versionCode === null
+      ? build !== Number(manifest.build)
+      : !Number.isSafeInteger(versionCode) || versionCode <= 0 || versionCode !== build;
+    if (!entry || entry.flavor !== flavor || entry.engine !== requirement.engine || entry.applicationId !== "com.vortx.android" || entry.artifactType !== "apk" || entry.signed !== true || entry.tag !== manifest.tag || entry.version !== manifest.version || !Number.isSafeInteger(build) || build <= 0 || invalidCode || entry.name !== manifest.name || entry.notes !== manifest.notes || Boolean(entry.prerelease) !== Boolean(manifest.prerelease) || entry.url !== releaseAssetURL(manifest.tag, requirement.name) || !Number.isInteger(Number(entry.size)) || Number(entry.size) <= 0 || digest(entry.sha256, `predecessor Android ${flavor} sha256`) !== entry.sha256 || entry.signer !== ANDROID_SIGNER_SHA256) {
       throw new Error(`predecessor Android ${flavor} metadata is invalid`);
     }
   }
+  const fullCode = android.full.versionCode == null ? null : Number(android.full.versionCode);
+  const playCode = android.play.versionCode == null ? null : Number(android.play.versionCode);
+  if (fullCode !== playCode) throw new Error("predecessor Android versionCode metadata conflicts between flavors");
   return android;
 }
 
@@ -432,8 +487,18 @@ export class FeedCoordinator {
 
   async fetch(request) {
     const payload = await request.json();
-    if (payload.action === "read-active") {
+    if (payload.action === "read-active" || payload.action === "read-active-receipt") {
       const active = await this.state.storage.get(ACTIVE_KEY);
+      if (payload.action === "read-active-receipt") {
+        if (!active) return jsonResponse({ active: null, inheritedAndroidState: "none", inheritedAndroid: null });
+        if (active.manifest?.android != null) return jsonResponse({ active, inheritedAndroidState: "active", inheritedAndroid: null });
+        try {
+          const inherited = await findInheritedAndroid(active, this.state.storage);
+          return jsonResponse({ active, inheritedAndroidState: inherited.state, inheritedAndroid: inherited.android });
+        } catch (error) {
+          return failure(409, "active-predecessor-invalid", error instanceof Error ? error.message : "Android predecessor chain is invalid");
+        }
+      }
       if (active?.manifest?.android != null) return jsonResponse({ active, predecessors: [] });
       const predecessors = [];
       const seen = new Set();
@@ -593,7 +658,7 @@ export class FeedCoordinator {
         }
         let successor;
         try {
-          successor = await buildAndroidAugmentation(payload, current);
+          successor = await buildAndroidAugmentation(payload, current, storage);
         } catch (error) {
           return failure(409, "augmentation-evidence-conflict", error instanceof Error ? error.message : "Android augmentation evidence is invalid");
         }
@@ -670,7 +735,7 @@ async function handleReceipt(request, env) {
     const validated = await validateStage(payload);
     return stageReceipt({ ...payload, ...validated }, env);
   }
-  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover" || payload.action === "augment-android" || payload.action === "operation-status") return coordinatorRequest(request, env, payload);
+  if (payload.action === "promote" || payload.action === "rollback" || payload.action === "recover" || payload.action === "augment-android" || payload.action === "operation-status" || payload.action === "read-active-receipt") return coordinatorRequest(request, env, payload);
   return failure(400, "receipt-action", "unsupported receipt action");
 }
 

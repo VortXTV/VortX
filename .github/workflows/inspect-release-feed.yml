@@ -1,0 +1,40 @@
+name: Inspect active release feed receipt
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    environment: release-approval
+    timeout-minutes: 5
+    steps:
+      - name: Read the authenticated active receipt identity and digests
+        env:
+          RELEASE_FEED_RECEIPT_SECRET: ${{ secrets.RELEASE_FEED_RECEIPT_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RELEASE_FEED_RECEIPT_SECRET:-}" ] || { echo '::error::release feed receipt secret is unavailable'; exit 1; }
+          printf '::add-mask::%s\n' "$RELEASE_FEED_RECEIPT_SECRET"
+          BODY='{"action":"read-active-receipt"}'
+          SIGNATURE="$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$RELEASE_FEED_RECEIPT_SECRET" -binary | od -An -tx1 | tr -d ' \n')"
+          RESPONSE="$(curl --fail-with-body --connect-timeout 5 --max-time 20 -sS \
+            -H 'Content-Type: application/json' -H "X-VortX-Receipt: sha256=$SIGNATURE" \
+            --data-binary "$BODY" https://vortx.tv/__release/receipt)"
+          jq -e '
+            .active.manifest.generation and .active.receiptSha256 and
+            .active.manifest.sourceSha256 and .active.manifest.appcastSha256 and
+            .active.manifest.tag and .active.manifest.releaseId
+          ' <<<"$RESPONSE" >/dev/null || { echo '::error::active release receipt is unavailable or incomplete'; exit 1; }
+          jq -r '
+            "Active release: \(.active.manifest.tag) (ID \(.active.manifest.releaseId))",
+            "Generation: \(.active.manifest.generation)",
+            "Receipt SHA-256: \(.active.receiptSha256)",
+            "Source SHA-256: \(.active.manifest.sourceSha256)",
+            "Appcast SHA-256: \(.active.manifest.appcastSha256)",
+            "Source commit: \(.active.manifest.sourceCommit)"
+          ' <<<"$RESPONSE"
