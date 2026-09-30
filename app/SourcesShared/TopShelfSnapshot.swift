@@ -72,6 +72,100 @@ enum TopShelfSnapshot {
         let items: [Item]
     }
 
+    /// Pure state transitions used by the app-side private Trakt publisher. Keeping these rules in the
+    /// Foundation-only contract lets the standalone tests exercise the privacy boundary without linking
+    /// TVServices or the engine model, while the Top Shelf extension still compiles only this file.
+    enum PrivatePublicationPolicy {
+        /// The stable identity of one selected row. Playback progress is deliberately absent: a progress
+        /// tick must update the JSON row but must not cancel an in-flight image warm or prune its cache.
+        struct ArtworkInput: Equatable, Sendable {
+            let id: String
+            let type: String
+            let poster: String?
+        }
+
+        private struct RowKey: Hashable {
+            let id: String
+            let type: String
+        }
+
+        /// Restart warming only when ownership or the selected row/artwork set changes. Titles and
+        /// progress belong to the publication payload, not to the CDN/cache identity.
+        static func requiresWarmRestart(
+            previousSessionRaw: String?,
+            currentSessionRaw: String?,
+            previousArtworkInputs: [ArtworkInput]?,
+            currentArtworkInputs: [ArtworkInput]
+        ) -> Bool {
+            previousSessionRaw != currentSessionRaw
+                || previousArtworkInputs != currentArtworkInputs
+        }
+
+        /// Apply a fresh title/progress publication while retaining only previously generated managed
+        /// `file://` posters. A remote URL can never be carried forward through this merge.
+        static func mergingCurrentProgress(
+            pending: [Item],
+            previouslyPublished: [Item]
+        ) -> [Item] {
+            var managedPosters: [RowKey: String] = [:]
+            for item in previouslyPublished {
+                guard let poster = item.poster,
+                      let url = URL(string: poster),
+                      url.isFileURL else { continue }
+                managedPosters[RowKey(id: item.id, type: item.type)] = poster
+            }
+            return pending.map { item in
+                guard let poster = managedPosters[RowKey(id: item.id, type: item.type)] else {
+                    return item
+                }
+                return Item(
+                    id: item.id,
+                    type: item.type,
+                    title: item.title,
+                    poster: poster,
+                    progress: item.progress
+                )
+            }
+        }
+
+        /// An auth-boundary callback is relevant only while the emitted session is still the certified
+        /// current session. A stale callback for an old account cannot clear a newer private publication;
+        /// a current callback never clears a local overlay row.
+        static func shouldClearObsoletePrivateOwner(
+            emittedSessionRaw: String?,
+            currentSessionRaw: String?,
+            privateOwnerRaw: String?,
+            publishedPrivateRows: Bool
+        ) -> Bool {
+            guard emittedSessionRaw == currentSessionRaw,
+                  let privateOwnerRaw,
+                  privateOwnerRaw != currentSessionRaw else { return false }
+            return publishedPrivateRows
+        }
+
+        /// Validate response metadata before accepting a bounded byte stream. The writer supplies the
+        /// strict first-party-final-URL result from `TraktArtworkPolicy`; this helper owns status/MIME/
+        /// length accounting and is intentionally independent of URLSession.
+        static func acceptsArtworkResponse(
+            finalURLIsFirstParty: Bool,
+            statusCode: Int,
+            mimeType: String?,
+            expectedContentLength: Int64?,
+            accumulatedBytes: Int
+        ) -> Bool {
+            guard finalURLIsFirstParty,
+                  (200..<300).contains(statusCode),
+                  mimeType?.lowercased().hasPrefix("image/") == true,
+                  accumulatedBytes > 0,
+                  accumulatedBytes <= TopShelfSnapshot.maxArtworkBytes else { return false }
+            if let expectedContentLength,
+               expectedContentLength > Int64(TopShelfSnapshot.maxArtworkBytes) {
+                return false
+            }
+            return true
+        }
+    }
+
     // MARK: Container
 
     /// The shared container, or nil when the App Group is not provisioned (unsigned build, Lite, or a

@@ -15,21 +15,44 @@ import TVServices
 /// the watched / sync file set is touched.
 enum TopShelfSnapshotWriter {
 
-    private struct WarmCandidate: Sendable, Equatable {
+    private typealias WarmCandidate = TopShelfSnapshot.PrivatePublicationPolicy.ArtworkInput
+
+    private struct ArtworkRowKey: Hashable, Sendable {
         let id: String
         let type: String
-        let poster: String?
     }
 
-    /// One in-flight private-art warm pass. Every new publication cancels the previous pass and advances
-    /// `publicationGeneration`; the generation check is the commit fence for out-of-order profile/auth
-    /// refreshes. The pending queue is still published synchronously before this task starts.
+    /// One in-flight private-art warm pass. An owner or artwork-set change cancels the previous pass and
+    /// advances `publicationGeneration`; a progress-only publication preserves it. The generation check
+    /// is the commit fence for out-of-order profile/auth refreshes. The pending queue is published before
+    /// this task starts.
     @MainActor private static var warmTask: Task<Void, Never>?
     @MainActor private static var publicationGeneration: UInt64 = 0
     @MainActor private static var authBoundaryInstalled = false
     @MainActor private static var lastPrivateSessionID: TraktSessionID?
-    @MainActor private static var lastPrivatePending: [TopShelfSnapshot.Item]?
     @MainActor private static var lastPrivateArtworkInputs: [WarmCandidate]?
+    @MainActor private static var lastPrivatePublished: [TopShelfSnapshot.Item]?
+    @MainActor private static var lastPublishedSelectionSource: TraktPlaybackShadow.ContinueWatchingSource?
+
+    /// Redirects are admitted only while every hop remains an exact first-party Trakt image URL. The
+    /// initial URL is validated before the request starts; this delegate closes the privacy gap where a
+    /// trusted CDN URL could redirect the app's private image fetch to an unrelated host.
+    private final class ArtworkSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            guard let url = request.url,
+                  TraktArtworkPolicy.isFirstPartyArtwork(url.absoluteString) else {
+                completionHandler(nil)
+                return
+            }
+            completionHandler(request)
+        }
+    }
 
     /// Private, cookie-free image session. Trakt's CDN image bytes are written into the managed App Group
     /// cache below; the extension later reads a local file URL and never re-fetches the raw CDN URL.
@@ -41,7 +64,7 @@ enum TopShelfSnapshotWriter {
         configuration.waitsForConnectivity = false
         configuration.httpShouldSetCookies = false
         configuration.urlCache = nil
-        return URLSession(configuration: configuration)
+        return URLSession(configuration: configuration, delegate: ArtworkSessionDelegate(), delegateQueue: nil)
     }()
 
     /// User setting: mirror Continue Watching onto the tvOS Home screen's Top Shelf.
@@ -88,7 +111,16 @@ enum TopShelfSnapshotWriter {
             selection = .init(items: profiles.cwItems, source: .local, sessionID: nil)
         }
         let pending = items(from: selection.items, source: selection.source)
-        let sourceItems = selection.items.map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) }
+        // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
+        // finished, removed, or temporary seeds; those rows never render and must not consume one of the
+        // bounded eight private-image requests.
+        let sourceItems = Array(selection.items.lazy
+            .filter {
+                EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
+            }
+            .filter { $0.removed != true && $0.temp != true }
+            .prefix(TopShelfSnapshot.maxItems)
+            .map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) })
 
         // A private Trakt row is published immediately with nil artwork. The only later replacement is
         // a local file URL produced by the bounded first-party warm pass; joined third-party artwork is
@@ -99,27 +131,38 @@ enum TopShelfSnapshotWriter {
         if selection.source == .trakt,
            let sessionID = selection.sessionID,
            TopShelfSnapshot.containerURL != nil,
-           sessionID == lastPrivateSessionID,
-           pending == lastPrivatePending,
-           sourceItems == lastPrivateArtworkInputs {
-            // Home re-seeds frequently. The pending queue is unchanged, so the existing warm pass (or
-            // its completed local-file replacements) already owns this exact publication. Restarting it
-            // here would defeat Trakt's cache requirement and create a CDN request on every redraw.
+           lastPublishedSelectionSource == .trakt,
+           let previouslyPublished = lastPrivatePublished,
+           !TopShelfSnapshot.PrivatePublicationPolicy.requiresWarmRestart(
+               previousSessionRaw: lastPrivateSessionID?.rawValue,
+               currentSessionRaw: sessionID.rawValue,
+               previousArtworkInputs: lastPrivateArtworkInputs,
+               currentArtworkInputs: sourceItems
+           ) {
+            // Home re-seeds frequently. Progress/title changes are a new publication, not a new image
+            // owner: preserve managed file posters and the in-flight warm pass, then publish the fresh
+            // progress immediately. This avoids a CDN request and cache prune on every playback tick.
+            let updated = TopShelfSnapshot.PrivatePublicationPolicy.mergingCurrentProgress(
+                pending: pending,
+                previouslyPublished: previouslyPublished
+            )
+            lastPrivatePublished = updated
+            publish(updated)
             return
         }
         cancelWarm(clearArtwork: true)
+        lastPublishedSelectionSource = selection.source
         publish(pending)
         guard selection.source == .trakt,
               let sessionID = selection.sessionID,
               TopShelfSnapshot.containerURL != nil else { return }
 
         lastPrivateSessionID = sessionID
-        lastPrivatePending = pending
         lastPrivateArtworkInputs = sourceItems
+        lastPrivatePublished = pending
         let generation = publicationGeneration
         warmTask = Task.detached(priority: .utility) {
             await warmTraktArtwork(
-                pending: pending,
                 sourceItems: sourceItems,
                 sessionID: sessionID,
                 generation: generation
@@ -131,6 +174,7 @@ enum TopShelfSnapshotWriter {
     @MainActor
     static func clear() {
         cancelWarm(clearArtwork: true)
+        lastPublishedSelectionSource = nil
         publish([])
     }
 
@@ -225,14 +269,39 @@ enum TopShelfSnapshotWriter {
     private static func installAuthBoundaryObserver() {
         guard !authBoundaryInstalled else { return }
         authBoundaryInstalled = true
-        TraktAuthBoundary.observe(key: "trakt-top-shelf") { _ in
+        TraktAuthBoundary.observe(key: "trakt-top-shelf") { emittedSessionID in
             // The auth boundary is synchronous and may be announced from a credential worker. Hop to
-            // the main actor before touching the generation/task state or notifying TVServices.
+            // the main actor before touching the generation/task state or notifying TVServices. The
+            // emitted session is part of the event: an old callback must not clear a newer publication.
             Task { @MainActor in
-                cancelWarm(clearArtwork: true)
-                publish([])
+                let observedGeneration = publicationGeneration
+                handleAuthBoundary(
+                    emittedSessionID: emittedSessionID,
+                    observedGeneration: observedGeneration
+                )
             }
         }
+    }
+
+    @MainActor
+    private static func handleAuthBoundary(
+        emittedSessionID: TraktSessionID?,
+        observedGeneration: UInt64
+    ) {
+        guard observedGeneration == publicationGeneration,
+              TraktAuth.storedSessionID == emittedSessionID,
+              TopShelfSnapshot.PrivatePublicationPolicy.shouldClearObsoletePrivateOwner(
+                  emittedSessionRaw: emittedSessionID?.rawValue,
+                  currentSessionRaw: TraktAuth.storedSessionID?.rawValue,
+                  privateOwnerRaw: lastPrivateSessionID?.rawValue,
+                  publishedPrivateRows: lastPublishedSelectionSource == .trakt
+              ) else { return }
+
+        // Only an obsolete private owner is cleared. A stale auth event never reaches this branch, and a
+        // local overlay publication is left intact rather than replaced by an empty shelf.
+        cancelWarm(clearArtwork: true)
+        lastPublishedSelectionSource = nil
+        publish([])
     }
 
     @MainActor
@@ -242,8 +311,9 @@ enum TopShelfSnapshotWriter {
         warmTask = nil
         if clearArtwork {
             lastPrivateSessionID = nil
-            lastPrivatePending = nil
             lastPrivateArtworkInputs = nil
+            lastPrivatePublished = nil
+            lastPublishedSelectionSource = nil
             TopShelfSnapshot.clearArtworkCache()
         }
     }
@@ -252,16 +322,15 @@ enum TopShelfSnapshotWriter {
     /// the original account/profile publication still owns the generation. The Top Shelf gets a pending
     /// title/progress queue immediately; a later commit merely fills local file URLs for successful art.
     private static func warmTraktArtwork(
-        pending: [TopShelfSnapshot.Item],
         sourceItems: [WarmCandidate],
         sessionID: TraktSessionID,
         generation: UInt64
     ) async {
-        var replacements: [String: String] = [:]
+        var replacements: [ArtworkRowKey: String] = [:]
 
-        for item in pending.prefix(TopShelfSnapshot.maxItems) {
+        for candidate in sourceItems.prefix(TopShelfSnapshot.maxItems) {
             guard !Task.isCancelled,
-                  let raw = sourceItems.first(where: { $0.id == item.id && $0.type == item.type })?.poster,
+                  let raw = candidate.poster,
                   TraktArtworkPolicy.isFirstPartyArtwork(raw),
                   let url = URL(string: raw),
                   let data = await fetchTraktArtwork(from: url) else { continue }
@@ -272,11 +341,16 @@ enum TopShelfSnapshotWriter {
             let stored: (owned: Bool, url: URL?) = await MainActor.run {
                 guard generation == publicationGeneration,
                       TraktAuth.storedSessionID == sessionID,
-                      isEnabled else { return (false, nil) }
+                      isEnabled,
+                      lastPrivateSessionID == sessionID,
+                      lastPrivateArtworkInputs == sourceItems,
+                      lastPublishedSelectionSource == .trakt else { return (false, nil) }
                 return (true, TopShelfSnapshot.storeArtwork(data, for: raw))
             }
             guard stored.owned else { return }
-            if let localURL = stored.url { replacements[item.id] = localURL.absoluteString }
+            if let localURL = stored.url {
+                replacements[ArtworkRowKey(id: candidate.id, type: candidate.type)] = localURL.absoluteString
+            }
         }
 
         guard !Task.isCancelled else { return }
@@ -284,35 +358,59 @@ enum TopShelfSnapshotWriter {
         await MainActor.run {
             guard generation == publicationGeneration,
                   TraktAuth.storedSessionID == sessionID,
-                  isEnabled else { return }
-            let updated = pending.map { item -> TopShelfSnapshot.Item in
-                guard let local = replacementURLs[item.id] else { return item }
-                return TopShelfSnapshot.Item(
-                    id: item.id,
-                    type: item.type,
-                    title: item.title,
-                    poster: local,
-                    progress: item.progress
-                )
+                  isEnabled,
+                  lastPrivateSessionID == sessionID,
+                  lastPrivateArtworkInputs == sourceItems,
+                  lastPublishedSelectionSource == .trakt,
+                  let current = lastPrivatePublished else { return }
+            let updated = current.map { item -> TopShelfSnapshot.Item in
+                guard let local = replacementURLs[ArtworkRowKey(id: item.id, type: item.type)] else {
+                    return item
+                }
+                return TopShelfSnapshot.Item(id: item.id, type: item.type, title: item.title, poster: local, progress: item.progress)
             }
+            lastPrivatePublished = updated
             publish(updated)
         }
     }
 
     private static func fetchTraktArtwork(from url: URL) async -> Data? {
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled,
+              TraktArtworkPolicy.isFirstPartyArtwork(url.absoluteString) else { return nil }
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("image/*", forHTTPHeaderField: "Accept")
         do {
-            let (data, response) = try await artworkSession.data(for: request)
-            guard !Task.isCancelled,
-                  data.count > 0,
-                  data.count <= TopShelfSnapshot.maxArtworkBytes,
-                  let http = response as? HTTPURLResponse,
-                  (200..<300).contains(http.statusCode),
-                  http.mimeType?.lowercased().hasPrefix("image/") == true else { return nil }
+            let (bytes, response) = try await artworkSession.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  let finalURL = response.url,
+                  TraktArtworkPolicy.isFirstPartyArtwork(finalURL.absoluteString),
+                  TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+                      finalURLIsFirstParty: true,
+                      statusCode: http.statusCode,
+                      mimeType: http.mimeType,
+                      expectedContentLength: http.expectedContentLength,
+                      accumulatedBytes: 1
+                  ) else { return nil }
+            var data = Data()
+            if http.expectedContentLength > 0 {
+                data.reserveCapacity(min(Int(http.expectedContentLength), TopShelfSnapshot.maxArtworkBytes))
+            }
+            for try await byte in bytes {
+                try Task.checkCancellation()
+                // Returning from the AsyncBytes sequence tears down this request; do not let an
+                // unknown-length response accumulate beyond the managed per-image bound.
+                guard data.count < TopShelfSnapshot.maxArtworkBytes else { return nil }
+                data.append(byte)
+            }
+            guard TopShelfSnapshot.PrivatePublicationPolicy.acceptsArtworkResponse(
+                finalURLIsFirstParty: TraktArtworkPolicy.isFirstPartyArtwork(finalURL.absoluteString),
+                statusCode: http.statusCode,
+                mimeType: http.mimeType,
+                expectedContentLength: http.expectedContentLength,
+                accumulatedBytes: data.count
+            ) else { return nil }
             return data
         } catch {
             return nil
