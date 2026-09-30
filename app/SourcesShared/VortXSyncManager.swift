@@ -472,6 +472,9 @@ final class VortXSyncManager: ObservableObject {
     /// pull that carried a newer order. Views showing the add-on list observe it to re-sort live, since
     /// appliedAddonOrder is a plain UserDefaults static (not @Published) and gives SwiftUI no other signal.
     static let addonOrderChangedNote = Notification.Name("vortx.addonOrderChanged")
+    /// Posted after the process-wide VortX credential namespace changes. CoreBridge uses this
+    /// non-secret generation receipt to retire queued engine history before a new owner hydrates.
+    static let credentialScopeDidChangeNote = Notification.Name("vortx.credentialScopeDidChange")
 
     private func publishAppliedAddonOrder(_ order: [String]) {
         let normalized = AddonOrderSyncPolicy.unique(order.map(AddonTombstones.normalize))
@@ -809,11 +812,16 @@ final class VortXSyncManager: ObservableObject {
         // A busy publication boundary is a hard composition failure. Do not let any dependent store, source
         // index, or session field observe a partial owner transition; the caller leaves all of them untouched.
         guard let capture = credentialAuthority.tryBind(scope) else { return nil }
+        if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
         cancelProviderLegacyMigration(except: capture)
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
         OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
         OwnerWatchedIntentStore.bind(ownerID: scope.keychainOwnerID)
+        NotificationCenter.default.post(
+            name: Self.credentialScopeDidChangeNote,
+            object: nil,
+            userInfo: ["generation": capture.generation])
         return capture
     }
 
@@ -825,11 +833,16 @@ final class VortXSyncManager: ObservableObject {
         certifying: @MainActor () -> CredentialMutationResult
     ) -> CredentialScopeRegistry.Capture? {
         guard let capture = credentialAuthority.tryBind(scope, certifying: certifying) else { return nil }
+        if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
         cancelProviderLegacyMigration(except: capture)
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
         OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
         OwnerWatchedIntentStore.bind(ownerID: scope.keychainOwnerID)
+        NotificationCenter.default.post(
+            name: Self.credentialScopeDidChangeNote,
+            object: nil,
+            userInfo: ["generation": capture.generation])
         return capture
     }
 
@@ -1090,6 +1103,10 @@ final class VortXSyncManager: ObservableObject {
     private func establishCredentialOwner(_ capture: CredentialScopeRegistry.Capture) -> Bool {
         guard let established = credentialAuthority.establishAuthenticatedOwner(capture),
               case .account = established.scope else { return false }
+        NotificationCenter.default.post(
+            name: Self.credentialScopeDidChangeNote,
+            object: nil,
+            userInfo: ["generation": established.generation])
         let owner = established.scope
         _ = ApiKeys.shared.migrateLegacyIfEligible(owner: owner, capture: established)
         _ = DebridKeys.shared.migrateLegacyIfEligible(owner: owner, capture: established)
@@ -2845,7 +2862,17 @@ final class VortXSyncManager: ObservableObject {
         // skipped the re-add but converged new offsets. The per-title re-add library events also rebuild, but
         // this final pass guarantees a consistent rail regardless of event coalescing.
         guard isCurrent(capture) else { return }
-        CoreBridge.shared.rebuildContinueWatching()
+        // CoreBridge keeps account-local history closed across the owner boundary.  The recommendation
+        // inputs come directly from this decrypted document, never from the resident engine arrays that
+        // may still belong to the previous account.  A successful document with no library is an explicit
+        // empty source snapshot; failed/empty pulls returned above create no receipt.
+        let source = BecauseYouWatchedDocumentHistory.snapshot(
+            from: doc,
+            removedIDs: LibraryTombstones.all())
+        CoreBridge.shared.recordOwnedHistoryHydration(
+            credentialCapture: capture,
+            library: source.library,
+            continueWatching: source.continueWatching)
     }
 
     /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's

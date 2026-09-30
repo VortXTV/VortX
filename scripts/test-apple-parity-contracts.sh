@@ -43,6 +43,15 @@ swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Tests/BecauseYouWatchedHistoryReceiptContractTests.swift -o "$build_dir/watch-history-receipt"
 "$build_dir/watch-history-receipt" "$repo_root"
 swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift \
+  app/Tests/BecauseYouWatchedGuestProvenancePolicyTests.swift -o "$build_dir/watch-guest-provenance"
+"$build_dir/watch-guest-provenance"
+swiftc -parse-as-library -D DOCUMENT_HISTORY_STANDALONE_TEST -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/DetailMetaRecoveryPolicy.swift app/SourcesShared/LibraryWatchedMutationPolicy.swift \
+  app/SourcesShared/BecauseYouWatchedDocumentHistory.swift \
+  app/Tests/BecauseYouWatchedDocumentHistoryTests.swift -o "$build_dir/watch-document-history"
+"$build_dir/watch-document-history"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Tests/BecauseYouWatchedCredentialBoundaryContractTests.swift -o "$build_dir/watch-credentials"
 "$build_dir/watch-credentials" "$repo_root"
 swiftc -strict-concurrency=complete -warnings-as-errors \

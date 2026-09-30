@@ -308,7 +308,7 @@ final class StremioAccount: ObservableObject {
             let wasSignedIn = isSignedIn
             // The active profile/keychain slot was captured before the await. Never resolve the
             // destination dynamically from the profile selected after the response returned.
-            // Never use the old dynamic `authKey = key` destination after this await: the selected
+            // Never use a dynamically selected credential destination after this await: the selected
             // profile may have changed. Write only to the slot captured before the request started.
             Keychain.set(key, for: context.keychainAccount)
             guard authOperationStillCurrent(context) else { return }

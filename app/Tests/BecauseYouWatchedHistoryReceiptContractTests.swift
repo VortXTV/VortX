@@ -36,6 +36,8 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
         let root = CommandLine.arguments.dropFirst().first ?? FileManager.default.currentDirectoryPath
         guard let policy = read(root, "app/SourcesShared/BecauseYouWatchedHistoryPolicy.swift"),
               let bridge = read(root, "app/SourcesShared/CoreBridge.swift"),
+              let sync = read(root, "app/SourcesShared/VortXSyncManager.swift"),
+              let documentHistory = read(root, "app/SourcesShared/BecauseYouWatchedDocumentHistory.swift"),
               let account = read(root, "app/SourcesShared/StremioAccount.swift"),
               let tv = read(root, "app/SourcesTV/HomeView.swift"),
               let ios = read(root, "app/SourcesiOS/iOSRootView.swift") else {
@@ -137,6 +139,23 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
         check(localReplacement == .readyEngine && localAdmission.isReady,
               "new local owner receipt restores admission after a local boundary")
 
+        // Cold imported-away startup retains a Stremio slot but must stay closed until the exact
+        // VortX-owned hydration receipt arrives. A later board event cannot stand in for that proof.
+        var coldImportedAway = Admission()
+        let coldOwnerKey = "imported-cold-owner"
+        let coldPending = coldImportedAway.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: coldOwnerKey,
+            snapshot: snapshot(nil, revision: 6, fields: []))
+        check(coldPending == .unsettledEngine && !coldImportedAway.isReady,
+              "retained imported token without a hydration receipt stays gated")
+        let coldReceipt = coldImportedAway.evaluate(
+            usesEngineHistory: true, activeProfileID: profileA,
+            activeKeychainAccount: "stremiox.auth", ownerKey: "imported-cold-owner-ready",
+            snapshot: snapshot(localOwnerA, revision: 7, fields: ["library"]))
+        check(coldReceipt == .readyEngine && coldImportedAway.isReady,
+              "exact local owner hydration receipt restores cold imported-away admission")
+
         // Production source contracts: only accepted decoded account history creates the durable
         // receipt; epoch/profile resets clear it; Home consumes it instead of raw changedFields; and
         // auth awaits carry an exact non-secret owner context.
@@ -148,7 +167,10 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
                 bridge.contains("func settledLocalHistoryOwner()") &&
                 bridge.contains("CredentialScopeRegistry.shared.capture()") &&
                 bridge.contains("isMigrationEligible(credentialCapture)") &&
-                bridge.contains("localHistoryRecoveryInFlight"),
+                bridge.contains("localHistoryRecoveryInFlight") &&
+                bridge.contains("captureImportedAwayColdLocalRecoveryContext") &&
+                bridge.contains("importedAwayColdLocalRecoveryReady") &&
+                bridge.contains("recordOwnedHistoryHydration"),
               "CoreBridge owns the production owner-tagged history receipt")
         check(bridge.contains("lastAcceptedHistoryReceipt = nil") &&
                 bridge.contains("acceptedHistoryReceiptRevision = 0") &&
@@ -156,14 +178,25 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
                 bridge.contains("fields: [\"library\"]"),
               "receipt is cleared at boundaries and recorded only for concrete history fields")
         for (name, source) in [("tvOS", tv), ("iOS", ios)] {
-            check(source.contains("let receipt = core.lastAcceptedHistoryReceipt") &&
-                    source.contains("let localOwner = core.settledLocalHistoryOwner()") &&
-                    source.contains("owner: validReceipt?.owner ?? binding.map") &&
-                    source.contains("?? localOwner") &&
-                    source.contains("changedFields: validReceipt?.changedFields ?? []") &&
-                    source.contains("onChange(of: core.lastAcceptedHistoryReceipt?.revision)") &&
+            check(source.contains("acceptedLocalRecommendationHistory()") &&
+                    source.contains("localSource?.receipt.owner") &&
+                    source.contains("binding == nil") &&
                     !source.contains("changedFields: core.changedFields"),
-                  "\(name) Home uses the durable receipt, never latest changedFields")
+                  "\(name) Home uses source-owned local history, never resident fallback")
+
+            let providerRailsLeadHistoryGuard: Bool = {
+                guard let guardRange = source.range(of: "guard let owner = historySnapshot.owner"),
+                      let traktRange = source.range(of: "traktRails.refresh()"),
+                      let simklRange = source.range(of: "simklRails.refresh()"),
+                      let mediaServerRange = source.range(of: "mediaServerRails.refresh()") else {
+                    return false
+                }
+                return traktRange.lowerBound < guardRange.lowerBound &&
+                    simklRange.lowerBound < guardRange.lowerBound &&
+                    mediaServerRange.lowerBound < guardRange.lowerBound
+            }()
+            check(providerRailsLeadHistoryGuard,
+                  "\(name) independent provider rails refresh before personalized history admission")
         }
         check(account.contains("struct AuthOperationContext") &&
                 account.contains("authOperationStillCurrent(context)") &&
@@ -186,6 +219,38 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
                 bridge.contains("eventProfileID == ProfileStore.shared.active?.id.uuidString") &&
                 bridge.contains("eventKeychainAccount == ProfileStore.shared.activeKeychainAccount"),
               "CoreBridge rejects a delayed credential event for another selected owner")
+        check(bridge.contains("VortXSyncManager.credentialScopeDidChangeNote") &&
+                bridge.contains("capturedCredentialCapture: credentialCapture") &&
+                bridge.contains("CredentialScopeRegistry.shared.isCurrent(credentialCapture)") &&
+                bridge.contains("acceptedLocalRecommendationHistory") &&
+                !bridge.contains("resetSignedOutEngineForLocalHydration") &&
+                bridge.contains("await self.loadLibraryAndAwait()"),
+              "history source reads retain the exact VortX credential capture")
+        check(sync.contains("credentialScopeDidChangeNote") &&
+                sync.contains("BecauseYouWatchedDocumentHistory.snapshot") &&
+                sync.contains("library: source.library") &&
+                sync.contains("continueWatching: source.continueWatching") &&
+                !sync.contains("awaitLocalHistoryHydrationReset"),
+              "VortX owner transitions publish a boundary and hydration receipt")
+        check(bridge.contains("&& (!tokenPresent || (importedAwayFromStremio && importedAwayReady))"),
+              "ordinary retained Stremio tokens cannot masquerade as local-history authority")
+        check(bridge.contains("private func credentialScopeDidChange(") &&
+                bridge.contains("previousScope: CredentialScope?") &&
+                bridge.contains("localHistoryHydrationContext = beginLocalHistoryHydration()") &&
+                !bridge.contains("previousEstablishedScope") &&
+                !bridge.contains("resetSignedOutEngineForLocalHydration"),
+              "account-to-guest and A-to-B transitions close history without recommendation-only resets")
+        check(documentHistory.contains("DetailMetaRecoveryPolicy.catalogIDShape") &&
+                documentHistory.contains("case .imdb, .tmdb, .tvdb, .kitsu") &&
+                documentHistory.contains("document[\"vortx\"]") &&
+                documentHistory.contains("timeOffsetSeconds * 1000") &&
+                documentHistory.contains("CFGetTypeID(number)") &&
+                documentHistory.contains("CFBooleanGetTypeID()") &&
+                documentHistory.contains("seen.insert(item.id).inserted"),
+              "document mapper validates supported identifiers and excludes resident-state fallbacks")
+        check(bridge.contains("recordsHistoryReceipt: true") &&
+                bridge.contains("capturedCredentialCapture: credentialCapture"),
+              "library-triggered Continue Watching rebuild supplies its required receipt argument")
 
         if failures == 0 {
             print("ALL TESTS PASSED")

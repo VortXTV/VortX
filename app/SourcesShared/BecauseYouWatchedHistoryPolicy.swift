@@ -1,4 +1,36 @@
 import Foundation
+import CoreFoundation
+
+/// Missing provenance is not proof of guest ownership. A durable account exclusion is never cleared
+/// merely by a failed session restore or another account bind; only a genuinely fresh device can mint
+/// its initial guest receipt before the engine reads its persisted storage.
+enum BecauseYouWatchedGuestProvenancePolicy {
+    static func exclusionReceipt(from raw: Any?) -> Bool? {
+        guard let number = raw as? NSNumber,
+              CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+
+    static func acceptsDeviceHistory(exclusionReceipt: Bool?, isSignedOutDevice: Bool) -> Bool {
+        isSignedOutDevice && exclusionReceipt == false
+    }
+
+    static func canEstablishCleanDevice(
+        exclusionReceipt: Bool?, isSignedOutDevice: Bool, storageIsKnownFresh: Bool
+    ) -> Bool {
+        exclusionReceipt == nil && isSignedOutDevice && storageIsKnownFresh
+    }
+
+    static func storageIsKnownFresh(at directory: URL, fileManager: FileManager = .default) -> Bool {
+        do {
+            return try fileManager.contentsOfDirectory(atPath: directory.path).isEmpty
+        } catch {
+            let failure = error as NSError
+            return failure.domain == NSCocoaErrorDomain &&
+                (failure.code == NSFileReadNoSuchFileError || failure.code == NSFileNoSuchFileError)
+        }
+    }
+}
 
 /// Foundation-only admission for account-owned Home recommendation history.
 ///

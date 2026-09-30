@@ -1495,7 +1495,7 @@ struct iOSHomeView: View {
     /// nil-UID local-owner generation becomes authoritative once that history context settles.
     private var becauseYouWatchedOwnerKey: String {
         let binding = core.settledActiveAccountBinding()
-        let localOwner = core.settledLocalHistoryOwner()
+        let localOwner = core.acceptedLocalRecommendationHistory()?.receipt.owner
         return BecauseYouWatchedModel.recommendationOwnerKey(
             profileKeychainAccount: profiles.activeKeychainAccount,
             isSignedIn: account.isSignedIn,
@@ -1513,8 +1513,9 @@ struct iOSHomeView: View {
     /// only the newest engine event, so it is intentionally not used as owner-history evidence here.
     private var becauseYouWatchedHistorySnapshot: BecauseYouWatchedHistoryPolicy.Snapshot {
         let binding = core.settledActiveAccountBinding()
-        let localOwner = core.settledLocalHistoryOwner()
-        let receipt = core.lastAcceptedHistoryReceipt
+        let localSource = core.acceptedLocalRecommendationHistory()
+        let localOwner = localSource?.receipt.owner
+        let receipt = binding == nil ? localSource?.receipt : core.lastAcceptedHistoryReceipt
         let validReceipt: BecauseYouWatchedHistoryPolicy.Snapshot? = receipt.flatMap { candidate in
             guard let owner = candidate.owner else { return nil }
             if let binding {
@@ -1538,6 +1539,11 @@ struct iOSHomeView: View {
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
+        // These independently owned rails do not require the engine-history recommendation receipt.
+        // Keep their throttled refreshes live even while personalized history admission is settling.
+        traktRails.refresh()
+        simklRails.refresh()
+        mediaServerRails.refresh()
         let usesEngineHistory = profiles.activeUsesEngineHistory
         let activeKeychainAccount = profiles.activeKeychainAccount
         let historySnapshot = becauseYouWatchedHistorySnapshot
@@ -1557,8 +1563,29 @@ struct iOSHomeView: View {
             }
         }
 
-        let cw = usesEngineHistory ? core.continueWatching : profiles.cwItems
-        let library = usesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        let cw: [CoreCWItem]
+        let library: [CoreCWItem]
+        if !usesEngineHistory {
+            cw = profiles.cwItems
+            library = profiles.libraryItems
+        } else if core.settledActiveAccountBinding() != nil {
+            cw = core.continueWatching
+            library = core.library?.catalog ?? []
+        } else {
+            // A local VortX account's resident engine may still contain another owner's rows. Only
+            // consume the values carried by its current source-owned receipt, never that resident union.
+            guard let source = core.acceptedLocalRecommendationHistory(),
+                  source.receipt.owner == historySnapshot.owner else {
+                topPicks.clear()
+                becauseYouWatched.retireForUnsettledHistory(
+                    profileID: profiles.activeID, ownerKey: becauseYouWatchedOwnerKey,
+                    historySnapshot: historySnapshot
+                )
+                return
+            }
+            cw = source.continueWatching
+            library = source.library
+        }
         becauseYouWatched.refresh(
             profileID: profiles.activeID,
             cw: cw,
@@ -1573,9 +1600,6 @@ struct iOSHomeView: View {
         } else {
             topPicks.clear()
         }
-        traktRails.refresh()   // Trakt watchlist rail; internally throttled + dormant with empty creds
-        simklRails.refresh()   // SIMKL plan-to-watch rail; internally throttled + dormant with empty creds
-        mediaServerRails.refresh()   // "Recently added" on connected media servers; throttled + dormant with none
     }
 
     /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases, derived
