@@ -1947,7 +1947,7 @@ class EngineStremioRepository(
             historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
                 // Load yields the persisted ctx library model; a failed/invalid model is null, not an empty wipe.
-                val uidJson = (owner.principal.takeUnless { it == "signed-out" }?.let(::JSONObject) ?: JSONObject.NULL).toString()
+                val uidJson = owner.principal.takeUnless { it == "signed-out" }?.let(JSONObject::quote) ?: "null"
                 val events = StremioCoreNative.readLibraryEvents(uidJson)
                 ownerLibraryEventItems(events, owner.principal) ?: ownerLibrarySyncItems(StremioCoreNative.getState(EngineActions.libraryField()))
             }
