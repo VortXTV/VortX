@@ -11,6 +11,7 @@ internal object UsenetProviderFallbackPolicy {
     suspend fun <T> firstReady(
         servers: List<UsenetProviderServer>,
         stillCurrent: () -> Boolean,
+        discard: (T) -> Unit = {},
         attempt: suspend (UsenetProviderServer) -> T,
     ): T {
         val enabled = servers.filter { it.enabled }
@@ -22,7 +23,15 @@ internal object UsenetProviderFallbackPolicy {
             attempted += server.id
             try {
                 val value = attempt(server)
-                if (!stillCurrent()) throw CancellationException("Usenet owner or configuration changed")
+                if (!stillCurrent()) {
+                    // The attempt may have registered a progressive loopback session before the final owner
+                    // fence. Dispose it before propagating cancellation; otherwise no later player owns it.
+                    try {
+                        discard(value)
+                    } finally {
+                        throw CancellationException("Usenet owner or configuration changed")
+                    }
+                }
                 return value
             } catch (cancel: CancellationException) {
                 throw cancel

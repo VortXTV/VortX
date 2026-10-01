@@ -113,6 +113,25 @@ class UsenetProviderServerListTest {
         assertTrue(failure.message.orEmpty().contains("changed"))
     }
 
+    @Test fun `post attempt owner switch discards the newly ready value before cancellation`() = runTest {
+        var current = true
+        var discarded: String? = null
+        val failure = assertThrows(CancellationException::class.java) {
+            kotlinx.coroutines.runBlocking {
+                UsenetProviderFallbackPolicy.firstReady(
+                    servers = listOf(server("only")),
+                    stillCurrent = { current },
+                    discard = { value: String -> discarded = value; Unit },
+                ) {
+                    current = false
+                    "registered-loopback"
+                }
+            }
+        }
+        assertEquals("registered-loopback", discarded)
+        assertTrue(failure.message.orEmpty().contains("changed"))
+    }
+
     @Test fun `all disabled has meaningful typed readiness failure`() = runTest {
         assertThrows(UsenetProviderFallbackPolicy.NoEnabledProviders::class.java) {
             kotlinx.coroutines.runBlocking {

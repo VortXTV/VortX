@@ -356,6 +356,7 @@ internal class DebridCoordinator(
                         stillCurrent = {
                             keys.isCurrent(owner) && providerStore.isCurrent(owner, providerRead.revision)
                         },
+                        discard = { ready -> ready.native.cancel() },
                     ) { server ->
                         val native = nativeResolver(server.credentials).resolve(
                             nzbUrl = candidate.nzbUrl,
