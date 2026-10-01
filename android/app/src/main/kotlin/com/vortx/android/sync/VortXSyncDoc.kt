@@ -74,6 +74,8 @@ object VortXSyncDoc {
         val historyOnly: Boolean = false,
         /** Sparse history producers omit watch flags; omission is not an explicit unwatch. */
         val declaredWatchFields: Set<String>? = null,
+        /** Internal permission derived from an authenticated newer addedAt stamp, never decoded from a row. */
+        val membershipAddedAt: Double? = null,
     ) {
         val identity: String get() = "$type:$metaId"
     }

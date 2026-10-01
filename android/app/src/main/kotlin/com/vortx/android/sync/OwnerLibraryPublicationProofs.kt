@@ -7,6 +7,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 /** Unknown owner is represented by absence of this object; uid=null is a positively settled native owner. */
 data class NativeLibraryOwner(val uid: String?)
@@ -231,5 +232,32 @@ internal class OwnerLibraryPublicationLease(
             proofs.grantProjected(account, native, listOf(after to outgoing))
         }
         true
+    }
+}
+
+/** Bridges separate UI invocation leases without recapturing an older operation's account/native owner. */
+internal class OwnerLibraryPendingTransitions {
+    private data class Capture(val owner: Any, val lease: OwnerLibraryPublicationLease)
+    private val captures = ConcurrentHashMap<String, Capture>()
+
+    fun record(identity: String, owner: Any, lease: OwnerLibraryPublicationLease) {
+        captures[identity] = Capture(owner, lease)
+        if (captures.size > 256) captures.keys.firstOrNull { it != identity }?.let(captures::remove)
+    }
+
+    /** Caller holds the native history fence; owner includes its exact profile/native revision. */
+    fun completePrior(identity: String, owner: Any, read: () -> List<VortXSyncDoc.OwnerLibraryItem>?): Boolean {
+        val captured = captures[identity] ?: return true
+        if (captured.owner != owner || !captured.lease.isCurrent()) {
+            captures.remove(identity, captured)
+            return false
+        }
+        val complete = captured.lease.completePending(identity, read)
+        if (complete) captures.remove(identity, captured)
+        return complete
+    }
+
+    fun completed(identity: String, lease: OwnerLibraryPublicationLease) {
+        captures[identity]?.takeIf { it.lease === lease }?.let { captures.remove(identity, it) }
     }
 }

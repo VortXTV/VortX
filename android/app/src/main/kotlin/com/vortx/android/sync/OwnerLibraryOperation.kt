@@ -19,16 +19,22 @@ internal data class OwnerLibraryOperation(
     val manualInitial: Boolean = false,
     val progressInitial: Boolean = false,
 ) {
-    enum class Kind { MEMBERSHIP, PROGRESS, MANUAL }
+    enum class Kind { MEMBERSHIP, PROGRESS, MANUAL, REMOVE }
 
     fun projection(before: VortXSyncDoc.OwnerLibraryItem?, owned: VortXSyncDoc.OwnerLibraryItem?, after: VortXSyncDoc.OwnerLibraryItem): VortXSyncDoc.OwnerLibraryItem? {
         if (before != null && owned == null) return null
         return when (kind) {
+            Kind.REMOVE -> {
+                if (before == null || owned == null || !LocalLibraryPublicationPolicy.removed(before, after)) return null
+                owned.copy(removed = true, historyOnly = true, eventEpochMs = after.nativeEventEpochMs)
+            }
             Kind.MEMBERSHIP -> {
                 if (name == null || after.name != name || after.poster != poster) return null
                 val membershipState = if (before == null) after else after.copy(name = before.name, poster = before.poster)
                 if (!LocalLibraryPublicationPolicy.membershipAdded(before, membershipState)) return null
-                if (owned != null) owned.copy(name = after.name, poster = after.poster, removed = false, historyOnly = false)
+                if (owned != null) owned.copy(name = after.name, poster = after.poster, removed = false, historyOnly = false,
+                    eventEpochMs = after.nativeEventEpochMs.takeIf { owned.lastWatched != null || owned.watched != null ||
+                        owned.timesWatched != null || owned.wholeTitleWatched != null || owned.currentVideoWatched != null })
                 else after.copy(videoId = null, timeOffsetMs = 0, durationMs = 0, lastWatched = null,
                     watched = null, currentVideoWatched = null, timesWatched = null, wholeTitleWatched = null,
                     eventEpochMs = null, nativeEventEpochMs = null, removed = false, historyOnly = false, declaredWatchFields = emptySet())

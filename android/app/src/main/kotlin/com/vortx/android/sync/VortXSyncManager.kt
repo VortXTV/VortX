@@ -2307,6 +2307,7 @@ class VortXSyncManager(context: Context) {
         val local = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
         val native = gateway.nativeLibraryOwner(nativeLease)
+        val stamps = libraryTombstones.timestampsForSync()
         if (native != null) local.mapNotNull { libraryPublicationProofs.published(lease.accountId, native, it) }
             .filter { !it.historyOnly && !it.removed && LibraryTombstones.normalize(it.metaId) !in removed }
             .forEach { saved.add(it.identity) }
@@ -2315,13 +2316,17 @@ class VortXSyncManager(context: Context) {
             OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(removed = row.identity !in saved)
         }
         val incoming = membership.map { row ->
-            val prior = local.singleOrNull { it.identity == row.identity }?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
-            OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior)
+            val raw = local.singleOrNull { it.identity == row.identity }
+            val prior = raw?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
+            val stamp = stamps[LibraryTombstones.normalize(row.metaId)]
+            val addedAt = stamp?.get("addedAt") ?: 0.0
+            val readd = !row.removed && OwnerLibraryHistoryPolicy.clock(row) == null && raw?.removed == true &&
+                addedAt > (stamp?.get("removedAt") ?: 0.0) && addedAt > (raw.nativeEventEpochMs ?: 0).toDouble()
+            OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(membershipAddedAt = addedAt.takeIf { readd })
         } + history
         val eligible = incoming.filter {
             it.historyOnly || (LibraryTombstones.normalize(it.metaId) in removed) == it.removed
         }
-        val stamps = libraryTombstones.timestampsForSync()
         // A tombstone-only peer still carries a genuine membership event. Keep the local watch clock
         // and opaque watched field intact while applying that event's timestamp, never the receive time.
         val membershipRemovals = local.mapNotNull { item ->

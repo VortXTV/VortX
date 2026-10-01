@@ -7,6 +7,85 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OwnerHistoryCarrierTest {
+    @Test fun `delayed removal then separate invocation readd preserves only prior authorized history`() {
+        for (uid in listOf(null, "shared")) {
+            val persistence = MemoryLibraryProofPersistence()
+            val proofs = OwnerLibraryPublicationProofs(persistence)
+            val native = NativeLibraryOwner(uid)
+            val transitions = OwnerLibraryPendingTransitions()
+            val before = publicationRow().copy(watched = "opaque", timesWatched = 3)
+            val authorized = before.copy(watched = null, timesWatched = null, wholeTitleWatched = null,
+                currentVideoWatched = null, declaredWatchFields = emptySet())
+            assertTrue(proofs.grantProjected("B", native, listOf(before to authorized)))
+            var rows = listOf(before)
+            val removal = OwnerLibraryPublicationLease("B", proofs) { it() }
+            assertTrue(removal.mutateObserved(native, before.identity, { rows }, OwnerLibraryOperation(OwnerLibraryOperation.Kind.REMOVE), { rows.single() }) {})
+            transitions.record(before.identity, "captured-owner-revision", removal)
+            val removed = before.copy(removed = true, eventEpochMs = 3000, nativeEventEpochMs = 3000)
+            rows = listOf(removed) // the native disk future completes after the invocation returns
+            assertNull(proofs.published("B", native, removed))
+            assertTrue(transitions.completePrior(before.identity, "captured-owner-revision") { rows })
+            val removedOutbound = proofs.published("B", native, removed)!!
+            assertTrue(removedOutbound.historyOnly)
+            assertNull(removedOutbound.watched)
+            assertEquals(before.lastWatched, removedOutbound.lastWatched)
+            val readd = OwnerLibraryPublicationLease("B", proofs) { it() }
+            assertTrue(readd.mutateObserved(native, before.identity, { rows }, OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = before.name), { rows.single() }) {})
+            val added = removed.copy(removed = false, eventEpochMs = 4000, nativeEventEpochMs = 4000)
+            rows = listOf(added)
+            assertTrue(readd.completePending(before.identity) { rows })
+            val outbound = OwnerLibraryPublicationProofs(persistence).published("B", native, added)!!
+            assertFalse(outbound.historyOnly)
+            assertFalse(outbound.removed)
+            assertEquals(4000L, outbound.eventEpochMs)
+            assertEquals(before.lastWatched, outbound.lastWatched)
+            assertNull(outbound.watched)
+            assertEquals(emptySet<String>(), outbound.declaredWatchFields)
+        }
+    }
+
+    @Test fun `deferred removal cannot grant absent foreign changed owner or failed storage rows`() {
+        for (mode in listOf("absent", "foreign", "ownerChanged", "accountChanged", "failedRead", "failedCommit", "alteredPayload")) {
+            val disk = MemoryLibraryProofPersistence()
+            val proofs = OwnerLibraryPublicationProofs(disk)
+            val native = NativeLibraryOwner(null)
+            val before = publicationRow()
+            if (mode != "foreign") assertTrue(proofs.grant("B", native, listOf(before)))
+            var current = true
+            val lease = OwnerLibraryPublicationLease("B", proofs) { if (current) it() else false }
+            var rows: List<VortXSyncDoc.OwnerLibraryItem>? = when (mode) { "absent" -> emptyList(); "failedRead" -> null; else -> listOf(before) }
+            val transitions = OwnerLibraryPendingTransitions()
+            lease.mutateObserved(native, before.identity, { rows }, OwnerLibraryOperation(OwnerLibraryOperation.Kind.REMOVE), { rows?.singleOrNull() }) {}
+            transitions.record(before.identity, "old-owner", lease)
+            val removed = before.copy(removed = true, eventEpochMs = 3000, nativeEventEpochMs = 3000,
+                watched = if (mode == "alteredPayload") "foreign" else before.watched)
+            rows = listOf(removed)
+            if (mode == "accountChanged") current = false
+            if (mode == "failedCommit") disk.failWrites = true
+            transitions.completePrior(before.identity, if (mode == "ownerChanged") "new-owner" else "old-owner") { rows }
+            assertNull(mode, OwnerLibraryPublicationProofs(disk).published("B", native, removed))
+        }
+    }
+
+    @Test fun `cold add pending witness chains to first playback through a separate lease`() {
+        val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
+        val native = NativeLibraryOwner("shared")
+        val transitions = OwnerLibraryPendingTransitions()
+        var rows = emptyList<VortXSyncDoc.OwnerLibraryItem>()
+        val cold = publicationRow().copy(videoId = null, timeOffsetMs = 0, durationMs = 0)
+        val add = OwnerLibraryPublicationLease("B", proofs) { it() }
+        add.mutateObserved(native, cold.identity, { rows }, OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = cold.name), { rows.singleOrNull() }) {}
+        transitions.record(cold.identity, "B-revision", add)
+        rows = listOf(cold)
+        assertTrue(transitions.completePrior(cold.identity, "B-revision") { rows })
+        assertNull(proofs.published("B", native, cold)!!.lastWatched)
+        val play = OwnerLibraryPublicationLease("B", proofs) { it() }
+        val played = publicationRow(epoch = 3000)
+        play.mutateObserved(native, cold.identity, { rows }, OwnerLibraryOperation(OwnerLibraryOperation.Kind.PROGRESS, cold.metaId, 1000, 10000), { played }) { rows = listOf(played) }
+        assertEquals(played.lastWatched, proofs.published("B", native, played)!!.lastWatched)
+        assertFalse(proofs.published("B", native, played)!!.historyOnly)
+    }
+
     @Test fun `manual movie series season and episode intents never contain membership or viewing fields`() {
         val disk = MemoryLibraryProofPersistence()
         val store = OwnerWatchedIntentStore(disk) { 1000.0 }

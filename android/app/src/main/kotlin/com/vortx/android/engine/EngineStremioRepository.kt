@@ -58,6 +58,7 @@ import com.vortx.android.sync.AddonPublicationProofs
 import com.vortx.android.sync.OwnerWatchedIntentStore
 import com.vortx.android.sync.OwnerLibraryOperation
 import com.vortx.android.sync.OwnerLibraryHistoryPolicy
+import com.vortx.android.sync.OwnerLibraryPendingTransitions
 import com.vortx.android.sync.AccountAddonSyncGateway
 import com.vortx.android.sync.AccountAddonGatewayLease
 import com.vortx.android.sync.LibraryTombstones
@@ -1881,7 +1882,7 @@ class EngineStremioRepository(
                 HistoryRoute.Engine -> {
                     val native = NativeLibraryOwner(owner.principal.takeUnless { it == "signed-out" })
                     val target = nativeOwnerLibrary.snapshot(native.uid) { it() }?.singleOrNull { it.metaId == id }
-                    mutateLocalLibrary(publication, owner, target?.type, id, LocalLibraryPublicationPolicy::removed) {
+                    mutateLocalLibrary(publication, owner, target?.type, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.REMOVE)) {
                         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
                     }
                     tombstones.tombstone(id)
@@ -2067,6 +2068,8 @@ class EngineStremioRepository(
     private fun captureLibraryPublication(): OwnerLibraryPublicationLease? =
         (appContext as? VortXApplication)?.syncManager?.captureLibraryPublicationLease()
 
+    private val pendingLibraryTransitions = OwnerLibraryPendingTransitions()
+
     private fun mutateLocalLibrary(
         publication: OwnerLibraryPublicationLease?, owner: ContinueWatchingOwner, type: String?, id: String?,
         validate: (VortXSyncDoc.OwnerLibraryItem?, VortXSyncDoc.OwnerLibraryItem) -> Boolean = { _, _ -> false },
@@ -2077,6 +2080,7 @@ class EngineStremioRepository(
         val native = NativeLibraryOwner(owner.principal.takeUnless { it == "signed-out" })
         if (operation != null) {
             val identity = "$type:$id"
+            pendingLibraryTransitions.completePrior(identity, owner) { nativeOwnerLibrary.snapshot(native.uid) { it() } }
             fun modelJson(field: String) = runCatching { JSONObject(StremioCoreNative.getState(JSONObject.quote(field))) }.getOrNull()
             val observedOperation = when (operation.kind) {
                 OwnerLibraryOperation.Kind.MANUAL -> operation.copy(manualInitial = operation.admitsInitialManual(modelJson(EngineActions.FIELD_META_DETAILS), identity))
@@ -2103,12 +2107,13 @@ class EngineStremioRepository(
                 }
                 // Membership grants only exact submitted metadata and a pristine state, never a view clock.
                 // Unlike progress, this has no dependency on a Player/MetaDetails model being loaded.
-                model ?: if (operation.kind == OwnerLibraryOperation.Kind.MEMBERSHIP || observedOperation.manualDirect)
-                    nativeOwnerLibrary.snapshot(native.uid) { it() }?.singleOrNull { it.identity == identity } else null
+                if (operation.kind == OwnerLibraryOperation.Kind.MEMBERSHIP || operation.kind == OwnerLibraryOperation.Kind.REMOVE || observedOperation.manualDirect)
+                    nativeOwnerLibrary.snapshot(native.uid) { it() }?.singleOrNull { it.identity == identity } else model
             }
             check(publication.mutateObserved(native, identity, { nativeOwnerLibrary.snapshot(native.uid) { it() } }, observedOperation, candidate, action)) {
                 "Library account changed. Try again."
             }
+            pendingLibraryTransitions.record(identity, owner, publication)
             engineScope.launch {
                 // No suspension under either fence. Original account and native captures are retained.
                 repeat(100) {
@@ -2117,7 +2122,7 @@ class EngineStremioRepository(
                     val complete = runCatching { historyOwnerFence.mutate(expectedOwner = owner) {
                         publication.completePending(identity) { nativeOwnerLibrary.snapshot(native.uid) { it() } }
                     } }.getOrElse { return@launch }
-                    if (complete) { requestOwnerLibrarySync(owner); return@launch }
+                    if (complete) { pendingLibraryTransitions.completed(identity, publication); requestOwnerLibrarySync(owner); return@launch }
                 }
             }
             return
@@ -3331,7 +3336,7 @@ class EngineStremioRepository(
                     overlay.removeWatchEntry(id)
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(admission.publication, owner, type.id, id, LocalLibraryPublicationPolicy::removed) {
+                    mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.REMOVE)) {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
                     }
                     tombstones.tombstone(id)

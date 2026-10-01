@@ -9,6 +9,23 @@ import org.junit.Test
 import java.time.Instant
 
 class NativeOwnerLibraryGatewayTest {
+    @Test fun `metadata readd uses admitted newer membership stamp and never restores zero history`() {
+        for (mode in listOf("good", "missing", "equal", "newerNative", "failedRead", "expired")) {
+            var adds = 0
+            var current = true
+            val previous = item(epoch = if (mode == "newerNative") 4000 else 2000).copy(removed = true)
+            val incoming = item().copy(videoId = null, timeOffsetMs = 0, durationMs = 0,
+                lastWatched = null, eventEpochMs = null, watched = null, timesWatched = null,
+                membershipAddedAt = when (mode) { "missing" -> null; "equal" -> 2000.0; else -> 3000.0 })
+            val gateway = NativeOwnerLibraryGateway(read = {
+                if (mode == "expired") current = false
+                if (mode == "failedRead") "null" else projection(listOf(previous))
+            }, restore = { error("Metadata re-add must preserve native history via AddToLibrary") }, add = { adds++ })
+            gateway.apply("native", listOf(incoming), { current && it() })
+            assertEquals(mode, if (mode == "good") 1 else 0, adds)
+        }
+    }
+
     @Test fun `restore ownership witness requires successful exact receipt and matching postread`() {
         for (mode in listOf("exact", "noOp", "wrongReceipt", "unavailablePost", "alteredPost", "expiredPost", "metadata")) {
             val requested = item().copy(currentVideoWatched = null)

@@ -448,7 +448,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     fun `public manager restores existing history and never advances a failed or expired receipt`() = runBlocking {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {
-            for (mode in listOf("success", "unsavedHistory", "savedHistory", "sparseApple", "tombstoneOnly", "readded", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
+            for (mode in listOf("success", "unsavedHistory", "savedHistory", "sparseApple", "tombstoneOnly", "readded", "metadataReadd", "metadataStaleReadd", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
                 val context = MemoryContext()
                 val manager = newManager(context)
                 val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
@@ -480,11 +480,16 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                     row.put("removed", true)
                     doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 2000).put("addedAt", 3000)))
                 }
+                if (mode.startsWith("metadata")) {
+                    for (field in listOf("v", "t", "d", "eventEpochMs", "lastWatched", "watched", "currentVideoWatched", "wholeTitleWatched", "timesWatched")) row.remove(field)
+                    doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 500).put("addedAt", if (mode == "metadataReadd") 3000 else 1000)))
+                }
                 val envelope = requireNotNull(VortXCrypto.sealDocument(key, doc.toString().toByteArray(), accountA.id, 2L, true))
                 manager.installSyncTestSeam(VortXSyncManager.Session("A-token", accountA, key), 1L,
                     transport = { _, _, _, _ -> 200 to JSONObject().put("version", 2L).put("document", envelope) })
                 fun replaceAccount() = manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("B-token", accountB, key))
                 var nativeWrites = 0
+                var metadataAdds = 0
                 var attemptedApply = false
                 var restoredProjection: String? = null
                 val native = com.vortx.android.engine.NativeOwnerLibraryGateway(
@@ -493,6 +498,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                         // Both VortX accounts deliberately share this same native UID.
                         restoredProjection ?: JSONObject("""{"uid":"same-native","events":[{"meta":{"id":"tt1","type":"movie","name":"Movie"},"currentVideoId":"tt1","timeOffsetMs":1000,"durationMs":50000,"eventEpochMs":1000,"lastWatchedEpochMs":1000,"watched":null,"currentVideoWatched":false,"wholeTitleWatched":false,"timesWatched":0,"removed":false}]}""").apply {
                             if (mode == "sparseApple") getJSONArray("events").getJSONObject(0).put("watched", "prior-opaque").put("timesWatched", 3).put("wholeTitleWatched", true).put("currentVideoWatched", true)
+                            if (mode.startsWith("metadata")) getJSONArray("events").getJSONObject(0).put("removed", true)
                         }.toString()
                     },
                     restore = { request ->
@@ -517,7 +523,11 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                         if (mode == "null") "null" else
                             """{"uid":"${if (mode == "wrongUid") "wrong" else "same-native"}","events":[{"id":"tt1","type":"movie","currentVideoId":"tt1","eventEpochMs":2000}]}"""
                     },
-                    add = { error("Existing history must not use metadata add") },
+                    add = {
+                        assertEquals("metadataReadd", mode)
+                        assertEquals(3000.0, it.membershipAddedAt!!, 0.0)
+                        metadataAdds++
+                    },
                 )
                 manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
                     private val lease = object : AccountAddonGatewayLease {}
@@ -549,6 +559,10 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                         assertTrue(proofs.published(accountA.id, NativeLibraryOwner("same-native"), actual)!!.historyOnly)
                         assertTrue(LibraryTombstones(context).all().isEmpty())
                     }
+                } else if (mode.startsWith("metadata")) {
+                    assertEquals(0, nativeWrites)
+                    assertEquals(if (mode == "metadataReadd") 1 else 0, metadataAdds)
+                    assertEquals(2L, manager.lastAppliedVersion())
                 } else if (mode == "readded") {
                     assertEquals(0, nativeWrites)
                     assertFalse("Newer explicit add wins", "tt1" in LibraryTombstones(context).all())

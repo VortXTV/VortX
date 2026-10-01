@@ -39,7 +39,9 @@ internal object OwnerLibraryHistoryPolicy {
             when {
                 event != null -> event > maxOf(previous?.nativeEventEpochMs ?: 0, previous?.let(::clock) ?: 0)
                 item.lastWatched != null || item.removed -> false
-                else -> previous == null
+                else -> previous == null || (previous.removed && item.membershipAddedAt?.let {
+                    it.isFinite() && it > maxOf(previous.nativeEventEpochMs ?: 0, clock(previous) ?: 0).toDouble()
+                } == true)
             }
         }
     }
