@@ -32,6 +32,12 @@ Capture any failing URL/QR/Stremio-import operation before changing its proven o
 Provide an owner-confirmed inspect/reapply/clear flow for unsynced legacy add-on edits lacking an
 exact-owner marker. Keep records recoverable. Never infer ownership from lowercased account IDs,
 a shared native UID or a signed-out bucket. Cloud sync cannot reconstruct an edit never uploaded.
+Enumerate only the older `.account.<suffix>` order preferences, deleted arrays and stamp records,
+excluding both current
+`.account.v2.<exact-id>` records and the live unscoped signed-out fallback. Old removal/addition
+stamps may have lowercased URL paths and queries; do not reconstruct a configured URL from them.
+Reapply explicitly confirmed choices through new fenced install/remove/order operations, leave
+historical records intact, and require a separate snapshot-matching confirmation to clear them.
 
 ## 4. Extend genuine account history to supported custom provider identities
 
