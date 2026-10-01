@@ -10,6 +10,39 @@ enum AVPlayerRecoverySettlementPolicy {
         let revision: UInt64
     }
 
+    /// A ready callback may invoke recovery work that synchronously replaces its item. This receipt fences the
+    /// remainder of that old callback before it can publish selection topology or transport for the new mount.
+    /// Item identity remains an engine concern; this type owns the generation/mount half of the receipt.
+    struct ReadyContinuationOwnership: Equatable, Sendable {
+        let generation: UInt64
+        let mountIdentity: UInt64
+
+        func isCurrent(generation: UInt64, mountIdentity: UInt64) -> Bool {
+            self.generation == generation && self.mountIdentity == mountIdentity
+        }
+    }
+
+    /// A remux input seek may be accepted just after its requested source timestamp. Recovery must use that
+    /// achieved origin as its in-item target; retrying the original timestamp is before the mounted window and
+    /// remounts forever. This is recovery-only: ordinary viewer seeks keep the strict mounted-window policy.
+    static func normalizedRecoverySourceSeconds(
+        requestedSourceSeconds: Double,
+        achievedOriginSeconds: Double,
+        acceptedForwardLandingTolerance: Double
+    ) -> Double {
+        guard requestedSourceSeconds.isFinite,
+              achievedOriginSeconds.isFinite,
+              acceptedForwardLandingTolerance.isFinite,
+              acceptedForwardLandingTolerance >= 0 else {
+            return requestedSourceSeconds.isFinite ? max(requestedSourceSeconds, 0) : 0
+        }
+        let requested = max(requestedSourceSeconds, 0)
+        let forwardOffset = achievedOriginSeconds - requested
+        guard forwardOffset > 0,
+              forwardOffset <= acceptedForwardLandingTolerance else { return requested }
+        return achievedOriginSeconds
+    }
+
     struct ExternalSubtitleSettlement: Equatable, Sendable {
         private(set) var pending: Ownership?
 
@@ -49,6 +82,12 @@ enum AVPlayerRecoverySettlementPolicy {
         let ownership: Ownership
         let sourceSeconds: Double
         let playbackRequested: Bool
+    }
+
+    /// A failed recovery hands the engine an exact bounded remount-or-error repair target. Returning this
+    /// receipt rather than a Boolean prevents false/no-callback handling from silently deleting recovery.
+    struct RecoverySeekRepair: Equatable, Sendable {
+        let sourceSeconds: Double
     }
 
     struct RecoverySeekSettlement: Equatable, Sendable {
@@ -91,8 +130,12 @@ enum AVPlayerRecoverySettlementPolicy {
             return true
         }
 
-        mutating func fail(requestID: UInt64) -> Bool {
-            finish(requestID: requestID)
+        mutating func fail(requestID: UInt64) -> RecoverySeekRepair? {
+            guard issuedRequestID == requestID,
+                  let ticket else { return nil }
+            self.ticket = nil
+            issuedRequestID = nil
+            return RecoverySeekRepair(sourceSeconds: ticket.sourceSeconds)
         }
 
         mutating func supersede() {

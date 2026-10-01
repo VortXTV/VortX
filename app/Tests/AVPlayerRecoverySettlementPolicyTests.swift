@@ -4,6 +4,7 @@
 //     -o /tmp/avplayer-recovery-settlement-policy-test \
 //     app/Sources/Player/AVPlayerRecoverySettlementPolicy.swift \
 //     app/Sources/Player/VortXHLSSeekAnchorState.swift \
+//     app/Sources/Player/RemuxResumePolicy.swift \
 //     app/Tests/AVPlayerRecoverySettlementPolicyTests.swift \
 //     && /tmp/avplayer-recovery-settlement-policy-test
 
@@ -33,6 +34,8 @@ enum AVPlayerRecoverySettlementPolicyTests {
         recoveryCompletionFailureAndDeadlineRetireOnlyTheirOwnedTicket()
         newerUserSeekSupersedesRecoveryAndPausedRestoreDoesNotRequestPlayback()
         recoveryAdmissionReconcilesLocalHLSAtTheActualLanding()
+        readyContinuationRejectsSynchronousRecoveryRemount()
+        recoveryNormalizesAcceptedForwardOriginWithoutWeakeningOutsideTolerance()
 
         print("===== FAILURES: \(failures) =====")
         exit(failures == 0 ? 0 : 1)
@@ -81,14 +84,15 @@ enum AVPlayerRecoverySettlementPolicyTests {
             sourceSeconds: 340, playbackRequested: true,
             generation: generation, mountIdentity: mount, revision: 1)
         let failedBound = recovery.bind(requestID: 101, ticket: failed)
-        let failedRetired = recovery.fail(requestID: 101)
+        let failedRepair = recovery.fail(requestID: 101)
         let deadline = recovery.issue(
             sourceSeconds: 341, playbackRequested: true,
             generation: generation, mountIdentity: mount, revision: 2)
         let deadlineBound = recovery.bind(requestID: 102, ticket: deadline)
-        let deadlineRetired = recovery.fail(requestID: 102)
-        check("false completion and deadline retire their recovery tickets without retaining a stale receipt",
-              failedBound && failedRetired && deadlineBound && deadlineRetired && recovery.ticket == nil)
+        let deadlineRepair = recovery.fail(requestID: 102)
+        check("false completion and deadline yield their owned remount repair instead of only deleting recovery",
+              failedBound && failedRepair?.sourceSeconds == 340
+                && deadlineBound && deadlineRepair?.sourceSeconds == 341 && recovery.ticket == nil)
     }
 
     private static func newerUserSeekSupersedesRecoveryAndPausedRestoreDoesNotRequestPlayback() {
@@ -124,5 +128,39 @@ enum AVPlayerRecoverySettlementPolicyTests {
         check("recovery seek uses local-HLS admission then reconciles the actual paused landing",
               bound && admitted && reconciled && finished && periodicAccepted
                 && anchor.currentPlaybackSeconds == 144.8 && !ticket.playbackRequested)
+    }
+
+    private static func readyContinuationRejectsSynchronousRecoveryRemount() {
+        let originalReady = AVPlayerRecoverySettlementPolicy.ReadyContinuationOwnership(
+            generation: generation, mountIdentity: mount)
+        let unchanged = originalReady.isCurrent(generation: generation, mountIdentity: mount)
+        // `remountForSeek` replaces both receipts synchronously before the old ready handler returns.
+        let afterSynchronousRemount = originalReady.isCurrent(
+            generation: generation + 1, mountIdentity: mount + 1)
+        check("old ready continuation cannot publish selection or didStart after synchronous remount",
+              unchanged && !afterSynchronousRemount)
+    }
+
+    private static func recoveryNormalizesAcceptedForwardOriginWithoutWeakeningOutsideTolerance() {
+        let acceptedOrigin = AVPlayerRecoverySettlementPolicy.normalizedRecoverySourceSeconds(
+            requestedSourceSeconds: 1_200,
+            achievedOriginSeconds: 1_200.2,
+            acceptedForwardLandingTolerance: RemuxResumePolicy.forwardLandingToleranceSeconds)
+        let acceptedAction = RemuxResumePolicy.mountedSeekAction(
+            sourceSeconds: acceptedOrigin,
+            origin: 1_200.2,
+            producedEdgePlayerSeconds: 0)
+        let outsideTolerance = AVPlayerRecoverySettlementPolicy.normalizedRecoverySourceSeconds(
+            requestedSourceSeconds: 1_200,
+            achievedOriginSeconds: 1_200.26,
+            acceptedForwardLandingTolerance: RemuxResumePolicy.forwardLandingToleranceSeconds)
+        let outsideAction = RemuxResumePolicy.mountedSeekAction(
+            sourceSeconds: outsideTolerance,
+            origin: 1_200.26,
+            producedEdgePlayerSeconds: 0)
+        check("accepted forward recovery origin seeks local zero once rather than remounting",
+              acceptedOrigin == 1_200.2 && acceptedAction == .seekPlayer(0))
+        check("outside forward tolerance remains a remount repair, preserving viewer seek policy",
+              outsideTolerance == 1_200 && outsideAction == .remountAtSource(1_200))
     }
 }

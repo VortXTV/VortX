@@ -926,11 +926,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                   self.seekEndBoundary.requestID == requestID else { return }
             self.seekCompletionTimeoutTask = nil
             // Advance ownership before cancelling AVFoundation: its resulting completion is now stale.
-            _ = self.recoverySeekSettlement.fail(requestID: requestID)
+            let recoveryRepair = self.recoverySeekSettlement.fail(requestID: requestID)
             self.invalidateSeekRequests()
             seekItem?.cancelPendingSeeks()
             DiagnosticsLog.log("avplayer", "seek completion deadline: aborting owned seek and restoring requested target")
-            if !self.remountForSeek(sourceSeconds: sourceSeconds), let loadToken {
+            let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds
+            if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let loadToken {
                 // A direct asset cannot use the remux seek replacement. Expose a failure instead of
                 // leaving the chrome frozen or manufacturing an EOF that would advance the episode.
                 self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: loadToken)
@@ -2711,11 +2712,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     // An interrupted current seek is not a successful landing. Retire its ownership
                     // before cancelling native work, then recover the requested source position using
                     // the same bounded path as the deadline. Stale callbacks above cannot enter here.
-                    _ = self.recoverySeekSettlement.fail(requestID: requestID)
+                    let recoveryRepair = self.recoverySeekSettlement.fail(requestID: requestID)
                     self.invalidateSeekRequests()
                     seekItem?.cancelPendingSeeks()
                     DiagnosticsLog.log("avplayer", "seek completion interrupted: restoring requested target")
-                    if !self.remountForSeek(sourceSeconds: sourceSeconds), let seekLoadToken {
+                    let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds
+                    if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let seekLoadToken {
                         self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: seekLoadToken)
                     }
                     return
@@ -3125,16 +3127,23 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         pendingPlaybackIntent = nil
         remuxSeekRemountTarget = nil
 
+        // Input-seek admission may accept an origin slightly after the requested source timestamp. A recovery
+        // seek to the old timestamp would then be outside this mounted forward-only HLS window and remount the
+        // same input again. Normalize only this accepted-forward recovery edge; viewer seeks stay strict.
+        let recoverySourceSeconds = AVPlayerRecoverySettlementPolicy.normalizedRecoverySourceSeconds(
+            requestedSourceSeconds: restore.sourceSeconds,
+            achievedOriginSeconds: remuxTimelineOrigin,
+            acceptedForwardLandingTolerance: RemuxResumePolicy.forwardLandingToleranceSeconds)
         let recoveryTicket = recoverySeekSettlement.issue(
-            sourceSeconds: restore.sourceSeconds,
+            sourceSeconds: recoverySourceSeconds,
             playbackRequested: playbackRequested,
             generation: itemGeneration,
             mountIdentity: playbackMountIdentity,
             revision: seekRequestGeneration &+ 1)
-        seek(to: restore.sourceSeconds, recoveryTicket: recoveryTicket)
+        seek(to: recoverySourceSeconds, recoveryTicket: recoveryTicket)
         DiagnosticsLog.log(
             "avplayer",
-            "released recovery position through owned seek transaction generation=\(itemGeneration) mount=\(playbackMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)); selection restoration continues asynchronously")
+            "released recovery position through owned seek transaction generation=\(itemGeneration) mount=\(playbackMountIdentity) requestedSourceTime=\(String(format: "%.3f", restore.sourceSeconds)) seekSourceTime=\(String(format: "%.3f", recoverySourceSeconds)); selection restoration continues asynchronously")
     }
 
     private func sourceAudioMPVTracks() -> [MPVTrack] {
@@ -4196,6 +4205,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard owns(item, loadToken: loadToken) else { return }
         switch item.status {
         case .readyToPlay:
+            let readyContinuation = AVPlayerRecoverySettlementPolicy.ReadyContinuationOwnership(
+                generation: itemGeneration,
+                mountIdentity: playbackMountIdentity)
             // A recovery item reuses a mount that already crossed its one-time ready edge. Calling the local
             // deadline transition again returns false by design and would strand the fresh item before play.
             remuxRemoteMount?.markEngineReady()
@@ -4298,6 +4310,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // makes the ready item authoritative for all later seek/play/pause calls even if the asset never
             // returns an audible or legible group.
             releasePendingPlaybackIntentAtReady(for: item)
+            // Recovery can synchronously remount when its target is outside the current served HLS window.
+            // Do not let this old ready callback publish topology or `didStart` into that replacement: its own
+            // ready callback must remain the sole owner of those observations.
+            guard readyContinuation.isCurrent(
+                generation: itemGeneration,
+                mountIdentity: playbackMountIdentity),
+                  self.item === item,
+                  player.currentItem === item,
+                  owns(item, loadToken: loadToken) else { return }
             // Publish audio and subtitle topology together after both media-selection groups resolve. An
             // audio-only publication would consume the chrome's one-shot automatic selection before the
             // subtitle rows exist.
