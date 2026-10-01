@@ -86,6 +86,28 @@ class TraktContinueWatchingModelTest {
     }
 
     @Test
+    fun `episode card carries typed detail hint without inventing a local resume`() {
+        val card = traktContinueWatchingFallback(
+            TraktContinueWatchingSeed(
+                id = "tmdb:tv:42",
+                type = MediaType.SERIES,
+                name = "Show",
+                progress = 33f,
+                pausedAt = "2026-10-01T12:00:00Z",
+                tmdbId = 42,
+                imdbId = null,
+                season = 0,
+                episode = 4,
+                episodeName = "Special",
+            ),
+        )
+
+        assertEquals(0, card.preferredEpisode?.season)
+        assertEquals(4, card.preferredEpisode?.episode)
+        assertEquals(null, card.resumeSeconds)
+    }
+
+    @Test
     fun `distinct Trakt row remains read only and native row remains untouched`() {
         val native = Catalog("continue", "Continue Watching", listOf(item("tt-native")))
         val rows = withTraktContinueWatchingRail(listOf(native), listOf(item("tt-trakt")))

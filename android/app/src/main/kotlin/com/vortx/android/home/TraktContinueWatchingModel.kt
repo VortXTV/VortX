@@ -7,6 +7,7 @@ import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.PreferredEpisode
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -156,7 +157,7 @@ private fun traktSeed(row: JSONObject): TraktContinueWatchingSeed? {
 /** Reuses the signed TMDB edge. Episodes use the typed TV path and prefer their still over the show backdrop. */
 private object TraktPlaybackArtwork {
     suspend fun resolve(seed: TraktContinueWatchingSeed): MetaItem {
-        val tmdb = seed.tmdbId ?: resolveTmdb(seed) ?: return fallback(seed)
+        val tmdb = seed.tmdbId ?: resolveTmdb(seed) ?: return traktContinueWatchingFallback(seed)
         val media = if (seed.type == MediaType.SERIES) "tv" else "movie"
         val detail = CatalogTmdbEdge.getJson("/$media/$tmdb")
         val episode = if (media == "tv" && seed.season != null && seed.episode != null) {
@@ -164,7 +165,7 @@ private object TraktPlaybackArtwork {
         } else null
         val poster = detail?.optStringOrNull("poster_path")?.let { "${CatalogTmdbEdge.IMAGE_BASE}/w342$it" }
         val backdrop = episode?.optStringOrNull("still_path") ?: detail?.optStringOrNull("backdrop_path")
-        return fallback(seed).copy(
+        return traktContinueWatchingFallback(seed).copy(
             poster = poster,
             background = backdrop?.let { "${CatalogTmdbEdge.IMAGE_BASE}/w780$it" },
             year = detail?.optStringOrNull(if (media == "tv") "first_air_date" else "release_date")?.take(4),
@@ -178,13 +179,20 @@ private object TraktPlaybackArtwork {
         return results.optJSONArray(key)?.optJSONObject(0)?.optInt("id", 0)?.takeIf { it > 0 }
     }
 
-    private fun fallback(seed: TraktContinueWatchingSeed) = MetaItem(
-        id = seed.id, type = seed.type, name = seed.name, progress = (seed.progress / 100f).coerceIn(0f, 1f),
-        caption = if (seed.type == MediaType.SERIES) {
-            "S${seed.season} E${seed.episode}" + seed.episodeName?.let { " · $it" }.orEmpty()
-        } else null,
-    )
 }
+
+/** Builds the remote read-only card before artwork enrichment; it deliberately has no local resume value. */
+internal fun traktContinueWatchingFallback(seed: TraktContinueWatchingSeed) = MetaItem(
+    id = seed.id, type = seed.type, name = seed.name, progress = (seed.progress / 100f).coerceIn(0f, 1f),
+    preferredEpisode = if (seed.type == MediaType.SERIES && seed.season != null && seed.episode != null) {
+        PreferredEpisode(season = seed.season, episode = seed.episode)
+    } else {
+        null
+    },
+    caption = if (seed.type == MediaType.SERIES) {
+        "S${seed.season} E${seed.episode}" + seed.episodeName?.let { " · $it" }.orEmpty()
+    } else null,
+)
 
 private fun JSONArray.toObjects(): List<JSONObject> = buildList {
     for (index in 0 until length()) optJSONObject(index)?.let(::add)

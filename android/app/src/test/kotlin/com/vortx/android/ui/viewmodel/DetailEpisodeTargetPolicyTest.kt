@@ -3,6 +3,7 @@ package com.vortx.android.ui.viewmodel
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.sources.SourceRequestFence
@@ -19,6 +20,69 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DetailEpisodeTargetPolicyTest {
+    @Test
+    fun `route hint chooses its exact actual episode regardless of metadata order or title`() {
+        val episodes = listOf(
+            Episode("s3e1", "Season premiere", season = 3, episode = 1),
+            Episode("s2e3", "Renamed by add-on", season = 2, episode = 3),
+            Episode("s2e2", "Earlier", season = 2, episode = 2),
+        )
+
+        val target = detailEpisodeTargetForRoute(
+            videos = episodes,
+            preferredEpisode = PreferredEpisode(season = 2, episode = 3),
+            selectedEpisodeId = null,
+        )
+
+        assertEquals("s2e3", target?.id)
+    }
+
+    @Test
+    fun `new-season route hint uses coordinates and optional exact video identity`() {
+        val episodes = listOf(
+            Episode("old-id", "Episode", season = 4, episode = 1),
+            Episode("new-id", "Episode", season = 5, episode = 1),
+        )
+
+        val target = detailEpisodeTargetForRoute(
+            videos = episodes,
+            preferredEpisode = PreferredEpisode(season = 5, episode = 1, videoIdentity = "new-id"),
+            selectedEpisodeId = null,
+        )
+
+        assertEquals("new-id", target?.id)
+    }
+
+    @Test
+    fun `stale invalid or wrong-identity route hints leave primary fallback available`() {
+        val episodes = listOf(
+            Episode("s1e1", "First", season = 1, episode = 1),
+            Episode("s1e2", "Second", season = 1, episode = 2),
+        )
+
+        val staleTarget = detailEpisodeTargetForRoute(episodes, PreferredEpisode(1, 9), null)
+        assertNull(staleTarget)
+        assertEquals("s1e1", (staleTarget ?: detailEpisodeTargetOrder(episodes).first()).id)
+        assertNull(detailEpisodeTargetForRoute(episodes, PreferredEpisode(-1, 1), null))
+        assertNull(detailEpisodeTargetForRoute(episodes, PreferredEpisode(1, 2, "stale-id"), null))
+    }
+
+    @Test
+    fun `manual episode selection takes precedence over a route hint`() {
+        val episodes = listOf(
+            Episode("s1e1", "First", season = 1, episode = 1),
+            Episode("s1e2", "Second", season = 1, episode = 2),
+        )
+
+        val target = detailEpisodeTargetForRoute(
+            videos = episodes,
+            preferredEpisode = PreferredEpisode(1, 2),
+            selectedEpisodeId = "s1e1",
+        )
+
+        assertEquals("s1e1", target?.id)
+    }
+
     @Test
     fun `specials never outrank the first actual episode`() {
         val ordered = detailEpisodeTargetOrder(

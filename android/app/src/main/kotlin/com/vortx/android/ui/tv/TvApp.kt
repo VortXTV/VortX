@@ -39,6 +39,7 @@ import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.detailViewModelKey
+import com.vortx.android.ui.detailEpisodeRouteKey
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
@@ -137,7 +138,9 @@ fun TvApp(
         val sourceSettingsRevision by SourceSettingsRevision.observe(appContext).collectAsStateWithLifecycle()
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
-            detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
+            detail?.let {
+                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch"
+            } ?: "no-detail:$detailSourceEpoch",
         )
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
         // progress tick + Player unload) still completes after the player leaves composition -- the same
@@ -158,10 +161,16 @@ fun TvApp(
                     typeId = playerDetail.type.id,
                     mediaId = playerDetail.id,
                     ownerEpoch = detailSourceEpoch,
+                    preferredEpisode = playerDetail.preferredEpisode,
                 ),
                 factory = StremioXViewModelFactory(
                     repo = repo,
-                    detailArgs = StremioXViewModelFactory.DetailArgs(playerDetail.type, playerDetail.id),
+                    detailArgs = StremioXViewModelFactory.DetailArgs(
+                        playerDetail.type,
+                        playerDetail.id,
+                        playerDetail.name,
+                        playerDetail.preferredEpisode,
+                    ),
                     appContext = appContext,
                 ),
             )
@@ -305,10 +314,16 @@ fun TvApp(
                             typeId = current.type.id,
                             mediaId = current.id,
                             ownerEpoch = detailSourceEpoch,
+                            preferredEpisode = current.preferredEpisode,
                         ),
                         factory = StremioXViewModelFactory(
                             repo = repo,
-                            detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
+                            detailArgs = StremioXViewModelFactory.DetailArgs(
+                                current.type,
+                                current.id,
+                                current.name,
+                                current.preferredEpisode,
+                            ),
                             appContext = appContext,
                         ),
                     )

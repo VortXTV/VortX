@@ -140,6 +140,13 @@ enum class MediaType(val label: String, val id: String) {
 /// `CoreMeta.imdbRating`/`.genres` do, so the featured hero shows a rating. [resumeSeconds] is the
 /// saved resume position in whole seconds on a Continue Watching item (from `state.timeOffset`),
 /// surfaced through [resumeLabel] as "Resume 1:03".
+data class PreferredEpisode(
+    val season: Int,
+    val episode: Int,
+    /** Optional engine video identity; when supplied it must agree with the episode coordinates. */
+    val videoIdentity: String? = null,
+)
+
 data class MetaItem(
     val id: String,
     val type: MediaType,
@@ -158,6 +165,8 @@ data class MetaItem(
     val previewRuntimeMinutes: Int? = null,
     val previewSeasonCount: Int? = null,
     val resumeSeconds: Double? = null,
+    /** A remote-provider episode target; this never represents a local resume position. */
+    val preferredEpisode: PreferredEpisode? = null,
     val caption: String? = null,
     val watched: Boolean = false,
     /// The first playable YouTube trailer id for this preview, threaded onto the catalog-preview model so

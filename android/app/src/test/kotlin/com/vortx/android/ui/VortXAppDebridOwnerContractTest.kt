@@ -107,7 +107,9 @@ class VortXAppDebridOwnerContractTest {
 
     private companion object {
         const val BOUNDED_OWNER_GENERATION =
-            """detail?.let { "${'$'}{it.type}:${'$'}{it.id}:${'$'}detailSourceEpoch" }"""
+            """detail?.let {
+                "${'$'}{it.type}:${'$'}{it.id}:${'$'}{detailEpisodeRouteKey(it.preferredEpisode)}:${'$'}detailSourceEpoch"
+            }"""
         const val PLAYER_BOUNDED_OWNER =
             """viewModelStoreOwner = detailVmOwner,
                         key = detailViewModelKey(

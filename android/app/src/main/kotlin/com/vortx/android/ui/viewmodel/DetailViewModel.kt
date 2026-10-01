@@ -28,6 +28,7 @@ import com.vortx.android.model.LanguagePriority
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferences
@@ -356,6 +357,7 @@ class DetailViewModel(
     private val id: String,
     appContext: Context,
     private val routeName: String? = null,
+    private val initialPreferredEpisode: PreferredEpisode? = null,
 ) : ViewModel() {
 
     private val app = appContext.applicationContext
@@ -636,13 +638,17 @@ class DetailViewModel(
         if (type == MediaType.SERIES) {
             // A series' hero Watch/Resume target depends on which episode + watched state the meta carries,
             // so meta must land (above) before the sources fan-out is scoped.
-            val primary = primaryEpisodeOf(detail)
-            if (primary != null) {
-                _selectedSeason.value = primary.first.season
+            val target = detailEpisodeTargetForRoute(
+                videos = detail.videos,
+                preferredEpisode = initialPreferredEpisode,
+                selectedEpisodeId = _selectedEpisodeId.value,
+            ) ?: primaryEpisodeOf(detail)?.first
+            if (target != null) {
+                _selectedSeason.value = target.season
                 // Programmatic first selection: never arms the auto-pick latch (auto-playing on merely
                 // OPENING a detail page would be aggressive; Apple fires only on the episode source page
                 // the viewer navigated to).
-                selectEpisode(primary.first.id, userTap = false)
+                selectEpisode(target.id, userTap = false)
             } else {
                 startSourceLoad(null)
             }
@@ -841,7 +847,13 @@ class DetailViewModel(
             val detail = loaded.getOrNull()
             val oldTarget = _selectedEpisodeId.value
             val target = if (type == MediaType.SERIES) {
-                detail?.videos?.firstOrNull { it.id == oldTarget }
+                detail?.let {
+                    detailEpisodeTargetForRoute(
+                        videos = it.videos,
+                        preferredEpisode = null,
+                        selectedEpisodeId = oldTarget,
+                    )
+                }
                     ?: detail?.let { primaryEpisodeOf(it)?.first }
             } else {
                 null
@@ -2436,6 +2448,29 @@ internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
     val ordered = videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
     val actualEpisodes = ordered.filter { it.season > 0 }
     return actualEpisodes.ifEmpty { ordered }
+}
+
+/**
+ * Resolves a route-provided episode only against the metadata for the title currently open.
+ * A user-selected episode always wins, while a stale or malformed remote hint deliberately returns null
+ * so the existing primary-episode policy remains the fallback.
+ */
+internal fun detailEpisodeTargetForRoute(
+    videos: List<Episode>,
+    preferredEpisode: PreferredEpisode?,
+    selectedEpisodeId: String?,
+): Episode? {
+    selectedEpisodeId?.let { selectedId ->
+        videos.firstOrNull { it.id == selectedId }?.let { return it }
+    }
+    val hint = preferredEpisode
+        ?.takeIf { it.season >= 0 && it.episode > 0 }
+        ?: return null
+    return videos.firstOrNull { candidate ->
+        candidate.season == hint.season &&
+            candidate.episode == hint.episode &&
+            (hint.videoIdentity == null || candidate.id == hint.videoIdentity)
+    }
 }
 
 /**
