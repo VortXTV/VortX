@@ -1316,7 +1316,7 @@ struct iOSDetailView: View {
         // pin the banner while the below-content + episode/source list scroll independently beneath it. On
         // iOS/iPadOS the two are composed back into the exact single scrolling column as before.
         let overlap = SourcePresentationPolicy.mobileHeroActionOverlap(width: width, viewport: height)
-        return VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: overlap > 0 ? 0 : Theme.Space.md) {
             heroBanner(width: width, height: height)
             heroBelow(width: width, scrollToSources: scrollToSources)
                 .padding(.top, -overlap)
@@ -4363,7 +4363,9 @@ struct iOSEpisodeStreams: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 hero(width: geo.size.width, viewport: geo.size.height)
-                sourceListView(width: geo.size.width)
+                sourceListView(width: geo.size.width,
+                               heroOwnsPrimaryPlay: SourcePresentationPolicy.mobileHeroActionOverlap(
+                                   width: geo.size.width, viewport: geo.size.height) > 0)
             }
             .padding(.bottom, Theme.Space.xl)
             .frame(width: geo.size.width, alignment: .leading)
@@ -4538,7 +4540,7 @@ struct iOSEpisodeStreams: View {
         // below on the canvas, same structure as iOSDetailView.hero, so a long episode synopsis can't push
         // the backdrop down behind the text.
         let overlap = SourcePresentationPolicy.mobileHeroActionOverlap(width: width, viewport: viewport)
-        return VStack(alignment: .leading, spacing: 0) {
+        return VStack(alignment: .leading, spacing: overlap > 0 ? 0 : Theme.Space.md) {
             ZStack(alignment: .bottomLeading) {
                 backdrop(height: SourcePresentationPolicy.mobileHeroHeight(width: width, viewport: viewport))
                     .ignoresSafeArea(edges: .top)
@@ -4568,10 +4570,12 @@ struct iOSEpisodeStreams: View {
             .frame(width: width, alignment: .leading)
 
             #if os(iOS)
+            if overlap > 0 {
             episodePrimaryAction
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.top, -overlap)
                 .padding(.bottom, Theme.Space.md)
+            }
             #endif
             if let overview = shownVideo.overview, !overview.isEmpty {
                 Text(overview)
@@ -4612,14 +4616,6 @@ struct iOSEpisodeStreams: View {
     }
     #endif
 
-    private var episodeSourceListShowsPrimaryPlay: Bool {
-        #if os(iOS)
-        return false
-        #else
-        return true
-        #endif
-    }
-
     /// The RemoteConfig kill switch for the "Re-find sources" control (backend-first mandate). Baked ON.
     private var refindEnabled: Bool {
         RemoteConfig.snapshot.isFeatureOn("refindSources", default: RemoteConfigDefaults.featureRefindSources)
@@ -4640,7 +4636,7 @@ struct iOSEpisodeStreams: View {
     /// The episode source list (extracted so the iOS single-scroll body and the macOS pinned body render the
     /// EXACT same list). While the episode's player / trailer cover is up, skip the rankedGroups pass (pass []
     /// + isSuspended) so this hidden episode list stops re-rendering behind the video; it restores on close.
-    private func sourceListView(width: CGFloat) -> some View {
+    private func sourceListView(width: CGFloat, heroOwnsPrimaryPlay: Bool = false) -> some View {
         iOSSourceList(
             groups: presentation != nil ? [] : rankedEpisode(),
             progress: core.streamLoadProgress(forStreamId: shownVideo.id),
@@ -4656,7 +4652,7 @@ struct iOSEpisodeStreams: View {
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             isEpisode: true,
-            showsPrimaryPlayButton: episodeSourceListShowsPrimaryPlay,
+            showsPrimaryPlayButton: !heroOwnsPrimaryPlay,
             play: { stream, url in Task { await play(stream, url: url) } },
             playWithEngine: { stream, url, preference in
                 Task { await play(stream, url: url, enginePreference: preference) }

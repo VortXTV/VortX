@@ -411,8 +411,10 @@ struct iOSRootView: View {
         .onExitCommand {
             // Escape preserves the content views' own back behavior; when desktop chrome owns focus,
             // it simply returns focus to the active navigation item instead of stranding the cursor.
-            if macSearchFocused { macSearchFocused = false }
-            tabFocus = .tab(tab.rawValue)
+            if macSearchFocused || tabFocus != nil {
+                macSearchFocused = false
+                tabFocus = .tab(tab.rawValue)
+            }
         }
     }
 

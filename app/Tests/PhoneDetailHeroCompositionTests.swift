@@ -9,7 +9,8 @@ enum PhoneDetailHeroCompositionTests {
         precondition(source.contains("episodePrimaryAction\n                .padding(.horizontal, Theme.Space.md)\n                .padding(.top, -overlap)"))
         precondition(source.contains("Task { await playBest(groups.flatMap(\\.streams), labeledBest: best) }"))
         precondition(source.contains(".disabled(loading || preparing || best?.playableURL(isEpisode: true) == nil)"))
-        precondition(source.contains("showsPrimaryPlayButton: episodeSourceListShowsPrimaryPlay"))
+        precondition(source.contains("showsPrimaryPlayButton: !heroOwnsPrimaryPlay"))
+        precondition(source.contains("heroOwnsPrimaryPlay: SourcePresentationPolicy.mobileHeroActionOverlap("))
         precondition(source.contains("lhs.showsPrimaryPlayButton == rhs.showsPrimaryPlayButton"))
         precondition(source.contains("if showsPrimaryPlayButton {"))
         // Dynamic Type can grow the primary button: no fixed button-height or offset removes its hit area.
