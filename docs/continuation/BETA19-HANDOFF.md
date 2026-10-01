@@ -2,8 +2,8 @@
 
 > **Historical August 2026 snapshot, not the current release runbook.** Its Beta 18/build 220,
 > department assignments and Apple-only Beta 19 scope predate later releases and owner directions.
-> Current verified public release is 0.4.0 Beta 17 (Apple 253 / Android 238); the October 1 candidate
-> is documented in [the Beta 18 source notes](../releases/0.4.0-beta.18.md) and
+> Current verified public release is 0.4.0 Beta 18 (Apple 254 / Android 239), published on October 1.
+> See [the Beta 18 release notes and receipts](../releases/0.4.0-beta.18.md) and
 > [the Android parity record](../ANDROID-TV-APPLE-PARITY-PLAN.md). Verify live tags and current
 > source before taking release actions. The old snapshots and rejected WIPs below remain history,
 > not permission to restore them or to override today's release gates.

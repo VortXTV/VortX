@@ -3,7 +3,7 @@
 Status: active implementation and acceptance record. The October 1 follow-up below is current;
 older dated sections preserve their historical release boundary, not a claim of completed parity.
 
-## October 1 candidate follow-up
+## October 1 Beta 18 publication follow-up
 
 The reviewed source batch after Beta 17 adds direct Newznab indexer configuration/search, prioritized
 saved NNTP servers and local fallback, strict decoded yEnc/cache admission, stale readiness disposal,
@@ -26,10 +26,12 @@ marker remain quarantined on disk, not transparently migrated into a newly signe
 The shipping Apple add-on lifecycle changes are retained in the shared immutable engine pin. Locked
 native tests and actual Android native compilation/export inspection passed for all three ABIs.
 The integrated Full/Play suites passed 1,492/1,419 tests with no failures, errors or skips. Native
-history/storage tests passed 21 against the pinned dependency without a local override. Exact
-release/LTO packages, production signer/version/feed checks and physical
-remote/provider journeys remain separate gates. Do not turn these source receipts into a numerical
-parity claim or a promise of hardware playback. See [the candidate notes](releases/0.4.0-beta.18.md).
+history/storage tests passed 21 against the pinned dependency without a local override. The exact
+release/LTO packages, production signer, version, checksum and feed checks passed separately. Beta 18
+is public as Latest beta; both Full/Play update entries advertise Android code 239 from the accepted
+source, alongside Apple build 254. Physical remote/provider journeys remain separate acceptance work.
+Do not turn source and package receipts into a numerical parity claim or a promise of hardware
+playback. See [the release notes and publication receipts](releases/0.4.0-beta.18.md).
 
 ## September 30 implementation follow-up
 

@@ -6,7 +6,8 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.4.0-beta.18 - Playback settlement, Mac redesign, Android Usenet, and account sync
 
-Candidate Apple build **254**, Android version code **239**. Includes the reviewed work since
+Published **1 October 2026** as [Latest beta](https://github.com/VortXTV/VortX/releases/tag/v0.4.0-beta.18),
+Apple build **254**, Android version code **239**. Includes the reviewed work since
 Beta 17: owned AVPlayer recovery and subtitle settlement, the native Mac sidebar and in-window
 Settings, the iPhone hero-seam Watch action, Android Newznab indexers and prioritized NNTP servers,
 Trakt Continue Watching and manual check-in, phone Library segments, remote add-on ordering,
@@ -16,9 +17,11 @@ Android filmography selection races, deferred remove/re-add ownership and separa
 membership clocks without fabricated progress.
 
 See [the full Beta 18 notes](docs/releases/0.4.0-beta.18.md) for the complete behavior and verification
-boundaries. Native account-library publication provenance has passed its scoped independent review; tagged packages,
-signing and update feeds remain release gates. This candidate entry is not a publication receipt or a claim of universal playback
-closure or complete Android visual parity.
+boundaries and linked publication receipts. Native account-library publication provenance passed its
+scoped independent review; tagged packages, signing, checksums, Latest and Apple/Android update feeds
+passed separate release gates. Publication preserved the immutable application tag and all ten accepted
+assets after a reviewed feed-transport repair. This is not a claim of universal playback closure or
+complete Android visual parity.
 
 ## 0.4.0-beta.17 - Resume recovery, binge playback, skip controls, and Android fixes
 
