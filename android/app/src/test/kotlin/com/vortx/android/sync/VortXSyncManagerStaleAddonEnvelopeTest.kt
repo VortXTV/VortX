@@ -79,6 +79,26 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     }
 
     @Test
+    fun `remote descriptor admission rejects userinfo private literals and malformed manifest fields`() {
+        fun row(url: Any, id: Any, name: Any) = JSONObject()
+            .put("transportUrl", url)
+            .put("manifest", JSONObject().put("id", id).put("name", name))
+
+        val document = JSONObject().put(
+            "addons",
+            JSONArray()
+                .put(row("https://user:token@public.example/manifest.json", "one", "One"))
+                .put(row("https://127.0.0.1/manifest.json", "two", "Two"))
+                .put(row("https://[::1]/manifest.json", "three", "Three"))
+                .put(row("https://good.example/manifest.json", 7, "Bad id type"))
+                .put(row("https://also-good.example/manifest.json", "four", JSONObject()))
+                .put(row("https://valid.example/manifest.json", "valid", "Valid")),
+        )
+
+        assertEquals(listOf("https://valid.example/manifest.json"), VortXSyncDoc.parse(document).addons.map { it.transportUrl })
+    }
+
+    @Test
     fun `unavailable session retry restores signed in add-on tombstone scope and sync payload`() {
         val context = MemoryContext()
         val manager = VortXSyncManager(context)

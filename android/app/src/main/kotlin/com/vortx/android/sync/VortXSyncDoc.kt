@@ -7,6 +7,7 @@ import com.vortx.android.profile.WatchEntry
 import com.vortx.android.profile.optStringOrNull
 import com.vortx.android.profile.toStringList
 import com.vortx.android.data.AddonTombstones
+import com.vortx.android.engine.PublicAddressPolicy
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -183,11 +184,21 @@ object VortXSyncDoc {
 
     /** Parse one safely-installable descriptor without rejecting compatible shallow records elsewhere in a doc. */
     internal fun addonDescriptor(raw: JSONObject): AddonDescriptor? {
-        val url = raw.optStringOrNull("transportUrl")?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-        val uri = runCatching { URI(url) }.getOrNull()
-        if (uri?.scheme?.lowercase() !in setOf("http", "https") || uri?.host.isNullOrBlank()) return null
+        // Do not coerce arbitrary JSON values to strings: this object is dispatched directly to the native
+        // engine during account hydration, so it has the same public-network admission as a pasted install.
+        val url = (raw.opt("transportUrl") as? String)?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val uri = runCatching { URI(url) }.getOrNull() ?: return null
+        if (
+            uri.scheme?.lowercase() !in setOf("http", "https") ||
+            uri.host.isNullOrBlank() || uri.rawUserInfo != null ||
+            runCatching { PublicAddressPolicy.requireLiteralPublicOrHostname(uri.host) }.isFailure
+        ) return null
         val manifest = raw.optJSONObject("manifest") ?: return null
-        if (manifest.optString("id", "").isBlank()) return null
+        // Native's manifest serde needs real string values; `optString` would turn numbers/objects into
+        // seemingly valid ids and feed malformed account material into InstallAddon.
+        val id = manifest.opt("id") as? String ?: return null
+        val name = manifest.opt("name") as? String ?: return null
+        if (id.isBlank() || name.isBlank()) return null
         return AddonDescriptor(url, JSONObject(raw.toString()))
     }
 

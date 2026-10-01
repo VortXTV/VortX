@@ -1959,8 +1959,11 @@ class EngineStremioRepository(
     ): Boolean =
         withContext(Dispatchers.Default) {
             val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext false
-            val manifest = descriptor.raw.optJSONObject("manifest") ?: return@withContext false
-            if (manifest.optString("id", "").isBlank()) return@withContext false
+            // Revalidate at the dispatch boundary. Gateways are intentionally public to sync tests and future
+            // account surfaces, so a hand-built descriptor must not bypass codec URL/typed-manifest admission.
+            val admitted = VortXSyncDoc.addonDescriptor(descriptor.raw) ?: return@withContext false
+            if (admitted.transportUrl != descriptor.transportUrl) return@withContext false
+            val manifest = admitted.raw.optJSONObject("manifest") ?: return@withContext false
             runCatching {
                 historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                     check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
