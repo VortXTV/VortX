@@ -6,8 +6,10 @@ import com.vortx.android.profile.UserProfile
 import com.vortx.android.profile.WatchEntry
 import com.vortx.android.profile.optStringOrNull
 import com.vortx.android.profile.toStringList
+import com.vortx.android.data.AddonTombstones
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
 
 /**
  * The encrypted sync DOCUMENT codec: the pure, session-free transforms between the local profile roster
@@ -42,6 +44,12 @@ import org.json.JSONObject
  */
 object VortXSyncDoc {
 
+    /** An installable account-owned descriptor. The raw object is retained so opaque manifest fields survive. */
+    data class AddonDescriptor(
+        val transportUrl: String,
+        val raw: JSONObject,
+    )
+
     /** The parsed roster + overlay + tombstone view of a pulled doc, ready for the ordered syncDown apply. */
     data class Parsed(
         /** The remote roster, or null when the doc carries neither `vortx.roster` nor `vortx.profiles`. */
@@ -64,6 +72,10 @@ object VortXSyncDoc {
         val deletedAddonsTs: Map<String, Map<String, Double>>,
         /** Stamp-less removals authored by the web client; only syncDown may mint these into stamps. */
         val webAddonRemovals: List<String>,
+        /** App-owned and web-owned installable descriptors, app rows winning duplicate identities. */
+        val addons: List<AddonDescriptor>,
+        /** Shared top-level priority spine. Null means the document did not carry an order. */
+        val addonOrder: List<String>?,
         /** The remote device's active profile (advisory; selection stays per-device). */
         val activeProfile: String?,
     )
@@ -84,6 +96,8 @@ object VortXSyncDoc {
                 emptyList(),
                 emptyMap(),
                 webAddonRemovals,
+                ownedAddons(doc, null),
+                parseAddonOrder(doc.optJSONArray("addonOrder")),
                 null,
             )
 
@@ -139,9 +153,90 @@ object VortXSyncDoc {
             deletedAddons,
             deletedAddonsTs,
             webAddonRemovals,
+            ownedAddons(doc, vortx),
+            parseAddonOrder(doc.optJSONArray("addonOrder")),
             active,
         )
     }
+
+    /**
+     * Account-owned add-ons are a stable app-first union of `vortx.addons` and website `doc.addons`.
+     * URL-only legacy rows remain valid account records but are deliberately not returned here: native
+     * InstallAddon needs a manifest, and an incomplete remote row must never turn into an empty install.
+     */
+    internal fun ownedAddons(doc: JSONObject, vortx: JSONObject? = doc.optJSONObject("vortx")): List<AddonDescriptor> {
+        val byIdentity = LinkedHashMap<String, AddonDescriptor>()
+        fun addAll(rows: JSONArray?) {
+            rows ?: return
+            for (index in 0 until rows.length()) {
+                val raw = rows.optJSONObject(index) ?: continue
+                val descriptor = addonDescriptor(raw) ?: continue
+                val identity = AddonTombstones.normalize(descriptor.transportUrl)
+                if (identity.isNotEmpty() && identity !in byIdentity) byIdentity[identity] = descriptor
+            }
+        }
+        // App descriptors are canonical on conflict; website-only entries append in their document order.
+        addAll(vortx?.optJSONArray("addons"))
+        addAll(doc.optJSONArray("addons"))
+        return byIdentity.values.toList()
+    }
+
+    /** Parse one safely-installable descriptor without rejecting compatible shallow records elsewhere in a doc. */
+    internal fun addonDescriptor(raw: JSONObject): AddonDescriptor? {
+        val url = raw.optStringOrNull("transportUrl")?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val uri = runCatching { URI(url) }.getOrNull()
+        if (uri?.scheme?.lowercase() !in setOf("http", "https") || uri?.host.isNullOrBlank()) return null
+        val manifest = raw.optJSONObject("manifest") ?: return null
+        if (manifest.optString("id", "").isBlank()) return null
+        return AddonDescriptor(url, JSONObject(raw.toString()))
+    }
+
+    private fun parseAddonOrder(raw: JSONArray?): List<String>? {
+        raw ?: return null
+        val seen = HashSet<String>()
+        val out = ArrayList<String>(minOf(raw.length(), MAX_ADDON_ORDER_ENTRIES))
+        for (index in 0 until raw.length()) {
+            if (out.size == MAX_ADDON_ORDER_ENTRIES) break
+            val url = raw.opt(index) as? String ?: continue
+            val normalized = AddonTombstones.normalize(url)
+            if (normalized.isNotEmpty() && seen.add(normalized)) out += normalized
+        }
+        return out
+    }
+
+    /**
+     * Read-merge local engine descriptors into the app-owned carrier. Never replaces a known-good remote
+     * descriptor with an empty local snapshot; local descriptors win only for identities they actually hold.
+     */
+    internal fun mergeLocalAddons(
+        vortx: JSONObject,
+        local: List<AddonDescriptor>,
+        removed: Set<String>,
+    ): JSONObject {
+        if (local.isEmpty()) return vortx
+        val merged = LinkedHashMap<String, JSONObject>()
+        for (prior in vortx.optJSONArray("addons").orEmptyObjects()) {
+            val descriptor = addonDescriptor(prior) ?: continue
+            val identity = AddonTombstones.normalize(descriptor.transportUrl)
+            if (identity !in removed && identity !in merged) merged[identity] = descriptor.raw
+        }
+        for (descriptor in local) {
+            val identity = AddonTombstones.normalize(descriptor.transportUrl)
+            if (identity !in removed && identity.isNotEmpty()) merged[identity] = descriptor.raw
+        }
+        if (merged.isNotEmpty()) {
+            vortx.put("addons", JSONArray(merged.values.toList()))
+            if (!vortx.has("addonsOwnedAt")) vortx.put("addonsOwnedAt", System.currentTimeMillis())
+        }
+        return vortx
+    }
+
+    private fun JSONArray?.orEmptyObjects(): List<JSONObject> {
+        this ?: return emptyList()
+        return buildList { for (index in 0 until length()) optJSONObject(index)?.let(::add) }
+    }
+
+    private const val MAX_ADDON_ORDER_ENTRIES = 1024
 
     private fun parseLibraryTimestamps(raw: JSONObject?): Map<String, Map<String, Double>> {
         raw ?: return emptyMap()

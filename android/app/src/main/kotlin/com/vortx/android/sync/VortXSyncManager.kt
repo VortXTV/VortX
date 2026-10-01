@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
 import com.vortx.android.backup.SettingsBackup
+import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridService
@@ -114,6 +115,14 @@ internal typealias SyncRequestTestSeam = suspend (
     body: JSONObject?,
     bearerToken: String?,
 ) -> Pair<Int, JSONObject?>
+
+/** Native engine boundary: sync owns account semantics; the repository owns descriptors and native actions. */
+interface AccountAddonSyncGateway {
+    suspend fun accountAddonSnapshot(): List<VortXSyncDoc.AddonDescriptor>
+    suspend fun installAccountAddon(descriptor: VortXSyncDoc.AddonDescriptor): Boolean
+    suspend fun removeAccountAddon(normalizedTransportUrl: String): Boolean
+    suspend fun applyRemoteAddonOrder(order: List<String>): Boolean
+}
 
 /**
  * Publishes a session value only after its encrypted persistence mutation succeeds. Failed replacement
@@ -870,6 +879,7 @@ class VortXSyncManager(context: Context) {
     private val metadataKeys = MetadataProviderKeys(appContext)
     private val libraryTombstones = LibraryTombstones(appContext)
     private val addonTombstones = AddonTombstones(appContext)
+    private val addonPrefs = AddonPrefsStore(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
     private val sessionState = DurableSessionState(
@@ -903,6 +913,8 @@ class VortXSyncManager(context: Context) {
 
     /** The roster/overlay store the sync engine reads + folds into. Set by [attachSyncSeams]. */
     @Volatile private var profileStore: ProfileStore? = null
+    /** Bound by the application after the single native repository is available. */
+    @Volatile private var addonGateway: AccountAddonSyncGateway? = null
 
     /**
      * Set while syncDown is applying a remote pull. The writes it makes (roster fold, overlay hydrate) must
@@ -928,6 +940,7 @@ class VortXSyncManager(context: Context) {
 
     init {
         AddonTombstones.activateAccount(session?.account?.id)
+        AddonPrefsStore.activateAccount(session?.account?.id)
     }
 
     /**
@@ -949,6 +962,7 @@ class VortXSyncManager(context: Context) {
         if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable) {
             sessionState.restore(persisted, persistedOwnerEpoch)
             AddonTombstones.activateAccount(persisted?.account?.id)
+            AddonPrefsStore.activateAccount(persisted?.account?.id)
             _account.value = persisted?.account
         } else if (
             !sessionTruthMatches(live, persisted) ||
@@ -1368,6 +1382,7 @@ class VortXSyncManager(context: Context) {
             cancelSessionWork()
             sessionState.clear {
                 AddonTombstones.activateAccount(null)
+                AddonPrefsStore.activateAccount(null)
                 _account.value = null
                 _sessionUiState.value = SessionUiState.SignedOut
             }
@@ -1401,6 +1416,7 @@ class VortXSyncManager(context: Context) {
         require(testSession.account.id.isNotBlank())
         sessionState.restore(testSession)
         AddonTombstones.activateAccount(testSession.account.id)
+        AddonPrefsStore.activateAccount(testSession.account.id)
         _account.value = testSession.account
         _sessionUiState.value = SessionUiState.SignedIn(testSession.account)
         syncState.setLastVersion(testSession.account.id, highWaterVersion)
@@ -1444,6 +1460,14 @@ class VortXSyncManager(context: Context) {
         store.watchOverlay.onRequestSync = { requestSyncSoon() }
         store.watchOverlay.onPushWatch = { _, _ -> requestSyncSoon() }
     }
+
+    /** Separate because native-engine startup and ProfileStore startup are independently fail-soft. */
+    fun attachAccountAddonGateway(gateway: AccountAddonSyncGateway) {
+        addonGateway = gateway
+    }
+
+    /** Called after a local drag has persisted an account-scoped dirty order overlay. */
+    fun onLocalAddonOrderChanged() = requestSyncSoon()
 
     private fun resolveStore(): ProfileStore? = profileStore ?: ProfileStore.sharedOrNull()
 
@@ -1668,12 +1692,16 @@ class VortXSyncManager(context: Context) {
         // Stamp snapshot taken when the push BEGINS, before the blob is built: a key re-edited while this
         // push is in flight gets a newer stamp and stays dirty (its newer value was not necessarily carried).
         val pushedStamps = readDirtySettings()
+        val pushedAddonOrder = addonPrefs.orderDirtyAt()
         val initial = mergeLocalIntoDoc(lease) ?: return false    // failed pull: never overwrite the account doc
         if (!isSyncLeaseCurrent(lease)) return false
         val synced = pushDerivedDoc(lease, initial) { mergeLocalIntoDoc(lease) }
         // Only a CONFIRMED push clears its stamps; a failed/lost push leaves every key dirty so the next
         // pull cannot clobber the un-pushed local edits.
-        if (synced && isSyncLeaseCurrent(lease)) clearPushedDirtySettings(pushedStamps)
+        if (synced && isSyncLeaseCurrent(lease)) {
+            clearPushedDirtySettings(pushedStamps)
+            addonPrefs.clearPushedOrderDirty(pushedAddonOrder)
+        }
         return synced && isSyncLeaseCurrent(lease)
     }
 
@@ -1717,6 +1745,10 @@ class VortXSyncManager(context: Context) {
             is SyncDocPull.Empty -> JSONObject()
             is SyncDocPull.Doc -> pull.doc
         }
+        if (!isSyncLeaseCurrent(lease)) return null
+        // Reading local native state is deliberately outside the Main transaction. An unavailable/degraded
+        // engine contributes an empty snapshot, which mergeLocalAddons treats as preserve-not-delete.
+        val localAddons = addonGateway?.accountAddonSnapshot().orEmpty()
         if (!isSyncLeaseCurrent(lease)) return null
         val parsed = VortXSyncDoc.parse(doc)
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
@@ -1769,6 +1801,11 @@ class VortXSyncManager(context: Context) {
                     deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
                 )?.let { doc.put("settings", it) }
                 val vortx = VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx"))
+                VortXSyncDoc.mergeLocalAddons(
+                    vortx = vortx,
+                    local = localAddons,
+                    removed = addonTombstones.all(),
+                )
                 doc.put(
                     "vortx",
                     applyAddonTombstonesToVortx(applyLibraryTombstonesToVortx(vortx), addonTombstones),
@@ -1777,6 +1814,12 @@ class VortXSyncManager(context: Context) {
                 // never-delete, so a key set on one device follows the account. Foreign apiKeys keys are preserved.
                 mergeDebridKeysIntoDoc(doc)
                 mergeMetadataKeysIntoDoc(doc)
+                // Do not turn every routine push into a stale order write. Only an unacknowledged local
+                // drag owns the top-level spine; accepted pushes clear exactly that dirty generation.
+                if (addonPrefs.orderDirtyAt() != null) {
+                    val order = addonPrefs.appliedOrder()
+                    if (order.isEmpty()) doc.remove("addonOrder") else doc.put("addonOrder", JSONArray(order))
+                }
             }
         }
         return doc.takeIf { published && isSyncLeaseCurrent(lease) }
@@ -1953,6 +1996,9 @@ class VortXSyncManager(context: Context) {
         }
         if (!foldedTombstones || !isSyncLeaseCurrent(lease)) return false
         if (libraryTombstonesChanged || addonTombstonesChanged) requestSyncSoon()
+        // An older/equal authenticated envelope may advance only LWW tombstones. Enforce those removals
+        // immediately, but never hydrate descriptors or apply order until the normal version gate opens.
+        if (addonTombstonesChanged && !enforceRemovedAccountAddons(lease)) return false
         // VERSION-WINS: profile/settings data applies only from a STRICTLY-NEWER remote. Equal docs may run a
         // forced explicit restore, while an older authenticated doc contributes only add-on tombstone stamps.
         if (!shouldApplyVersionedPayload) {
@@ -2005,6 +2051,10 @@ class VortXSyncManager(context: Context) {
             }
         }
         if (!published || !isSyncLeaseCurrent(lease)) return false
+        // Account add-on descriptors/order are versioned payload. Every native mutation is lease-fenced so
+        // an account switch cannot install, remove, or reorder against the new session's engine state.
+        if (applyRemoteAccountAddons(lease, parsed)) restored = true
+        if (!isSyncLeaseCurrent(lease)) return false
         // gap 2: adopt connected-service (debrid) keys set on another device. Applied off the Main thread
         // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
         // applyingRemote window). Owner-scoped by DebridKeys' account binding; never clears a key the blob omits.
@@ -2018,6 +2068,54 @@ class VortXSyncManager(context: Context) {
         // Debounced and self-gated; the push reads LOCAL values (local wins) and clears the stamps it carries.
         if (readDirtySettings().isNotEmpty()) requestSyncSoon()
         return restored
+    }
+
+    /** Remove only add-ons with an effective tombstone; repository skips protected engine stubs. */
+    private suspend fun enforceRemovedAccountAddons(lease: SyncSessionLease): Boolean {
+        val gateway = addonGateway ?: return true
+        val removed = addonTombstones.all()
+        if (removed.isEmpty()) return true
+        val installed = gateway.accountAddonSnapshot()
+        if (!isSyncLeaseCurrent(lease)) return false
+        for (descriptor in installed) {
+            val identity = AddonTombstones.normalize(descriptor.transportUrl)
+            if (identity !in removed) continue
+            if (!isSyncLeaseCurrent(lease)) return false
+            gateway.removeAccountAddon(identity)
+            if (!isSyncLeaseCurrent(lease)) return false
+        }
+        return true
+    }
+
+    /** Install only missing valid descriptors and converge the shared order without overwriting a local drag. */
+    private suspend fun applyRemoteAccountAddons(
+        lease: SyncSessionLease,
+        parsed: VortXSyncDoc.Parsed,
+    ): Boolean {
+        val gateway = addonGateway ?: return false
+        val removed = addonTombstones.all()
+        val installed = gateway.accountAddonSnapshot()
+        if (!isSyncLeaseCurrent(lease)) return false
+        val present = installed.mapTo(HashSet()) { AddonTombstones.normalize(it.transportUrl) }
+        var changed = false
+        for (descriptor in parsed.addons) {
+            val identity = AddonTombstones.normalize(descriptor.transportUrl)
+            if (identity.isEmpty() || identity in removed || identity in present) continue
+            if (!isSyncLeaseCurrent(lease)) return false
+            if (gateway.installAccountAddon(descriptor)) changed = true
+            if (!isSyncLeaseCurrent(lease)) return false
+        }
+        if (!enforceRemovedAccountAddons(lease)) return false
+        // Dirty is persisted per account: a late remote order cannot erase an unacknowledged local reorder,
+        // including after process death. Remote application is marked remote so it does not self-push.
+        if (addonPrefs.orderDirtyAt() == null && parsed.addonOrder != null) {
+            if (addonPrefs.setAppliedOrder(parsed.addonOrder, remote = true)) {
+                if (!isSyncLeaseCurrent(lease)) return false
+                if (gateway.applyRemoteAddonOrder(parsed.addonOrder)) changed = true
+                if (!isSyncLeaseCurrent(lease)) return false
+            }
+        }
+        return changed
     }
 
     /**
@@ -2238,6 +2336,7 @@ class VortXSyncManager(context: Context) {
             ) {
                 sessionState.replace(s) {
                     AddonTombstones.activateAccount(account.id)
+                    AddonPrefsStore.activateAccount(account.id)
                     _account.value = account
                     _sessionUiState.value = SessionUiState.SignedIn(account)
                 }

@@ -49,7 +49,9 @@ import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sync.AccountLibrarySync
+import com.vortx.android.sync.AccountAddonSyncGateway
 import com.vortx.android.sync.LibraryTombstones
+import com.vortx.android.sync.VortXSyncDoc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -782,7 +784,7 @@ class EngineStremioRepository(
     /// How long to wait for a field's NewState before falling back to the current state. The engine is
     /// local except for add-on HTTP, so a few seconds covers a cold add-on fan-out.
     private val loadTimeoutSeconds: Long = 12,
-) : CatalogRepository, AuthRepository {
+) : CatalogRepository, AuthRepository, AccountAddonSyncGateway {
 
     private val appContext = context.applicationContext
     private val addonManifestFetcher = AddonManifestFetcher(MANIFEST_FETCH_TIMEOUT_MS)
@@ -1908,11 +1910,61 @@ class EngineStremioRepository(
 
     override suspend fun applyAddonOrder(transportUrls: List<String>): Result<Unit> =
         withContext(Dispatchers.Default) { runCatching {
-            addonPrefs.setAppliedOrder(transportUrls)
+            val changed = addonPrefs.setAppliedOrder(transportUrls)
             // Same local-poke as [setAddonDisabled]: the list order + future meta picks changed.
             changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            if (changed) (appContext as? VortXApplication)?.syncManager?.onLocalAddonOrderChanged()
             Unit
         } }
+
+    /** Raw native descriptor snapshot for the encrypted VortX account; no network work or logging. */
+    override suspend fun accountAddonSnapshot(): List<VortXSyncDoc.AddonDescriptor> =
+        withContext(Dispatchers.Default) {
+            val parsed = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+            buildList {
+                for (addon in parsed) {
+                    val raw = runCatching { JSONObject(addon.rawDescriptorJson) }.getOrNull() ?: continue
+                    VortXSyncDoc.addonDescriptor(raw)?.let(::add)
+                }
+            }
+        }
+
+    /**
+     * Install a descriptor already authenticated inside the account document. This avoids a duplicate manifest
+     * fetch and uses the same native InstallAddon boundary as a normal install; remote work never tombstones
+     * or schedules a sync echo.
+     */
+    override suspend fun installAccountAddon(descriptor: VortXSyncDoc.AddonDescriptor): Boolean =
+        withContext(Dispatchers.Default) {
+            val manifest = descriptor.raw.optJSONObject("manifest") ?: return@withContext false
+            if (manifest.optString("id", "").isBlank()) return@withContext false
+            runCatching {
+                StremioCoreNative.dispatch(EngineActions.installAddon(descriptor.transportUrl, manifest))
+                changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                true
+            }.getOrDefault(false)
+        }
+
+    /** Remote tombstone enforcement uses the engine's exact returned descriptor and never removes protected rows. */
+    override suspend fun removeAccountAddon(normalizedTransportUrl: String): Boolean =
+        withContext(Dispatchers.Default) {
+            val target = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+                .firstOrNull { AddonTombstones.normalize(it.transportUrl) == normalizedTransportUrl }
+                ?: return@withContext false
+            if (target.isProtected) return@withContext false
+            runCatching {
+                StremioCoreNative.dispatch(EngineActions.uninstallAddon(target.rawDescriptorJson))
+                changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                true
+            }.getOrDefault(false)
+        }
+
+    /** Remote order was already persisted by the sync manager with remote=true; refresh reactive readers only. */
+    override suspend fun applyRemoteAddonOrder(order: List<String>): Boolean =
+        withContext(Dispatchers.Default) {
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            true
+        }
 
     override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> =
         withContext(Dispatchers.Default) { runCatching {
@@ -1995,7 +2047,8 @@ class EngineStremioRepository(
         // An explicit install is intent to HAVE the add-on: clear any removal tombstone so a re-install of a
         // previously removed add-on is honored, not re-suppressed on the next read (SRC-2, Apple
         // `CoreBridge.installAddon` -> `AddonTombstones.forget`).
-        if (addonTombstones.forget(normalized)) requestAddonTombstoneSync()
+        addonTombstones.forget(normalized)
+        requestAddonTombstoneSync()
     }
 
     override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {
@@ -2004,7 +2057,8 @@ class EngineStremioRepository(
         // gone across an engine reset (#137). PROTECTED stubs (Cinemeta, Local) are never tombstoned: a logout
         // resets the engine to exactly those, so a tombstone would wrongly suppress an essential default
         // forever (SRC-2, Apple `CoreBridge.uninstallAddon` -> `AddonTombstones.tombstone`).
-        if (!addon.isProtected && addonTombstones.tombstone(addon.transportUrl)) requestAddonTombstoneSync()
+        if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)
+        requestAddonTombstoneSync()
     }
 
     /** A successful local add-on remove/reinstall is account data, unlike a remote fold. */

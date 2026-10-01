@@ -3,6 +3,7 @@ package com.vortx.android.sync
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -19,6 +20,63 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VortXSyncManagerStaleAddonEnvelopeTest {
+
+    @Test
+    fun `account descriptors union app then web, skip shallow rows, and retain normalized order`() {
+        val appUrl = "https://app.example/manifest.json"
+        val webUrl = "https://web.example/manifest.json"
+        fun descriptor(url: String, id: String, name: String) = JSONObject()
+            .put("transportUrl", url)
+            .put("manifest", JSONObject().put("id", id).put("name", name))
+
+        val document = JSONObject()
+            .put("addonOrder", JSONArray().put(" HTTPS://WEB.EXAMPLE/MANIFEST.JSON ").put(webUrl))
+            .put(
+                "vortx",
+                JSONObject().put(
+                    "addons",
+                    JSONArray().put(descriptor(appUrl, "app", "App copy")).put(JSONObject().put("transportUrl", "https://shallow.example")),
+                ),
+            )
+            .put(
+                "addons",
+                JSONArray()
+                    .put(descriptor(appUrl, "app-web", "Web copy that must lose"))
+                    .put(descriptor(webUrl, "web", "Website only")),
+            )
+
+        val parsed = VortXSyncDoc.parse(document)
+        assertEquals(listOf(appUrl, webUrl), parsed.addons.map { it.transportUrl })
+        assertEquals("app", parsed.addons.first().raw.getJSONObject("manifest").getString("id"))
+        assertEquals(listOf(webUrl.lowercase()), parsed.addonOrder)
+    }
+
+    @Test
+    fun `account order is isolated and an acknowledgement cannot clear a newer local drag`() {
+        val context = MemoryContext()
+        val prefs = AddonPrefsStore(context)
+        val first = "https://one.example/manifest.json"
+        val second = "https://two.example/manifest.json"
+
+        AddonPrefsStore.activateAccount("account-a")
+        assertTrue(prefs.setAppliedOrder(listOf(first)))
+        val firstDirty = requireNotNull(prefs.orderDirtyAt())
+        assertTrue(prefs.setAppliedOrder(listOf(second)))
+        val secondDirty = requireNotNull(prefs.orderDirtyAt())
+        assertTrue(secondDirty > firstDirty)
+        prefs.clearPushedOrderDirty(firstDirty)
+        assertEquals(secondDirty, prefs.orderDirtyAt())
+
+        AddonPrefsStore.activateAccount("account-b")
+        assertTrue(prefs.appliedOrder().isEmpty())
+        assertTrue(prefs.setAppliedOrder(listOf(first), remote = true))
+        assertEquals(listOf(first), prefs.appliedOrder())
+        assertEquals(null, prefs.orderDirtyAt())
+
+        AddonPrefsStore.activateAccount("account-a")
+        assertEquals(listOf(second), prefs.appliedOrder())
+        assertEquals(secondDirty, prefs.orderDirtyAt())
+    }
 
     @Test
     fun `unavailable session retry restores signed in add-on tombstone scope and sync payload`() {
@@ -67,6 +125,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             var versionedPayloadApplied = false
 
             val removedAddon = "https://peer.example/manifest.json"
+            val addonGateway = RecordingAddonGateway(removedAddon)
             val oldDocument = JSONObject()
                 .put("settings", JSONObject().put("local.setting", "replace"))
                 .put("apiKeys", JSONObject().put("realdebrid", "remote-value"))
@@ -113,9 +172,11 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                 },
                 onVersionedPayloadApply = { versionedPayloadApplied = true },
             )
+            manager.attachAccountAddonGateway(addonGateway)
 
             assertTrue(manager.syncDown(force = true))
             assertTrue(removedAddon in addonTombstones.all())
+            assertEquals(listOf(removedAddon), addonGateway.removed)
             assertFalse("library-entry" in libraryTombstones.all())
             assertFalse(versionedPayloadApplied)
             assertEquals("keep", settings.getString("local.setting", null))
@@ -128,6 +189,24 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             Dispatchers.resetMain()
         }
     }
+}
+
+private class RecordingAddonGateway(url: String) : AccountAddonSyncGateway {
+    private val descriptor = VortXSyncDoc.AddonDescriptor(
+        transportUrl = url,
+        raw = JSONObject()
+            .put("transportUrl", url)
+            .put("manifest", JSONObject().put("id", "peer").put("name", "Peer")),
+    )
+    val removed = mutableListOf<String>()
+
+    override suspend fun accountAddonSnapshot(): List<VortXSyncDoc.AddonDescriptor> = listOf(descriptor)
+    override suspend fun installAccountAddon(descriptor: VortXSyncDoc.AddonDescriptor): Boolean = false
+    override suspend fun removeAccountAddon(normalizedTransportUrl: String): Boolean {
+        removed += normalizedTransportUrl
+        return true
+    }
+    override suspend fun applyRemoteAddonOrder(order: List<String>): Boolean = false
 }
 
 private class MemoryContext : ContextWrapper(null) {
