@@ -1,7 +1,28 @@
 # Android TV: match the Apple TV experience
 
-Status: active implementation and acceptance record. The September 30 follow-up below is current;
+Status: active implementation and acceptance record. The October 1 follow-up below is current;
 older dated sections preserve their historical release boundary, not a claim of completed parity.
+
+## October 1 candidate follow-up
+
+The reviewed source batch after Beta 17 adds direct Newznab indexer configuration/search, prioritized
+saved NNTP servers and local fallback, strict decoded yEnc/cache admission, stale readiness disposal,
+phone Library segments, remote add-on reordering, optional read-only Trakt Continue Watching and
+manual detail check-in. Trakt carries typed episode intent through navigation and owner reloads;
+session/toggle/cache receipts fence final Home publication. Home rail order/hidden/layout settings
+now interoperate with Apple account documents and backups without flattening profile catalog order.
+
+Owner-library reads/restores now have typed native event and receipt contracts. Newer real events can
+converge without synthesizing a viewing timestamp or overwriting progress with metadata; queued
+membership actions capture their owner before dispatch, and library removal stamps are account-scoped.
+The final native-row publication provenance gate is still under review: a shared native UID/null bucket
+is not by itself evidence that resident history or add-on descriptors belong to the current VortX account.
+
+The shipping Apple add-on lifecycle changes are retained in the shared immutable engine pin. Locked
+native tests and actual Android native compilation/export inspection passed for all three ABIs.
+Full/Play app tests, exact release/LTO packages, production signer/version/feed checks and physical
+remote/provider journeys remain separate gates. Do not turn these source receipts into a numerical
+parity claim or a promise of hardware playback. See [the candidate notes](releases/0.4.0-beta.18.md).
 
 ## September 30 implementation follow-up
 

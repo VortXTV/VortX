@@ -4,6 +4,19 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.4.0-beta.18 - Playback settlement, Mac redesign, Android Usenet, and account sync
+
+Candidate Apple build **254**, Android version code **239**. Includes the reviewed work since
+Beta 17: owned AVPlayer recovery and subtitle settlement, the native Mac sidebar and in-window
+Settings, the iPhone hero-seam Watch action, Android Newznab indexers and prioritized NNTP servers,
+Trakt Continue Watching and manual check-in, phone Library segments, remote add-on ordering,
+cross-client Home rail backup/sync, and receipt-checked genuine native owner-library history.
+
+See [the full Beta 18 notes](docs/releases/0.4.0-beta.18.md) for the complete behavior and verification
+boundaries. Final account-publication provenance, tagged packages, signing and update feeds remain
+release gates; this candidate entry is not a publication receipt or a claim of universal playback
+closure or complete Android visual parity.
+
 ## 0.4.0-beta.17 - Resume recovery, binge playback, skip controls, and Android fixes
 
 Apple build **253**, Android version code **238**. Includes the completed changes since Beta 16:

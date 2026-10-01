@@ -5,15 +5,15 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.17"
+    static let version = "0.4.0-beta.18"
     static let highlights: [String] = [
-        "Failed saved resume targets retire through source and player replacements instead of repeatedly reopening the same unavailable position. A real first frame at 0:00 is accepted, and explicit seeks retain ownership.",
-        "Automatic intro, recap and credits skipping now offers Off, 5, 10, 15 and 30 seconds. Skip immediately or cancel the countdown with X; paused and buffering time cannot spend the countdown.",
-        "Android source changes preserve Play/Pause intent. Next-episode prewarming is cancellable and scoped to the current viewer and episode; Continue Watching targeting, episode focus and independent track restoration are repaired.",
-        "Subtitle requests include the selected file metadata where available and tolerate malformed individual results. Late track inventories cannot override manual subtitle Off.",
-        "Watch-based suggestions and Trakt/Top Shelf artwork are tied to the active account/profile. Progress-only updates retain valid artwork rather than erasing it.",
-        "Batch downloads recover from displaced metadata requests. Optional Android watched-download cleanup stays Off by default and requires durable watched evidence, released player resources and recoverable file/index updates.",
-        "Apple build 253 and signed Android version code 238. Physical-device DV, NNTP throughput and frame pacing still need fresh testing; the Mac/iPhone redesign and full Android visual/feature parity are not claimed complete."
+        "AVPlayer recovery belongs to the current item and seek. Accepted landings settle once; retired callbacks cannot restart a replacement or override Pause. Explicit subtitle choices and Off supersede late restoration.",
+        "Mac has a native seven-destination sidebar and in-window categorized Settings, with search, keyboard navigation and Reduce Motion. The iPhone episode Watch action overlaps the large hero without collapsing long labels; iPad and Mac keep their source-list Play control.",
+        "Android supports direct Newznab indexers and multiple prioritized NNTP servers. Encrypted account/profile configuration, decoded yEnc coverage, provider fallback and cancellation fences protect source and next-episode preparation.",
+        "Optional Android Trakt Continue Watching carries typed episode intent and resolves artwork. Session and toggle changes invalidate old results. Manual detail check-in offers an explicit conflict action without marking anything watched.",
+        "Android phone and TV share Library segments. TV add-on ordering has remote move controls; Home rail order interoperates with Apple account documents and backups.",
+        "The candidate native owner-library path preserves zero progress, watched counts and per-video state separately. Receipt validation, account-specific removals and pre-dispatch fences are implemented; final account-publication provenance remains a release gate.",
+        "Beta 17 playback, automatic-skip, source-owned suggestions, subtitle metadata and artwork repairs are retained. Apple build 254 and Android version code 239; sustained DV/NNTP, frame pacing, physical remote journeys and complete Android visual parity are not claimed verified."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses

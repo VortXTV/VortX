@@ -114,10 +114,9 @@ internal class TvDetailInitialFocus {
 /// Because the source list comes from [DetailViewModel], the active profile's Kids content guard applies on
 /// TV with no extra code -- it is enforced inside the ViewModel's source-ranking context, not in the UI.
 ///
-/// Slice scope: this shows meta + a flat ranked source list + Play. The phone screen's season/episode
-/// browser, the per-source long-press pin menu, watched-state toggles, and cast/credits are NOT reproduced
-/// here yet (see the session report's gap list). For a series the ViewModel still auto-targets the
-/// resume/first-unwatched episode, so Watch plays the right thing.
+/// Seasons, episodes, watched actions, source filters/pins, cast and related rails below the hero use
+/// the shared repositories and ViewModel. Keep this route independent of old prototype gap lists;
+/// physical remote/layout parity is a separate acceptance check, not an absent-feature assumption.
 @Composable
 fun TvDetailScreen(
     viewModel: DetailViewModel,
