@@ -45,6 +45,44 @@ class TraktContinueWatchingModelTest {
     }
 
     @Test
+    fun `clear returns promptly while an in-flight fetch is still awaiting`() = runBlocking {
+        val source = FakeSource(response = Result.success(listOf(item("tt-a"))))
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        source.beforeReturn = { entered.complete(Unit); release.await() }
+        val model = TraktContinueWatchingModel(source)
+        val pending = async { model.refresh(true) }
+        entered.await()
+
+        model.clear()
+        release.complete(Unit)
+
+        assertTrue(pending.await().items.isEmpty())
+    }
+
+    @Test
+    fun `toggle revision fence never retains account A after off then on`() = runBlocking {
+        val source = FakeSource(response = Result.success(listOf(item("tt-a"))))
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        source.beforeReturn = { entered.complete(Unit); release.await() }
+        val model = TraktContinueWatchingModel(source)
+        val pending = async { model.refresh(true) }
+        entered.await()
+
+        source.enabled = false
+        source.toggleRevision += 1
+        release.complete(Unit)
+        assertTrue(pending.await().items.isEmpty())
+
+        source.enabled = true
+        source.toggleRevision += 1
+        source.beforeReturn = null
+        source.response = Result.success(listOf(item("tt-b")))
+        assertEquals(listOf("tt-b"), model.refresh(true).items.map(MetaItem::id))
+    }
+
+    @Test
     fun `failure retains successful snapshot for same account`() = runBlocking {
         var clock = 0L
         val source = FakeSource(response = Result.success(listOf(item("tt1"))))
@@ -123,8 +161,10 @@ class TraktContinueWatchingModelTest {
         var response: Result<List<MetaItem>> = Result.success(emptyList()),
     ) : TraktContinueWatchingSource {
         var fetches = 0
+        var toggleRevision = 0L
         var beforeReturn: (suspend () -> Unit)? = null
         override fun sessionEpoch(): Long? = epoch
+        override fun toggleRevision(): Long = toggleRevision
         override fun isEnabled(): Boolean = enabled
         override suspend fun fetch(expectedEpoch: Long): Result<List<MetaItem>> {
             fetches += 1

@@ -12,18 +12,27 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
 /** A separately-owned, read-only Trakt paused-playback row. It never alters engine progress. */
 internal const val TRAKT_CONTINUE_WATCHING_CATALOG_ID = "vortx.home.traktContinueWatching"
 
-internal data class TraktContinueWatchingRefresh(val items: List<MetaItem>, val changed: Boolean)
+/** Exact external state a Home assignment must still observe after asynchronous provider work finishes. */
+internal data class TraktContinueWatchingReceipt(
+    val sessionEpoch: Long?,
+    val toggleRevision: Long,
+)
+
+internal data class TraktContinueWatchingRefresh(
+    val items: List<MetaItem>,
+    val changed: Boolean,
+    val receipt: TraktContinueWatchingReceipt,
+)
 
 internal interface TraktContinueWatchingSource {
     fun sessionEpoch(): Long?
+    fun toggleRevision(): Long
     fun isEnabled(): Boolean
     suspend fun fetch(expectedEpoch: Long): Result<List<MetaItem>>
 }
@@ -33,40 +42,85 @@ internal class TraktContinueWatchingModel(
     private val source: TraktContinueWatchingSource = TraktPlaybackSource,
     private val nowMillis: () -> Long = System::currentTimeMillis,
 ) {
-    private val mutex = Mutex()
-    private var epoch: Long? = null
+    private val stateLock = Any()
+    private var receipt: TraktContinueWatchingReceipt? = null
     private var revision = 0L
     private var lastSuccessAt: Long? = null
     private var cached: List<MetaItem> = emptyList()
 
-    suspend fun refresh(allowOwner: Boolean): TraktContinueWatchingRefresh = mutex.withLock {
-        val before = cached
-        val expected = source.sessionEpoch()
-        if (!allowOwner || !source.isEnabled() || expected == null) {
-            reset(null)
-            return TraktContinueWatchingRefresh(emptyList(), before.isNotEmpty())
+    /** Network/artwork work runs outside [stateLock], so [clear] invalidates immediately. */
+    suspend fun refresh(allowOwner: Boolean): TraktContinueWatchingRefresh {
+        val plan = synchronized(stateLock) {
+            val before = cached
+            val current = sourceReceipt()
+            if (!allowOwner || !source.isEnabled() || current.sessionEpoch == null) {
+                resetLocked(null)
+                return@synchronized RefreshPlan.Immediate(snapshotLocked(before, current))
+            }
+            if (receipt != current) resetLocked(current)
+            if (lastSuccessAt?.let { nowMillis() - it < REFRESH_INTERVAL_MS } == true) {
+                return@synchronized RefreshPlan.Immediate(snapshotLocked(before, current))
+            }
+            RefreshPlan.Fetch(
+                receipt = current,
+                revision = revision,
+                before = before,
+            )
         }
-        if (epoch != expected) reset(expected)
-        if (lastSuccessAt?.let { nowMillis() - it < REFRESH_INTERVAL_MS } == true) {
-            return TraktContinueWatchingRefresh(cached, before != cached)
+
+        if (plan is RefreshPlan.Immediate) return plan.refresh
+        val fetchPlan = plan as RefreshPlan.Fetch
+        val response = source.fetch(requireNotNull(fetchPlan.receipt.sessionEpoch))
+        return synchronized(stateLock) {
+            val current = sourceReceipt()
+            val sourceStillMatches = source.isEnabled() && current == fetchPlan.receipt
+            if (revision != fetchPlan.revision || receipt != fetchPlan.receipt || !sourceStillMatches) {
+                // This request itself is the last owner of the old cache: clear it. A newer refresh/clear
+                // already advanced [revision], so never erase that newer state from a delayed old response.
+                if (revision == fetchPlan.revision && receipt == fetchPlan.receipt) {
+                    resetLocked(current.takeIf { source.isEnabled() && it.sessionEpoch != null })
+                }
+                return@synchronized snapshotLocked(fetchPlan.before, current)
+            }
+            response.onSuccess {
+                cached = it
+                lastSuccessAt = nowMillis()
+            }
+            snapshotLocked(fetchPlan.before, fetchPlan.receipt)
         }
-        val capturedRevision = revision
-        val response = source.fetch(expected)
-        if (capturedRevision != revision || source.sessionEpoch() != expected || !source.isEnabled()) {
-            if (source.sessionEpoch() != expected || !source.isEnabled()) reset(null)
-            return TraktContinueWatchingRefresh(cached, before != cached)
-        }
-        response.onSuccess { cached = it; lastSuccessAt = nowMillis() }
-        TraktContinueWatchingRefresh(cached, before != cached)
     }
 
-    suspend fun clear() = mutex.withLock { reset(null) }
+    /** Synchronous invalidation: a late fetch sees its changed [revision] and cannot republish. */
+    fun clear() = synchronized(stateLock) { resetLocked(null) }
 
-    private fun reset(nextEpoch: Long?) {
+    private fun sourceReceipt() = TraktContinueWatchingReceipt(
+        sessionEpoch = source.sessionEpoch(),
+        toggleRevision = source.toggleRevision(),
+    )
+
+    private fun snapshotLocked(
+        before: List<MetaItem>,
+        currentReceipt: TraktContinueWatchingReceipt,
+    ) = TraktContinueWatchingRefresh(
+        items = cached,
+        changed = before != cached,
+        receipt = currentReceipt,
+    )
+
+    private fun resetLocked(nextReceipt: TraktContinueWatchingReceipt?) {
         revision += 1
-        epoch = nextEpoch
+        receipt = nextReceipt
         lastSuccessAt = null
         cached = emptyList()
+    }
+
+    private sealed interface RefreshPlan {
+        data class Immediate(val refresh: TraktContinueWatchingRefresh) : RefreshPlan
+        data class Fetch(
+            val receipt: TraktContinueWatchingReceipt,
+            val revision: Long,
+            val before: List<MetaItem>,
+        ) : RefreshPlan
     }
 
     private companion object { const val REFRESH_INTERVAL_MS = 5 * 60 * 1000L }
@@ -91,6 +145,7 @@ internal fun withTraktContinueWatchingRail(rows: List<Catalog>, items: List<Meta
 /** Authenticated, refreshed-token, exact-session adapter. Both legs must succeed before a replace. */
 private object TraktPlaybackSource : TraktContinueWatchingSource {
     override fun sessionEpoch(): Long? = TraktAuth.currentSessionEpoch
+    override fun toggleRevision(): Long = ScrobbleService.toggleChanges.value
     override fun isEnabled(): Boolean = ScrobbleService.isToggleOn(
         ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false,
     )

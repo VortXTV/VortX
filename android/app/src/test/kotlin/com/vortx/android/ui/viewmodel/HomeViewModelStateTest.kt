@@ -1,6 +1,7 @@
 package com.vortx.android.ui.viewmodel
 
 import com.vortx.android.data.HomeUpdate
+import com.vortx.android.home.TraktContinueWatchingReceipt
 import com.vortx.android.model.Catalog
 import com.vortx.android.ui.UiState
 import org.junit.Assert.assertEquals
@@ -8,6 +9,39 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class HomeViewModelStateTest {
+    @Test
+    fun `delayed account A Trakt result awaiting other rails is rejected under account B`() {
+        val accountA = TraktContinueWatchingReceipt(sessionEpoch = 41L, toggleRevision = 7L)
+
+        assertEquals(
+            false,
+            isTraktContinueWatchingReceiptCurrent(
+                receipt = accountA,
+                currentSessionEpoch = 42L,
+                currentToggleRevision = 7L,
+                currentlyEnabled = true,
+            ),
+        )
+        assertEquals(
+            false,
+            isTraktContinueWatchingReceiptCurrent(
+                receipt = accountA,
+                currentSessionEpoch = 41L,
+                currentToggleRevision = 8L,
+                currentlyEnabled = true,
+            ),
+        )
+        assertEquals(
+            false,
+            isTraktContinueWatchingReceiptCurrent(
+                receipt = accountA,
+                currentSessionEpoch = 41L,
+                currentToggleRevision = 7L,
+                currentlyEnabled = false,
+            ),
+        )
+    }
+
     @Test
     fun `initial empty heartbeat stays loading`() {
         assertNull(HomeUpdateReducer().reduce(HomeUpdate(rows = emptyList())))

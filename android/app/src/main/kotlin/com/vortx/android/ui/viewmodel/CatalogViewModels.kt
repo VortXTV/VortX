@@ -30,6 +30,7 @@ import com.vortx.android.home.foldSimklUpcomingSeeds
 import com.vortx.android.home.TopPicksModel
 import com.vortx.android.home.TraktRailsModel
 import com.vortx.android.home.TraktContinueWatchingModel
+import com.vortx.android.home.TraktContinueWatchingReceipt
 import com.vortx.android.home.importedCatalogRails
 import com.vortx.android.home.upcomingMetaBases
 import com.vortx.android.home.withBecauseYouWatchedRail
@@ -291,15 +292,17 @@ class HomeViewModel internal constructor(
         }
         scope.launch {
             TraktAuth.sessionBoundary.drop(1).collectLatest {
+                invalidateTraktPersonalizedRows()
                 traktRails.clear()
-                traktContinueWatching.clear()
-                traktWatchlist = emptyList()
-                traktContinueWatchingItems = emptyList()
-                publishHome()
                 refreshPersonalizedRails()
             }
         }
-        scope.launch { ScrobbleService.toggleChanges.drop(1).collectLatest { refreshPersonalizedRails() } }
+        scope.launch {
+            ScrobbleService.toggleChanges.drop(1).collectLatest {
+                invalidateTraktPersonalizedRows(clearWatchlist = false)
+                refreshPersonalizedRails()
+            }
+        }
         scope.launch {
             SIMKLAuth.sessionBoundary.drop(1).collectLatest {
                 simklRails.clear()
@@ -512,10 +515,24 @@ class HomeViewModel internal constructor(
             val upcomingChanged = upcoming?.let(::applyReleaseCalendar) == true
             if (because.changed) becauseYouWatchedRail = because.rail
             if (media.changed) mediaServerRails = media.rails
+            val currentTraktContinueWatching = isTraktContinueWatchingReceiptCurrent(
+                receipt = traktContinueWatchingRefresh.receipt,
+                currentSessionEpoch = TraktAuth.currentSessionEpoch,
+                currentToggleRevision = ScrobbleService.toggleChanges.value,
+                currentlyEnabled = ScrobbleService.isToggleOn(
+                    ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING,
+                    false,
+                ),
+            )
+            val nextTraktContinueWatching = if (currentTraktContinueWatching) {
+                traktContinueWatchingRefresh.items
+            } else {
+                traktContinueWatchingItems
+            }
             val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items ||
-                traktContinueWatchingItems != traktContinueWatchingRefresh.items
+                traktContinueWatchingItems != nextTraktContinueWatching
             traktWatchlist = trakt.items
-            traktContinueWatchingItems = traktContinueWatchingRefresh.items
+            traktContinueWatchingItems = nextTraktContinueWatching
             simklWatchlist = simkl.items
             if (
                 refreshed.changed || because.changed || media.changed || upcomingChanged ||
@@ -556,6 +573,16 @@ class HomeViewModel internal constructor(
         simklWatchlist = emptyList()
         becauseYouWatchedRail = null
         mediaServerRails = emptyList()
+    }
+
+    /** Clear visible Trakt-derived rows and revoke every stale personalized completion before cleanup work. */
+    private fun invalidateTraktPersonalizedRows(clearWatchlist: Boolean = true) {
+        personalizedJob?.cancel()
+        personalizedGeneration += 1
+        traktContinueWatching.clear()
+        traktContinueWatchingItems = emptyList()
+        if (clearWatchlist) traktWatchlist = emptyList()
+        publishHome()
     }
 
     private fun personalizedOwnerKey(owner: ContinueWatchingOwner): String = buildString {
@@ -650,6 +677,17 @@ class HomeViewModel internal constructor(
         const val CONFIRMATION_POLL_MS = 75L
     }
 }
+
+/** A late Trakt completion can assign Home only while the exact external session/toggle receipt still holds. */
+internal fun isTraktContinueWatchingReceiptCurrent(
+    receipt: TraktContinueWatchingReceipt,
+    currentSessionEpoch: Long?,
+    currentToggleRevision: Long,
+    currentlyEnabled: Boolean,
+): Boolean = currentlyEnabled &&
+    receipt.sessionEpoch != null &&
+    receipt.sessionEpoch == currentSessionEpoch &&
+    receipt.toggleRevision == currentToggleRevision
 
 private data class ContinueWatchingRollback(
     val row: Catalog,
