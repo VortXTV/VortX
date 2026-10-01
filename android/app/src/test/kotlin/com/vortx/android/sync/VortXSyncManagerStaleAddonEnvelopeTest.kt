@@ -120,6 +120,15 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         assertEquals("tt777", vortx.getJSONArray("library").getJSONObject(0).getString("id"))
         VortXSyncDoc.mergeLocalOwnerLibrary(vortx, listOf(parsed!!.first()), setOf("tt123"))
         assertEquals("tt777", vortx.getJSONArray("library").getJSONObject(0).getString("id"))
+
+        val remote = row("tt123", "movie", 42).put("d", 99).put("v", "tt123:2:3")
+            .put("lastWatched", "2026-10-01T10:00:00Z").put("watched", "opaque-native-bits")
+        val preserved = JSONObject().put("library", JSONArray().put(remote))
+        VortXSyncDoc.mergeLocalOwnerLibrary(preserved, listOf(parsed.first()), emptySet())
+        val after = preserved.getJSONArray("library").getJSONObject(0)
+        assertEquals(42, after.getInt("t")); assertEquals(99, after.getInt("d"))
+        assertEquals("tt123:2:3", after.getString("v")); assertEquals("2026-10-01T10:00:00Z", after.getString("lastWatched"))
+        assertEquals("opaque-native-bits", after.getString("watched"))
     }
 
     @Test

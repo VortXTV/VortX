@@ -230,6 +230,9 @@ object VortXSyncDoc {
         }
         for (item in local) {
             if (LibraryTombstones.normalize(item.metaId) !in removed) {
+                // Membership-only native snapshots deliberately carry no genuine event receipt. They may
+                // append a title, but never replace a peer row's t/d/v/clock or opaque watched bitfield.
+                if (item.identity in merged) continue
                 merged[item.identity] = JSONObject().apply {
                     put("id", item.metaId); put("type", item.type); put("name", item.name); put("poster", item.poster ?: "")
                     put("t", item.timeOffsetMs / 1000L); put("d", item.durationMs / 1000L); put("v", item.videoId ?: "")
