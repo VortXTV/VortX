@@ -1,5 +1,6 @@
 package com.vortx.android.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -26,6 +27,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -42,7 +44,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.model.MetaItem
 import com.vortx.android.person.PersonSeed
-import com.vortx.android.person.TMDBPersonClient
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.theme.VortXGlass
@@ -52,6 +53,9 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.viewmodel.PersonUiState
 import com.vortx.android.ui.viewmodel.PersonViewModel
+import com.vortx.android.ui.viewmodel.DetailNavigationFence
+import com.vortx.android.ui.viewmodel.resolveRelatedDetailTitle
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /// The Person page, ported from `app/SourcesShared/PersonView.swift`: tap a cast member on the detail
@@ -74,18 +78,30 @@ fun PersonScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
-    // Guard a rapid double-tap on a filmography tile so a slow tmdb -> tt resolve can't open twice.
-    var resolving by remember { mutableStateOf(false) }
+    // The latest selection wins even if a blocking TMDB request outlives cancellation.
+    val lookupFence = remember(viewModel, seed.id) { DetailNavigationFence() }
+    var lookupJob by remember(viewModel, seed.id) { mutableStateOf<Job?>(null) }
+    DisposableEffect(lookupFence) {
+        onDispose {
+            lookupFence.invalidate()
+            lookupJob?.cancel()
+        }
+    }
+    val back: () -> Unit = {
+        lookupFence.invalidate()
+        lookupJob?.cancel()
+        onBack()
+    }
+    BackHandler(onBack = back)
 
     val openTitle: (MetaItem) -> Unit = { item ->
-        if (!resolving) {
-            resolving = true
-            scope.launch {
-                // Resolve tmdb: -> tt BEFORE opening, the same fail-soft resolve the hub grids use; push
-                // the unresolved id if the lookup fails so the detail still opens (just sparser).
-                val tt = TMDBPersonClient.imdbId(item.id, item.type)
-                resolving = false
-                onOpenTitle(if (tt != null) item.copy(id = tt) else item)
+        val generation = lookupFence.begin()
+        lookupJob?.cancel()
+        lookupJob = scope.launch {
+            val resolved = resolveRelatedDetailTitle(item)
+            if (lookupFence.accepts(generation)) {
+                lookupFence.invalidate()
+                onOpenTitle(resolved)
             }
         }
     }
@@ -131,7 +147,7 @@ fun PersonScreen(
                 }
             }
         }
-        PersonBackChip(onBack = onBack, modifier = Modifier.align(Alignment.TopStart))
+        PersonBackChip(onBack = back, modifier = Modifier.align(Alignment.TopStart))
     }
 }
 

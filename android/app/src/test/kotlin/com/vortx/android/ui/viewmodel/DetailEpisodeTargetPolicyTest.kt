@@ -212,6 +212,25 @@ class DetailEpisodeTargetPolicyTest {
     }
 
     @Test
+    fun `filmography latest tap wins even when the first lookup completes last`() {
+        val fence = DetailNavigationFence()
+        val first = fence.begin()
+        val latest = fence.begin()
+        val opened = mutableListOf<String>()
+        if (fence.accepts(latest)) opened += "latest"
+        if (fence.accepts(first)) opened += "first"
+        assertEquals(listOf("latest"), opened)
+    }
+
+    @Test
+    fun `filmography back invalidates latest lookup before screen disposal`() {
+        val fence = DetailNavigationFence()
+        val pending = fence.begin()
+        fence.invalidate()
+        assertFalse(fence.accepts(pending))
+    }
+
+    @Test
     fun `warm source is retained only for the exact current owner and profile`() {
         val sourceFence = SourceRequestFence("profile-a")
         val request = sourceFence.begin("profile-a", "episode-2")

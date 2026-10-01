@@ -75,7 +75,7 @@ class AddonPrefsStore(
 
     /** Clear only the reorder carried by an accepted push; a newer drag must remain pending. */
     fun clearPushedOrderDirty(snapshot: Long?) {
-        val account = activeAccountScope ?: return
+        if (activeAccountScope == null) return
         snapshot ?: return
         val key = scopedKey(KEY_ORDER_DIRTY_AT)
         if (prefs.getLong(key, 0L) == snapshot) prefs.edit().remove(key).apply()
