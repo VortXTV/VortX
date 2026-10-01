@@ -50,6 +50,7 @@ import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
 import com.vortx.android.sync.AccountLibrarySync
 import com.vortx.android.sync.AccountAddonSyncGateway
+import com.vortx.android.sync.AccountAddonGatewayLease
 import com.vortx.android.sync.LibraryTombstones
 import com.vortx.android.sync.VortXSyncDoc
 import kotlinx.coroutines.CancellationException
@@ -785,6 +786,13 @@ class EngineStremioRepository(
     /// local except for add-on HTTP, so a few seconds covers a cold add-on fan-out.
     private val loadTimeoutSeconds: Long = 12,
 ) : CatalogRepository, AuthRepository, AccountAddonSyncGateway {
+
+    /**
+     * The native account fence captured by VortX account sync. It intentionally carries the complete
+     * owner, rather than a display UID alone: profile/account-slot transitions and a same-UID engine
+     * reauthentication both advance the owner revision and must reject a stale remote mutation.
+     */
+    private data class EngineAccountAddonLease(val owner: ContinueWatchingOwner) : AccountAddonGatewayLease
 
     private val appContext = context.applicationContext
     private val addonManifestFetcher = AddonManifestFetcher(MANIFEST_FETCH_TIMEOUT_MS)
@@ -1917,16 +1925,27 @@ class EngineStremioRepository(
             Unit
         } }
 
+    override fun captureAccountAddonLease(): AccountAddonGatewayLease? =
+        historyOwnerFence.captureRead()
+            ?.takeIf { it.owner.usesEngineHistory && it.owner.principal != "signed-out" }
+            ?.let { EngineAccountAddonLease(it.owner) }
+
     /** Raw native descriptor snapshot for the encrypted VortX account; no network work or logging. */
-    override suspend fun accountAddonSnapshot(): List<VortXSyncDoc.AddonDescriptor> =
+    override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> =
         withContext(Dispatchers.Default) {
-            val parsed = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
-            buildList {
-                for (addon in parsed) {
-                    val raw = runCatching { JSONObject(addon.rawDescriptorJson) }.getOrNull() ?: continue
-                    VortXSyncDoc.addonDescriptor(raw)?.let(::add)
+            val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext emptyList()
+            runCatching {
+                historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
+                    check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
+                    val parsed = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+                    buildList {
+                        for (addon in parsed) {
+                            val raw = runCatching { JSONObject(addon.rawDescriptorJson) }.getOrNull() ?: continue
+                            VortXSyncDoc.addonDescriptor(raw)?.let(::add)
+                        }
+                    }
                 }
-            }
+            }.getOrDefault(emptyList())
         }
 
     /**
@@ -1934,36 +1953,59 @@ class EngineStremioRepository(
      * fetch and uses the same native InstallAddon boundary as a normal install; remote work never tombstones
      * or schedules a sync echo.
      */
-    override suspend fun installAccountAddon(descriptor: VortXSyncDoc.AddonDescriptor): Boolean =
+    override suspend fun installAccountAddon(
+        nativeLease: AccountAddonGatewayLease,
+        descriptor: VortXSyncDoc.AddonDescriptor,
+    ): Boolean =
         withContext(Dispatchers.Default) {
+            val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext false
             val manifest = descriptor.raw.optJSONObject("manifest") ?: return@withContext false
             if (manifest.optString("id", "").isBlank()) return@withContext false
             runCatching {
-                StremioCoreNative.dispatch(EngineActions.installAddon(descriptor.transportUrl, manifest))
-                changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
+                    check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
+                    StremioCoreNative.dispatch(EngineActions.installAddon(descriptor.transportUrl, manifest))
+                    changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                }
                 true
             }.getOrDefault(false)
         }
 
     /** Remote tombstone enforcement uses the engine's exact returned descriptor and never removes protected rows. */
-    override suspend fun removeAccountAddon(normalizedTransportUrl: String): Boolean =
+    override suspend fun removeAccountAddon(
+        nativeLease: AccountAddonGatewayLease,
+        normalizedTransportUrl: String,
+    ): Boolean =
         withContext(Dispatchers.Default) {
-            val target = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
-                .firstOrNull { AddonTombstones.normalize(it.transportUrl) == normalizedTransportUrl }
-                ?: return@withContext false
-            if (target.isProtected) return@withContext false
+            val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext false
             runCatching {
-                StremioCoreNative.dispatch(EngineActions.uninstallAddon(target.rawDescriptorJson))
-                changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
-                true
+                historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
+                    check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
+                    val target = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+                        .firstOrNull { AddonTombstones.normalize(it.transportUrl) == normalizedTransportUrl }
+                        ?: return@mutate false
+                    if (target.isProtected) return@mutate false
+                    StremioCoreNative.dispatch(EngineActions.uninstallAddon(target.rawDescriptorJson))
+                    changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                    true
+                }
             }.getOrDefault(false)
         }
 
     /** Remote order was already persisted by the sync manager with remote=true; refresh reactive readers only. */
-    override suspend fun applyRemoteAddonOrder(order: List<String>): Boolean =
+    override suspend fun applyRemoteAddonOrder(
+        nativeLease: AccountAddonGatewayLease,
+        order: List<String>,
+    ): Boolean =
         withContext(Dispatchers.Default) {
-            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
-            true
+            val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext false
+            runCatching {
+                historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
+                    check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
+                    changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                    true
+                }
+            }.getOrDefault(false)
         }
 
     override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> =

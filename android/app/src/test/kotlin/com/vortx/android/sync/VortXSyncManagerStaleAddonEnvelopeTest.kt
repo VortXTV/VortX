@@ -192,6 +192,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
 }
 
 private class RecordingAddonGateway(url: String) : AccountAddonSyncGateway {
+    private data object Lease : AccountAddonGatewayLease
     private val descriptor = VortXSyncDoc.AddonDescriptor(
         transportUrl = url,
         raw = JSONObject()
@@ -200,13 +201,14 @@ private class RecordingAddonGateway(url: String) : AccountAddonSyncGateway {
     )
     val removed = mutableListOf<String>()
 
-    override suspend fun accountAddonSnapshot(): List<VortXSyncDoc.AddonDescriptor> = listOf(descriptor)
-    override suspend fun installAccountAddon(descriptor: VortXSyncDoc.AddonDescriptor): Boolean = false
-    override suspend fun removeAccountAddon(normalizedTransportUrl: String): Boolean {
+    override fun captureAccountAddonLease(): AccountAddonGatewayLease = Lease
+    override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> = listOf(descriptor)
+    override suspend fun installAccountAddon(nativeLease: AccountAddonGatewayLease, descriptor: VortXSyncDoc.AddonDescriptor): Boolean = false
+    override suspend fun removeAccountAddon(nativeLease: AccountAddonGatewayLease, normalizedTransportUrl: String): Boolean {
         removed += normalizedTransportUrl
         return true
     }
-    override suspend fun applyRemoteAddonOrder(order: List<String>): Boolean = false
+    override suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>): Boolean = false
 }
 
 private class MemoryContext : ContextWrapper(null) {

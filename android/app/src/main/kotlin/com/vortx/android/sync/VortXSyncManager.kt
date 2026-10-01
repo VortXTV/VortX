@@ -116,12 +116,23 @@ internal typealias SyncRequestTestSeam = suspend (
     bearerToken: String?,
 ) -> Pair<Int, JSONObject?>
 
+/** Opaque native-owner fence. A gateway may only use a lease it captured for the current engine account. */
+interface AccountAddonGatewayLease
+
 /** Native engine boundary: sync owns account semantics; the repository owns descriptors and native actions. */
 interface AccountAddonSyncGateway {
-    suspend fun accountAddonSnapshot(): List<VortXSyncDoc.AddonDescriptor>
-    suspend fun installAccountAddon(descriptor: VortXSyncDoc.AddonDescriptor): Boolean
-    suspend fun removeAccountAddon(normalizedTransportUrl: String): Boolean
-    suspend fun applyRemoteAddonOrder(order: List<String>): Boolean
+    /** Captures the native account UID/profile generation which must still own every later dispatch. */
+    fun captureAccountAddonLease(): AccountAddonGatewayLease?
+    suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor>
+    suspend fun installAccountAddon(
+        nativeLease: AccountAddonGatewayLease,
+        descriptor: VortXSyncDoc.AddonDescriptor,
+    ): Boolean
+    suspend fun removeAccountAddon(
+        nativeLease: AccountAddonGatewayLease,
+        normalizedTransportUrl: String,
+    ): Boolean
+    suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>): Boolean
 }
 
 /**
@@ -1748,7 +1759,11 @@ class VortXSyncManager(context: Context) {
         if (!isSyncLeaseCurrent(lease)) return null
         // Reading local native state is deliberately outside the Main transaction. An unavailable/degraded
         // engine contributes an empty snapshot, which mergeLocalAddons treats as preserve-not-delete.
-        val localAddons = addonGateway?.accountAddonSnapshot().orEmpty()
+        val localAddons = addonGateway?.let { gateway ->
+            gateway.captureAccountAddonLease()?.let { nativeLease ->
+                gateway.accountAddonSnapshot(nativeLease)
+            }
+        }.orEmpty()
         if (!isSyncLeaseCurrent(lease)) return null
         val parsed = VortXSyncDoc.parse(doc)
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
@@ -2075,13 +2090,15 @@ class VortXSyncManager(context: Context) {
         val gateway = addonGateway ?: return true
         val removed = addonTombstones.all()
         if (removed.isEmpty()) return true
-        val installed = gateway.accountAddonSnapshot()
+        val nativeLease = gateway.captureAccountAddonLease() ?: return false
+        if (!isSyncLeaseCurrent(lease)) return false
+        val installed = gateway.accountAddonSnapshot(nativeLease)
         if (!isSyncLeaseCurrent(lease)) return false
         for (descriptor in installed) {
             val identity = AddonTombstones.normalize(descriptor.transportUrl)
             if (identity !in removed) continue
             if (!isSyncLeaseCurrent(lease)) return false
-            gateway.removeAccountAddon(identity)
+            gateway.removeAccountAddon(nativeLease, identity)
             if (!isSyncLeaseCurrent(lease)) return false
         }
         return true
@@ -2094,7 +2111,9 @@ class VortXSyncManager(context: Context) {
     ): Boolean {
         val gateway = addonGateway ?: return false
         val removed = addonTombstones.all()
-        val installed = gateway.accountAddonSnapshot()
+        val nativeLease = gateway.captureAccountAddonLease() ?: return false
+        if (!isSyncLeaseCurrent(lease)) return false
+        val installed = gateway.accountAddonSnapshot(nativeLease)
         if (!isSyncLeaseCurrent(lease)) return false
         val present = installed.mapTo(HashSet()) { AddonTombstones.normalize(it.transportUrl) }
         var changed = false
@@ -2102,7 +2121,7 @@ class VortXSyncManager(context: Context) {
             val identity = AddonTombstones.normalize(descriptor.transportUrl)
             if (identity.isEmpty() || identity in removed || identity in present) continue
             if (!isSyncLeaseCurrent(lease)) return false
-            if (gateway.installAccountAddon(descriptor)) changed = true
+            if (gateway.installAccountAddon(nativeLease, descriptor)) changed = true
             if (!isSyncLeaseCurrent(lease)) return false
         }
         if (!enforceRemovedAccountAddons(lease)) return false
@@ -2111,7 +2130,7 @@ class VortXSyncManager(context: Context) {
         if (addonPrefs.orderDirtyAt() == null && parsed.addonOrder != null) {
             if (addonPrefs.setAppliedOrder(parsed.addonOrder, remote = true)) {
                 if (!isSyncLeaseCurrent(lease)) return false
-                if (gateway.applyRemoteAddonOrder(parsed.addonOrder)) changed = true
+                if (gateway.applyRemoteAddonOrder(nativeLease, parsed.addonOrder)) changed = true
                 if (!isSyncLeaseCurrent(lease)) return false
             }
         }
