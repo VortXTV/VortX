@@ -1,4 +1,4 @@
-package com.vortx.android.ui.tv
+package com.vortx.android.ui.library
 
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
@@ -41,6 +41,12 @@ class TvLibrarySmartFiltersTest {
     }
 
     @Test
+    fun `unknown and synthetic non-anime ids use their media type`() {
+        assertEquals(LibrarySegment.MOVIES, LibrarySegment.bucket(item("synthetic-movie-id", MediaType.MOVIE)))
+        assertEquals(LibrarySegment.SHOWS, LibrarySegment.bucket(item("unknown:catalog:42", MediaType.SERIES)))
+    }
+
+    @Test
     fun `segment bar hidden for a single bucket and shown with All plus present buckets`() {
         val moviesOnly = listOf(item("tt1", MediaType.MOVIE), item("tt2", MediaType.MOVIE))
         assertEquals(emptyList<LibrarySegment>(), LibrarySegment.availableSegments(moviesOnly))
@@ -58,8 +64,14 @@ class TvLibrarySmartFiltersTest {
 
     @Test
     fun `segment filter keeps only the bucket`() {
-        val items = listOf(item("tt1", MediaType.MOVIE), item("kitsu:2", MediaType.SERIES))
-        assertEquals(listOf(items[1]), LibrarySegment.ANIME.filter(items))
+        val items = listOf(
+            item("tt1", MediaType.MOVIE),
+            item("tt2", MediaType.SERIES),
+            item("kitsu:2", MediaType.SERIES),
+        )
+        assertEquals(listOf(items[0]), LibrarySegment.MOVIES.filter(items))
+        assertEquals(listOf(items[1]), LibrarySegment.SHOWS.filter(items))
+        assertEquals(listOf(items[2]), LibrarySegment.ANIME.filter(items))
         assertEquals(items, LibrarySegment.ALL.filter(items))
     }
 
@@ -110,5 +122,22 @@ class TvLibrarySmartFiltersTest {
         val shown = LibrarySmartFilter.apply(items, setOf(LibrarySmartFilter.UNWATCHED, LibrarySmartFilter.SHORT))
         assertEquals(listOf(items[0]), shown)
         assertEquals(items, LibrarySmartFilter.apply(items, emptySet()))
+    }
+
+    @Test
+    fun `engine loaded list remains the source while segment and smart filters intersect`() {
+        val overlayItem = item("overlay-movie", watched = false, runtimeMinutes = 45)
+        val items = listOf(
+            item("show", MediaType.SERIES, watched = true, runtimeMinutes = 45),
+            overlayItem,
+            item("anime", MediaType.SERIES, watched = false, runtimeMinutes = 45).copy(id = "anilist:9"),
+        )
+
+        val movies = LibrarySegment.MOVIES.filter(items)
+        val shown = LibrarySmartFilter.apply(movies, setOf(LibrarySmartFilter.UNWATCHED, LibrarySmartFilter.SHORT))
+
+        assertEquals(items, LibrarySegment.ALL.filter(items))
+        assertEquals(listOf(overlayItem), shown)
+        assertEquals(3, items.size) // segment/filter projections do not mutate the loaded result
     }
 }

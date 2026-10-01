@@ -78,6 +78,8 @@ import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.components.SignedOutState
 import com.vortx.android.ui.components.shimmer
+import com.vortx.android.ui.library.LibrarySegment
+import com.vortx.android.ui.library.LibrarySmartFilter
 import com.vortx.android.ui.search.RecentSearchesRow
 import com.vortx.android.ui.search.SearchResultSection
 import com.vortx.android.ui.search.textResourceId
@@ -269,24 +271,30 @@ private fun DiscoverFilterChips(filters: DiscoverFilters?, hideLive: Boolean, on
 @Composable
 fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val filters = (state as? UiState.Success<LibraryResult>)?.data?.filters
-    // Client-side smart filters (audit R01, Apple LibraryView.LibrarySmartFilter): multi-select and
-    // AND-combined, applied on top of the engine's type/sort. Reset when the screen's engine query
-    // changes is NOT wanted - the set survives refilters, exactly like Apple's @State.
-    var activeFilters by remember { mutableStateOf(emptySet<LibrarySmartFilter>()) }
+    val result = (state as? UiState.Success<LibraryResult>)?.data
+    val filters = result?.filters
+    val allItems = result?.items.orEmpty()
+    val segments = remember(allItems) { LibrarySegment.availableSegments(allItems) }
+    var selectedSegment by remember { mutableStateOf(LibrarySegment.ALL) }
+    val activeSegment = if (selectedSegment in segments || segments.isEmpty()) selectedSegment else LibrarySegment.ALL
+    val segmentedItems = remember(allItems, activeSegment) { activeSegment.filter(allItems) }
+    val applicableFilters = remember(segmentedItems) { LibrarySmartFilter.applicable(segmentedItems) }
+    var selectedFilters by remember { mutableStateOf(emptySet<LibrarySmartFilter>()) }
+    val activeFilters = selectedFilters intersect applicableFilters.toSet()
 
     Column(modifier = modifier.fillMaxSize()) {
         LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
-        LibrarySmartFilterChips(active = activeFilters, onToggle = { f ->
-            activeFilters = if (f in activeFilters) activeFilters - f else activeFilters + f
-        })
+        LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })
+        LibrarySmartFilterChips(
+            available = applicableFilters,
+            active = activeFilters,
+            onToggle = { selectedFilters = LibrarySmartFilter.toggle(selectedFilters, it) },
+        )
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
             is UiState.Success -> PosterGrid(
-                items = s.data.items.filter { item ->
-                    activeFilters.all { it.matches(item) }
-                },
+                items = LibrarySmartFilter.apply(segmentedItems, activeFilters),
                 onItem = onItem,
                 emptyHint = if (activeFilters.isEmpty()) "Titles you save appear here."
                             else "Nothing matches these filters.",
@@ -296,41 +304,38 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
     }
 }
 
-/// Client-side SMART filters for the Library: Unwatched / In Progress / Watched / Short, evaluated as
-/// predicates over fields a saved entry already carries (the read-only watched signal, 0..1 watch
-/// progress, and the preview runtime). Multi-select AND-combined, so combinations read as one smart
-/// list ("Unwatched" + "Short" = unwatched short films). A field the entry does not carry (runtime
-/// for a title never played) simply does not match; it never crashes. Mirrors Apple
-/// `LibraryView.swift` `LibrarySmartFilter` with identical thresholds.
-internal enum class LibrarySmartFilter(val label: String) {
-    UNWATCHED("Unwatched"),
-    IN_PROGRESS("In Progress"),
-    WATCHED("Watched"),
-    SHORT("Short");
-
-    fun matches(item: MetaItem): Boolean = when (this) {
-        UNWATCHED -> !item.watched
-        WATCHED -> item.watched
-        // The actively-resumable band: played into, but below the engine's own ~0.9 finished ceiling.
-        IN_PROGRESS -> (item.progress ?: 0f) > 0f && (item.progress ?: 0f) < IN_PROGRESS_CEIL
-        // Runtime strictly under 100 minutes counts as Short; an unknown runtime cannot match.
-        SHORT -> (item.previewRuntimeMinutes ?: Int.MAX_VALUE) < SHORT_RUNTIME_MINUTES
-    }
-
-    internal companion object {
-        /** Runtime strictly under this many minutes counts as "Short" (100 minutes). */
-        const val SHORT_RUNTIME_MINUTES = 100
-
-        /** The actively-resumable progress ceiling, matching Apple's `inProgressCeil`. */
-        const val IN_PROGRESS_CEIL = 0.9f
+@Composable
+private fun LibrarySegmentChips(
+    segments: List<LibrarySegment>,
+    active: LibrarySegment,
+    onSelect: (LibrarySegment) -> Unit,
+) {
+    if (segments.isEmpty()) return
+    ChipScrollRow {
+        segments.forEach { segment ->
+            Chip(
+                label = stringResource(segment.titleResource),
+                selected = segment == active,
+                onClick = { onSelect(segment) },
+            )
+        }
     }
 }
 
 @Composable
-private fun LibrarySmartFilterChips(active: Set<LibrarySmartFilter>, onToggle: (LibrarySmartFilter) -> Unit) {
+private fun LibrarySmartFilterChips(
+    available: List<LibrarySmartFilter>,
+    active: Set<LibrarySmartFilter>,
+    onToggle: (LibrarySmartFilter) -> Unit,
+) {
+    if (available.isEmpty()) return
     ChipScrollRow {
-        LibrarySmartFilter.entries.forEach { f ->
-            Chip(label = f.label, selected = f in active, onClick = { onToggle(f) })
+        available.forEach { filter ->
+            Chip(
+                label = stringResource(filter.titleResource),
+                selected = filter in active,
+                onClick = { onToggle(filter) },
+            )
         }
     }
 }
@@ -338,13 +343,6 @@ private fun LibrarySmartFilterChips(active: Set<LibrarySmartFilter>, onToggle: (
 @Composable
 private fun LibraryFilterChips(filters: LibraryFilters?, onSelect: (String) -> Unit) {
     if (filters == null) return
-    if (filters.types.size > 1) {
-        ChipScrollRow {
-            filters.types.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
-            }
-        }
-    }
     if (filters.sorts.isNotEmpty()) {
         ChipScrollRow {
             filters.sorts.forEach { option ->
