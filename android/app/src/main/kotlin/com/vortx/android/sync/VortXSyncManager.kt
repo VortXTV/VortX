@@ -1466,6 +1466,25 @@ class VortXSyncManager(context: Context) {
     internal fun captureSyncLeaseAdmissionTestSeam(): ((() -> Boolean) -> Boolean)? =
         captureSyncLease()?.let(::syncLeaseAdmission)
 
+    /** Capture invocation ownership even while signed out; a queued action cannot adopt a later session. */
+    internal fun captureLocalLibraryMutationAdmission(): ((() -> Boolean) -> Boolean)? =
+        operations.snapshot { generation ->
+            sessionState.serialized {
+                if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable) return@serialized null
+                val expected = sessionState.value
+                val epoch = sessionState.ownerEpoch
+                val admission: ((() -> Boolean) -> Boolean) = { dispatch ->
+                    operations.snapshot { currentGeneration ->
+                        sessionState.serialized {
+                            currentGeneration == generation && sessionState.ownerEpoch == epoch &&
+                                sessionState.value === expected && dispatch()
+                        }
+                    }
+                }
+                admission
+            }
+        }
+
     internal fun replaceSyncSessionTestSeam(session: Session) {
         operations.invalidate {
             sessionState.restore(session)

@@ -6,6 +6,7 @@ import android.content.SharedPreferences
 import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -20,6 +21,76 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VortXSyncManagerStaleAddonEnvelopeTest {
+
+    @Test
+    fun `queued typed add and remove capture invocation owner before dispatcher can adopt B`() = kotlinx.coroutines.test.runTest {
+        Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
+        try {
+            for (action in listOf("add", "remove")) for (transition in listOf("account", "session", "native")) {
+                val context = MemoryContext()
+                val manager = VortXSyncManager(context)
+                val key = ByteArray(32) { (it + 1).toByte() }
+                val a = VortXSyncManager.Session("token-a", VortXSyncManager.Account("A-queued", "a@example.test", "A", false), key)
+                val b = VortXSyncManager.Session("token-b", VortXSyncManager.Account("B-queued", "b@example.test", "B", false), key)
+                manager.installSyncTestSeam(a, 0L, transport = { _, _, _, _ -> 404 to JSONObject() })
+                val aStore = LibraryTombstones(context)
+                aStore.merge(emptyList(), mapOf("tt1" to mapOf("removedAt" to 1000.0)))
+                var nativePrincipal = "same-native"
+                val fence = com.vortx.android.engine.HistoryOwnerFence(
+                    captureOwner = { revision -> com.vortx.android.data.ContinueWatchingOwner(
+                        profileId = com.vortx.android.profile.UserProfile.OWNER_ID,
+                        accountSlot = "primary", principal = nativePrincipal, usesEngineHistory = true, revision = revision,
+                    ) },
+                    ownerRouteMatches = { owner -> owner.principal == nativePrincipal },
+                    transitionInProgress = { false },
+                )
+                var captures = 0
+                val writes = mutableListOf<String>()
+                val queuedDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler)
+                suspend fun invokeMutation(): Result<Unit> = runCatching {
+                    com.vortx.android.engine.withOwnerLibraryMutationAdmission(
+                        queuedDispatcher,
+                        capture = {
+                            captures++
+                            com.vortx.android.engine.OwnerLibraryMutationAdmission.capture(
+                                fence, manager.captureLocalLibraryMutationAdmission(), { LibraryTombstones(context) },
+                            )
+                        },
+                    ) { admitted ->
+                        admitted.mutate { _, tombstones ->
+                            writes += "${manager.currentSession()?.account?.id}:$action"
+                            if (action == "add") tombstones.forget("tt1") else tombstones.tombstone("tt1")
+                            Unit
+                        }
+                    }
+                }
+                // UNDISPATCHED enters the production wrapper immediately, but its withContext(Default)
+                // equivalent remains queued. Moving capture inside that hop makes this assertion fail.
+                val queued = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { invokeMutation() }
+                assertEquals(1, captures)
+                assertTrue(writes.isEmpty())
+                when (transition) {
+                    "account" -> manager.replaceSyncSessionTestSeam(b)
+                    "session" -> manager.replaceSyncSessionTestSeam(a.copy(token = "replacement-token"))
+                    "native" -> nativePrincipal = "other-native"
+                }
+                testScheduler.runCurrent()
+                assertTrue("$action/$transition must fail closed", queued.await().isFailure)
+                assertTrue("No native action against replacement owner", writes.isEmpty())
+                if (transition == "account") assertTrue(LibraryTombstones(context).all().isEmpty())
+                manager.replaceSyncSessionTestSeam(a)
+                assertEquals(setOf("tt1"), LibraryTombstones(context).all())
+                // A fresh invocation still succeeds under its own captured account and native owner.
+                val fresh = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { invokeMutation() }
+                testScheduler.runCurrent()
+                assertTrue(fresh.await().isSuccess)
+                assertEquals(listOf("A-queued:$action"), writes)
+            }
+        } finally {
+            LibraryTombstones.activateAccount(null)
+            Dispatchers.resetMain()
+        }
+    }
 
     @Test
     fun `real account switch isolates tombstones and sync upload preserves opaque peer entries`() = runBlocking {

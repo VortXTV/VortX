@@ -1983,6 +1983,12 @@ class EngineStremioRepository(
         }
     }
 
+    private fun captureOwnerLibraryMutation(): OwnerLibraryMutationAdmission = OwnerLibraryMutationAdmission.capture(
+        fence = historyOwnerFence,
+        admit = (appContext as? VortXApplication)?.syncManager?.captureLocalLibraryMutationAdmission(),
+        tombstones = { LibraryTombstones(appContext) },
+    )
+
     /** Raw native descriptor snapshot for the encrypted VortX account; no network work or logging. */
     override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> =
         withContext(Dispatchers.Default) {
@@ -3051,13 +3057,12 @@ class EngineStremioRepository(
         } }
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
-        withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
-            val tombstones = LibraryTombstones(appContext)
+        runCatchingPreservingCancellation {
+            withOwnerLibraryMutationAdmission(Dispatchers.Default, ::captureOwnerLibraryMutation) { admission ->
             metaDetailsGate.exclusive {
-            val permit = historyOwnerFence.captureRead()
-                ?: throw IllegalStateException("History owner is changing. Try again.")
+            admission.requireCurrent()
             ensureResidentMutationTarget(type, id)
-            historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+            admission.mutate { owner, tombstones ->
                 when (val route = historyRouteLocked(owner)) {
                     is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                         overlay.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
@@ -3078,13 +3083,12 @@ class EngineStremioRepository(
             }
         } }
 
-    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
-        val tombstones = LibraryTombstones(appContext)
+    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = runCatchingPreservingCancellation {
+        withOwnerLibraryMutationAdmission(Dispatchers.Default, ::captureOwnerLibraryMutation) { admission ->
         metaDetailsGate.exclusive {
-        val permit = historyOwnerFence.captureRead()
-            ?: throw IllegalStateException("History owner is changing. Try again.")
+        admission.requireCurrent()
         ensureResidentMutationTarget(type, id)
-        historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+        admission.mutate { owner, tombstones ->
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.removeWatchEntry(id)
