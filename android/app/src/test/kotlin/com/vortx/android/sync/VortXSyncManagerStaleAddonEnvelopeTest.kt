@@ -99,6 +99,30 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     }
 
     @Test
+    fun `owner library is app first typed zero safe and never treats omission as clear`() {
+        fun row(id: Any, type: Any, seconds: Any = 0) = JSONObject()
+            .put("id", id).put("type", type).put("name", "Title").put("t", seconds).put("d", 0).put("v", "tt1:1:1")
+        val document = JSONObject()
+            .put("library", JSONArray().put(row("tt999", "movie", 9)))
+            .put("vortx", JSONObject().put("library", JSONArray()
+                .put(row("tt123", "movie", 0))
+                .put(row("bad", "movie", 7))
+                .put(row("tmdb:5", "series", -3))))
+        val parsed = VortXSyncDoc.parse(document).ownerLibrary
+        assertEquals(2, parsed?.size)
+        assertEquals("tt123", parsed?.first()?.metaId)
+        assertEquals(0L, parsed?.first()?.timeOffsetMs)
+        assertEquals(0L, parsed?.get(1)?.timeOffsetMs)
+        assertEquals(null, VortXSyncDoc.parse(JSONObject()).ownerLibrary)
+
+        val vortx = JSONObject().put("library", JSONArray().put(row("tt777", "movie", 4)))
+        VortXSyncDoc.mergeLocalOwnerLibrary(vortx, emptyList(), emptySet())
+        assertEquals("tt777", vortx.getJSONArray("library").getJSONObject(0).getString("id"))
+        VortXSyncDoc.mergeLocalOwnerLibrary(vortx, listOf(parsed!!.first()), setOf("tt123"))
+        assertEquals("tt777", vortx.getJSONArray("library").getJSONObject(0).getString("id"))
+    }
+
+    @Test
     fun `unavailable session retry restores signed in add-on tombstone scope and sync payload`() {
         val context = MemoryContext()
         val manager = VortXSyncManager(context)
