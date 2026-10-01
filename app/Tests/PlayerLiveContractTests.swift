@@ -4044,7 +4044,8 @@ enum PlayerLiveContractTests {
                     "self.subtitleSelectionRevision == revision",
                     "selectionContextIsCurrent(",
                     "item.currentMediaSelection.selectedMediaOption(in: group) == requested",
-                    "self.setExternalSubtitleActive(activatingExternalAfterSettlement)",
+                    "self.externalSubtitleSettlement.consumeIfNativeDeselected(",
+                    "self.setExternalSubtitleActive(true)",
                     "self.refreshSelectionTracks(for: item)",
                   ]))
         check("wiring: the ticked-row identity includes the external subtitle",
@@ -4199,10 +4200,12 @@ enum PlayerLiveContractTests {
                   "pendingMediaSelectionIntent = selectionIntent",
                   "pendingPlaybackIntent = nil",
                   "remuxSeekRemountTarget = nil",
-                  "RemuxResumePolicy.playerSeek(",
-                  "producedEdgePlayerSeconds: producedEdgeSeconds",
-                  "player.seek(to:",
-              ]) && readyIntentRelease?.contains("await ") == false)
+                  "AVPlayerRecoverySettlementPolicy.normalizedRecoverySourceSeconds(",
+                  "acceptedForwardLandingTolerance: RemuxResumePolicy.forwardLandingToleranceSeconds",
+                  "recoverySeekSettlement.issue(",
+                  "seek(to: recoverySourceSeconds, recoveryTicket: recoveryTicket)",
+              ]) && readyIntentRelease?.contains("await ") == false
+                  && readyIntentRelease?.contains("player.seek(to:") == false)
         check("wiring: initial track publication waits for both audio and subtitle groups",
               initialTrackPublication?.contains("emit(MPVProperty.trackList") == false
                   && engine?.components(separatedBy: "emit(MPVProperty.trackList").count == 2
@@ -4397,7 +4400,7 @@ enum PlayerLiveContractTests {
         check("wiring: an external overlay excludes a late-discovered native subtitle group",
               sourceContainsInOrder(groupLoad, [
                   "player.appliesMediaSelectionCriteriaAutomatically = false",
-                  "if externalSubActive || pendingExternalSubtitleActivation {",
+                  "if externalSubActive || externalSubtitleSettlement.hasPendingIntent {",
                   "selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)",
               ]))
         check("wiring: immediate external subtitle activation uses the authoritative deselect helper",

@@ -64,6 +64,7 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
+import com.vortx.android.ui.components.TraktManualCheckInAction
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.DetailNavigationFence
@@ -113,10 +114,9 @@ internal class TvDetailInitialFocus {
 /// Because the source list comes from [DetailViewModel], the active profile's Kids content guard applies on
 /// TV with no extra code -- it is enforced inside the ViewModel's source-ranking context, not in the UI.
 ///
-/// Slice scope: this shows meta + a flat ranked source list + Play. The phone screen's season/episode
-/// browser, the per-source long-press pin menu, watched-state toggles, and cast/credits are NOT reproduced
-/// here yet (see the session report's gap list). For a series the ViewModel still auto-targets the
-/// resume/first-unwatched episode, so Watch plays the right thing.
+/// Seasons, episodes, watched actions, source filters/pins, cast and related rails below the hero use
+/// the shared repositories and ViewModel. Keep this route independent of old prototype gap lists;
+/// physical remote/layout parity is a separate acceptance check, not an absent-feature assumption.
 @Composable
 fun TvDetailScreen(
     viewModel: DetailViewModel,
@@ -406,6 +406,14 @@ private fun TvDetailContent(
                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                 ) {
+                    item {
+                        TraktManualCheckInAction(
+                            detail = detail,
+                            primaryEpisode = viewModel.primaryEpisode()?.first,
+                            resolving = playback is Playback.Resolving,
+                            tv = true,
+                        )
+                    }
                     // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a
                     // miss). Shown only when the meta carries a YouTube trailer id; plays through the shared
                     // player pipeline (the same [DetailViewModel] playback latch the Watch button uses).

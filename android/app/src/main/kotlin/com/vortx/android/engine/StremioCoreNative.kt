@@ -69,6 +69,12 @@ object StremioCoreNative {
     /// the engine is callable end to end.
     fun schemaVersion(): Int = nativeSchemaVersion()
 
+    /** Durable receipt-based owner-library restore; literal `null` means all-or-nothing rejection. */
+    fun restoreLibrary(requestJson: String): String = nativeRestoreLibrary(requestJson)
+
+    /** Genuine persisted library events for a JSON-encoded nullable native UID (`"uid"` or `null`). */
+    fun readLibraryEvents(ownerUidJson: String): String = nativeReadLibraryEvents(ownerUidJson)
+
     // ---- JNI declarations. Implemented in core/src/android_jni.rs; symbol names are derived from
     //      this package + class + method, so keep them in lockstep with the Rust side. ----
 
@@ -83,4 +89,8 @@ object StremioCoreNative {
     private external fun nativeGetState(fieldJson: String): String
 
     private external fun nativeSchemaVersion(): Int
+
+    private external fun nativeRestoreLibrary(requestJson: String): String
+
+    private external fun nativeReadLibraryEvents(ownerUidJson: String): String
 }

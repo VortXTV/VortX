@@ -116,7 +116,7 @@ internal class NntpClient(
         output: OutputStream,
         encodedLimit: Long,
         decodedLimit: Long,
-    ): Long {
+    ): YencDecoder.DecodedPart {
         writeLine("BODY $article")
         val code = readResponse()
         if (!code.startsWith("222")) throw IOException("NNTP body rejected")

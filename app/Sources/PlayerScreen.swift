@@ -867,6 +867,9 @@ struct PlayerScreen: View {
     @State private var isSeekable = true
     @State private var loadTimeout: Task<Void, Never>?
     @State private var playbackDeadlineClock = PlaybackActiveTimeClock()
+    @State private var recoveryPauseOwner: PlayerLoadToken?
+    @State private var recoveryPauseIntent = false
+    @State private var recoveryPauseTarget: Double = 0
     @State private var reconnecting = false          // showing the "Recovering…" auto-retry state
     @State private var reconnectMsg = "Recovering…"
     @State private var autoRetryCount = 0
@@ -1903,6 +1906,13 @@ struct PlayerScreen: View {
     }
 
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        if let loadToken, loadToken == recoveryPauseOwner,
+           loadToken == coordinator.player?.activeLoadToken,
+           name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
+           event.loadToken == loadToken, abs(event.seconds - recoveryPauseTarget) <= 2 {
+            recoveryPauseOwner = nil
+            if recoveryPauseIntent { coordinator.player?.pause() }
+        }
         if let loadToken, loadToken == coordinator.player?.activeLoadToken {
             adoptResumeSurfaceIfCurrent(loadToken: loadToken)
             // AV callbacks are generation-fenced by the engine; mpv uses a fresh token per mount.
@@ -3132,12 +3142,19 @@ struct PlayerScreen: View {
                 preparedRemux.abandon(reason: "iOS admission owner or engine mismatch")
             }
         }
+        let capturedRecoveryPause = (player as? MPVMetalViewController)?.requestedPauseIntent
+            ?? playbackDeadlineClock.isPaused
         let candidateToken = player.loadFile(
             p.url, headers: p.headers, live: live, audioSidecar: sidecar,
             reusing: loadToken
         )
         let issuedToken = candidateToken == player.activeLoadToken ? candidateToken : nil
         if let issuedToken {
+            // Same-source recovery retains the latest viewer pause across the new file's startup.
+            recoveryPauseIntent = capturedRecoveryPause
+            recoveryPauseTarget = requestedResumeOrigin
+            recoveryPauseOwner = preservingAbandonedResume && recoveryPauseIntent ? issuedToken : nil
+            if recoveryPauseOwner != nil { player.pause() }
             abandonedResumeRecovery = DeferredResumeSeekReconciliationPolicy.afterAdmission(
                 current: abandonedResumeRecovery, retiringOwner: retiringOwner, acceptedOwner: issuedToken,
                 preservingSourceChain: preservingAbandonedResume, recoveryOriginSeconds: requestedResumeOrigin
@@ -3692,11 +3709,13 @@ struct PlayerScreen: View {
 
     private func viewerPause() {
         guard coordinator.player != nil else { return }
+        recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.pause()
     }
 
     private func viewerPlay() {
+        recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.play()
     }
@@ -5051,9 +5070,15 @@ struct PlayerScreen: View {
                     _ = deferredResumeAttempt.complete(ticket)
                     return
                 }
+                var resumeDuration = duration
+                if let owner = recoveryPauseOwner, recoveryPauseIntent,
+                   let mpv = coordinator.player as? MPVMetalViewController {
+                    guard let loadedDuration = mpv.durationForPausedRecovery(owner: owner) else { continue }
+                    resumeDuration = loadedDuration
+                }
                 let decision = DeferredResumePolicy.decision(
                     targetSeconds: ticket.targetSeconds,
-                    observedDurationSeconds: duration,
+                    observedDurationSeconds: resumeDuration,
                     engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
                     deadlineReached: false
                 )
@@ -5065,7 +5090,16 @@ struct PlayerScreen: View {
                     // and wedges video output (blank + frozen timer); defer it to the first-frame commit so it
                     // lands as an ordinary warm scrub, which is proven to render. A mid-play nudge (a stall or
                     // source-switch reload after the first frame) is already warm, so it seeks immediately.
-                    if hasStartedPlaying {
+                    if let owner = recoveryPauseOwner, owner == coordinator.player?.activeLoadToken,
+                       recoveryPauseIntent {
+                        if let mpv = coordinator.player as? MPVMetalViewController {
+                            guard mpv.seekForPausedRecovery(to: target, owner: owner) else { continue }
+                        } else {
+                            coordinator.player?.seekForResume(to: target)
+                        }
+                        recoveryPauseTarget = target
+                        pendingLibmpvResumeSeek = nil
+                    } else if hasStartedPlaying {
                         coordinator.player?.seek(to: target)
                     } else {
                         pendingLibmpvResumeSeek = target

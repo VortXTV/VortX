@@ -48,6 +48,15 @@ private struct BecauseYouWatchedDocumentHistoryTests {
             {"id":"tt0000001","type":"movie","name":"A resident","t":99,"d":100,"v":"movie-a","poster":"a-poster"}
           ],
           "vortx": {
+            "byProfile": {
+              "00000000-0000-0000-0000-00000000A11C": {
+                "ownerHistory": [
+                  {"id":"tt0000099","type":"movie","name":"Unsaved genuine play","t":0,"d":100,"v":"tt0000099","lastWatched":"2026-10-01T12:00:00.000Z","eventEpochMs":1760000000000},
+                  {"id":"tt0000097","type":"movie","name":"Unsaved resume","t":33,"d":100,"v":"tt0000097","lastWatched":"2026-10-01T12:00:01.000Z","eventEpochMs":1760000001000},
+                  {"id":"tt0000098","type":"movie","name":"Malformed peer","t":10,"d":100,"v":"tt0000098"}
+                ]
+              }
+            },
             "library": [
               {"id":"tt0000001","type":"movie","name":"B shared","t":12,"d":100,"v":"movie-b","poster":"b-poster"},
               {"id":"TVDB:12345","type":"tv","name":"B television","t":0,"d":1},
@@ -66,17 +75,19 @@ private struct BecauseYouWatchedDocumentHistoryTests {
         let snapshot = BecauseYouWatchedDocumentHistory.snapshot(
             from: document,
             removedIDs: ["tt0000004"])
-        precondition(snapshot.library.map(\.id) == ["tt0000001", "tvdb:12345", "tmdb:123"],
+        precondition(snapshot.library.map(\.id) == ["tt0000099", "tt0000097", "tt0000001", "tvdb:12345", "tmdb:123"],
                      "only current B document rows survive validation/tombstones")
-        precondition(snapshot.library.first?.name == "B shared",
-                     "resident A progress cannot replace the first B source row")
-        precondition(snapshot.library.first?.state.timeOffset == 12_000,
+        precondition(snapshot.library.first(where: { $0.id == "tt0000001" })?.name == "B shared",
+                     "resident A progress cannot replace the current B library source row")
+        precondition(snapshot.library.first(where: { $0.id == "tt0000001" })?.state.timeOffset == 12_000,
                      "shared id uses B's document offset, not resident A's offset")
         precondition(snapshot.library.last?.state.timeOffset == 1_000 &&
                      snapshot.library.last?.state.duration == 0,
                      "numeric wire 0/1 values remain numeric rather than Boolean")
-        precondition(snapshot.continueWatching.map(\.id) == ["tt0000001", "tmdb:123"],
+        precondition(snapshot.continueWatching.map(\.id) == ["tt0000097", "tt0000001", "tmdb:123"],
                      "membership with zero progress does not become watch evidence")
+        precondition(snapshot.library.first?.id == "tt0000099" && snapshot.continueWatching.first?.id == "tt0000097",
+                     "zero history stays recommendation-only while positive unsaved history cold-restores CW")
         print("ALL TESTS PASSED")
     }
 }

@@ -142,6 +142,22 @@ final class MPVMetalViewController: PlatformViewController {
     private var freshOrigin = FreshPlaybackOriginPolicy<PlayerLoadToken>()
     /// One destructive cache flight per controller; all mutations occur on the main queue.
     private var cacheFlushFlight = CacheFlushSingleFlight<PlayerLoadToken>()
+    /// Mirrored under loadTokenLock so queued main-queue callbacks retain the command attempt
+    /// they actually observed, rather than adopting whichever flight exists when they execute.
+    private struct CacheReanchorEventWitness: Equatable {
+        let id: UInt64
+        let owner: PlayerLoadToken
+        let attempt: Int
+    }
+    private var cacheReanchorEventWitness: CacheReanchorEventWitness?
+    private func captureCacheReanchorEventWitness() -> CacheReanchorEventWitness? {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return cacheReanchorEventWitness
+    }
+    private func acceptsCacheReanchorEventWitness(_ witness: CacheReanchorEventWitness?) -> Bool {
+        guard let witness else { return false }
+        return cacheFlushFlight.acceptsEvent(id: witness.id, owner: witness.owner, attempt: witness.attempt)
+    }
     /// The source inputs needed for the one bounded same-source retry after a proven false EOF. Kept per
     /// accepted load (rather than reading mpv's redirected path) so signed URLs, headers, and sidecars keep
     /// the exact normal `loadFile` ownership and sanitisation path on reopen.
@@ -1340,6 +1356,16 @@ final class MPVMetalViewController: PlatformViewController {
         sampleLiveState: Bool = true
     ) {
         guard let flight else { return }
+        loadTokenLock.lock()
+        if cacheReanchorEventWitness?.id == flight.id { cacheReanchorEventWitness = nil }
+        loadTokenLock.unlock()
+        // Restore before replacement/explicit-seek ownership changes. An old callback must never
+        // write its option snapshot into a newer source or flight.
+        if let handle = mpv, activeLoadToken == flight.owner,
+           cacheFlushFlight.current == nil {
+            let status = mpv_set_property_string(handle, "demuxer-seekable-cache", flight.originalSeekableCache)
+            if status < 0 { mpvLog.error("cache seek option restoration failed status=\(status)") }
+        }
         #if canImport(UIKit)
         let bufferedAheadReceipt: String
         let pausedForCacheReceipt: String
@@ -1353,7 +1379,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
         DiagnosticsLog.log(
             "player",
-            "internal-cache-flush-end operation=atomic-reanchor flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) bufferedAhead=\(bufferedAheadReceipt) pausedForCache=\(pausedForCacheReceipt) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount) elapsed=\(cacheFlushElapsedReceipt(startUptime: flight.startUptime)) outcome=\(flight.result.rawValue)"
+            "internal-cache-flush-end operation=low-level-reanchor flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) bufferedAhead=\(bufferedAheadReceipt) pausedForCache=\(pausedForCacheReceipt) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount) elapsed=\(cacheFlushElapsedReceipt(startUptime: flight.startUptime)) outcome=\(flight.result.rawValue)"
         )
         #else
         _ = flight
@@ -1394,6 +1420,7 @@ final class MPVMetalViewController: PlatformViewController {
     ) -> PlayerLoadToken {
         // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
         // including internal reloads, so a queued callback can never become valid again through token reuse.
+        finishCacheFlushFlight(cacheFlushFlight.reset())
         let issuedToken = PlayerLoadToken()
         loadTokenLock.lock()
         let requestedOrigin = requestedFreshOrigin
@@ -1753,7 +1780,8 @@ final class MPVMetalViewController: PlatformViewController {
             }
             #endif
         } else {
-            // Rejected replace: preserve the previous source's cache lifecycle and any active single flight.
+            // Rejected replace: preserve the previous source's cache budget. The request already
+            // canceled maintenance and restored its temporary option before attempting replacement.
             #if os(tvOS)
             setString("cache-pause-initial", priorCachePauseInitial)
             setString("cache-pause-wait", priorCachePauseWait)
@@ -1994,7 +2022,7 @@ final class MPVMetalViewController: PlatformViewController {
             .map { $0 ? "true" : "false" } ?? "unknown"
         DiagnosticsLog.log(
             "player",
-            "internal-cache-flush-begin operation=atomic-reanchor flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) bufferedAhead=\(bufferedAheadReceipt) pausedForCache=\(pausedForCacheReceipt) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount)"
+            "internal-cache-flush-begin operation=low-level-reanchor flightId=\(flight.id) reason=\(flight.reason.rawValue) target=\(flight.targetArgument) bufferedAhead=\(bufferedAheadReceipt) pausedForCache=\(pausedForCacheReceipt) loadToken=\(flight.owner.hashValue) coalesced=\(flight.coalescedCount)"
         )
     }
 
@@ -2051,29 +2079,41 @@ final class MPVMetalViewController: PlatformViewController {
     /// A queued time sample from before the forced low-level seek is never accepted as transport progress.
     private func completeCacheFlushFlightRecovery(
         owner: PlayerLoadToken,
-        observedPosition: Double
+        observedPosition: Double,
+        witness: CacheReanchorEventWitness?,
+        lowLevelSeeks: Int?
     ) {
+        guard acceptsCacheReanchorEventWitness(witness) else { return }
         guard let completed = cacheFlushFlight.completeOnProgress(
             owner: owner,
             observedPosition: observedPosition,
-            progressEpsilon: Self.cacheReanchorProgressEpsilon
+            progressEpsilon: Self.cacheReanchorProgressEpsilon,
+            lowLevelSeeks: lowLevelSeeks
         ) else { return }
         finishCacheFlushFlight(completed)
     }
 
-    private func observeCacheReanchorSeek(owner: PlayerLoadToken) {
+    private func observeCacheReanchorSeek(owner: PlayerLoadToken, witness: CacheReanchorEventWitness?) {
+        guard acceptsCacheReanchorEventWitness(witness) else { return }
         guard cacheFlushFlight.markSeekEventObserved(owner: owner) else { return }
         DiagnosticsLog.log("player", "internal-cache-reanchor seek-observed loadToken=\(owner.hashValue)")
     }
 
-    private func completeCacheReanchorOnPlaybackRestart(owner: PlayerLoadToken) {
-        guard let completed = cacheFlushFlight.completeOnPlaybackRestart(owner: owner) else { return }
-        finishCacheFlushFlight(completed)
+    private func completeCacheReanchorOnPlaybackRestart(owner: PlayerLoadToken,
+        witness: CacheReanchorEventWitness?, position: Double, seeks: Int?) {
+        guard acceptsCacheReanchorEventWitness(witness) else { return }
+        if let completed = cacheFlushFlight.completeOnPlaybackRestart(
+            owner: owner, position: position, lowLevelSeeks: seeks
+        ) {
+            finishCacheFlushFlight(completed)
+        } else if let retry = cacheFlushFlight.reissueAfterCachedRestart(owner: owner, lowLevelSeeks: seeks) {
+            issueCacheReanchorSeek(retry)
+        }
     }
 
-    /// Force libmpv to discard its forward cache and re-anchor at the current position in one core-locked command
-    /// list. `drop-buffers` alone can terminalize a fully-read finite source before a recovery command exists;
-    /// the compound list admits no event turn between that drop and the exact low-level seek.
+    /// Force a low-level seek with the decoder intact until mpv actually executes it. Pinned mpv
+    /// 8c67647b clears the cache range inside demux_seek when seekable caching is disabled. A
+    /// separate buffer-drop command resets playback before the delayed seek and can produce EOF.
     private func flushDemuxerCachePreservingPosition(reason: CacheFlushReason) -> CacheFlushDisposition {
         guard mpv != nil else { return .skipped }
         guard var owner = callbackLoadToken(requiresLoadedFile: true) else { return .skipped }
@@ -2092,6 +2132,9 @@ final class MPVMetalViewController: PlatformViewController {
         }
         guard cacheFlushFlight.admit(owner: owner) == .started else { return .coalesced }
         guard getFlag(MPVProperty.seekable) else { return .skipped }
+        // A viewer/track seek already owns the demuxer. Its delayed restart cannot certify
+        // maintenance; the applied memory caps remain in force while it settles.
+        guard diagnosticFlag("seeking") == false else { return .skipped }
         let pos = getDouble(MPVProperty.timePos)
         guard pos.isFinite, pos > 0 else { return .skipped }
         let targetArgument = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), pos)
@@ -2100,6 +2143,9 @@ final class MPVMetalViewController: PlatformViewController {
               loadedOwner == owner else {
             return .skipped
         }
+        guard let originalSeekableCache = getString("demuxer-seekable-cache"),
+              let lowLevelSeeks = diagnosticInt("demuxer-cache-state/debug-low-level-seeks") else { return .skipped }
+        let wasPaused = getFlag(MPVProperty.pause)
 
         precondition(cacheFlushFlight.nextFlightID < UInt64.max)
         let nextFlightID = cacheFlushFlight.nextFlightID + 1
@@ -2112,7 +2158,10 @@ final class MPVMetalViewController: PlatformViewController {
             target: pos,
             targetArgument: targetArgument,
             startUptime: ProcessInfo.processInfo.systemUptime,
-            timeoutWorkItem: timeoutWorkItem
+            timeoutWorkItem: timeoutWorkItem,
+            originalSeekableCache: originalSeekableCache,
+            lowLevelSeeksAtIssue: lowLevelSeeks,
+            wasPaused: wasPaused
         )
         beginCacheFlushReceipt(flight)
         DispatchQueue.main.asyncAfter(
@@ -2120,19 +2169,35 @@ final class MPVMetalViewController: PlatformViewController {
             execute: timeoutWorkItem
         )
 
-        guard let flight = cacheFlushFlight.current,
+        let optionStatus = mpv_set_property_string(handle, "demuxer-seekable-cache", "no")
+        guard optionStatus >= 0 else {
+            if let ended = cacheFlushFlight.seekCommandError(id: flight.id, owner: flight.owner) {
+                cacheFlushCommandErrorReceipt(ended, commandName: "disable-cache-seeking", status: optionStatus)
+                finishCacheFlushFlight(ended)
+            }
+            return .started
+        }
+        issueCacheReanchorSeek(flight)
+        return .started
+    }
+
+    private func issueCacheReanchorSeek(_ requested: CacheFlushFlight<PlayerLoadToken>) {
+        guard let flight = cacheFlushFlight.current, flight.id == requested.id,
               cacheFlushFlight.matches(id: flight.id, owner: flight.owner),
               flight.phase == .seeking,
-              mpv != nil,
+              let handle = mpv,
               let currentOwner = callbackLoadToken(requiresLoadedFile: true),
               currentOwner == flight.owner else {
-            return .started
+            return
         }
         // This reports command-list acceptance only. SEEK plus restart/progress remain the required completion
         // evidence, and a real EOF is still terminal rather than being hidden as an internal maintenance edge.
+        loadTokenLock.lock()
+        cacheReanchorEventWitness = .init(id: flight.id, owner: flight.owner, attempt: flight.reissues)
+        loadTokenLock.unlock()
         let commandResult = mpv_command_string(
             handle,
-            "no-osd drop-buffers; no-osd seek \(flight.targetArgument) absolute+exact"
+            "no-osd seek \(flight.targetArgument) absolute+exact"
         )
         if commandResult >= 0 {
             _ = cacheFlushFlight.markSeekCommandAccepted(id: flight.id, owner: flight.owner)
@@ -2141,15 +2206,14 @@ final class MPVMetalViewController: PlatformViewController {
             // treated as a completed seek.
             seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
             seekEOFRecovery.begin(
-                owner: flight.owner, target: flight.target, wasPaused: getFlag(MPVProperty.pause),
+                owner: flight.owner, target: flight.target, wasPaused: flight.wasPaused,
                 duration: getDouble(MPVProperty.duration),
                 origin: .cacheReanchor, now: ProcessInfo.processInfo.systemUptime
             )
         } else if let ended = cacheFlushFlight.seekCommandError(id: flight.id, owner: flight.owner) {
-            cacheFlushCommandErrorReceipt(ended, commandName: "drop-buffers; seek", status: commandResult)
+            cacheFlushCommandErrorReceipt(ended, commandName: "seek", status: commandResult)
             finishCacheFlushFlight(ended)
         }
-        return .started
     }
 
     /// System memory warning (registered in viewDidLoad). Posted on the main thread; re-dispatch is a
@@ -2913,14 +2977,22 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     func play() {
+        if let owner = activeLoadToken { cacheFlushFlight.updateTransportIntent(owner: owner, paused: false) }
         if let owner = activeLoadToken,
            seekEOFRecovery.updateTransportIntent(owner: owner, paused: false) != nil {
             return
         }
         setFlag(MPVProperty.pause, false)
     }
+
+    /// Internal EOF repair temporarily pauses the core; replacement recovery must carry the
+    /// viewer's latest transport intent rather than that implementation pause.
+    var requestedPauseIntent: Bool {
+        seekEOFRecovery.current?.wasPaused ?? getFlag(MPVProperty.pause)
+    }
     
     func pause() {
+        if let owner = activeLoadToken { cacheFlushFlight.updateTransportIntent(owner: owner, paused: true) }
         if let owner = activeLoadToken,
            seekEOFRecovery.updateTransportIntent(owner: owner, paused: true) != nil {
             return
@@ -3010,6 +3082,32 @@ final class MPVMetalViewController: PlatformViewController {
                 owner: owner, target: seconds, wasPaused: wasPaused, duration: duration, origin: .resume,
                 now: ProcessInfo.processInfo.systemUptime)
         })
+    }
+
+    /// A parked recovery cannot advance from a preceding keyframe. Admit only the loaded
+    /// replacement, and request an exact frame without the viewer-scrub cache hold.
+    func durationForPausedRecovery(owner: PlayerLoadToken) -> Double? {
+        guard activeLoadToken == owner, callbackLoadToken(requiresLoadedFile: true) == owner else { return nil }
+        let duration = getDouble(MPVProperty.duration)
+        return duration.isFinite && duration > 0 ? duration : nil
+    }
+
+    func seekForPausedRecovery(to seconds: Double, owner: PlayerLoadToken) -> Bool {
+        guard seconds.isFinite, activeLoadToken == owner,
+              callbackLoadToken(requiresLoadedFile: true) == owner else { return false }
+        cancelCacheReanchorForExplicitSeek()
+        supersedeSeekEOFRecoveryForExplicitSeek()
+        let wasPaused = getFlag(MPVProperty.pause)
+        let duration = getDouble(MPVProperty.duration)
+        var accepted = false
+        command("seek", args: [String(seconds), "absolute+exact"], returnValueCallback: { [weak self] status in
+            guard let self, status >= 0, self.activeLoadToken == owner else { return }
+            accepted = true
+            self.seekEOFRecovery.begin(
+                owner: owner, target: seconds, wasPaused: wasPaused, duration: duration, origin: .resume,
+                now: ProcessInfo.processInfo.systemUptime)
+        })
+        return accepted
     }
 
     /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Apply the same cache-window
@@ -4074,7 +4172,7 @@ final class MPVMetalViewController: PlatformViewController {
         guard let intent = seekEOFRecovery.beginReloadSeek(owner: loadToken) else { return }
         // Do not flash the beginning of the reopened file; resume only once target position is observed.
         setFlag(MPVProperty.pause, true)
-        command("seek", args: [String(intent.target), "absolute"], returnValueCallback: { [weak self] status in
+        command("seek", args: [String(intent.target), "absolute+exact"], returnValueCallback: { [weak self] status in
             guard status < 0 else { return }
             DispatchQueue.main.async {
                 self?.failSeekEOFRecovery(loadToken: loadToken, reason: "reopen seek command failed")
@@ -4091,6 +4189,11 @@ final class MPVMetalViewController: PlatformViewController {
 
     private func failSeekEOFRecovery(loadToken: PlayerLoadToken, reason: String) {
         seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
+        let intent = seekEOFRecovery.current
+        if intent?.owner == loadToken, seekEOFRecovery.reloadIsInFlight(owner: loadToken),
+           activeLoadToken == loadToken, let intent {
+            setFlag(MPVProperty.pause, intent.wasPaused)
+        }
         seekEOFRecovery.cancel(owner: loadToken)
         guard PlayerLoadProvenanceState.accepts(callbackToken: loadToken, activeToken: activeLoadToken) else { return }
         finishCacheFlushFlight(cacheFlushFlight.reset(owner: loadToken))
@@ -4359,6 +4462,10 @@ final class MPVMetalViewController: PlatformViewController {
                                             PlayerTimePositionEvent(seconds: value, loadToken: loadToken),
                                             loadToken: loadToken
                                         )
+                                        #if canImport(UIKit)
+                                        let cacheWitness = self.captureCacheReanchorEventWitness()
+                                        let cacheSeeks = cacheWitness == nil ? nil : self.diagnosticInt("demuxer-cache-state/debug-low-level-seeks", handle: handle)
+                                        #endif
                                         DispatchQueue.main.async { [weak self] in
                                             guard let self,
                                                   PlayerLoadProvenanceState.accepts(
@@ -4368,7 +4475,8 @@ final class MPVMetalViewController: PlatformViewController {
                                             #if canImport(UIKit)
                                             self.completeCacheFlushFlightRecovery(
                                                 owner: loadToken,
-                                                observedPosition: value
+                                                observedPosition: value,
+                                                witness: cacheWitness, lowLevelSeeks: cacheSeeks
                                             )
                                             #endif
                                             self.seekEOFRecovery.observePosition(
@@ -4417,12 +4525,13 @@ final class MPVMetalViewController: PlatformViewController {
                     }
                     #if canImport(UIKit)
                     guard let loadToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }
+                    let cacheWitness = self.captureCacheReanchorEventWitness()
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.mpv != nil,
                               PlayerLoadProvenanceState.accepts(
                                 callbackToken: loadToken, activeToken: self.activeLoadToken
                               ) else { return }
-                        self.observeCacheReanchorSeek(owner: loadToken)
+                        self.observeCacheReanchorSeek(owner: loadToken, witness: cacheWitness)
                         _ = self.seekEOFRecovery.observeSeek(owner: loadToken)
                     }
                     #else
@@ -4431,12 +4540,16 @@ final class MPVMetalViewController: PlatformViewController {
                 case MPV_EVENT_PLAYBACK_RESTART:
                     #if canImport(UIKit)
                     guard let loadToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }
+                    let cacheWitness = self.captureCacheReanchorEventWitness()
+                    let cacheSeeks = cacheWitness == nil ? nil : self.diagnosticInt("demuxer-cache-state/debug-low-level-seeks", handle: handle)
+                    let cachePosition = self.getDouble(MPVProperty.timePos)
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.mpv != nil,
                               PlayerLoadProvenanceState.accepts(
                                 callbackToken: loadToken, activeToken: self.activeLoadToken
                               ) else { return }
-                        self.completeCacheReanchorOnPlaybackRestart(owner: loadToken)
+                        self.completeCacheReanchorOnPlaybackRestart(owner: loadToken,
+                            witness: cacheWitness, position: cachePosition, seeks: cacheSeeks)
                     }
                     #else
                     break

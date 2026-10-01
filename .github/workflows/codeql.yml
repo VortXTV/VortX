@@ -78,6 +78,10 @@ jobs:
         with:
           languages: java-kotlin
           build-mode: manual
+          # The generated Code Quality autobuilder does not provision Android's pinned NDK.
+          # Run the same maintained quality selector alongside security queries on this traced
+          # build; do not suppress compiled-language findings to hide that infrastructure failure.
+          queries: ./.github/codeql/java-quality.qls
 
       # CodeQL only extracts Kotlin from a compilation it traces. This task configures the Android
       # modules and compiles the Play variant without invoking the private-engine release pipeline.

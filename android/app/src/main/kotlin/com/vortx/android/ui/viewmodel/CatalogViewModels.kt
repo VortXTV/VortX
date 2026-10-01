@@ -29,6 +29,8 @@ import com.vortx.android.home.SimklRailsModel
 import com.vortx.android.home.foldSimklUpcomingSeeds
 import com.vortx.android.home.TopPicksModel
 import com.vortx.android.home.TraktRailsModel
+import com.vortx.android.home.TraktContinueWatchingModel
+import com.vortx.android.home.TraktContinueWatchingReceipt
 import com.vortx.android.home.importedCatalogRails
 import com.vortx.android.home.upcomingMetaBases
 import com.vortx.android.home.withBecauseYouWatchedRail
@@ -37,7 +39,9 @@ import com.vortx.android.home.withImportedCatalogRails
 import com.vortx.android.home.withEditorialCollectionsRails
 import com.vortx.android.home.withReleaseCalendarRails
 import com.vortx.android.home.withTopPicksRail
+import com.vortx.android.home.withTraktContinueWatchingRail
 import com.vortx.android.integrations.SIMKLAuth
+import com.vortx.android.integrations.ScrobbleService
 import com.vortx.android.integrations.TraktAuth
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.mediaserver.MediaServerCatalogsModel
@@ -163,6 +167,7 @@ class HomeViewModel internal constructor(
     private val railSurface: HomeRailSurface = HomeRailSurface.PHONE,
     private val watchlistStore: WatchlistStore? = null,
     private val traktRails: TraktRailsModel = TraktRailsModel(),
+    private val traktContinueWatching: TraktContinueWatchingModel = TraktContinueWatchingModel(),
     private val simklRails: SimklRailsModel = SimklRailsModel(),
     private val becauseYouWatched: BecauseYouWatchedModel = BecauseYouWatchedModel(),
     private val mediaServerCatalogs: MediaServerCatalogsModel = MediaServerCatalogsModel(),
@@ -219,6 +224,7 @@ class HomeViewModel internal constructor(
     private var upcomingEpisodes: List<MetaItem> = emptyList()
     private var upcomingMovies: List<MetaItem> = emptyList()
     private var traktWatchlist: List<MetaItem> = emptyList()
+    private var traktContinueWatchingItems: List<MetaItem> = emptyList()
     private var simklWatchlist: List<MetaItem> = emptyList()
     private var becauseYouWatchedRail: Catalog? = null
     private var mediaServerRails: List<Catalog> = emptyList()
@@ -286,9 +292,14 @@ class HomeViewModel internal constructor(
         }
         scope.launch {
             TraktAuth.sessionBoundary.drop(1).collectLatest {
+                invalidateTraktPersonalizedRows()
                 traktRails.clear()
-                traktWatchlist = emptyList()
-                publishHome()
+                refreshPersonalizedRails()
+            }
+        }
+        scope.launch {
+            ScrobbleService.toggleChanges.drop(1).collectLatest {
+                invalidateTraktPersonalizedRows(clearWatchlist = false)
                 refreshPersonalizedRails()
             }
         }
@@ -329,6 +340,7 @@ class HomeViewModel internal constructor(
         upcomingEpisodes = emptyList()
         upcomingMovies = emptyList()
         traktWatchlist = emptyList()
+        traktContinueWatchingItems = emptyList()
         simklWatchlist = emptyList()
         becauseYouWatchedRail = null
         mediaServerRails = emptyList()
@@ -467,6 +479,7 @@ class HomeViewModel internal constructor(
                 )
             }
             val traktWork = async { traktRails.refresh() }
+            val traktContinueWatchingWork = async { traktContinueWatching.refresh(historyOwner.usesEngineHistory) }
             val simklWork = async { simklRails.refresh() }
             val mediaServerWork = async { mediaServerCatalogs.refresh() }
             val releaseWork = async {
@@ -492,6 +505,7 @@ class HomeViewModel internal constructor(
             val because = becauseWork.await()
             val upcoming = releaseWork.await()
             val trakt = traktWork.await()
+            val traktContinueWatchingRefresh = traktContinueWatchingWork.await()
             val simkl = simklWork.await()
             val media = mediaServerWork.await()
             if (!requestIsCurrent()) return@launch
@@ -501,12 +515,28 @@ class HomeViewModel internal constructor(
             val upcomingChanged = upcoming?.let(::applyReleaseCalendar) == true
             if (because.changed) becauseYouWatchedRail = because.rail
             if (media.changed) mediaServerRails = media.rails
-            val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items
+            val currentTraktContinueWatching = isTraktContinueWatchingReceiptCurrent(
+                receipt = traktContinueWatchingRefresh.receipt,
+                currentSessionEpoch = TraktAuth.currentSessionEpoch,
+                currentToggleRevision = ScrobbleService.toggleChanges.value,
+                currentlyEnabled = ScrobbleService.isToggleOn(
+                    ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING,
+                    false,
+                ),
+            )
+            val nextTraktContinueWatching = if (currentTraktContinueWatching) {
+                traktContinueWatchingRefresh.items
+            } else {
+                traktContinueWatchingItems
+            }
+            val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items ||
+                traktContinueWatchingItems != nextTraktContinueWatching
             traktWatchlist = trakt.items
+            traktContinueWatchingItems = nextTraktContinueWatching
             simklWatchlist = simkl.items
             if (
                 refreshed.changed || because.changed || media.changed || upcomingChanged ||
-                trakt.changed || simkl.changed || externalChanged
+                trakt.changed || traktContinueWatchingRefresh.changed || simkl.changed || externalChanged
             ) {
                 publishHome()
             }
@@ -539,9 +569,20 @@ class HomeViewModel internal constructor(
         upcomingEpisodes = emptyList()
         upcomingMovies = emptyList()
         traktWatchlist = emptyList()
+        traktContinueWatchingItems = emptyList()
         simklWatchlist = emptyList()
         becauseYouWatchedRail = null
         mediaServerRails = emptyList()
+    }
+
+    /** Clear visible Trakt-derived rows and revoke every stale personalized completion before cleanup work. */
+    private fun invalidateTraktPersonalizedRows(clearWatchlist: Boolean = true) {
+        personalizedJob?.cancel()
+        personalizedGeneration += 1
+        traktContinueWatching.clear()
+        traktContinueWatchingItems = emptyList()
+        if (clearWatchlist) traktWatchlist = emptyList()
+        publishHome()
     }
 
     private fun personalizedOwnerKey(owner: ContinueWatchingOwner): String = buildString {
@@ -558,13 +599,14 @@ class HomeViewModel internal constructor(
 
     private fun publishHome() {
         val hasClientRows = topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
-            traktWatchlist.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
+            traktWatchlist.isNotEmpty() || traktContinueWatchingItems.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
             importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty() ||
             editorialRails.isNotEmpty()
         if (!sourceHasRows && !hasClientRows) return
         val topRows = withTopPicksRail(baseRows, topPicksItems)
         val becauseRows = withBecauseYouWatchedRail(topRows, becauseYouWatchedRail)
-        val externalRows = withExternalWatchlistRails(becauseRows, traktWatchlist, simklWatchlist)
+        val traktContinueWatchingRows = withTraktContinueWatchingRail(becauseRows, traktContinueWatchingItems)
+        val externalRows = withExternalWatchlistRails(traktContinueWatchingRows, traktWatchlist, simklWatchlist)
         val serverRows = withMediaServerRails(externalRows, mediaServerRails)
         val importedRows = withImportedCatalogRails(serverRows, importedRails)
         val calendarRows = withReleaseCalendarRails(importedRows, upcomingEpisodes, upcomingMovies)
@@ -635,6 +677,17 @@ class HomeViewModel internal constructor(
         const val CONFIRMATION_POLL_MS = 75L
     }
 }
+
+/** A late Trakt completion can assign Home only while the exact external session/toggle receipt still holds. */
+internal fun isTraktContinueWatchingReceiptCurrent(
+    receipt: TraktContinueWatchingReceipt,
+    currentSessionEpoch: Long?,
+    currentToggleRevision: Long,
+    currentlyEnabled: Boolean,
+): Boolean = currentlyEnabled &&
+    receipt.sessionEpoch != null &&
+    receipt.sessionEpoch == currentSessionEpoch &&
+    receipt.toggleRevision == currentToggleRevision
 
 private data class ContinueWatchingRollback(
     val row: Catalog,

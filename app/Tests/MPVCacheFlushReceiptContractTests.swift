@@ -54,6 +54,27 @@ private enum MPVCacheFlushReceiptContractTests {
         return source.replacingCharacters(in: range, with: replacement)
     }
 
+    private static func hasNonDestructiveReanchor(_ source: String, policy: String) -> Bool {
+        guard let flush = cacheFlushSource(source), let load = loadFileSource(source),
+              let finish = section(source, from: "private func finishCacheFlushFlight", to: "    /// mpv's stock User-Agent"),
+              let observe = section(source, from: "private func observeCacheReanchorSeek", to: "    private func completeCacheReanchorOnPlaybackRestart") else { return false }
+        return !source.contains("no-osd drop-buffers")
+            && ordered(["getString(\"demuxer-seekable-cache\")", "let wasPaused = getFlag(MPVProperty.pause)",
+                        "cacheFlushFlight.install(", "mpv_set_property_string(handle, \"demuxer-seekable-cache\", \"no\")",
+                        "issueCacheReanchorSeek(flight)"], in: flush)
+            && ordered(["finishCacheFlushFlight(cacheFlushFlight.reset())", "let issuedToken = PlayerLoadToken()"], in: load)
+            && finish.contains("activeLoadToken == flight.owner")
+            && finish.contains("cacheFlushFlight.current == nil")
+            && finish.contains("flight.originalSeekableCache")
+            && !observe.contains("finishCacheFlushFlight")
+            && source.contains("diagnosticInt(\"demuxer-cache-state/debug-low-level-seeks\", handle: handle)")
+            && source.contains("cacheFlushFlight.acceptsEvent(id: witness.id, owner: witness.owner, attempt: witness.attempt)")
+            && policy.contains("lowLevelSeeks > flight.lowLevelSeeksAtIssue")
+            && policy.contains("flight.reissues == 0")
+            && policy.contains("return finish(result: .timedOut)")
+            && policy.contains("abs(position - intent.target) <= 2")
+    }
+
     private static func hasFiniteReasons(_ source: String, policy: String) -> Bool {
         return policy.contains("enum CacheFlushReason: String, Equatable")
             && policy.contains("case pausedCacheClamp = \"paused-cache-clamp\"")
@@ -90,7 +111,7 @@ private enum MPVCacheFlushReceiptContractTests {
                 [
                     "beginCacheFlushReceipt(flight)",
                     "mpv_command_string(",
-                    "no-osd drop-buffers; no-osd seek",
+                    "no-osd seek",
                     "flight.targetArgument",
                     "absolute+exact",
                 ],
@@ -202,7 +223,7 @@ private enum MPVCacheFlushReceiptContractTests {
                 "let currentOwner = callbackLoadToken(requiresLoadedFile: true)",
                 "currentOwner == flight.owner",
                 "mpv_command_string(",
-                "no-osd drop-buffers; no-osd seek",
+                "no-osd seek",
                 "flight.targetArgument",
                 "absolute+exact",
                 "if commandResult >= 0",
@@ -242,8 +263,8 @@ private enum MPVCacheFlushReceiptContractTests {
             && !source.contains("markSeek(id:")
             && events.contains("case MPV_EVENT_SEEK:")
             && events.contains("case MPV_EVENT_PLAYBACK_RESTART:")
-            && events.contains("self.observeCacheReanchorSeek(owner: loadToken)")
-            && events.contains("self.completeCacheReanchorOnPlaybackRestart(owner: loadToken)")
+            && events.contains("self.observeCacheReanchorSeek(owner: loadToken, witness: cacheWitness)")
+            && events.contains("self.completeCacheReanchorOnPlaybackRestart(owner: loadToken,")
             && source.contains("handleCacheFlushTimeout(id: nextFlightID, owner: owner)")
             && source.contains("cacheFlushFlight.settle(id: id, owner: owner)")
             && policy.contains("case awaitingSeekEvent")
@@ -280,7 +301,7 @@ private enum MPVCacheFlushReceiptContractTests {
             && receiptSource.contains("elapsed=")
             && receiptSource.contains("outcome=")
             && receiptSource.contains("loadToken=")
-            && receiptSource.contains("operation=atomic-reanchor")
+            && receiptSource.contains("operation=low-level-reanchor")
             && !receiptSource.contains("completed")
             && !receiptSource.contains("restarted")
             && !receiptSource.contains("seek-completed")
@@ -382,7 +403,7 @@ private enum MPVCacheFlushReceiptContractTests {
                 ],
                 in: load
             )
-            && load.contains("Rejected replace: preserve the previous source's cache lifecycle")
+            && load.contains("Rejected replace: preserve the previous source's cache budget")
             && events.contains("case MPV_EVENT_END_FILE:")
             && events.contains("cacheFlushFlight.reset(owner: loadToken)")
             && ordered(
@@ -450,8 +471,28 @@ private enum MPVCacheFlushReceiptContractTests {
         let controller = try String(contentsOf: controllerURL, encoding: .utf8)
         let policy = try String(contentsOf: policyURL, encoding: .utf8)
 
+        check("252 maintenance requires low-level completion and exact-owner restoration", hasNonDestructiveReanchor(controller, policy: policy))
+        check("hostile: option readback cannot replace low-level evidence", !hasNonDestructiveReanchor(controller.replacingOccurrences(of: "demuxer-cache-state/debug-low-level-seeks", with: "demuxer-seekable-cache"), policy: policy))
+        check("hostile: stale owner cannot restore replacement options", !hasNonDestructiveReanchor(controller.replacingOccurrences(of: "activeLoadToken == flight.owner", with: "true"), policy: policy))
+        check("hostile: timeout cannot count as memory relief", !hasNonDestructiveReanchor(controller, policy: policy.replacingOccurrences(of: "return finish(result: .timedOut)", with: "return finish(result: .commandAccepted)")))
+        check("hostile: zero after high-target reload cannot restore", !hasNonDestructiveReanchor(controller, policy: policy.replacingOccurrences(of: "abs(position - intent.target) <= 2", with: "true")))
+        let parked = section(controller, from: "func seekForPausedRecovery", to: "/// Relative seek") ?? ""
+        check("paused recovery admits only the loaded owner before issuing exact seek", ordered([
+            "callbackLoadToken(requiresLoadedFile: true) == owner", "cancelCacheReanchorForExplicitSeek()",
+            "\"absolute+exact\"", "status >= 0", "accepted = true", "return accepted"
+        ], in: parked))
+        for relative in ["Sources/PlayerScreen.swift", "SourcesTV/TVPlayerView.swift"] {
+            let surface = try String(contentsOf: appRoot.appendingPathComponent(relative), encoding: .utf8)
+            check("\(relative): recovery captures transport intent before admission", ordered(["let capturedRecoveryPause", "let candidateToken", "recoveryPauseIntent = capturedRecoveryPause"], in: surface))
+            check("\(relative): raw zero cannot discharge paused high-target recovery", surface.contains("abs(event.seconds - recoveryPauseTarget) <= 2") && surface.contains("recoveryPauseTarget = target") && surface.contains("coordinator.player?.seekForResume(to: target)"))
+            check("\(relative): slow reopen does not spend paused seek before loaded admission", surface.contains("guard mpv.seekForPausedRecovery(to: target, owner: owner) else") && (relative.contains("TVPlayer") ? surface.contains("appliedResume = false\n                    resumeIsMidPlayRecovery = midPlayRecovery") : surface.contains("owner: owner) else { continue }")))
+            check("\(relative): stale duration cannot clear paused target before loaded admission", ordered(
+                relative.contains("TVPlayer")
+                    ? ["var duration = self.duration", "durationForPausedRecovery(owner: owner)", "duration = loadedDuration", "appliedResume = true"]
+                    : ["var resumeDuration = duration", "durationForPausedRecovery(owner: owner)", "resumeDuration = loadedDuration", "observedDurationSeconds: resumeDuration", "case .clear:"], in: surface))
+        }
         check("finite reasons name every internal cache-flush source", hasFiniteReasons(controller, policy: policy))
-        check("receipt records cache state before one atomic drop-and-exact-seek command", hasReceiptBeforeCommands(controller))
+        check("receipt records cache state before the exact low-level seek", hasReceiptBeforeCommands(controller))
         check("each production cache-flush caller supplies a static reason",
               everyProductionCallSiteHasStaticReason(controller))
         check("paused cache diagnostics qualify the receipt helper with self",
@@ -607,7 +648,7 @@ private enum MPVCacheFlushReceiptContractTests {
             with: "if true {",
             in: controller
         )
-        check("hostile: rejected loadfile cannot reset the current flight",
+        check("hostile: rejected loadfile cannot reset the current memory budget",
               !hasLifecycleResetContract(rejectedReplacementResetMutant))
 
         let redirectResetMutant = replacingFirst(

@@ -73,6 +73,32 @@ do {
 }
 
 // 5. Episode CHANGE travels with the newer position as one atomic unit (never mixed fields).
+// Native AddToLibrary initializes lastWatched to NOW even though no playback occurred.
+do {
+    let engine: [String: Any] = ["id": "tt100", "name": "Fresh", "type": "movie", "poster": "q",
+                                 "t": 0, "d": 0, "v": "", "lastWatched": newer]
+    var prior = row(800, 2400, "tt100:2:4", older)
+    prior["peerExtension"] = "keep"
+    let merged = OwnerLibraryPositionPolicy.resolve(engine: engine, prior: prior)
+    expect((merged["t"] as? Int) == 800 && (merged["v"] as? String) == "tt100:2:4",
+           "native constructor NOW clock cannot erase actual playback")
+    expect((merged["lastWatched"] as? String) == older,
+           "native metadata clock cannot advance the viewing clock")
+    expect((merged["peerExtension"] as? String) == "keep" && (merged["name"] as? String) == "Fresh",
+           "prior-winning merge keeps peer extensions and fresh display metadata")
+    prior.removeValue(forKey: "lastWatched")
+    let legacy = OwnerLibraryPositionPolicy.resolve(engine: engine, prior: prior)
+    expect((legacy["t"] as? Int) == 800 && legacy["lastWatched"] == nil,
+           "constructor NOW cannot wipe clockless legacy progress or invent its clock")
+    let pristine = OwnerLibraryPositionPolicy.resolve(engine: engine, prior: [:])
+    expect(OwnerLibraryPositionPolicy.lastWatchedMillis(pristine["lastWatched"]) == 0,
+           "new unplayed library item does not manufacture a viewing clock")
+    expect(!OwnerLibraryPositionPolicy.hasRealClock(engine), "bare constructor clock is not a playback clock")
+    let genuine = OwnerLibraryPositionPolicy.resolve(engine: row(600, 2400, "tt100:1:1", older), prior: engine)
+    expect((genuine["t"] as? Int) == 600 && (genuine["lastWatched"] as? String) == older,
+           "previously synced constructor NOW cannot erase genuine local playback")
+}
+
 do {
     let engine = row(500, 2400, "tt100:3:1", newer)            // peer moved on to S3E1, later
     let prior = row(800, 2400, "tt100:2:4", older)
@@ -86,6 +112,8 @@ do {
     expect(OwnerLibraryPositionPolicy.lastWatchedMillis(1_700_000_000_000 as NSNumber) > 0,
            "raw ms number parses as a clock")
     expect(OwnerLibraryPositionPolicy.lastWatchedMillis("garbage") == 0, "unparsable string is no clock")
+    expect(OwnerLibraryPositionPolicy.lastWatchedMillis(true as NSNumber) == 0,
+           "JSON Boolean is not a watch clock")
     expect(OwnerLibraryPositionPolicy.lastWatchedMillis("") == 0 && OwnerLibraryPositionPolicy.lastWatchedMillis(nil as Any?) == 0,
            "empty/missing is no clock")
     expect(OwnerLibraryPositionPolicy.lastWatchedMillis("2026-09-10T22:30:00Z") ==

@@ -47,9 +47,22 @@ object LiveTypes {
 /// applied order (Android today, until the sync/profile layer lands) this is exactly the old `.first`
 /// engine-order behavior, so English users and un-reordered accounts are unchanged.
 object AddonOrder {
-    /// Byte-for-byte with Apple `AddonTombstones.normalize`: trim + lowercase the transport URL so an
-    /// applied-order entry matches an engine descriptor base regardless of surrounding whitespace/case.
-    fun normalize(url: String): String = url.trim().lowercase()
+    /** URL scheme/host are case-insensitive; configured paths and queries may contain case-sensitive secrets. */
+    fun normalize(url: String): String {
+        val trimmed = url.trim()
+        val uri = runCatching { java.net.URI(trimmed) }.getOrNull() ?: return trimmed
+        val host = uri.host ?: return trimmed
+        val scheme = uri.scheme ?: return trimmed
+        return buildString {
+            append(scheme.lowercase()).append("://")
+            uri.rawUserInfo?.let { append(it).append('@') }
+            append(host.lowercase())
+            if (uri.port >= 0) append(':').append(uri.port)
+            append(uri.rawPath.orEmpty())
+            uri.rawQuery?.let { append('?').append(it) }
+            uri.rawFragment?.let { append('#').append(it) }
+        }
+    }
 
     /// Pick the entry whose [Ready.base] add-on is earliest in [appliedAddonOrder]. [ready] is every
     /// add-on that returned a ready value, in engine order. With an empty order this returns the first
@@ -140,6 +153,13 @@ enum class MediaType(val label: String, val id: String) {
 /// `CoreMeta.imdbRating`/`.genres` do, so the featured hero shows a rating. [resumeSeconds] is the
 /// saved resume position in whole seconds on a Continue Watching item (from `state.timeOffset`),
 /// surfaced through [resumeLabel] as "Resume 1:03".
+data class PreferredEpisode(
+    val season: Int,
+    val episode: Int,
+    /** Optional engine video identity; when supplied it must agree with the episode coordinates. */
+    val videoIdentity: String? = null,
+)
+
 data class MetaItem(
     val id: String,
     val type: MediaType,
@@ -158,6 +178,8 @@ data class MetaItem(
     val previewRuntimeMinutes: Int? = null,
     val previewSeasonCount: Int? = null,
     val resumeSeconds: Double? = null,
+    /** A remote-provider episode target; this never represents a local resume position. */
+    val preferredEpisode: PreferredEpisode? = null,
     val caption: String? = null,
     val watched: Boolean = false,
     /// The first playable YouTube trailer id for this preview, threaded onto the catalog-preview model so

@@ -41,7 +41,7 @@ enum SubtitleSelectionSettlementContractTests {
         let externalLoad = slice(source, from: "    func addExternalSubtitle(", to: "    /// Stop rendering")
         let restore = slice(source, from: "                switch restore.subtitle", to: "            } else if pendingMediaSelectionIntent != nil")
         let notification = slice(source, from: "    @objc private func mediaSelectionDidChange", to: "    private func teardownObservers")
-        let groupLoad = slice(source, from: "            if externalSubActive || pendingExternalSubtitleActivation {", to: "            let sourceBackedAudio")
+        let groupLoad = slice(source, from: "            if externalSubActive || externalSubtitleSettlement.hasPendingIntent {", to: "            let sourceBackedAudio")
         let settlement = slice(source, from: "    private func selectNativeSubtitle", to: "    private func setExternalSubtitleActive")
         let disableExternal = slice(source, from: "    private func disableExternalSubtitle", to: "    /// AVFoundation cannot time-shift")
         let ready = slice(source, from: "    private func handleStatus", to: "    private func emit(")
@@ -60,11 +60,11 @@ enum SubtitleSelectionSettlementContractTests {
         check("central settlement is item-generation and mount fenced", settlement?.contains("selectionContextIsCurrent(") == true
             && settlement?.contains("subtitleSelectionRevision") == true
             && settlement?.contains("item.select(requested, in: group)") == true)
-        check("missing cached legible group defers external activation until topology resolves", settlement?.contains("pendingExternalSubtitleActivation = activatingExternalAfterSettlement") == true
+        check("missing cached legible group retains an owned external settlement until topology resolves", settlement?.contains("externalSubtitleSettlement.request(") == true
             && settlement?.contains("selectionTopologyGeneration == itemGeneration") == true
-            && source.contains("if pendingExternalSubtitleActivation {")
+            && source.contains("if externalSubtitleSettlement.hasPendingIntent {")
             && source.contains("selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)"))
-        check("external teardown clears pending activation and cancels old settlement", disableExternal?.contains("pendingExternalSubtitleActivation = false") == true
+        check("external teardown clears pending activation and cancels old settlement", disableExternal?.contains("externalSubtitleSettlement.clear()") == true
             && disableExternal?.contains("subtitleSelectionRevision &+= 1") == true
             && disableExternal?.contains("externalSubtitleRequestRevision &+= 1") == true)
         check("external fetch completion is fenced by its request revision", externalLoad?.contains("let requestRevision = externalSubtitleRequestRevision") == true

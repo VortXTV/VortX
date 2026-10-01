@@ -19,6 +19,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.LibraryFilters
 import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.library.LibrarySegment
+import com.vortx.android.ui.library.LibrarySmartFilter
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.LibraryViewModel

@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
+import java.security.MessageDigest
 
 internal interface LibraryTombstonePersistence {
     fun readMap(key: String): Map<String, Double>
@@ -50,6 +51,10 @@ class LibraryTombstones internal constructor(
     private val persistence: LibraryTombstonePersistence,
     private val nowMs: () -> Double = { System.currentTimeMillis().toDouble() },
 ) {
+    // A store is a captured owner capability, not a live pointer to whichever account signs in next.
+    // A -> B -> A invalidates an old A capability even though A's durable namespace is reused.
+    private val owner = synchronized(LOCK) { activeOwner }
+
     constructor(context: Context) : this(
         SharedPrefsLibraryTombstonePersistence(
             context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE),
@@ -62,12 +67,15 @@ class LibraryTombstones internal constructor(
     )
 
     fun all(): Set<String> = synchronized(LOCK) {
+        if (!isCurrent()) return@synchronized emptySet()
         val state = load()
-        effectiveRemoved(state.removedAt, state.addedAt)
+        if (isCurrent()) effectiveRemoved(state.removedAt, state.addedAt) else emptySet()
     }
 
     fun timestampsForSync(): Map<String, Map<String, Double>> = synchronized(LOCK) {
+        if (!isCurrent() || owner.accountId == null) return@synchronized emptyMap()
         val state = load()
+        if (!isCurrent()) return@synchronized emptyMap()
         buildMap {
             for (id in state.removedAt.keys + state.addedAt.keys) {
                 val entry = buildMap {
@@ -80,22 +88,24 @@ class LibraryTombstones internal constructor(
     }
 
     fun tombstone(id: String): Boolean = synchronized(LOCK) {
+        if (!isCurrent()) return@synchronized false
         val key = normalize(id)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
         val state = load()
         val wasRemoved = isRemoved(key, state)
         state.removedAt[key] = maxOf(state.removedAt[key] ?: 0.0, nowMs())
-        save(state)
+        if (!save(state)) return@synchronized false
         !wasRemoved && isRemoved(key, state)
     }
 
     fun forget(id: String): Boolean = synchronized(LOCK) {
+        if (!isCurrent()) return@synchronized false
         val key = normalize(id)
         if (key.isEmpty() || key.length > MAX_ID_LENGTH) return false
         val state = load()
         val wasRemoved = isRemoved(key, state)
         state.addedAt[key] = maxOf(state.addedAt[key] ?: 0.0, nowMs())
-        save(state)
+        if (!save(state)) return@synchronized false
         wasRemoved && !isRemoved(key, state)
     }
 
@@ -103,6 +113,7 @@ class LibraryTombstones internal constructor(
         legacyIds: List<String>,
         stampsRaw: Map<String, Map<String, Double>>,
     ): Boolean = synchronized(LOCK) {
+        if (!isCurrent() || owner.accountId == null) return@synchronized false
         val state = load()
         val before = effectiveRemoved(state.removedAt, state.addedAt)
         val futureThresholdMs = nowMs() + 48.0 * 60.0 * 60.0 * 1000.0
@@ -131,18 +142,23 @@ class LibraryTombstones internal constructor(
             state.removedAt[id] = maxOf(state.removedAt[id] ?: 0.0, MIGRATION_EPOCH_MS)
         }
 
-        save(state)
+        if (!save(state)) return@synchronized false
         if (maxFutureSeen > 0.0) {
             Log.d(TAG, "library tombstone fold saw a stamp ${maxFutureSeen.toLong()} beyond now+48h (peer clock skew)")
         }
         val after = load()
-        effectiveRemoved(after.removedAt, after.addedAt) != before
+        isCurrent() && effectiveRemoved(after.removedAt, after.addedAt) != before
     }
 
+    private fun isCurrent(): Boolean = owner == activeOwner
+
+    private fun scopedKey(base: String): String = owner.namespace?.let { "$base.account.$it" } ?: base
+
     private fun load(): State {
-        val removedAt = persistence.readMap(REMOVED_AT_KEY).toMutableMap()
-        val addedAt = persistence.readMap(ADDED_AT_KEY).toMutableMap()
-        for (raw in persistence.readLegacy(LEGACY_DELETED_KEY).take(MAX_ENTRIES)) {
+        val removedAt = persistence.readMap(scopedKey(REMOVED_AT_KEY)).toMutableMap()
+        val addedAt = persistence.readMap(scopedKey(ADDED_AT_KEY)).toMutableMap()
+        // Old global data has no proven account owner; only the unassigned local namespace may see it.
+        for (raw in persistence.readLegacy(scopedKey(LEGACY_DELETED_KEY)).take(MAX_ENTRIES)) {
             val id = normalize(raw)
             if (id.isNotEmpty() && id.length <= MAX_ID_LENGTH) {
                 removedAt[id] = maxOf(removedAt[id] ?: 0.0, MIGRATION_EPOCH_MS)
@@ -151,14 +167,16 @@ class LibraryTombstones internal constructor(
         return State(removedAt, addedAt)
     }
 
-    private fun save(state: State) {
+    private fun save(state: State): Boolean {
+        if (!isCurrent()) return false
         val bounded = capped(state)
-        persistence.writeMap(REMOVED_AT_KEY, bounded.removedAt)
-        persistence.writeMap(ADDED_AT_KEY, bounded.addedAt)
+        persistence.writeMap(scopedKey(REMOVED_AT_KEY), bounded.removedAt)
+        persistence.writeMap(scopedKey(ADDED_AT_KEY), bounded.addedAt)
         persistence.writeLegacy(
-            LEGACY_DELETED_KEY,
+            scopedKey(LEGACY_DELETED_KEY),
             effectiveRemoved(bounded.removedAt, bounded.addedAt),
         )
+        return isCurrent()
     }
 
     private fun isRemoved(id: String, state: State): Boolean =
@@ -186,6 +204,18 @@ class LibraryTombstones internal constructor(
         private const val MAX_ENTRIES = 10_000
         private const val MAX_ID_LENGTH = 512
         private val LOCK = Any()
+        private data class Owner(val accountId: String?, val namespace: String?, val revision: Long)
+        private var activeOwner = Owner(null, null, 0)
+
+        /** Called only at serialized VortX session adoption/clear, before publishing the new account. */
+        internal fun activateAccount(accountId: String?) = synchronized(LOCK) {
+            val id = accountId?.takeIf { it.isNotBlank() }
+            val namespace = id?.let {
+                MessageDigest.getInstance("SHA-256").digest(it.toByteArray(Charsets.UTF_8))
+                    .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+            }
+            activeOwner = Owner(id, namespace, activeOwner.revision + 1)
+        }
 
         fun normalize(id: String): String = id.trim().lowercase()
 

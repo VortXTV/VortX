@@ -19,6 +19,11 @@ enum SourcePresentationPolicyTests {
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 800, viewport: 390) == 360)
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 0, viewport: 0) == 420)
         precondition(SourcePresentationPolicy.mobileHeroHeight(width: 390, viewport: .nan) == 420)
-        print("Source presentation: 14 checks passed")
+        precondition(SourcePresentationPolicy.mobileHeroActionOverlap(width: 390, viewport: 800) == 26)
+        precondition(SourcePresentationPolicy.mobileHeroActionOverlap(width: 820, viewport: 1100) == 0)
+        precondition(SourcePresentationPolicy.mobileHeroActionOverlap(width: 800, viewport: 390) == 0)
+        precondition(SourcePresentationPolicy.mobileHeroActionOverlap(width: 0, viewport: 0) == 0)
+        precondition(SourcePresentationPolicy.mobileHeroActionOverlap(width: .nan, viewport: 800) == 0)
+        print("Source presentation: 19 checks passed")
     }
 }

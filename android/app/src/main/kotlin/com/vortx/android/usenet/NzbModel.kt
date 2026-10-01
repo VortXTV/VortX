@@ -19,8 +19,8 @@ internal data class NzbFile(
     val isVideo: Boolean
         get() = VIDEO_EXTENSIONS.any { name.lowercase().endsWith(it) }
 
-    /// Estimated size: the sum of every segment's declared bytes. Used only for the earliest-file probe;
-    /// the real size comes from the NNTP SIZE response.
+    /// Encoded transport estimate. It reserves initial cache space only; yEnc whole-file size and contiguous
+    /// part ranges are authoritative for playback Content-Length and EOF.
     val declaredBytes: Long get() = segments.sumOf { it.bytes }
 
     private companion object {

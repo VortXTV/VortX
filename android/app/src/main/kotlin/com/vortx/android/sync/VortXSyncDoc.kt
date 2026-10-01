@@ -6,8 +6,11 @@ import com.vortx.android.profile.UserProfile
 import com.vortx.android.profile.WatchEntry
 import com.vortx.android.profile.optStringOrNull
 import com.vortx.android.profile.toStringList
+import com.vortx.android.data.AddonTombstones
+import com.vortx.android.engine.PublicAddressPolicy
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URI
 
 /**
  * The encrypted sync DOCUMENT codec: the pure, session-free transforms between the local profile roster
@@ -42,6 +45,45 @@ import org.json.JSONObject
  */
 object VortXSyncDoc {
 
+    /** An installable account-owned descriptor. The raw object is retained so opaque manifest fields survive. */
+    data class AddonDescriptor(
+        val transportUrl: String,
+        val raw: JSONObject,
+    )
+
+    /** Owner library record. On the wire t/d are seconds; in memory they remain zero-safe milliseconds. */
+    data class OwnerLibraryItem(
+        val metaId: String,
+        val type: String,
+        val name: String,
+        val poster: String?,
+        val videoId: String?,
+        val timeOffsetMs: Long,
+        val durationMs: Long,
+        /** A genuine producer event clock only; null is intentionally not replaced with "now". */
+        val lastWatched: String?,
+        val watched: String? = null,
+        val currentVideoWatched: Boolean? = null,
+        val timesWatched: Long? = null,
+        val removed: Boolean = false,
+        val wholeTitleWatched: Boolean? = null,
+        val eventEpochMs: Long? = null,
+        /** Native mutation clock is only a conflict floor, never a substitute for a watch clock. */
+        val nativeEventEpochMs: Long? = null,
+        /** Internal carrier authority, not a native membership field. */
+        val historyOnly: Boolean = false,
+        /** Sparse history producers omit watch flags; omission is not an explicit unwatch. */
+        val declaredWatchFields: Set<String>? = null,
+        /** Internal permission derived from an authenticated newer addedAt stamp, never decoded from a row. */
+        val membershipAddedAt: Double? = null,
+        /** Internal CAS admission from an exact account-owned raw/projection pair; never decoded from wire. */
+        val conditionalHistory: ConditionalOwnerHistory? = null,
+    ) {
+        val identity: String get() = "$type:$metaId"
+    }
+
+    data class ConditionalOwnerHistory(val expected: OwnerLibraryItem, val priorEventEpochMs: Long, val priorLastWatchedEpochMs: Long)
+
     /** The parsed roster + overlay + tombstone view of a pulled doc, ready for the ordered syncDown apply. */
     data class Parsed(
         /** The remote roster, or null when the doc carries neither `vortx.roster` nor `vortx.profiles`. */
@@ -64,8 +106,15 @@ object VortXSyncDoc {
         val deletedAddonsTs: Map<String, Map<String, Double>>,
         /** Stamp-less removals authored by the web client; only syncDown may mint these into stamps. */
         val webAddonRemovals: List<String>,
+        /** App-owned and web-owned installable descriptors, app rows winning duplicate identities. */
+        val addons: List<AddonDescriptor>,
+        /** Shared top-level priority spine. Null means the document did not carry an order. */
+        val addonOrder: List<String>?,
+        /** App-owned vortx.library, falling back to the website's top-level library import. */
+        val ownerLibrary: List<OwnerLibraryItem>?,
         /** The remote device's active profile (advisory; selection stays per-device). */
         val activeProfile: String?,
+        val ownerHistory: List<OwnerLibraryItem> = emptyList(),
     )
 
     // ---- Read: doc.vortx -> local-state view ----
@@ -84,6 +133,9 @@ object VortXSyncDoc {
                 emptyList(),
                 emptyMap(),
                 webAddonRemovals,
+                ownedAddons(doc, null),
+                parseAddonOrder(doc.optJSONArray("addonOrder")),
+                ownerLibrary(doc, null),
                 null,
             )
 
@@ -139,9 +191,213 @@ object VortXSyncDoc {
             deletedAddons,
             deletedAddonsTs,
             webAddonRemovals,
+            ownedAddons(doc, vortx),
+            parseAddonOrder(doc.optJSONArray("addonOrder")),
+            ownerLibrary(doc, vortx),
             active,
+            ownerHistory(vortx),
         )
     }
+
+    internal fun ownerHistory(vortx: JSONObject?): List<OwnerLibraryItem> {
+        val rows = vortx?.optJSONObject("byProfile")?.optJSONObject(UserProfile.OWNER_ID)?.optJSONArray("ownerHistory") ?: return emptyList()
+        if (rows.length() > 10_000) return emptyList()
+        return (0 until rows.length()).mapNotNull { index -> rows.optJSONObject(index)?.let(::ownerHistoryItem) }
+    }
+
+    internal fun ownerHistoryItem(raw: JSONObject): OwnerLibraryItem? {
+        for (field in listOf("id", "type", "name", "v")) if ((raw.opt(field) as? String).isNullOrBlank()) return null
+        val event = OwnerLibraryHistoryPolicy.unsignedInteger(raw.opt("eventEpochMs")) ?: return null
+        if (event !in 1..9_007_199_254_740_991L) return null
+        val time = (raw.opt("t") as? Number)?.toDouble() ?: return null
+        val duration = (raw.opt("d") as? Number)?.toDouble() ?: return null
+        if (!time.isFinite() || !duration.isFinite() || time !in 0.0..2_000_000.0 || duration <= 0 || duration > 2_000_000) return null
+        val item = ownerLibraryItem(raw) ?: return null
+        if (OwnerLibraryHistoryPolicy.watchClock(item) == null) return null
+        return item.copy(removed = true, historyOnly = true,
+            declaredWatchFields = setOf("watched", "currentVideoWatched", "timesWatched", "wholeTitleWatched").filterTo(hashSetOf()) { raw.has(it) })
+    }
+
+    internal fun mergeLocalOwnerHistory(vortx: JSONObject, local: List<OwnerLibraryItem>?) {
+        val history = local.orEmpty().filter { it.historyOnly && ownerHistoryItem(OwnerLibraryHistoryPolicy.encode(it, JSONObject())) != null }
+        if (history.isEmpty()) return
+        if (vortx.has("byProfile") && vortx.optJSONObject("byProfile") == null) return
+        val byProfile = vortx.optJSONObject("byProfile") ?: JSONObject().also { vortx.put("byProfile", it) }
+        if (byProfile.has(UserProfile.OWNER_ID) && byProfile.optJSONObject(UserProfile.OWNER_ID) == null) return
+        val owner = byProfile.optJSONObject(UserProfile.OWNER_ID) ?: JSONObject().also { byProfile.put(UserProfile.OWNER_ID, it) }
+        if (owner.has("ownerHistory") && owner.optJSONArray("ownerHistory") == null) return
+        val previous = owner.optJSONArray("ownerHistory")
+        if ((previous?.length() ?: 0) > 10_000) return
+        val merged = OwnerLibraryHistoryPolicy.merge(previous, history, emptySet(), ::ownerHistoryItem)
+        if (merged.length() <= 10_000) owner.put("ownerHistory", merged)
+    }
+
+    /**
+     * App data wins over a website/Stremio import when present. Invalid rows are independently ignored;
+     * absence stays null so a partial document can never mean "clear the engine library".
+     */
+    internal fun ownerLibrary(doc: JSONObject, vortx: JSONObject? = doc.optJSONObject("vortx")): List<OwnerLibraryItem>? {
+        val rows = vortx?.optJSONArray("library") ?: doc.optJSONArray("library") ?: return null
+        return buildMap<String, OwnerLibraryItem> {
+            for (index in 0 until rows.length()) {
+                val raw = rows.optJSONObject(index) ?: continue
+                val item = ownerLibraryItem(raw) ?: continue
+                putIfAbsent(item.identity, item.copy(declaredWatchFields =
+                    setOf("watched", "currentVideoWatched", "timesWatched", "wholeTitleWatched").filterTo(hashSetOf()) { raw.has(it) }))
+            }
+        }.values.toList()
+    }
+
+    internal fun ownerLibraryItem(row: JSONObject): OwnerLibraryItem? {
+        val id = row.opt("id") as? String ?: return null
+        val type = row.opt("type") as? String ?: return null
+        if (!isTypedCatalogIdentity(id) || type !in setOf("movie", "series")) return null
+        fun nullableType(key: String, valid: (Any) -> Boolean): Boolean =
+            !row.has(key) || row.isNull(key) || valid(row.get(key))
+        if (!nullableType("lastWatched") { it is String } || !nullableType("v") { it is String } ||
+            !nullableType("watched") { it is String } || !nullableType("currentVideoWatched") { it is Boolean } ||
+            !nullableType("wholeTitleWatched") { it is Boolean } || !nullableType("removed") { it is Boolean } ||
+            !nullableType("timesWatched") { OwnerLibraryHistoryPolicy.unsignedInteger(it)?.let { n -> n <= 0xffff_ffffL } == true } ||
+            !nullableType("eventEpochMs") { OwnerLibraryHistoryPolicy.unsignedInteger(it)?.let { n -> n > 0 } == true }) return null
+        val lastWatched = (row.opt("lastWatched") as? String)?.takeIf { it.isNotBlank() }
+        if (lastWatched != null && runCatching { java.time.Instant.parse(lastWatched).toEpochMilli() > 0 }.getOrDefault(false).not()) return null
+        val hasEvent = lastWatched != null || (!row.isNull("eventEpochMs") && row.has("eventEpochMs"))
+        for (key in listOf("t", "d")) {
+            val value = (row.opt(key) as? Number)?.toDouble()
+            if (hasEvent && (value == null || !value.isFinite() || value < 0 || value * 1000 >= Long.MAX_VALUE.toDouble())) return null
+        }
+        fun wireSeconds(key: String): Long = (row.opt(key) as? Number)?.toDouble()
+            ?.takeIf { it.isFinite() && it >= 0.0 }?.times(1000.0)?.toLong() ?: 0L
+        return OwnerLibraryItem(
+            metaId = id,
+            type = type,
+            name = (row.opt("name") as? String).orEmpty(),
+            poster = (row.opt("poster") as? String)?.takeIf { it.isNotBlank() },
+            videoId = (row.opt("v") as? String)?.takeIf { it.isNotBlank() },
+            timeOffsetMs = wireSeconds("t"),
+            durationMs = wireSeconds("d"),
+            lastWatched = lastWatched,
+            watched = row.opt("watched") as? String,
+            currentVideoWatched = row.opt("currentVideoWatched") as? Boolean,
+            timesWatched = OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("timesWatched"))?.takeIf { it <= 0xffff_ffffL },
+            removed = row.opt("removed") as? Boolean ?: false,
+            wholeTitleWatched = if (type == "movie") row.opt("wholeTitleWatched") as? Boolean else null,
+            eventEpochMs = OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("eventEpochMs"))?.takeIf { it > 0 },
+        )
+    }
+
+    /** Reject synthetic IDs before they can reach the native account library. */
+    internal fun isTypedCatalogIdentity(id: String): Boolean =
+        (id.startsWith("tt") && id.length > 2 && id.drop(2).all(Char::isDigit)) ||
+            (id.startsWith("tmdb:") && id.length > 5 && id.drop(5).all(Char::isDigit))
+
+    /** Merge only a positive native snapshot; do not delete peer data because a local model is empty. */
+    internal fun mergeLocalOwnerLibrary(
+        vortx: JSONObject,
+        local: List<OwnerLibraryItem>?,
+        removed: Set<String>,
+    ) {
+        local ?: return
+        vortx.put("library", OwnerLibraryHistoryPolicy.merge(vortx.optJSONArray("library"), local, removed))
+    }
+
+    /**
+     * Account-owned add-ons are a stable app-first union of `vortx.addons` and website `doc.addons`.
+     * URL-only legacy rows remain valid account records but are deliberately not returned here: native
+     * InstallAddon needs a manifest, and an incomplete remote row must never turn into an empty install.
+     */
+    internal fun ownedAddons(doc: JSONObject, vortx: JSONObject? = doc.optJSONObject("vortx")): List<AddonDescriptor> {
+        val byIdentity = LinkedHashMap<String, AddonDescriptor>()
+        fun addAll(rows: JSONArray?) {
+            rows ?: return
+            for (index in 0 until rows.length()) {
+                val raw = rows.optJSONObject(index) ?: continue
+                val descriptor = addonDescriptor(raw) ?: continue
+                val identity = AddonPublicationProofs.endpoint(descriptor.transportUrl)
+                if (identity.isNotEmpty() && identity !in byIdentity) byIdentity[identity] = descriptor
+            }
+        }
+        // App descriptors are canonical on conflict; website-only entries append in their document order.
+        addAll(vortx?.optJSONArray("addons"))
+        addAll(doc.optJSONArray("addons"))
+        return byIdentity.values.toList()
+    }
+
+    /** Parse one safely-installable descriptor without rejecting compatible shallow records elsewhere in a doc. */
+    internal fun addonDescriptor(raw: JSONObject): AddonDescriptor? {
+        // Do not coerce arbitrary JSON values to strings: this object is dispatched directly to the native
+        // engine during account hydration, so it has the same public-network admission as a pasted install.
+        val url = (raw.opt("transportUrl") as? String)?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val uri = runCatching { URI(url) }.getOrNull() ?: return null
+        if (
+            uri.scheme?.lowercase() !in setOf("http", "https") ||
+            uri.host.isNullOrBlank() || uri.rawUserInfo != null ||
+            runCatching { PublicAddressPolicy.requireLiteralPublicOrHostname(uri.host) }.isFailure
+        ) return null
+        val manifest = raw.optJSONObject("manifest") ?: return null
+        // Native's manifest serde needs real string values; `optString` would turn numbers/objects into
+        // seemingly valid ids and feed malformed account material into InstallAddon.
+        val id = manifest.opt("id") as? String ?: return null
+        val name = manifest.opt("name") as? String ?: return null
+        if (id.isBlank() || name.isBlank()) return null
+        return AddonDescriptor(url, JSONObject(raw.toString()))
+    }
+
+    private fun parseAddonOrder(raw: JSONArray?): List<String>? {
+        raw ?: return null
+        val seen = HashSet<String>()
+        val out = ArrayList<String>(minOf(raw.length(), MAX_ADDON_ORDER_ENTRIES))
+        for (index in 0 until raw.length()) {
+            if (out.size == MAX_ADDON_ORDER_ENTRIES) break
+            val url = raw.opt(index) as? String ?: continue
+            val normalized = AddonTombstones.normalize(url)
+            if (normalized.isNotEmpty() && seen.add(normalized)) out += normalized
+        }
+        return out
+    }
+
+    /**
+     * Read-merge local engine descriptors into the app-owned carrier. Never replaces a known-good remote
+     * descriptor with an empty local snapshot; local descriptors win only for identities they actually hold.
+     */
+    internal fun mergeLocalAddons(
+        vortx: JSONObject,
+        local: List<AddonDescriptor>,
+        removed: Set<String>,
+    ): JSONObject {
+        if (local.isEmpty()) return vortx
+        val merged = mutableListOf<Any>()
+        val positions = mutableMapOf<String, Int>()
+        val prior = vortx.optJSONArray("addons")
+        for (index in 0 until (prior?.length() ?: 0)) {
+            val raw = prior!!.get(index)
+            val descriptor = (raw as? JSONObject)?.let(::addonDescriptor)
+            if (descriptor == null) { merged.add(raw); continue }
+            val identity = AddonPublicationProofs.endpoint(descriptor.transportUrl)
+            if (AddonTombstones.normalize(descriptor.transportUrl) in removed) continue
+            if (identity !in positions) { positions[identity] = merged.size; merged.add(raw) }
+        }
+        for (descriptor in local) {
+            val identity = AddonPublicationProofs.endpoint(descriptor.transportUrl)
+            if (AddonTombstones.normalize(descriptor.transportUrl) !in removed && identity.isNotEmpty()) {
+                val position = positions[identity]
+                if (position == null) { positions[identity] = merged.size; merged.add(descriptor.raw) }
+                else merged[position] = descriptor.raw
+            }
+        }
+        if (merged.isNotEmpty()) {
+            vortx.put("addons", JSONArray(merged))
+            if (!vortx.has("addonsOwnedAt")) vortx.put("addonsOwnedAt", System.currentTimeMillis())
+        }
+        return vortx
+    }
+
+    private fun JSONArray?.orEmptyObjects(): List<JSONObject> {
+        this ?: return emptyList()
+        return buildList { for (index in 0 until length()) optJSONObject(index)?.let(::add) }
+    }
+
+    private const val MAX_ADDON_ORDER_ENTRIES = 1024
 
     private fun parseLibraryTimestamps(raw: JSONObject?): Map<String, Map<String, Double>> {
         raw ?: return emptyMap()

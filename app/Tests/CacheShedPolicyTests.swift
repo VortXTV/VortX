@@ -476,7 +476,7 @@ check("single-flight: only the exact owner observes the seek boundary",
         && flightGate.markSeekEventObserved(owner: 1)
         && flightGate.current?.phase == .settling)
 check("single-flight: restart settles after the seek boundary and cancels timeout once",
-      flightGate.completeOnPlaybackRestart(owner: 1)?.result == .commandAccepted
+      flightGate.completeOnPlaybackRestart(owner: 1, position: 1604, lowLevelSeeks: 1)?.result == .commandAccepted
         && flightGate.current == nil && firstTimeout.isCancelled)
 
 var progressGate = CacheFlushSingleFlight<Int>()
@@ -489,7 +489,7 @@ _ = progressGate.markSeekEventObserved(owner: 32)
 check("single-flight: post-seek progress settles only for the exact owner and target",
       progressGate.completeOnProgress(owner: 33, observedPosition: 321, progressEpsilon: 0.25) == nil
         && progressGate.completeOnProgress(owner: 32, observedPosition: 320, progressEpsilon: 0.25) == nil
-        && progressGate.completeOnProgress(owner: 32, observedPosition: 320.25, progressEpsilon: 0.25)?.result == .commandAccepted
+        && progressGate.completeOnProgress(owner: 32, observedPosition: 320.25, progressEpsilon: 0.25, lowLevelSeeks: 1)?.result == .commandAccepted
         && progressGate.current == nil)
 
 var errorGate = CacheFlushSingleFlight<Int>()
@@ -509,7 +509,7 @@ let timeoutFlight = timeoutGate.install(
 )
 _ = timeoutGate.markSeekCommandAccepted(id: timeoutFlight.id, owner: 13)
 check("single-flight: bounded timeout restores after command acceptance even if the seek event never arrives",
-      timeoutGate.settle(id: timeoutFlight.id, owner: 13)?.result == .commandAccepted && timeoutGate.current == nil)
+      timeoutGate.settle(id: timeoutFlight.id, owner: 13)?.result == .timedOut && timeoutGate.current == nil)
 
 var replacementGate = CacheFlushSingleFlight<Int>()
 let replacementFlight = replacementGate.install(
@@ -533,6 +533,58 @@ _ = independentA.install(
 )
 check("single-flight: two helper instances have independent gates",
       independentA.current != nil && independentB.current == nil && independentB.admit(owner: 10) == .started)
+
+// Build 252's three exact maintenance shapes: preserve the playhead and transport intent,
+// require an actual low-level seek, and never confuse an early zero with target restoration.
+for (target, buffered, paused, reason) in [
+    (3685.974, 50.688, false, CacheFlushReason.memoryWarning),
+    (3693.815, 42.720, false, CacheFlushReason.memoryWarning),
+    (3516.999, 221.248, true, CacheFlushReason.pausedCacheClamp)
+] {
+    var gate = CacheFlushSingleFlight<Int>()
+    let snapshot = gate.install(owner: 252, reason: reason, target: target,
+        targetArgument: String(target), startUptime: 0, timeoutWorkItem: DispatchWorkItem {},
+        originalSeekableCache: "yes", lowLevelSeeksAtIssue: 7, wasPaused: paused)
+    _ = gate.markSeekCommandAccepted(id: snapshot.id, owner: 252)
+    check("252 target \(target) buffer \(buffered): acceptance alone cannot restore",
+          gate.completeOnPlaybackRestart(owner: 252, position: target, lowLevelSeeks: 8) == nil)
+    _ = gate.markSeekEventObserved(owner: 252)
+    check("252: cached restart is not memory relief",
+          gate.completeOnPlaybackRestart(owner: 252, position: target, lowLevelSeeks: 7) == nil)
+    check("252: exactly one reissue preserves original deadline and option",
+          gate.reissueAfterCachedRestart(owner: 252, lowLevelSeeks: 7)?.originalSeekableCache == "yes"
+          && gate.current?.wasPaused == paused && gate.current?.target == target)
+    check("252: queued pre-reissue callback cannot adopt new counter or restart position",
+          !gate.acceptsEvent(id: snapshot.id, owner: 252, attempt: 0)
+          && !gate.acceptsEvent(id: snapshot.id - 1, owner: 252, attempt: 1)
+          && gate.acceptsEvent(id: snapshot.id, owner: 252, attempt: 1))
+    _ = gate.markSeekCommandAccepted(id: snapshot.id, owner: 252)
+    _ = gate.markSeekEventObserved(owner: 252)
+    check("252: second cached restart never loops",
+          gate.reissueAfterCachedRestart(owner: 252, lowLevelSeeks: 7) == nil)
+    check("252: stale owner or zero never completes even after low-level work",
+          gate.completeOnPlaybackRestart(owner: 251, position: target, lowLevelSeeks: 8) == nil
+          && gate.completeOnPlaybackRestart(owner: 252, position: 0, lowLevelSeeks: 8) == nil)
+    let done = gate.completeOnPlaybackRestart(owner: 252, position: target, lowLevelSeeks: 8)
+    check("252: owned target landing restores original option and captured pause",
+          done?.originalSeekableCache == "yes" && done?.wasPaused == paused && gate.current == nil)
+    check("252: stale timeout cannot restore again", gate.settle(id: snapshot.id, owner: 252) == nil)
+
+    var eof = SeekEOFRecoveryPolicy<Int>()
+    eof.begin(owner: 252, target: target, wasPaused: paused, duration: 3740.529,
+              origin: .cacheReanchor, now: 0)
+    _ = eof.observeSeek(owner: 252)
+    eof.observePosition(owner: 252, position: target)
+    _ = eof.consumeEOFForReload(owner: 252)
+    _ = eof.adoptReload(owner: 253)
+    _ = eof.beginReloadSeek(owner: 253)
+    _ = eof.observeSeek(owner: 253)
+    check("252: reopened first frame at zero cannot restore high target",
+          eof.completeReloadAtPosition(owner: 253, position: 0) == nil)
+    _ = eof.updateTransportIntent(owner: 253, paused: !paused)
+    check("252: latest viewer transport wins at exact landing",
+          eof.completeReloadAtPosition(owner: 253, position: target)?.wasPaused == !paused)
+}
 
 // MARK: - Seek-adjacent EOF recovery (diag-13)
 
@@ -562,7 +614,8 @@ check("seek EOF: reload owner is a fresh token and must restore target position 
       seekEOF.adoptReload(owner: 3)?.owner == 3
         && seekEOF.beginReloadSeek(owner: 3)?.phase == .awaitingReloadSeekEvent
         && seekEOF.observeSeek(owner: 3) == .awaitingReloadPosition
-        && seekEOF.completeReloadAtPosition(owner: 3, position: 620)?.wasPaused == true
+        && seekEOF.completeReloadAtPosition(owner: 3, position: 620) == nil
+        && seekEOF.completeReloadAtPosition(owner: 3, position: 631.53)?.wasPaused == true
         && seekEOF.current == nil)
 
 // A and B deliberately share an owner: this models consecutive scrubs in one loaded mpv item, where
@@ -596,6 +649,12 @@ check("seek EOF: direct cache begin cannot inherit an older viewer seek's callba
         && directReplacement.shouldRejectUnprovenEOF(owner: 40, now: 402.02))
 
 var transportEOF = SeekEOFRecoveryPolicy<Int>()
+transportEOF.begin(owner: 90, target: 3516.999, wasPaused: false, duration: 3740.529, origin: .cacheReanchor, now: 0)
+check("252: viewer pause before EOF is retained without blocking ordinary transport",
+      transportEOF.updateTransportIntent(owner: 90, paused: true) == nil && transportEOF.current?.wasPaused == true)
+check("252: later Play supersedes parked maintenance intent before any reload",
+      transportEOF.updateTransportIntent(owner: 90, paused: false) == nil && transportEOF.current?.wasPaused == false)
+transportEOF.reset()
 transportEOF.begin(owner: 10, target: 631.53, wasPaused: true, duration: 1398.08, origin: .viewer, now: 300)
 _ = transportEOF.observeSeek(owner: 10)
 _ = transportEOF.consumeEOFForReload(owner: 10)

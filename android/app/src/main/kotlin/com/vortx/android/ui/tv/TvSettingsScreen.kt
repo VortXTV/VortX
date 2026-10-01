@@ -80,6 +80,8 @@ import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.SourcesSettingsScreen
+import com.vortx.android.ui.screens.ConfiguredUsenetServersSettingsScreen
+import com.vortx.android.ui.screens.ConfiguredNzbIndexerSettingsScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
 import com.vortx.android.ui.viewmodel.AccountViewModel
@@ -391,6 +393,18 @@ fun TvSettingsScreen(
         return
     }
 
+    if (route == TvSettingsRoute.USENET_SERVERS) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        ConfiguredUsenetServersSettingsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
+    if (route == TvSettingsRoute.NZB_INDEXERS) {
+        BackHandler { route = TvSettingsRoute.ROOT }
+        ConfiguredNzbIndexerSettingsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
+        return
+    }
+
     if (route == TvSettingsRoute.SOURCES) {
         BackHandler { route = TvSettingsRoute.ROOT }
         SourcesSettingsScreen(onBack = { route = TvSettingsRoute.ROOT }, modifier = modifier)
@@ -496,6 +510,21 @@ fun TvSettingsScreen(
                         label = "Metadata keys",
                         detail = "Add your own TMDB / OMDB keys for ratings and artwork.",
                         onClick = { route = TvSettingsRoute.METADATA },
+                    )
+                }
+            }
+
+            if (show("usenet", "nntp", "server priority", "fallback", "nzb", "indexer", "nzbgeek", "newznab")) item {
+                TvSettingsSection("Usenet") {
+                    TvSettingsNavigationRow(
+                        label = "Usenet servers",
+                        detail = "Saved NNTP servers, priority and fallback.",
+                        onClick = { route = TvSettingsRoute.USENET_SERVERS },
+                    )
+                    TvSettingsNavigationRow(
+                        label = "NZB indexers",
+                        detail = "Connect NZBGeek or another Newznab indexer to your Usenet servers.",
+                        onClick = { route = TvSettingsRoute.NZB_INDEXERS },
                     )
                 }
             }
@@ -983,6 +1012,8 @@ internal enum class TvSettingsRoute {
     IPTV,
     PLAYBACK,
     SOURCES,
+    USENET_SERVERS,
+    NZB_INDEXERS,
     BACKUP,
     DIAGNOSTICS;
 

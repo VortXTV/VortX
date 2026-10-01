@@ -26,14 +26,13 @@ struct TraktCheckinChip: View {
     /// never-touched switch and the runtime gate would disagree.
     @AppStorage(ExternalSyncToggle.traktCheckin) private var enabled = false
 
-    @State private var connected = false
     @State private var conflictUntil: Date?
     @State private var showConflict = false
     @State private var errorMessage: String?
     @State private var showError = false
 
     var body: some View {
-        if enabled, connected, let meta = core.metaDetails?.meta {
+        if enabled, TraktAuth.storedSessionID != nil, let meta = core.metaDetails?.meta {
             let isSeries = EpisodePlaybackIdentity.usesSeriesLifecycle(type: meta.type)
             if TraktCheckinModel.canOffer(isSeries: isSeries, season: season, episode: episode) {
                 let key = TraktCheckinModel.key(id: meta.id, season: season, episode: episode)
@@ -54,9 +53,6 @@ struct TraktCheckinChip: View {
                 } message: {
                     Text(errorMessage ?? "Trakt could not be reached.")
                 }
-                // Sign-in lives behind an actor, so it is resolved once the chip appears rather than read
-                // synchronously in `body`.
-                .task { connected = await TraktAuth.shared.isSignedIn }
             }
         }
     }

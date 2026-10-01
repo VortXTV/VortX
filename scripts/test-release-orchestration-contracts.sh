@@ -54,6 +54,22 @@ trigger_block() {
 [[ -f "$RELEASE_WF" ]] || fail "release workflow missing: $RELEASE_WF"
 [[ -f "$VALIDATION_WF" ]] || fail "secretless validation workflow missing: $VALIDATION_WF"
 
+# Release and candidate builds must share the same immutable wrapper revision; otherwise a
+# source-level history API can link on one platform yet ship an older engine on another.
+engine_pin=""
+for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    pin="$(awk '/repository: VortXTV\/stremiox-core/{active=1; next}
+        active && /^[[:space:]]+ref:/{print $2; exit}' "$wf")"
+    [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || fail "$(basename "$wf") wrapper pin must be immutable"
+    [[ -z "$engine_pin" || "$engine_pin" = "$pin" ]] || fail "Apple/Android wrapper pins differ"
+    engine_pin="$pin"
+done
+ok "Apple and both Android lanes use one exact wrapper revision"
+require_grep "Android quality analysis uses the NDK-aware traced build" \
+    'queries: \./\.github/codeql/java-quality\.qls' "$CODEQL_WF"
+require_grep "Android quality suite retains GitHub's maintained selector" \
+    'apply: code-quality-selectors\.yml' "$REPO_ROOT/.github/codeql/java-quality.qls"
+
 # setup-android's default includes the removed standalone 'tools' package. Validate the actual
 # action block, not a matching comment elsewhere, in every SDK lane before any native build starts.
 for wf in "$ANDROID_CI_WF" "$RELEASE_WF" "$VALIDATION_WF" "$CODEQL_WF"; do
@@ -139,7 +155,34 @@ for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
         'targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android' "$wf"
     require_grep "$(basename "$wf") verifies all three shipped ABI directories" \
         'for abi in arm64-v8a armeabi-v7a x86_64' "$wf"
+    for method in nativeRestoreLibrary nativeReadLibraryEvents; do
+        require_grep "$(basename "$wf") requires $method in the engine artifact" \
+            "Java_com_vortx_android_engine_StremioCoreNative_$method" "$wf"
+    done
+    # Run the exact production symbol predicate against readelf-shaped rows. A matching
+    # import/local/hidden/object must never stand in for a callable JNI definition.
+    symbol_predicate="$(sed -n "s/.*awk -v required=.* '\\(.*\\)' <<<.*/\\1/p" "$wf")"
+    [[ -n "$symbol_predicate" ]] || fail "$(basename "$wf") callable JNI predicate missing"
+    valid_symbol='1: 0000000000000100 64 FUNC GLOBAL DEFAULT 12 nativeRestoreLibrary'
+    awk -v required=nativeRestoreLibrary "$symbol_predicate" <<<"$valid_symbol" \
+        || fail "$(basename "$wf") rejects a defined visible JNI function"
+    for invalid_symbol in \
+        '1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND nativeRestoreLibrary' \
+        '1: 0000000000000100 64 FUNC LOCAL DEFAULT 12 nativeRestoreLibrary' \
+        '1: 0000000000000100 64 FUNC GLOBAL HIDDEN 12 nativeRestoreLibrary' \
+        '1: 0000000000000100 64 OBJECT GLOBAL DEFAULT 12 nativeRestoreLibrary'; do
+        if awk -v required=nativeRestoreLibrary "$symbol_predicate" <<<"$invalid_symbol"; then
+            fail "$(basename "$wf") accepts a non-callable JNI entry"
+        fi
+    done
+    require_grep "$(basename "$wf") rejects non-little-endian engines" 'Data:.*little endian' "$wf"
+    require_grep "$(basename "$wf") rejects non-shared-object engines" 'Type:.*DYN' "$wf"
+    ok "$(basename "$wf") JNI predicate rejects undefined/local/hidden/object symbols"
 done
+require_grep "release verifies engines inside the Play AAB as well as both APKs" \
+    'prefix=base/lib' "$RELEASE_WF"
+require_grep "candidate verifies exactly one Full and one Play APK" \
+    '\$\{#full_apks\[@\]\} -ne 1.*\$\{#play_apks\[@\]\} -ne 1' "$ANDROID_CI_WF"
 require_grep "secretless packaging proves libmpv for all three shipped ABIs" \
     'for abi in arm64-v8a armeabi-v7a x86_64' "$VALIDATION_WF"
 require_grep "release docs name all three universal APK ABIs" \

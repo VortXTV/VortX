@@ -11,6 +11,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
@@ -67,6 +70,9 @@ object ScrobbleService {
 
     @Volatile private var togglePrefs: SharedPreferences? = null
     @Volatile private var traktSessionWatcherStarted = false
+    private val _toggleChanges = MutableStateFlow(0L)
+    /** Mounted Home surfaces use this to react immediately to a settings change. */
+    internal val toggleChanges: StateFlow<Long> = _toggleChanges.asStateFlow()
 
     /// Idempotent init: wire the toggle prefs and both auth token stores. Safe to call from every entry
     /// point (the player scrobble hook, the Integrations screen).
@@ -145,6 +151,7 @@ object ScrobbleService {
 
     fun setToggle(key: String, enabled: Boolean) {
         togglePrefs?.edit()?.putBoolean(key, enabled)?.apply()
+        _toggleChanges.value += 1
     }
 
     // MARK: - Live transitions (fire-and-forget)

@@ -392,11 +392,13 @@ fun TvFilterChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     stateDescription: String? = null,
+    enabled: Boolean = true,
 ) {
     val colors = VortXTheme.colors
     val accessibilityStateDescription = stateDescription
     Surface(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.semantics {
             this.selected = selected
             accessibilityStateDescription?.let { this.stateDescription = it }

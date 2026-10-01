@@ -2259,7 +2259,7 @@ enum CredentialScope: Equatable, Hashable, Sendable {
 final class CredentialScopeRegistry: @unchecked Sendable {
     static let shared = CredentialScopeRegistry()
 
-    struct Capture: Equatable, Sendable {
+    struct Capture: Equatable, Hashable, Sendable {
         let scope: CredentialScope
         let generation: UInt64
 

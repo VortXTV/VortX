@@ -10,6 +10,7 @@ import com.vortx.android.data.PreviewAuthRepository
 import com.vortx.android.home.HomeRailPreferences
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.home.SimklRailsModel
 import com.vortx.android.home.TraktRailsModel
@@ -39,9 +40,14 @@ class StremioXViewModelFactory(
     private val homeSurface: HomeRailSurface = HomeRailSurface.PHONE,
 ) : ViewModelProvider.Factory {
 
-    /// [name] is the tapped card's title, used only to paint the placeholder hero for a meta-less `tt`
-    /// (see [DetailViewModel]'s meta recovery); optional so existing call sites stay unchanged.
-    data class DetailArgs(val type: MediaType, val id: String, val name: String? = null)
+    /// [name] is the tapped card's title, used only to paint the placeholder hero for a meta-less `tt`.
+    /// [preferredEpisode] is an optional remote route target, never a local history/resume value.
+    data class DetailArgs(
+        val type: MediaType,
+        val id: String,
+        val name: String? = null,
+        val preferredEpisode: PreferredEpisode? = null,
+    )
 
     @Suppress("UNCHECKED_CAST")
     override fun <T : ViewModel> create(modelClass: Class<T>): T = when {
@@ -96,7 +102,7 @@ class StremioXViewModelFactory(
             val context = requireNotNull(appContext) {
                 "DetailViewModel requires an app Context (debrid keys + source-list assembly)"
             }
-            DetailViewModel(repo, args.type, args.id, context, args.name) as T
+            DetailViewModel(repo, args.type, args.id, context, args.name, args.preferredEpisode) as T
         }
         else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }

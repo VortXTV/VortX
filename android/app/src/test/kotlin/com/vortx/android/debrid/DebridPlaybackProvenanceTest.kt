@@ -128,18 +128,19 @@ class DebridPlaybackProvenanceTest {
     }
 
     @Test
-    fun coordinatorKeepsTorBoxPrecedenceThenNativeFallbackAndDoesNotSwallowCancellation() {
+    fun coordinatorTriesSavedNntpInPriorityBeforeTorBoxCloudAndDoesNotSwallowCancellation() {
         val coordinator = source("src/main/kotlin/com/vortx/android/debrid/DebridCoordinator.kt")
         val usenetBranch = coordinator.substringAfter("// USENET first:")
             .substringBefore("// Raw torrent only:")
 
+        val native = usenetBranch.indexOf("UsenetProviderFallbackPolicy.firstReady")
         val torBox = usenetBranch.indexOf("keys.isConfigured(DebridService.TOR_BOX, owner)")
-        val native = usenetBranch.indexOf("usenetProviderStore?.load(owner)")
-        assertTrue("TorBox must be attempted before the native provider", torBox >= 0 && torBox < native)
+        assertTrue("saved NNTP priority must be attempted before TorBox cloud", native >= 0 && native < torBox)
         assertTrue(usenetBranch.contains("catch (cancel: CancellationException)"))
         assertTrue(usenetBranch.contains("throw cancel"))
         assertTrue(usenetBranch.contains("withTimeoutOrNull(RESOLVE_TIMEOUT_MS)"))
-        assertTrue(usenetBranch.contains("It intentionally has no direct-link deadline."))
+        assertTrue(usenetBranch.contains("same NZB/file/episode selection first"))
+        assertTrue(usenetBranch.contains("native.cancel()"))
         assertTrue(usenetBranch.contains("isNativeFile = true"))
     }
 

@@ -2782,7 +2782,8 @@ final class CoreBridge: ObservableObject {
                 ? Self.applyOwnedContinueWatchingFloor(causalPreview, mayReplace: mayReplaceCW)
                 : causalPreview)
             let items = ownerProfile
-                ? Self.unionOwnerContinueWatching(engine: engine, library: library)
+                ? Self.unionOwnerContinueWatching(engine: engine, library: library,
+                                                  history: BecauseYouWatchedDocumentHistory.ownerHistoryItems(from: OwnerHistoryStore.validRows()))
                 : engine
             VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
             self.continueWatching = items
@@ -2894,7 +2895,7 @@ final class CoreBridge: ObservableObject {
     /// Synthesized items follow in library order (the library's default `lastwatched` sort, so still
     /// recency-leaning) and are pruned of finished titles. Pure + owner-only; the caller gates on
     /// `activeUsesEngineHistory`.
-    static func unionOwnerContinueWatching(engine: [CoreCWItem], library: [CoreCWItem]) -> [CoreCWItem] {
+    static func unionOwnerContinueWatching(engine: [CoreCWItem], library: [CoreCWItem], history: [CoreCWItem] = []) -> [CoreCWItem] {
         var synthesized: [CoreCWItem] = []
         for item in library {
             // Real saved titles only: skip removed / temp markers, and skip anything the engine already
@@ -2919,7 +2920,9 @@ final class CoreBridge: ObservableObject {
         // Engine order is already newest-first and remains authoritative when its clock is not exposed. The
         // played video id supplies the cross-provider alias bridge (for example tmdb display id plus tt…:S:E),
         // so poster rotations never split a title and unrelated same-name titles never meet.
-        return ContinueWatchingDedupe.fold(engine + pruneFinished(synthesized)) {
+        // History follows the real engine preview but precedes membership-derived synthetic rows.  It is
+        // never added to `library`; it only makes a verified unsaved playback resumable on this device.
+        return ContinueWatchingDedupe.fold(engine + pruneFinished(history) + pruneFinished(synthesized)) {
             .init(
                 id: $0.id,
                 type: $0.type,

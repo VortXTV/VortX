@@ -18,6 +18,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -58,6 +59,31 @@ internal fun tvAddonsFocusTarget(event: TvAddonsFocusEvent): TvAddonsFocusTarget
     TvAddonsFocusEvent.BACK_TO_SETTINGS -> TvAddonsFocusTarget.SETTINGS_ADDONS
 }
 
+internal enum class TvAddonMoveDirection(val delta: Int) { UP(-1), DOWN(1) }
+
+internal data class TvAddonMoveResult(
+    val order: List<String>,
+    val focusDirection: TvAddonMoveDirection,
+)
+
+/** Pure one-step priority move. Keys are transport URLs so identity survives list movement. */
+internal fun tvAddonMove(
+    currentUrls: List<String>,
+    transportUrl: String,
+    direction: TvAddonMoveDirection,
+): TvAddonMoveResult? {
+    val from = currentUrls.indexOf(transportUrl)
+    val to = from + direction.delta
+    if (from < 0 || to !in currentUrls.indices) return null
+    val next = currentUrls.toMutableList().apply { add(to, removeAt(from)) }
+    val focusDirection = when {
+        direction == TvAddonMoveDirection.UP && to == 0 -> TvAddonMoveDirection.DOWN
+        direction == TvAddonMoveDirection.DOWN && to == next.lastIndex -> TvAddonMoveDirection.UP
+        else -> direction
+    }
+    return TvAddonMoveResult(next, focusDirection)
+}
+
 /** TV add-on status surface. Network ownership stays in the shared [AddonsViewModel]. */
 @Composable
 internal fun TvAddonsScreen(
@@ -70,7 +96,20 @@ internal fun TvAddonsScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val health by viewModel.health.collectAsStateWithLifecycle()
     val installed = (state as? UiState.Success)?.data.orEmpty()
+    val latestInstalled by rememberUpdatedState(installed)
     val backFocus = remember { FocusRequester() }
+    var moveFocus by remember { mutableStateOf<TvAddonMoveFocus?>(null) }
+    var moveFocusSequence by remember { mutableStateOf(0) }
+
+    fun moveAddon(transportUrl: String, direction: TvAddonMoveDirection) {
+        // Re-read the latest observed set on every press: a stale row callback must not resurrect an
+        // add-on removed since composition, and newly installed rows participate in the move order.
+        val latestUrls = latestInstalled.map(InstalledAddon::transportUrl)
+        val result = tvAddonMove(latestUrls, transportUrl, direction) ?: return
+        viewModel.applyOrder(result.order)
+        moveFocusSequence += 1
+        moveFocus = TvAddonMoveFocus(transportUrl, result.focusDirection)
+    }
 
     // Per-add-on Configure QR (Apple `ConfigureAddonView` tvOS path): TV has no browser, so it shows the
     // add-on's configuration page as a QR to finish on a phone. Null when no Configure sheet is open.
@@ -162,6 +201,12 @@ internal fun TvAddonsScreen(
                             } else {
                                 null
                             },
+                            onMoveUp = { moveAddon(addon.transportUrl, TvAddonMoveDirection.UP) },
+                            onMoveDown = { moveAddon(addon.transportUrl, TvAddonMoveDirection.DOWN) },
+                            canMoveUp = current.data.indexOfFirst { it.transportUrl == addon.transportUrl } > 0,
+                            canMoveDown = current.data.indexOfFirst { it.transportUrl == addon.transportUrl } < current.data.lastIndex,
+                            moveFocus = moveFocus,
+                            moveFocusSequence = moveFocusSequence,
                         )
                     }
                 }
@@ -182,6 +227,11 @@ internal fun TvAddonsScreen(
     }
 }
 
+private data class TvAddonMoveFocus(
+    val transportUrl: String,
+    val direction: TvAddonMoveDirection,
+)
+
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun TvAddonRow(
@@ -189,8 +239,27 @@ private fun TvAddonRow(
     health: AddonHealth,
     onClick: () -> Unit,
     onConfigure: (() -> Unit)? = null,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    moveFocus: TvAddonMoveFocus?,
+    moveFocusSequence: Int,
 ) {
     val colors = VortXTheme.colors
+    val upFocus = remember(addon.transportUrl) { FocusRequester() }
+    val downFocus = remember(addon.transportUrl) { FocusRequester() }
+    LaunchedEffect(moveFocusSequence, moveFocus) {
+        if (moveFocus?.transportUrl == addon.transportUrl) {
+            withFrameNanos { }
+            runCatching {
+                when (moveFocus.direction) {
+                    TvAddonMoveDirection.UP -> upFocus.requestFocus()
+                    TvAddonMoveDirection.DOWN -> downFocus.requestFocus()
+                }
+            }
+        }
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
@@ -261,6 +330,20 @@ private fun TvAddonRow(
                 modifier = Modifier.width(200.dp),
             )
         }
+        TvAddonAction(
+            label = "Move up",
+            onClick = onMoveUp,
+            modifier = Modifier.width(150.dp),
+            focusRequester = upFocus,
+            enabled = canMoveUp,
+        )
+        TvAddonAction(
+            label = "Move down",
+            onClick = onMoveDown,
+            modifier = Modifier.width(170.dp),
+            focusRequester = downFocus,
+            enabled = canMoveDown,
+        )
     }
 }
 
@@ -271,19 +354,23 @@ private fun TvAddonAction(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     focusRequester: FocusRequester? = null,
+    enabled: Boolean = true,
 ) {
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.then(
             if (focusRequester == null) Modifier else Modifier.focusRequester(focusRequester),
         ),
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.surface1,
-            contentColor = colors.textPrimary,
+            contentColor = if (enabled) colors.textPrimary else colors.textTertiary,
             focusedContainerColor = colors.accent,
             focusedContentColor = colors.onAccent,
+            disabledContainerColor = colors.surface1,
+            disabledContentColor = colors.textTertiary,
         ),
         scale = ClickableSurfaceDefaults.scale(focusedScale = 1.03f),
         border = ClickableSurfaceDefaults.border(

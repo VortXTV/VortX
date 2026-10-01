@@ -17,6 +17,43 @@ import java.util.Date
 class SettingsBackupInteropTest {
 
     @Test
+    fun homeRailsPreserveOrderedAppleArraysThroughAccountAndFileBackup() {
+        val order = listOf("addon:second", "continue", "future:unknown", "addon:first")
+        val values = mapOf<String, Any>(
+            "vortx.home.railOrder" to JSONArray(order).toString(),
+            "vortx.home.railHidden" to setOf("addon:hidden", "future:hidden"),
+            "vortx.home.layout" to "wall",
+        )
+        val native = SettingsBackup.plistSettingsFrom(values)
+        assertEquals(order, native["vortx.home.railOrder"])
+        assertEquals(listOf("addon:hidden", "future:hidden"), native["vortx.home.railHidden"])
+        val apple = SettingsBackup.settingsFromBlob(blobFromDomain(native))!!
+        assertEquals(SettingsBackup.BackupValue.Str(JSONArray(order).toString()), apple["vortx.home.railOrder"])
+        assertEquals(SettingsBackup.BackupValue.StrSet(setOf("addon:hidden", "future:hidden")), apple["vortx.home.railHidden"])
+        assertEquals(SettingsBackup.BackupValue.Str("wall"), apple["vortx.home.layout"])
+        val backup = SettingsBackup.makeBackup(values, "com.vortx.android", now = Date(0))!!
+        assertEquals(order, SettingsBackup.decodeDomain(backup)!!["vortx.home.railOrder"])
+        assertEquals(apple, SettingsBackup.restoreValues(backup))
+        val appleBackup = SettingsBackup.encode(native, "com.vortx.apple", "VortX", now = Date(0))!!
+        assertEquals(apple, SettingsBackup.restoreValues(appleBackup))
+        val legacy = SettingsBackup.encode(mapOf("vortx.home.railOrder" to JSONArray(order).toString()), "com.vortx.android", "VortX")!!
+        assertEquals(apple["vortx.home.railOrder"], SettingsBackup.restoreValues(legacy)!!["vortx.home.railOrder"])
+    }
+
+    @Test
+    fun malformedRailArraysNeverOverwriteLocalLayoutAndCatalogOrderRemainsProfileScoped() {
+        assertFalse(SettingsBackup.plistSettingsFrom(mapOf("vortx.home.railOrder" to "[\"continue\",7]"))
+            .containsKey("vortx.home.railOrder"))
+        val invalid = mapOf<String, Any>("vortx.home.railOrder" to listOf("continue", 7L),
+            "vortx.home.railHidden" to listOf("continue", false))
+        assertTrue(SettingsBackup.settingsFromBlob(blobFromDomain(invalid))!!.isEmpty())
+        val backup = SettingsBackup.encode(invalid, "com.vortx.apple", "VortX")!!
+        assertFalse(SettingsBackup.restoreValues(backup)!!.containsKey("vortx.home.railOrder"))
+        assertFalse(SettingsBackup.restoreValues(backup)!!.containsKey("vortx.home.railHidden"))
+        assertFalse(SettingsBackup.SYNCABLE_SETTING_TYPES.containsKey("stremiox.catalog.order"))
+    }
+
+    @Test
     fun autoSkipDelayAndLegacyFlagRoundTripWithTheirExactTypes() {
         val values = mapOf<String, Any>(
             "stremiox.autoSkipDelaySeconds" to 15,

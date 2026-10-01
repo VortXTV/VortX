@@ -359,7 +359,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     fun reconcileUseAccount() = resolveReconcile { sync.useAccountData() }
 
     /// Keep this device's data (a push; still merged into the pulled doc, never a blind overwrite).
-    fun reconcileKeepDevice() = resolveReconcile { sync.pushThisDevice() }
+    fun reconcileKeepDevice() = resolveReconcile { sync.importThisDeviceLibraryAndPush() }
 
     private fun resolveReconcile(action: suspend () -> Unit) {
         _showReconcile.value = false

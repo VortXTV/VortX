@@ -817,6 +817,7 @@ final class VortXSyncManager: ObservableObject {
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
         OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
+        OwnerHistoryStore.bind(ownerID: scope.keychainOwnerID)
         OwnerWatchedIntentStore.bind(ownerID: scope.keychainOwnerID)
         NotificationCenter.default.post(
             name: Self.credentialScopeDidChangeNote,
@@ -838,6 +839,7 @@ final class VortXSyncManager: ObservableObject {
         ApiKeys.shared.bind(owner: scope)
         DebridKeys.shared.bind(owner: scope)
         OwnerResumeStore.bind(ownerID: scope.keychainOwnerID)
+        OwnerHistoryStore.bind(ownerID: scope.keychainOwnerID)
         OwnerWatchedIntentStore.bind(ownerID: scope.keychainOwnerID)
         NotificationCenter.default.post(
             name: Self.credentialScopeDidChangeNote,
@@ -1716,6 +1718,17 @@ final class VortXSyncManager: ObservableObject {
             bucket["removed"] = removed
             byProfile[p.id.uuidString] = bucket
         }
+        // Playback history is deliberately separate from the owner library.  The engine manufactures
+        // temporary/removed rows for an unsaved first play and initializes ordinary adds with a synthetic
+        // `lastWatched`, so neither kind of native membership state may author this carrier.  Android uses
+        // this fixed owner bucket too; keep all unknown sibling fields while replacing only our array.
+        let ownerHistoryProfileID = "00000000-0000-0000-0000-00000000A11C"
+        var ownerHistoryBucket = byProfile[ownerHistoryProfileID] as? [String: Any] ?? [:]
+        let priorOwnerHistory = ownerHistoryBucket["ownerHistory"]
+        if let mergedOwnerHistory = OwnerHistoryStore.wire(merging: priorOwnerHistory) {
+            ownerHistoryBucket["ownerHistory"] = mergedOwnerHistory
+            byProfile[ownerHistoryProfileID] = ownerHistoryBucket
+        }
         // The owner/main profile's library lives in the account (not a watch overlay), so it was absent
         // from the dashboard, which only received the byProfile overlay libraries above. Emit it as
         // vortx.library from the engine's account library so the dashboard's main-profile Library is
@@ -2580,6 +2593,13 @@ final class VortXSyncManager: ObservableObject {
         // account truth without a cold relaunch. Runs after the tombstone fold above so a removed title is
         // excluded. Inside the withRemoteApplySuppressed region, so the cache write does not arm a self-echo push.
         OwnerResumeStore.recordReadds(libraryAdvance.readdedAddedAt)
+        // Read only the stable owner bucket.  A missing/malformed sibling section cannot erase the
+        // local cache; mergeWire accepts only a bounded array and preserves unknown peer rows on export.
+        let ownerHistoryProfileID = "00000000-0000-0000-0000-00000000A11C"
+        if let history = ((doc["vortx"] as? [String: Any])?["byProfile"] as? [String: Any])?[ownerHistoryProfileID] as? [String: Any],
+           OwnerHistoryStore.mergeWire(history["ownerHistory"], capture: capture) {
+            restored = true
+        }
         refreshOwnerResumeCache(from: doc)
         // Owner watched intents are an account-scoped LWW carrier, deliberately separate from raw
         // engine library JSON. Apply while remote suppression is active so this read cannot echo-push;
@@ -2843,6 +2863,15 @@ final class VortXSyncManager: ObservableObject {
         // which would otherwise be stale on a fresh device. Suppressed so these UserDefaults writes do not
         // self-arm a push.
         withRemoteApplySuppressed { foldDocTombstones(doc) }
+        // Cold hydration does not necessarily run syncDown first.  Fold the owner-history array here
+        // under the same remote-apply suppression, so a VortX-only reinstall can render/resume a real
+        // unsaved playback immediately without treating it as a library add.
+        let ownerHistoryProfileID = "00000000-0000-0000-0000-00000000A11C"
+        withRemoteApplySuppressed {
+            _ = OwnerHistoryStore.mergeWire(
+                (((coldVortx?["byProfile"] as? [String: Any])?[ownerHistoryProfileID] as? [String: Any])?["ownerHistory"]),
+                capture: capture)
+        }
         let owned = Self.ownedAddons(from: doc)
         if !owned.isEmpty {
             CoreBridge.shared.hydrateAddonsFromAccount(owned)
@@ -2937,7 +2966,7 @@ final class VortXSyncManager: ObservableObject {
         guard let vortx = doc["vortx"] as? [String: Any] else { return }
         // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
         let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
-        guard !ownedLibrary.isEmpty else { return }
+        guard !ownedLibrary.isEmpty || !OwnerHistoryStore.validRows().isEmpty else { return }
         // SKIP any id the user removed (the library analogue of ownedAddons(from:) excluding AddonTombstones):
         // a cold/empty engine must not RE-ADD a title the user explicitly removed, which was the exact
         // resurrection path. The doc's deletedLibrary/deletedLibraryTs were folded into this local set on
@@ -3203,9 +3232,9 @@ final class VortXSyncManager: ObservableObject {
     private func refreshOwnerResumeCache(from doc: [String: Any]) {
         let vortx = doc["vortx"] as? [String: Any]
         let ownedLibrary = (vortx?["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
-        guard !ownedLibrary.isEmpty else { return }
+        guard !ownedLibrary.isEmpty || !OwnerHistoryStore.validRows().isEmpty else { return }
         let removed = LibraryTombstones.all()
-        let entries: [(id: String, t: Double, d: Double, v: String?, lastWatched: String?)] = ownedLibrary.compactMap { item in
+        var entries: [(id: String, t: Double, d: Double, v: String?, lastWatched: String?)] = ownedLibrary.compactMap { item in
             guard let id = item["id"] as? String, !id.isEmpty,
                   !removed.contains(LibraryTombstones.normalize(id)) else { return nil }
             return (id: id,
@@ -3214,7 +3243,26 @@ final class VortXSyncManager: ObservableObject {
                     v: item["v"] as? String,
                     lastWatched: item["lastWatched"] as? String)
         }
+        // Membership-neutral history gives a cold device a usable resume/CW observation without
+        // calling AddToLibrary.  It is not filtered through LibraryTombstones: a library removal says
+        // nothing about a genuine prior playback event.
+        entries += OwnerHistoryStore.validRows().compactMap { item in
+            guard let id = item["id"] as? String,
+                  let t = Self.historySeconds(item["t"]),
+                  let d = Self.historySeconds(item["d"]), d > 0,
+                  let v = item["v"] as? String,
+                  let lastWatched = item["lastWatched"] as? String else { return nil }
+            return (id: id, t: t, d: d, v: v, lastWatched: lastWatched)
+        }
         OwnerResumeStore.merge(entries)
+    }
+
+    private static func historySeconds(_ raw: Any?) -> Double? {
+        guard let value = raw as? NSNumber,
+              CFGetTypeID(value) != CFBooleanGetTypeID(),
+              value.doubleValue.isFinite, value.doubleValue >= 0,
+              value.doubleValue <= 2_000_000 else { return nil }
+        return value.doubleValue
     }
 
     /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an

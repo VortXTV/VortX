@@ -11,7 +11,14 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.ArrayBlockingQueue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 /**
  * One ordered, append-only NZB title plus its loopback HTTP representation.  A player may request any
@@ -21,28 +28,52 @@ import kotlinx.coroutines.Job
  */
 internal class UsenetProgressiveSession(
     val file: File,
-    private val declaredBytes: Long,
     internal val mediaType: String = "video/x-matroska",
     private val allocation: UsenetCachePolicy.Allocation? = null,
 ) : AutoCloseable {
     private val monitor = Object()
+    /** Null until the first validated yEnc part admits a stable, authoritative whole-file total. */
+    private var totalBytes: Long? = null
     private var availableBytes = 0L
     private var completed = false
     private var failure: Throwable? = null
+    /** Completes after a real ordered prefix is committed, or terminally when that cannot happen. */
+    private val initialPrefix = CompletableDeferred<Unit>()
     @Volatile private var closed = false
     @Volatile private var producer: Job? = null
+    // The long-running producer belongs to this session and is cancelled on every stale/drop/close path.
+    private val producerRoot = SupervisorJob()
     private val id = UUID.randomUUID().toString()
 
-    val url: String get() = UsenetProgressiveLoopback.register(id, this)
+    val url: String
+        get() {
+            check(synchronized(monitor) { totalBytes != null }) { "Usenet total has not been admitted" }
+            return UsenetProgressiveLoopback.register(id, this)
+        }
+
+    /** Must happen before the first committed byte, before a URL can be registered or served. */
+    fun admitTotal(authoritativeBytes: Long) = synchronized(monitor) {
+        if (authoritativeBytes <= 0) return false
+        val existing = totalBytes
+        if (existing != null) return existing == authoritativeBytes
+        if (availableBytes != 0L || !allocationResize(authoritativeBytes)) return false
+        totalBytes = authoritativeBytes
+        true
+    }
 
     fun appendCommitted(bytes: Long) = synchronized(monitor) {
         check(!closed) { "progressive session closed" }
+        require(bytes > 0) { "committed prefix must advance" }
+        check(totalBytes != null && bytes <= totalBytes!! - availableBytes) { "committed bytes exceed admitted total" }
         availableBytes += bytes
+        initialPrefix.complete(Unit)
         monitor.notifyAll()
     }
 
     fun finish() = synchronized(monitor) {
+        check(totalBytes != null && availableBytes == totalBytes) { "cannot finish incomplete Usenet coverage" }
         completed = true
+        if (availableBytes == 0L) initialPrefix.completeExceptionally(IOException("Usenet produced no playable bytes"))
         allocation?.complete()
         monitor.notifyAll()
     }
@@ -50,12 +81,23 @@ internal class UsenetProgressiveSession(
     fun fail(error: Throwable) = synchronized(monitor) {
         failure = error
         completed = true
+        initialPrefix.completeExceptionally(error)
         monitor.notifyAll()
         allocation?.abandon()
         UsenetProgressiveLoopback.unregister(id)
     }
 
     internal fun attachProducer(job: Job) { producer = job }
+
+    internal fun launchProducer(block: suspend () -> Unit) {
+        attachProducer(CoroutineScope(producerRoot + Dispatchers.IO).launch { block() })
+    }
+
+    /** A prefix proves the loopback URL is usable without waiting for the complete title download. */
+    suspend fun awaitUsablePrefix(timeoutMs: Long) {
+        require(timeoutMs > 0) { "timeout must be positive" }
+        withTimeout(timeoutMs) { initialPrefix.await() }
+    }
 
     /** Serve exactly the requested bytes, pausing at the append frontier without preloading title data. */
     internal fun copyRange(start: Long, end: Long, output: java.io.OutputStream) {
@@ -91,6 +133,7 @@ internal class UsenetProgressiveSession(
         val delete = synchronized(monitor) {
             if (closed) return
             closed = true
+            initialPrefix.cancel(CancellationException("Usenet session closed"))
             monitor.notifyAll()
             !completed
         }
@@ -98,11 +141,14 @@ internal class UsenetProgressiveSession(
         // Cancelling the assembly job starts each NNTP transport's cancellation hook, which closes its
         // currently published socket instead of leaving a background download behind after player teardown.
         producer?.cancel()
+        producerRoot.cancel()
         allocation?.abandon()
         if (delete) file.delete()
     }
 
-    internal fun totalBytes(): Long = declaredBytes
+    internal fun totalBytes(): Long = synchronized(monitor) { checkNotNull(totalBytes) }
+
+    private fun allocationResize(total: Long): Boolean = allocation?.resize(total) ?: true
 }
 
 /** One private 127.0.0.1 listener shared by progressive NZB sessions. */
@@ -112,14 +158,28 @@ internal object UsenetProgressiveLoopback {
     private val lock = Any()
     @Volatile private var server: ServerSocket? = null
     @Volatile private var port = 0
+    /** Test-only seam for proving registration cleanup when loopback binding is unavailable. */
+    @Volatile internal var bindPortOverrideForTest: (() -> Int?)? = null
 
     fun register(id: String, session: UsenetProgressiveSession): String {
         sessions[id] = session
-        val boundPort = ensureListening() ?: throw IOException("Usenet loopback unavailable")
+        val boundPort = try {
+            val override = bindPortOverrideForTest
+            if (override != null) override() else ensureListening()
+        } catch (error: Throwable) {
+            sessions.remove(id, session)
+            throw error
+        }
+        if (boundPort == null) {
+            sessions.remove(id, session)
+            throw IOException("Usenet loopback unavailable")
+        }
         return "http://127.0.0.1:$boundPort/nzb/$id"
     }
 
     fun unregister(id: String) { sessions.remove(id) }
+
+    internal fun activeSessionCountForTest(): Int = sessions.size
 
     private fun ensureListening(): Int? = synchronized(lock) {
         server?.takeIf { !it.isClosed && port != 0 }?.let { return port }

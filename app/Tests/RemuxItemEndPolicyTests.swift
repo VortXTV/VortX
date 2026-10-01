@@ -478,7 +478,7 @@ enum RemuxItemEndPolicyTests {
                 && containsInOrder(tvSurface, [
                     "private func reloadAtPlayhead()",
                     "let recoveryToken = coordinator.player is AVPlayerEngineController",
-                    "reusing: recoveryToken, resumeOrigin: currentTime",
+                    "reusing: recoveryToken, resumeOrigin: recoveryOrigin",
                 ]))
         let readyHandler = sourceSection(
             engine,

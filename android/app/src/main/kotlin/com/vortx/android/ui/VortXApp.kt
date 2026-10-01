@@ -76,6 +76,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamSource
 import com.vortx.android.player.AutoAddLibrarySetting
 import com.vortx.android.player.BadSourceAutoRetrySetting
@@ -133,6 +134,8 @@ import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.ui.screens.SourcesSettingsScreen
+import com.vortx.android.ui.screens.ConfiguredUsenetServersSettingsScreen
+import com.vortx.android.ui.screens.ConfiguredNzbIndexerSettingsScreen
 import com.vortx.android.ui.screens.UnifiedSignInScreen
 import com.vortx.android.ui.screens.WhatsNewScreen
 import com.vortx.android.ui.screens.WhosWatchingScreen
@@ -169,7 +172,15 @@ internal fun detailViewModelKey(
     typeId: String,
     mediaId: String,
     ownerEpoch: String,
-): String = "$prefix-$typeId-$mediaId-$ownerEpoch"
+    preferredEpisode: PreferredEpisode? = null,
+): String = "$prefix-$typeId-$mediaId-$ownerEpoch-episode-${detailEpisodeRouteKey(preferredEpisode)}"
+
+/** Makes a route hint part of the ViewModel lifetime without parsing display-only captions. */
+internal fun detailEpisodeRouteKey(preferredEpisode: PreferredEpisode?): String {
+    val hint = preferredEpisode ?: return "none"
+    val identity = hint.videoIdentity.orEmpty()
+    return "${hint.season}:${hint.episode}:${identity.length}:$identity"
+}
 
 private enum class Tab(
     val label: String,
@@ -265,10 +276,30 @@ fun VortXApp(
         // WHY audit R02: save only the stable route strings, then rehydrate through the deep-link target hook.
         var savedDetailId by rememberSaveable { mutableStateOf<String?>(null) }
         var savedDetailType by rememberSaveable { mutableStateOf<String?>(null) }
-        val detail = remember(savedDetailId, savedDetailType) {
+        var savedDetailEpisodeSeason by rememberSaveable { mutableStateOf<Int?>(null) }
+        var savedDetailEpisodeNumber by rememberSaveable { mutableStateOf<Int?>(null) }
+        var savedDetailEpisodeIdentity by rememberSaveable { mutableStateOf<String?>(null) }
+        val savedDetailPreferredEpisode = remember(
+            savedDetailEpisodeSeason,
+            savedDetailEpisodeNumber,
+            savedDetailEpisodeIdentity,
+        ) {
+            if (savedDetailEpisodeSeason != null && savedDetailEpisodeNumber != null) {
+                PreferredEpisode(
+                    season = savedDetailEpisodeSeason!!,
+                    episode = savedDetailEpisodeNumber!!,
+                    videoIdentity = savedDetailEpisodeIdentity,
+                )
+            } else {
+                null
+            }
+        }
+        val detail = remember(savedDetailId, savedDetailType, savedDetailPreferredEpisode) {
             val restoredType = MediaType.entries.firstOrNull { it.id == savedDetailType }
             if (restoredType != null && !savedDetailId.isNullOrEmpty()) {
-                VortXDeepLink(restoredType, savedDetailId!!).toMetaItem()
+                VortXDeepLink(restoredType, savedDetailId!!).toMetaItem().copy(
+                    preferredEpisode = savedDetailPreferredEpisode,
+                )
             } else {
                 null
             }
@@ -276,6 +307,9 @@ fun VortXApp(
         val openDetail: (MetaItem?) -> Unit = { item ->
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
+            savedDetailEpisodeSeason = item?.preferredEpisode?.season
+            savedDetailEpisodeNumber = item?.preferredEpisode?.episode
+            savedDetailEpisodeIdentity = item?.preferredEpisode?.videoIdentity
         }
         var detailGeneration by remember { mutableStateOf(0L) }
         var pendingDirectResumeId by remember { mutableStateOf<String?>(null) }
@@ -299,7 +333,9 @@ fun VortXApp(
         // holder so bumping it never itself recomposes.
         val autoAdvanceStreak = remember { intArrayOf(0) }
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
-            detail?.let { "${it.type}:${it.id}:$detailSourceEpoch" } ?: "no-detail:$detailSourceEpoch",
+            detail?.let {
+                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch"
+            } ?: "no-detail:$detailSourceEpoch",
         )
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
         // the Android analogue of Apple's `curMeta` (`PlaybackMeta`): [Playable] itself carries only the
@@ -325,6 +361,8 @@ fun VortXApp(
         var showDownloadQueue by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
+        var showUsenetServers by remember { mutableStateOf(false) }
+        var showNzbIndexers by remember { mutableStateOf(false) }
         var showMetadataKeys by remember { mutableStateOf(false) }
         var showPosterStyle by remember { mutableStateOf(false) }
         var showHomeDiscover by remember { mutableStateOf(false) }
@@ -382,6 +420,8 @@ fun VortXApp(
             showDownloadQueue = false
             showPlayback = false
             showSources = false
+            showUsenetServers = false
+            showNzbIndexers = false
             showMetadataKeys = false
             showPosterStyle = false
             showHomeDiscover = false
@@ -593,10 +633,16 @@ fun VortXApp(
                             typeId = showForNext.type.id,
                             mediaId = showForNext.id,
                             ownerEpoch = detailSourceEpoch,
+                            preferredEpisode = showForNext.preferredEpisode,
                         ),
                         factory = StremioXViewModelFactory(
                             repo = repo,
-                            detailArgs = StremioXViewModelFactory.DetailArgs(showForNext.type, showForNext.id),
+                            detailArgs = StremioXViewModelFactory.DetailArgs(
+                                showForNext.type,
+                                showForNext.id,
+                                showForNext.name,
+                                showForNext.preferredEpisode,
+                            ),
                             appContext = appContext,
                         ),
                     )
@@ -1028,6 +1074,18 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showUsenetServers) {
+            BackHandler { showUsenetServers = false }
+            ConfiguredUsenetServersSettingsScreen(onBack = { showUsenetServers = false })
+            return@VortXTheme
+        }
+
+        if (showNzbIndexers) {
+            BackHandler { showNzbIndexers = false }
+            ConfiguredNzbIndexerSettingsScreen(onBack = { showNzbIndexers = false })
+            return@VortXTheme
+        }
+
         if (showSources) {
             // Settings > Sources: source ranking + filters. Self-contained for the same reason as Playback:
             // it drives `SourcePreferencesStore`, which is the same `vortx_settings` file, and the ranker
@@ -1167,10 +1225,16 @@ fun VortXApp(
                         typeId = current.type.id,
                         mediaId = current.id,
                         ownerEpoch = detailSourceEpoch,
+                        preferredEpisode = current.preferredEpisode,
                     ),
                     factory = StremioXViewModelFactory(
                         repo = repo,
-                        detailArgs = StremioXViewModelFactory.DetailArgs(current.type, current.id),
+                        detailArgs = StremioXViewModelFactory.DetailArgs(
+                            current.type,
+                            current.id,
+                            current.name,
+                            current.preferredEpisode,
+                        ),
                         appContext = appContext,
                     ),
                 )
@@ -1355,6 +1419,8 @@ fun VortXApp(
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
+                    onUsenetServersClick = { showUsenetServers = true },
+                    onNzbIndexersClick = { showNzbIndexers = true },
                     onMetadataKeysClick = { showMetadataKeys = true },
                     onPosterStyleClick = { showPosterStyle = true },
                     onHomeDiscoverClick = { showHomeDiscover = true },

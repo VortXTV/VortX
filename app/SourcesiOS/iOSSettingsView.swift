@@ -201,9 +201,17 @@ struct iOSSettingsView: View {
     @State private var libraryDocument: BackupDocument?
     // Clear Continue Watching (Advanced): a durable, tombstoned bulk clear needs an explicit confirm.
     @State private var showClearCWConfirm = false
+    #if os(macOS)
+    /// The Mac keeps the exact same setting bindings, but scopes the dense desktop form to a real
+    /// category so it is navigable rather than a single tall, narrow scrolling column.
+    @State private var macSettingsCategory: MacSettingsCategory = .profile
+    #endif
 
     var body: some View {
         NavigationStack {
+            #if os(macOS)
+            macSettingsShell
+            #else
             Form {
                 // Phase-0 seeding banner for the com.vortx move (see MoveSeeding): pinned above the search
                 // field, ungated by the settings filter so the move state is ALWAYS inspectable here. Not
@@ -247,6 +255,8 @@ struct iOSSettingsView: View {
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            #endif
+        }
             // The whole Form follows the app accent (#49): toggles, segmented selections, picker
             // checkmarks, stepper +/- glyphs, navigation chevrons, and any selected row tint inherit
             // this instead of the system blue/grey, matching how tvOS SettingsView colors its
@@ -412,7 +422,6 @@ struct iOSSettingsView: View {
             .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
                 SettingsChangeLog.logChanges()
             }
-        }
     }
 
     // MARK: Settings search
@@ -477,6 +486,125 @@ struct iOSSettingsView: View {
         }
         .listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
     }
+
+    #if os(macOS)
+    /// A compact desktop workspace around the existing sections. This is intentionally a custom HStack,
+    /// not a second Settings scene: every control below keeps the same state and presentation owner.
+    private var macSettingsShell: some View {
+        HStack(spacing: 0) {
+            macSettingsCategoryRail
+            Rectangle()
+                .fill(Theme.Palette.hairline)
+                .frame(width: 1)
+                .accessibilityHidden(true)
+            Form {
+                seedingSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+                searchSection
+                if isSearching && !hasAnySettingsMatch {
+                    noSettingsMatchRow
+                } else {
+                    ForEach(macVisibleSettingsSections, id: \.title) { section in
+                        macSettingsSection(section)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.Palette.canvas.ignoresSafeArea())
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+    }
+
+    private var macSettingsCategoryRail: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("SETTINGS")
+                    .font(.caption2.weight(.bold))
+                    .tracking(1.2)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                Text("\(macSettingsCategory.title)")
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.top, Theme.Space.md)
+
+            VStack(spacing: 4) {
+                ForEach(MacSettingsCategory.allCases) { category in
+                    Button {
+                        macSettingsCategory = category
+                        settingsQuery = ""
+                    } label: {
+                        HStack(spacing: Theme.Space.sm) {
+                            Image(systemName: category.symbol)
+                                .frame(width: 18)
+                            Text(category.title)
+                                .font(.system(size: 14, weight: macSettingsCategory == category ? .semibold : .medium))
+                            Spacer(minLength: 0)
+                        }
+                        .foregroundStyle(macSettingsCategory == category ? Theme.Palette.accent : Theme.Palette.textSecondary)
+                        .padding(.horizontal, Theme.Space.sm)
+                        .frame(minHeight: 36)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background {
+                            RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                                .fill(macSettingsCategory == category ? VortXGlass.activeFill : .clear)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(category.title)
+                    .accessibilityAddTraits(macSettingsCategory == category ? [.isSelected] : [])
+                }
+            }
+            .padding(.horizontal, Theme.Space.sm)
+
+            Spacer(minLength: Theme.Space.md)
+            Text("Search shows matching controls across every category.")
+                .font(.caption2)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.bottom, Theme.Space.md)
+        }
+        .frame(minWidth: 200, idealWidth: 224, maxWidth: 248, maxHeight: .infinity, alignment: .leading)
+        .background(Theme.Palette.surface1.opacity(0.72))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings categories")
+    }
+
+    private var macVisibleSettingsSections: [SettingsSearchSection] {
+        if isSearching {
+            return SettingsSearchSection.allCases.filter(sectionMatches)
+        }
+        return macSettingsCategory.sections
+    }
+
+    /// Typed section routing keeps the Form's compiler work bounded and prevents the Mac presentation
+    /// from growing a second copy of any settings control or binding.
+    @ViewBuilder private func macSettingsSection(_ section: SettingsSearchSection) -> some View {
+        switch section {
+        case .profiles: profilesSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .language: languageSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .account: accountSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .stremioMirror: stremioMirrorSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .playback: playbackSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .downloads: downloadsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .notifications: notificationsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .streams: streamsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .community: communitySection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .server: serverSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .tabBar: tabBarSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .appearance: appearanceSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .audioSubtitle: audioSubtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .subtitle: subtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .advanced: advancedSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .backup: backupSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .about: aboutSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .engine: engineSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        }
+    }
+    #endif
 
     // MARK: Profiles
 
@@ -2183,6 +2311,52 @@ private enum SettingsSearchSection: CaseIterable {
         }
     }
 }
+
+#if os(macOS)
+/// Desktop-only grouping for the existing Settings sections. The grouping changes the route a user takes
+/// through the UI, never the section identities or the flat keys they bind.
+private enum MacSettingsCategory: String, CaseIterable, Identifiable {
+    case profile, account, playback, sources, appearance, subtitles, maintenance
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .profile: return "Profile"
+        case .account: return "Account & Sync"
+        case .playback: return "Playback"
+        case .sources: return "Sources & Server"
+        case .appearance: return "Appearance"
+        case .subtitles: return "Audio & Subtitles"
+        case .maintenance: return "Advanced"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .profile: return "person.crop.circle"
+        case .account: return "person.badge.key"
+        case .playback: return "play.circle"
+        case .sources: return "dot.radiowaves.left.and.right"
+        case .appearance: return "paintpalette"
+        case .subtitles: return "captions.bubble"
+        case .maintenance: return "wrench.and.screwdriver"
+        }
+    }
+
+    var sections: [SettingsSearchSection] {
+        switch self {
+        case .profile: return [.profiles, .language]
+        case .account: return [.account, .stremioMirror]
+        case .playback: return [.playback, .downloads, .notifications]
+        case .sources: return [.streams, .community, .server]
+        case .appearance: return [.tabBar, .appearance]
+        case .subtitles: return [.audioSubtitle, .subtitle]
+        case .maintenance: return [.advanced, .backup, .about, .engine]
+        }
+    }
+}
+#endif
 
 /// Wraps the backup JSON for SwiftUI's `.fileExporter` / `.fileImporter`. Works on iOS and
 /// macOS; tvOS has no document UI, so file backup lives on the other platforms.

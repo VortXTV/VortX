@@ -22,6 +22,9 @@ enum BecauseYouWatchedDocumentHistory {
         let rawLibrary = (vortx?["library"] as? [[String: Any]])
             ?? (document["library"] as? [[String: Any]])
             ?? []
+        let ownerHistoryProfileID = "00000000-0000-0000-0000-00000000A11C"
+        let rawOwnerHistory = (((vortx?["byProfile"] as? [String: Any])?[ownerHistoryProfileID]
+            as? [String: Any])?["ownerHistory"] as? [[String: Any]]) ?? []
         let tombstones = Set(
             removedIDs
                 .map(normalizedID)
@@ -31,7 +34,15 @@ enum BecauseYouWatchedDocumentHistory {
 
         var seen = Set<String>()
         var library: [CoreCWItem] = []
-        library.reserveCapacity(rawLibrary.count)
+        library.reserveCapacity(rawLibrary.count + rawOwnerHistory.count)
+
+        // History rows come first intentionally: a genuine player event is stronger evidence than an
+        // engine library row, whose initial lastWatched can be construction metadata.  It is accepted
+        // into this recommendation-only snapshot, never into the saved-library model or tombstones.
+        for raw in rawOwnerHistory {
+            guard validOwnerHistoryRow(raw), let item = mapItem(raw), seen.insert(item.id).inserted else { continue }
+            library.append(item)
+        }
 
         for raw in rawLibrary {
             guard let item = mapItem(raw),
@@ -44,6 +55,39 @@ enum BecauseYouWatchedDocumentHistory {
         // Continue Watching; missing/zero counters remain zero and are intentionally not synthesized.
         let continueWatching = library.filter { $0.state.timeOffset > 0 }
         return Snapshot(library: library, continueWatching: continueWatching)
+    }
+
+    /// Map durable local owner-history rows for the live Continue Watching union.  The caller supplies
+    /// only rows admitted by OwnerHistoryStore, keeping this mapper Foundation-testable and ensuring an
+    /// opaque/malformed peer row cannot become playback UI state.
+    static func ownerHistoryItems(from rows: [[String: Any]]) -> [CoreCWItem] {
+        var seen = Set<String>()
+        return rows.compactMap { raw in
+            guard let item = mapItem(raw), item.state.timeOffset > 0,
+                  item.state.duration > 0, seen.insert(item.id).inserted else { return nil }
+            return item
+        }
+    }
+
+    /// A document is untrusted at this layer.  Validate the owner-history causal tuple separately
+    /// from normal library rows so a peer's partial/future schema cannot become local CW evidence.
+    private static func validOwnerHistoryRow(_ raw: [String: Any]) -> Bool {
+        guard let id = raw["id"] as? String, !id.isEmpty,
+              let type = raw["type"] as? String, type == "movie" || type == "series",
+              let video = raw["v"] as? String, !video.isEmpty,
+              let event = nonnegativeFiniteSeconds(raw["eventEpochMs"]),
+              event > 0, event.rounded(.towardZero) == event,
+              event <= 9_007_199_254_740_991,
+              let lastWatched = raw["lastWatched"] as? String, isoMillis(lastWatched) > 0 else { return false }
+        if let watched = raw["watched"], !isNull(watched), !(watched is String) { return false }
+        for key in ["currentVideoWatched", "wholeTitleWatched"]
+        where raw[key].map({ !isNull($0) }) == true {
+            guard let value = raw[key] as? NSNumber,
+                  CFGetTypeID(value) == CFBooleanGetTypeID() else { return false }
+        }
+        if let timesWatched = raw["timesWatched"], !isNull(timesWatched),
+           !isUnsigned32(timesWatched) { return false }
+        return true
     }
 
     private static func mapItem(_ raw: [String: Any]) -> CoreCWItem? {
@@ -114,5 +158,21 @@ enum BecauseYouWatchedDocumentHistory {
         }
         guard value.isFinite, value >= 0, value <= Double.greatestFiniteMagnitude / 1000 else { return nil }
         return value
+    }
+
+    private static func isUnsigned32(_ raw: Any) -> Bool {
+        guard let value = nonnegativeFiniteSeconds(raw),
+              value.rounded(.towardZero) == value else { return false }
+        return value <= Double(UInt32.max)
+    }
+
+    private static func isNull(_ raw: Any) -> Bool { raw is NSNull }
+
+    private static func isoMillis(_ value: String) -> Double {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return (fractional.date(from: value) ?? plain.date(from: value))?.timeIntervalSince1970 ?? 0
     }
 }

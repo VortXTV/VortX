@@ -559,6 +559,9 @@ struct TVPlayerView: View {
     @State private var avWatchdogArmedAt: Date?
     @State private var loadTimeout: Task<Void, Never>?
     @State private var playbackDeadlineClock = PlaybackActiveTimeClock()
+    @State private var recoveryPauseOwner: PlayerLoadToken?
+    @State private var recoveryPauseIntent = false
+    @State private var recoveryPauseTarget: Double = 0
     @State private var playbackIdleTimerOwner = UUID()
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -1749,6 +1752,17 @@ struct TVPlayerView: View {
     }
 
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        if loadToken == recoveryPauseOwner, loadToken == coordinator.player?.activeLoadToken,
+           name == MPVProperty.timePos, recoveryPauseIntent, !appliedResume {
+            maybeResume()
+        }
+        if let loadToken, loadToken == recoveryPauseOwner,
+           loadToken == coordinator.player?.activeLoadToken,
+           name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
+           event.loadToken == loadToken, abs(event.seconds - recoveryPauseTarget) <= 2 {
+            recoveryPauseOwner = nil
+            if recoveryPauseIntent { coordinator.player?.pause() }
+        }
         if let loadToken, loadToken == coordinator.player?.activeLoadToken {
             adoptResumeSurfaceIfCurrent(loadToken: loadToken)
             // AV callbacks are generation-fenced by the engine; mpv uses a fresh token per mount.
@@ -4014,6 +4028,8 @@ struct TVPlayerView: View {
                 preparedRemux.abandon(reason: "tvOS admission owner or engine mismatch")
             }
         }
+        let capturedRecoveryPause = (player as? MPVMetalViewController)?.requestedPauseIntent
+            ?? playbackDeadlineClock.isPaused
         let candidateToken: PlayerLoadToken
         // AVFoundation and the remux server consume the raw URL + headers. Only libmpv needs the embedded
         // proxy's server-side header injection and playlist rewriting.
@@ -4052,6 +4068,11 @@ struct TVPlayerView: View {
         }
         if let issuedToken {
             cancelEmptySourceRecovery()
+            // Same-source recovery retains the latest viewer pause across the new file's startup.
+            recoveryPauseIntent = capturedRecoveryPause
+            recoveryPauseTarget = requestedResumeOrigin
+            recoveryPauseOwner = preservingAbandonedResume && recoveryPauseIntent ? issuedToken : nil
+            if recoveryPauseOwner != nil { player.pause() }
             foregroundMountRevalidation.clear()
             clearPostFrameResumeSeekWatchdog()
             abandonedResumeRecovery = DeferredResumeSeekReconciliationPolicy.afterAdmission(
@@ -5978,6 +5999,7 @@ struct TVPlayerView: View {
 
     private func viewerPause() {
         guard coordinator.player != nil else { return }
+        recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
         refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(true)
@@ -5985,6 +6007,7 @@ struct TVPlayerView: View {
     }
 
     private func viewerPlay() {
+        recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         refreshPlaybackIdleTimer()
         updateIncomingPauseIntent(false)
@@ -10537,6 +10560,12 @@ struct TVPlayerView: View {
     /// stored offset is meaningless (and would jump into the past). Mirrors PlayerScreen's live guard.
     private func maybeResume() {
         guard !isCurrentLiveStream else { return }
+        var duration = self.duration
+        if let owner = recoveryPauseOwner, recoveryPauseIntent,
+           let mpv = coordinator.player as? MPVMetalViewController {
+            guard let loadedDuration = mpv.durationForPausedRecovery(owner: owner) else { return }
+            duration = loadedDuration
+        }
         guard !appliedResume, duration > 0, let r = resumeSeconds else { return }
         appliedResume = true
         // One-shot: the marker describes THIS value, and this is the moment it is spent.
@@ -10621,8 +10650,25 @@ struct TVPlayerView: View {
         // cold libmpv pipeline arms the cache-emptying hold and wedges video output (blank + frozen timer). Once
         // the first frame has rendered the pipeline is warm, so applying it there makes it an ordinary scrub,
         // which is proven to render. The start watchdog recovers the case where that first frame never arrives.
-        pendingLibmpvResumeSeek = target
-        startLibmpvResumeWatchdog(target: target)
+        if let owner = recoveryPauseOwner, owner == coordinator.player?.activeLoadToken,
+           recoveryPauseIntent {
+            // A paused replacement cannot generate the advancing first frame used by warm
+            // resume. The no-hold seek restores its parked frame without changing transport.
+            if let mpv = coordinator.player as? MPVMetalViewController {
+                guard mpv.seekForPausedRecovery(to: target, owner: owner) else {
+                    appliedResume = false
+                    resumeIsMidPlayRecovery = midPlayRecovery
+                    return
+                }
+            } else {
+                coordinator.player?.seekForResume(to: target)
+            }
+            recoveryPauseTarget = target
+            pendingLibmpvResumeSeek = nil
+        } else {
+            pendingLibmpvResumeSeek = target
+            startLibmpvResumeWatchdog(target: target)
+        }
         currentTime = target
         lastSaved = target
         inFlightSeekTarget = target   // same guard as commitScrub: pre-resume ticks near 0 must not clobber the resume point

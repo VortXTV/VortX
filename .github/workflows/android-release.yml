@@ -79,7 +79,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/stremiox-core
-          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
+          ref: 31c66611822043e089f5819ad232a5df93975873
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false
@@ -162,22 +162,46 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           apks=(android/app/build/outputs/apk/full/release/*.apk android/app/build/outputs/apk/play/release/*.apk)
-          if [ ${#apks[@]} -ne 2 ]; then
-            echo "::error::expected exactly two release APKs, found ${#apks[@]}"
+          bundles=(android/app/build/outputs/bundle/playRelease/*.aab)
+          if [ ${#apks[@]} -ne 2 ] || [ ${#bundles[@]} -ne 1 ]; then
+            echo "::error::expected exactly two release APKs and one AAB"
             exit 1
           fi
+          READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
+          # Require the complete public Kotlin binding, including the receipt-based history API.
+          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion Java_com_vortx_android_engine_StremioCoreNative_nativeRestoreLibrary Java_com_vortx_android_engine_StremioCoreNative_nativeReadLibraryEvents"
+          syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
           workdir="$(mktemp -d)"
           trap 'rm -rf "$workdir"' EXIT
-          for apk in "${apks[@]}"; do
+          for apk in "${apks[@]}" "${bundles[@]}"; do
+            prefix=lib
+            [[ "$apk" == *.aab ]] && prefix=base/lib
             for abi in arm64-v8a armeabi-v7a x86_64; do
+              case "$abi" in
+                arm64-v8a) elf_class=ELF64; machine=AArch64 ;;
+                armeabi-v7a) elf_class=ELF32; machine=ARM ;;
+                x86_64) elf_class=ELF64; machine='Advanced Micro Devices X86-64' ;;
+              esac
               for lib in libstremiox_core.so libvortx_ffi.so; do
-                entry="lib/$abi/$lib"
+                entry="$prefix/$abi/$lib"
                 out="$workdir/$(basename "$apk").$abi.$lib"
                 unzip -p "$apk" "$entry" > "$out" 2>/dev/null || { echo "::error::$entry missing from $apk"; exit 1; }
                 test -s "$out" || { echo "::error::$entry is empty in $apk"; exit 1; }
                 magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
                 test "$magic" = "7f454c46" || { echo "::error::$entry is not ELF in $apk"; exit 1; }
-                echo "ok: $apk contains non-empty ELF $entry"
+                header="$("$READELF" -h "$out")"
+                grep -Eq "Class:[[:space:]]+$elf_class([[:space:]]|$)" <<<"$header" || { echo "::error::$entry has wrong ELF class"; exit 1; }
+                grep -Eq 'Data:.*little endian' <<<"$header" || { echo "::error::$entry is not little-endian"; exit 1; }
+                grep -Eq 'Type:[[:space:]]+DYN\b' <<<"$header" || { echo "::error::$entry is not a shared object"; exit 1; }
+                grep -Eq "Machine:[[:space:]]+$machine([[:space:]]|$)" <<<"$header" || { echo "::error::$entry has wrong architecture"; exit 1; }
+                symbols="$("$READELF" -W --dyn-syms "$out")"
+                required="$syms_libvortx_ffi"
+                [[ "$lib" == libstremiox_core.so ]] && required="$syms_libstremiox_core"
+                for symbol in $required; do
+                  awk -v required="$symbol" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == required { found=1 } END { exit !found }' <<<"$symbols" || { echo "::error::$entry lacks callable JNI export $symbol"; exit 1; }
+                done
+                echo "ok: $apk contains verified engine ABI and JNI exports for $entry"
               done
             done
           done

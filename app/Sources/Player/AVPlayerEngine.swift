@@ -276,6 +276,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var seekRequestGeneration: UInt64 = 0
     private var preparedSeekTask: Task<Void, Never>?
     private var seekCompletionTimeoutTask: Task<Void, Never>?
+    /// A recovery-position seek shares the normal seek request epoch and HLS admission transaction. This
+    /// ticket records only the recovery origin so a later viewer seek can retire it before AVFoundation calls
+    /// its completion handler.
+    private var recoverySeekSettlement = AVPlayerRecoverySettlementPolicy.RecoverySeekSettlement()
     private weak var registeredSeekServer: VortXRemuxHLSServer?
     private var registeredSeekRequestID: UInt64?
     #if os(tvOS)
@@ -581,8 +585,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// New external subtitle requests supersede every earlier fetch, including a later Off/built-in choice on
     /// the same AVPlayerItem.  Item/token ownership alone cannot distinguish those requests.
     private var externalSubtitleRequestRevision: UInt64 = 0
-    /// A loaded external cue file waits here while AVFoundation is still resolving the item's legible group.
-    private var pendingExternalSubtitleActivation = false
+    /// A loaded external cue file waits here while AVFoundation is still resolving native legible deselection.
+    /// Unlike a Boolean, its generation/mount/revision ownership survives the final bounded retry and lets the
+    /// matching media-selection notification consume the overlay activation exactly once.
+    private var externalSubtitleSettlement = AVPlayerRecoverySettlementPolicy.ExternalSubtitleSettlement()
     /// Label of the loaded external overlay subtitle, so it can be published as a REAL row of `tracks(ofType:
     /// "sub")` instead of being invisible to the chrome. Build 191 field defect: on this engine an add-on /
     /// pooled subtitle rendered over the video while the picker showed "Off" ticked and the row the viewer
@@ -896,6 +902,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func invalidateSeekRequests() {
+        recoverySeekSettlement.supersede()
         _ = supersedeSeekRequest()
     }
 
@@ -919,10 +926,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                   self.seekEndBoundary.requestID == requestID else { return }
             self.seekCompletionTimeoutTask = nil
             // Advance ownership before cancelling AVFoundation: its resulting completion is now stale.
+            let recoveryRepair = self.recoverySeekSettlement.fail(requestID: requestID)
             self.invalidateSeekRequests()
             seekItem?.cancelPendingSeeks()
             DiagnosticsLog.log("avplayer", "seek completion deadline: aborting owned seek and restoring requested target")
-            if !self.remountForSeek(sourceSeconds: sourceSeconds), let loadToken {
+            let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds
+            if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let loadToken {
                 // A direct asset cannot use the remux seek replacement. Expose a failure instead of
                 // leaving the chrome frozen or manufacturing an EOF that would advance the episode.
                 self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: loadToken)
@@ -2494,8 +2503,28 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     func seek(to seconds: Double) {
+        seek(to: seconds, recoveryTicket: nil)
+    }
+
+    /// Recovery uses this exact path rather than a raw AVPlayer seek, so local-HLS preparation, the
+    /// completion deadline, request epoch, and actual-landing publication remain one transaction.
+    private func seek(
+        to seconds: Double,
+        recoveryTicket: AVPlayerRecoverySettlementPolicy.RecoverySeekTicket?
+    ) {
         guard seconds.isFinite else { return }
+        if let recoveryTicket {
+            guard recoverySeekSettlement.owns(recoveryTicket) else { return }
+        } else {
+            // A viewer seek is newer intent than a remount restore, even if the old AVFoundation completion
+            // arrives later. `supersedeSeekRequest` below fences its native work and HLS receipt ownership.
+            recoverySeekSettlement.supersede()
+        }
         let seekRequestID = supersedeSeekRequest()
+        if let recoveryTicket,
+           !recoverySeekSettlement.bind(requestID: seekRequestID, ticket: recoveryTicket) {
+            return
+        }
         eventOwnedRecoveryTask?.cancel()
         eventOwnedRecoveryTask = nil
         deferredEventOwnedRecovery = nil
@@ -2683,15 +2712,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     // An interrupted current seek is not a successful landing. Retire its ownership
                     // before cancelling native work, then recover the requested source position using
                     // the same bounded path as the deadline. Stale callbacks above cannot enter here.
+                    let recoveryRepair = self.recoverySeekSettlement.fail(requestID: requestID)
                     self.invalidateSeekRequests()
                     seekItem?.cancelPendingSeeks()
                     DiagnosticsLog.log("avplayer", "seek completion interrupted: restoring requested target")
-                    if !self.remountForSeek(sourceSeconds: sourceSeconds), let seekLoadToken {
+                    let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds
+                    if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let seekLoadToken {
                         self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: seekLoadToken)
                     }
                     return
                 }
                 self.seekEndBoundary.finish(requestID: requestID)
+                _ = self.recoverySeekSettlement.finish(requestID: requestID)
                 if let preparedServer {
                     self.completeSeekAdmission(
                         requestID: requestID,
@@ -3075,7 +3107,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// Release the position half of a remount as soon as AVPlayer says this item is playable.  Group discovery
     /// is allowed to take arbitrarily long (or never finish for a malformed/remote asset), so it cannot own
     /// the playhead, remux target, or transport gate.  The copied continuation owns selections only.
-    private func releasePendingPlaybackIntentAtReady(for readyItem: AVPlayerItem) {
+    private func releasePendingPlaybackIntentAtReady(for _: AVPlayerItem) {
         guard var intent = pendingPlaybackIntent,
               let restore = intent.consume(
                 generation: itemGeneration,
@@ -3095,24 +3127,23 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         pendingPlaybackIntent = nil
         remuxSeekRemountTarget = nil
 
-        let playerSeconds: Double
-        if isRemuxMounted {
-            let sourceDuration = remuxHLSServer?.sourceDurationSeconds
-                ?? remuxRemoteMount?.sourceDurationSeconds
-                ?? remuxLoader?.sourceDurationSeconds
-            playerSeconds = RemuxResumePolicy.playerSeek(
-                sourceSeconds: restore.sourceSeconds,
-                origin: remuxTimelineOrigin,
-                authoritativeSourceDurationSeconds: sourceDuration,
-                playerDurationSeconds: readyItem.duration.seconds,
-                producedEdgePlayerSeconds: producedEdgeSeconds)
-        } else {
-            playerSeconds = restore.sourceSeconds
-        }
-        player.seek(to: CMTime(seconds: playerSeconds, preferredTimescale: 600), completionHandler: { _ in })
+        // Input-seek admission may accept an origin slightly after the requested source timestamp. A recovery
+        // seek to the old timestamp would then be outside this mounted forward-only HLS window and remount the
+        // same input again. Normalize only this accepted-forward recovery edge; viewer seeks stay strict.
+        let recoverySourceSeconds = AVPlayerRecoverySettlementPolicy.normalizedRecoverySourceSeconds(
+            requestedSourceSeconds: restore.sourceSeconds,
+            achievedOriginSeconds: remuxTimelineOrigin,
+            acceptedForwardLandingTolerance: RemuxResumePolicy.forwardLandingToleranceSeconds)
+        let recoveryTicket = recoverySeekSettlement.issue(
+            sourceSeconds: recoverySourceSeconds,
+            playbackRequested: playbackRequested,
+            generation: itemGeneration,
+            mountIdentity: playbackMountIdentity,
+            revision: seekRequestGeneration &+ 1)
+        seek(to: recoverySourceSeconds, recoveryTicket: recoveryTicket)
         DiagnosticsLog.log(
             "avplayer",
-            "released recovery position at ready generation=\(itemGeneration) mount=\(playbackMountIdentity) sourceTime=\(String(format: "%.3f", restore.sourceSeconds)); selection restoration continues asynchronously")
+            "released recovery position through owned seek transaction generation=\(itemGeneration) mount=\(playbackMountIdentity) requestedSourceTime=\(String(format: "%.3f", restore.sourceSeconds)) seekSourceTime=\(String(format: "%.3f", recoverySourceSeconds)); selection restoration continues asynchronously")
     }
 
     private func sourceAudioMPVTracks() -> [MPVTrack] {
@@ -3283,9 +3314,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let group = subGroup, let item = player.currentItem else {
             // A missing cached group while topology is loading is not evidence that AVFoundation has no native
             // legible selection. Defer overlay activation until group loading has conclusively completed.
-            pendingExternalSubtitleActivation = activatingExternalAfterSettlement
+            if activatingExternalAfterSettlement {
+                externalSubtitleSettlement.request(
+                    generation: itemGeneration,
+                    mountIdentity: playbackMountIdentity,
+                    revision: revision)
+            } else {
+                externalSubtitleSettlement.clear()
+            }
             if !activatingExternalAfterSettlement || selectionTopologyGeneration == itemGeneration {
-                pendingExternalSubtitleActivation = false
+                externalSubtitleSettlement.clear()
                 setExternalSubtitleActive(activatingExternalAfterSettlement)
             } else {
                 setExternalSubtitleActive(false)
@@ -3293,9 +3331,16 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             publishSelectionTracks()
             return
         }
-        pendingExternalSubtitleActivation = false
         let generation = itemGeneration
         let mountIdentity = playbackMountIdentity
+        if activatingExternalAfterSettlement {
+            externalSubtitleSettlement.request(
+                generation: generation,
+                mountIdentity: mountIdentity,
+                revision: revision)
+        } else {
+            externalSubtitleSettlement.clear()
+        }
         setExternalSubtitleActive(false)
         item.select(requested, in: group)
         refreshSelectionTracks(for: item)
@@ -3309,7 +3354,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                   item.currentMediaSelection.selectedMediaOption(in: group) == requested else {
                 return false
             }
-            self.setExternalSubtitleActive(activatingExternalAfterSettlement)
+            if activatingExternalAfterSettlement {
+                guard self.externalSubtitleSettlement.consumeIfNativeDeselected(
+                    generation: generation,
+                    mountIdentity: mountIdentity,
+                    revision: revision,
+                    nativeDeselected: requested == nil) else { return false }
+                self.setExternalSubtitleActive(true)
+            }
             self.refreshSelectionTracks(for: item)
             return true
         }
@@ -3327,7 +3379,14 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                         generation: generation,
                         mountIdentity: mountIdentity) else { return }
                 guard item.currentMediaSelection.selectedMediaOption(in: group) != requested else {
-                    self.setExternalSubtitleActive(activatingExternalAfterSettlement)
+                    if activatingExternalAfterSettlement {
+                        guard self.externalSubtitleSettlement.consumeIfNativeDeselected(
+                            generation: generation,
+                            mountIdentity: mountIdentity,
+                            revision: revision,
+                            nativeDeselected: requested == nil) else { return }
+                        self.setExternalSubtitleActive(true)
+                    }
                     self.refreshSelectionTracks(for: item)
                     return
                 }
@@ -3489,7 +3548,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private func disableExternalSubtitle(discardingCues: Bool = false) {
         // Cancellation is required even when keeping parsed cues for a picker detour: a newer selection may
         // re-activate them, but delayed settlement work from the old one must never do so on its own.
-        pendingExternalSubtitleActivation = false
+        externalSubtitleSettlement.clear()
         externalSubtitleRequestRevision &+= 1
         subtitleSelectionRevision &+= 1
         externalSubActive = false
@@ -4146,6 +4205,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard owns(item, loadToken: loadToken) else { return }
         switch item.status {
         case .readyToPlay:
+            let readyContinuation = AVPlayerRecoverySettlementPolicy.ReadyContinuationOwnership(
+                generation: itemGeneration,
+                mountIdentity: playbackMountIdentity)
             // A recovery item reuses a mount that already crossed its one-time ready edge. Calling the local
             // deadline transition again returns false by design and would strand the fresh item before play.
             remuxRemoteMount?.markEngineReady()
@@ -4248,6 +4310,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // makes the ready item authoritative for all later seek/play/pause calls even if the asset never
             // returns an audible or legible group.
             releasePendingPlaybackIntentAtReady(for: item)
+            // Recovery can synchronously remount when its target is outside the current served HLS window.
+            // Do not let this old ready callback publish topology or `didStart` into that replacement: its own
+            // ready callback must remain the sole owner of those observations.
+            guard readyContinuation.isCurrent(
+                generation: itemGeneration,
+                mountIdentity: playbackMountIdentity),
+                  self.item === item,
+                  player.currentItem === item,
+                  owns(item, loadToken: loadToken) else { return }
             // Publish audio and subtitle topology together after both media-selection groups resolve. An
             // audio-only publication would consume the chrome's one-shot automatic selection before the
             // subtitle rows exist.
@@ -4935,7 +5006,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // arrives after the immediate deselect above could do anything, so explicitly deselect it now.
             // This intentionally runs only for the overlay-active state: native-only selection keeps the
             // framework's current legible choice untouched.
-            if externalSubActive || pendingExternalSubtitleActivation {
+            if externalSubActive || externalSubtitleSettlement.hasPendingIntent {
                 selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
             }
             let sourceBackedAudio = !remuxSourceAudioTracks.isEmpty
@@ -5077,7 +5148,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             // force the newly available option topology to publish once even when both are Off.
             selectionTopologyGeneration = selectionGeneration
             selectionRefreshState.reset()
-            if pendingExternalSubtitleActivation {
+            if externalSubtitleSettlement.hasPendingIntent {
                 // No legible group was ultimately published. It is now safe to activate the external overlay:
                 // this is the resolved-nil case, not the earlier asynchronous group-loading window.
                 selectNativeSubtitle(nil, activatingExternalAfterSettlement: true)
@@ -5153,6 +5224,19 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         guard let changedItem = note.object as? AVPlayerItem,
               changedItem === player.currentItem,
               selectionTopologyGeneration == itemGeneration else { return }
+        if let group = subGroup,
+           externalSubtitleSettlement.consumeIfNativeDeselected(
+                generation: itemGeneration,
+                mountIdentity: playbackMountIdentity,
+                revision: subtitleSelectionRevision,
+                nativeDeselected: changedItem.currentMediaSelection.selectedMediaOption(in: group) == nil) {
+            // The final retry may have issued its last `select(nil)` before AVFoundation settles. Retaining an
+            // identity-owned intent lets this authoritative notification activate the renderer once, without
+            // waiting for another arbitrary retry or rendering while native captions are still selected.
+            setExternalSubtitleActive(true)
+            refreshSelectionTracks(for: changedItem)
+            return
+        }
         if externalSubActive,
            let group = subGroup,
            changedItem.currentMediaSelection.selectedMediaOption(in: group) != nil {
@@ -5165,6 +5249,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func teardownObservers() {
+        externalSubtitleSettlement.clear()
         invalidateNativeSubtitleOverlay()
         remuxSubtitleInventoryRefreshTask?.cancel()
         remuxSubtitleInventoryRefreshTask = nil

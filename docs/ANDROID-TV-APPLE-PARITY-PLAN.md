@@ -1,7 +1,35 @@
 # Android TV: match the Apple TV experience
 
-Status: active implementation and acceptance record. The September 30 follow-up below is current;
+Status: active implementation and acceptance record. The October 1 follow-up below is current;
 older dated sections preserve their historical release boundary, not a claim of completed parity.
+
+## October 1 candidate follow-up
+
+The reviewed source batch after Beta 17 adds direct Newznab indexer configuration/search, prioritized
+saved NNTP servers and local fallback, strict decoded yEnc/cache admission, stale readiness disposal,
+phone Library segments, remote add-on reordering, optional read-only Trakt Continue Watching and
+manual detail check-in. Trakt carries typed episode intent through navigation and owner reloads;
+session/toggle/cache receipts fence final Home publication. Home rail order/hidden/layout settings
+now interoperate with Apple account documents and backups without flattening profile catalog order.
+
+Owner-library reads/restores now have typed native event and receipt contracts. Newer real events can
+converge without synthesizing a viewing timestamp or overwriting progress with metadata; queued
+membership actions capture their owner before dispatch, and library removal stamps are account-scoped.
+The native-row publication provenance gate has passed bounded independent review: exact persisted-row
+proof and original captured operations are required; a shared native UID/null bucket is not ownership.
+Manual watched intent and genuine viewing events use the Apple-compatible owner carriers. Deferred
+remove/re-add preserves proof across invocation leases. Metadata-only membership clocks cannot replace
+a newer real peer resume; conditional native restoration keeps the real viewing and persistence clocks
+separate and rejects changed or unproven state. Earlier unsynced add-on records without an exact-owner
+marker remain quarantined on disk, not transparently migrated into a newly signed-in account.
+
+The shipping Apple add-on lifecycle changes are retained in the shared immutable engine pin. Locked
+native tests and actual Android native compilation/export inspection passed for all three ABIs.
+The integrated Full/Play suites passed 1,492/1,419 tests with no failures, errors or skips. Native
+history/storage tests passed 21 against the pinned dependency without a local override. Exact
+release/LTO packages, production signer/version/feed checks and physical
+remote/provider journeys remain separate gates. Do not turn these source receipts into a numerical
+parity claim or a promise of hardware playback. See [the candidate notes](releases/0.4.0-beta.18.md).
 
 ## September 30 implementation follow-up
 
@@ -40,7 +68,7 @@ Phone and TV now show add-on-declared Prequel, Sequel, and Related rails through
 
 Beta 13 remained an unpublished draft; this follow-up is included in Beta 14. TMDB collection results also supply previous/next movie cards explicitly labeled **Release Order**, using the existing fetch and only valid dated parts. The full collection rail remains unchanged. At that release, custom `anime`/other content-type routing without coercing types to movies was outstanding; the September 30 follow-up now implements those routes. Full visual and remote-navigation acceptance remains below.
 
-Also outstanding: rapid title selection can race asynchronous TMDB-to-IMDb lookups in phone and TV detail navigation. A later selection needs to cancel and supersede the earlier lookup, including direct relation selection; verify reversed completion order and page disposal before shipping that change.
+October 1 follow-up: rapid relation and filmography selections now cancel and supersede asynchronous title lookups. Generation checks reject reversed completions; Back and disposal invalidate pending navigation immediately on both phone and TV. Tests cover those boundaries; physical remote journeys remain separate.
 
 Beta 14 publication follow-up: the signed Android artifacts are public, but the appcast inherits Beta 1 Android entries while the active receipt has Android null. The augmentation workflow currently compares the inherited public appcast against the canonical null-Android receipt and rejects it. Its worker also derives the Android build from the Apple manifest (247), not the actual Android versionCode (237). Correct both with explicit artifact-bound Android version evidence and tests for inherited entries before augmenting the feed; do not weaken receipt, signer, checksum, or rollback checks. Apple feeds and release packages remain independently verifiable.
 
