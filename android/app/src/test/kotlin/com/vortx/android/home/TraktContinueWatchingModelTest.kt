@@ -2,6 +2,7 @@ package com.vortx.android.home
 
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.Catalog
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
