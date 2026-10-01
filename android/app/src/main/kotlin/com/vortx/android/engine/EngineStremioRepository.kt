@@ -39,6 +39,8 @@ import com.vortx.android.model.PlaybackContext
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.model.TrackPreferencesStore
+import com.vortx.android.nzb.NzbIndexerStore
+import com.vortx.android.nzb.NzbSearch
 import com.vortx.android.library.WatchedIndex
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.ContinueWatchingOwnerGate
@@ -52,6 +54,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -77,6 +80,7 @@ import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -801,6 +805,18 @@ class EngineStremioRepository(
             usenetProviderStore = UsenetProviderStore(
                 appContext,
                 debridKeys::ownerToken,
+                debridKeys::mutateCurrentOwner,
+            ),
+        )
+    }
+
+    /** Direct Newznab sources use the same owner token as debrid and the active profile as their second scope. */
+    private val nzbSourceAggregator by lazy {
+        NzbSourceAggregator(
+            NzbIndexerStore(
+                appContext,
+                debridKeys::ownerToken,
+                { ProfileStore.sharedOrNull()?.activeProfileId ?: UserProfile.OWNER_ID },
                 debridKeys::mutateCurrentOwner,
             ),
         )
@@ -2149,6 +2165,12 @@ class EngineStremioRepository(
         runLatestStreamLoad { generation ->
             withContext(Dispatchers.Default) {
                 metaDetailsGate.exclusive {
+        // The current MetaDetails is already resident for both visible detail loads and the one-shot
+        // CatalogRepository.streams() used by NEXT prewarm. Capture an immutable title/episode identity
+        // before dispatching the stream reload; the aggregator additionally fences owner/profile/config
+        // revision before it returns, while this generation fence prevents a superseded request repainting.
+        val nzbSearch = nzbSearchForCurrentDetail(type, id, episodeId)
+        val nzbGroups = nzbSearch?.let { search -> async { nzbSourceAggregator.groups(search) } }
         // Re-find sources: the engine caches this title's stream groups, so the plain Load below is a
         // no-op with ZERO add-on HTTP once they are resident. Unload the MetaDetails model FIRST so the
         // Load re-queries every stream add-on fresh and expired/dead sources are replaced. Default off:
@@ -2238,11 +2260,41 @@ class EngineStremioRepository(
             },
             isCurrent = { streamLoadGate.isCurrent(generation) },
             timeoutMs = loadTimeoutSeconds.seconds.inWholeMilliseconds,
-        ).collect { send(it) }
+        ).collect { update ->
+            send(update)
+            // Do not delay normal add-on first paint on a direct-indexer request. The final update is
+            // appended only after engine fan-out settles; `streams().last()` (including NEXT prewarm)
+            // therefore gets the complete list, and stale/cancelled requests cannot publish this tail.
+            if (update.terminal && nzbGroups != null) {
+                val directGroups = nzbGroups.await()
+                currentCoroutineContext().ensureActive()
+                if (streamLoadGate.isCurrent(generation) && directGroups.isNotEmpty()) {
+                    send(appendNzbGroupsAtTerminal(update, directGroups))
+                }
+            }
+        }
                 }
             }
         }
     }.distinctUntilChanged()
+
+    private fun nzbSearchForCurrentDetail(type: MediaType, id: String, episodeId: String?): NzbSearch? {
+        val state = StremioCoreNative.getState("\"${EngineActions.FIELD_META_DETAILS}\"")
+        val detail = EngineState.parseMetaDetail(state, addonPrefs.appliedOrder()) ?: return null
+        if (detail.id != id || detail.type != type || detail.name.isBlank()) return null
+        return when (type) {
+            MediaType.MOVIE -> NzbSearch(title = detail.name, movieImdbId = nzbImdbId(id), year = detail.releaseInfo?.let(::nzbYear))
+            MediaType.SERIES -> {
+                val episode = episodeId?.let { wanted -> detail.videos.firstOrNull { it.id == wanted } } ?: return null
+                NzbSearch(title = detail.name, seriesImdbId = nzbImdbId(id), season = episode.season, episode = episode.episode)
+            }
+            else -> null
+        }.takeIf { it?.isValid() == true }
+    }
+
+    private fun nzbYear(releaseInfo: String): Int? = Regex("\\b(18|19|20)\\d{2}\\b").find(releaseInfo)?.value?.toIntOrNull()
+
+    private fun nzbImdbId(id: String): String? = id.takeIf { NzbSearch.imdbDigits(it) != NzbSearch.INVALID_IMDB }
 
     override suspend fun streams(
         type: MediaType,
