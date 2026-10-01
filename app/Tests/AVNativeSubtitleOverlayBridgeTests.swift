@@ -49,7 +49,11 @@ enum AVNativeSubtitleOverlayBridgeTests {
         let engine = try String(contentsOfFile: "app/Sources/Player/AVPlayerEngine.swift", encoding: .utf8)
         precondition(engine.contains("self.itemGeneration == generation, !self.externalSubActive"))
         precondition(engine.contains("if active { invalidateNativeSubtitleOverlay() }"))
-        precondition(engine.contains("private func teardownObservers() {\n        invalidateNativeSubtitleOverlay()"))
+        let teardownStart = engine.range(of: "private func teardownObservers() {")!.lowerBound
+        let teardownEnd = engine.range(of: "private func installPlayheadReceiptObserver()")!.lowerBound
+        let teardown = engine[teardownStart..<teardownEnd]
+        precondition(teardown.contains("externalSubtitleSettlement.clear()"))
+        precondition(teardown.contains("invalidateNativeSubtitleOverlay()"))
         precondition(engine.contains("if hadNativeOverlay, !externalSubActive { subtitleOverlay?.setText(nil) }"))
         precondition(engine.contains("$0.delivery == .webVTT"))
         precondition(engine.contains("externalPlayback: player.isExternalPlaybackActive"))
