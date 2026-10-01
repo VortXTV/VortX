@@ -8,6 +8,44 @@ import org.junit.Test
 
 class TvAddonsContractTest {
     @Test
+    fun `TV add-on move policy swaps adjacent URLs and keeps focus enabled`() {
+        assertEquals(
+            TvAddonMoveResult(listOf("b", "a", "c"), TvAddonMoveDirection.DOWN),
+            tvAddonMove(listOf("a", "b", "c"), "b", TvAddonMoveDirection.UP),
+        )
+        assertEquals(
+            TvAddonMoveResult(listOf("a", "c", "b"), TvAddonMoveDirection.UP),
+            tvAddonMove(listOf("a", "b", "c"), "b", TvAddonMoveDirection.DOWN),
+        )
+    }
+
+    @Test
+    fun `TV add-on move policy rejects bounds and stale removed rows while using current membership`() {
+        assertEquals(null, tvAddonMove(listOf("a", "b"), "a", TvAddonMoveDirection.UP))
+        assertEquals(null, tvAddonMove(listOf("a", "b"), "b", TvAddonMoveDirection.DOWN))
+        assertEquals(null, tvAddonMove(listOf("a", "c"), "b", TvAddonMoveDirection.UP))
+        assertEquals(
+            TvAddonMoveResult(listOf("a", "b", "c"), TvAddonMoveDirection.UP),
+            tvAddonMove(listOf("a", "c", "b"), "b", TvAddonMoveDirection.UP),
+        )
+    }
+
+    @Test
+    fun `TV move controls use the shared reorder path and stable URL focus`() {
+        val addons = readProjectFile("src/main/kotlin/com/vortx/android/ui/tv/TvAddonsScreen.kt")
+        val repository = readProjectFile("src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt")
+        assertTrue(addons.contains("latestInstalled.map(InstalledAddon::transportUrl)"))
+        assertTrue(addons.contains("tvAddonMove(latestUrls, transportUrl, direction)"))
+        assertTrue(addons.contains("viewModel.applyOrder(result.order)"))
+        assertTrue(addons.contains("key = InstalledAddon::transportUrl"))
+        assertTrue(addons.contains("FocusRequester()"))
+        assertTrue(addons.contains("enabled = canMoveUp"))
+        assertTrue(addons.contains("enabled = canMoveDown"))
+        assertTrue(repository.contains("addonPrefs.setAppliedOrder(transportUrls)"))
+        assertTrue(repository.contains("changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))"))
+    }
+
+    @Test
     fun `TV settings routes to add-ons and Back restores the settings target`() {
         assertEquals(TvSettingsRoute.ROOT, TvSettingsRoute.ADDONS.back())
         assertEquals(TvAddonsFocusTarget.BACK, tvAddonsFocusTarget(TvAddonsFocusEvent.SCREEN_ENTRY))
