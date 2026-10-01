@@ -304,10 +304,15 @@ jobs:
             echo "::error::pinned NDK llvm-readelf not found/executable at $READELF; refusing to verify APKs with an unpinned readelf"
             exit 1
           fi
-          apks=(android/app/build/outputs/apk/full/debug/*.apk android/app/build/outputs/apk/play/debug/*.apk)
-          if [ ${#apks[@]} -eq 0 ]; then echo "::error::no APKs found to verify engine .so"; exit 1; fi
+          full_apks=(android/app/build/outputs/apk/full/debug/*.apk)
+          play_apks=(android/app/build/outputs/apk/play/debug/*.apk)
+          if [ ${#full_apks[@]} -ne 1 ] || [ ${#play_apks[@]} -ne 1 ]; then
+            echo "::error::expected exactly one Full APK and one Play APK to verify engines"
+            exit 1
+          fi
+          apks=("${full_apks[@]}" "${play_apks[@]}")
           # Required dynamic exports per lib (derivation + source citations in the step comment above).
-          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion"
+          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion Java_com_vortx_android_engine_StremioCoreNative_nativeRestoreLibrary Java_com_vortx_android_engine_StremioCoreNative_nativeReadLibraryEvents"
           syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
           fail=0
           workdir="$(mktemp -d)"
@@ -351,7 +356,7 @@ jobs:
                 syms_var="syms_${lib%.so}"
                 missing=""
                 for sym in ${!syms_var}; do
-                  grep -Eq "[[:space:]]${sym}[[:space:]]*\$" <<<"$dynsyms" || missing="$missing $sym"
+                  awk -v required="$sym" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == required { found=1 } END { exit !found }' <<<"$dynsyms" || missing="$missing $sym"
                 done
                 if [ -n "$missing" ]; then
                   echo "::error::$entry in $apk is missing required JNI export(s):$missing"; fail=1; continue
