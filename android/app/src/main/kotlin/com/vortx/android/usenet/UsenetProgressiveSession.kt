@@ -28,11 +28,12 @@ import kotlinx.coroutines.withTimeout
  */
 internal class UsenetProgressiveSession(
     val file: File,
-    private val declaredBytes: Long,
     internal val mediaType: String = "video/x-matroska",
     private val allocation: UsenetCachePolicy.Allocation? = null,
 ) : AutoCloseable {
     private val monitor = Object()
+    /** Null until the first validated yEnc part admits a stable, authoritative whole-file total. */
+    private var totalBytes: Long? = null
     private var availableBytes = 0L
     private var completed = false
     private var failure: Throwable? = null
@@ -44,17 +45,33 @@ internal class UsenetProgressiveSession(
     private val producerRoot = SupervisorJob()
     private val id = UUID.randomUUID().toString()
 
-    val url: String get() = UsenetProgressiveLoopback.register(id, this)
+    val url: String
+        get() {
+            check(synchronized(monitor) { totalBytes != null }) { "Usenet total has not been admitted" }
+            return UsenetProgressiveLoopback.register(id, this)
+        }
+
+    /** Must happen before the first committed byte, before a URL can be registered or served. */
+    fun admitTotal(authoritativeBytes: Long) = synchronized(monitor) {
+        if (authoritativeBytes <= 0) return false
+        val existing = totalBytes
+        if (existing != null) return existing == authoritativeBytes
+        if (availableBytes != 0L || !allocationResize(authoritativeBytes)) return false
+        totalBytes = authoritativeBytes
+        true
+    }
 
     fun appendCommitted(bytes: Long) = synchronized(monitor) {
         check(!closed) { "progressive session closed" }
         require(bytes > 0) { "committed prefix must advance" }
+        check(totalBytes != null && bytes <= totalBytes!! - availableBytes) { "committed bytes exceed admitted total" }
         availableBytes += bytes
         initialPrefix.complete(Unit)
         monitor.notifyAll()
     }
 
     fun finish() = synchronized(monitor) {
+        check(totalBytes != null && availableBytes == totalBytes) { "cannot finish incomplete Usenet coverage" }
         completed = true
         if (availableBytes == 0L) initialPrefix.completeExceptionally(IOException("Usenet produced no playable bytes"))
         allocation?.complete()
@@ -73,7 +90,7 @@ internal class UsenetProgressiveSession(
     internal fun attachProducer(job: Job) { producer = job }
 
     internal fun launchProducer(block: suspend () -> Unit) {
-        attachProducer(CoroutineScope(producerRoot + Dispatchers.IO).launch(block = block))
+        attachProducer(CoroutineScope(producerRoot + Dispatchers.IO).launch { block() })
     }
 
     /** A prefix proves the loopback URL is usable without waiting for the complete title download. */
@@ -129,7 +146,9 @@ internal class UsenetProgressiveSession(
         if (delete) file.delete()
     }
 
-    internal fun totalBytes(): Long = declaredBytes
+    internal fun totalBytes(): Long = synchronized(monitor) { checkNotNull(totalBytes) }
+
+    private fun allocationResize(total: Long): Boolean = allocation?.resize(total) ?: true
 }
 
 /** One private 127.0.0.1 listener shared by progressive NZB sessions. */

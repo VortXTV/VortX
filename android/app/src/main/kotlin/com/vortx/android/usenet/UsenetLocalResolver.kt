@@ -67,7 +67,7 @@ internal class UsenetLocalResolver(
         NzbResult(
             file = session.file,
             subject = pick.name,
-            sizeBytes = pick.declaredBytes,
+            sizeBytes = session.totalBytes(),
             progressiveSession = session,
         )
     }
@@ -79,13 +79,9 @@ internal class UsenetLocalResolver(
         }
         val allocation = cacheFile(declaredBytes)
         val target = allocation.file
-        val session = UsenetProgressiveSession(target, declaredBytes, mediaTypeFor(file.name), allocation)
-        try {
-            session.url // register before the worker can make progress or fail
-        } catch (error: Throwable) {
-            allocation.abandon(); target.delete()
-            throw error
-        }
+        // NZB bytes are an encoded transport estimate. A yEnc whole-file size admits the stable total before
+        // any URL is registered, so the player never receives an estimate as Content-Length.
+        val session = UsenetProgressiveSession(target, mediaTypeFor(file.name), allocation)
         session.launchProducer {
             try {
                 assemble(file, target, session)
@@ -132,8 +128,8 @@ internal class UsenetLocalResolver(
                         for (seg in jobs) {
                             coroutineContext.ensureActive()
                             val part = File(workDir, "$seg.part")
-                            val decodedBytes = fetchSegmentTo(segments[seg], part)
-                            completed.send(CompletedPart(seg, part, decodedBytes))
+                            val metadata = fetchSegmentTo(segments[seg], part)
+                            completed.send(CompletedPart(seg, part, metadata))
                         }
                     }
                 }
@@ -151,26 +147,26 @@ internal class UsenetLocalResolver(
                         }
                         while (true) {
                             val next = reordered.remove(expected) ?: break
-                            if (!NzbAssemblyLimits.permitsAppend(assembledBytes, next.decodedBytes, declaredBytes)) {
-                                throw ResolveException("NZB decoded size exceeds declared title size")
+                            if (!NzbAssemblyLimits.permitsPart(assembledBytes, next.metadata)) {
+                                throw ResolveException("yEnc part coverage is not contiguous")
+                            }
+                            if (!session.admitTotal(next.metadata.totalBytes)) {
+                                throw ResolveException("Usenet cache cannot admit authoritative yEnc title size")
                             }
                             next.file.inputStream().use { input -> input.copyTo(out, SEGMENT_COPY_BUFFER_BYTES) }
-                            assembledBytes += next.decodedBytes
+                            assembledBytes += next.metadata.decodedBytes
                             // Make the complete ordered part visible before waking a range reader. The reader
                             // never observes a half-written part, which keeps its file reads deterministic.
                             out.flush()
-                            session.appendCommitted(next.decodedBytes)
+                            session.appendCommitted(next.metadata.decodedBytes)
                             if (!next.file.delete()) throw ResolveException("segment cache cleanup failed")
                             expected += 1
                             if (nextToSchedule < segments.size) jobs.send(nextToSchedule++)
                         }
                     }
-                    // A short aggregate is not an EOF signal for a player range request. Treat it as a
-                    // terminal provider failure so neither readiness nor the loopback handler can present
-                    // temporarily/malformedly missing bytes as a completed title.
-                    if (assembledBytes != declaredBytes) {
-                        throw ResolveException("NZB decoded size did not match declared title size")
-                    }
+                    // Only exact yEnc range coverage completes the loopback resource. NZB XML byte values
+                    // are encoded transport estimates and must never define media EOF.
+                    if (assembledBytes != session.totalBytes()) throw ResolveException("yEnc title coverage is incomplete")
                 }
                 jobs.close()
                 workers.forEach { it.join() }
@@ -185,7 +181,7 @@ internal class UsenetLocalResolver(
     }
 
     @OptIn(InternalCoroutinesApi::class)
-    private suspend fun fetchSegmentTo(segment: NzbSegment, destination: File): Long = withContext(Dispatchers.IO) {
+    private suspend fun fetchSegmentTo(segment: NzbSegment, destination: File): YencDecoder.DecodedPart = withContext(Dispatchers.IO) {
         if (segment.article.isEmpty()) throw ResolveException("segment has no article id")
         val client = NntpClient(
             host = credentials.host,
@@ -317,17 +313,17 @@ internal class UsenetLocalResolver(
         const val MAX_TITLE_BYTES = 100L * 1024 * 1024 * 1024
     }
 
-    private data class CompletedPart(val index: Int, val file: File, val decodedBytes: Long)
+    private data class CompletedPart(val index: Int, val file: File, val metadata: YencDecoder.DecodedPart)
 }
 
 /** The aggregate assembly boundary. It is checked before copying every ordered part to the playable file. */
 internal object NzbAssemblyLimits {
     private const val MAX_TITLE_BYTES = 100L * 1024 * 1024 * 1024
 
-    fun permitsAppend(assembledBytes: Long, nextPartBytes: Long, declaredBytes: Long): Boolean =
-        assembledBytes >= 0 && nextPartBytes >= 0 && declaredBytes in 1..MAX_TITLE_BYTES &&
-            nextPartBytes <= MAX_TITLE_BYTES - assembledBytes &&
-            nextPartBytes <= declaredBytes - assembledBytes
+    fun permitsPart(assembledBytes: Long, part: YencDecoder.DecodedPart): Boolean =
+        assembledBytes >= 0 && part.totalBytes in 1..MAX_TITLE_BYTES && part.begin == assembledBytes + 1 &&
+            part.endInclusive in part.begin..part.totalBytes &&
+            part.decodedBytes == part.endInclusive - part.begin + 1
 }
 
 /// The result of a native usenet resolve: a playable LOCAL file the player opens directly.

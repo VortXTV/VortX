@@ -31,6 +31,9 @@ import androidx.compose.ui.unit.dp
 import com.vortx.android.usenet.UsenetProviderRead
 import com.vortx.android.usenet.UsenetProviderServer
 import com.vortx.android.usenet.UsenetProviderStore
+import com.vortx.android.debrid.DebridOwnerToken
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 /**
  * Reusable phone settings content for encrypted saved NNTP servers. It deliberately takes a constructed
@@ -46,6 +49,7 @@ internal fun UsenetServersSettingsScreen(
 ) {
     var servers by remember { mutableStateOf<List<UsenetProviderServer>>(emptyList()) }
     var revision by remember { mutableLongStateOf(0L) }
+    var capturedOwner by remember { mutableStateOf<DebridOwnerToken?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     var editingId by remember { mutableStateOf<String?>(null) }
     var name by remember { mutableStateOf("") }
@@ -55,30 +59,47 @@ internal fun UsenetServersSettingsScreen(
     var password by remember { mutableStateOf("") }
     var connections by remember { mutableStateOf("4") }
 
+    fun clearEditor() {
+        editingId = null; name = ""; host = ""; port = "563"; username = ""; password = ""; connections = "4"
+    }
+
     fun refresh(clearMessage: Boolean = true) {
         when (val current = store.snapshot()) {
             is UsenetProviderRead.Available -> {
+                if (current.owner != capturedOwner) {
+                    servers = emptyList(); clearEditor(); capturedOwner = current.owner; message = null
+                }
                 servers = current.servers.servers
                 revision = current.revision
                 if (clearMessage) message = null
             }
             is UsenetProviderRead.Missing -> {
+                if (current.owner != capturedOwner) {
+                    servers = emptyList(); clearEditor(); capturedOwner = current.owner; message = null
+                }
                 servers = emptyList()
                 revision = current.revision
                 if (clearMessage) message = null
             }
             is UsenetProviderRead.UnavailableOrCorrupt -> {
+                if (current.owner != capturedOwner) {
+                    servers = emptyList(); clearEditor(); capturedOwner = current.owner
+                }
                 servers = emptyList()
                 revision = current.revision
                 message = "Saved Usenet settings could not be read. Nothing was changed."
             }
         }
     }
-    fun clearEditor() {
-        editingId = null; name = ""; host = ""; port = "563"; username = ""; password = ""; connections = "4"
-    }
     fun persist(next: List<UsenetProviderServer>) {
-        if (store.saveServers(next, revision)) {
+        val owner = capturedOwner
+        if (owner == null) {
+            message = "Usenet settings are unavailable for the current account. Nothing was changed."
+            return
+        }
+        // Passing the snapshot owner explicitly makes an A->B switch reject this exact stale draft even
+        // when both process-local document revisions happen to be zero.
+        if (store.saveServers(next, revision, owner)) {
             clearEditor(); refresh()
         } else {
             message = "Could not safely save Usenet servers. Refresh and try again."
@@ -114,7 +135,15 @@ internal fun UsenetServersSettingsScreen(
         persist(if (existing == null) servers + candidate else servers.map { if (it.id == existing.id) candidate else it })
     }
 
-    LaunchedEffect(store) { refresh() }
+    LaunchedEffect(store) {
+        refresh()
+        // Account ownership is not a Compose StateFlow at this boundary. Polling is lifecycle-owned by this
+        // composition and clears the in-memory credentials immediately after a profile/account transition.
+        while (isActive) {
+            delay(1_000)
+            refresh(clearMessage = false)
+        }
+    }
 
     Scaffold(
         topBar = {

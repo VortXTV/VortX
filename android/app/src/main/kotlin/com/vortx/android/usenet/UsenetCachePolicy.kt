@@ -7,7 +7,13 @@ internal object UsenetCachePolicy {
     const val MAX_CACHE_BYTES = 20L * 1024 * 1024 * 1024
     private val active = linkedMapOf<String, Long>()
 
-    data class Allocation(val file: File) {
+    class Allocation internal constructor(
+        val file: File,
+        internal val home: File,
+        internal val maxBytes: Long,
+    ) {
+        /** Upgrade the NZB estimate to the first yEnc part's authoritative total before any bytes commit. */
+        fun resize(authoritativeBytes: Long): Boolean = UsenetCachePolicy.resize(this, authoritativeBytes)
         fun complete() = Unit // still leased by the active loopback/player session
         fun abandon() = synchronized(UsenetCachePolicy) { active.remove(file.absolutePath) }
     }
@@ -25,6 +31,24 @@ internal object UsenetCachePolicy {
                     if (stale.delete()) used -= bytes
                 }
             }
-        if (used + incomingBytes > maxBytes) null else Allocation(target).also { active[target.absolutePath] = incomingBytes }
+        if (used + incomingBytes > maxBytes) null else Allocation(target, home, maxBytes).also { active[target.absolutePath] = incomingBytes }
+    }
+
+    private fun resize(allocation: Allocation, incomingBytes: Long): Boolean = synchronized(this) {
+        if (incomingBytes !in 1..allocation.maxBytes) return@synchronized false
+        val current = active[allocation.file.absolutePath] ?: return@synchronized false
+        var used = (allocation.home.listFiles() ?: emptyArray())
+            .filter { it.isFile && it.absolutePath !in active }.sumOf(File::length) + active.values.sum()
+        (allocation.home.listFiles() ?: emptyArray()).filter { it.isFile && it.absolutePath !in active }
+            .sortedBy(File::lastModified).forEach { stale ->
+                if (used - current + incomingBytes > allocation.maxBytes) {
+                    val bytes = stale.length()
+                    if (stale.delete()) used -= bytes
+                }
+            }
+        if (used - current + incomingBytes > allocation.maxBytes) false else {
+            active[allocation.file.absolutePath] = incomingBytes
+            true
+        }
     }
 }

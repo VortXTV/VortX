@@ -38,13 +38,14 @@ class UsenetProgressiveSessionTest {
         assertTrue(resolve.contains("session.awaitUsablePrefix(INITIAL_PREFIX_TIMEOUT_MS)"))
         assertTrue(resolve.contains("session.close()"))
         assertTrue(resolve.contains("Usenet provider was not ready"))
-        assertTrue(source.contains("assembledBytes != declaredBytes"))
+        assertTrue(source.contains("assembledBytes != session.totalBytes()"))
+        assertTrue(source.contains("yEnc part coverage is not contiguous"))
     }
 
     @Test
     fun `failed initial prefix is terminal rather than an empty successful url`() {
         val home = createTempDirectory("usenet-progressive").toFile()
-        val session = UsenetProgressiveSession(File(home, "title.mkv"), declaredBytes = 4)
+        val session = UsenetProgressiveSession(File(home, "title.mkv"))
         try {
             session.fail(IllegalStateException("authentication failed"))
             val failure = runCatching { kotlinx.coroutines.runBlocking { session.awaitUsablePrefix(100) } }.exceptionOrNull()
@@ -56,11 +57,26 @@ class UsenetProgressiveSessionTest {
     }
 
     @Test
+    fun `loopback url cannot exist until an authoritative total is admitted`() {
+        val home = createTempDirectory("usenet-progressive").toFile()
+        val session = UsenetProgressiveSession(File(home, "title.mkv"))
+        try {
+            assertTrue(runCatching { session.url }.isFailure)
+            assertTrue(session.admitTotal(7))
+            assertTrue(session.url.contains("127.0.0.1"))
+        } finally {
+            session.close()
+            home.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `loopback range headers arrive before the requested ordered bytes`() {
         val home = createTempDirectory("usenet-progressive").toFile()
         val file = java.io.File(home, "title.mkv")
-        val session = UsenetProgressiveSession(file, declaredBytes = 6)
+        val session = UsenetProgressiveSession(file)
         try {
+            assertTrue(session.admitTotal(6))
             val url = URL(session.url)
             val connection = (url.openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "bytes=2-5") }
             assertEquals(206, connection.responseCode)
@@ -87,8 +103,9 @@ class UsenetProgressiveSessionTest {
     @Test fun `suffix range and ordinary GET have RFC status and container type`() {
         val home = createTempDirectory("usenet-progressive").toFile()
         val file = java.io.File(home, "title.mp4"); file.writeBytes("abcdef".toByteArray())
-        val session = UsenetProgressiveSession(file, 6, "video/mp4")
+        val session = UsenetProgressiveSession(file, "video/mp4")
         try {
+            assertTrue(session.admitTotal(6))
             session.appendCommitted(6); session.finish()
             val suffix = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "bytes=-2") }
             assertEquals(206, suffix.responseCode); assertEquals("bytes 4-5/6", suffix.getHeaderField("Content-Range")); assertEquals("ef", suffix.inputStream.readBytes().toString(Charsets.UTF_8))
@@ -99,8 +116,9 @@ class UsenetProgressiveSessionTest {
 
     @Test fun `non-byte and unsatisfiable ranges are refused with RFC 416 metadata`() {
         val home = createTempDirectory("usenet-progressive").toFile(); val file = java.io.File(home, "title.mkv")
-        file.writeBytes("abcdef".toByteArray()); val session = UsenetProgressiveSession(file, 6)
+        file.writeBytes("abcdef".toByteArray()); val session = UsenetProgressiveSession(file)
         try {
+            assertTrue(session.admitTotal(6))
             session.appendCommitted(6); session.finish()
             val wrongUnit = (URL(session.url).openConnection() as HttpURLConnection).apply { setRequestProperty("Range", "widgets=0-1") }
             assertEquals(416, wrongUnit.responseCode); assertEquals("bytes */6", wrongUnit.getHeaderField("Content-Range"))
@@ -114,8 +132,9 @@ class UsenetProgressiveSessionTest {
     @Test
     fun `HEAD describes the bounded loopback resource without downloading`() {
         val home = createTempDirectory("usenet-progressive").toFile()
-        val session = UsenetProgressiveSession(java.io.File(home, "title.mkv"), declaredBytes = 9)
+        val session = UsenetProgressiveSession(java.io.File(home, "title.mkv"))
         try {
+            assertTrue(session.admitTotal(9))
             val connection = (URL(session.url).openConnection() as HttpURLConnection).apply { requestMethod = "HEAD" }
             assertEquals(200, connection.responseCode)
             assertEquals("9", connection.getHeaderField("Content-Length"))

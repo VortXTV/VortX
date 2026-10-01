@@ -3,6 +3,7 @@ package com.vortx.android.usenet
 import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /// Pure-JVM tests for [YencDecoder], including a reference round-trip through an ENCODER built from the
@@ -56,9 +57,13 @@ class YencDecoderTest {
     }
 
     @Test
-    fun `empty body outside ybegin-yend contributes nothing`() {
-        val decoded = decode("garbage before\r\n=ybegin size=0 name=x\r\n=yend size=0\r\n")
-        assertEquals(0, decoded.size)
+    fun `zero or missing authoritative total is rejected before playback`() {
+        assertThrows(YencDecoder.DecodeException::class.java) {
+            decode("garbage before\r\n=ybegin size=0 name=x\r\n=yend size=0\r\n")
+        }
+        assertThrows(YencDecoder.DecodeException::class.java) {
+            decode("=ybegin line=128 name=x\r\nabc\r\n=yend size=3\r\n")
+        }
     }
 
     @Test
@@ -73,6 +78,30 @@ class YencDecoderTest {
             YencDecoder.decodeTextTo(wrapBody(boundary), rejected, decodedLimit = 2)
         }
         assertEquals("only bounded bytes reached the private output", 2, rejected.size())
+    }
+
+    @Test
+    fun `ybegin whole size and ypart range are returned as authoritative coverage`() {
+        val payload = byteArrayOf(10, 20, 30)
+        val output = ByteArrayOutputStream()
+        val decoder = YencDecoder.StreamingDecoder(output, decodedLimit = 3)
+        ("=ybegin line=128 size=9 name=test.mkv\r\n" +
+            "=ypart begin=4 end=6\r\n" + encode(payload) + "\r\n=yend size=3\r\n")
+            .lineSequence().forEach(decoder::consumeLine)
+        val part = decoder.finish()
+        assertEquals(9L, part.totalBytes)
+        assertEquals(4L, part.begin)
+        assertEquals(6L, part.endInclusive)
+        assertEquals(3L, part.decodedBytes)
+        assertTrue(output.toByteArray().contentEquals(payload))
+    }
+
+    @Test
+    fun `part range whose bytes do not match decoded article is rejected`() {
+        assertThrows(YencDecoder.DecodeException::class.java) {
+            decode("=ybegin line=128 size=5 name=test.mkv\r\n=ypart begin=1 end=4\r\n" +
+                encode(byteArrayOf(1, 2, 3)) + "\r\n=yend size=3\r\n")
+        }
     }
 
     private fun decode(body: String): ByteArray = ByteArrayOutputStream().also { output ->
