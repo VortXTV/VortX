@@ -1951,6 +1951,7 @@ class EngineStremioRepository(
     override suspend fun addAccountLibraryItems(
         nativeLease: AccountAddonGatewayLease,
         items: List<VortXSyncDoc.OwnerLibraryItem>,
+        admit: ((() -> Boolean) -> Boolean),
     ): Boolean = withContext(Dispatchers.Default) {
         val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext false
         runCatching {
@@ -1959,7 +1960,7 @@ class EngineStremioRepository(
                 // AddToLibrary is the production ctx action. We deliberately do not synthesize TimeChanged
                 // or watched actions here: those require a native receipt with a genuine event timestamp.
                 for (item in items) {
-                    StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster))
+                    if (!admit { StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster)); true }) return@mutate false
                 }
                 if (items.isNotEmpty()) changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
                 items.isNotEmpty()

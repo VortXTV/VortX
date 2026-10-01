@@ -145,6 +145,7 @@ interface AccountLibrarySyncGateway {
     suspend fun addAccountLibraryItems(
         nativeLease: AccountAddonGatewayLease,
         items: List<VortXSyncDoc.OwnerLibraryItem>,
+        admit: ((() -> Boolean) -> Boolean),
     ): Boolean
 }
 
@@ -1743,8 +1744,11 @@ class VortXSyncManager(context: Context) {
         // Only a CONFIRMED push clears its stamps; a failed/lost push leaves every key dirty so the next
         // pull cannot clobber the un-pushed local edits.
         if (synced && isSyncLeaseCurrent(lease)) {
-            clearPushedDirtySettings(pushedStamps)
-            addonPrefs.clearPushedOrderDirty(pushedAddonOrder)
+            syncLeaseAdmission(lease).invoke {
+                clearPushedDirtySettings(pushedStamps)
+                addonPrefs.clearPushedOrderDirty(pushedAddonOrder)
+                true
+            }
         }
         return synced && isSyncLeaseCurrent(lease)
     }
@@ -2166,8 +2170,11 @@ class VortXSyncManager(context: Context) {
         if (!enforceRemovedAccountAddons(lease)) return false
         // Dirty is persisted per account: a late remote order cannot erase an unacknowledged local reorder,
         // including after process death. Remote application is marked remote so it does not self-push.
-        if (addonPrefs.orderDirtyAt() == null && parsed.addonOrder != null) {
-            if (addonPrefs.setAppliedOrder(parsed.addonOrder, remote = true)) {
+        if (parsed.addonOrder != null) {
+            val wroteOrder = syncLeaseAdmission(lease).invoke {
+                addonPrefs.orderDirtyAt() == null && addonPrefs.setAppliedOrder(parsed.addonOrder, remote = true)
+            }
+            if (wroteOrder) {
                 if (!isSyncLeaseCurrent(lease)) return false
                 if (gateway.applyRemoteAddonOrder(nativeLease, parsed.addonOrder, syncLeaseAdmission(lease))) changed = true
                 if (!isSyncLeaseCurrent(lease)) return false
@@ -2198,7 +2205,7 @@ class VortXSyncManager(context: Context) {
         val missing = incoming.filter {
             it.identity !in present && LibraryTombstones.normalize(it.metaId) !in removed
         }
-        return missing.isNotEmpty() && gateway.addAccountLibraryItems(nativeLease, missing) && isSyncLeaseCurrent(lease)
+        return missing.isNotEmpty() && gateway.addAccountLibraryItems(nativeLease, missing, syncLeaseAdmission(lease)) && isSyncLeaseCurrent(lease)
     }
 
     /**
