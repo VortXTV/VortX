@@ -111,10 +111,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/stremiox-core
-          # Same engine ref as release-tvos.yml (fix/meta-imdb-link-preserve): keep both surfaces
-          # on one engine. Same push gate applies: flip the stremio-core path patch to a git rev
-          # pin on the private mirror before this ref can build in CI.
-          ref: 4d5ae6371cc9e4031f787cf1c7adf7a535474b0c
+          # Same reviewed, immutable wrapper as both release lanes. Its lockfile resolves the
+          # published Git dependency; callable history exports are verified below for every ABI.
+          ref: f38023a1b6358ad374c365d2bcd6a84f34b189fd
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

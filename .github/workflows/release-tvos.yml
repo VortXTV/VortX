@@ -134,9 +134,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/stremiox-core
-          # Private wrapper release pin. Its Cargo patch resolves the reviewed public stremio-core fork,
-          # including the imdb-rating and local add-on action fixes; the public-core library suite passed 243 tests.
-          ref: 201409f886502981c28870b2d4031781e6109ee3
+          # Shared Apple/Android wrapper pin. Retains the shipping add-on lifecycle fixes and adds
+          # independently reviewed owner-library receipts; locked native tests passed against its Git pin.
+          ref: f38023a1b6358ad374c365d2bcd6a84f34b189fd
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

@@ -54,6 +54,18 @@ trigger_block() {
 [[ -f "$RELEASE_WF" ]] || fail "release workflow missing: $RELEASE_WF"
 [[ -f "$VALIDATION_WF" ]] || fail "secretless validation workflow missing: $VALIDATION_WF"
 
+# Release and candidate builds must share the same immutable wrapper revision; otherwise a
+# source-level history API can link on one platform yet ship an older engine on another.
+engine_pin=""
+for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    pin="$(awk '/repository: VortXTV\/stremiox-core/{active=1; next}
+        active && /^[[:space:]]+ref:/{print $2; exit}' "$wf")"
+    [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || fail "$(basename "$wf") wrapper pin must be immutable"
+    [[ -z "$engine_pin" || "$engine_pin" = "$pin" ]] || fail "Apple/Android wrapper pins differ"
+    engine_pin="$pin"
+done
+ok "Apple and both Android lanes use one exact wrapper revision"
+
 # setup-android's default includes the removed standalone 'tools' package. Validate the actual
 # action block, not a matching comment elsewhere, in every SDK lane before any native build starts.
 for wf in "$ANDROID_CI_WF" "$RELEASE_WF" "$VALIDATION_WF" "$CODEQL_WF"; do
