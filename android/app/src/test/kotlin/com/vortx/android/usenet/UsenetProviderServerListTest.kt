@@ -1,5 +1,9 @@
 package com.vortx.android.usenet
 
+import com.vortx.android.debrid.DebridOwnerScope
+import com.vortx.android.debrid.DebridOwnerToken
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -9,6 +13,38 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UsenetProviderServerListTest {
+    @Test fun `owner transaction serializes concurrent snapshot and save without lock inversion`() {
+        val credentialOwnerLock = Any()
+        val documentLock = Any()
+        val owner = DebridOwnerToken(DebridOwnerScope.SignedOutLocal, generation = 7)
+        val start = CountDownLatch(2)
+        val complete = CountDownLatch(2)
+        val mutate: (DebridOwnerToken, () -> Boolean) -> Boolean = { _, mutation ->
+            synchronized(credentialOwnerLock) { mutation() }
+        }
+        val operation = { label: String ->
+            Thread {
+                start.countDown()
+                start.await()
+                assertEquals(
+                    label,
+                    UsenetProviderOwnerTransaction.run(
+                        owner = owner,
+                        mutateCurrentOwner = mutate,
+                        storeLock = documentLock,
+                        rejected = { "rejected" },
+                        operation = { label },
+                    ),
+                )
+                complete.countDown()
+            }.apply { isDaemon = true; start() }
+        }
+
+        operation("snapshot")
+        operation("save")
+        assertTrue("owner-then-document operations deadlocked", complete.await(2, TimeUnit.SECONDS))
+    }
+
     @Test fun `legacy single credential migrates into stable server list`() {
         val legacy = credentials("one.example").toJson().toString()
         val decoded = requireNotNull(UsenetProviderServerList.decode(legacy))

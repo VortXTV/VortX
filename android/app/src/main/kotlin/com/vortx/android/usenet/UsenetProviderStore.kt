@@ -17,6 +17,30 @@ internal sealed interface UsenetProviderRead {
 }
 
 /**
+ * Coordinates the two locks that protect a saved-server document.  The credential-owner transaction is
+ * always outermost: it fences an account transition for the entire document operation, and prevents a
+ * resolver read (store -> owner) racing a settings save (owner -> store) from deadlocking.
+ */
+internal object UsenetProviderOwnerTransaction {
+    fun <T : Any> run(
+        owner: DebridOwnerToken,
+        mutateCurrentOwner: (DebridOwnerToken, () -> Boolean) -> Boolean,
+        storeLock: Any,
+        rejected: () -> T,
+        operation: () -> T,
+    ): T {
+        var value: T? = null
+        val accepted = mutateCurrentOwner(owner) {
+            synchronized(storeLock) {
+                value = operation()
+            }
+            true
+        }
+        return if (accepted) checkNotNull(value) else rejected()
+    }
+}
+
+/**
  * Encrypted owner-scoped source of truth for saved NNTP accounts. The whole priority list is one document;
  * all mutations include an expected revision, preventing an edit from erasing another server list change.
  */
@@ -31,20 +55,24 @@ internal class UsenetProviderStore(
 
     fun snapshot(owner: DebridOwnerToken? = currentOwner()): UsenetProviderRead {
         owner ?: return UsenetProviderRead.UnavailableOrCorrupt(null, 0)
-        if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return UsenetProviderRead.UnavailableOrCorrupt(owner, revision(owner))
-        synchronized(lock(owner)) {
+        return UsenetProviderOwnerTransaction.run(
+            owner = owner,
+            mutateCurrentOwner = mutateCurrentOwner,
+            storeLock = lock(owner),
+            rejected = { UsenetProviderRead.UnavailableOrCorrupt(owner, revision(owner)) },
+        ) {
             val currentRevision = revision(owner)
             val confirmed = store.confirmedSnapshot(storageKey(owner))
-            if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return UsenetProviderRead.UnavailableOrCorrupt(owner, currentRevision)
             // A read outage is not evidence of absence. Only a persistent, confirmed null may be displayed
             // as Missing or accepted by a subsequent mutation.
             if (confirmed.availability != PersistentCredentialAvailability.AVAILABLE) {
-                return UsenetProviderRead.UnavailableOrCorrupt(owner, currentRevision)
+                UsenetProviderRead.UnavailableOrCorrupt(owner, currentRevision)
+            } else {
+                val raw = confirmed.values[storageKey(owner)]
+                if (raw == null) UsenetProviderRead.Missing(owner, currentRevision)
+                else UsenetProviderServerList.decode(raw)?.let { UsenetProviderRead.Available(owner, it, currentRevision) }
+                    ?: UsenetProviderRead.UnavailableOrCorrupt(owner, currentRevision)
             }
-            val raw = confirmed.values[storageKey(owner)]
-            if (raw == null) return UsenetProviderRead.Missing(owner, currentRevision)
-            return UsenetProviderServerList.decode(raw)?.let { UsenetProviderRead.Available(owner, it, currentRevision) }
-                ?: UsenetProviderRead.UnavailableOrCorrupt(owner, currentRevision)
         }
     }
 
@@ -66,17 +94,26 @@ internal class UsenetProviderStore(
         owner ?: return false
         val next = UsenetProviderServerList(servers = servers)
         if (!UsenetProviderServerList.isValid(next)) return false
-        return mutateCurrentOwner(owner) {
-            synchronized(lock(owner)) {
-                if (revision(owner) != expectedRevision) return@synchronized false
+        return UsenetProviderOwnerTransaction.run(
+            owner = owner,
+            mutateCurrentOwner = mutateCurrentOwner,
+            storeLock = lock(owner),
+            rejected = { false },
+        ) {
+            if (revision(owner) != expectedRevision) {
+                false
+            } else {
                 val confirmed = store.confirmedSnapshot(storageKey(owner))
-                if (confirmed.availability != PersistentCredentialAvailability.AVAILABLE) return@synchronized false
                 val raw = confirmed.values[storageKey(owner)]
-                if (raw != null && UsenetProviderServerList.decode(raw) == null) return@synchronized false
-                if (!UsenetCredentialOwnerPolicy.permits(owner, currentOwner())) return@synchronized false
-                val saved = store.set(mapOf(storageKey(owner) to next.toJson().toString()))
-                if (saved) bump(owner)
-                saved
+                if (confirmed.availability != PersistentCredentialAvailability.AVAILABLE ||
+                    (raw != null && UsenetProviderServerList.decode(raw) == null)
+                ) {
+                    false
+                } else {
+                    val saved = store.set(mapOf(storageKey(owner) to next.toJson().toString()))
+                    if (saved) bump(owner)
+                    saved
+                }
             }
         }
     }

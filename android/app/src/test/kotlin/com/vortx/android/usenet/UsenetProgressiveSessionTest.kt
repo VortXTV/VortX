@@ -2,18 +2,78 @@ package com.vortx.android.usenet
 
 import java.io.FileOutputStream
 import java.io.File
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.io.path.createTempDirectory
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class UsenetProgressiveSessionTest {
+    @Test
+    fun `loopback bind failure unregisters the session`() {
+        val home = createTempDirectory("usenet-progressive").toFile()
+        val before = UsenetProgressiveLoopback.activeSessionCountForTest()
+        val session = UsenetProgressiveSession(File(home, "title.mkv"))
+        try {
+            assertTrue(session.admitTotal(1))
+            UsenetProgressiveLoopback.bindPortOverrideForTest = { throw IOException("test bind failure") }
+            assertTrue(runCatching { session.url }.isFailure)
+            assertEquals(before, UsenetProgressiveLoopback.activeSessionCountForTest())
+        } finally {
+            UsenetProgressiveLoopback.bindPortOverrideForTest = null
+            session.close()
+            home.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `failed loopback provider is cancelled and fallback advances to next server`() = runTest {
+        val home = createTempDirectory("usenet-progressive").toFile()
+        val before = UsenetProgressiveLoopback.activeSessionCountForTest()
+        val attempts = mutableListOf<String>()
+        var failedSession: UsenetProgressiveSession? = null
+        var successfulSession: UsenetProgressiveSession? = null
+        try {
+            val url = UsenetProviderFallbackPolicy.firstReady(
+                servers = listOf(testServer("first"), testServer("second")),
+                stillCurrent = { true },
+            ) { server ->
+                attempts += server.id
+                val session = UsenetProgressiveSession(File(home, "${server.id}.mkv"))
+                check(session.admitTotal(1))
+                if (server.id == "first") {
+                    failedSession = session
+                    UsenetProgressiveLoopback.bindPortOverrideForTest = { throw IOException("test bind failure") }
+                } else {
+                    successfulSession = session
+                    UsenetProgressiveLoopback.bindPortOverrideForTest = null
+                }
+                try {
+                    session.url
+                } catch (error: Throwable) {
+                    session.close()
+                    throw error
+                }
+            }
+            assertTrue(url.contains("127.0.0.1"))
+            assertEquals(listOf("first", "second"), attempts)
+            assertTrue("failed provider session was not cancelled", runCatching { failedSession!!.appendCommitted(1) }.isFailure)
+        } finally {
+            UsenetProgressiveLoopback.bindPortOverrideForTest = null
+            failedSession?.close()
+            successfulSession?.close()
+            assertEquals(before, UsenetProgressiveLoopback.activeSessionCountForTest())
+            home.deleteRecursively()
+        }
+    }
+
     @Test
     fun `producer cancellation is rethrown instead of reporting a failed session`() {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/usenet/UsenetLocalResolver.kt")
@@ -150,4 +210,16 @@ class UsenetProgressiveSessionTest {
         return candidates.firstOrNull(File::isFile)?.readText()
             ?: error("Could not locate $relativePath from ${File(".").absolutePath}")
     }
+
+    private fun testServer(id: String) = UsenetProviderServer(
+        id = id,
+        name = id,
+        host = "$id.example",
+        port = 563,
+        username = "user-$id",
+        password = "secret-$id",
+        maxConnections = 1,
+        useSSL = true,
+        enabled = true,
+    )
 }

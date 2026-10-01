@@ -5,6 +5,7 @@ import android.util.Log
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.model.StreamSource
 import com.vortx.android.usenet.UsenetLocalResolver
+import com.vortx.android.usenet.NzbResult
 import com.vortx.android.usenet.UsenetProviderCredentials
 import com.vortx.android.usenet.UsenetProviderFallbackPolicy
 import com.vortx.android.usenet.UsenetProviderRead
@@ -81,6 +82,9 @@ internal class DebridCoordinator(
         val context = appContext ?: throw IllegalStateException("usenet native resolve requires an app context")
         return UsenetLocalResolver(context, credentials)
     }
+
+    /** A native result is admitted only after its authoritative loopback resource has successfully bound. */
+    private data class ReadyNativeUsenet(val native: NzbResult, val url: String)
 
     // ------------------------------------------------------------------------------------------------
     // Value types
@@ -359,14 +363,21 @@ internal class DebridCoordinator(
                             fileIdx = candidate.fileIdx,
                             episode = episode,
                         )
-                        if (!keys.isCurrent(owner) || !providerStore.isCurrent(owner, providerRead.revision)) {
+                        try {
+                            // Register while this provider attempt still owns the producer. A bind failure must
+                            // close it and let firstReady advance to the next saved NNTP server.
+                            val url = native.url
+                            if (!keys.isCurrent(owner) || !providerStore.isCurrent(owner, providerRead.revision)) {
+                                throw CancellationException("Usenet owner or configuration changed")
+                            }
+                            ReadyNativeUsenet(native, url)
+                        } catch (error: Throwable) {
                             native.cancel()
-                            throw CancellationException("Usenet owner or configuration changed")
+                            throw error
                         }
-                        native
                     }
                     if (!keys.isCurrent(owner) || !providerStore.isCurrent(owner, providerRead.revision)) {
-                        result.cancel()
+                        result.native.cancel()
                         throw CancellationException("Usenet owner or configuration changed")
                     }
                     return DebridPlaybackRef(
@@ -379,7 +390,7 @@ internal class DebridCoordinator(
                         fileIdx = candidate.fileIdx,
                         episode = episode,
                         isNativeFile = true,
-                        progressiveSession = result.progressiveSession,
+                        progressiveSession = result.native.progressiveSession,
                     )
                 } catch (cancel: CancellationException) {
                     throw cancel

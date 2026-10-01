@@ -158,14 +158,28 @@ internal object UsenetProgressiveLoopback {
     private val lock = Any()
     @Volatile private var server: ServerSocket? = null
     @Volatile private var port = 0
+    /** Test-only seam for proving registration cleanup when loopback binding is unavailable. */
+    @Volatile internal var bindPortOverrideForTest: (() -> Int?)? = null
 
     fun register(id: String, session: UsenetProgressiveSession): String {
         sessions[id] = session
-        val boundPort = ensureListening() ?: throw IOException("Usenet loopback unavailable")
+        val boundPort = try {
+            val override = bindPortOverrideForTest
+            if (override != null) override() else ensureListening()
+        } catch (error: Throwable) {
+            sessions.remove(id, session)
+            throw error
+        }
+        if (boundPort == null) {
+            sessions.remove(id, session)
+            throw IOException("Usenet loopback unavailable")
+        }
         return "http://127.0.0.1:$boundPort/nzb/$id"
     }
 
     fun unregister(id: String) { sessions.remove(id) }
+
+    internal fun activeSessionCountForTest(): Int = sessions.size
 
     private fun ensureListening(): Int? = synchronized(lock) {
         server?.takeIf { !it.isClosed && port != 0 }?.let { return port }
