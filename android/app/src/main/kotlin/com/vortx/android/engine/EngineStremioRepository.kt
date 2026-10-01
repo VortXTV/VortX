@@ -1930,7 +1930,10 @@ class EngineStremioRepository(
 
     override fun captureAccountAddonLease(): AccountAddonGatewayLease? =
         historyOwnerFence.captureRead()
-            ?.takeIf { it.owner.usesEngineHistory && it.owner.principal != "signed-out" }
+            // A VortX account may legitimately own a settled local/native ctx before Stremio sign-in.
+            // The owner fence already validates that ctx/profile atomically; restrict the account document
+            // to the main profile rather than treating a nullable native UID as a guest/no-owner signal.
+            ?.takeIf { it.owner.usesEngineHistory && it.owner.profileId == UserProfile.OWNER_ID }
             ?.let { EngineAccountAddonLease(it.owner) }
 
     override fun captureAccountLibraryLease(): AccountAddonGatewayLease? = captureAccountAddonLease()
