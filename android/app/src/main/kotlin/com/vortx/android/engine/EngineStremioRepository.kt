@@ -1973,6 +1973,13 @@ class EngineStremioRepository(
         add = { item -> StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster)) },
     )
 
+    /** Only genuine local main-owner mutations arm publication; remote restores never call this. */
+    private fun requestOwnerLibrarySync(owner: ContinueWatchingOwner) {
+        if (owner.usesEngineHistory && owner.profileId == UserProfile.OWNER_ID) {
+            (appContext as? VortXApplication)?.syncManager?.onLocalOwnerLibraryChanged()
+        }
+    }
+
     /** Raw native descriptor snapshot for the encrypted VortX account; no network work or logging. */
     override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> =
         withContext(Dispatchers.Default) {
@@ -2750,6 +2757,7 @@ class EngineStremioRepository(
                         StremioCoreNative.dispatch(
                             EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
                         )
+                        requestOwnerLibrarySync(owner)
                     }
                 }
             }
@@ -2831,6 +2839,7 @@ class EngineStremioRepository(
                                     StremioCoreNative.dispatch(EngineActions.markAsWatched(true))
                                 }
                             }
+                            requestOwnerLibrarySync(owner)
                         }
                     }
                 }
@@ -2969,6 +2978,7 @@ class EngineStremioRepository(
                             )
                         }
                     StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
+                    requestOwnerLibrarySync(owner)
                 }
             }
             requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
@@ -3002,9 +3012,10 @@ class EngineStremioRepository(
                         detail.poster,
                     )
                 }
-                HistoryRoute.Engine -> StremioCoreNative.dispatch(
-                    EngineActions.markVideoAsWatched(videoId, season, episode, isWatched),
-                )
+                HistoryRoute.Engine -> {
+                    StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
+                    requestOwnerLibrarySync(owner)
+                }
             }
             requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                 ?: throw IllegalStateException("Couldn't update watched state.")
@@ -3025,9 +3036,10 @@ class EngineStremioRepository(
                         val ids = detail.videos.filter { it.season == season }.map { it.id }
                         overlay.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
                     }
-                    HistoryRoute.Engine -> StremioCoreNative.dispatch(
-                        EngineActions.markSeasonAsWatched(season, isWatched),
-                    )
+                    HistoryRoute.Engine -> {
+                        StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
+                        requestOwnerLibrarySync(owner)
+                    }
                 }
                 requireResidentMutationTarget(type, id).let { withOverlayState(it, HistoryReadPermit(owner)) }
                     ?: throw IllegalStateException("Couldn't update watched state.")
@@ -3051,6 +3063,7 @@ class EngineStremioRepository(
                             EngineActions.addToLibrary(id, type.id, name, poster),
                         )
                         LibraryTombstones(appContext).forget(id)
+                        requestOwnerLibrarySync(owner)
                         // Mirror the account-library add to Trakt/SIMKL watchlists (account path only).
                         AccountLibrarySync.onLibraryAdded(appContext, type, id)
                     }
@@ -3074,6 +3087,7 @@ class EngineStremioRepository(
                 HistoryRoute.Engine -> {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
                     LibraryTombstones(appContext).tombstone(id)
+                    requestOwnerLibrarySync(owner)
                     // Mirror the account-library remove to the Trakt watchlist (typed; SIMKL has no remove).
                     AccountLibrarySync.onLibraryRemoved(appContext, id, type)
                 }
