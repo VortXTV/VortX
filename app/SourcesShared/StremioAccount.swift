@@ -137,14 +137,22 @@ extension PlaybackMutationTarget {
     static func capture(core: CoreBridge) -> PlaybackMutationTarget {
         let profiles = ProfileStore.shared
         if profiles.activeUsesEngineHistory {
+            // History is an owner-account carrier, never a generic native-engine carrier. A
+            // secondary profile may use its own Stremio account, but its callbacks must not
+            // manufacture rows in the fixed owner bucket.
+            let ownerHistoryCapture: CredentialScopeRegistry.Capture? =
+                profiles.activeID == UserProfile.ownerID && profiles.active?.isOwner == true
+                ? CredentialScopeRegistry.shared.capture()
+                : nil
             return .engine(profileID: profiles.activeID,
                            keychainAccount: profiles.activeKeychainAccount,
-                           uid: core.currentUID())
+                           uid: core.currentUID(), historyCapture: ownerHistoryCapture)
         }
         guard let profileID = profiles.activeID else {
             // A missing active id means no profile can own a local write. The engine route is
             // deliberately fail-closed below when the active context no longer matches.
-            return .engine(profileID: nil, keychainAccount: profiles.activeKeychainAccount, uid: core.currentUID())
+            return .engine(profileID: nil, keychainAccount: profiles.activeKeychainAccount,
+                           uid: core.currentUID(), historyCapture: nil)
         }
         return .overlay(profileID: profileID)
     }
@@ -171,6 +179,25 @@ extension PlaybackMutationTarget {
             extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
         )
         return PlaybackMutationOwnershipPolicy.allowsAccountMutation(self, in: context)
+    }
+
+    /// A player progress event may enter the owner-history carrier only if its immutable launch
+    /// epoch is still current and both the captured and current profiles are the canonical owner.
+    /// `usesEngineHistory` alone is deliberately insufficient: secondary profiles can have their
+    /// own native account but must never write the owner's membership-neutral history.
+    func stillOwnsOwnerHistoryContext(core: CoreBridge) -> Bool {
+        guard case let .engine(profileID, _, _, historyCapture?) = self,
+              profileID == UserProfile.ownerID,
+              ProfileStore.shared.activeID == UserProfile.ownerID,
+              ProfileStore.shared.active?.isOwner == true,
+              CredentialScopeRegistry.shared.isCurrent(historyCapture),
+              stillOwnsCurrentContext(core: core) else { return false }
+        return true
+    }
+
+    var ownerHistoryCapture: CredentialScopeRegistry.Capture? {
+        guard case let .engine(_, _, _, historyCapture) = self else { return nil }
+        return historyCapture
     }
 
     var overlayProfileID: UUID? {
@@ -462,6 +489,22 @@ final class StremioAccount: ObservableObject {
             ProfileStore.shared.recordProgress(meta: meta, positionSeconds: positionSeconds,
                                                durationSeconds: durationSeconds, profileID: profileID)
             return
+        }
+        // This is the only shared Apple callback that still carries the committed playback identity
+        // after the player has passed its first-frame/integrity gates.  Capture before the optional
+        // Stremio mirror gate: VortX-only accounts must retain genuine watch history too.  The captured
+        // target/capture fence prevents a delayed callback from writing under a newly-selected account.
+        if let credentialCapture = target.ownerHistoryCapture,
+           target.stillOwnsOwnerHistoryContext(core: CoreBridge.shared),
+           durationSeconds > 0, positionSeconds >= 0 {
+            _ = await MainActor.run {
+                guard CredentialScopeRegistry.shared.isCurrent(credentialCapture),
+                      target.stillOwnsOwnerHistoryContext(core: CoreBridge.shared) else { return false }
+                return OwnerHistoryStore.recordPlayback(
+                    titleID: meta.libraryId, type: meta.type, name: meta.name, poster: meta.poster,
+                    videoID: meta.videoId, positionSeconds: positionSeconds, durationSeconds: durationSeconds,
+                    capture: credentialCapture)
+            }
         }
         // Wave 4: VortX owns the MAIN profile's Continue Watching + resume. The position is already persisted to
         // the engine's LOCAL library bucket by the co-located `CoreBridge.reportProgress` at every player call

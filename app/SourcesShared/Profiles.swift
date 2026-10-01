@@ -400,7 +400,7 @@ final class ProfileStore: ObservableObject {
             credentialFingerprint: entry.credentialFingerprint ?? "", binding: binding) {
             let target = PlaybackMutationTarget.engine(profileID: binding.profileID,
                                                         keychainAccount: binding.keychainAccount,
-                                                        uid: binding.uid)
+                                                        uid: binding.uid, historyCapture: nil)
             let replayID = "\(entry.profileID.uuidString):\(entry.credentialFingerprint ?? "unbound"):\(entry.metaID):\(entry.type)"
             guard !pendingAccountLibraryReplayIDs.contains(replayID) else { continue }
             pendingAccountLibraryReplayIDs.insert(replayID)

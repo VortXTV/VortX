@@ -5,6 +5,13 @@
 
 import Foundation
 
+// Minimal policy-only fixture: the production target carries a credential epoch captured when
+// the player session starts, but this executable intentionally does not link the credential store.
+enum CredentialScope: Hashable { case fixture }
+final class CredentialScopeRegistry {
+    struct Capture: Hashable { let generation: UInt64 }
+}
+
 private typealias Policy = PlaybackMutationOwnershipPolicy
 private var failures = 0
 
@@ -31,7 +38,7 @@ private struct PlaybackMutationOwnershipPolicyTests {
         let replacementContext = Policy.Context(activeProfileID: replacement, activeUsesEngineHistory: false,
                                                 activeKeychainAccount: account, activeUID: "owner-uid",
                                                 extantOverlayProfileIDs: [overlay, replacement])
-        let ownerTarget = Policy.Target.engine(profileID: owner, keychainAccount: account, uid: "owner-uid")
+        let ownerTarget = Policy.Target.engine(profileID: owner, keychainAccount: account, uid: "owner-uid", historyCapture: nil)
         let overlayTarget = Policy.Target.overlay(profileID: overlay)
         let settledOwner = Policy.SettledAccountBinding(profileID: owner, keychainAccount: account,
                                                         credentialFingerprint: "fp", uid: "owner-uid", generation: 1)
@@ -51,9 +58,9 @@ private struct PlaybackMutationOwnershipPolicyTests {
                                                        activeKeychainAccount: account, activeUID: "owner-uid",
                                                        extantOverlayProfileIDs: [])),
               "removed overlay rejects stale callback")
-        check(!Policy.allows(Policy.Target.engine(profileID: owner, keychainAccount: account, uid: "old"),
+        check(!Policy.allows(Policy.Target.engine(profileID: owner, keychainAccount: account, uid: "old", historyCapture: nil),
                              in: ownerContext), "account uid replacement rejects async engine completion")
-        check(!Policy.allows(Policy.Target.engine(profileID: owner, keychainAccount: account, uid: nil),
+        check(!Policy.allows(Policy.Target.engine(profileID: owner, keychainAccount: account, uid: nil, historyCapture: nil),
                              in: ownerContext), "unhydrated launch identity is not a wildcard")
         check(Policy.allowsAccountMutation(ownerTarget, in: ownerContext),
               "owner target may dispatch an account mutation")

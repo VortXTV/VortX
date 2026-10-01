@@ -56,6 +56,13 @@ swiftc -parse-as-library -D DOCUMENT_HISTORY_STANDALONE_TEST -strict-concurrency
   app/Tests/BecauseYouWatchedDocumentHistoryTests.swift -o "$build_dir/watch-document-history"
 "$build_dir/watch-document-history"
 swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/OwnerHistoryStore.swift app/Tests/OwnerHistoryStoreTests.swift \
+  -o "$build_dir/owner-history"
+"$build_dir/owner-history"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/OwnerHistoryInteropContractTests.swift -o "$build_dir/owner-history-interop"
+"$build_dir/owner-history-interop" "$repo_root"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Tests/BecauseYouWatchedCredentialBoundaryContractTests.swift -o "$build_dir/watch-credentials"
 "$build_dir/watch-credentials" "$repo_root"
 swiftc -strict-concurrency=complete -warnings-as-errors \

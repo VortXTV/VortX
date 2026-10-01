@@ -65,7 +65,7 @@ enum LibraryAutoAdd {
         let profileID: UUID? = {
             switch target {
             case .overlay(let id): return id
-            case .engine(let id, _, _): return id
+            case .engine(let id, _, _, _): return id
             }
         }()
         guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),

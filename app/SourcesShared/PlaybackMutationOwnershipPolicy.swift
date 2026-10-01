@@ -4,7 +4,11 @@ import Foundation
 /// engine so the profile-switch cases can be tested without a running player.
 enum PlaybackMutationOwnershipPolicy {
     enum Target: Hashable {
-        case engine(profileID: UUID?, keychainAccount: String, uid: String?)
+        /// `historyCapture` is present only for the canonical owner player session.  It is
+        /// deliberately part of the target captured at player mount, rather than acquired when
+        /// a delayed progress callback happens to run.
+        case engine(profileID: UUID?, keychainAccount: String, uid: String?,
+                    historyCapture: CredentialScopeRegistry.Capture?)
         case overlay(profileID: UUID)
     }
 
@@ -60,7 +64,7 @@ enum PlaybackMutationOwnershipPolicy {
     /// Resolver writes are account mutations, so a profile/uid-only player target is insufficient.
     /// The target must be paired with the immutable credential binding captured before suspension.
     static func allowsResolverDispatch(target: Target?, binding: SettledAccountBinding?) -> Bool {
-        guard let binding, case let .engine(profileID, account, uid) = target else { return false }
+        guard let binding, case let .engine(profileID, account, uid, _) = target else { return false }
         return profileID == binding.profileID && account == binding.keychainAccount && uid == binding.uid
     }
 
@@ -116,7 +120,7 @@ enum PlaybackMutationOwnershipPolicy {
         case .overlay(let profileID):
             // An overlay player owns its captured cache even after it stops being the active view.
             return context.extantOverlayProfileIDs.contains(profileID)
-        case .engine(let profileID, let account, let uid):
+        case .engine(let profileID, let account, let uid, _):
             guard context.activeProfileID == profileID,
                   context.activeUsesEngineHistory,
                   context.activeKeychainAccount == account else { return false }
