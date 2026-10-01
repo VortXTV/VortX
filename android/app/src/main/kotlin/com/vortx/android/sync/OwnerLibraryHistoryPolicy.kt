@@ -17,6 +17,31 @@ internal object OwnerLibraryHistoryPolicy {
 
     fun clock(item: VortXSyncDoc.OwnerLibraryItem): Long? = item.eventEpochMs ?: watchClock(item)
 
+    /** Only an exact publication proof supplied by the manager may separate viewing from native mtime. */
+    fun admitConditionalHistory(incoming: VortXSyncDoc.OwnerLibraryItem, raw: VortXSyncDoc.OwnerLibraryItem?,
+        owned: VortXSyncDoc.OwnerLibraryItem?): VortXSyncDoc.OwnerLibraryItem {
+        if (raw == null || owned == null || raw.identity != incoming.identity || owned.identity != raw.identity) return incoming
+        val priorEvent = clock(owned) ?: 0
+        val priorView = watchClock(owned) ?: 0
+        val event = clock(incoming) ?: return incoming
+        val view = watchClock(incoming) ?: return incoming
+        val native = raw.nativeEventEpochMs ?: return incoming
+        val neutralMembership = priorEvent == 0L && priorView == 0L && !owned.historyOnly && !owned.removed && !raw.removed &&
+            owned.declaredWatchFields == emptySet<String>() && owned.videoId == null && owned.timeOffsetMs == 0L && owned.durationMs == 0L &&
+            owned.watched == null && owned.timesWatched == null && owned.currentVideoWatched == null && owned.wholeTitleWatched == null &&
+            raw.videoId == null && raw.timeOffsetMs == 0L && raw.durationMs == 0L && raw.watched == null &&
+            (raw.timesWatched ?: 0) == 0L && raw.currentVideoWatched != true && raw.wholeTitleWatched != true
+        val priorViewMatches = priorView > 0 && priorEvent >= priorView && watchClock(raw) == priorView
+        if (!(neutralMembership || priorViewMatches) || event <= priorEvent || view <= priorView ||
+            view > event || event > native || incoming.durationMs <= 0 || incoming.videoId.isNullOrBlank()) return incoming
+        return incoming.copy(conditionalHistory = VortXSyncDoc.ConditionalOwnerHistory(raw, priorEvent, priorView))
+    }
+
+    fun conditionalMatches(item: VortXSyncDoc.OwnerLibraryItem, raw: VortXSyncDoc.OwnerLibraryItem?): Boolean {
+        val condition = item.conditionalHistory ?: return false
+        return raw != null && OwnerLibraryPublicationProofs.fingerprint(raw) == OwnerLibraryPublicationProofs.fingerprint(condition.expected)
+    }
+
     fun preserveUndeclaredWatchFields(incoming: VortXSyncDoc.OwnerLibraryItem, owned: VortXSyncDoc.OwnerLibraryItem?): VortXSyncDoc.OwnerLibraryItem {
         val fields = incoming.declaredWatchFields ?: return incoming
         if (owned == null) return incoming
@@ -40,6 +65,7 @@ internal object OwnerLibraryHistoryPolicy {
                 it.isFinite() && it > maxOf(previous.nativeEventEpochMs ?: 0, clock(previous) ?: 0).toDouble()
             } == true
             when {
+                item.conditionalHistory != null -> conditionalMatches(item, previous)
                 readd -> true
                 event != null -> event > maxOf(previous?.nativeEventEpochMs ?: 0, previous?.let(::clock) ?: 0)
                 item.lastWatched != null || item.removed -> false

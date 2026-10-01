@@ -9,6 +9,59 @@ import org.junit.Test
 import java.time.Instant
 
 class NativeOwnerLibraryGatewayTest {
+    @Test fun `conditional history needs exact raw witness and both exact receipt clocks`() {
+        for (mode in listOf("good", "changedRaw", "expiredRead", "missingReceiptClock", "wrongReceiptClock", "wrongPostClock", "wrongUid", "expired")) {
+            val prior = item(epoch = 5000).copy(nativeEventEpochMs = 20000)
+            val incoming = OwnerLibraryHistoryPolicy.admitConditionalHistory(item(epoch = 10000), prior, prior.copy(eventEpochMs = 5000))
+            assertNotNull(incoming.conditionalHistory)
+            var rows = listOf(if (mode == "changedRaw") prior.copy(timeOffsetMs = 123) else prior)
+            var writes = 0
+            var current = true
+            var witnessed = emptyList<VortXSyncDoc.OwnerLibraryItem>()
+            val gateway = NativeOwnerLibraryGateway(read = { if (mode == "expiredRead") current = false; projection(rows) }, restore = { request ->
+                writes++
+                val event = JSONObject(request).getJSONArray("events").getJSONObject(0)
+                val condition = event.getJSONObject("conditionalHistory")
+                assertEquals(5000L, condition.getLong("priorEventEpochMs"))
+                assertEquals(5000L, condition.getLong("priorLastWatchedEpochMs"))
+                assertEquals(20000L, condition.getJSONObject("expected").getLong("eventEpochMs"))
+                assertEquals(10000L, event.getLong("genuineEventEpochMs"))
+                rows = listOf(incoming.copy(nativeEventEpochMs = if (mode == "wrongPostClock") 21000 else 20000))
+                if (mode == "expired") current = false
+                JSONObject(receipt(request)).apply {
+                    if (mode == "wrongUid") put("uid", "wrong")
+                    if (mode != "missingReceiptClock") getJSONArray("events").getJSONObject(0).put("persistedEventEpochMs", if (mode == "wrongReceiptClock") 10000 else 20000)
+                }.toString()
+            }, add = { error("Conditional playback cannot use metadata add") })
+            gateway.apply("native", listOf(incoming), { current && it() }) { witnessed = it }
+            assertEquals(mode, if (mode in listOf("changedRaw", "expiredRead")) 0 else 1, writes)
+            assertEquals(mode, if (mode == "good") 1 else 0, witnessed.size)
+        }
+    }
+
+    @Test fun `metadata-only readd callback retains observed proof across its deferred write`() {
+        val nativeOwner = com.vortx.android.sync.NativeLibraryOwner("native")
+        val proofs = com.vortx.android.sync.OwnerLibraryPublicationProofs(com.vortx.android.sync.MemoryLibraryProofPersistence())
+        val before = item(epoch = 5000).copy(nativeEventEpochMs = 20000, removed = true)
+        assertTrue(proofs.grantProjected("B", nativeOwner, listOf(before to before.copy(historyOnly = true))))
+        val lease = com.vortx.android.sync.OwnerLibraryPublicationLease("B", proofs) { it() }
+        var rows = listOf(before)
+        var dispatches = 0
+        val incoming = item(epoch = 5000).copy(membershipAddedAt = 30000.0)
+        val gateway = NativeOwnerLibraryGateway({ projection(rows) }, { error("Old progress cannot be restored") }, { error("Observed callback required") })
+        assertTrue(gateway.apply("native", listOf(incoming), permit, addMetadata = { row ->
+            assertTrue(lease.mutateObserved(nativeOwner, row.identity, { rows },
+                com.vortx.android.sync.OwnerLibraryOperation(com.vortx.android.sync.OwnerLibraryOperation.Kind.MEMBERSHIP, name = row.name), { rows.single() }) { dispatches++ })
+        }))
+        assertEquals(1, dispatches)
+        rows = listOf(before.copy(removed = false, eventEpochMs = 31000, nativeEventEpochMs = 31000))
+        assertTrue(lease.completePending(before.identity) { rows })
+        val authorized = proofs.published("B", nativeOwner, rows.single())!!
+        assertFalse(authorized.removed)
+        assertFalse(authorized.historyOnly)
+        assertEquals(5000L, authorized.eventEpochMs)
+    }
+
     @Test fun `metadata readd uses admitted newer membership stamp and never restores zero history`() {
         for (mode in listOf("good", "olderProgress", "missing", "equal", "newerNative", "failedRead", "expired")) {
             var adds = 0

@@ -116,7 +116,7 @@ internal class OwnerLibraryPublicationProofs(private val persistence: LibraryPro
             val expectedMovieWatched = request.wholeTitleWatched ?: (count > 0)
             return actual.identity == request.identity && actual.name == request.name && actual.poster == request.poster &&
                 actual.videoId == request.videoId && actual.timeOffsetMs == request.timeOffsetMs && actual.durationMs == request.durationMs &&
-                actual.nativeEventEpochMs == OwnerLibraryHistoryPolicy.clock(request) &&
+                actual.nativeEventEpochMs == (request.conditionalHistory?.expected?.nativeEventEpochMs ?: OwnerLibraryHistoryPolicy.clock(request)) &&
                 OwnerLibraryHistoryPolicy.watchClock(actual) == OwnerLibraryHistoryPolicy.watchClock(request) &&
                 actual.watched == request.watched && actual.timesWatched == count && actual.removed == request.removed &&
                 ((actual.currentVideoWatched == true) == expectedCurrentWatched) &&

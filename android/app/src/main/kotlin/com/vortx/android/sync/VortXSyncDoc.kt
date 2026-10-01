@@ -76,9 +76,13 @@ object VortXSyncDoc {
         val declaredWatchFields: Set<String>? = null,
         /** Internal permission derived from an authenticated newer addedAt stamp, never decoded from a row. */
         val membershipAddedAt: Double? = null,
+        /** Internal CAS admission from an exact account-owned raw/projection pair; never decoded from wire. */
+        val conditionalHistory: ConditionalOwnerHistory? = null,
     ) {
         val identity: String get() = "$type:$metaId"
     }
+
+    data class ConditionalOwnerHistory(val expected: OwnerLibraryItem, val priorEventEpochMs: Long, val priorLastWatchedEpochMs: Long)
 
     /** The parsed roster + overlay + tombstone view of a pulled doc, ready for the ordered syncDown apply. */
     data class Parsed(

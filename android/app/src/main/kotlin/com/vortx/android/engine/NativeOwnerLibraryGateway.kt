@@ -20,14 +20,16 @@ internal class NativeOwnerLibraryGateway(
     }
 
     /** Re-read and select strictly newer events inside the same admitted native critical section. */
-    fun apply(uid: String?, incoming: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean), onRestored: (List<VortXSyncDoc.OwnerLibraryItem>) -> Unit = {}): Boolean {
+    fun apply(uid: String?, incoming: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean),
+        addMetadata: ((VortXSyncDoc.OwnerLibraryItem) -> Unit)? = null,
+        onRestored: (List<VortXSyncDoc.OwnerLibraryItem>) -> Unit = {}): Boolean {
         return admit {
             val local = parseProjection(read(uid?.let(JSONObject::quote) ?: "null"), uid) ?: return@admit false
             if (!admit { true }) return@admit false
             val candidates = OwnerLibraryHistoryPolicy.newerIncoming(incoming, local)
             val events = candidates.filter { item ->
                 val previous = local.singleOrNull { it.identity == item.identity }
-                (OwnerLibraryHistoryPolicy.clock(item) ?: 0) > maxOf(previous?.nativeEventEpochMs ?: 0,
+                OwnerLibraryHistoryPolicy.conditionalMatches(item, previous) || (OwnerLibraryHistoryPolicy.clock(item) ?: 0) > maxOf(previous?.nativeEventEpochMs ?: 0,
                     previous?.let(OwnerLibraryHistoryPolicy::clock) ?: 0)
             }
             if (events.isNotEmpty()) {
@@ -37,7 +39,7 @@ internal class NativeOwnerLibraryGateway(
             }
             // A newer membership stamp can re-add a removed title without replaying stale progress.
             for (item in candidates.filter { candidate -> events.none { it.identity == candidate.identity } }) {
-                if (!admit { add(item); true }) return@admit false
+                if (!admit { (addMetadata ?: add)(item); true }) return@admit false
             }
             if (events.isNotEmpty()) {
                 val post = parseProjection(read(uid?.let(JSONObject::quote) ?: "null"), uid)
@@ -62,6 +64,16 @@ internal class NativeOwnerLibraryGateway(
         put("currentVideoWatched", item.currentVideoWatched ?: JSONObject.NULL)
         put("timesWatched", item.timesWatched ?: JSONObject.NULL)
         put("removed", item.removed)
+        item.conditionalHistory?.let { condition ->
+            val expected = condition.expected
+            put("conditionalHistory", JSONObject().put("priorEventEpochMs", condition.priorEventEpochMs)
+                .put("priorLastWatchedEpochMs", condition.priorLastWatchedEpochMs).put("expected", JSONObject()
+                    .put("meta", JSONObject().put("id", expected.metaId).put("type", expected.type).put("name", expected.name).put("poster", expected.poster ?: JSONObject.NULL))
+                    .put("currentVideoId", expected.videoId ?: JSONObject.NULL).put("timeOffsetMs", expected.timeOffsetMs).put("durationMs", expected.durationMs)
+                    .put("eventEpochMs", expected.nativeEventEpochMs).put("lastWatchedEpochMs", OwnerLibraryHistoryPolicy.watchClock(expected) ?: JSONObject.NULL)
+                    .put("wholeTitleWatched", expected.wholeTitleWatched ?: JSONObject.NULL).put("currentVideoWatched", expected.currentVideoWatched ?: JSONObject.NULL)
+                    .put("timesWatched", expected.timesWatched ?: JSONObject.NULL).put("watched", expected.watched ?: JSONObject.NULL).put("removed", expected.removed)))
+        }
     }
 
     internal fun receiptMatches(raw: String, uid: String?, requested: List<VortXSyncDoc.OwnerLibraryItem>): Boolean {
@@ -78,6 +90,9 @@ internal class NativeOwnerLibraryGateway(
             if (!row.has("currentVideoId") || (row.opt("currentVideoId") != JSONObject.NULL && row.opt("currentVideoId") !is String)) return false
             if ((row.opt("currentVideoId") as? String) != item.videoId ||
                 OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("eventEpochMs")) != OwnerLibraryHistoryPolicy.clock(item)) return false
+            val persisted = item.conditionalHistory?.expected?.nativeEventEpochMs
+            if (persisted != null && OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("persistedEventEpochMs")) != persisted) return false
+            if (persisted == null && row.has("persistedEventEpochMs") && OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("persistedEventEpochMs")) != OwnerLibraryHistoryPolicy.clock(item)) return false
         }
         return remaining.isEmpty()
     }

@@ -2312,8 +2312,10 @@ class VortXSyncManager(context: Context) {
             .filter { !it.historyOnly && !it.removed && LibraryTombstones.normalize(it.metaId) !in removed }
             .forEach { saved.add(it.identity) }
         val history = parsed.ownerHistory.map { row ->
-            val prior = local.singleOrNull { it.identity == row.identity }?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
-            OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(removed = row.identity !in saved)
+            val raw = local.singleOrNull { it.identity == row.identity }
+            val prior = raw?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
+            OwnerLibraryHistoryPolicy.admitConditionalHistory(
+                OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(removed = row.identity !in saved), raw, prior)
         }
         val incoming = membership.map { row ->
             val raw = local.singleOrNull { it.identity == row.identity }
@@ -2322,7 +2324,8 @@ class VortXSyncManager(context: Context) {
             val addedAt = stamp?.get("addedAt") ?: 0.0
             val readd = !row.removed && raw?.removed == true &&
                 addedAt > (stamp?.get("removedAt") ?: 0.0) && addedAt > (raw.nativeEventEpochMs ?: 0).toDouble()
-            OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(membershipAddedAt = addedAt.takeIf { readd })
+            OwnerLibraryHistoryPolicy.admitConditionalHistory(
+                OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(membershipAddedAt = addedAt.takeIf { readd }), raw, prior)
         } + history
         val eligible = incoming.filter {
             it.historyOnly || (LibraryTombstones.normalize(it.metaId) in removed) == it.removed

@@ -448,7 +448,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     fun `public manager restores existing history and never advances a failed or expired receipt`() = runBlocking {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {
-            for (mode in listOf("success", "unsavedHistory", "savedHistory", "sparseApple", "tombstoneOnly", "readded", "metadataReadd", "metadataOlderProgress", "metadataStaleReadd", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
+            for (mode in listOf("success", "unsavedHistory", "savedHistory", "sparseApple", "conditionalOwned", "conditionalCold", "conditionalUnknown", "conditionalChanged", "tombstoneOnly", "readded", "metadataReadd", "metadataOlderProgress", "metadataStaleReadd", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
                 val context = MemoryContext()
                 val manager = newManager(context)
                 val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
@@ -465,7 +465,8 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                     .put("lastWatched", "1970-01-01T00:00:02Z").put("watched", JSONObject.NULL)
                     .put("currentVideoWatched", true).put("wholeTitleWatched", true).put("timesWatched", 1)
                 val doc = JSONObject().put("vortx", JSONObject().put("library", JSONArray().put(row)))
-                if (mode in listOf("unsavedHistory", "savedHistory", "sparseApple")) {
+                if (mode in listOf("unsavedHistory", "savedHistory", "sparseApple") || mode.startsWith("conditional")) {
+                    if (mode.startsWith("conditional")) row.put("eventEpochMs", 10000).put("lastWatched", "1970-01-01T00:00:10Z")
                     if (mode == "sparseApple") for (field in listOf("watched", "timesWatched", "wholeTitleWatched", "currentVideoWatched")) row.remove(field)
                     doc.getJSONObject("vortx").put("library", JSONArray().apply {
                         if (mode == "savedHistory") put(JSONObject().put("id", "tt1").put("type", "movie").put("name", "Movie"))
@@ -493,13 +494,21 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                 var metadataAdds = 0
                 var attemptedApply = false
                 var restoredProjection: String? = null
+                var readCount = 0
                 val native = com.vortx.android.engine.NativeOwnerLibraryGateway(
                     read = {
+                        readCount++
                         if (mode == "afterRead") replaceAccount()
                         // Both VortX accounts deliberately share this same native UID.
                         restoredProjection ?: JSONObject("""{"uid":"same-native","events":[{"meta":{"id":"tt1","type":"movie","name":"Movie"},"currentVideoId":"tt1","timeOffsetMs":1000,"durationMs":50000,"eventEpochMs":1000,"lastWatchedEpochMs":1000,"watched":null,"currentVideoWatched":false,"wholeTitleWatched":false,"timesWatched":0,"removed":false}]}""").apply {
                             if (mode == "sparseApple") getJSONArray("events").getJSONObject(0).put("watched", "prior-opaque").put("timesWatched", 3).put("wholeTitleWatched", true).put("currentVideoWatched", true)
                             if (mode.startsWith("metadata")) getJSONArray("events").getJSONObject(0).put("removed", true)
+                            if (mode.startsWith("conditional")) getJSONArray("events").getJSONObject(0)
+                                .put("eventEpochMs", 20000).put("lastWatchedEpochMs", 5000).put("removed", true)
+                                .put("timeOffsetMs", if (mode == "conditionalChanged" && readCount >= 3) 999 else 1000)
+                            if (mode == "conditionalCold") getJSONArray("events").getJSONObject(0)
+                                .put("lastWatchedEpochMs", 20000).put("removed", false).put("timeOffsetMs", 0).put("durationMs", 0)
+                                .put("currentVideoId", JSONObject.NULL)
                         }.toString()
                     },
                     restore = { request ->
@@ -513,6 +522,12 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                             assertTrue(applied.getBoolean("currentVideoWatched"))
                         }
                         applied.put("eventEpochMs", applied.get("genuineEventEpochMs"))
+                        if (mode in listOf("conditionalOwned", "conditionalCold")) {
+                            assertEquals(if (mode == "conditionalCold") 0L else 5000L, applied.getJSONObject("conditionalHistory").getLong("priorEventEpochMs"))
+                            assertEquals(20000L, applied.getJSONObject("conditionalHistory").getJSONObject("expected").getLong("eventEpochMs"))
+                            assertEquals(10000L, applied.getLong("genuineEventEpochMs"))
+                            applied.put("eventEpochMs", 20000)
+                        }
                         restoredProjection = JSONObject().put("uid", "same-native").put("events", JSONArray().put(applied)).toString()
                         if (mode == "tombstoneOnly") {
                             val event = JSONObject(request).getJSONArray("events").getJSONObject(0)
@@ -521,7 +536,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                             assertEquals(1000L, event.getLong("lastWatchedEpochMs"))
                         }
                         if (mode == "afterResponse") replaceAccount()
-                        if (mode == "null") "null" else
+                        if (mode in listOf("conditionalOwned", "conditionalCold")) """{"uid":"same-native","events":[{"id":"tt1","type":"movie","currentVideoId":"tt1","eventEpochMs":10000,"persistedEventEpochMs":20000}]}""" else if (mode == "null") "null" else
                             """{"uid":"${if (mode == "wrongUid") "wrong" else "same-native"}","events":[{"id":"tt1","type":"movie","currentVideoId":"tt1","eventEpochMs":2000}]}"""
                     },
                     add = {
@@ -549,8 +564,24 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                     }
                 })
                 if (mode == "sparseApple") assertTrue(proofs.grant(accountA.id, NativeLibraryOwner("same-native"), requireNotNull(native.snapshot("same-native") { it() })))
+                if (mode in listOf("conditionalOwned", "conditionalChanged", "conditionalCold")) {
+                    val raw = requireNotNull(native.snapshot("same-native") { it() }).single()
+                    val authorized = if (mode == "conditionalCold") OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = raw.name).projection(null, null, raw)!!
+                        else raw.copy(eventEpochMs = 5000, historyOnly = true)
+                    assertTrue(proofs.grantProjected(accountA.id, NativeLibraryOwner("same-native"), listOf(raw to authorized)))
+                }
                 manager.syncDown(force = true)
-                if (mode in listOf("success", "tombstoneOnly", "unsavedHistory", "savedHistory", "sparseApple")) {
+                if (mode.startsWith("conditional")) {
+                    assertEquals(mode, if (mode in listOf("conditionalOwned", "conditionalCold")) 1 else 0, nativeWrites)
+                    assertEquals(2L, manager.lastAppliedVersion())
+                    if (mode in listOf("conditionalOwned", "conditionalCold")) {
+                        val raw = requireNotNull(native.snapshot("same-native") { it() }).single()
+                        assertEquals(20000L, raw.nativeEventEpochMs)
+                        val authorized = proofs.published(accountA.id, NativeLibraryOwner("same-native"), raw)!!
+                        assertEquals(10000L, authorized.eventEpochMs)
+                        assertEquals(10000L, OwnerLibraryHistoryPolicy.watchClock(authorized))
+                    }
+                } else if (mode in listOf("success", "tombstoneOnly", "unsavedHistory", "savedHistory", "sparseApple")) {
                     assertTrue(attemptedApply)
                     assertEquals(1, nativeWrites)
                     assertEquals(2L, manager.lastAppliedVersion())

@@ -7,6 +7,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OwnerHistoryCarrierTest {
+    @Test fun `conditional cold add requires exact neutral membership authority not a constructor viewing clock`() {
+        val raw = publicationRow(epoch = 20000).copy(videoId = null, timeOffsetMs = 0, durationMs = 0)
+        val owned = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = raw.name).projection(null, null, raw)!!
+        val incoming = publicationRow(epoch = 10000)
+        val admitted = OwnerLibraryHistoryPolicy.admitConditionalHistory(incoming, raw, owned)
+        assertEquals(0L, admitted.conditionalHistory!!.priorEventEpochMs)
+        assertEquals(0L, admitted.conditionalHistory!!.priorLastWatchedEpochMs)
+        assertEquals(20000L, admitted.conditionalHistory!!.expected.nativeEventEpochMs)
+        for (unproven in listOf<VortXSyncDoc.OwnerLibraryItem?>(null, owned.copy(historyOnly = true),
+            owned.copy(declaredWatchFields = null), owned.copy(videoId = "tt1"), owned.copy(timesWatched = 1)))
+            assertNull(OwnerLibraryHistoryPolicy.admitConditionalHistory(incoming, raw, unproven).conditionalHistory)
+        for (changed in listOf(raw.copy(timeOffsetMs = 1), raw.copy(videoId = "tt1"), raw.copy(timesWatched = 1), raw.copy(watched = "opaque")))
+            assertNull(OwnerLibraryHistoryPolicy.admitConditionalHistory(incoming, changed, owned).conditionalHistory)
+    }
+
     @Test fun `delayed removal then separate invocation readd preserves only prior authorized history`() {
         for (uid in listOf(null, "shared")) {
             val persistence = MemoryLibraryProofPersistence()

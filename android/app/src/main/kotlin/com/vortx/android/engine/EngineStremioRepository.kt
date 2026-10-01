@@ -2028,16 +2028,12 @@ class EngineStremioRepository(
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
                 var restored = emptyList<VortXSyncDoc.OwnerLibraryItem>()
                 val uid = owner.principal.takeUnless { it == "signed-out" }
-                val clocked = items.filter { OwnerLibraryHistoryPolicy.clock(it) != null }
-                val accepted = nativeOwnerLibrary.apply(uid, clocked, admit) { restored = it } && admit {
-                    for (item in items.filter { OwnerLibraryHistoryPolicy.clock(it) == null }) {
+                val accepted = nativeOwnerLibrary.apply(uid, items, admit, addMetadata = { item ->
                         mutateLocalLibrary(publication, owner, item.type, item.metaId,
                             operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = item.name, poster = item.poster)) {
-                            check(nativeOwnerLibrary.apply(uid, listOf(item), admit)) { "Account membership owner changed." }
+                            StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster))
                         }
-                    }
-                    true
-                }
+                }) { restored = it }
                 if (accepted && items.isNotEmpty()) admit { changedFields.tryEmit(setOf(EngineActions.FIELD_CTX)); true }
                 AccountLibraryRestoreResult(accepted, if (accepted) restored else emptyList())
             }
