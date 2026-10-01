@@ -89,8 +89,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONArray
+import java.time.Instant
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -1946,7 +1947,9 @@ class EngineStremioRepository(
             historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
                 // Load yields the persisted ctx library model; a failed/invalid model is null, not an empty wipe.
-                ownerLibrarySyncItems(StremioCoreNative.getState(EngineActions.libraryField()))
+                val uidJson = (owner.principal.takeUnless { it == "signed-out" }?.let(::JSONObject) ?: JSONObject.NULL).toString()
+                val events = StremioCoreNative.readLibraryEvents(uidJson)
+                ownerLibraryEventItems(events, owner.principal) ?: ownerLibrarySyncItems(StremioCoreNative.getState(EngineActions.libraryField()))
             }
         }.getOrNull()
     }
@@ -1987,6 +1990,30 @@ class EngineStremioRepository(
                     timeOffsetMs = state?.optLong("timeOffset", 0L)?.coerceAtLeast(0L) ?: 0L,
                     durationMs = state?.optLong("duration", 0L)?.coerceAtLeast(0L) ?: 0L,
                     lastWatched = null,
+                ))
+            }
+        }
+    }
+
+    /** Only a native persisted event clock may export progress; malformed/metadata-only events are ignored. */
+    private fun ownerLibraryEventItems(json: String, ownerPrincipal: String): List<VortXSyncDoc.OwnerLibraryItem>? {
+        val root = runCatching { JSONObject(json) }.getOrNull() ?: return null
+        val uid = root.opt("uid") as? String
+        if ((ownerPrincipal == "signed-out") != (uid == null) || (uid != null && uid != ownerPrincipal)) return null
+        val events = root.optJSONArray("events") ?: return null
+        return buildList {
+            for (index in 0 until events.length()) {
+                val event = events.optJSONObject(index) ?: continue
+                val id = event.opt("id") as? String ?: continue
+                val type = event.opt("type") as? String ?: continue
+                val epoch = (event.opt("lastWatchedEpochMs") as? Number)?.toLong()?.takeIf { it >= 0L } ?: continue
+                if (!VortXSyncDoc.isTypedCatalogIdentity(id) || type !in setOf("movie", "series")) continue
+                add(VortXSyncDoc.OwnerLibraryItem(
+                    metaId = id, type = type, name = (event.opt("name") as? String).orEmpty(),
+                    poster = event.opt("poster") as? String, videoId = event.opt("currentVideoId") as? String,
+                    timeOffsetMs = ((event.opt("timeOffsetMs") as? Number)?.toLong() ?: 0L).coerceAtLeast(0L),
+                    durationMs = ((event.opt("durationMs") as? Number)?.toLong() ?: 0L).coerceAtLeast(0L),
+                    lastWatched = Instant.ofEpochMilli(epoch).toString(),
                 ))
             }
         }
