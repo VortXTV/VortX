@@ -1963,15 +1963,48 @@ class EngineStremioRepository(
         runCatching {
             historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
+                val genuine = items.filter { it.lastWatched != null }
+                if (genuine.isNotEmpty()) {
+                    val uid = owner.principal.takeUnless { it == "signed-out" }
+                    val events = JSONArray()
+                    for (item in genuine) {
+                        val epoch = runCatching { Instant.parse(item.lastWatched).toEpochMilli() }.getOrNull() ?: return@mutate false
+                        events.put(JSONObject().apply {
+                            put("meta", JSONObject().put("id", item.metaId).put("type", item.type).put("name", item.name).apply { item.poster?.let { put("poster", it) } })
+                            put("currentVideoId", item.videoId ?: JSONObject.NULL)
+                            put("timeOffsetMs", item.timeOffsetMs); put("durationMs", item.durationMs)
+                            put("genuineLastWatchedEpochMs", epoch)
+                            put("wholeTitleWatched", JSONObject.NULL)
+                        })
+                    }
+                    val request = JSONObject().put("ownerUid", uid ?: JSONObject.NULL).put("events", events)
+                    var response: String? = null
+                    if (!admit { response = StremioCoreNative.restoreLibrary(request.toString()); response != "null" } ||
+                        !restoreReceiptMatches(response, uid, genuine)
+                    ) return@mutate false
+                }
                 // AddToLibrary is the production ctx action. We deliberately do not synthesize TimeChanged
                 // or watched actions here: those require a native receipt with a genuine event timestamp.
-                for (item in items) {
+                for (item in items.filter { it.lastWatched == null }) {
                     if (!admit { StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster)); true }) return@mutate false
                 }
                 if (items.isNotEmpty()) changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
                 items.isNotEmpty()
             }
         }.getOrDefault(false)
+    }
+
+    private fun restoreReceiptMatches(raw: String?, uid: String?, requested: List<VortXSyncDoc.OwnerLibraryItem>): Boolean {
+        raw ?: return false
+        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return false
+        if (raw == "null" || (root.opt("uid") as? String) != uid) return false
+        if (uid == null && root.opt("uid") != JSONObject.NULL) return false
+        val receipts = root.optJSONArray("events") ?: return false
+        if (receipts.length() != requested.size) return false
+        return requested.all { item ->
+            val epoch = runCatching { Instant.parse(item.lastWatched).toEpochMilli() }.getOrNull() ?: return@all false
+            (0 until receipts.length()).any { index -> receipts.optJSONObject(index)?.let { it.optString("type") == item.type && it.optString("id") == item.metaId && it.optLong("eventEpochMs", -1L) == epoch && it.optString("currentVideoId", "") == (item.videoId ?: "") } == true }
+        }
     }
 
     private fun ownerLibrarySyncItems(json: String): List<VortXSyncDoc.OwnerLibraryItem>? {
