@@ -22,6 +22,33 @@ internal fun publicationRow(id: String = "tt1", epoch: Long = 2000) = VortXSyncD
 )
 
 class OwnerLibraryPublicationProofsTest {
+    @Test fun `production policies retain ownership through first movie mark load progress remove and readd`() {
+        val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
+        val native = NativeLibraryOwner(null)
+        val lease = OwnerLibraryPublicationLease("B", proofs) { it() }
+        var rows = emptyList<VortXSyncDoc.OwnerLibraryItem>()
+        fun mutate(row: VortXSyncDoc.OwnerLibraryItem, policy: (VortXSyncDoc.OwnerLibraryItem?, VortXSyncDoc.OwnerLibraryItem) -> Boolean) {
+            assertTrue(lease.mutate(native, row.identity, { rows }, policy) { rows = listOf(row) })
+            assertTrue(proofs.owns("B", native, row))
+        }
+        val firstWatch = publicationRow().copy(timeOffsetMs = 0, durationMs = 0, lastWatched = null, videoId = null, wholeTitleWatched = true, timesWatched = 1)
+        mutate(firstWatch, LocalLibraryPublicationPolicy.watched(true))
+        val removed = firstWatch.copy(removed = true, eventEpochMs = 3000, nativeEventEpochMs = 3000)
+        mutate(removed, LocalLibraryPublicationPolicy::removed)
+        mutate(removed.copy(removed = false, eventEpochMs = 4000, nativeEventEpochMs = 4000), LocalLibraryPublicationPolicy::membershipAdded)
+        rows = emptyList()
+        val loaded = publicationRow("tt2").copy(timeOffsetMs = 0, durationMs = 0, lastWatched = null)
+        mutate(loaded, LocalLibraryPublicationPolicy.playerLoaded("tt2"))
+        mutate(loaded.copy(timeOffsetMs = 2500, durationMs = 10000, lastWatched = "1970-01-01T00:00:03Z", eventEpochMs = 3000, nativeEventEpochMs = 3000), LocalLibraryPublicationPolicy.progress("tt2", 2500, 10000))
+        assertFalse(LocalLibraryPublicationPolicy.playerLoaded("tt2")(null, loaded.copy(watched = "foreign-bits")))
+        assertFalse(LocalLibraryPublicationPolicy.watched(true)(null, firstWatch.copy(timeOffsetMs = 1000)))
+        // A removal may not claim an existing foreign row merely because it matches the action shape.
+        rows = listOf(publicationRow("tt99"))
+        val foreignRemoved = rows.single().copy(removed = true, nativeEventEpochMs = 3000, eventEpochMs = 3000)
+        lease.mutate(native, foreignRemoved.identity, { rows }, LocalLibraryPublicationPolicy::removed) { rows = listOf(foreignRemoved) }
+        assertFalse(proofs.owns("B", native, foreignRemoved))
+    }
+
     @Test fun `exact account native type and entire payload persist across restart`() {
         val disk = MemoryLibraryProofPersistence()
         val proofs = OwnerLibraryPublicationProofs(disk)

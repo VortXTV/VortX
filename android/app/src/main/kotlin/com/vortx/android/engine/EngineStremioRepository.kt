@@ -53,6 +53,7 @@ import com.vortx.android.sync.AccountLibrarySyncGateway
 import com.vortx.android.sync.AccountLibraryRestoreResult
 import com.vortx.android.sync.NativeLibraryOwner
 import com.vortx.android.sync.OwnerLibraryPublicationLease
+import com.vortx.android.sync.LocalLibraryPublicationPolicy
 import com.vortx.android.sync.AccountAddonSyncGateway
 import com.vortx.android.sync.AccountAddonGatewayLease
 import com.vortx.android.sync.LibraryTombstones
@@ -1823,7 +1824,7 @@ class EngineStremioRepository(
                     )
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(publication, owner, item.type.id, item.id, ::addedMembershipProof) {
+                    mutateLocalLibrary(publication, owner, item.type.id, item.id, LocalLibraryPublicationPolicy::membershipAdded) {
                     StremioCoreNative.dispatch(
                         EngineActions.addToLibrary(
                             id = item.id,
@@ -1846,13 +1847,18 @@ class EngineStremioRepository(
 
     override suspend fun removeFromLibrary(id: String): Result<Unit> = runCatching {
         val tombstones = LibraryTombstones(appContext)
+        val publication = captureLibraryPublication()
         historyOwnerFence.mutate { owner ->
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     overlay.removeWatchEntry(id)
                 }
                 HistoryRoute.Engine -> {
-                    StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                    val native = NativeLibraryOwner(owner.principal.takeUnless { it == "signed-out" })
+                    val target = nativeOwnerLibrary.snapshot(native.uid) { it() }?.singleOrNull { it.metaId == id }
+                    mutateLocalLibrary(publication, owner, target?.type, id, LocalLibraryPublicationPolicy::removed) {
+                        StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
+                    }
                     tombstones.tombstone(id)
                     (appContext as? VortXApplication)?.syncManager?.onLocalOwnerLibraryChanged()
                     // Bare-id remove: the type is unknown here, so the Trakt remove targets both arrays
@@ -2023,22 +2029,6 @@ class EngineStremioRepository(
         }
     }
 
-    private fun addedMembershipProof(before: VortXSyncDoc.OwnerLibraryItem?, after: VortXSyncDoc.OwnerLibraryItem): Boolean =
-        !after.removed && if (before == null) {
-            after.lastWatched == null && after.videoId == null && after.timeOffsetMs == 0L && after.durationMs == 0L &&
-                after.watched == null && (after.timesWatched ?: 0) == 0L && after.currentVideoWatched != true
-        } else after.copy(removed = before.removed, nativeEventEpochMs = before.nativeEventEpochMs, eventEpochMs = before.eventEpochMs) == before
-
-    private fun progressPublicationProof(video: String?, position: Long, duration: Long): (VortXSyncDoc.OwnerLibraryItem?, VortXSyncDoc.OwnerLibraryItem) -> Boolean = { before, after ->
-        after.videoId == video && after.timeOffsetMs == position && after.durationMs == duration && after.lastWatched != null &&
-            (before != null || (after.watched == null && (after.timesWatched ?: 0) <= 1))
-    }
-
-    private fun watchedPublicationProof(before: VortXSyncDoc.OwnerLibraryItem?, after: VortXSyncDoc.OwnerLibraryItem): Boolean =
-        before != null && after.name == before.name && after.poster == before.poster && after.videoId == before.videoId &&
-            after.timeOffsetMs == before.timeOffsetMs && after.durationMs == before.durationMs && after.lastWatched == before.lastWatched &&
-            after.removed == before.removed
-
     /** Raw native descriptor snapshot for the encrypted VortX account; no network work or logging. */
     override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> =
         withContext(Dispatchers.Default) {
@@ -2125,8 +2115,9 @@ class EngineStremioRepository(
         }
 
     override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> =
-        withContext(Dispatchers.Default) { runCatching {
-            historyOwnerFence.mutate { owner ->
+        runCatching {
+        withOwnerLibraryMutationAdmission(Dispatchers.Default, ::captureOwnerLibraryMutation) { admission ->
+            admission.mutate { owner, _ ->
                 when (val route = historyRouteLocked(owner)) {
                     is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                         overlay.setWatched(
@@ -2146,7 +2137,10 @@ class EngineStremioRepository(
                             .put("type", item.type.id)
                             .put("name", item.name)
                             .also { if (item.poster != null) it.put("poster", item.poster) }
-                        StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
+                        mutateLocalLibrary(admission.publication, owner, item.type.id, item.id, LocalLibraryPublicationPolicy.watched(isWatched)) {
+                            StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
+                        }
+                        requestOwnerLibrarySync(owner)
                     }
                 }
                 changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
@@ -2734,7 +2728,7 @@ class EngineStremioRepository(
                     val route = historyRouteLocked(owner)
                     val engineRoute = route is HistoryRoute.Engine
                     if (engineRoute) {
-                        mutateLocalLibrary(publication, owner, context.type, context.contentId, ::addedMembershipProof) {
+                        mutateLocalLibrary(publication, owner, context.type, context.contentId, LocalLibraryPublicationPolicy.playerLoaded(context.videoId)) {
                         StremioCoreNative.dispatch(
                             EngineActions.loadPlayer(buildLocalPlayerSelected(context)),
                         )
@@ -2778,7 +2772,7 @@ class EngineStremioRepository(
                     }
                     val enginePlayerLoaded = route is HistoryRoute.Engine && selected != null
                     val libraryMetaId = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("id")?.takeIf { it.isNotBlank() }
-                    if (enginePlayerLoaded) mutateLocalLibrary(publication, owner, type, libraryMetaId, ::addedMembershipProof) {
+                    if (enginePlayerLoaded) mutateLocalLibrary(publication, owner, type, libraryMetaId, LocalLibraryPublicationPolicy.playerLoaded(videoId)) {
                         StremioCoreNative.dispatch(EngineActions.loadPlayer(selected!!))
                     }
                     PlaybackHistorySession(
@@ -2824,7 +2818,7 @@ class EngineStremioRepository(
                         }
                     }
                     HistoryRoute.Engine -> if (active.enginePlayerLoaded) {
-                        mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, progressPublicationProof(active.videoId, positionMs, durationMs)) {
+                        mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, LocalLibraryPublicationPolicy.progress(active.videoId, positionMs, durationMs)) {
                         StremioCoreNative.dispatch(
                             EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
                         )
@@ -2892,7 +2886,7 @@ class EngineStremioRepository(
                         HistoryRoute.Engine -> if (
                             active.enginePlayerLoaded && durationMs > 0L && positionMs >= 0L
                         ) {
-                            mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, progressPublicationProof(active.videoId, positionMs, durationMs)) {
+                            mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, LocalLibraryPublicationPolicy.progress(active.videoId, positionMs, durationMs)) {
                             StremioCoreNative.dispatch(
                                 EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
                             )
@@ -3039,7 +3033,7 @@ class EngineStremioRepository(
                     overlay.setWatched(isWatched, id, videoIds, detail.name, type.id, detail.poster)
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(publication, owner, type.id, id, ::watchedPublicationProof) {
+                    mutateLocalLibrary(publication, owner, type.id, id, LocalLibraryPublicationPolicy.watched(isWatched)) {
                     // A series' aggregate action does not update its episode bitfield. Keep every
                     // dependent dispatch in this one MetaDetails transaction so another detail load or
                     // mutation cannot interleave a partially-marked series.
@@ -3093,7 +3087,7 @@ class EngineStremioRepository(
                     )
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(publication, owner, type.id, id, ::watchedPublicationProof) {
+                    mutateLocalLibrary(publication, owner, type.id, id, LocalLibraryPublicationPolicy.watched(isWatched)) {
                     StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
                     }
                     requestOwnerLibrarySync(owner)
@@ -3121,7 +3115,7 @@ class EngineStremioRepository(
                         overlay.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
                     }
                     HistoryRoute.Engine -> {
-                        mutateLocalLibrary(publication, owner, type.id, id, ::watchedPublicationProof) {
+                        mutateLocalLibrary(publication, owner, type.id, id, LocalLibraryPublicationPolicy.watched(isWatched)) {
                         StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
                         }
                         requestOwnerLibrarySync(owner)
@@ -3145,7 +3139,7 @@ class EngineStremioRepository(
                         overlay.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
                     }
                     HistoryRoute.Engine -> {
-                        mutateLocalLibrary(admission.publication, owner, type.id, id, ::addedMembershipProof) {
+                        mutateLocalLibrary(admission.publication, owner, type.id, id, LocalLibraryPublicationPolicy::membershipAdded) {
                         StremioCoreNative.dispatch(
                             EngineActions.addToLibrary(id, type.id, name, poster),
                         )
@@ -3173,7 +3167,7 @@ class EngineStremioRepository(
                     overlay.removeWatchEntry(id)
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(admission.publication, owner, type.id, id) {
+                    mutateLocalLibrary(admission.publication, owner, type.id, id, LocalLibraryPublicationPolicy::removed) {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
                     }
                     tombstones.tombstone(id)
