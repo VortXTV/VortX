@@ -1,5 +1,12 @@
 # Android next-release runbook
 
+> **Historical August 2026 audit and preservation snapshot, not today's release gate.**
+> The Beta 19 Apple-only direction, branch registry, toolchain paths and parity counts below
+> predate the current owner directions and subsequent integrated releases. Use the dated
+> [Android parity record](../ANDROID-TV-APPLE-PARITY-PLAN.md) and
+> [Beta 18 notes](../releases/0.4.0-beta.18.md) for the current implementation and its verification
+> limits. Do not restore the rejected historical branches or treat their status as current.
+
 Status: preservation/backlog only. This document is not a Beta 19 gate.
 Beta 19 is Apple-only; Android artifacts and the Android appcast entry remain
 absent/null until a later release passes this runbook.
