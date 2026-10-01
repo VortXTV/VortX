@@ -1,0 +1,5 @@
+- description: Java and Kotlin quality queries using the traced Android build
+- queries: .
+  from: codeql/java-queries
+- apply: code-quality-selectors.yml
+  from: codeql/suite-helpers

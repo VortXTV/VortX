@@ -65,6 +65,10 @@ for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
     engine_pin="$pin"
 done
 ok "Apple and both Android lanes use one exact wrapper revision"
+require_grep "Android quality analysis uses the NDK-aware traced build" \
+    'queries: \./\.github/codeql/java-quality\.qls' "$CODEQL_WF"
+require_grep "Android quality suite retains GitHub's maintained selector" \
+    'apply: code-quality-selectors\.yml' "$REPO_ROOT/.github/codeql/java-quality.qls"
 
 # setup-android's default includes the removed standalone 'tools' package. Validate the actual
 # action block, not a matching comment elsewhere, in every SDK lane before any native build starts.
