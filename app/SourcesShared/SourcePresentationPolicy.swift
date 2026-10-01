@@ -30,4 +30,11 @@ enum SourcePresentationPolicy {
         let phonePortrait = width < 600 && viewport > width
         return max(360, viewport * (phonePortrait ? 0.78 : 0.60))
     }
+
+    /// The primary action crosses the artwork/canvas seam on phones. This is layout padding, not
+    /// an offset, so its full hit area and the controls below stay in the scrolling document.
+    static func mobileHeroActionOverlap(width: CGFloat, viewport: CGFloat) -> CGFloat {
+        guard width.isFinite, viewport.isFinite, width > 0, viewport > width, width < 600 else { return 0 }
+        return 26
+    }
 }

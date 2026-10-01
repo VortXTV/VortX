@@ -1315,9 +1315,11 @@ struct iOSDetailView: View {
         // full synopsis, credits, language chips) so the macOS pinned-hero scroll model (`macDetailBody`) can
         // pin the banner while the below-content + episode/source list scroll independently beneath it. On
         // iOS/iPadOS the two are composed back into the exact single scrolling column as before.
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
+        let overlap = SourcePresentationPolicy.mobileHeroActionOverlap(width: width, viewport: height)
+        return VStack(alignment: .leading, spacing: 0) {
             heroBanner(width: width, height: height)
             heroBelow(width: width, scrollToSources: scrollToSources)
+                .padding(.top, -overlap)
         }
         .frame(width: width, alignment: .leading)
     }
@@ -1398,7 +1400,7 @@ struct iOSDetailView: View {
                 }
             }
             .padding(.horizontal, Theme.Space.md)
-            .padding(.bottom, Theme.Space.lg)
+            .padding(.bottom, Theme.Space.lg + heroActionOverlap(width: width, viewport: height))
             .frame(width: width, alignment: .leading)
         }
         // Circular translucent chrome: back chevron top-left, overflow top-right. Overlaid on the ZStack
@@ -1406,6 +1408,14 @@ struct iOSDetailView: View {
         // then insets the discs below the status bar / notch, so the hero reads like a cinematic media app.
         .overlay(alignment: .topLeading) { heroChrome }
         .frame(width: width, alignment: .leading)
+    }
+
+    private func heroActionOverlap(width: CGFloat, viewport: CGFloat) -> CGFloat {
+        #if os(macOS)
+        return 0
+        #else
+        return SourcePresentationPolicy.mobileHeroActionOverlap(width: width, viewport: viewport)
+        #endif
     }
 
     /// The scrollable remainder of the hero: the action row (Watch Now / series actions), the full
@@ -4211,6 +4221,7 @@ struct iOSDetailView: View {
 /// presents the native player, exactly like the movie path. This replaces the old behaviour where
 /// tapping an episode silently auto-played the best source and showed no sources / no quality picker.
 struct iOSEpisodeStreams: View {
+    @Environment(\.dismiss) private var dismiss
     let meta: CoreMetaItem
     let video: CoreVideo
     let season: Int
@@ -4364,6 +4375,8 @@ struct iOSEpisodeStreams: View {
         #if os(iOS)
         .navigationTitle(shownVideo.episodeTitle)
         .inlineNavigationTitle()
+        .toolbar(.hidden, for: .navigationBar)
+        .background(RestoreSwipeBack().frame(width: 0, height: 0).allowsHitTesting(false))
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         // The engine loads per-episode streams on demand; trigger that load for THIS episode, but only
@@ -4524,9 +4537,11 @@ struct iOSEpisodeStreams: View {
         // Fixed backdrop banner (show eyebrow + episode title + meta overlaid) with the overview flowing
         // below on the canvas, same structure as iOSDetailView.hero, so a long episode synopsis can't push
         // the backdrop down behind the text.
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
+        let overlap = SourcePresentationPolicy.mobileHeroActionOverlap(width: width, viewport: viewport)
+        return VStack(alignment: .leading, spacing: 0) {
             ZStack(alignment: .bottomLeading) {
                 backdrop(height: SourcePresentationPolicy.mobileHeroHeight(width: width, viewport: viewport))
+                    .ignoresSafeArea(edges: .top)
                 VStack(alignment: .leading, spacing: Theme.Space.sm) {
                     Text(meta.name.uppercased())
                         .font(Theme.Typography.eyebrow).tracking(1.5)
@@ -4540,11 +4555,24 @@ struct iOSEpisodeStreams: View {
                     metaRow
                 }
                 .padding(.horizontal, Theme.Space.md)
-                .padding(.bottom, Theme.Space.lg)
+                .padding(.bottom, Theme.Space.lg + overlap)
                 .frame(width: width, alignment: .leading)
             }
+            #if os(iOS)
+            .overlay(alignment: .topLeading) {
+                CircleIconButton(systemName: "chevron.left", diameter: Theme.Control.circleChrome) { dismiss() }
+                    .accessibilityLabel("Back")
+                    .padding(Theme.Space.md)
+            }
+            #endif
             .frame(width: width, alignment: .leading)
 
+            #if os(iOS)
+            episodePrimaryAction
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.top, -overlap)
+                .padding(.bottom, Theme.Space.md)
+            #endif
             if let overview = shownVideo.overview, !overview.isEmpty {
                 Text(overview)
                     .font(Theme.Typography.body)
@@ -4556,6 +4584,40 @@ struct iOSEpisodeStreams: View {
             }
         }
         .frame(width: width, alignment: .leading)
+    }
+
+    #if os(iOS)
+    /// The hero uses the same settled source pick and existing resolution path as the source list.
+    /// Moving the button must not create a separate resolver, resume policy or automatic source choice.
+    private var episodePrimaryAction: some View {
+        let groups = rankedEpisode()
+        let best = sourceList.best
+        let loading = !sourceList.isSettled
+        return Button {
+            guard let best, best.playableURL(isEpisode: true) != nil else { return }
+            Task { await playBest(groups.flatMap(\.streams), labeledBest: best) }
+        } label: {
+            HStack(spacing: Theme.Space.sm) {
+                if loading || preparing { ProgressView().tint(Theme.Palette.onAccent) }
+                else { Image(systemName: "play.fill") }
+                Text(preparing ? "Preparing…" : loading ? "Finding sources…" :
+                     best.map { "Watch in \(StreamRanking.watchLabel($0))" } ?? "No sources available")
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+            }
+        }
+        .buttonStyle(HeroPlayButtonStyle())
+        .disabled(loading || preparing || best?.playableURL(isEpisode: true) == nil)
+        .frame(maxWidth: 760, alignment: .leading)
+    }
+    #endif
+
+    private var episodeSourceListShowsPrimaryPlay: Bool {
+        #if os(iOS)
+        return false
+        #else
+        return true
+        #endif
     }
 
     /// The RemoteConfig kill switch for the "Re-find sources" control (backend-first mandate). Baked ON.
@@ -4594,6 +4656,7 @@ struct iOSEpisodeStreams: View {
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             isEpisode: true,
+            showsPrimaryPlayButton: episodeSourceListShowsPrimaryPlay,
             play: { stream, url in Task { await play(stream, url: url) } },
             playWithEngine: { stream, url, preference in
                 Task { await play(stream, url: url, enginePreference: preference) }
@@ -5675,6 +5738,8 @@ struct iOSSourceList: View {
     /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode + live pages
     /// keep the default true; there the control bar is the only primary action.
     var showsPrimaryControls = true
+    /// Episode detail on phones places Play at the hero seam; selectors and source controls remain here.
+    var showsPrimaryPlayButton = true
     let play: (CoreStream, URL) -> Void
     /// Explicit one-launch engine route from a source-row context menu. Optional for compatibility with
     /// narrow callers; normal taps continue through `play` and inherit the visible session picker.
@@ -5979,6 +6044,7 @@ struct iOSSourceList: View {
                     // gate. The Quality picker stays live so a manual pick is always available immediately.
                     // AUTO-PICK: race the top cached candidates in parallel via `playBest` when the caller
                     // wired it (best first, ranking order preserved), else the single-resolve `play(best)`.
+                    if showsPrimaryPlayButton {
                     Button { if let playBest { playBest(groups.flatMap(\.streams), best) } else { (playAuto ?? play)(best, url) } } label: {
                         if loading {
                             HStack(spacing: Theme.Space.sm) {
@@ -5994,6 +6060,7 @@ struct iOSSourceList: View {
                     .buttonStyle(PrimaryActionStyle())
                     .disabled(loading)
                     .opacity(loading ? 0.55 : 1)
+                    }
 
                     FlowLayout(spacing: Theme.Space.sm) {
                         qualityMenu
@@ -6332,6 +6399,7 @@ extension iOSSourceList: Equatable {
             && lhs.isEpisode == rhs.isEpisode
             && lhs.sourcesSettled == rhs.sourcesSettled
             && lhs.showsPrimaryControls == rhs.showsPrimaryControls
+            && lhs.showsPrimaryPlayButton == rhs.showsPrimaryPlayButton
             && lhs.progress == rhs.progress
             && lhs.continuity == rhs.continuity
             && lhs.pinContext == rhs.pinContext
