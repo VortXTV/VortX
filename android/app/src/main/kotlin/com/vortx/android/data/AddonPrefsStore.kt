@@ -69,7 +69,7 @@ class AddonPrefsStore(
     }
 
     /** Snapshot the current account's local reorder acknowledgement. `null` means no unconfirmed reorder. */
-    fun orderDirtyAt(): Long? = activeAccountScope?.let { account ->
+    fun orderDirtyAt(): Long? = activeAccountScope?.let {
         prefs.getLong(scopedKey(KEY_ORDER_DIRTY_AT), 0L).takeIf { it > 0L }
     }
 
