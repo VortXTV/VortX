@@ -1805,6 +1805,7 @@ class EngineStremioRepository(
         } }
 
     override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
+        val tombstones = LibraryTombstones(appContext)
         historyOwnerFence.mutate { owner ->
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
@@ -1824,7 +1825,7 @@ class EngineStremioRepository(
                             poster = item.poster,
                         ),
                     )
-                    LibraryTombstones(appContext).forget(item.id)
+                    tombstones.forget(item.id)
                     (appContext as? VortXApplication)?.syncManager?.onLocalOwnerLibraryChanged()
                     // Mirror the ACCOUNT-library add out to the connected Trakt/SIMKL watchlists. This
                     // Engine branch is the account path (an overlay profile takes HistoryRoute.Overlay and
@@ -1836,6 +1837,7 @@ class EngineStremioRepository(
     }
 
     override suspend fun removeFromLibrary(id: String): Result<Unit> = runCatching {
+        val tombstones = LibraryTombstones(appContext)
         historyOwnerFence.mutate { owner ->
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
@@ -1843,7 +1845,7 @@ class EngineStremioRepository(
                 }
                 HistoryRoute.Engine -> {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
-                    LibraryTombstones(appContext).tombstone(id)
+                    tombstones.tombstone(id)
                     (appContext as? VortXApplication)?.syncManager?.onLocalOwnerLibraryChanged()
                     // Bare-id remove: the type is unknown here, so the Trakt remove targets both arrays
                     // (see TitleRef). SIMKL has no watchlist-remove, so it is a no-op there.
@@ -1856,6 +1858,7 @@ class EngineStremioRepository(
     override suspend fun removeFromContinueWatching(
         target: ContinueWatchingDismissal,
     ): Result<Unit> = withContext(Dispatchers.Default) { runCatching {
+        val tombstones = LibraryTombstones(appContext)
         historyOwnerFence.mutate(expectedOwner = target.owner) { owner ->
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
@@ -1868,7 +1871,7 @@ class EngineStremioRepository(
                     // fail closed when the current native snapshot contains the same id under another type.
                     if (validateContinueWatchingRemovalTarget(strictContinueWatchingItemsLocked(), target)) {
                         StremioCoreNative.dispatch(EngineActions.removeFromLibrary(target.id))
-                        LibraryTombstones(appContext).tombstone(target.id)
+                        tombstones.tombstone(target.id)
                     }
                 }
             }
@@ -3049,6 +3052,7 @@ class EngineStremioRepository(
 
     override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
         withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+            val tombstones = LibraryTombstones(appContext)
             metaDetailsGate.exclusive {
             val permit = historyOwnerFence.captureRead()
                 ?: throw IllegalStateException("History owner is changing. Try again.")
@@ -3062,7 +3066,7 @@ class EngineStremioRepository(
                         StremioCoreNative.dispatch(
                             EngineActions.addToLibrary(id, type.id, name, poster),
                         )
-                        LibraryTombstones(appContext).forget(id)
+                        tombstones.forget(id)
                         requestOwnerLibrarySync(owner)
                         // Mirror the account-library add to Trakt/SIMKL watchlists (account path only).
                         AccountLibrarySync.onLibraryAdded(appContext, type, id)
@@ -3075,6 +3079,7 @@ class EngineStremioRepository(
         } }
 
     override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+        val tombstones = LibraryTombstones(appContext)
         metaDetailsGate.exclusive {
         val permit = historyOwnerFence.captureRead()
             ?: throw IllegalStateException("History owner is changing. Try again.")
@@ -3086,7 +3091,7 @@ class EngineStremioRepository(
                 }
                 HistoryRoute.Engine -> {
                     StremioCoreNative.dispatch(EngineActions.removeFromLibrary(id))
-                    LibraryTombstones(appContext).tombstone(id)
+                    tombstones.tombstone(id)
                     requestOwnerLibrarySync(owner)
                     // Mirror the account-library remove to the Trakt watchlist (typed; SIMKL has no remove).
                     AccountLibrarySync.onLibraryRemoved(appContext, id, type)

@@ -22,6 +22,80 @@ import org.junit.Test
 class VortXSyncManagerStaleAddonEnvelopeTest {
 
     @Test
+    fun `real account switch isolates tombstones and sync upload preserves opaque peer entries`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            for (removeTypedRow in listOf(false, true)) {
+                val context = MemoryContext()
+                val manager = VortXSyncManager(context)
+                val store = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
+                    .apply { isAccessible = true }.newInstance(context)
+                manager.attachSyncSeams(store)
+                val key = ByteArray(32) { (it + 1).toByte() }
+                val a = VortXSyncManager.Session("token-a", VortXSyncManager.Account("A-isolation", "a@example.test", "A", false), key)
+                val b = VortXSyncManager.Session("token-b", VortXSyncManager.Account("B-isolation", "b@example.test", "B", false), key)
+                fun row(id: String) = JSONObject().put("id", id).put("type", "movie").put("name", "Title")
+                    .put("t", 1).put("d", 50).put("v", id).put("lastWatched", "1970-01-01T00:00:01Z")
+                val opaqueObject = JSONObject().put("id", "tt2").put("type", "foreign").put("opaque", true)
+                val opaqueArray = JSONArray().put("opaque").put(JSONObject().put("nested", 3))
+                val rows = JSONArray().put(row("tt1")).put(opaqueObject).put("scalar").put(opaqueArray)
+                    .put(JSONObject.NULL).put(row("tt2"))
+                val doc = JSONObject().put("vortx", JSONObject().put("library", rows))
+                val envelope = requireNotNull(VortXCrypto.sealDocument(key, doc.toString().toByteArray(), b.account.id, 2L, true))
+                var uploaded: JSONObject? = null
+                manager.installSyncTestSeam(a, 0L, transport = { method, _, body, token ->
+                    assertEquals("token-b", token)
+                    if (method == "GET") 200 to JSONObject().put("version", 2L).put("document", envelope)
+                    else {
+                        val request = requireNotNull(body)
+                        uploaded = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), b.account.id, request.getLong("version")))))
+                        200 to JSONObject().put("accepted", true)
+                    }
+                })
+                val delayedA = LibraryTombstones(context)
+                assertTrue(delayedA.merge(emptyList(), mapOf("tt1" to mapOf("removedAt" to 9000.0))))
+                manager.replaceSyncSessionTestSeam(b)
+                val bStore = LibraryTombstones(context)
+                assertTrue(bStore.all().isEmpty())
+                assertFalse(delayedA.tombstone("tt2"))
+                var nativeMutations = 0
+                manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
+                    private val lease = object : AccountAddonGatewayLease {}
+                    override fun captureAccountLibraryLease(): AccountAddonGatewayLease = lease
+                    override suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)): List<VortXSyncDoc.OwnerLibraryItem>? {
+                        var result: List<VortXSyncDoc.OwnerLibraryItem>? = null
+                        admit { result = listOf("tt1", "tt2").map { id -> requireNotNull(VortXSyncDoc.ownerLibraryItem(row(id))) }; true }
+                        return result
+                    }
+                    override suspend fun addAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): Boolean = admit { nativeMutations++; true }
+                })
+                manager.syncDown(force = true)
+                assertEquals("A tombstone must not remove B's same identity", 0, nativeMutations)
+                assertEquals(2L, manager.lastAppliedVersion())
+                if (removeTypedRow) bStore.merge(emptyList(), mapOf("tt2" to mapOf("removedAt" to 5000.0)))
+                assertTrue(manager.syncUp())
+                val vortx = requireNotNull(uploaded).getJSONObject("vortx")
+                val output = vortx.getJSONArray("library")
+                assertEquals(if (removeTypedRow) 5 else 6, output.length())
+                assertEquals(opaqueObject.toString(), output.getJSONObject(1).toString())
+                assertEquals("scalar", output.getString(2))
+                assertEquals(opaqueArray.toString(), output.getJSONArray(3).toString())
+                assertTrue(output.isNull(4))
+                assertFalse(vortx.optJSONObject("deletedLibraryTs")?.has("tt1") == true)
+                if (removeTypedRow) assertEquals(5000.0, vortx.getJSONObject("deletedLibraryTs").getJSONObject("tt2").getDouble("removedAt"), 0.0)
+                else assertFalse(vortx.has("deletedLibraryTs"))
+                manager.replaceSyncSessionTestSeam(a)
+                assertEquals(setOf("tt1"), LibraryTombstones(context).all())
+                assertFalse(delayedA.forget("tt1"))
+                assertFalse(bStore.tombstone("tt3"))
+            }
+        } finally {
+            LibraryTombstones.activateAccount(null)
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun `public manager restores existing history and never advances a failed or expired receipt`() = runBlocking {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {

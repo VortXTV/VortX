@@ -902,7 +902,12 @@ class VortXSyncManager(context: Context) {
 
     private val debridKeys = DebridKeys(appContext)
     private val metadataKeys = MetadataProviderKeys(appContext)
-    private val libraryTombstones = LibraryTombstones(appContext)
+    @Volatile private var libraryTombstones = LibraryTombstones(appContext)
+
+    private fun bindLibraryAccount(accountId: String?) {
+        LibraryTombstones.activateAccount(accountId)
+        libraryTombstones = LibraryTombstones(appContext)
+    }
     private val addonTombstones = AddonTombstones(appContext)
     private val addonPrefs = AddonPrefsStore(appContext)
     private val store = SessionStore(appContext)
@@ -965,6 +970,7 @@ class VortXSyncManager(context: Context) {
     val isSignedIn: Boolean get() = session != null
 
     init {
+        operations.snapshot { bindLibraryAccount(session?.account?.id) }
         AddonTombstones.activateAccount(session?.account?.id)
         AddonPrefsStore.activateAccount(session?.account?.id)
     }
@@ -975,7 +981,7 @@ class VortXSyncManager(context: Context) {
      * Keystore unavailability, a partial/corrupt session tuple, or any disagreement between the live and
      * persisted session stays unknown so another subsystem cannot adopt signed-out local data by mistake.
      */
-    internal fun sessionOwnerSnapshot(): SessionOwnerSnapshot = sessionState.serialized {
+    internal fun sessionOwnerSnapshot(): SessionOwnerSnapshot = operations.snapshot { sessionState.serialized {
         val loaded = sessionRestoreTestSeam ?: store.load()
         val available = loaded as? SessionLoad.Available
         if (available == null) {
@@ -987,6 +993,7 @@ class VortXSyncManager(context: Context) {
         val persistedOwnerEpoch = available.ownerEpoch
         if (_sessionUiState.value == SessionUiState.UnknownOrUnavailable) {
             sessionState.restore(persisted, persistedOwnerEpoch)
+            bindLibraryAccount(persisted?.account?.id)
             AddonTombstones.activateAccount(persisted?.account?.id)
             AddonPrefsStore.activateAccount(persisted?.account?.id)
             _account.value = persisted?.account
@@ -1007,7 +1014,7 @@ class VortXSyncManager(context: Context) {
             _sessionUiState.value = SessionUiState.SignedIn(current.account)
             SessionOwnerSnapshot.Account(current.account.id, sessionState.ownerEpoch)
         }
-    }
+    } }
 
     /** Retry an unavailable/corrupt secure-session read without misclassifying it as sign-out. */
     fun retrySessionRestore() {
@@ -1407,6 +1414,7 @@ class VortXSyncManager(context: Context) {
             }
             cancelSessionWork()
             sessionState.clear {
+                bindLibraryAccount(null)
                 AddonTombstones.activateAccount(null)
                 AddonPrefsStore.activateAccount(null)
                 _account.value = null
@@ -1440,7 +1448,9 @@ class VortXSyncManager(context: Context) {
         onVersionedPayloadApply: () -> Unit = {},
     ) {
         require(testSession.account.id.isNotBlank())
+        operations.invalidate {
         sessionState.restore(testSession)
+        bindLibraryAccount(testSession.account.id)
         AddonTombstones.activateAccount(testSession.account.id)
         AddonPrefsStore.activateAccount(testSession.account.id)
         _account.value = testSession.account
@@ -1449,6 +1459,7 @@ class VortXSyncManager(context: Context) {
         requestTestSeam = transport
         versionedPayloadTestObserver = onVersionedPayloadApply
         refreshSettingsShadow()
+        }
     }
 
     /** Narrow regression seam for final native-dispatch admission; production replacements use the same coordinator. */
@@ -1458,6 +1469,7 @@ class VortXSyncManager(context: Context) {
     internal fun replaceSyncSessionTestSeam(session: Session) {
         operations.invalidate {
             sessionState.restore(session)
+            bindLibraryAccount(session.account.id)
             _account.value = session.account
             AddonTombstones.activateAccount(session.account.id)
             AddonPrefsStore.activateAccount(session.account.id)
@@ -1759,9 +1771,13 @@ class VortXSyncManager(context: Context) {
         if (source != null) {
             val filtered = JSONArray()
             for (index in 0 until source.length()) {
-                val item = source.optJSONObject(index) ?: continue
-                val id = LibraryTombstones.normalize(item.optString("id", ""))
-                if (id !in removed) filtered.put(item)
+                val raw = source.get(index)
+                val item = raw as? JSONObject
+                val id = item?.opt("id") as? String
+                val type = item?.opt("type") as? String
+                val isRemoved = id != null && VortXSyncDoc.isTypedCatalogIdentity(id) &&
+                    type in setOf("movie", "series") && LibraryTombstones.normalize(id) in removed
+                if (!isRemoved) filtered.put(raw)
             }
             if (filtered.length() > 0) vortx.put("library", filtered) else vortx.remove("library")
         }
@@ -2440,6 +2456,7 @@ class VortXSyncManager(context: Context) {
                 onCommitted = ::cancelSessionWork,
             ) {
                 sessionState.replace(s) {
+                    bindLibraryAccount(account.id)
                     AddonTombstones.activateAccount(account.id)
                     AddonPrefsStore.activateAccount(account.id)
                     _account.value = account
