@@ -98,7 +98,7 @@ fun RailHeader(title: String, eyebrow: String? = null, modifier: Modifier = Modi
 private const val CONTINUE_WATCHING_ROW_ID = "continue"
 
 internal fun posterMenuFor(catalog: Catalog): PosterCardMenu = when {
-    catalog.id == CONTINUE_WATCHING_ROW_ID && catalog.readOnly -> PosterCardMenu.NONE
+    catalog.readOnly -> PosterCardMenu.NONE
     catalog.id == CONTINUE_WATCHING_ROW_ID -> PosterCardMenu.CONTINUE_WATCHING
     else -> PosterCardMenu.CATALOG
 }
