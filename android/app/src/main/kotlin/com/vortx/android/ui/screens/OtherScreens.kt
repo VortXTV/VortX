@@ -538,6 +538,8 @@ fun SettingsScreen(
     debridServicesFocusRequester: FocusRequester,
     modifier: Modifier = Modifier,
     onOpenGallery: (() -> Unit)? = null,
+    onUsenetServersClick: (() -> Unit)? = null,
+    onNzbIndexersClick: (() -> Unit)? = null,
 ) {
     val accountValue = when (authState) {
         is AuthState.SignedIn -> authState.email ?: "Signed in"
@@ -630,6 +632,8 @@ fun SettingsScreen(
         SettingRow(VortXIcons.playRectangle, "Live TV", "IPTV", onClick = onLiveTvClick)
         SettingRow(VortXIcons.audioOutput, "Playback", playbackValue, onClick = onPlaybackClick)
         SettingRow(VortXIcons.sources, "Sources", sourcesValue, onClick = onSourcesClick)
+        onUsenetServersClick?.let { SettingRow(VortXIcons.mediaServer, "Usenet servers", "Priority and fallback", onClick = it) }
+        onNzbIndexersClick?.let { SettingRow(VortXIcons.search, "NZB indexers", "NZBGeek and Newznab", onClick = it) }
         SettingRow(
             VortXIcons.lock,
             "Debrid services",

@@ -21,7 +21,7 @@ swiftc -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/SourcePresentationPolicy.swift app/Tests/PhoneDetailHeroCompositionTests.swift \
   -o "$build_dir/phone-detail-hero"
 "$build_dir/phone-detail-hero"
-swiftc -strict-concurrency=complete -warnings-as-errors \
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Tests/TraktCheckinVisibilityContractTests.swift -o "$build_dir/trakt-checkin-visibility"
 "$build_dir/trakt-checkin-visibility"
 swiftc -strict-concurrency=complete -warnings-as-errors \

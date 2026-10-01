@@ -133,6 +133,8 @@ import com.vortx.android.ui.screens.TabBarScreen
 import com.vortx.android.iptv.IPTVSettingsScreen
 import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.ui.screens.SourcesSettingsScreen
+import com.vortx.android.ui.screens.ConfiguredUsenetServersSettingsScreen
+import com.vortx.android.ui.screens.ConfiguredNzbIndexerSettingsScreen
 import com.vortx.android.ui.screens.UnifiedSignInScreen
 import com.vortx.android.ui.screens.WhatsNewScreen
 import com.vortx.android.ui.screens.WhosWatchingScreen
@@ -325,6 +327,8 @@ fun VortXApp(
         var showDownloadQueue by remember { mutableStateOf(false) }
         var showPlayback by remember { mutableStateOf(false) }
         var showSources by remember { mutableStateOf(false) }
+        var showUsenetServers by remember { mutableStateOf(false) }
+        var showNzbIndexers by remember { mutableStateOf(false) }
         var showMetadataKeys by remember { mutableStateOf(false) }
         var showPosterStyle by remember { mutableStateOf(false) }
         var showHomeDiscover by remember { mutableStateOf(false) }
@@ -382,6 +386,8 @@ fun VortXApp(
             showDownloadQueue = false
             showPlayback = false
             showSources = false
+            showUsenetServers = false
+            showNzbIndexers = false
             showMetadataKeys = false
             showPosterStyle = false
             showHomeDiscover = false
@@ -1028,6 +1034,18 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showUsenetServers) {
+            BackHandler { showUsenetServers = false }
+            ConfiguredUsenetServersSettingsScreen(onBack = { showUsenetServers = false })
+            return@VortXTheme
+        }
+
+        if (showNzbIndexers) {
+            BackHandler { showNzbIndexers = false }
+            ConfiguredNzbIndexerSettingsScreen(onBack = { showNzbIndexers = false })
+            return@VortXTheme
+        }
+
         if (showSources) {
             // Settings > Sources: source ranking + filters. Self-contained for the same reason as Playback:
             // it drives `SourcePreferencesStore`, which is the same `vortx_settings` file, and the ranker
@@ -1355,6 +1373,8 @@ fun VortXApp(
                     onDownloadsClick = { showDownloads = true },
                     onPlaybackClick = { showPlayback = true },
                     onSourcesClick = { showSources = true },
+                    onUsenetServersClick = { showUsenetServers = true },
+                    onNzbIndexersClick = { showNzbIndexers = true },
                     onMetadataKeysClick = { showMetadataKeys = true },
                     onPosterStyleClick = { showPosterStyle = true },
                     onHomeDiscoverClick = { showHomeDiscover = true },

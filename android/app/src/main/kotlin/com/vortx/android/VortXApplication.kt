@@ -334,12 +334,18 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same
     /// fail-soft boundary [MainActivity] used to own directly) so a native-side problem degrades the
     /// UI instead of crashing it.
-    val catalogRepository: CatalogRepository get() = engine ?: fallbackCatalogRepository
+    val catalogRepository: CatalogRepository get() = accountConnectedEngine() ?: fallbackCatalogRepository
 
     /// The one [AuthRepository] the whole app shares -- the SAME underlying engine instance as
     /// [catalogRepository] when the engine is up (one repository class implements both contracts), so
     /// a sign-in immediately shows up in every catalog call that reads `ctx`-derived state.
-    val authRepository: AuthRepository get() = engine ?: fallbackAuthRepository
+    val authRepository: AuthRepository get() = accountConnectedEngine() ?: fallbackAuthRepository
+
+    /** Keep initialization lazy; attach the real engine only when a normal app consumer requests it. */
+    private fun accountConnectedEngine(): EngineStremioRepository? = engine?.also { repository ->
+        syncManager?.attachAccountAddonGateway(repository)
+        syncManager?.attachAccountLibraryGateway(repository)
+    }
 
     /// Coil3's app-wide [ImageLoader] (S03: real poster/backdrop art in [com.vortx.android.ui.
     /// components.PosterArt]). `crossfade(true)` matches DESIGN-SYSTEM.md's motion spec for image
