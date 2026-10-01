@@ -1,6 +1,7 @@
 package com.vortx.android.engine
 
 import com.vortx.android.sync.OwnerLibraryHistoryPolicy
+import com.vortx.android.sync.OwnerLibraryPublicationProofs
 import com.vortx.android.sync.VortXSyncDoc
 import org.json.JSONArray
 import org.json.JSONObject
@@ -19,7 +20,7 @@ internal class NativeOwnerLibraryGateway(
     }
 
     /** Re-read and select strictly newer events inside the same admitted native critical section. */
-    fun apply(uid: String?, incoming: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): Boolean {
+    fun apply(uid: String?, incoming: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean), onRestored: (List<VortXSyncDoc.OwnerLibraryItem>) -> Unit = {}): Boolean {
         return admit {
             val local = parseProjection(read(uid?.let(JSONObject::quote) ?: "null"), uid) ?: return@admit false
             if (!admit { true }) return@admit false
@@ -32,6 +33,11 @@ internal class NativeOwnerLibraryGateway(
             }
             for (item in candidates.filter { OwnerLibraryHistoryPolicy.clock(it) == null }) {
                 if (!admit { add(item); true }) return@admit false
+            }
+            if (events.isNotEmpty()) {
+                val post = parseProjection(read(uid?.let(JSONObject::quote) ?: "null"), uid)
+                val exact = post.orEmpty().filter { actual -> events.any { OwnerLibraryPublicationProofs.matchesRestored(it, actual) } }
+                if (!admit { onRestored(exact); true }) return@admit false
             }
             // A rejected native batch or expired lease never receives an acknowledgement.
             admit { true }

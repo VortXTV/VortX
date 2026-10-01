@@ -23,6 +23,89 @@ import org.junit.Test
 class VortXSyncManagerStaleAddonEnvelopeTest {
 
     @Test
+    fun `encrypted B sync with shared or null native owner never adopts resident A history implicitly`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            for (uid in listOf(null, "shared-native")) {
+                val context = MemoryContext()
+                val manager = VortXSyncManager(context)
+                val profileStore = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
+                    .apply { isAccessible = true }.newInstance(context)
+                manager.attachSyncSeams(profileStore)
+                val disk = MemoryLibraryProofPersistence()
+                val proofs = OwnerLibraryPublicationProofs(disk)
+                manager.installLibraryPublicationProofTestSeam(proofs)
+                val key = ByteArray(32) { (it + 1).toByte() }
+                val a = VortXSyncManager.Session("a", VortXSyncManager.Account("A-proof", "a@example.test", "A", false), key)
+                val b = VortXSyncManager.Session("b", VortXSyncManager.Account("B-proof", "b@example.test", "B", false), key)
+                val peer = JSONObject().put("id", "tt2").put("type", "movie").put("name", "B title")
+                    .put("v", "tt2").put("t", 0).put("d", 10).put("lastWatched", "1970-01-01T00:00:01Z").put("eventEpochMs", 1000)
+                val doc = JSONObject().put("vortx", JSONObject().put("library", JSONArray().put(peer)))
+                var serverVersion = 2L
+                var uploaded: JSONObject? = null
+                manager.installSyncTestSeam(a, 0, transport = { method, _, body, token ->
+                    assertEquals("b", token)
+                    if (method == "GET") 200 to JSONObject().put("version", serverVersion).put("document", requireNotNull(VortXCrypto.sealDocument(key, doc.toString().toByteArray(), b.account.id, serverVersion, true)))
+                    else {
+                        val request = requireNotNull(body)
+                        uploaded = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), b.account.id, request.getLong("version")))))
+                        serverVersion = request.getLong("version")
+                        200 to JSONObject().put("accepted", true)
+                    }
+                })
+                var resident = listOf(publicationRow("tt1", 3000), publicationRow("tt2", 3000))
+                fun projection(): String = JSONObject().put("uid", uid ?: JSONObject.NULL).put("events", JSONArray(resident.map { row ->
+                    JSONObject().put("meta", JSONObject().put("id", row.metaId).put("type", row.type).put("name", row.name).put("poster", row.poster ?: JSONObject.NULL))
+                        .put("currentVideoId", row.videoId ?: JSONObject.NULL).put("timeOffsetMs", row.timeOffsetMs).put("durationMs", row.durationMs)
+                        .put("eventEpochMs", row.nativeEventEpochMs).put("lastWatchedEpochMs", OwnerLibraryHistoryPolicy.watchClock(row) ?: JSONObject.NULL)
+                        .put("watched", row.watched ?: JSONObject.NULL).put("currentVideoWatched", row.currentVideoWatched ?: JSONObject.NULL)
+                        .put("timesWatched", row.timesWatched ?: 0).put("removed", row.removed).put("wholeTitleWatched", row.wholeTitleWatched ?: JSONObject.NULL)
+                })).toString()
+                val native = com.vortx.android.engine.NativeOwnerLibraryGateway(read = { projection() }, restore = { error("Raw LWW must skip newer A rows") }, add = { error("No metadata add") })
+                manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
+                    val lease = object : AccountAddonGatewayLease {}
+                    override fun captureAccountLibraryLease(): AccountAddonGatewayLease = lease
+                    override fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease) = NativeLibraryOwner(uid)
+                    override suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)) = native.snapshot(uid, admit)
+                    override suspend fun addAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)) = native.apply(uid, items, admit)
+                })
+                val expired = requireNotNull(manager.captureLibraryPublicationLease())
+                manager.replaceSyncSessionTestSeam(b)
+                assertFalse(expired.mutate(NativeLibraryOwner(uid), "movie:tt9", { resident }, { _, _ -> true }) { error("Expired A cannot mutate B") })
+                manager.useAccountData()
+                assertTrue(manager.pushThisDevice())
+                fun output() = requireNotNull(uploaded).getJSONObject("vortx").getJSONArray("library")
+                assertEquals(1, output().length())
+                assertEquals(peer.toString(), output().getJSONObject(0).toString())
+                assertTrue(manager.mergeBoth())
+                assertEquals(1, output().length())
+                assertFalse(requireNotNull(uploaded).getJSONObject("vortx").has("deletedLibraryTs"))
+
+                // A genuine operation on a positively absent B title proves only that exact target.
+                val local = requireNotNull(manager.captureLibraryPublicationLease())
+                val newRow = publicationRow("tt3", 4000)
+                assertTrue(local.mutate(NativeLibraryOwner(uid), newRow.identity, { resident }, { before, after -> before == null && after == newRow }) { resident = resident + newRow })
+                assertTrue(manager.syncUp())
+                assertEquals(setOf("tt2", "tt3"), (0 until output().length()).map { output().getJSONObject(it).getString("id") }.toSet())
+                // Same epoch with altered contents is not the previously granted event.
+                resident = resident.map { if (it.metaId == "tt3") it.copy(timeOffsetMs = 5000) else it }
+                assertTrue(manager.syncUp())
+                assertEquals(1, output().length())
+                disk.failWrites = true
+                assertFalse(manager.importThisDeviceLibraryAndPush())
+                disk.failWrites = false
+                assertTrue(manager.importThisDeviceLibraryAndPush())
+                assertEquals(setOf("tt1", "tt2", "tt3"), (0 until output().length()).map { output().getJSONObject(it).getString("id") }.toSet())
+                resident = resident + publicationRow("tt99", 5000)
+                manager.installLibraryPublicationProofTestSeam(OwnerLibraryPublicationProofs(disk))
+                assertTrue(manager.pushThisDevice())
+                assertEquals(3, output().length())
+                manager.cancelSyncTestWork()
+            }
+        } finally { LibraryTombstones.activateAccount(null); Dispatchers.resetMain() }
+    }
+
+    @Test
     fun `queued typed add and remove capture invocation owner before dispatcher can adopt B`() = kotlinx.coroutines.test.runTest {
         Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
         try {
@@ -173,6 +256,8 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             for (mode in listOf("success", "tombstoneOnly", "readded", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
                 val context = MemoryContext()
                 val manager = VortXSyncManager(context)
+                val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
+                manager.installLibraryPublicationProofTestSeam(proofs)
                 // Construct an empty store without Android's device-language bootstrap in this JVM test.
                 val store = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
                     .apply { isAccessible = true }.newInstance(context)
@@ -199,14 +284,18 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                 fun replaceAccount() = manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("B-token", accountB, key))
                 var nativeWrites = 0
                 var attemptedApply = false
+                var restoredProjection: String? = null
                 val native = com.vortx.android.engine.NativeOwnerLibraryGateway(
                     read = {
                         if (mode == "afterRead") replaceAccount()
                         // Both VortX accounts deliberately share this same native UID.
-                        """{"uid":"same-native","events":[{"meta":{"id":"tt1","type":"movie","name":"Movie"},"currentVideoId":"tt1","timeOffsetMs":1000,"durationMs":50000,"eventEpochMs":1000,"lastWatchedEpochMs":1000,"watched":null,"currentVideoWatched":false,"wholeTitleWatched":false,"timesWatched":0,"removed":false}]}"""
+                        restoredProjection ?: """{"uid":"same-native","events":[{"meta":{"id":"tt1","type":"movie","name":"Movie"},"currentVideoId":"tt1","timeOffsetMs":1000,"durationMs":50000,"eventEpochMs":1000,"lastWatchedEpochMs":1000,"watched":null,"currentVideoWatched":false,"wholeTitleWatched":false,"timesWatched":0,"removed":false}]}"""
                     },
                     restore = { request ->
                         nativeWrites++
+                        val applied = JSONObject(request).getJSONArray("events").getJSONObject(0)
+                        applied.put("eventEpochMs", applied.get("genuineEventEpochMs"))
+                        restoredProjection = JSONObject().put("uid", "same-native").put("events", JSONArray().put(applied)).toString()
                         if (mode == "tombstoneOnly") {
                             val event = JSONObject(request).getJSONArray("events").getJSONObject(0)
                             assertTrue(event.getBoolean("removed"))
@@ -222,11 +311,19 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                 manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
                     private val lease = object : AccountAddonGatewayLease {}
                     override fun captureAccountLibraryLease(): AccountAddonGatewayLease = lease
+                    override fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease) = NativeLibraryOwner("same-native")
                     override suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)) = native.snapshot("same-native", admit)
                     override suspend fun addAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): Boolean {
                         attemptedApply = true
                         if (mode == "beforeDispatch") replaceAccount()
                         return native.apply("same-native", items, admit)
+                    }
+                    override suspend fun restoreAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): AccountLibraryRestoreResult {
+                        attemptedApply = true
+                        if (mode == "beforeDispatch") replaceAccount()
+                        var restored = emptyList<VortXSyncDoc.OwnerLibraryItem>()
+                        val accepted = native.apply("same-native", items, admit) { restored = it }
+                        return AccountLibraryRestoreResult(accepted, restored)
                     }
                 })
                 manager.syncDown(force = true)
@@ -234,6 +331,8 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                     assertTrue(attemptedApply)
                     assertEquals(1, nativeWrites)
                     assertEquals(2L, manager.lastAppliedVersion())
+                    val actual = requireNotNull(native.snapshot("same-native") { it() }).single()
+                    assertEquals("Synthetic removals cannot claim inherited history", mode == "success", proofs.owns(accountA.id, NativeLibraryOwner("same-native"), actual))
                 } else if (mode == "readded") {
                     assertEquals(0, nativeWrites)
                     assertFalse("Newer explicit add wins", "tt1" in LibraryTombstones(context).all())

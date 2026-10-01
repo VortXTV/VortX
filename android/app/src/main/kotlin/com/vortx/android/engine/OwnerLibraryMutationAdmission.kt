@@ -2,6 +2,7 @@ package com.vortx.android.engine
 
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.sync.LibraryTombstones
+import com.vortx.android.sync.OwnerLibraryPublicationLease
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
 
@@ -11,6 +12,7 @@ internal class OwnerLibraryMutationAdmission private constructor(
     private val permit: HistoryReadPermit,
     private val admit: ((() -> Boolean) -> Boolean),
     private val tombstones: LibraryTombstones,
+    val publication: OwnerLibraryPublicationLease?,
 ) {
     fun requireCurrent() {
         check(fence.readIsCurrent(permit) && admit { true }) { "Library owner changed. Try again." }
@@ -30,10 +32,11 @@ internal class OwnerLibraryMutationAdmission private constructor(
             fence: HistoryOwnerFence,
             admit: ((() -> Boolean) -> Boolean)?,
             tombstones: () -> LibraryTombstones,
+            publication: OwnerLibraryPublicationLease? = null,
         ): OwnerLibraryMutationAdmission {
             val accountAdmission = checkNotNull(admit) { "Library account is unavailable. Try again." }
             val permit = checkNotNull(fence.captureRead()) { "History owner is changing. Try again." }
-            return OwnerLibraryMutationAdmission(fence, permit, accountAdmission, tombstones()).also { it.requireCurrent() }
+            return OwnerLibraryMutationAdmission(fence, permit, accountAdmission, tombstones(), publication).also { it.requireCurrent() }
         }
     }
 }

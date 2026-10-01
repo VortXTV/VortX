@@ -140,6 +140,7 @@ interface AccountAddonSyncGateway {
 /** Owner-library boundary: positive reads and receipt-validated restores share the account admission lock. */
 interface AccountLibrarySyncGateway {
     fun captureAccountLibraryLease(): AccountAddonGatewayLease?
+    fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease): NativeLibraryOwner? = null
     /** Null means native state is not positively ready; an empty list means a confirmed empty library. */
     suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)): List<VortXSyncDoc.OwnerLibraryItem>?
     suspend fun addAccountLibraryItems(
@@ -147,6 +148,8 @@ interface AccountLibrarySyncGateway {
         items: List<VortXSyncDoc.OwnerLibraryItem>,
         admit: ((() -> Boolean) -> Boolean),
     ): Boolean
+    suspend fun restoreAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): AccountLibraryRestoreResult =
+        AccountLibraryRestoreResult(addAccountLibraryItems(nativeLease, items, admit))
 }
 
 /**
@@ -903,6 +906,14 @@ class VortXSyncManager(context: Context) {
     private val debridKeys = DebridKeys(appContext)
     private val metadataKeys = MetadataProviderKeys(appContext)
     @Volatile private var libraryTombstones = LibraryTombstones(appContext)
+    private var libraryPublicationProofs = OwnerLibraryPublicationProofs(appContext)
+
+    internal fun installLibraryPublicationProofTestSeam(proofs: OwnerLibraryPublicationProofs) { libraryPublicationProofs = proofs }
+
+    internal fun captureLibraryPublicationLease(): OwnerLibraryPublicationLease? {
+        val lease = captureSyncLease() ?: return null
+        return OwnerLibraryPublicationLease(lease.accountId, libraryPublicationProofs, syncLeaseAdmission(lease))
+    }
 
     private fun bindLibraryAccount(accountId: String?) {
         LibraryTombstones.activateAccount(accountId)
@@ -1495,6 +1506,8 @@ class VortXSyncManager(context: Context) {
         }
     }
 
+    internal fun cancelSyncTestWork() { cancelSessionWork() }
+
     // MARK: - Encrypted sync document: the engine (syncUp / syncDown)
     //
     // Kotlin port of the sync-engine half of Apple `VortXSyncManager` (`syncUp` / `syncDown`, the
@@ -1838,7 +1851,11 @@ class VortXSyncManager(context: Context) {
         }.orEmpty()
         val localOwnerLibrary = libraryGateway?.let { gateway ->
             val nativeLease = gateway.captureAccountLibraryLease()
-            if (nativeLease != null) gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) else null
+            if (nativeLease != null) {
+                val raw = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease))
+                val native = gateway.nativeLibraryOwner(nativeLease)
+                if (native == null) null else raw?.filter { libraryPublicationProofs.owns(lease.accountId, native, it) }
+            } else null
         }
         if (!isSyncLeaseCurrent(lease)) return null
         val parsed = VortXSyncDoc.parse(doc)
@@ -2255,7 +2272,17 @@ class VortXSyncManager(context: Context) {
                 item.copy(removed = true, eventEpochMs = epoch) else null
         }
         val candidates = OwnerLibraryHistoryPolicy.newerIncoming(eligible + membershipRemovals, local)
-        return (candidates.isEmpty() || gateway.addAccountLibraryItems(nativeLease, candidates, syncLeaseAdmission(lease))) && isSyncLeaseCurrent(lease)
+        if (candidates.isEmpty()) return isSyncLeaseCurrent(lease)
+        val result = gateway.restoreAccountLibraryItems(nativeLease, candidates, syncLeaseAdmission(lease))
+        if (!result.accepted || !isSyncLeaseCurrent(lease)) return false
+        val native = gateway.nativeLibraryOwner(nativeLease)
+        if (native != null) {
+            // Only canonical account document rows can establish ownership. A synthetic membership
+            // removal assembled from a resident foreign row must never claim its inherited history.
+            val canonical = result.restored.filter { actual -> eligible.any { OwnerLibraryPublicationProofs.matchesRestored(it, actual) } }
+            if (canonical.isNotEmpty() && !syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grant(lease.accountId, native, canonical) }) return false
+        }
+        return isSyncLeaseCurrent(lease)
     }
 
     /**
@@ -2436,6 +2463,17 @@ class VortXSyncManager(context: Context) {
         if (retryPendingPushBeforePull(lease)) return false
         val pushed = syncUp(lease)
         return pushed && isSyncLeaseCurrent(lease)
+    }
+
+    /** Explicit Keep device choice only. Sync now, automatic empty seeding, and Merge both never grant. */
+    suspend fun importThisDeviceLibraryAndPush(): Boolean {
+        val lease = captureSyncLease() ?: return false
+        val gateway = libraryGateway ?: return false
+        val nativeLease = gateway.captureAccountLibraryLease() ?: return false
+        val native = gateway.nativeLibraryOwner(nativeLease) ?: return false
+        val snapshot = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
+        if (!syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grant(lease.accountId, native, snapshot) }) return false
+        return syncUp(lease) && isSyncLeaseCurrent(lease)
     }
 
     /** "Sync now" recommended path: union both ways so EVERY profile from both sides survives, then push. */

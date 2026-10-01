@@ -9,6 +9,27 @@ import org.junit.Test
 import java.time.Instant
 
 class NativeOwnerLibraryGatewayTest {
+    @Test fun `restore ownership witness requires successful exact receipt and matching postread`() {
+        for (mode in listOf("exact", "noOp", "wrongReceipt", "unavailablePost", "alteredPost", "expiredPost", "metadata")) {
+            val requested = item().copy(currentVideoWatched = null)
+            var current = if (mode == "noOp") listOf(requested) else emptyList()
+            var restored = false
+            var active = true
+            var witnessed = emptyList<VortXSyncDoc.OwnerLibraryItem>()
+            val gateway = NativeOwnerLibraryGateway(read = {
+                if (restored && mode == "expiredPost") active = false
+                if (restored && mode == "unavailablePost") "null" else projection(current)
+            }, restore = { request ->
+                restored = true
+                current = listOf(if (mode == "alteredPost") requested.copy(timeOffsetMs = 999) else requested)
+                if (mode == "wrongReceipt") "null" else receipt(request)
+            }, add = {})
+            val incoming = if (mode == "metadata") requested.copy(lastWatched = null, eventEpochMs = null, watched = null, timesWatched = 0) else requested
+            gateway.apply("native", listOf(incoming), { operation -> active && operation() }) { witnessed = it }
+            assertEquals(mode, if (mode == "exact") 1 else 0, witnessed.size)
+        }
+    }
+
     private val permit: ((() -> Boolean) -> Boolean) = { it() }
     private fun item(id: String = "tt1", epoch: Long = 2000, type: String = "series") = VortXSyncDoc.OwnerLibraryItem(
         id, type, "Title", null, if (type == "movie") id else "$id:1:2", 0, 50_000,
