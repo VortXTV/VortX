@@ -41,6 +41,7 @@ struct CacheFlushFlight<Owner: Equatable> {
     enum Result: String, Equatable {
         case pending
         case commandAccepted = "command-accepted"
+        case timedOut = "timed-out"
         case seekCommandError = "seek-command-error"
         case canceled
     }
@@ -51,6 +52,10 @@ struct CacheFlushFlight<Owner: Equatable> {
     let target: Double
     let targetArgument: String
     let startUptime: TimeInterval
+    let originalSeekableCache: String
+    let lowLevelSeeksAtIssue: Int
+    var wasPaused: Bool
+    var reissues = 0
     var coalescedCount = 0
     var phase: Phase = .seeking
     var result: Result = .pending
@@ -85,7 +90,10 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
         target: Double,
         targetArgument: String,
         startUptime: TimeInterval,
-        timeoutWorkItem: DispatchWorkItem
+        timeoutWorkItem: DispatchWorkItem,
+        originalSeekableCache: String = "auto",
+        lowLevelSeeksAtIssue: Int = 0,
+        wasPaused: Bool = false
     ) -> CacheFlushFlight<Owner> {
         precondition(target.isFinite && target > 0)
         precondition(!targetArgument.isEmpty)
@@ -100,6 +108,9 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
             target: target,
             targetArgument: targetArgument,
             startUptime: startUptime,
+            originalSeekableCache: originalSeekableCache,
+            lowLevelSeeksAtIssue: lowLevelSeeksAtIssue,
+            wasPaused: wasPaused,
             timeoutWorkItem: timeoutWorkItem
         )
         current = flight
@@ -108,6 +119,10 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
 
     func matches(id: UInt64, owner: Owner) -> Bool {
         current?.id == id && current?.owner == owner
+    }
+
+    func acceptsEvent(id: UInt64, owner: Owner, attempt: Int) -> Bool {
+        matches(id: id, owner: owner) && current?.reissues == attempt
     }
 
     mutating func markSeekCommandAccepted(id: UInt64, owner: Owner) -> Bool {
@@ -135,8 +150,7 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
         return true
     }
 
-    /// The single bounded settle-window edge accepts a successful seek. It
-    /// requires the exact flight identity and never consults a replacement's current ID.
+    /// Deadline expiration is a failure, never proof of transport or memory relief.
     @discardableResult
     mutating func settle(id: UInt64, owner: Owner) -> CacheFlushFlight<Owner>? {
         guard let flight = current,
@@ -144,7 +158,7 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
               flight.owner == owner,
               flight.phase == .awaitingSeekEvent || flight.phase == .settling,
               flight.result == .pending else { return nil }
-        return finish(result: .commandAccepted)
+        return finish(result: .timedOut)
     }
 
     /// A token-fenced recovery edge proves the forced seek has crossed mpv's transport restart boundary.
@@ -152,7 +166,8 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
     mutating func completeOnProgress(
         owner: Owner,
         observedPosition: Double,
-        progressEpsilon: Double
+        progressEpsilon: Double,
+        lowLevelSeeks: Int? = nil
     ) -> CacheFlushFlight<Owner>? {
         guard let flight = current,
               flight.owner == owner,
@@ -161,17 +176,39 @@ struct CacheFlushSingleFlight<Owner: Equatable> {
               observedPosition.isFinite,
               progressEpsilon.isFinite,
               progressEpsilon >= 0,
-              observedPosition >= flight.target + progressEpsilon else { return nil }
+              observedPosition >= flight.target + progressEpsilon,
+              abs(observedPosition - flight.target) <= 2,
+              let lowLevelSeeks, lowLevelSeeks > flight.lowLevelSeeksAtIssue else { return nil }
         return finish(result: .commandAccepted)
     }
 
     @discardableResult
-    mutating func completeOnPlaybackRestart(owner: Owner) -> CacheFlushFlight<Owner>? {
+    mutating func completeOnPlaybackRestart(owner: Owner, position: Double? = nil,
+                                          lowLevelSeeks: Int? = nil) -> CacheFlushFlight<Owner>? {
         guard let flight = current,
               flight.owner == owner,
               flight.phase == .settling,
-              flight.result == .pending else { return nil }
+              flight.result == .pending,
+              let position, position.isFinite, abs(position - flight.target) <= 2,
+              let lowLevelSeeks, lowLevelSeeks > flight.lowLevelSeeksAtIssue else { return nil }
         return finish(result: .commandAccepted)
+    }
+
+    /// Runtime options reach the demux thread asynchronously. One completed in-cache seek may
+    /// therefore need reissuing; retain the original deadline and never repeat after low-level work began.
+    mutating func reissueAfterCachedRestart(owner: Owner, lowLevelSeeks: Int?) -> CacheFlushFlight<Owner>? {
+        guard var flight = current, flight.owner == owner, flight.phase == .settling,
+              flight.reissues == 0, let lowLevelSeeks,
+              lowLevelSeeks == flight.lowLevelSeeksAtIssue else { return nil }
+        flight.reissues = 1
+        flight.phase = .seeking
+        current = flight
+        return flight
+    }
+
+    mutating func updateTransportIntent(owner: Owner, paused: Bool) {
+        guard current?.owner == owner else { return }
+        current?.wasPaused = paused
     }
 
     @discardableResult
@@ -372,7 +409,7 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     mutating func completeReloadAtPosition(owner: Owner, position: Double) -> Intent? {
         guard let intent = current, intent.owner == owner,
               intent.phase == .awaitingReloadPosition,
-              position.isFinite else { return nil }
+              position.isFinite, abs(position - intent.target) <= 2 else { return nil }
         current = nil
         return intent
     }
@@ -390,10 +427,10 @@ struct SeekEOFRecoveryPolicy<Owner: Equatable> {
     /// changing a newer reload's eventual completion state.
     mutating func updateTransportIntent(owner: Owner, paused: Bool) -> UInt64? {
         guard var intent = current, intent.owner == owner else { return nil }
+        intent.wasPaused = paused
+        current = intent
         switch intent.phase {
         case .awaitingReloadFile, .awaitingReloadSeekEvent, .awaitingReloadPosition:
-            intent.wasPaused = paused
-            current = intent
             return intent.transportGeneration
         default:
             return nil
