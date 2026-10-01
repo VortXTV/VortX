@@ -79,7 +79,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/stremiox-core
-          ref: f38023a1b6358ad374c365d2bcd6a84f34b189fd
+          ref: 31c66611822043e089f5819ad232a5df93975873
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

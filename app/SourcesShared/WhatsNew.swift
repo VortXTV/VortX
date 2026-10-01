@@ -12,7 +12,8 @@ enum WhatsNew {
         "Android supports direct Newznab indexers and multiple prioritized NNTP servers. Encrypted account/profile configuration, decoded yEnc coverage, provider fallback and cancellation fences protect source and next-episode preparation.",
         "Optional Android Trakt Continue Watching carries typed episode intent and resolves artwork. Session and toggle changes invalidate old results. Manual detail check-in offers an explicit conflict action without marking anything watched.",
         "Android phone and TV share Library segments. TV add-on ordering has remote move controls; Home rail order interoperates with Apple account documents and backups.",
-        "The candidate native owner-library path preserves zero progress, watched counts and per-video state separately. Receipt validation, account-specific removals and pre-dispatch fences are implemented; final account-publication provenance remains a release gate.",
+        "Account-owned viewing history and manual watched intent interoperate across Apple and Android without changing Saved membership. Exact persisted proof, captured operations and separate viewing clocks protect deferred remove/re-add and newer peer resumes from metadata-only timestamps.",
+        "VortX Player cache maintenance no longer resets playback before its seek executes. Owned low-level seek evidence, bounded settlement and exact paused-reopen admission address the observed false EOF, restart and lost-resume paths without changing the memory limits.",
         "Beta 17 playback, automatic-skip, source-owned suggestions, subtitle metadata and artwork repairs are retained. Apple build 254 and Android version code 239; sustained DV/NNTP, frame pacing, physical remote journeys and complete Android visual parity are not claimed verified."
     ]
 

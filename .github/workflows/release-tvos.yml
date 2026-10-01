@@ -136,7 +136,7 @@ jobs:
           repository: VortXTV/stremiox-core
           # Shared Apple/Android wrapper pin. Retains the shipping add-on lifecycle fixes and adds
           # independently reviewed owner-library receipts; locked native tests passed against its Git pin.
-          ref: f38023a1b6358ad374c365d2bcd6a84f34b189fd
+          ref: 31c66611822043e089f5819ad232a5df93975873
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false

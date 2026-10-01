@@ -113,7 +113,7 @@ jobs:
           repository: VortXTV/stremiox-core
           # Same reviewed, immutable wrapper as both release lanes. Its lockfile resolves the
           # published Git dependency; callable history exports are verified below for every ABI.
-          ref: f38023a1b6358ad374c365d2bcd6a84f34b189fd
+          ref: 31c66611822043e089f5819ad232a5df93975873
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: core
           persist-credentials: false
