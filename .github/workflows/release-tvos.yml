@@ -58,6 +58,11 @@ on:
         description: "Optional numeric draft-release ID. When set, CI resolves the draft by ID directly instead of by tag lookup (GITHUB_TOKEN tag lookup can miss drafts)."
         required: false
         default: ""
+      resume_handoff:
+        description: 'Main-only coordinator resume. JSON: {"runId":123,"attempt":1,"appsArtifactId":123,"feedArtifactId":124,"sourceCommit":"40-hex","build":"123"}. Never rebuilds or changes the release tag.'
+        required: false
+        type: string
+        default: ""
 
 # Workflow-wide default is READ-ONLY: repo-controlled build code (scripts/*, app/scripts/*,
 # the xcodegen'd build phases) must never hold blanket write authority. Two narrowly scoped
@@ -69,7 +74,7 @@ permissions:
 
 jobs:
   build-tvos:
-    if: github.event_name != 'release'
+    if: github.event_name != 'release' && inputs.resume_handoff == ''
     # Environment gate for the token-bearing build job (trust boundary): the `engine-ci` environment
     # carries explicit deployment protection policies for branch and tag build refs. A run started
     # from any other ref blocks before any build step executes, keeping ENGINE_REPO_TOKEN unreachable
@@ -1060,7 +1065,12 @@ jobs:
     outputs:
       release_id: ${{ steps.identity.outputs.release_id }}
       apple_only: ${{ steps.identity.outputs.apple_only }}
-    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag)
+    if: >-
+      always() && !cancelled() && github.event_name == 'workflow_dispatch' &&
+      inputs.release_tag != '' && inputs.tvos_test_only != true && (
+        (inputs.resume_handoff == '' && needs.build-tvos.result == 'success' && github.ref == format('refs/tags/{0}', inputs.release_tag)) ||
+        (inputs.resume_handoff != '' && needs.build-tvos.result == 'skipped' && github.ref == 'refs/heads/main')
+      )
     concurrency:
       group: vortx-release-${{ inputs.release_tag }}
       cancel-in-progress: false
@@ -1068,18 +1078,117 @@ jobs:
     environment: release-approval
     permissions:
       contents: write
+      actions: read
     timeout-minutes: 35
     steps:
+      - name: Validate immutable handoff provenance before coordinator resume
+        id: handoff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          RESUME_HANDOFF: ${{ inputs.resume_handoff }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RESUME_HANDOFF" ]; then
+            echo "build_source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # GITHUB_SHA remains the reviewed coordinator code commit. Artifact provenance is a
+          # separate value, accepted only after GitHub's original attempt and job evidence agree.
+          [ "$GITHUB_REF" = refs/heads/main ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || exit 1
+          [ "$(gh api --jq '.object.sha' -- "repos/$GH_REPO/git/ref/heads/main")" = "$GITHUB_SHA" ] || { echo '::error::resume must execute current main'; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || exit 1
+          jq -e '
+            type == "object" and
+            (keys == ["appsArtifactId","attempt","build","feedArtifactId","runId","sourceCommit"]) and
+            all(.runId,.attempt,.appsArtifactId,.feedArtifactId; type == "number" and . > 0 and . == floor and . < 9007199254740992) and
+            (.appsArtifactId != .feedArtifactId) and
+            (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.build | type == "string" and test("^[0-9]+$"))' <<<"$RESUME_HANDOFF" >/dev/null
+          RUN_ID="$(jq -r '.runId' <<<"$RESUME_HANDOFF")"; ATTEMPT="$(jq -r '.attempt' <<<"$RESUME_HANDOFF")"
+          BUILD_SOURCE_SHA="$(jq -r '.sourceCommit' <<<"$RESUME_HANDOFF")"
+          APPS_ID="$(jq -r '.appsArtifactId' <<<"$RESUME_HANDOFF")"; FEED_ID="$(jq -r '.feedArtifactId' <<<"$RESUME_HANDOFF")"
+          # A same-named workflow on an arbitrary tag is not a reviewed release source. The
+          # original build commit must already belong to the current main coordinator history.
+          gh api -- "repos/$GH_REPO/compare/$BUILD_SOURCE_SHA...$GITHUB_SHA" | jq -e --arg source "$BUILD_SOURCE_SHA" '
+            (.status == "ahead" or .status == "identical") and .merge_base_commit.sha == $source' >/dev/null
+          gh api -- "repos/$GH_REPO/actions/runs/$RUN_ID" > "$RUNNER_TEMP/source-latest-run.json"
+          gh api -- "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT" > "$RUNNER_TEMP/source-run.json"
+          for RECORD in "$RUNNER_TEMP/source-latest-run.json" "$RUNNER_TEMP/source-run.json"; do
+            jq -e --arg repo "$GH_REPO" --arg sha "$BUILD_SOURCE_SHA" --arg tag "$TAG" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" '
+              .id == $run and .run_attempt == $attempt and .repository.full_name == $repo and .head_repository.full_name == $repo and
+              (.repository.id | type == "number" and . > 0) and .head_repository.id == .repository.id and
+              .path == ".github/workflows/release-tvos.yml" and .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $tag and
+              .status == "completed" and (.conclusion == "success" or .conclusion == "failure")' "$RECORD" >/dev/null
+          done
+          # Paginate before flattening: a missing build or a truncated job list never implies success.
+          gh api --paginate --slurp -- "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" | jq '[.[].jobs[]]' > "$RUNNER_TEMP/source-jobs.json"
+          jq -e --arg sha "$BUILD_SOURCE_SHA" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --slurpfile source "$RUNNER_TEMP/source-run.json" '
+            all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed") and
+            ([.[] | select(.name == "build-tvos" and .conclusion == "success")] | length == 1) and
+            ([.[] | select(.name == "build-tvos")] | length == 1) and
+            ([.[] | select(.name == "attach-release")] | length == 1) and
+            ([.[] | select(.name == "attach-release") | .steps[] | select(.name == "Attach only exact draft assets and create the authenticated staged receipt" and .status == "completed" and .conclusion == "success")] | length == 1) and
+            (if $source[0].conclusion == "failure" then
+              ([.[] | select(.conclusion == "failure")] | map(.name) == ["attach-release"]) and
+              ([.[] | select(.conclusion != "success" and .conclusion != "failure" and .conclusion != "skipped")] | length == 0) and
+              ([.[] | select(.name == "attach-release") | .steps[] | select(.conclusion == "failure")] | map(.name) == ["Atomically activate the staged feed, prove routes, then publish last"])
+            else all(.[]; .conclusion == "success" or .conclusion == "skipped") and
+              ([.[] | select(.name == "attach-release" and .conclusion == "success")] | length == 1) end)' "$RUNNER_TEMP/source-jobs.json" >/dev/null
+          for SPEC in "$APPS_ID|VortX-tvOS-ci|Upload the immutable app handoff" "$FEED_ID|VortX-release-feed|Upload the immutable feed handoff"; do
+            ID="${SPEC%%|*}"; REST="${SPEC#*|}"; NAME="${REST%%|*}"; UPLOAD_STEP="${REST#*|}"
+            gh api -- "repos/$GH_REPO/actions/artifacts/$ID" > "$RUNNER_TEMP/source-artifact.json"
+            jq -e --argjson id "$ID" --arg name "$NAME" --arg step "$UPLOAD_STEP" --slurpfile source "$RUNNER_TEMP/source-run.json" --slurpfile jobs "$RUNNER_TEMP/source-jobs.json" '
+              . as $artifact | $source[0] as $run |
+              .id == $id and .name == $name and .expired == false and .size_in_bytes > 0 and
+              (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+              .workflow_run.id == $run.id and .workflow_run.head_sha == $run.head_sha and .workflow_run.head_branch == $run.head_branch and
+              .workflow_run.repository_id == $run.repository.id and .workflow_run.head_repository_id == $run.head_repository.id and
+              ([$jobs[0][] | select(.name == "build-tvos") | .steps[] | select(.name == $step and .conclusion == "success" and .status == "completed") |
+                select(.started_at <= $artifact.created_at and .completed_at >= $artifact.created_at)] | length == 1)' "$RUNNER_TEMP/source-artifact.json" >/dev/null
+          done
+          {
+            echo "build_source_sha=$BUILD_SOURCE_SHA"
+            echo "expected_build=$(jq -r '.build' <<<"$RESUME_HANDOFF")"
+            echo "run_id=$RUN_ID"
+            echo "apps_id=$APPS_ID"
+            echo "feed_id=$FEED_ID"
+          } >> "$GITHUB_OUTPUT"
+          echo "Reviewed coordinator $GITHUB_SHA resumes source $BUILD_SOURCE_SHA from run $RUN_ID attempt $ATTEMPT"
+
       - name: Download the built apps
+        if: inputs.resume_handoff == ''
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: VortX-tvOS-ci
           path: out
 
       - name: Download the immutable feed artifact
+        if: inputs.resume_handoff == ''
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: VortX-release-feed
+          path: feed-artifact
+
+      - name: Download only the approved original apps artifact
+        if: inputs.resume_handoff != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.handoff.outputs.apps_id }}
+          run-id: ${{ steps.handoff.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          merge-multiple: true
+          path: out
+
+      - name: Download only the approved original feed artifact
+        if: inputs.resume_handoff != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: ${{ steps.handoff.outputs.feed_id }}
+          run-id: ${{ steps.handoff.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          merge-multiple: true
           path: feed-artifact
 
       - name: Bind the draft release, tag commit, and monotonic source before any write
@@ -1090,6 +1199,8 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           RELEASE_ID_INPUT: ${{ inputs.release_id }}
           APPLE_ONLY_INPUT: ${{ inputs.apple_only }}
+          BUILD_SOURCE_SHA: ${{ steps.handoff.outputs.build_source_sha }}
+          EXPECTED_BUILD: ${{ steps.handoff.outputs.expected_build }}
         run: |
           set -euo pipefail
           TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
@@ -1098,10 +1209,16 @@ jobs:
             exit 1
           fi
           MANIFEST=feed-artifact/manifest.json
-          jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" \
-            '.tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
+          jq -e --arg tag "$TAG" --arg commit "$BUILD_SOURCE_SHA" \
+            '.schemaVersion == 2 and .tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
           BUILD="$(jq -er '.build' "$MANIFEST")"
           [[ "$BUILD" =~ ^[0-9]+$ ]] || { echo "::error::feed artifact build is not numeric"; exit 1; }
+          [ -z "$EXPECTED_BUILD" ] || [ "$BUILD" = "$EXPECTED_BUILD" ] || { echo '::error::resume build differs from approved handoff'; exit 1; }
+          for SPEC in 'sourceSha256:source.json' 'appcastSha256:appcast.json' 'checksumSha256:SHA256SUMS-ci.txt'; do
+            KEY="${SPEC%%:*}"; FILE="feed-artifact/${SPEC#*:}"
+            EXPECTED_SHA="$(jq -er --arg key "$KEY" '.[$key]' "$MANIFEST")"
+            [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] && [ "$(shasum -a 256 "$FILE" | awk '{print $1}')" = "$EXPECTED_SHA" ] || { echo "::error::immutable feed bytes differ for $KEY"; exit 1; }
+          done
           if [[ "$RELEASE_ID_INPUT" =~ ^[0-9]+$ ]]; then
             RELEASE_JSON="$(gh api "repos/$GH_REPO/releases/$RELEASE_ID_INPUT")"
           else
@@ -1139,7 +1256,7 @@ jobs:
             TAG_SHA="$(jq -r '.object.sha' <<<"$TAG_OBJECT")"
             TAG_TYPE="$(jq -r '.object.type' <<<"$TAG_OBJECT")"
           done
-          [ "$TAG_TYPE" = commit ] && [ "$TAG_SHA" = "$GITHUB_SHA" ] || { echo "::error::tag $TAG is not bound to this immutable build"; exit 1; }
+          [ "$TAG_TYPE" = commit ] && [ "$TAG_SHA" = "$BUILD_SOURCE_SHA" ] || { echo "::error::tag $TAG is not bound to this immutable build"; exit 1; }
           gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" | jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .draft == true and .prerelease == $prerelease' >/dev/null
           MAIN_REF="$(gh api -- "repos/$GH_REPO/git/ref/heads/main")"
           MAIN_HEAD="$(jq -er '.object.sha' <<<"$MAIN_REF")"
@@ -1351,15 +1468,14 @@ jobs:
             done
           }
           commit_source_bytes() {
-            local file="$1" message="$2" expected_head="${3:-}" main_head base_tree source_b64 blob_sha tree_sha commit_sha
+            local file="$1" message="$2" expected_head="${3:-}" main_head base_tree blob_sha tree_sha commit_sha
             main_head="$(gh api --jq '.object.sha' -- "repos/$GH_REPO/git/ref/heads/main")"
             if [ -n "$expected_head" ] && [ "$main_head" != "$expected_head" ]; then
               echo "::error::main moved from the guarded head $expected_head to $main_head; refusing feed overwrite"
               return 1
             fi
             base_tree="$(gh api --jq '.tree.sha' -- "repos/$GH_REPO/git/commits/$main_head")"
-            source_b64="$(base64 <"$file" | tr -d '\n')"
-            blob_sha="$(jq -cn --arg content "$source_b64" '{content:$content,encoding:"base64"}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/blobs")"
+            blob_sha="$(jq -cn --rawfile source "$file" '{content:($source | @base64),encoding:"base64"}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/blobs")"
             tree_sha="$(jq -cn --arg base "$base_tree" --arg blob "$blob_sha" '{base_tree:$base,tree:[{path:"altstore/source.json",mode:"100644",type:"blob",sha:$blob}]}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/trees")"
             commit_sha="$(jq -cn --arg message "$message" --arg tree "$tree_sha" --arg parent "$main_head" '{message:$message,tree:$tree,parents:[$parent],author:{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"},committer:{name:"Mamaclapper",email:"mamaclapper@users.noreply.github.com"}}' | gh api --method POST --input - --jq '.sha' -- "repos/$GH_REPO/git/commits")"
             jq -cn --arg sha "$commit_sha" '{sha:$sha,force:false}' | gh api --method PATCH --input - --jq '.object.sha' -- "repos/$GH_REPO/git/refs/heads/main" >/dev/null
