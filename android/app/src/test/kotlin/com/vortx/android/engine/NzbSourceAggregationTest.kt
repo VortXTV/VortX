@@ -27,8 +27,9 @@ class NzbSourceAggregationTest {
         val indexer = StreamGroup("Indexer", emptyList(), "nzbindexer:one")
         val partial = StreamLoadUpdate(listOf(normal), loaded = 1, total = 2, terminal = false)
         val terminal = StreamLoadUpdate(listOf(normal), loaded = 2, total = 2, terminal = true)
-        assertEquals(listOf(normal), appendNzbGroupsAtTerminal(partial, listOf(indexer)).groups)
-        assertEquals(listOf(normal, indexer), appendNzbGroupsAtTerminal(terminal, listOf(indexer)).groups)
+        val result = NzbSourceAggregation(listOf(indexer), admission = null)
+        assertEquals(listOf(normal), appendNzbGroupsAtTerminal(partial, result, admissionCurrent = true).groups)
+        assertEquals(listOf(normal, indexer), appendNzbGroupsAtTerminal(terminal, result, admissionCurrent = true).groups)
     }
 
     @Test fun cancelledOrChangedConfigAdmissionCannotPublishLateSearches() {
@@ -38,5 +39,23 @@ class NzbSourceAggregationTest {
         assertEquals(false, admission.accepts(scopeCurrent = false, currentRevision = 4, coroutineActive = true))
         assertEquals(false, admission.accepts(scopeCurrent = true, currentRevision = 5, coroutineActive = true))
         assertEquals(false, admission.accepts(scopeCurrent = true, currentRevision = 4, coroutineActive = false))
+    }
+
+    @Test fun completedSearchIsRecheckedAtTerminalBeforeItCanReachPrewarm() {
+        val normal = StreamGroup("Normal", emptyList())
+        val direct = StreamGroup("Indexer", emptyList(), "nzbindexer:one")
+        val scope = NzbIndexerStore.Scope(DebridOwnerToken(DebridOwnerScope.Account("a"), 1), "profile")
+        val completed = NzbSourceAggregation(listOf(direct), NzbSearchAdmission(scope, configRevision = 4))
+        val terminal = StreamLoadUpdate(listOf(normal), loaded = 2, total = 2, terminal = true)
+
+        // The indexer request completed for A@revision4, then settings changed while engine fan-out waited.
+        assertEquals(
+            listOf(normal),
+            appendNzbGroupsAtTerminal(terminal, completed, admissionCurrent = completed.admission!!.accepts(true, 5, true)).groups,
+        )
+        assertEquals(
+            listOf(normal, direct),
+            appendNzbGroupsAtTerminal(terminal, completed, admissionCurrent = completed.admission!!.accepts(true, 4, true)).groups,
+        )
     }
 }

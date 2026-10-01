@@ -19,7 +19,8 @@ internal class NzbIndexerStore(
     private val mutateCurrentOwner: (DebridOwnerToken, () -> Boolean) -> Boolean,
 ) {
     data class Scope(val owner: DebridOwnerToken, val profileId: String) {
-        val identity: String get() = "${owner.scope.storageSuffix}.${owner.generation}.$profileId"
+        /** Durable encrypted-record namespace; owner generation belongs only to the in-flight fence. */
+        val storageIdentity: String get() = "${owner.scope.storageSuffix}.$profileId"
     }
 
     data class Document(val revision: Long, val indexers: List<NzbIndexerConfig>)
@@ -58,9 +59,26 @@ internal class NzbIndexerStore(
     /** Blank [apiKey] retains a key only for an existing configuration; a new one needs a real key. */
     fun save(config: NzbIndexerConfig, apiKey: String): Boolean = captureScope()?.let { save(config, apiKey, it) } ?: false
 
-    fun save(config: NzbIndexerConfig, apiKey: String, scope: Scope): Boolean {
+    fun save(config: NzbIndexerConfig, apiKey: String, scope: Scope): Boolean =
+        save(config, apiKey, scope, expectedRevision = null, requireExpectedRevision = false)
+
+    /**
+     * Applies an editor action only to the exact owner/profile/document that produced its visible state.
+     * This prevents a cached Compose editor from retargeting a different profile after a switch.
+     */
+    fun saveFromRead(config: NzbIndexerConfig, apiKey: String, scope: Scope, expectedRevision: Long?): Boolean =
+        save(config, apiKey, scope, expectedRevision, requireExpectedRevision = true)
+
+    private fun save(
+        config: NzbIndexerConfig,
+        apiKey: String,
+        scope: Scope,
+        expectedRevision: Long?,
+        requireExpectedRevision: Boolean,
+    ): Boolean {
         if (!isCurrent(scope) || !config.isValidMetadata()) return false
         val existing = read(scope)
+        if (requireExpectedRevision && !nzbReadMatchesRevision(existing, expectedRevision)) return false
         val document = when (existing) {
             is Read.Ready -> existing.document
             Read.Missing -> Document(revision = 0, indexers = emptyList())
@@ -81,18 +99,34 @@ internal class NzbIndexerStore(
         if (key.isNotEmpty()) keys[normalized.id] = key
         if (keys[normalized.id].isNullOrBlank()) return false
         val encoded = encode(Document(document.revision + 1, next), keys) ?: return false
-        return mutateCurrentOwner(scope.owner) { isCurrent(scope) && secure.set(storageKey(scope), encoded) }
+        return mutateCurrentOwner(scope.owner) {
+            isCurrent(scope) &&
+                (!requireExpectedRevision || nzbReadMatchesRevision(read(scope), expectedRevision)) &&
+                secure.set(storageKey(scope), encoded)
+        }
     }
 
     fun remove(id: String): Boolean = captureScope()?.let { remove(id, it) } ?: false
 
-    fun remove(id: String, scope: Scope): Boolean {
-        val document = (read(scope) as? Read.Ready)?.document ?: return false
+    fun remove(id: String, scope: Scope): Boolean = remove(id, scope, expectedRevision = null, requireExpectedRevision = false)
+
+    /** See [saveFromRead]; deletes must be fenced by the same visible document revision. */
+    fun removeFromRead(id: String, scope: Scope, expectedRevision: Long?): Boolean =
+        remove(id, scope, expectedRevision, requireExpectedRevision = true)
+
+    private fun remove(id: String, scope: Scope, expectedRevision: Long?, requireExpectedRevision: Boolean): Boolean {
+        val existing = read(scope)
+        if (requireExpectedRevision && !nzbReadMatchesRevision(existing, expectedRevision)) return false
+        val document = (existing as? Read.Ready)?.document ?: return false
         if (!document.indexers.any { it.id == id }) return true
         val keys = decodeKeys(storageKey(scope)) ?: return false
         val next = document.indexers.filterNot { it.id == id }
         val encoded = encode(Document(document.revision + 1, next), keys - id) ?: return false
-        return mutateCurrentOwner(scope.owner) { isCurrent(scope) && secure.set(storageKey(scope), encoded) }
+        return mutateCurrentOwner(scope.owner) {
+            isCurrent(scope) &&
+                (!requireExpectedRevision || nzbReadMatchesRevision(read(scope), expectedRevision)) &&
+                secure.set(storageKey(scope), encoded)
+        }
     }
 
     /** Exposes a captured key only to the request adapter, never to UI callers. */
@@ -102,7 +136,7 @@ internal class NzbIndexerStore(
         return decodeKeys(storageKey(scope))?.get(id)?.takeIf { it.isNotBlank() && isCurrent(scope) }
     }
 
-    private fun storageKey(scope: Scope): String = "$PREFIX${scope.identity}"
+    private fun storageKey(scope: Scope): String = "$PREFIX${scope.storageIdentity}"
 
     private fun decodeKeys(key: String): Map<String, String>? {
         val snapshot = secure.confirmedSnapshot(key)
@@ -172,3 +206,10 @@ internal fun nzbStoreScopeIsCurrent(
     currentOwner: DebridOwnerToken?,
     currentProfileId: String?,
 ): Boolean = currentOwner == captured.owner && currentProfileId?.trim() == captured.profileId
+
+/** A missing record is revision zero for the purpose of an editor's first save. */
+internal fun nzbReadMatchesRevision(read: NzbIndexerStore.Read, expectedRevision: Long?): Boolean = when (read) {
+    is NzbIndexerStore.Read.Ready -> read.document.revision == expectedRevision
+    NzbIndexerStore.Read.Missing -> expectedRevision == null
+    else -> false
+}

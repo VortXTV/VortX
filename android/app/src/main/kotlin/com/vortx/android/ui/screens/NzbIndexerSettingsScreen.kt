@@ -53,8 +53,13 @@ internal fun NzbIndexerSettingsScreen(
     var editing by remember { mutableStateOf<NzbIndexerConfig?>(null) }
     var deleting by remember { mutableStateOf<NzbIndexerConfig?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
-    val snapshot = remember(revision) { store.read() }
+    // A screen may survive a profile/account switch. Every action below uses this exact read receipt,
+    // never whatever scope happens to be current at click time.
+    val readScope = remember(revision) { store.captureScope() }
+    val snapshot = remember(revision, readScope) { readScope?.let(store::read) ?: NzbIndexerStore.Read.Stale }
     val document = (snapshot as? NzbIndexerStore.Read.Ready)?.document
+    val readRevision = document?.revision
+    fun staleAction() { message = "Account, profile or indexer settings changed. Reopen this page." }
 
     Scaffold(
         topBar = {
@@ -83,8 +88,10 @@ internal fun NzbIndexerSettingsScreen(
                         Text(NzbIndexerEndpointPolicy.hostOnly(config.endpoint) ?: "Invalid endpoint")
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(checked = config.enabled, onCheckedChange = { enabled ->
-                                if (!store.save(config.copy(enabled = enabled), "")) message = "Could not update this indexer."
-                                revision++
+                                val saved = readScope?.let { scope ->
+                                    store.saveFromRead(config.copy(enabled = enabled), "", scope, readRevision)
+                                } == true
+                                if (saved) revision++ else staleAction()
                             })
                             Text(if (config.enabled) "Enabled" else "Disabled")
                             TextButton(onClick = { editing = config; message = null }) { Text("Edit") }
@@ -103,7 +110,8 @@ internal fun NzbIndexerSettingsScreen(
             testIndexer = testIndexer,
             onDismiss = { editing = null },
             onSave = { config, key ->
-                if (store.save(config, key)) { editing = null; message = null; revision++ } else message = "Could not save. Check the endpoint, API key and secure storage."
+                val saved = readScope?.let { scope -> store.saveFromRead(config, key, scope, readRevision) } == true
+                if (saved) { editing = null; message = null; revision++ } else staleAction()
             },
         )
     }
@@ -112,7 +120,15 @@ internal fun NzbIndexerSettingsScreen(
             onDismissRequest = { deleting = null },
             title = { Text("Delete ${config.name}?") },
             text = { Text("This removes the encrypted API key for this indexer from the current account and profile.") },
-            confirmButton = { TextButton(onClick = { if (!store.remove(config.id)) message = "Could not delete this indexer."; deleting = null; revision++ }) { Text("Delete") } },
+            confirmButton = { TextButton(onClick = {
+                val removed = readScope?.let { scope -> store.removeFromRead(config.id, scope, readRevision) } == true
+                if (removed) {
+                    deleting = null
+                    revision++
+                } else {
+                    staleAction()
+                }
+            }) { Text("Delete") } },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } },
         )
     }

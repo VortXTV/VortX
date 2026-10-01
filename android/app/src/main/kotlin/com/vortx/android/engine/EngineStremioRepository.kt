@@ -2267,9 +2267,10 @@ class EngineStremioRepository(
         // The current MetaDetails is already resident for both visible detail loads and the one-shot
         // CatalogRepository.streams() used by NEXT prewarm. Capture an immutable title/episode identity
         // before dispatching the stream reload; the aggregator additionally fences owner/profile/config
-        // revision before it returns, while this generation fence prevents a superseded request repainting.
+        // revision before it returns and again immediately before terminal publication; this generation
+        // fence independently prevents a superseded request repainting.
         val nzbSearch = nzbSearchForCurrentDetail(type, id, episodeId)
-        val nzbGroups = nzbSearch?.let { search -> async { nzbSourceAggregator.groups(search) } }
+        val nzbResult = nzbSearch?.let { search -> async { nzbSourceAggregator.aggregate(search) } }
         // Re-find sources: the engine caches this title's stream groups, so the plain Load below is a
         // no-op with ZERO add-on HTTP once they are resident. Unload the MetaDetails model FIRST so the
         // Load re-queries every stream add-on fresh and expired/dead sources are replaced. Default off:
@@ -2364,11 +2365,16 @@ class EngineStremioRepository(
             // Do not delay normal add-on first paint on a direct-indexer request. The final update is
             // appended only after engine fan-out settles; `streams().last()` (including NEXT prewarm)
             // therefore gets the complete list, and stale/cancelled requests cannot publish this tail.
-            if (update.terminal && nzbGroups != null) {
-                val directGroups = nzbGroups.await()
+            if (update.terminal && nzbResult != null) {
+                val directResult = nzbResult.await()
                 currentCoroutineContext().ensureActive()
-                if (streamLoadGate.isCurrent(generation) && directGroups.isNotEmpty()) {
-                    send(appendNzbGroupsAtTerminal(update, directGroups))
+                val merged = appendNzbGroupsAtTerminal(
+                    update = update,
+                    result = directResult,
+                    admissionCurrent = nzbSourceAggregator.isAdmitted(directResult, currentCoroutineContext().isActive),
+                )
+                if (streamLoadGate.isCurrent(generation) && merged != update) {
+                    send(merged)
                 }
             }
         }

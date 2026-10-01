@@ -16,7 +16,7 @@ import java.security.MessageDigest
 import kotlin.coroutines.coroutineContext
 
 /**
- * Direct Newznab source seam for the Android core bridge. It is intentionally independent of native
+ * Direct Newznab source seam. It is intentionally independent of native
  * stremio-core: external indexer groups are appended after the user's normal add-on order, and their
  * streams use the existing CoreStream-equivalent NZB fields so the ordinary Usenet resolver decides
  * availability. A search result is not a cache/readiness assertion.
@@ -25,10 +25,12 @@ internal class NzbSourceAggregator(
     private val store: NzbIndexerStore,
     private val client: NzbIndexerClient = NzbIndexerClient(),
 ) {
-    suspend fun groups(search: NzbSearch): List<StreamGroup> = coroutineScope {
-        val scope = store.captureScope() ?: return@coroutineScope emptyList()
-        val document = (store.read(scope) as? NzbIndexerStore.Read.Ready)?.document ?: return@coroutineScope emptyList()
+    suspend fun aggregate(search: NzbSearch): NzbSourceAggregation = coroutineScope {
+        val scope = store.captureScope() ?: return@coroutineScope NzbSourceAggregation.empty()
+        val document = (store.read(scope) as? NzbIndexerStore.Read.Ready)?.document
+            ?: return@coroutineScope NzbSourceAggregation.empty()
         val revision = document.revision
+        val admission = NzbSearchAdmission(scope, revision)
         val indexed = document.indexers.filter { it.enabled }.map { config ->
             async {
                 val key = store.keyFor(config.id, scope) ?: return@async null
@@ -39,22 +41,29 @@ internal class NzbSourceAggregator(
         coroutineContext.ensureActive()
         // A late result cannot admit across account/profile/config mutations.
         val current = (store.read(scope) as? NzbIndexerStore.Read.Ready)?.document
-        if (!NzbSearchAdmission(scope, revision).accepts(store.isCurrent(scope), current?.revision, coroutineContext.isActive)) {
-            return@coroutineScope emptyList()
+        if (!admission.accepts(store.isCurrent(scope), current?.revision, coroutineContext.isActive)) {
+            return@coroutineScope NzbSourceAggregation.empty(admission)
         }
-        indexed.mapNotNull { (config, releases) ->
-            releases.takeIf(List<NzbRelease>::isNotEmpty)?.let { releaseList ->
-                StreamGroup(
-                    addon = config.name,
-                    base = "$BASE${config.id}",
-                    streams = releaseList.map { release -> release.toStream(config.id, config.name) },
-                )
-            }
-        }
+        NzbSourceAggregation(
+            groups = indexed.mapNotNull { (config, releases) ->
+                releases.takeIf(List<NzbRelease>::isNotEmpty)?.let { releaseList ->
+                    StreamGroup(
+                        addon = config.name,
+                        base = "$BASE${config.id}",
+                        streams = releaseList.map { release -> release.toStream(config.id, config.name) },
+                    )
+                }
+            },
+            admission = admission,
+        )
     }
 
-    /** Keeps normal, user-ordered add-on groups first and preserves the saved indexer order after them. */
-    suspend fun merge(normalGroups: List<StreamGroup>, search: NzbSearch): List<StreamGroup> = mergeNzbGroups(normalGroups, groups(search))
+    /** Re-check immediately before the terminal update reaches a visible/prewarm consumer. */
+    fun isAdmitted(result: NzbSourceAggregation, coroutineActive: Boolean = true): Boolean {
+        val admission = result.admission ?: return result.groups.isEmpty()
+        val current = (store.read(admission.scope) as? NzbIndexerStore.Read.Ready)?.document
+        return admission.accepts(store.isCurrent(admission.scope), current?.revision, coroutineActive)
+    }
 
     private fun NzbRelease.toStream(indexerId: String, indexerName: String): StreamSource {
         val handle = sha256(enclosureUrl)
@@ -82,6 +91,16 @@ internal class NzbSourceAggregator(
     private companion object { const val BASE = "nzbindexer:" }
 }
 
+/** A direct-source result carries the exact scope/config receipt which authorized its groups. */
+internal data class NzbSourceAggregation(
+    val groups: List<StreamGroup>,
+    val admission: NzbSearchAdmission?,
+) {
+    companion object {
+        fun empty(admission: NzbSearchAdmission? = null) = NzbSourceAggregation(emptyList(), admission)
+    }
+}
+
 /** Pure ordering seam: core/add-on group order is never re-sorted by a direct-indexer tail. */
 internal fun mergeNzbGroups(normalGroups: List<StreamGroup>, indexerGroups: List<StreamGroup>): List<StreamGroup> =
     normalGroups + indexerGroups
@@ -93,5 +112,12 @@ internal data class NzbSearchAdmission(val scope: NzbIndexerStore.Scope, val con
 }
 
 /** The terminal snapshot is what CatalogRepository.streams().last() returns to NEXT prewarm. */
-internal fun appendNzbGroupsAtTerminal(update: StreamLoadUpdate, indexerGroups: List<StreamGroup>): StreamLoadUpdate =
-    if (update.terminal && indexerGroups.isNotEmpty()) update.copy(groups = mergeNzbGroups(update.groups, indexerGroups)) else update
+internal fun appendNzbGroupsAtTerminal(
+    update: StreamLoadUpdate,
+    result: NzbSourceAggregation,
+    admissionCurrent: Boolean,
+): StreamLoadUpdate = if (update.terminal && admissionCurrent && result.groups.isNotEmpty()) {
+    update.copy(groups = mergeNzbGroups(update.groups, result.groups))
+} else {
+    update
+}
