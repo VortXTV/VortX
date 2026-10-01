@@ -25,9 +25,7 @@ import org.json.JSONArray
 ///     pattern [com.vortx.android.sources.SourcePinStore] uses, so one profile's toggles never
 ///     leak into another and no [com.vortx.android.profile.ProfileStore] file change is needed.
 ///
-/// All URLs are normalized ([AddonOrder.normalize]: trim + lowercase) before compare/store, the
-/// same normalization the applied-order rank map uses, so a toggle matches an engine descriptor
-/// base regardless of case/whitespace.
+/// URL scheme/host are normalized by [AddonOrder.normalize]; configured path/query case is preserved.
 class AddonPrefsStore(
     context: Context,
     private val activeProfileId: () -> String = { DEFAULT_PROFILE },
@@ -139,10 +137,10 @@ class AddonPrefsStore(
 
         /** VortXSyncManager is the sole source of account ownership for the shared priority overlay. */
         fun activateAccount(accountId: String?) {
-            activeAccountScope = accountId?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            activeAccountScope = accountId?.takeIf { it.isNotBlank() }
         }
 
         private fun scopedKey(key: String): String =
-            activeAccountScope?.let { "$key.account.$it" } ?: key
+            activeAccountScope?.let { "$key.account.v2.$it" } ?: key
     }
 }

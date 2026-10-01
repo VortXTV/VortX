@@ -47,9 +47,22 @@ object LiveTypes {
 /// applied order (Android today, until the sync/profile layer lands) this is exactly the old `.first`
 /// engine-order behavior, so English users and un-reordered accounts are unchanged.
 object AddonOrder {
-    /// Byte-for-byte with Apple `AddonTombstones.normalize`: trim + lowercase the transport URL so an
-    /// applied-order entry matches an engine descriptor base regardless of surrounding whitespace/case.
-    fun normalize(url: String): String = url.trim().lowercase()
+    /** URL scheme/host are case-insensitive; configured paths and queries may contain case-sensitive secrets. */
+    fun normalize(url: String): String {
+        val trimmed = url.trim()
+        val uri = runCatching { java.net.URI(trimmed) }.getOrNull() ?: return trimmed
+        val host = uri.host ?: return trimmed
+        val scheme = uri.scheme ?: return trimmed
+        return buildString {
+            append(scheme.lowercase()).append("://")
+            uri.rawUserInfo?.let { append(it).append('@') }
+            append(host.lowercase())
+            if (uri.port >= 0) append(':').append(uri.port)
+            append(uri.rawPath.orEmpty())
+            uri.rawQuery?.let { append('?').append(it) }
+            uri.rawFragment?.let { append('#').append(it) }
+        }
+    }
 
     /// Pick the entry whose [Ready.base] add-on is earliest in [appliedAddonOrder]. [ready] is every
     /// add-on that returned a ready value, in engine order. With an empty order this returns the first

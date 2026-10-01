@@ -86,7 +86,7 @@ class AddonTombstones internal constructor(
     }
 
     private fun currentScope(): Scope = Scope(
-        accountScope()?.trim()?.lowercase()?.takeIf { it.isNotEmpty() },
+        accountScope()?.takeIf { it.isNotBlank() },
     )
 
     /** The current durable removal set (normalized transportUrls that are EFFECTIVELY removed). */
@@ -332,13 +332,15 @@ class AddonTombstones internal constructor(
 
         /** Session ownership comes only from VortXSyncManager. Signed-out state is device-local only. */
         fun activateAccount(accountId: String?) {
-            activeAccountScope = accountId?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            activeAccountScope = accountId?.takeIf { it.isNotBlank() }
         }
 
         private fun scopedKey(key: String, scope: Scope): String =
-            scope.accountId?.let { "$key.account.$it" } ?: key
+            // The old namespace lowercased account IDs and cannot prove an exact owner. Keep it
+            // quarantined rather than guessing which case-sensitive account may claim its stamps.
+            scope.accountId?.let { "$key.account.v2.$it" } ?: key
 
-        /** Trim + lowercase, applied on both the write and the match side, matching Apple `normalize`. */
-        fun normalize(url: String): String = url.trim().lowercase()
+        /** Preserve configured path/query case. Legacy lowercase stamps remain literal; their lost case is unknowable. */
+        fun normalize(url: String): String = com.vortx.android.model.AddonOrder.normalize(url)
     }
 }

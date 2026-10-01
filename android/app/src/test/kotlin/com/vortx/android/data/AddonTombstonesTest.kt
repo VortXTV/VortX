@@ -69,11 +69,17 @@ class AddonTombstonesTest {
     }
 
     @Test
-    fun `normalize matches across casing and whitespace`() {
+    fun `normalize matches scheme and host but preserves configured path and query case`() {
         val p = FakeTombstonePersistence()
         val t = store(p) { 1_000.0 }
         t.tombstone("  HTTPS://Example.com/Manifest.json  ")
-        assertTrue("https://example.com/manifest.json" in t.all())
+        assertTrue("https://example.com/Manifest.json" in t.all())
+        assertFalse("https://example.com/manifest.json" in t.all())
+        t.tombstone("https://example.com/TokenA/manifest.json?Key=AA")
+        assertFalse("https://example.com/tokena/manifest.json?key=aa" in t.all())
+        // Old lowercase stamps are retained literally, never guessed to own a configured case variant.
+        t.merge(listOf("https://example.com/legacy/manifest.json?key=aa"), emptyMap())
+        assertFalse("https://example.com/Legacy/manifest.json?Key=AA" in t.all())
     }
 
     @Test
@@ -147,7 +153,7 @@ class AddonTombstonesTest {
         val p = FakeTombstonePersistence()
         val t = store(p) { 1_000.0 }
         t.tombstone(url)
-        val legacy = p.store["stremiox.addons.deleted.account.test-account"]
+        val legacy = p.store["stremiox.addons.deleted.account.v2.test-account"]
         assertTrue(legacy != null && legacy.contains("example.com"))
     }
 
@@ -213,7 +219,7 @@ class AddonTombstonesTest {
         assertEquals("[\"$url\"]", p.store["stremiox.addons.deleted"])
         assertEquals("{\"$url\":1000}", p.store["stremiox.addons.removedAt"])
         assertTrue(p.reads.none { it == "stremiox.addons.deleted" || it == "stremiox.addons.removedAt" })
-        assertTrue(p.writes.all { it.contains(".account.test-account") })
+        assertTrue(p.writes.all { it.contains(".account.v2.test-account") })
     }
 
     @Test

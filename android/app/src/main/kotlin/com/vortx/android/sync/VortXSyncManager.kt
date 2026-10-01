@@ -16,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -123,6 +124,7 @@ interface AccountAddonGatewayLease
 interface AccountAddonSyncGateway {
     /** Captures the native account UID/profile generation which must still own every later dispatch. */
     fun captureAccountAddonLease(): AccountAddonGatewayLease?
+    fun nativeAddonOwner(nativeLease: AccountAddonGatewayLease): NativeLibraryOwner? = null
     suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor>
     suspend fun installAccountAddon(
         nativeLease: AccountAddonGatewayLease,
@@ -907,6 +909,14 @@ class VortXSyncManager(context: Context) {
     private val metadataKeys = MetadataProviderKeys(appContext)
     @Volatile private var libraryTombstones = LibraryTombstones(appContext)
     private var libraryPublicationProofs = OwnerLibraryPublicationProofs(appContext)
+    private var addonPublicationProofs = AddonPublicationProofs(appContext)
+
+    internal fun installAddonPublicationProofTestSeam(proofs: AddonPublicationProofs) { addonPublicationProofs = proofs }
+
+    internal fun captureAddonPublicationLease(): AddonPublicationLease? {
+        val lease = captureSyncLease() ?: return null
+        return AddonPublicationLease(lease.accountId, addonPublicationProofs, syncLeaseAdmission(lease))
+    }
 
     internal fun installLibraryPublicationProofTestSeam(proofs: OwnerLibraryPublicationProofs) { libraryPublicationProofs = proofs }
 
@@ -1506,7 +1516,10 @@ class VortXSyncManager(context: Context) {
         }
     }
 
-    internal fun cancelSyncTestWork() { cancelSessionWork() }
+    internal suspend fun cancelSyncTestWork() {
+        cancelSessionWork()
+        scope.coroutineContext[Job]?.cancelAndJoin()
+    }
 
     // MARK: - Encrypted sync document: the engine (syncUp / syncDown)
     //
@@ -1846,7 +1859,9 @@ class VortXSyncManager(context: Context) {
         // engine contributes an empty snapshot, which mergeLocalAddons treats as preserve-not-delete.
         val localAddons = addonGateway?.let { gateway ->
             gateway.captureAccountAddonLease()?.let { nativeLease ->
-                gateway.accountAddonSnapshot(nativeLease)
+                val raw = gateway.accountAddonSnapshot(nativeLease)
+                val native = gateway.nativeAddonOwner(nativeLease)
+                if (native == null) emptyList() else raw.mapNotNull { addonPublicationProofs.published(lease.accountId, native, it) }
             }
         }.orEmpty()
         val localOwnerLibrary = libraryGateway?.let { gateway ->
@@ -1930,7 +1945,10 @@ class VortXSyncManager(context: Context) {
                 // drag owns the top-level spine; accepted pushes clear exactly that dirty generation.
                 if (addonPrefs.orderDirtyAt() != null) {
                     val order = addonPrefs.appliedOrder()
-                    if (order.isEmpty()) doc.remove("addonOrder") else doc.put("addonOrder", JSONArray(order))
+                    val authorized = (parsed.addons + localAddons).mapTo(HashSet()) { AddonTombstones.normalize(it.transportUrl) }
+                    val publishableOrder = order.filter { AddonTombstones.normalize(it) in authorized }
+                    if (order.isEmpty()) doc.remove("addonOrder")
+                    else if (publishableOrder.isNotEmpty()) doc.put("addonOrder", JSONArray(publishableOrder))
                 }
             }
         }
@@ -2215,14 +2233,23 @@ class VortXSyncManager(context: Context) {
         if (!isSyncLeaseCurrent(lease)) return false
         val installed = gateway.accountAddonSnapshot(nativeLease)
         if (!isSyncLeaseCurrent(lease)) return false
-        val present = installed.mapTo(HashSet()) { AddonTombstones.normalize(it.transportUrl) }
+        val present = installed.mapTo(HashSet()) { AddonPublicationProofs.endpoint(it.transportUrl) }
         var changed = false
         for (descriptor in parsed.addons) {
             val identity = AddonTombstones.normalize(descriptor.transportUrl)
-            if (identity.isEmpty() || identity in removed || identity in present) continue
+            if (identity.isEmpty() || identity in removed || AddonPublicationProofs.endpoint(descriptor.transportUrl) in present) continue
             if (!isSyncLeaseCurrent(lease)) return false
             if (gateway.installAccountAddon(nativeLease, descriptor, syncLeaseAdmission(lease))) changed = true
             if (!isSyncLeaseCurrent(lease)) return false
+        }
+        val native = gateway.nativeAddonOwner(nativeLease)
+        if (native != null) {
+            val post = gateway.accountAddonSnapshot(nativeLease)
+            val authorized = parsed.addons.filter { AddonTombstones.normalize(it.transportUrl) !in removed }
+            val witnessed = authorized.mapNotNull { expected ->
+                post.singleOrNull { AddonPublicationProofs.matchesInstalled(expected, it) }?.let { it to expected }
+            }
+            if (!syncLeaseAdmission(lease).invoke { addonPublicationProofs.grant(lease.accountId, native, witnessed) }) return false
         }
         if (!enforceRemovedAccountAddons(lease)) return false
         // Dirty is persisted per account: a late remote order cannot erase an unacknowledged local reorder,
@@ -2473,6 +2500,13 @@ class VortXSyncManager(context: Context) {
         val native = gateway.nativeLibraryOwner(nativeLease) ?: return false
         val snapshot = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
         if (!syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grant(lease.accountId, native, snapshot) }) return false
+        val addons = addonGateway
+        if (addons != null) {
+            val addonLease = addons.captureAccountAddonLease() ?: return false
+            val addonNative = addons.nativeAddonOwner(addonLease) ?: return false
+            val addonSnapshot = addons.accountAddonSnapshot(addonLease)
+            if (!syncLeaseAdmission(lease).invoke { addonPublicationProofs.grant(lease.accountId, addonNative, addonSnapshot.map { it to it }) }) return false
+        }
         return syncUp(lease) && isSyncLeaseCurrent(lease)
     }
 

@@ -21,6 +21,142 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VortXSyncManagerStaleAddonEnvelopeTest {
+    private val managers = mutableListOf<VortXSyncManager>()
+    private fun newManager(context: Context) = VortXSyncManager(context).also { managers.add(it) }
+    @org.junit.After fun cleanupManagers() = runBlocking {
+        managers.forEach { it.cancelSyncTestWork() }
+        managers.clear()
+    }
+    @Test fun `B account publishes only authenticated configured addons until explicit import`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            for (uid in listOf(null, "shared")) {
+                val context = MemoryContext()
+                val manager = newManager(context)
+                manager.attachSyncSeams(com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java).apply { isAccessible = true }.newInstance(context))
+                val disk = MemoryLibraryProofPersistence()
+                manager.installAddonPublicationProofTestSeam(AddonPublicationProofs(disk))
+                manager.installLibraryPublicationProofTestSeam(OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence()))
+                val key = ByteArray(32) { (it + 1).toByte() }
+                val account = VortXSyncManager.Account("B-addons", "b@example.test", "B", false)
+                val aOnly = publicationAddon("https://addon.example/TokenA/manifest.json?Key=AA")
+                val bOwned = publicationAddon("https://addon.example/tokena/manifest.json?key=aa")
+                var resident = listOf(aOnly, bOwned.copy(raw = JSONObject(bOwned.raw.toString()).put("foreignExtra", "A-secret")))
+                val peer = JSONObject().put("vortx", JSONObject().put("addons", JSONArray().put(bOwned.raw)))
+                var version = 2L
+                var uploaded: JSONObject? = null
+                manager.installSyncTestSeam(VortXSyncManager.Session("b", account, key), 0, transport = { method, _, body, _ ->
+                    if (method == "GET") 200 to JSONObject().put("version", version).put("document", requireNotNull(VortXCrypto.sealDocument(key, peer.toString().toByteArray(), account.id, version, true)))
+                    else {
+                        val request = requireNotNull(body)
+                        version = request.getLong("version")
+                        uploaded = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), account.id, version))))
+                        200 to JSONObject().put("accepted", true)
+                    }
+                })
+                manager.attachAccountAddonGateway(object : AccountAddonSyncGateway {
+                    val lease = object : AccountAddonGatewayLease {}
+                    override fun captureAccountAddonLease(): AccountAddonGatewayLease = lease
+                    override fun nativeAddonOwner(nativeLease: AccountAddonGatewayLease) = NativeLibraryOwner(uid)
+                    override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease) = resident
+                    override suspend fun installAccountAddon(nativeLease: AccountAddonGatewayLease, descriptor: VortXSyncDoc.AddonDescriptor, admit: ((() -> Boolean) -> Boolean)) = admit { resident = resident + descriptor; true }
+                    override suspend fun removeAccountAddon(nativeLease: AccountAddonGatewayLease, normalizedTransportUrl: String, admit: ((() -> Boolean) -> Boolean)) = false
+                    override suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>, admit: ((() -> Boolean) -> Boolean)) = admit { true }
+                })
+                manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
+                    val lease = object : AccountAddonGatewayLease {}
+                    override fun captureAccountLibraryLease(): AccountAddonGatewayLease = lease
+                    override fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease) = NativeLibraryOwner(uid)
+                    override suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)) = emptyList<VortXSyncDoc.OwnerLibraryItem>()
+                    override suspend fun addAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)) = true
+                })
+                fun output() = requireNotNull(uploaded).getJSONObject("vortx").getJSONArray("addons")
+                manager.useAccountData()
+                AddonPrefsStore(context).setAppliedOrder(listOf(aOnly.transportUrl, bOwned.transportUrl))
+                assertTrue(manager.pushThisDevice())
+                assertEquals(1, output().length())
+                assertEquals(bOwned.raw.toString(), output().getJSONObject(0).toString())
+                assertFalse(output().toString().contains("A-secret"))
+                assertEquals(JSONArray().put(bOwned.transportUrl).toString(), requireNotNull(uploaded).getJSONArray("addonOrder").toString())
+                assertTrue(manager.mergeBoth())
+                assertEquals(1, output().length())
+                // A local explicit B install owns only its authored outbound manifest.
+                val local = publicationAddon("https://addon.example/B-local/manifest.json")
+                requireNotNull(manager.captureAddonPublicationLease()).install(NativeLibraryOwner(uid), local, { resident }) { resident = resident + local }
+                assertTrue(manager.pushThisDevice())
+                assertEquals(2, output().length())
+                assertFalse(output().toString().contains(aOnly.transportUrl))
+                assertTrue(manager.importThisDeviceLibraryAndPush())
+                assertEquals(3, output().length())
+                resident = resident + publicationAddon("https://addon.example/later/manifest.json")
+                manager.installAddonPublicationProofTestSeam(AddonPublicationProofs(disk))
+                assertTrue(manager.pushThisDevice())
+                assertEquals(3, output().length())
+                manager.cancelSyncTestWork()
+            }
+        } finally { LibraryTombstones.activateAccount(null); cleanupManagers(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `addon invocation captures before queued work and manifest completion across account switch`() = kotlinx.coroutines.test.runTest {
+        Dispatchers.setMain(UnconfinedTestDispatcher(testScheduler))
+        try {
+            for (mode in listOf("manifest", "order", "disabled", "remove")) for (uid in listOf("signed-out", "shared")) {
+                val manager = newManager(MemoryContext())
+                val key = ByteArray(32)
+                val a = VortXSyncManager.Session("a", VortXSyncManager.Account("A", "a@example.test", "A", false), key)
+                val b = VortXSyncManager.Session("b", VortXSyncManager.Account("B", "b@example.test", "B", false), key)
+                manager.installSyncTestSeam(a, 0, { _, _, _, _ -> 404 to JSONObject() })
+                val fence = com.vortx.android.engine.HistoryOwnerFence(
+                    captureOwner = { revision -> com.vortx.android.data.ContinueWatchingOwner(com.vortx.android.profile.UserProfile.OWNER_ID, "primary", uid, true, revision) },
+                    ownerRouteMatches = { it.principal == uid }, transitionInProgress = { false },
+                )
+                var captures = 0
+                var writes = 0
+                fun capture(): com.vortx.android.engine.OwnerAddonMutationAdmission {
+                    captures++
+                    return com.vortx.android.engine.OwnerAddonMutationAdmission.capture(fence, manager.captureLocalLibraryMutationAdmission(), manager.captureAddonPublicationLease())
+                }
+                val response = kotlinx.coroutines.CompletableDeferred<String>()
+                val work = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { runCatching {
+                    if (mode == "manifest") com.vortx.android.engine.performOwnedAddonInstall(::capture, { response.await() }) { admission, _ -> admission.mutate { writes++ } }
+                    else com.vortx.android.engine.withOwnerAddonMutationAdmission(kotlinx.coroutines.test.StandardTestDispatcher(testScheduler), ::capture) { admission -> admission.mutate { writes++ } }
+                } }
+                assertEquals(1, captures)
+                manager.replaceSyncSessionTestSeam(b)
+                response.complete("manifest")
+                testScheduler.runCurrent()
+                assertTrue(work.await().isFailure)
+                assertEquals("$mode must not mutate native state, tombstones, or prefs under B", 0, writes)
+            }
+        } finally { cleanupManagers(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `addon account identifiers retain exact case without claiming a legacy namespace`() {
+        val context = MemoryContext()
+        val tombstones = AddonTombstones(context)
+        val prefs = AddonPrefsStore(context)
+        val endpoint = "https://addon.example/Secret/manifest.json"
+        try {
+            context.getSharedPreferences("vortx_settings", Context.MODE_PRIVATE).edit()
+                .putString("stremiox.addons.deleted.account.owner", JSONArray().put(endpoint).toString()).commit()
+            context.getSharedPreferences("vortx.addon.prefs", Context.MODE_PRIVATE).edit()
+                .putString("vortx.sync.appliedAddonOrder.account.owner", JSONArray().put(endpoint).toString()).commit()
+            AddonTombstones.activateAccount("owner")
+            AddonPrefsStore.activateAccount("owner")
+            assertTrue("Legacy normalized owner has no exact account attribution", tombstones.all().isEmpty())
+            assertTrue(prefs.appliedOrder().isEmpty())
+            tombstones.tombstone(endpoint)
+            prefs.setAppliedOrder(listOf(endpoint))
+            AddonTombstones.activateAccount("Owner")
+            AddonPrefsStore.activateAccount("Owner")
+            assertTrue(tombstones.all().isEmpty())
+            assertTrue(prefs.appliedOrder().isEmpty())
+            AddonTombstones.activateAccount("owner")
+            AddonPrefsStore.activateAccount("owner")
+            assertEquals(setOf(endpoint), tombstones.all())
+            assertEquals(listOf(endpoint), prefs.appliedOrder())
+        } finally { AddonTombstones.activateAccount(null); AddonPrefsStore.activateAccount(null) }
+    }
 
     @Test
     fun `encrypted B sync with shared or null native owner never adopts resident A history implicitly`() = runBlocking {
@@ -28,7 +164,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         try {
             for (uid in listOf(null, "shared-native")) {
                 val context = MemoryContext()
-                val manager = VortXSyncManager(context)
+                val manager = newManager(context)
                 val profileStore = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
                     .apply { isAccessible = true }.newInstance(context)
                 manager.attachSyncSeams(profileStore)
@@ -102,7 +238,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                 assertEquals(3, output().length())
                 manager.cancelSyncTestWork()
             }
-        } finally { LibraryTombstones.activateAccount(null); Dispatchers.resetMain() }
+        } finally { LibraryTombstones.activateAccount(null); cleanupManagers(); Dispatchers.resetMain() }
     }
 
     @Test
@@ -111,7 +247,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         try {
             for (action in listOf("add", "remove")) for (transition in listOf("account", "session", "native")) {
                 val context = MemoryContext()
-                val manager = VortXSyncManager(context)
+                val manager = newManager(context)
                 val key = ByteArray(32) { (it + 1).toByte() }
                 val a = VortXSyncManager.Session("token-a", VortXSyncManager.Account("A-queued", "a@example.test", "A", false), key)
                 val b = VortXSyncManager.Session("token-b", VortXSyncManager.Account("B-queued", "b@example.test", "B", false), key)
@@ -171,7 +307,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             }
         } finally {
             LibraryTombstones.activateAccount(null)
-            Dispatchers.resetMain()
+            cleanupManagers(); Dispatchers.resetMain()
         }
     }
 
@@ -181,7 +317,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         try {
             for (removeTypedRow in listOf(false, true)) {
                 val context = MemoryContext()
-                val manager = VortXSyncManager(context)
+                val manager = newManager(context)
                 val store = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
                     .apply { isAccessible = true }.newInstance(context)
                 manager.attachSyncSeams(store)
@@ -245,7 +381,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             }
         } finally {
             LibraryTombstones.activateAccount(null)
-            Dispatchers.resetMain()
+            cleanupManagers(); Dispatchers.resetMain()
         }
     }
 
@@ -255,7 +391,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         try {
             for (mode in listOf("success", "tombstoneOnly", "readded", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
                 val context = MemoryContext()
-                val manager = VortXSyncManager(context)
+                val manager = newManager(context)
                 val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
                 manager.installLibraryPublicationProofTestSeam(proofs)
                 // Construct an empty store without Android's device-language bootstrap in this JVM test.
@@ -343,7 +479,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                 }
             }
         } finally {
-            Dispatchers.resetMain()
+            cleanupManagers(); Dispatchers.resetMain()
         }
     }
 
@@ -352,7 +488,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {
             val context = MemoryContext()
-            val manager = VortXSyncManager(context)
+            val manager = newManager(context)
             val store = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
                 .apply { isAccessible = true }.newInstance(context)
             manager.attachSyncSeams(store)
@@ -379,7 +515,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             assertEquals(0, uploads)
             assertEquals(0L, manager.lastAppliedVersion())
         } finally {
-            Dispatchers.resetMain()
+            cleanupManagers(); Dispatchers.resetMain()
         }
     }
 
@@ -410,7 +546,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         val parsed = VortXSyncDoc.parse(document)
         assertEquals(listOf(appUrl, webUrl), parsed.addons.map { it.transportUrl })
         assertEquals("app", parsed.addons.first().raw.getJSONObject("manifest").getString("id"))
-        assertEquals(listOf(webUrl.lowercase()), parsed.addonOrder)
+        assertEquals(listOf("https://web.example/MANIFEST.JSON", webUrl), parsed.addonOrder)
     }
 
     @Test
@@ -495,7 +631,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
 
     @Test
     fun `queued same native uid dispatch is rejected after vortx account replacement`() {
-        val manager = VortXSyncManager(MemoryContext())
+        val manager = newManager(MemoryContext())
         fun session(id: String) = VortXSyncManager.Session(
             token = "token-$id",
             account = VortXSyncManager.Account(id, "same-native-uid@example.test", "same native uid", false),
@@ -516,7 +652,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     @Test
     fun `unavailable session retry restores signed in add-on tombstone scope and sync payload`() {
         val context = MemoryContext()
-        val manager = VortXSyncManager(context)
+        val manager = newManager(context)
         val account = VortXSyncManager.Account("recovered-account", "person@example.test", "person", false)
         val session = VortXSyncManager.Session("token", account, ByteArray(32) { (it + 1).toByte() })
         val tombstones = AddonTombstones(context)
@@ -539,7 +675,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
         assertTrue(syncPayload.getJSONObject("deletedAddonsTs").has(removed))
         assertTrue(
             context.getSharedPreferences("vortx_settings", Context.MODE_PRIVATE)
-                .getString("stremiox.addons.deleted.account.recovered-account", null)
+                    .getString("stremiox.addons.deleted.account.v2.recovered-account", null)
                 ?.contains(removed) == true,
         )
     }
@@ -556,7 +692,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             val libraryTombstones = LibraryTombstones(context)
             val account = VortXSyncManager.Account("account", "person@example.test", "person", false)
             val key = ByteArray(32) { (it + 1).toByte() }
-            val manager = VortXSyncManager(context)
+            val manager = newManager(context)
             var versionedPayloadApplied = false
 
             val removedAddon = "https://peer.example/manifest.json"
@@ -621,7 +757,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
             assertEquals(VortXSyncManager.AccountDataProbe.UNREACHABLE, manager.accountHasSyncData())
             assertEquals(10L, manager.lastAppliedVersion())
         } finally {
-            Dispatchers.resetMain()
+            cleanupManagers(); Dispatchers.resetMain()
         }
     }
 }

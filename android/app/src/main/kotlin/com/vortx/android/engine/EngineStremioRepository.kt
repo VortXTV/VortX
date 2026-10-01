@@ -54,6 +54,7 @@ import com.vortx.android.sync.AccountLibraryRestoreResult
 import com.vortx.android.sync.NativeLibraryOwner
 import com.vortx.android.sync.OwnerLibraryPublicationLease
 import com.vortx.android.sync.LocalLibraryPublicationPolicy
+import com.vortx.android.sync.AddonPublicationProofs
 import com.vortx.android.sync.AccountAddonSyncGateway
 import com.vortx.android.sync.AccountAddonGatewayLease
 import com.vortx.android.sync.LibraryTombstones
@@ -1896,7 +1897,8 @@ class EngineStremioRepository(
         Unit
     } }
 
-    override suspend fun installedAddons(): Result<List<InstalledAddon>> = withContext(Dispatchers.Default) { runCatching {
+    override suspend fun installedAddons(): Result<List<InstalledAddon>> = runCatching {
+        withOwnerAddonMutationAdmission(Dispatchers.Default, ::captureAddonMutation) { admission -> admission.mutate {
         // Display order = the user's applied add-on order (Apple `orderedByApplied` on the add-on
         // list); newly installed add-ons fold in at the end in engine order. Each entry is stamped
         // with the ACTIVE profile's on/off overlay so the Add-ons screen renders the eye toggle
@@ -1924,26 +1926,28 @@ class EngineStremioRepository(
             val disabled = AddonOrder.normalize(addon.transportUrl) in disabledAddons
             if (disabled) addon.copy(isDisabled = true) else addon
         }
-    } }
+    } } }
 
     override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean): Result<Unit> =
-        withContext(Dispatchers.Default) { runCatching {
+        runCatching {
+            withOwnerAddonMutationAdmission(Dispatchers.Default, ::captureAddonMutation) { admission -> admission.mutate {
             addonPrefs.setDisabled(transportUrl, disabled)
             // A LOCAL overlay change the engine knows nothing about: poke our own reactive surfaces
             // (ctxUpdates listeners re-read the add-on list; homeUpdates re-snapshots the filtered
             // board) so the toggle shows everywhere immediately instead of riding the 3s safety poll.
             changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
             Unit
-        } }
+        } } }
 
     override suspend fun applyAddonOrder(transportUrls: List<String>): Result<Unit> =
-        withContext(Dispatchers.Default) { runCatching {
+        runCatching {
+            withOwnerAddonMutationAdmission(Dispatchers.Default, ::captureAddonMutation) { admission -> admission.mutate {
             val changed = addonPrefs.setAppliedOrder(transportUrls)
             // Same local-poke as [setAddonDisabled]: the list order + future meta picks changed.
             changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
             if (changed) (appContext as? VortXApplication)?.syncManager?.onLocalAddonOrderChanged()
             Unit
-        } }
+        } } }
 
     override fun captureAccountAddonLease(): AccountAddonGatewayLease? =
         historyOwnerFence.captureRead()
@@ -1957,6 +1961,8 @@ class EngineStremioRepository(
 
     override fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease): NativeLibraryOwner? =
         (nativeLease as? EngineAccountAddonLease)?.owner?.let { NativeLibraryOwner(it.principal.takeUnless { uid -> uid == "signed-out" }) }
+
+    override fun nativeAddonOwner(nativeLease: AccountAddonGatewayLease): NativeLibraryOwner? = nativeLibraryOwner(nativeLease)
 
     override suspend fun accountLibrarySnapshot(
         nativeLease: AccountAddonGatewayLease,
@@ -2036,15 +2042,14 @@ class EngineStremioRepository(
             runCatching {
                 historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                     check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
-                    val parsed = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
-                    buildList {
-                        for (addon in parsed) {
-                            val raw = runCatching { JSONObject(addon.rawDescriptorJson) }.getOrNull() ?: continue
-                            VortXSyncDoc.addonDescriptor(raw)?.let(::add)
-                        }
-                    }
+                    accountAddonSnapshotLocked()
                 }
             }.getOrDefault(emptyList())
+        }
+
+    private fun accountAddonSnapshotLocked(): List<VortXSyncDoc.AddonDescriptor> =
+        EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField())).mapNotNull { addon ->
+            runCatching { JSONObject(addon.rawDescriptorJson) }.getOrNull()?.let(VortXSyncDoc::addonDescriptor)
         }
 
     /**
@@ -2069,7 +2074,8 @@ class EngineStremioRepository(
                     check(owner.usesEngineHistory) { "Account add-ons require the engine-history owner." }
                     admit {
                         StremioCoreNative.dispatch(EngineActions.installAddon(descriptor.transportUrl, manifest))
-                        changedFields.tryEmit(setOf(EngineActions.FIELD_CTX)); true
+                        changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+                        accountAddonSnapshotLocked().singleOrNull { AddonPublicationProofs.matchesInstalled(descriptor, it) } != null
                     }
                 }
             }.getOrDefault(false)
@@ -2180,6 +2186,16 @@ class EngineStremioRepository(
     }
 
     override suspend fun installAddon(url: String): Result<Unit> = runCatching {
+        installAddonOwned(captureAddonMutation(), url)
+    }
+
+    private fun captureAddonMutation(): OwnerAddonMutationAdmission {
+        val sync = (appContext as? VortXApplication)?.syncManager
+        return OwnerAddonMutationAdmission.capture(historyOwnerFence, sync?.captureLocalLibraryMutationAdmission(), sync?.captureAddonPublicationLease())
+    }
+
+    private suspend fun installAddonOwned(admission: OwnerAddonMutationAdmission, url: String) {
+        performOwnedAddonInstall(capture = { admission }, fetch = {
         // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
         // debrid key). Refuse it here at the install boundary with configuration guidance, mirroring Apple
         // `CoreBridge.installAddonConfirmed`'s Beta 17 fix -- otherwise normalizing to /configure/manifest.json
@@ -2195,15 +2211,32 @@ class EngineStremioRepository(
         // re-installing an already-installed URL updates it in place with no separate uninstall step.
         val manifest = fetchAddonManifest(normalized)
             ?: throw IllegalStateException("That URL did not return a valid add-on manifest.")
-        StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest))
+        normalized to manifest
+        }, install = { captured, (normalized, manifest) -> captured.mutate { owner ->
+        val expected = requireNotNull(VortXSyncDoc.addonDescriptor(JSONObject().put("transportUrl", normalized).put("manifest", manifest)
+            .put("flags", JSONObject().put("official", false).put("protected", false))))
+        val native = NativeLibraryOwner(owner.principal.takeUnless { it == "signed-out" })
+        val publication = captured.publication
+        if (publication != null) {
+            check(publication.install(native, expected, ::accountAddonSnapshotLocked) {
+                StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest))
+            }) { "Couldn't confirm the installed add-on for this account." }
+        } else {
+            StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest))
+            check(accountAddonSnapshotLocked().singleOrNull { AddonPublicationProofs.matchesInstalled(expected, it) } != null) {
+                "Couldn't confirm the installed add-on."
+            }
+        }
         // An explicit install is intent to HAVE the add-on: clear any removal tombstone so a re-install of a
         // previously removed add-on is honored, not re-suppressed on the next read (SRC-2, Apple
         // `CoreBridge.installAddon` -> `AddonTombstones.forget`).
         addonTombstones.forget(normalized)
         requestAddonTombstoneSync()
+        } })
     }
 
     override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {
+        captureAddonMutation().mutate {
         StremioCoreNative.dispatch(EngineActions.uninstallAddon(addon.rawDescriptorJson))
         // Record the removal so a re-seeded OFFICIAL add-on (YouTube, WatchHub, ...) the user deleted stays
         // gone across an engine reset (#137). PROTECTED stubs (Cinemeta, Local) are never tombstoned: a logout
@@ -2211,6 +2244,7 @@ class EngineStremioRepository(
         // forever (SRC-2, Apple `CoreBridge.uninstallAddon` -> `AddonTombstones.tombstone`).
         if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)
         requestAddonTombstoneSync()
+        }
     }
 
     /** A successful local add-on remove/reinstall is account data, unlike a remote fold. */
@@ -2219,10 +2253,11 @@ class EngineStremioRepository(
     }
 
     override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String): Result<Unit> = runCatching {
+        val admission = captureAddonMutation()
         // Install the NEW URL first so a failed install never leaves the user with neither add-on (Apple
         // `EditAddonURLView.update`). installAddon already carries the /configure + validity guards and
         // upserts by transport URL, so this reuses it verbatim.
-        installAddon(newUrl).getOrThrow()
+        installAddonOwned(admission, newUrl)
         // If the new URL normalized to the SAME transport URL as the old one, the install was an in-place
         // update -- there is no distinct old descriptor to drop.
         val newNormalized = normalizedAddonUrl(newUrl)
@@ -2230,7 +2265,7 @@ class EngineStremioRepository(
         // Change-URL is a REPLACE, not a removal: drop the old URL but do NOT tombstone it, so the same URL
         // stays re-addable on every device (a removal tombstone would wrongly suppress it). Mirrors Apple
         // `CoreBridge.uninstallAddon(_, tombstone: false)`.
-        StremioCoreNative.dispatch(EngineActions.uninstallAddon(oldAddon.rawDescriptorJson))
+        admission.mutate { StremioCoreNative.dispatch(EngineActions.uninstallAddon(oldAddon.rawDescriptorJson)) }
     }
 
     /// Trim + validate scheme + ensure a `/manifest.json` suffix, mirroring Apple

@@ -266,7 +266,7 @@ object VortXSyncDoc {
             for (index in 0 until rows.length()) {
                 val raw = rows.optJSONObject(index) ?: continue
                 val descriptor = addonDescriptor(raw) ?: continue
-                val identity = AddonTombstones.normalize(descriptor.transportUrl)
+                val identity = AddonPublicationProofs.endpoint(descriptor.transportUrl)
                 if (identity.isNotEmpty() && identity !in byIdentity) byIdentity[identity] = descriptor
             }
         }
@@ -319,18 +319,27 @@ object VortXSyncDoc {
         removed: Set<String>,
     ): JSONObject {
         if (local.isEmpty()) return vortx
-        val merged = LinkedHashMap<String, JSONObject>()
-        for (prior in vortx.optJSONArray("addons").orEmptyObjects()) {
-            val descriptor = addonDescriptor(prior) ?: continue
-            val identity = AddonTombstones.normalize(descriptor.transportUrl)
-            if (identity !in removed && identity !in merged) merged[identity] = descriptor.raw
+        val merged = mutableListOf<Any>()
+        val positions = mutableMapOf<String, Int>()
+        val prior = vortx.optJSONArray("addons")
+        for (index in 0 until (prior?.length() ?: 0)) {
+            val raw = prior!!.get(index)
+            val descriptor = (raw as? JSONObject)?.let(::addonDescriptor)
+            if (descriptor == null) { merged.add(raw); continue }
+            val identity = AddonPublicationProofs.endpoint(descriptor.transportUrl)
+            if (AddonTombstones.normalize(descriptor.transportUrl) in removed) continue
+            if (identity !in positions) { positions[identity] = merged.size; merged.add(raw) }
         }
         for (descriptor in local) {
-            val identity = AddonTombstones.normalize(descriptor.transportUrl)
-            if (identity !in removed && identity.isNotEmpty()) merged[identity] = descriptor.raw
+            val identity = AddonPublicationProofs.endpoint(descriptor.transportUrl)
+            if (AddonTombstones.normalize(descriptor.transportUrl) !in removed && identity.isNotEmpty()) {
+                val position = positions[identity]
+                if (position == null) { positions[identity] = merged.size; merged.add(descriptor.raw) }
+                else merged[position] = descriptor.raw
+            }
         }
         if (merged.isNotEmpty()) {
-            vortx.put("addons", JSONArray(merged.values.toList()))
+            vortx.put("addons", JSONArray(merged))
             if (!vortx.has("addonsOwnedAt")) vortx.put("addonsOwnedAt", System.currentTimeMillis())
         }
         return vortx
