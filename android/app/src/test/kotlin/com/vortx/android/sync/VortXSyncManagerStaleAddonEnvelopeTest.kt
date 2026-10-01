@@ -123,6 +123,26 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     }
 
     @Test
+    fun `queued same native uid dispatch is rejected after vortx account replacement`() {
+        val manager = VortXSyncManager(MemoryContext())
+        fun session(id: String) = VortXSyncManager.Session(
+            token = "token-$id",
+            account = VortXSyncManager.Account(id, "same-native-uid@example.test", "same native uid", false),
+            dataKey = ByteArray(32),
+        )
+        manager.installSyncTestSeam(session("A"), 0L, transport = { _, _, _, _ -> 404 to null })
+        val queuedA = requireNotNull(manager.captureSyncLeaseAdmissionTestSeam())
+        manager.replaceSyncSessionTestSeam(session("B"))
+        var nativeDispatches = 0
+        assertFalse(queuedA { nativeDispatches += 1; true })
+        assertEquals(0, nativeDispatches)
+
+        val currentB = requireNotNull(manager.captureSyncLeaseAdmissionTestSeam())
+        assertTrue(currentB { nativeDispatches += 1; true })
+        assertEquals(1, nativeDispatches)
+    }
+
+    @Test
     fun `unavailable session retry restores signed in add-on tombstone scope and sync payload`() {
         val context = MemoryContext()
         val manager = VortXSyncManager(context)

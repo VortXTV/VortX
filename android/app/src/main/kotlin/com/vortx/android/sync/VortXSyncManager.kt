@@ -1450,6 +1450,19 @@ class VortXSyncManager(context: Context) {
         refreshSettingsShadow()
     }
 
+    /** Narrow regression seam for final native-dispatch admission; production replacements use the same coordinator. */
+    internal fun captureSyncLeaseAdmissionTestSeam(): ((() -> Boolean) -> Boolean)? =
+        captureSyncLease()?.let(::syncLeaseAdmission)
+
+    internal fun replaceSyncSessionTestSeam(session: Session) {
+        operations.invalidate {
+            sessionState.restore(session)
+            _account.value = session.account
+            AddonTombstones.activateAccount(session.account.id)
+            AddonPrefsStore.activateAccount(session.account.id)
+        }
+    }
+
     // MARK: - Encrypted sync document: the engine (syncUp / syncDown)
     //
     // Kotlin port of the sync-engine half of Apple `VortXSyncManager` (`syncUp` / `syncDown`, the
