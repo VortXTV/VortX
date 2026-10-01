@@ -137,11 +137,11 @@ interface AccountAddonSyncGateway {
     suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>, admit: ((() -> Boolean) -> Boolean)): Boolean
 }
 
-/** Owner-library native boundary. Restore is intentionally additive; progress is receipt-gated elsewhere. */
+/** Owner-library boundary: positive reads and receipt-validated restores share the account admission lock. */
 interface AccountLibrarySyncGateway {
     fun captureAccountLibraryLease(): AccountAddonGatewayLease?
     /** Null means native state is not positively ready; an empty list means a confirmed empty library. */
-    suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.OwnerLibraryItem>?
+    suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)): List<VortXSyncDoc.OwnerLibraryItem>?
     suspend fun addAccountLibraryItems(
         nativeLease: AccountAddonGatewayLease,
         items: List<VortXSyncDoc.OwnerLibraryItem>,
@@ -1803,7 +1803,7 @@ class VortXSyncManager(context: Context) {
         }.orEmpty()
         val localOwnerLibrary = libraryGateway?.let { gateway ->
             val nativeLease = gateway.captureAccountLibraryLease()
-            if (nativeLease != null) gateway.accountLibrarySnapshot(nativeLease) else null
+            if (nativeLease != null) gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) else null
         }
         if (!isSyncLeaseCurrent(lease)) return null
         val parsed = VortXSyncDoc.parse(doc)
@@ -1828,8 +1828,11 @@ class VortXSyncManager(context: Context) {
                     // is a monotone, idempotent union that also prunes the live roster, so it needs no version
                     // gate; buildVortx then emits the folded set (and read-merges the pulled one again).
                     if (parsed.deletedProfiles.isNotEmpty()) store.mergeDeletedTombstones(parsed.deletedProfiles)
-                    if (parsed.deletedLibrary.isNotEmpty() || parsed.deletedLibraryTs.isNotEmpty()) {
-                        libraryTombstones.merge(parsed.deletedLibrary, parsed.deletedLibraryTs)
+                    val libraryStamps = OwnerLibraryHistoryPolicy.canonicalLibraryTombstones(
+                        parsed.copy(ownerLibrary = parsed.ownerLibrary.orEmpty() + localOwnerLibrary.orEmpty()),
+                    )
+                    if (parsed.deletedLibrary.isNotEmpty() || libraryStamps.isNotEmpty()) {
+                        libraryTombstones.merge(parsed.deletedLibrary, libraryStamps)
                         refreshSettingsShadow()
                     }
                     // Fold app-authored add-on tombstones before publishing this read-merge. The max fold is
@@ -2035,11 +2038,11 @@ class VortXSyncManager(context: Context) {
                     // Its library tombstones and every versioned account field remain behind the H-2 barrier.
                     if (
                         addonFold.shouldFoldLibraryTombstones &&
-                            (parsed.deletedLibrary.isNotEmpty() || parsed.deletedLibraryTs.isNotEmpty())
+                            (parsed.deletedLibrary.isNotEmpty() || OwnerLibraryHistoryPolicy.canonicalLibraryTombstones(parsed).isNotEmpty())
                     ) {
                         libraryTombstonesChanged = libraryTombstones.merge(
                             parsed.deletedLibrary,
-                            parsed.deletedLibraryTs,
+                            OwnerLibraryHistoryPolicy.canonicalLibraryTombstones(parsed),
                         )
                         refreshSettingsShadow()
                         if (libraryTombstonesChanged) {
@@ -2111,7 +2114,9 @@ class VortXSyncManager(context: Context) {
         // Account add-on descriptors/order are versioned payload. Every native mutation is lease-fenced so
         // an account switch cannot install, remove, or reorder against the new session's engine state.
         if (applyRemoteAccountAddons(lease, parsed)) restored = true
-        if (applyRemoteOwnerLibrary(lease, parsed)) restored = true
+        // A failed receipt must leave this version retryable; other fields may already have converged.
+        if (!applyRemoteOwnerLibrary(lease, parsed)) return false
+        if (parsed.ownerLibrary?.isNotEmpty() == true) restored = true
         if (!isSyncLeaseCurrent(lease)) return false
         // gap 2: adopt connected-service (debrid) keys set on another device. Applied off the Main thread
         // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
@@ -2192,20 +2197,30 @@ class VortXSyncManager(context: Context) {
         }
     }
 
-    /** Hydrates missing, non-tombstoned typed titles only. Never replaces native membership or self-pushes. */
+    /** Restores newer history even for existing identities; native performs a fresh, fenced LWW check. */
     private suspend fun applyRemoteOwnerLibrary(lease: SyncSessionLease, parsed: VortXSyncDoc.Parsed): Boolean {
-        val incoming = parsed.ownerLibrary ?: return false
+        val incoming = parsed.ownerLibrary.orEmpty()
+        val removed = libraryTombstones.all()
+        if (incoming.isEmpty() && removed.isEmpty()) return true
         val gateway = libraryGateway ?: return false
         val nativeLease = gateway.captureAccountLibraryLease() ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
-        val local = gateway.accountLibrarySnapshot(nativeLease) ?: return false
+        val local = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
-        val present = local.mapTo(HashSet()) { it.identity }
-        val removed = libraryTombstones.all()
-        val missing = incoming.filter {
-            it.identity !in present && LibraryTombstones.normalize(it.metaId) !in removed
+        val eligible = incoming.filter {
+            (LibraryTombstones.normalize(it.metaId) in removed) == it.removed
         }
-        return missing.isNotEmpty() && gateway.addAccountLibraryItems(nativeLease, missing, syncLeaseAdmission(lease)) && isSyncLeaseCurrent(lease)
+        val stamps = libraryTombstones.timestampsForSync()
+        // A tombstone-only peer still carries a genuine membership event. Keep the local watch clock
+        // and opaque watched field intact while applying that event's timestamp, never the receive time.
+        val membershipRemovals = local.mapNotNull { item ->
+            val id = LibraryTombstones.normalize(item.metaId)
+            val epoch = stamps[id]?.get("removedAt")?.toLong()
+            if (id in removed && !item.removed && epoch != null && epoch > 1L)
+                item.copy(removed = true, eventEpochMs = epoch) else null
+        }
+        val candidates = OwnerLibraryHistoryPolicy.newerIncoming(eligible + membershipRemovals, local)
+        return (candidates.isEmpty() || gateway.addAccountLibraryItems(nativeLease, candidates, syncLeaseAdmission(lease))) && isSyncLeaseCurrent(lease)
     }
 
     /**

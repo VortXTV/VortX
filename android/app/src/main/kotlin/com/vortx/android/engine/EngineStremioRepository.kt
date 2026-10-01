@@ -91,7 +91,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import org.json.JSONArray
-import java.time.Instant
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -1941,15 +1940,13 @@ class EngineStremioRepository(
 
     override suspend fun accountLibrarySnapshot(
         nativeLease: AccountAddonGatewayLease,
+        admit: ((() -> Boolean) -> Boolean),
     ): List<VortXSyncDoc.OwnerLibraryItem>? = withContext(Dispatchers.Default) {
         val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext null
         runCatching {
             historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
-                // Load yields the persisted ctx library model; a failed/invalid model is null, not an empty wipe.
-                val uidJson = owner.principal.takeUnless { it == "signed-out" }?.let(JSONObject::quote) ?: "null"
-                val events = StremioCoreNative.readLibraryEvents(uidJson)
-                ownerLibraryEventItems(events, owner.principal) ?: ownerLibrarySyncItems(StremioCoreNative.getState(EngineActions.libraryField()))
+                nativeOwnerLibrary.snapshot(owner.principal.takeUnless { it == "signed-out" }, admit)
             }
         }.getOrNull()
     }
@@ -1963,94 +1960,18 @@ class EngineStremioRepository(
         runCatching {
             historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
-                val genuine = items.filter { it.lastWatched != null }
-                if (genuine.isNotEmpty()) {
-                    val uid = owner.principal.takeUnless { it == "signed-out" }
-                    val events = JSONArray()
-                    for (item in genuine) {
-                        val epoch = runCatching { Instant.parse(item.lastWatched).toEpochMilli() }.getOrNull() ?: return@mutate false
-                        events.put(JSONObject().apply {
-                            put("meta", JSONObject().put("id", item.metaId).put("type", item.type).put("name", item.name).apply { item.poster?.let { put("poster", it) } })
-                            put("currentVideoId", item.videoId ?: JSONObject.NULL)
-                            put("timeOffsetMs", item.timeOffsetMs); put("durationMs", item.durationMs)
-                            put("genuineLastWatchedEpochMs", epoch)
-                            put("wholeTitleWatched", JSONObject.NULL)
-                        })
-                    }
-                    val request = JSONObject().put("ownerUid", uid ?: JSONObject.NULL).put("events", events)
-                    var response: String? = null
-                    if (!admit { response = StremioCoreNative.restoreLibrary(request.toString()); response != "null" } ||
-                        !restoreReceiptMatches(response, uid, genuine)
-                    ) return@mutate false
-                }
-                // AddToLibrary is the production ctx action. We deliberately do not synthesize TimeChanged
-                // or watched actions here: those require a native receipt with a genuine event timestamp.
-                for (item in items.filter { it.lastWatched == null }) {
-                    if (!admit { StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster)); true }) return@mutate false
-                }
-                if (items.isNotEmpty()) changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
-                items.isNotEmpty()
+                val accepted = nativeOwnerLibrary.apply(owner.principal.takeUnless { it == "signed-out" }, items, admit)
+                if (accepted && items.isNotEmpty()) admit { changedFields.tryEmit(setOf(EngineActions.FIELD_CTX)); true }
+                accepted
             }
         }.getOrDefault(false)
     }
 
-    private fun restoreReceiptMatches(raw: String?, uid: String?, requested: List<VortXSyncDoc.OwnerLibraryItem>): Boolean {
-        raw ?: return false
-        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return false
-        if (raw == "null" || (root.opt("uid") as? String) != uid) return false
-        if (uid == null && root.opt("uid") != JSONObject.NULL) return false
-        val receipts = root.optJSONArray("events") ?: return false
-        if (receipts.length() != requested.size) return false
-        return requested.all { item ->
-            val epoch = runCatching { Instant.parse(item.lastWatched).toEpochMilli() }.getOrNull() ?: return@all false
-            (0 until receipts.length()).any { index -> receipts.optJSONObject(index)?.let { it.optString("type") == item.type && it.optString("id") == item.metaId && it.optLong("eventEpochMs", -1L) == epoch && it.optString("currentVideoId", "") == (item.videoId ?: "") } == true }
-        }
-    }
-
-    private fun ownerLibrarySyncItems(json: String): List<VortXSyncDoc.OwnerLibraryItem>? {
-        val catalog = runCatching { JSONObject(json).optJSONArray("catalog") }.getOrNull() ?: return null
-        return buildList {
-            for (index in 0 until catalog.length()) {
-                val row = catalog.optJSONObject(index) ?: continue
-                if (row.optBoolean("removed", false) || row.optBoolean("temp", false)) continue
-                val id = row.optString("_id").ifEmpty { row.optString("id") }
-                val type = row.optString("type")
-                if (!VortXSyncDoc.isTypedCatalogIdentity(id) || type !in setOf("movie", "series")) continue
-                val state = row.optJSONObject("state")
-                add(VortXSyncDoc.OwnerLibraryItem(
-                    metaId = id, type = type, name = row.optString("name"), poster = row.optString("poster").takeIf { it.isNotBlank() },
-                    videoId = state?.optString("video_id")?.takeIf { it.isNotBlank() },
-                    timeOffsetMs = state?.optLong("timeOffset", 0L)?.coerceAtLeast(0L) ?: 0L,
-                    durationMs = state?.optLong("duration", 0L)?.coerceAtLeast(0L) ?: 0L,
-                    lastWatched = null,
-                ))
-            }
-        }
-    }
-
-    /** Only a native persisted event clock may export progress; malformed/metadata-only events are ignored. */
-    private fun ownerLibraryEventItems(json: String, ownerPrincipal: String): List<VortXSyncDoc.OwnerLibraryItem>? {
-        val root = runCatching { JSONObject(json) }.getOrNull() ?: return null
-        val uid = root.opt("uid") as? String
-        if ((ownerPrincipal == "signed-out") != (uid == null) || (uid != null && uid != ownerPrincipal)) return null
-        val events = root.optJSONArray("events") ?: return null
-        return buildList {
-            for (index in 0 until events.length()) {
-                val event = events.optJSONObject(index) ?: continue
-                val id = event.opt("id") as? String ?: continue
-                val type = event.opt("type") as? String ?: continue
-                val epoch = (event.opt("lastWatchedEpochMs") as? Number)?.toLong()?.takeIf { it >= 0L } ?: continue
-                if (!VortXSyncDoc.isTypedCatalogIdentity(id) || type !in setOf("movie", "series")) continue
-                add(VortXSyncDoc.OwnerLibraryItem(
-                    metaId = id, type = type, name = (event.opt("name") as? String).orEmpty(),
-                    poster = event.opt("poster") as? String, videoId = event.opt("currentVideoId") as? String,
-                    timeOffsetMs = ((event.opt("timeOffsetMs") as? Number)?.toLong() ?: 0L).coerceAtLeast(0L),
-                    durationMs = ((event.opt("durationMs") as? Number)?.toLong() ?: 0L).coerceAtLeast(0L),
-                    lastWatched = Instant.ofEpochMilli(epoch).toString(),
-                ))
-            }
-        }
-    }
+    private val nativeOwnerLibrary = NativeOwnerLibraryGateway(
+        read = StremioCoreNative::readLibraryEvents,
+        restore = StremioCoreNative::restoreLibrary,
+        add = { item -> StremioCoreNative.dispatch(EngineActions.addToLibrary(item.metaId, item.type, item.name, item.poster)) },
+    )
 
     /** Raw native descriptor snapshot for the encrypted VortX account; no network work or logging. */
     override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> =

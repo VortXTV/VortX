@@ -22,6 +22,124 @@ import org.junit.Test
 class VortXSyncManagerStaleAddonEnvelopeTest {
 
     @Test
+    fun `public manager restores existing history and never advances a failed or expired receipt`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            for (mode in listOf("success", "tombstoneOnly", "readded", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
+                val context = MemoryContext()
+                val manager = VortXSyncManager(context)
+                // Construct an empty store without Android's device-language bootstrap in this JVM test.
+                val store = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
+                    .apply { isAccessible = true }.newInstance(context)
+                manager.attachSyncSeams(store)
+                val key = ByteArray(32) { (it + 1).toByte() }
+                val accountA = VortXSyncManager.Account("A-$mode", "a@example.test", "A", false)
+                val accountB = VortXSyncManager.Account("B-$mode", "b@example.test", "B", false)
+                val row = JSONObject().put("id", "tt1").put("type", "movie").put("name", "Movie")
+                    .put("v", "tt1").put("t", 0).put("d", 50).put("eventEpochMs", 2000)
+                    .put("lastWatched", "1970-01-01T00:00:02Z").put("watched", JSONObject.NULL)
+                    .put("currentVideoWatched", true).put("wholeTitleWatched", true).put("timesWatched", 1)
+                val doc = JSONObject().put("vortx", JSONObject().put("library", JSONArray().put(row)))
+                if (mode == "tombstoneOnly") {
+                    doc.getJSONObject("vortx").remove("library")
+                    doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 2000)))
+                }
+                if (mode == "readded") {
+                    row.put("removed", true)
+                    doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 2000).put("addedAt", 3000)))
+                }
+                val envelope = requireNotNull(VortXCrypto.sealDocument(key, doc.toString().toByteArray(), accountA.id, 2L, true))
+                manager.installSyncTestSeam(VortXSyncManager.Session("A-token", accountA, key), 1L,
+                    transport = { _, _, _, _ -> 200 to JSONObject().put("version", 2L).put("document", envelope) })
+                fun replaceAccount() = manager.replaceSyncSessionTestSeam(VortXSyncManager.Session("B-token", accountB, key))
+                var nativeWrites = 0
+                var attemptedApply = false
+                val native = com.vortx.android.engine.NativeOwnerLibraryGateway(
+                    read = {
+                        if (mode == "afterRead") replaceAccount()
+                        // Both VortX accounts deliberately share this same native UID.
+                        """{"uid":"same-native","events":[{"meta":{"id":"tt1","type":"movie","name":"Movie"},"currentVideoId":"tt1","timeOffsetMs":1000,"durationMs":50000,"eventEpochMs":1000,"lastWatchedEpochMs":1000,"watched":null,"currentVideoWatched":false,"wholeTitleWatched":false,"timesWatched":0,"removed":false}]}"""
+                    },
+                    restore = { request ->
+                        nativeWrites++
+                        if (mode == "tombstoneOnly") {
+                            val event = JSONObject(request).getJSONArray("events").getJSONObject(0)
+                            assertTrue(event.getBoolean("removed"))
+                            assertEquals(2000L, event.getLong("genuineEventEpochMs"))
+                            assertEquals(1000L, event.getLong("lastWatchedEpochMs"))
+                        }
+                        if (mode == "afterResponse") replaceAccount()
+                        if (mode == "null") "null" else
+                            """{"uid":"${if (mode == "wrongUid") "wrong" else "same-native"}","events":[{"id":"tt1","type":"movie","currentVideoId":"tt1","eventEpochMs":2000}]}"""
+                    },
+                    add = { error("Existing history must not use metadata add") },
+                )
+                manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
+                    private val lease = object : AccountAddonGatewayLease {}
+                    override fun captureAccountLibraryLease(): AccountAddonGatewayLease = lease
+                    override suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)) = native.snapshot("same-native", admit)
+                    override suspend fun addAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): Boolean {
+                        attemptedApply = true
+                        if (mode == "beforeDispatch") replaceAccount()
+                        return native.apply("same-native", items, admit)
+                    }
+                })
+                manager.syncDown(force = true)
+                if (mode == "success" || mode == "tombstoneOnly") {
+                    assertTrue(attemptedApply)
+                    assertEquals(1, nativeWrites)
+                    assertEquals(2L, manager.lastAppliedVersion())
+                } else if (mode == "readded") {
+                    assertEquals(0, nativeWrites)
+                    assertFalse("Newer explicit add wins", "tt1" in LibraryTombstones(context).all())
+                    assertEquals(2L, manager.lastAppliedVersion())
+                } else {
+                    assertTrue(mode, manager.lastAppliedVersion() < 2L)
+                    if (mode == "afterRead" || mode == "beforeDispatch") assertEquals(mode, 0, nativeWrites)
+                }
+            }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `public sync up cannot publish a native snapshot returned after same uid account replacement`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val context = MemoryContext()
+            val manager = VortXSyncManager(context)
+            val store = com.vortx.android.profile.ProfileStore::class.java.getDeclaredConstructor(Context::class.java)
+                .apply { isAccessible = true }.newInstance(context)
+            manager.attachSyncSeams(store)
+            val key = ByteArray(32) { (it + 1).toByte() }
+            val a = VortXSyncManager.Session("token-a", VortXSyncManager.Account("A-export", "a@example.test", "A", false), key)
+            val b = VortXSyncManager.Session("token-b", VortXSyncManager.Account("B-export", "b@example.test", "B", false), key)
+            var uploads = 0
+            manager.installSyncTestSeam(a, 0L, transport = { method, _, _, _ ->
+                if (method != "GET") uploads++
+                404 to JSONObject()
+            })
+            val native = com.vortx.android.engine.NativeOwnerLibraryGateway(
+                read = { manager.replaceSyncSessionTestSeam(b); """{"uid":"same-native","events":[]}""" },
+                restore = { error("Export cannot restore") }, add = { error("Export cannot add") },
+            )
+            manager.attachAccountLibraryGateway(object : AccountLibrarySyncGateway {
+                private val lease = object : AccountAddonGatewayLease {}
+                override fun captureAccountLibraryLease(): AccountAddonGatewayLease = lease
+                override suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)) = native.snapshot("same-native", admit)
+                override suspend fun addAccountLibraryItems(nativeLease: AccountAddonGatewayLease, items: List<VortXSyncDoc.OwnerLibraryItem>, admit: ((() -> Boolean) -> Boolean)): Boolean = error("Export cannot import")
+            })
+            assertFalse(manager.syncUp())
+            assertEquals("B-export", manager.currentSession()?.account?.id)
+            assertEquals(0, uploads)
+            assertEquals(0L, manager.lastAppliedVersion())
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
     fun `account descriptors union app then web, skip shallow rows, and retain normalized order`() {
         val appUrl = "https://app.example/manifest.json"
         val webUrl = "https://web.example/manifest.json"

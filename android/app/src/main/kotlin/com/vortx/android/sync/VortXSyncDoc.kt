@@ -62,6 +62,14 @@ object VortXSyncDoc {
         val durationMs: Long,
         /** A genuine producer event clock only; null is intentionally not replaced with "now". */
         val lastWatched: String?,
+        val watched: String? = null,
+        val currentVideoWatched: Boolean? = null,
+        val timesWatched: Long? = null,
+        val removed: Boolean = false,
+        val wholeTitleWatched: Boolean? = null,
+        val eventEpochMs: Long? = null,
+        /** Native mutation clock is only a conflict floor, never a substitute for a watch clock. */
+        val nativeEventEpochMs: Long? = null,
     ) {
         val identity: String get() = "$type:$metaId"
     }
@@ -197,6 +205,20 @@ object VortXSyncDoc {
         val id = row.opt("id") as? String ?: return null
         val type = row.opt("type") as? String ?: return null
         if (!isTypedCatalogIdentity(id) || type !in setOf("movie", "series")) return null
+        fun nullableType(key: String, valid: (Any) -> Boolean): Boolean =
+            !row.has(key) || row.isNull(key) || valid(row.get(key))
+        if (!nullableType("lastWatched") { it is String } || !nullableType("v") { it is String } ||
+            !nullableType("watched") { it is String } || !nullableType("currentVideoWatched") { it is Boolean } ||
+            !nullableType("wholeTitleWatched") { it is Boolean } || !nullableType("removed") { it is Boolean } ||
+            !nullableType("timesWatched") { OwnerLibraryHistoryPolicy.unsignedInteger(it)?.let { n -> n <= 0xffff_ffffL } == true } ||
+            !nullableType("eventEpochMs") { OwnerLibraryHistoryPolicy.unsignedInteger(it)?.let { n -> n > 0 } == true }) return null
+        val lastWatched = (row.opt("lastWatched") as? String)?.takeIf { it.isNotBlank() }
+        if (lastWatched != null && runCatching { java.time.Instant.parse(lastWatched).toEpochMilli() > 0 }.getOrDefault(false).not()) return null
+        val hasEvent = lastWatched != null || (!row.isNull("eventEpochMs") && row.has("eventEpochMs"))
+        for (key in listOf("t", "d")) {
+            val value = (row.opt(key) as? Number)?.toDouble()
+            if (hasEvent && (value == null || !value.isFinite() || value < 0 || value * 1000 >= Long.MAX_VALUE.toDouble())) return null
+        }
         fun wireSeconds(key: String): Long = (row.opt(key) as? Number)?.toDouble()
             ?.takeIf { it.isFinite() && it >= 0.0 }?.times(1000.0)?.toLong() ?: 0L
         return OwnerLibraryItem(
@@ -207,7 +229,13 @@ object VortXSyncDoc {
             videoId = (row.opt("v") as? String)?.takeIf { it.isNotBlank() },
             timeOffsetMs = wireSeconds("t"),
             durationMs = wireSeconds("d"),
-            lastWatched = (row.opt("lastWatched") as? String)?.takeIf { it.isNotBlank() },
+            lastWatched = lastWatched,
+            watched = row.opt("watched") as? String,
+            currentVideoWatched = row.opt("currentVideoWatched") as? Boolean,
+            timesWatched = OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("timesWatched"))?.takeIf { it <= 0xffff_ffffL },
+            removed = row.opt("removed") as? Boolean ?: false,
+            wholeTitleWatched = if (type == "movie") row.opt("wholeTitleWatched") as? Boolean else null,
+            eventEpochMs = OwnerLibraryHistoryPolicy.unsignedInteger(row.opt("eventEpochMs"))?.takeIf { it > 0 },
         )
     }
 
@@ -223,24 +251,7 @@ object VortXSyncDoc {
         removed: Set<String>,
     ) {
         local ?: return
-        val merged = LinkedHashMap<String, JSONObject>()
-        for (row in vortx.optJSONArray("library").orEmptyObjects()) {
-            val item = ownerLibraryItem(row) ?: continue
-            if (LibraryTombstones.normalize(item.metaId) !in removed) merged[item.identity] = row
-        }
-        for (item in local) {
-            if (LibraryTombstones.normalize(item.metaId) !in removed) {
-                // Membership-only native snapshots deliberately carry no genuine event receipt. They may
-                // append a title, but never replace a peer row's t/d/v/clock or opaque watched bitfield.
-                if (item.identity in merged) continue
-                merged[item.identity] = JSONObject().apply {
-                    put("id", item.metaId); put("type", item.type); put("name", item.name); put("poster", item.poster ?: "")
-                    put("t", item.timeOffsetMs / 1000L); put("d", item.durationMs / 1000L); put("v", item.videoId ?: "")
-                    item.lastWatched?.let { put("lastWatched", it) }
-                }
-            }
-        }
-        if (merged.isNotEmpty()) vortx.put("library", JSONArray(merged.values.toList()))
+        vortx.put("library", OwnerLibraryHistoryPolicy.merge(vortx.optJSONArray("library"), local, removed))
     }
 
     /**
