@@ -92,14 +92,13 @@ struct iOSRootView: View {
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
-    /// macOS keyboard browse: focus belongs to the floating glass tab pill, not the content screen.
+    /// macOS keyboard browse: focus belongs to the persistent desktop navigation, not the content screen.
     @FocusState private var tabFocus: MacBrowseFocus?
-    /// The persistent top-bar search field's text and focus state.
+    /// The persistent desktop search field's text and focus state.
     @State private var macQuery = ""
     @FocusState private var macSearchFocused: Bool
-    /// Measured height of the floated search and navigation chrome, reserved above scrollable content.
-    @State private var macTopChromeHeight: CGFloat = 64
     #endif
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
     /// when a still-newer build ships.
@@ -188,34 +187,16 @@ struct iOSRootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            #if os(macOS)
+            macDesktopShell
+            #else
             ZStack {
-                switch tab {
-                case .home:
-                    iOSHomeView(isActive: true)
-                case .discover:
-                    if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
-                case .live:
-                    if !hideLiveTab { iOSLiveView() }
-                case .library:
-                    if !hideLibraryTab { iOSLibraryView(isActive: true) }
-                case .search:
-                    if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
-                case .addons:
-                    AddonsView()
-                case .settings:
-                    iOSSettingsView()
-                }
+                selectedTabContent
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            #if os(macOS)
-            .safeAreaInset(edge: .top, spacing: 0) { Color.clear.frame(height: macTopChromeHeight) }
-            #endif
-            .overlay(alignment: .top) { macTopNavOverlay }
-            #if os(macOS)
-            .onPreferenceChange(MacTopChromeHeightKey.self) { macTopChromeHeight = $0 }
-            #endif
 
             bottomTabBarRow
+            #endif
         }
         .onChange(of: tab) { newTab in
             presentUpdateIfReady()
@@ -243,9 +224,9 @@ struct iOSRootView: View {
         .disabled(!shellVisible)
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .tint(Theme.Palette.accent)
-        .animation(.easeOut(duration: 0.25), value: updates.available?.build)
-        .animation(.easeOut(duration: 0.25), value: dismissedUpdateVersion)
-        .animation(.easeOut(duration: 0.25), value: connectivity.isOffline)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: updates.available?.build)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: dismissedUpdateVersion)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: connectivity.isOffline)
         // Offline-at-LAUNCH routing (#120): the monitor's FIRST verdict (and only that one) may redirect
         // the initial tab, so an app opened with no connection lands on something usable instead of a
         // dead Home: the Downloads surface when a completed download exists, else Settings. Strictly
@@ -381,6 +362,27 @@ struct iOSRootView: View {
         }
     }
 
+    /// One routing owner for every platform. The Mac shell changes only the surrounding chrome; all
+    /// destinations remain the existing real views, including the Downloads push inside Library.
+    @ViewBuilder private var selectedTabContent: some View {
+        switch tab {
+        case .home:
+            iOSHomeView(isActive: true)
+        case .discover:
+            if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
+        case .live:
+            if !hideLiveTab { iOSLiveView() }
+        case .library:
+            if !hideLibraryTab { iOSLibraryView(isActive: true) }
+        case .search:
+            if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
+        case .addons:
+            AddonsView()
+        case .settings:
+            iOSSettingsView()
+        }
+    }
+
     #if os(macOS)
     private struct UpdateCheckFeedback: Identifiable {
         let id = UUID()
@@ -390,46 +392,77 @@ struct iOSRootView: View {
     #endif
 
     #if os(macOS)
-    private var macTopBar: some View {
+    /// Desktop layout: familiar left navigation, persistent media search, and one real content host.
+    /// It deliberately does not mount a second TabView or a Settings scene, keeping every existing
+    /// destination, profile gate, banner, and route modifier attached to this root.
+    private var macDesktopShell: some View {
+        HStack(spacing: 0) {
+            macSidebar
+            Rectangle()
+                .fill(Theme.Palette.hairline)
+                .frame(width: 1)
+                .accessibilityHidden(true)
+            selectedTabContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .safeAreaInset(edge: .top, spacing: 0) { macContentHeader }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas)
+        .onExitCommand {
+            // Escape preserves the content views' own back behavior; when desktop chrome owns focus,
+            // it simply returns focus to the active navigation item instead of stranding the cursor.
+            if macSearchFocused { macSearchFocused = false }
+            tabFocus = .tab(tab.rawValue)
+        }
+    }
+
+    private var macContentHeader: some View {
         HStack(spacing: Theme.Space.md) {
-            Spacer(minLength: Theme.Space.md)
-            HStack(spacing: Theme.Space.sm) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                TextField(text: $macQuery) {
-                    Text("Search movies or series").foregroundStyle(Theme.Palette.textTertiary)
-                }
-                .textFieldStyle(.plain)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .focused($macSearchFocused)
-                .onSubmit { submitMacSearch() }
-                if !macQuery.isEmpty {
-                    Button { macQuery = "" } label: {
-                        Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.Palette.textTertiary)
-                    }
-                    .buttonStyle(.plain)
-                    .frame(minWidth: 24, minHeight: 24)
-                    .contentShape(Rectangle())
-                    .accessibilityLabel("Clear search")
-                }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(tab.title)
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("VortX for Mac")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Theme.Palette.textTertiary)
             }
-            .padding(.horizontal, Theme.Space.sm)
-            .padding(.vertical, 4)
-            .frame(maxWidth: 300)
-            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
+            Spacer(minLength: Theme.Space.md)
+            macTopBar
         }
-        .padding(.leading, 84)
-        .padding(.trailing, Theme.Space.md)
-        .frame(height: 32)
-        .frame(maxWidth: .infinity)
-        .background {
-            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.55), .clear],
-                           startPoint: .top, endPoint: .bottom)
-                .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
+        .padding(.horizontal, Theme.Space.lg)
+        .padding(.vertical, Theme.Space.sm)
+        .background(Theme.Palette.canvas.opacity(0.96))
+    }
+
+    private var macTopBar: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textSecondary)
+            TextField(text: $macQuery) {
+                Text("Search movies or series").foregroundStyle(Theme.Palette.textTertiary)
+            }
+            .textFieldStyle(.plain)
+            .font(Theme.Typography.body)
+            .foregroundStyle(Theme.Palette.textPrimary)
+            .focused($macSearchFocused)
+            .onSubmit { submitMacSearch() }
+            .accessibilityLabel("Search movies or series")
+            if !macQuery.isEmpty {
+                Button { macQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .frame(minWidth: 28, minHeight: 28)
+                .contentShape(Rectangle())
+                .accessibilityLabel("Clear search")
+            }
         }
+        .padding(.horizontal, Theme.Space.sm)
+        .padding(.vertical, 6)
+        .frame(minWidth: 220, idealWidth: 300, maxWidth: 360)
+        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous),
+                    fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
     }
 
     /// Where a search request lands (#117 rule: never route to a hidden tab, fall back to Home).
@@ -452,40 +485,87 @@ struct iOSRootView: View {
         tab = destination
     }
 
-    private var macNavPill: some View {
-        HStack(spacing: Theme.Space.md) {
-            VortXWordmark(fontSize: 18)
-            Divider().frame(height: 20)
-            HStack(spacing: Theme.Space.xs) {
+    private var macSidebar: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            HStack(spacing: Theme.Space.sm) {
+                VortXWordmark(fontSize: 21)
+                Spacer(minLength: 0)
+                Image(systemName: "macbook")
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.top, Theme.Space.md)
+
+            Text("BROWSE")
+                .font(.caption2.weight(.bold))
+                .tracking(1.2)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .padding(.horizontal, Theme.Space.md)
+
+            VStack(spacing: 4) {
                 ForEach(visibleTabs, id: \.rawValue) { item in
-                    tabButton(item).fixedSize().padding(.horizontal, Theme.Space.xs)
+                    macSidebarItem(item)
                 }
             }
             .focusSection()
+
+            Spacer(minLength: Theme.Space.md)
+            Text("⌘F to search · ⌘, for settings")
+                .font(.caption2)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.bottom, Theme.Space.md)
         }
-        .padding(.horizontal, Theme.Space.md)
-        .padding(.vertical, Theme.Space.xs)
-        .vortxGlass(in: Capsule())
+        .frame(minWidth: 188, idealWidth: 216, maxWidth: 240, maxHeight: .infinity, alignment: .leading)
+        .background(Theme.Palette.surface1.opacity(0.72))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Tabs")
+        .accessibilityLabel("Main navigation")
+    }
+
+    private func macSidebarItem(_ item: Tab) -> some View {
+        let selected = tab == item
+        return Button {
+            if selected {
+                TabScrollToTop.shared.bump(item.scrollKey)
+            } else {
+                tab = item
+            }
+        } label: {
+            HStack(spacing: Theme.Space.sm) {
+                Image(systemName: selected ? item.icon : item.inactiveIcon)
+                    .frame(width: 20)
+                    .overlay(alignment: .topTrailing) {
+                        if item == .library, activeDownloadCount > 0 {
+                            downloadCountBadge(activeDownloadCount)
+                                .scaleEffect(0.75, anchor: .topTrailing)
+                                .offset(x: 5, y: -5)
+                        }
+                    }
+                Text(item.title)
+                    .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
+            .padding(.horizontal, Theme.Space.sm)
+            .frame(minHeight: 36)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
+                    .fill(selected ? VortXGlass.activeFill : .clear)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, Theme.Space.sm)
+        .accessibilityLabel(item.title)
+        .accessibilityHint("Switches to \(item.title)")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .focusable()
+        .focused($tabFocus, equals: .tab(item.rawValue))
+        .macFocusRing(tabFocus == .tab(item.rawValue), cornerRadius: Theme.Radius.control)
     }
     #endif
-
-    @ViewBuilder private var macTopNavOverlay: some View {
-        #if os(macOS)
-        ZStack(alignment: .top) {
-            macTopBar
-            macNavPill
-        }
-        .background {
-            GeometryReader { geometry in
-                Color.clear.preference(key: MacTopChromeHeightKey.self, value: geometry.size.height)
-            }
-        }
-        #else
-        EmptyView()
-        #endif
-    }
 
     @ViewBuilder private var bottomTabBarRow: some View {
         #if os(macOS)
@@ -705,13 +785,6 @@ struct iOSRootView: View {
         #endif
     }
 }
-
-#if os(macOS)
-private struct MacTopChromeHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 64
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-#endif
 
 private extension View {
     /// macOS: reclaim the top container safe area (the window titlebar / traffic-light band) so a
