@@ -40,7 +40,8 @@ class AddonPublicationProofsTest {
             }
             var writes = 0
             val lease = AddonPublicationLease("B", proofs) { if (mode == "expired") false else it() }
-            lease.install(native, expected, { if (mode == "missing") emptyList() else listOf(actual) }) { writes++ }
+            val installed = lease.install(native, expected, { if (mode == "missing") emptyList() else listOf(actual) }) { writes++ }
+            assertEquals(mode, mode == "good", installed)
             assertEquals(mode, mode == "good", proofs.published("B", native, actual) != null)
             assertEquals(if (mode == "expired") 0 else 1, writes)
         }

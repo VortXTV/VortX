@@ -86,6 +86,5 @@ internal class AddonPublicationLease(
             ?: return@admit false
         if (!AddonPublicationProofs.matchesInstalled(expected, actual)) return@admit false
         proofs.grant(account, native, listOf(actual to expected))
-        true
     }
 }
