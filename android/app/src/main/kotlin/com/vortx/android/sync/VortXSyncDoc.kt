@@ -51,6 +51,21 @@ object VortXSyncDoc {
         val raw: JSONObject,
     )
 
+    /** Owner library record. On the wire t/d are seconds; in memory they remain zero-safe milliseconds. */
+    data class OwnerLibraryItem(
+        val metaId: String,
+        val type: String,
+        val name: String,
+        val poster: String?,
+        val videoId: String?,
+        val timeOffsetMs: Long,
+        val durationMs: Long,
+        /** A genuine producer event clock only; null is intentionally not replaced with "now". */
+        val lastWatched: String?,
+    ) {
+        val identity: String get() = "$type:$metaId"
+    }
+
     /** The parsed roster + overlay + tombstone view of a pulled doc, ready for the ordered syncDown apply. */
     data class Parsed(
         /** The remote roster, or null when the doc carries neither `vortx.roster` nor `vortx.profiles`. */
@@ -77,6 +92,8 @@ object VortXSyncDoc {
         val addons: List<AddonDescriptor>,
         /** Shared top-level priority spine. Null means the document did not carry an order. */
         val addonOrder: List<String>?,
+        /** App-owned vortx.library, falling back to the website's top-level library import. */
+        val ownerLibrary: List<OwnerLibraryItem>?,
         /** The remote device's active profile (advisory; selection stays per-device). */
         val activeProfile: String?,
     )
@@ -99,6 +116,7 @@ object VortXSyncDoc {
                 webAddonRemovals,
                 ownedAddons(doc, null),
                 parseAddonOrder(doc.optJSONArray("addonOrder")),
+                ownerLibrary(doc, null),
                 null,
             )
 
@@ -156,8 +174,70 @@ object VortXSyncDoc {
             webAddonRemovals,
             ownedAddons(doc, vortx),
             parseAddonOrder(doc.optJSONArray("addonOrder")),
+            ownerLibrary(doc, vortx),
             active,
         )
+    }
+
+    /**
+     * App data wins over a website/Stremio import when present. Invalid rows are independently ignored;
+     * absence stays null so a partial document can never mean "clear the engine library".
+     */
+    internal fun ownerLibrary(doc: JSONObject, vortx: JSONObject? = doc.optJSONObject("vortx")): List<OwnerLibraryItem>? {
+        val rows = vortx?.optJSONArray("library") ?: doc.optJSONArray("library") ?: return null
+        return buildMap<String, OwnerLibraryItem> {
+            for (index in 0 until rows.length()) {
+                val item = rows.optJSONObject(index)?.let(::ownerLibraryItem) ?: continue
+                putIfAbsent(item.identity, item)
+            }
+        }.values.toList()
+    }
+
+    internal fun ownerLibraryItem(row: JSONObject): OwnerLibraryItem? {
+        val id = row.opt("id") as? String ?: return null
+        val type = row.opt("type") as? String ?: return null
+        if (!isTypedCatalogIdentity(id) || type !in setOf("movie", "series")) return null
+        fun wireSeconds(key: String): Long = (row.opt(key) as? Number)?.toDouble()
+            ?.takeIf { it.isFinite() && it >= 0.0 }?.times(1000.0)?.toLong() ?: 0L
+        return OwnerLibraryItem(
+            metaId = id,
+            type = type,
+            name = (row.opt("name") as? String).orEmpty(),
+            poster = (row.opt("poster") as? String)?.takeIf { it.isNotBlank() },
+            videoId = (row.opt("v") as? String)?.takeIf { it.isNotBlank() },
+            timeOffsetMs = wireSeconds("t"),
+            durationMs = wireSeconds("d"),
+            lastWatched = (row.opt("lastWatched") as? String)?.takeIf { it.isNotBlank() },
+        )
+    }
+
+    /** Reject synthetic IDs before they can reach the native account library. */
+    internal fun isTypedCatalogIdentity(id: String): Boolean =
+        (id.startsWith("tt") && id.length > 2 && id.drop(2).all(Char::isDigit)) ||
+            (id.startsWith("tmdb:") && id.length > 5 && id.drop(5).all(Char::isDigit))
+
+    /** Merge only a positive native snapshot; do not delete peer data because a local model is empty. */
+    internal fun mergeLocalOwnerLibrary(
+        vortx: JSONObject,
+        local: List<OwnerLibraryItem>?,
+        removed: Set<String>,
+    ) {
+        local ?: return
+        val merged = LinkedHashMap<String, JSONObject>()
+        for (row in vortx.optJSONArray("library").orEmptyObjects()) {
+            val item = ownerLibraryItem(row) ?: continue
+            if (LibraryTombstones.normalize(item.metaId) !in removed) merged[item.identity] = row
+        }
+        for (item in local) {
+            if (LibraryTombstones.normalize(item.metaId) !in removed) {
+                merged[item.identity] = JSONObject().apply {
+                    put("id", item.metaId); put("type", item.type); put("name", item.name); put("poster", item.poster ?: "")
+                    put("t", item.timeOffsetMs / 1000L); put("d", item.durationMs / 1000L); put("v", item.videoId ?: "")
+                    item.lastWatched?.let { put("lastWatched", it) }
+                }
+            }
+        }
+        if (merged.isNotEmpty()) vortx.put("library", JSONArray(merged.values.toList()))
     }
 
     /**

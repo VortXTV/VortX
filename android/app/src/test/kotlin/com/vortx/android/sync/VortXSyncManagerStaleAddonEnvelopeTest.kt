@@ -223,12 +223,12 @@ private class RecordingAddonGateway(url: String) : AccountAddonSyncGateway {
 
     override fun captureAccountAddonLease(): AccountAddonGatewayLease = Lease
     override suspend fun accountAddonSnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.AddonDescriptor> = listOf(descriptor)
-    override suspend fun installAccountAddon(nativeLease: AccountAddonGatewayLease, descriptor: VortXSyncDoc.AddonDescriptor): Boolean = false
-    override suspend fun removeAccountAddon(nativeLease: AccountAddonGatewayLease, normalizedTransportUrl: String): Boolean {
+    override suspend fun installAccountAddon(nativeLease: AccountAddonGatewayLease, descriptor: VortXSyncDoc.AddonDescriptor, admit: ((() -> Boolean) -> Boolean)): Boolean = false
+    override suspend fun removeAccountAddon(nativeLease: AccountAddonGatewayLease, normalizedTransportUrl: String, admit: ((() -> Boolean) -> Boolean)): Boolean {
         removed += normalizedTransportUrl
         return true
     }
-    override suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>): Boolean = false
+    override suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>, admit: ((() -> Boolean) -> Boolean)): Boolean = false
 }
 
 private class MemoryContext : ContextWrapper(null) {

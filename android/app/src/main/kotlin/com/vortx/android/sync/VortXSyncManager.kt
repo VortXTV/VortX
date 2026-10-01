@@ -127,12 +127,25 @@ interface AccountAddonSyncGateway {
     suspend fun installAccountAddon(
         nativeLease: AccountAddonGatewayLease,
         descriptor: VortXSyncDoc.AddonDescriptor,
+        admit: ((() -> Boolean) -> Boolean),
     ): Boolean
     suspend fun removeAccountAddon(
         nativeLease: AccountAddonGatewayLease,
         normalizedTransportUrl: String,
+        admit: ((() -> Boolean) -> Boolean),
     ): Boolean
-    suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>): Boolean
+    suspend fun applyRemoteAddonOrder(nativeLease: AccountAddonGatewayLease, order: List<String>, admit: ((() -> Boolean) -> Boolean)): Boolean
+}
+
+/** Owner-library native boundary. Restore is intentionally additive; progress is receipt-gated elsewhere. */
+interface AccountLibrarySyncGateway {
+    fun captureAccountLibraryLease(): AccountAddonGatewayLease?
+    /** Null means native state is not positively ready; an empty list means a confirmed empty library. */
+    suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease): List<VortXSyncDoc.OwnerLibraryItem>?
+    suspend fun addAccountLibraryItems(
+        nativeLease: AccountAddonGatewayLease,
+        items: List<VortXSyncDoc.OwnerLibraryItem>,
+    ): Boolean
 }
 
 /**
@@ -926,6 +939,7 @@ class VortXSyncManager(context: Context) {
     @Volatile private var profileStore: ProfileStore? = null
     /** Bound by the application after the single native repository is available. */
     @Volatile private var addonGateway: AccountAddonSyncGateway? = null
+    @Volatile private var libraryGateway: AccountLibrarySyncGateway? = null
 
     /**
      * Set while syncDown is applying a remote pull. The writes it makes (roster fold, overlay hydrate) must
@@ -1477,8 +1491,14 @@ class VortXSyncManager(context: Context) {
         addonGateway = gateway
     }
 
+    fun attachAccountLibraryGateway(gateway: AccountLibrarySyncGateway) {
+        libraryGateway = gateway
+    }
+
     /** Called after a local drag has persisted an account-scoped dirty order overlay. */
     fun onLocalAddonOrderChanged() = requestSyncSoon()
+    /** Real local library mutations arm the existing durable/debounced account push. */
+    fun onLocalOwnerLibraryChanged() = requestSyncSoon()
 
     private fun resolveStore(): ProfileStore? = profileStore ?: ProfileStore.sharedOrNull()
 
@@ -1764,6 +1784,10 @@ class VortXSyncManager(context: Context) {
                 gateway.accountAddonSnapshot(nativeLease)
             }
         }.orEmpty()
+        val localOwnerLibrary = libraryGateway?.let { gateway ->
+            val nativeLease = gateway.captureAccountLibraryLease()
+            if (nativeLease != null) gateway.accountLibrarySnapshot(nativeLease) else null
+        }
         if (!isSyncLeaseCurrent(lease)) return null
         val parsed = VortXSyncDoc.parse(doc)
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
@@ -1821,6 +1845,7 @@ class VortXSyncManager(context: Context) {
                     local = localAddons,
                     removed = addonTombstones.all(),
                 )
+                VortXSyncDoc.mergeLocalOwnerLibrary(vortx, localOwnerLibrary, libraryTombstones.all())
                 doc.put(
                     "vortx",
                     applyAddonTombstonesToVortx(applyLibraryTombstonesToVortx(vortx), addonTombstones),
@@ -2069,6 +2094,7 @@ class VortXSyncManager(context: Context) {
         // Account add-on descriptors/order are versioned payload. Every native mutation is lease-fenced so
         // an account switch cannot install, remove, or reorder against the new session's engine state.
         if (applyRemoteAccountAddons(lease, parsed)) restored = true
+        if (applyRemoteOwnerLibrary(lease, parsed)) restored = true
         if (!isSyncLeaseCurrent(lease)) return false
         // gap 2: adopt connected-service (debrid) keys set on another device. Applied off the Main thread
         // (DebridKeys is thread-safe and its writes do not arm a push, so this needs no Main hop or the
@@ -2098,7 +2124,7 @@ class VortXSyncManager(context: Context) {
             val identity = AddonTombstones.normalize(descriptor.transportUrl)
             if (identity !in removed) continue
             if (!isSyncLeaseCurrent(lease)) return false
-            gateway.removeAccountAddon(nativeLease, identity)
+            gateway.removeAccountAddon(nativeLease, identity, syncLeaseAdmission(lease))
             if (!isSyncLeaseCurrent(lease)) return false
         }
         return true
@@ -2121,7 +2147,7 @@ class VortXSyncManager(context: Context) {
             val identity = AddonTombstones.normalize(descriptor.transportUrl)
             if (identity.isEmpty() || identity in removed || identity in present) continue
             if (!isSyncLeaseCurrent(lease)) return false
-            if (gateway.installAccountAddon(nativeLease, descriptor)) changed = true
+            if (gateway.installAccountAddon(nativeLease, descriptor, syncLeaseAdmission(lease))) changed = true
             if (!isSyncLeaseCurrent(lease)) return false
         }
         if (!enforceRemovedAccountAddons(lease)) return false
@@ -2130,11 +2156,36 @@ class VortXSyncManager(context: Context) {
         if (addonPrefs.orderDirtyAt() == null && parsed.addonOrder != null) {
             if (addonPrefs.setAppliedOrder(parsed.addonOrder, remote = true)) {
                 if (!isSyncLeaseCurrent(lease)) return false
-                if (gateway.applyRemoteAddonOrder(nativeLease, parsed.addonOrder)) changed = true
+                if (gateway.applyRemoteAddonOrder(nativeLease, parsed.addonOrder, syncLeaseAdmission(lease))) changed = true
                 if (!isSyncLeaseCurrent(lease)) return false
             }
         }
         return changed
+    }
+
+    /** Executes the native dispatch while the VortX session identity remains serialized with adopt/sign-out. */
+    private fun syncLeaseAdmission(lease: SyncSessionLease): ((() -> Boolean) -> Boolean) = { dispatch ->
+        operations.snapshot { generation ->
+            sessionState.serialized {
+                if (generation == lease.operationGeneration && sessionMatchesLease(lease)) dispatch() else false
+            }
+        }
+    }
+
+    /** Hydrates missing, non-tombstoned typed titles only. Never replaces native membership or self-pushes. */
+    private suspend fun applyRemoteOwnerLibrary(lease: SyncSessionLease, parsed: VortXSyncDoc.Parsed): Boolean {
+        val incoming = parsed.ownerLibrary ?: return false
+        val gateway = libraryGateway ?: return false
+        val nativeLease = gateway.captureAccountLibraryLease() ?: return false
+        if (!isSyncLeaseCurrent(lease)) return false
+        val local = gateway.accountLibrarySnapshot(nativeLease) ?: return false
+        if (!isSyncLeaseCurrent(lease)) return false
+        val present = local.mapTo(HashSet()) { it.identity }
+        val removed = libraryTombstones.all()
+        val missing = incoming.filter {
+            it.identity !in present && LibraryTombstones.normalize(it.metaId) !in removed
+        }
+        return missing.isNotEmpty() && gateway.addAccountLibraryItems(nativeLease, missing) && isSyncLeaseCurrent(lease)
     }
 
     /**
