@@ -55,6 +55,9 @@ import com.vortx.android.sync.NativeLibraryOwner
 import com.vortx.android.sync.OwnerLibraryPublicationLease
 import com.vortx.android.sync.LocalLibraryPublicationPolicy
 import com.vortx.android.sync.AddonPublicationProofs
+import com.vortx.android.sync.OwnerWatchedIntentStore
+import com.vortx.android.sync.OwnerLibraryOperation
+import com.vortx.android.sync.OwnerLibraryHistoryPolicy
 import com.vortx.android.sync.AccountAddonSyncGateway
 import com.vortx.android.sync.AccountAddonGatewayLease
 import com.vortx.android.sync.LibraryTombstones
@@ -425,11 +428,13 @@ internal class PlaybackHistorySessions {
     private val lock = Any()
     private var generation = 0L
     private var current: PlaybackHistorySession? = null
+    private var lastPublication: OwnerLibraryPublicationLease? = null
 
     fun replace(
         unloadPrevious: (PlaybackHistorySession) -> Unit,
         create: (PlaybackSessionToken) -> PlaybackHistorySession,
     ): PlaybackSessionToken = synchronized(lock) {
+        lastPublication?.invalidate()
         current?.let(unloadPrevious)
         current = null
         check(generation < Long.MAX_VALUE) { "Playback session generation exhausted." }
@@ -438,6 +443,7 @@ internal class PlaybackHistorySessions {
         val replacement = create(token)
         check(replacement.token == token) { "Playback session token mismatch." }
         current = replacement
+        lastPublication = replacement.publication
         token
     }
 
@@ -1106,7 +1112,18 @@ class EngineStremioRepository(
     private fun withOverlayState(detail: MetaDetail, permit: HistoryReadPermit): MetaDetail? {
         val shaped = try {
             when (val route = historyRouteLocked(permit.owner)) {
-                HistoryRoute.Engine -> detail
+                HistoryRoute.Engine -> {
+                    val entries = if (permit.owner.profileId == UserProfile.OWNER_ID)
+                        (appContext as? VortXApplication)?.syncManager?.captureOwnerWatchedIntentLease()?.entries().orEmpty() else emptyList()
+                    val whole = entries.firstOrNull { it.title == detail.id && it.video == detail.id }
+                    detail.copy(
+                        watchedVideoIds = OwnerWatchedIntentStore.effectiveVideos(entries, detail.id, detail.watchedVideoIds, detail.videos.mapTo(HashSet()) { it.id }),
+                        libraryItem = whole?.let { intent ->
+                            (detail.libraryItem ?: LibraryItemInfo(detail.id, true, true, null, 0, 0, 0))
+                                .copy(timesWatched = if (intent.watched) 1 else 0, flaggedWatched = if (intent.watched) 1 else 0)
+                        } ?: detail.libraryItem,
+                    )
+                }
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
                     val entry = overlay.watch[detail.id]
                     val libraryItem = entry?.let {
@@ -1632,7 +1649,7 @@ class EngineStremioRepository(
                 suppressAccountHistory = suppressEngineHistory,
             )
         }
-        val allBoardRows = WatchedIndex.apply(pagedBoardRows, watchedIds)
+        val allBoardRows = WatchedIndex.apply(pagedBoardRows, OwnerWatchedIntentStore.effectiveTitles(ownerWatchedEntries(), watchedIds))
         // Per-profile add-on on/off overlay (Apple `buildBoardRows`' disabledAddons guard,
         // CoreBridge.swift:2191): a disabled add-on's catalog rows must not render on this profile's
         // Home. The row id is "<base>|<type>|<id>" (see [EngineState.parseCatalogs]); rows with no
@@ -1719,9 +1736,16 @@ class EngineStremioRepository(
     /// A no-op allocation when the set is empty (the common case).
     private fun withWatchedFlags(items: List<MetaItem>): List<MetaItem> {
         val ids = currentWatchedIds()
-        if (ids.isEmpty()) return items
-        return items.map { if (!it.watched && it.id in ids) it.copy(watched = true) else it }
+        val manual = ownerWatchedEntries().filter { it.title == it.video }.associateBy { it.title }
+        return items.map { item ->
+            val watched = manual[item.id]?.watched ?: (item.watched || item.id in ids)
+            if (watched == item.watched) item else item.copy(watched = watched)
+        }
     }
+
+    private fun ownerWatchedEntries(): List<OwnerWatchedIntentStore.Entry> =
+        if (ProfileStore.sharedOrNull()?.activeUsesEngineHistory == false || ProfileStore.sharedOrNull()?.active?.id != UserProfile.OWNER_ID) emptyList()
+        else (appContext as? VortXApplication)?.syncManager?.captureOwnerWatchedIntentLease()?.entries().orEmpty()
 
     /// The set of meta ids the ACTIVE profile has watched, for badging catalog/search/discover cards.
     /// Mirrors the Home board builder's own watched-id computation verbatim (an overlay profile reads its
@@ -1825,7 +1849,7 @@ class EngineStremioRepository(
                     )
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(publication, owner, item.type.id, item.id, LocalLibraryPublicationPolicy::membershipAdded) {
+                    mutateLocalLibrary(publication, owner, item.type.id, item.id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = item.name, poster = item.poster)) {
                     StremioCoreNative.dispatch(
                         EngineActions.addToLibrary(
                             id = item.id,
@@ -1959,6 +1983,13 @@ class EngineStremioRepository(
 
     override fun captureAccountLibraryLease(): AccountAddonGatewayLease? = captureAccountAddonLease()
 
+    override suspend fun ownerWatchedChanged(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)): Boolean {
+        val owned = nativeLease as? EngineAccountAddonLease ?: return false
+        return runCatching { historyOwnerFence.mutate(expectedOwner = owned.owner) {
+            admit { changedFields.tryEmit(setOf(EngineActions.FIELD_CTX, EngineActions.FIELD_META_DETAILS)); true }
+        } }.getOrDefault(false)
+    }
+
     override fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease): NativeLibraryOwner? =
         (nativeLease as? EngineAccountAddonLease)?.owner?.let { NativeLibraryOwner(it.principal.takeUnless { uid -> uid == "signed-out" }) }
 
@@ -1987,18 +2018,30 @@ class EngineStremioRepository(
         nativeLease: AccountAddonGatewayLease,
         items: List<VortXSyncDoc.OwnerLibraryItem>,
         admit: ((() -> Boolean) -> Boolean),
-    ): AccountLibraryRestoreResult = withContext(Dispatchers.Default) {
+    ): AccountLibraryRestoreResult {
+        val publication = captureLibraryPublication()
+        return withContext(Dispatchers.Default) {
         val owned = nativeLease as? EngineAccountAddonLease ?: return@withContext AccountLibraryRestoreResult(false)
         runCatching {
             historyOwnerFence.mutate(expectedOwner = owned.owner) { owner ->
                 check(owner.usesEngineHistory) { "Owner library requires the engine-history owner." }
                 var restored = emptyList<VortXSyncDoc.OwnerLibraryItem>()
-                val accepted = nativeOwnerLibrary.apply(owner.principal.takeUnless { it == "signed-out" }, items, admit) { restored = it }
+                val uid = owner.principal.takeUnless { it == "signed-out" }
+                val clocked = items.filter { OwnerLibraryHistoryPolicy.clock(it) != null }
+                val accepted = nativeOwnerLibrary.apply(uid, clocked, admit) { restored = it } && admit {
+                    for (item in items.filter { OwnerLibraryHistoryPolicy.clock(it) == null }) {
+                        mutateLocalLibrary(publication, owner, item.type, item.metaId,
+                            operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = item.name, poster = item.poster)) {
+                            check(nativeOwnerLibrary.apply(uid, listOf(item), admit)) { "Account membership owner changed." }
+                        }
+                    }
+                    true
+                }
                 if (accepted && items.isNotEmpty()) admit { changedFields.tryEmit(setOf(EngineActions.FIELD_CTX)); true }
                 AccountLibraryRestoreResult(accepted, if (accepted) restored else emptyList())
             }
         }.getOrDefault(AccountLibraryRestoreResult(false))
-    }
+    } }
 
     private val nativeOwnerLibrary = NativeOwnerLibraryGateway(
         read = StremioCoreNative::readLibraryEvents,
@@ -2018,6 +2061,7 @@ class EngineStremioRepository(
         admit = (appContext as? VortXApplication)?.syncManager?.captureLocalLibraryMutationAdmission(),
         tombstones = { LibraryTombstones(appContext) },
         publication = captureLibraryPublication(),
+        watchedIntents = (appContext as? VortXApplication)?.syncManager?.captureOwnerWatchedIntentLease(),
     )
 
     private fun captureLibraryPublication(): OwnerLibraryPublicationLease? =
@@ -2026,10 +2070,58 @@ class EngineStremioRepository(
     private fun mutateLocalLibrary(
         publication: OwnerLibraryPublicationLease?, owner: ContinueWatchingOwner, type: String?, id: String?,
         validate: (VortXSyncDoc.OwnerLibraryItem?, VortXSyncDoc.OwnerLibraryItem) -> Boolean = { _, _ -> false },
+        operation: OwnerLibraryOperation? = null,
         action: () -> Unit,
     ) {
         if (publication == null || type == null || id == null || owner.profileId != UserProfile.OWNER_ID) { action(); return }
         val native = NativeLibraryOwner(owner.principal.takeUnless { it == "signed-out" })
+        if (operation != null) {
+            val identity = "$type:$id"
+            fun modelJson(field: String) = runCatching { JSONObject(StremioCoreNative.getState(JSONObject.quote(field))) }.getOrNull()
+            val observedOperation = when (operation.kind) {
+                OwnerLibraryOperation.Kind.MANUAL -> operation.copy(manualInitial = operation.admitsInitialManual(modelJson(EngineActions.FIELD_META_DETAILS), identity))
+                OwnerLibraryOperation.Kind.PROGRESS -> operation.copy(progressInitial = operation.admitsInitialProgress(modelJson(EngineActions.FIELD_PLAYER), identity))
+                else -> operation
+            }
+            val candidate = {
+                val field = if (operation.kind == OwnerLibraryOperation.Kind.PROGRESS) EngineActions.FIELD_PLAYER else EngineActions.FIELD_META_DETAILS
+                val json = modelJson(field)
+                var model = json?.optJSONObject("libraryItem")?.let(OwnerLibraryOperation::modelCandidate)
+                    ?.takeIf { it.identity == identity && observedOperation.acceptsManualModel(json, it) }
+                if (operation.kind == OwnerLibraryOperation.Kind.PROGRESS) {
+                    val candidates = mutableListOf<VortXSyncDoc.OwnerLibraryItem>()
+                    model?.let(candidates::add)
+                    modelJson(EngineActions.FIELD_META_DETAILS)?.optJSONObject("libraryItem")?.let(OwnerLibraryOperation::modelCandidate)?.let(candidates::add)
+                    modelJson(EngineActions.FIELD_LIBRARY)?.optJSONArray("catalog")?.let { rows ->
+                        for (index in 0 until rows.length()) rows.optJSONObject(index)?.let(OwnerLibraryOperation::modelCandidate)?.let(candidates::add)
+                    }
+                    // LibraryChanged can stamp a loaded model after Player unload. Still require the
+                    // captured operation's exact target/position/duration; disk presence alone is never enough.
+                    model = candidates.filter { it.identity == identity && it.videoId == operation.video &&
+                        it.timeOffsetMs == operation.position && it.durationMs == operation.duration }
+                        .maxByOrNull { it.nativeEventEpochMs ?: 0 }
+                }
+                // Membership grants only exact submitted metadata and a pristine state, never a view clock.
+                // Unlike progress, this has no dependency on a Player/MetaDetails model being loaded.
+                model ?: if (operation.kind == OwnerLibraryOperation.Kind.MEMBERSHIP || observedOperation.manualDirect)
+                    nativeOwnerLibrary.snapshot(native.uid) { it() }?.singleOrNull { it.identity == identity } else null
+            }
+            check(publication.mutateObserved(native, identity, { nativeOwnerLibrary.snapshot(native.uid) { it() } }, observedOperation, candidate, action)) {
+                "Library account changed. Try again."
+            }
+            engineScope.launch {
+                // No suspension under either fence. Original account and native captures are retained.
+                repeat(100) {
+                    delay(1000)
+                    if (!publication.isCurrent()) return@launch
+                    val complete = runCatching { historyOwnerFence.mutate(expectedOwner = owner) {
+                        publication.completePending(identity) { nativeOwnerLibrary.snapshot(native.uid) { it() } }
+                    } }.getOrElse { return@launch }
+                    if (complete) { requestOwnerLibrarySync(owner); return@launch }
+                }
+            }
+            return
+        }
         check(publication.mutate(native, "$type:$id", { nativeOwnerLibrary.snapshot(native.uid) { it() } }, validate, action)) {
             "Library account changed. Try again."
         }
@@ -2138,14 +2230,17 @@ class EngineStremioRepository(
                     HistoryRoute.Engine -> {
                         // Hand the native action its resident preview when available. The minimal fallback
                         // is the same shape accepted by AddToLibrary.
-                        val preview = rawMetaPreview(item.id) ?: JSONObject()
+                        val preview = rawMetaPreview(item.id)?.takeIf { it.optString("type") == item.type.id } ?: JSONObject()
                             .put("id", item.id)
                             .put("type", item.type.id)
                             .put("name", item.name)
                             .also { if (item.poster != null) it.put("poster", item.poster) }
-                        mutateLocalLibrary(admission.publication, owner, item.type.id, item.id, LocalLibraryPublicationPolicy.watched(isWatched)) {
+                        mutateLocalLibrary(admission.publication, owner, item.type.id, item.id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MANUAL,
+                            name = preview.optString("name"), poster = preview.opt("poster") as? String,
+                            manualWatched = isWatched, manualWhole = true, manualDirect = true)) {
                             StremioCoreNative.dispatch(EngineActions.metaItemMarkAsWatched(preview, isWatched))
                         }
+                        admission.watchedIntents?.let { check(it.record(item.id, listOf(item.id), isWatched)) { "Couldn't save watched intent for this account." } }
                         requestOwnerLibrarySync(owner)
                     }
                 }
@@ -2372,7 +2467,9 @@ class EngineStremioRepository(
         }
     }
 
-    override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
+    override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> {
+        val watchedAdmission = runCatching { captureOwnerLibraryMutation() }.getOrNull()
+        return withContext(Dispatchers.Default) { runCatchingPreservingCancellation {
         metaDetailsGate.exclusive {
         val permit = historyOwnerFence.captureRead()
             ?: throw IllegalStateException("History owner is changing. Try again.")
@@ -2388,12 +2485,43 @@ class EngineStremioRepository(
         val detail = EngineState.parseMetaDetail(state, addonPrefs.appliedOrder())
             ?.takeIf { matchesDetailMutationTarget(it, type, id) }
             ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
+        watchedAdmission?.let { admission ->
+            admission.mutate { owner, _ ->
+                if (owner.usesEngineHistory && owner.profileId == UserProfile.OWNER_ID) {
+                    val entries = admission.watchedIntents?.entries().orEmpty().filter { it.title == id }
+                    if (entries.isNotEmpty()) {
+                        val resident = requireResidentMutationTarget(type, id)
+                        val raw = JSONObject(StremioCoreNative.getState(JSONObject.quote(EngineActions.FIELD_META_DETAILS)))
+                        val array = raw.optJSONArray("watchedVideoIds")
+                        val witnessed = array?.let { list -> (0 until list.length()).mapNotNull { list.opt(it) as? String }
+                            .takeIf { it.size == list.length() && it.distinct().size == it.size }?.toSet() }
+                        val known = resident.videos.mapTo(hashSetOf()) { it.id }
+                        if (type == MediaType.MOVIE) {
+                            val desired = entries.firstOrNull { it.video == id }?.watched
+                            if (desired != null && (resident.libraryItem?.timesWatched?.let { it > 0 } ?: false) != desired) {
+                                mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MANUAL,
+                                    name = resident.name, poster = resident.poster, manualWatched = desired, manualWhole = true)) {
+                                    StremioCoreNative.dispatch(EngineActions.markAsWatched(desired))
+                                }
+                            }
+                        } else if (witnessed != null && known.isNotEmpty() && known.size == resident.videos.size && witnessed.all { it in known }) {
+                            val desired = OwnerWatchedIntentStore.effectiveVideos(entries, id, witnessed, known)
+                            val changes = resident.videos.filter { (it.id in witnessed) != (it.id in desired) }
+                            if (changes.isNotEmpty()) mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MANUAL)) {
+                                changes.forEach { video -> StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(video.id,
+                                    video.season.takeIf { it > 0 }, video.episode.takeIf { it > 0 }, video.id in desired)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Per-profile gate: replace the account-derived saved/resume/ticks with the overlay's for an
         // overlay profile (no-op for engine-backed profiles).
         withOverlayState(detail, permit)
             ?: throw IllegalStateException("History owner changed while loading this title.")
         }
-    } }
+    } } }
 
     override fun streamUpdates(
         type: MediaType,
@@ -2763,7 +2891,7 @@ class EngineStremioRepository(
                     val route = historyRouteLocked(owner)
                     val engineRoute = route is HistoryRoute.Engine
                     if (engineRoute) {
-                        mutateLocalLibrary(publication, owner, context.type, context.contentId, LocalLibraryPublicationPolicy.playerLoaded(context.videoId)) {
+                        mutateLocalLibrary(publication, owner, context.type, context.contentId) {
                         StremioCoreNative.dispatch(
                             EngineActions.loadPlayer(buildLocalPlayerSelected(context)),
                         )
@@ -2807,7 +2935,7 @@ class EngineStremioRepository(
                     }
                     val enginePlayerLoaded = route is HistoryRoute.Engine && selected != null
                     val libraryMetaId = selected?.optJSONObject("metaRequest")?.optJSONObject("path")?.optString("id")?.takeIf { it.isNotBlank() }
-                    if (enginePlayerLoaded) mutateLocalLibrary(publication, owner, type, libraryMetaId, LocalLibraryPublicationPolicy.playerLoaded(videoId)) {
+                    if (enginePlayerLoaded) mutateLocalLibrary(publication, owner, type, libraryMetaId) {
                         StremioCoreNative.dispatch(EngineActions.loadPlayer(selected!!))
                     }
                     PlaybackHistorySession(
@@ -2853,7 +2981,7 @@ class EngineStremioRepository(
                         }
                     }
                     HistoryRoute.Engine -> if (active.enginePlayerLoaded) {
-                        mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, LocalLibraryPublicationPolicy.progress(active.videoId, positionMs, durationMs)) {
+                        mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.PROGRESS, active.videoId, positionMs, durationMs, active.name, active.poster)) {
                         StremioCoreNative.dispatch(
                             EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
                         )
@@ -2921,7 +3049,7 @@ class EngineStremioRepository(
                         HistoryRoute.Engine -> if (
                             active.enginePlayerLoaded && durationMs > 0L && positionMs >= 0L
                         ) {
-                            mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, LocalLibraryPublicationPolicy.progress(active.videoId, positionMs, durationMs)) {
+                            mutateLocalLibrary(active.publication, owner, active.type, active.libraryMetaId, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.PROGRESS, active.videoId, positionMs, durationMs, active.name, active.poster)) {
                             StremioCoreNative.dispatch(
                                 EngineActions.playerTimeChanged(positionMs, durationMs, PROGRESS_DEVICE),
                             )
@@ -3018,12 +3146,9 @@ class EngineStremioRepository(
 
     // ---- S05: Detail watched-state + library mutations ----
     //
-    // Every dispatch below is followed by an IMMEDIATE re-read of `meta_details` (no loadFieldUntil
-    // wait): stremio-core's `Runtime::dispatch` runs synchronously and `MetaDetails::update` recomputes
-    // `library_item` from `ctx.library` on every dispatched message, so the post-dispatch snapshot
-    // already carries the mutation -- see [EngineActions]'s "S05" doc comment for the full reasoning.
-    // Returning the refreshed [MetaDetail] lets the ViewModel swap its state in one step instead of a
-    // separate re-load, so ticks/progress/library-chip state flip live the instant the action returns.
+    // Detail actions optimistically refresh the resident model. Neither dispatch nor that model read
+    // is a durable receipt: publication waits for the exact operation-derived candidate to match the
+    // persisted native projection. The separate causal manual-intent overlay supplies immediate ticks.
 
     private fun currentMetaDetail(): MetaDetail? =
         EngineState.parseMetaDetail(StremioCoreNative.getState(EngineActions.metaDetailsField()), addonPrefs.appliedOrder())
@@ -3054,13 +3179,11 @@ class EngineStremioRepository(
             ?: throw IllegalStateException("This title changed while saving. Try again.")
 
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = runCatchingPreservingCancellation {
-        val publication = captureLibraryPublication()
-        withContext(Dispatchers.Default) {
+        withOwnerLibraryMutationAdmission(Dispatchers.Default, ::captureOwnerLibraryMutation) { admission ->
         metaDetailsGate.exclusive {
-        val permit = historyOwnerFence.captureRead()
-            ?: throw IllegalStateException("History owner is changing. Try again.")
+        admission.requireCurrent()
         ensureResidentMutationTarget(type, id)
-        historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+        admission.mutate { owner, _ ->
             val detail = requireResidentMutationTarget(type, id)
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
@@ -3068,7 +3191,9 @@ class EngineStremioRepository(
                     overlay.setWatched(isWatched, id, videoIds, detail.name, type.id, detail.poster)
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(publication, owner, type.id, id, LocalLibraryPublicationPolicy.watched(isWatched)) {
+                    mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MANUAL,
+                        name = detail.name, poster = detail.poster, manualWatched = isWatched, manualWhole = true,
+                        manualInventory = detail.videos.map { it.id }, manualVideos = detail.videos.mapTo(hashSetOf()) { it.id })) {
                     // A series' aggregate action does not update its episode bitfield. Keep every
                     // dependent dispatch in this one MetaDetails transaction so another detail load or
                     // mutation cannot interleave a partially-marked series.
@@ -3085,6 +3210,7 @@ class EngineStremioRepository(
                         }
                     StremioCoreNative.dispatch(EngineActions.markAsWatched(isWatched))
                     }
+                    admission.watchedIntents?.let { check(it.record(id, listOf(id), isWatched)) { "Couldn't save watched intent for this account." } }
                     requestOwnerLibrarySync(owner)
                 }
             }
@@ -3102,13 +3228,11 @@ class EngineStremioRepository(
         episode: Int?,
         isWatched: Boolean,
     ): Result<MetaDetail> = runCatchingPreservingCancellation {
-        val publication = captureLibraryPublication()
-        withContext(Dispatchers.Default) {
+        withOwnerLibraryMutationAdmission(Dispatchers.Default, ::captureOwnerLibraryMutation) { admission ->
         metaDetailsGate.exclusive {
-        val permit = historyOwnerFence.captureRead()
-            ?: throw IllegalStateException("History owner is changing. Try again.")
+        admission.requireCurrent()
         ensureResidentMutationTarget(type, id)
-        historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+        admission.mutate { owner, _ ->
             val detail = requireResidentMutationTarget(type, id)
             when (val route = historyRouteLocked(owner)) {
                 is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
@@ -3122,9 +3246,12 @@ class EngineStremioRepository(
                     )
                 }
                 HistoryRoute.Engine -> {
-                    mutateLocalLibrary(publication, owner, type.id, id, LocalLibraryPublicationPolicy.watched(isWatched)) {
+                    mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MANUAL,
+                        name = detail.name, poster = detail.poster, manualWatched = isWatched,
+                        manualInventory = detail.videos.map { it.id }, manualVideos = setOf(videoId))) {
                     StremioCoreNative.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
                     }
+                    admission.watchedIntents?.let { check(it.record(id, listOf(videoId), isWatched)) { "Couldn't save watched intent for this account." } }
                     requestOwnerLibrarySync(owner)
                 }
             }
@@ -3136,13 +3263,11 @@ class EngineStremioRepository(
 
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
         runCatchingPreservingCancellation {
-            val publication = captureLibraryPublication()
-            withContext(Dispatchers.Default) {
+            withOwnerLibraryMutationAdmission(Dispatchers.Default, ::captureOwnerLibraryMutation) { admission ->
             metaDetailsGate.exclusive {
-            val permit = historyOwnerFence.captureRead()
-                ?: throw IllegalStateException("History owner is changing. Try again.")
+            admission.requireCurrent()
             ensureResidentMutationTarget(type, id)
-            historyOwnerFence.mutate(expectedOwner = permit.owner) { owner ->
+            admission.mutate { owner, _ ->
                 val detail = requireResidentMutationTarget(type, id)
                 when (val route = historyRouteLocked(owner)) {
                     is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
@@ -3150,9 +3275,13 @@ class EngineStremioRepository(
                         overlay.setWatched(isWatched, id, ids, detail.name, type.id, detail.poster)
                     }
                     HistoryRoute.Engine -> {
-                        mutateLocalLibrary(publication, owner, type.id, id, LocalLibraryPublicationPolicy.watched(isWatched)) {
+                        mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MANUAL,
+                            name = detail.name, poster = detail.poster, manualWatched = isWatched,
+                            manualInventory = detail.videos.map { it.id }, manualVideos = detail.videos.filter { it.season == season }.mapTo(hashSetOf()) { it.id })) {
                         StremioCoreNative.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
                         }
+                        val videos = detail.videos.filter { it.season == season }.map { it.id }
+                        admission.watchedIntents?.let { check(it.record(id, videos, isWatched)) { "Couldn't save watched intent for this account." } }
                         requestOwnerLibrarySync(owner)
                     }
                 }
@@ -3174,7 +3303,7 @@ class EngineStremioRepository(
                         overlay.addLibraryEntry(metaId = id, name = name, type = type.id, poster = poster)
                     }
                     HistoryRoute.Engine -> {
-                        mutateLocalLibrary(admission.publication, owner, type.id, id, LocalLibraryPublicationPolicy::membershipAdded) {
+                        mutateLocalLibrary(admission.publication, owner, type.id, id, operation = OwnerLibraryOperation(OwnerLibraryOperation.Kind.MEMBERSHIP, name = name, poster = poster)) {
                         StremioCoreNative.dispatch(
                             EngineActions.addToLibrary(id, type.id, name, poster),
                         )

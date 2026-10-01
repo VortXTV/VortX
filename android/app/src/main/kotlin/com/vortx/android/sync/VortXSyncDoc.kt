@@ -70,6 +70,10 @@ object VortXSyncDoc {
         val eventEpochMs: Long? = null,
         /** Native mutation clock is only a conflict floor, never a substitute for a watch clock. */
         val nativeEventEpochMs: Long? = null,
+        /** Internal carrier authority, not a native membership field. */
+        val historyOnly: Boolean = false,
+        /** Sparse history producers omit watch flags; omission is not an explicit unwatch. */
+        val declaredWatchFields: Set<String>? = null,
     ) {
         val identity: String get() = "$type:$metaId"
     }
@@ -104,6 +108,7 @@ object VortXSyncDoc {
         val ownerLibrary: List<OwnerLibraryItem>?,
         /** The remote device's active profile (advisory; selection stays per-device). */
         val activeProfile: String?,
+        val ownerHistory: List<OwnerLibraryItem> = emptyList(),
     )
 
     // ---- Read: doc.vortx -> local-state view ----
@@ -184,7 +189,41 @@ object VortXSyncDoc {
             parseAddonOrder(doc.optJSONArray("addonOrder")),
             ownerLibrary(doc, vortx),
             active,
+            ownerHistory(vortx),
         )
+    }
+
+    internal fun ownerHistory(vortx: JSONObject?): List<OwnerLibraryItem> {
+        val rows = vortx?.optJSONObject("byProfile")?.optJSONObject(UserProfile.OWNER_ID)?.optJSONArray("ownerHistory") ?: return emptyList()
+        if (rows.length() > 10_000) return emptyList()
+        return (0 until rows.length()).mapNotNull { index -> rows.optJSONObject(index)?.let(::ownerHistoryItem) }
+    }
+
+    internal fun ownerHistoryItem(raw: JSONObject): OwnerLibraryItem? {
+        for (field in listOf("id", "type", "name", "v")) if ((raw.opt(field) as? String).isNullOrBlank()) return null
+        val event = OwnerLibraryHistoryPolicy.unsignedInteger(raw.opt("eventEpochMs")) ?: return null
+        if (event !in 1..9_007_199_254_740_991L) return null
+        val time = (raw.opt("t") as? Number)?.toDouble() ?: return null
+        val duration = (raw.opt("d") as? Number)?.toDouble() ?: return null
+        if (!time.isFinite() || !duration.isFinite() || time !in 0.0..2_000_000.0 || duration <= 0 || duration > 2_000_000) return null
+        val item = ownerLibraryItem(raw) ?: return null
+        if (OwnerLibraryHistoryPolicy.watchClock(item) == null) return null
+        return item.copy(removed = true, historyOnly = true,
+            declaredWatchFields = setOf("watched", "currentVideoWatched", "timesWatched", "wholeTitleWatched").filterTo(hashSetOf()) { raw.has(it) })
+    }
+
+    internal fun mergeLocalOwnerHistory(vortx: JSONObject, local: List<OwnerLibraryItem>?) {
+        val history = local.orEmpty().filter { it.historyOnly && ownerHistoryItem(OwnerLibraryHistoryPolicy.encode(it, JSONObject())) != null }
+        if (history.isEmpty()) return
+        if (vortx.has("byProfile") && vortx.optJSONObject("byProfile") == null) return
+        val byProfile = vortx.optJSONObject("byProfile") ?: JSONObject().also { vortx.put("byProfile", it) }
+        if (byProfile.has(UserProfile.OWNER_ID) && byProfile.optJSONObject(UserProfile.OWNER_ID) == null) return
+        val owner = byProfile.optJSONObject(UserProfile.OWNER_ID) ?: JSONObject().also { byProfile.put(UserProfile.OWNER_ID, it) }
+        if (owner.has("ownerHistory") && owner.optJSONArray("ownerHistory") == null) return
+        val previous = owner.optJSONArray("ownerHistory")
+        if ((previous?.length() ?: 0) > 10_000) return
+        val merged = OwnerLibraryHistoryPolicy.merge(previous, history, emptySet(), ::ownerHistoryItem)
+        if (merged.length() <= 10_000) owner.put("ownerHistory", merged)
     }
 
     /**
@@ -195,8 +234,10 @@ object VortXSyncDoc {
         val rows = vortx?.optJSONArray("library") ?: doc.optJSONArray("library") ?: return null
         return buildMap<String, OwnerLibraryItem> {
             for (index in 0 until rows.length()) {
-                val item = rows.optJSONObject(index)?.let(::ownerLibraryItem) ?: continue
-                putIfAbsent(item.identity, item)
+                val raw = rows.optJSONObject(index) ?: continue
+                val item = ownerLibraryItem(raw) ?: continue
+                putIfAbsent(item.identity, item.copy(declaredWatchFields =
+                    setOf("watched", "currentVideoWatched", "timesWatched", "wholeTitleWatched").filterTo(hashSetOf()) { raw.has(it) }))
             }
         }.values.toList()
     }

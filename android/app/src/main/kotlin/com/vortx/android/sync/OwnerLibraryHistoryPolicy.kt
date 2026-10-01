@@ -17,6 +17,17 @@ internal object OwnerLibraryHistoryPolicy {
 
     fun clock(item: VortXSyncDoc.OwnerLibraryItem): Long? = item.eventEpochMs ?: watchClock(item)
 
+    fun preserveUndeclaredWatchFields(incoming: VortXSyncDoc.OwnerLibraryItem, owned: VortXSyncDoc.OwnerLibraryItem?): VortXSyncDoc.OwnerLibraryItem {
+        val fields = incoming.declaredWatchFields ?: return incoming
+        if (owned == null) return incoming
+        return incoming.copy(
+            watched = if ("watched" in fields) incoming.watched else owned.watched,
+            timesWatched = if ("timesWatched" in fields) incoming.timesWatched else owned.timesWatched,
+            wholeTitleWatched = if ("wholeTitleWatched" in fields) incoming.wholeTitleWatched else owned.wholeTitleWatched,
+            currentVideoWatched = if ("currentVideoWatched" in fields || incoming.videoId != owned.videoId) incoming.currentVideoWatched else owned.currentVideoWatched,
+        )
+    }
+
     fun newerIncoming(
         incoming: List<VortXSyncDoc.OwnerLibraryItem>,
         local: List<VortXSyncDoc.OwnerLibraryItem>,
@@ -33,13 +44,14 @@ internal object OwnerLibraryHistoryPolicy {
         }
     }
 
-    fun merge(existing: JSONArray?, local: List<VortXSyncDoc.OwnerLibraryItem>, removed: Set<String>): JSONArray {
+    fun merge(existing: JSONArray?, local: List<VortXSyncDoc.OwnerLibraryItem>, removed: Set<String>,
+        decode: (JSONObject) -> VortXSyncDoc.OwnerLibraryItem? = VortXSyncDoc::ownerLibraryItem): JSONArray {
         val rows = mutableListOf<Any>()
         val indexes = mutableMapOf<String, Int>()
         if (existing != null) for (index in 0 until existing.length()) {
             val raw = existing.get(index)
             val row = raw as? JSONObject
-            val item = row?.let(VortXSyncDoc::ownerLibraryItem)
+            val item = row?.let(decode)
             if (item != null && LibraryTombstones.normalize(item.metaId) in removed) continue
             val identity = item?.identity ?: row?.let { rawRow ->
                 val id = rawRow.opt("id") as? String
@@ -55,7 +67,7 @@ internal object OwnerLibraryHistoryPolicy {
             val clock = clock(item)
             if (index != null) {
                 val prior = rows[index] as JSONObject
-                val previous = VortXSyncDoc.ownerLibraryItem(prior) ?: continue
+                val previous = decode(prior) ?: continue
                 // A malformed peer event is opaque; an unclocked local read cannot repair it.
                 if (clock == null || (previous.lastWatched != null && clock(previous) == null)) continue
                 if (clock <= (clock(previous) ?: 0)) continue
@@ -69,17 +81,19 @@ internal object OwnerLibraryHistoryPolicy {
         return JSONArray(rows)
     }
 
-    private fun encode(item: VortXSyncDoc.OwnerLibraryItem, row: JSONObject): JSONObject = row.apply {
+    internal fun encode(item: VortXSyncDoc.OwnerLibraryItem, row: JSONObject): JSONObject = row.apply {
         put("id", item.metaId); put("type", item.type); put("name", item.name); put("poster", item.poster ?: "")
         if (clock(item) != null) {
             put("v", item.videoId ?: ""); put("t", item.timeOffsetMs / 1000.0); put("d", item.durationMs / 1000.0)
             put("lastWatched", item.lastWatched ?: JSONObject.NULL)
             item.eventEpochMs?.let { put("eventEpochMs", it) }
-            put("watched", item.watched ?: JSONObject.NULL)
-            put("currentVideoWatched", item.currentVideoWatched ?: JSONObject.NULL)
-            put("timesWatched", item.timesWatched ?: JSONObject.NULL)
-            put("removed", item.removed)
-            put("wholeTitleWatched", if (item.type == "movie") item.wholeTitleWatched ?: JSONObject.NULL else JSONObject.NULL)
+            val watchFields = mapOf("watched" to item.watched, "currentVideoWatched" to item.currentVideoWatched,
+                "timesWatched" to item.timesWatched, "wholeTitleWatched" to if (item.type == "movie") item.wholeTitleWatched else null)
+            for ((field, value) in watchFields) {
+                if (item.declaredWatchFields == null || field in item.declaredWatchFields)
+                    put(field, value ?: JSONObject.NULL)
+            }
+            if (item.historyOnly) remove("removed") else put("removed", item.removed)
         }
     }
 
@@ -87,7 +101,7 @@ internal object OwnerLibraryHistoryPolicy {
     fun canonicalLibraryTombstones(parsed: VortXSyncDoc.Parsed): Map<String, Map<String, Double>> {
         val stamps = parsed.deletedLibraryTs.mapValues { it.value.toMutableMap() }.toMutableMap()
         for (item in parsed.ownerLibrary.orEmpty()) {
-            if (!item.removed) continue
+            if (!item.removed || item.historyOnly) continue
             val epoch = clock(item)?.toDouble() ?: continue
             val entry = stamps.getOrPut(LibraryTombstones.normalize(item.metaId)) { mutableMapOf() }
             entry["removedAt"] = maxOf(entry["removedAt"] ?: 0.0, epoch)

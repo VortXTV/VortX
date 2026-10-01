@@ -143,6 +143,7 @@ interface AccountAddonSyncGateway {
 interface AccountLibrarySyncGateway {
     fun captureAccountLibraryLease(): AccountAddonGatewayLease?
     fun nativeLibraryOwner(nativeLease: AccountAddonGatewayLease): NativeLibraryOwner? = null
+    suspend fun ownerWatchedChanged(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)): Boolean = admit { true }
     /** Null means native state is not positively ready; an empty list means a confirmed empty library. */
     suspend fun accountLibrarySnapshot(nativeLease: AccountAddonGatewayLease, admit: ((() -> Boolean) -> Boolean)): List<VortXSyncDoc.OwnerLibraryItem>?
     suspend fun addAccountLibraryItems(
@@ -910,6 +911,13 @@ class VortXSyncManager(context: Context) {
     @Volatile private var libraryTombstones = LibraryTombstones(appContext)
     private var libraryPublicationProofs = OwnerLibraryPublicationProofs(appContext)
     private var addonPublicationProofs = AddonPublicationProofs(appContext)
+    private var ownerWatchedIntents = OwnerWatchedIntentStore(appContext)
+
+    internal fun installOwnerWatchedIntentTestSeam(store: OwnerWatchedIntentStore) { ownerWatchedIntents = store }
+    internal fun captureOwnerWatchedIntentLease(): OwnerWatchedIntentLease? {
+        val lease = captureSyncLease() ?: return null
+        return OwnerWatchedIntentLease(lease.accountId, ownerWatchedIntents, syncLeaseAdmission(lease))
+    }
 
     internal fun installAddonPublicationProofTestSeam(proofs: AddonPublicationProofs) { addonPublicationProofs = proofs }
 
@@ -1869,7 +1877,7 @@ class VortXSyncManager(context: Context) {
             if (nativeLease != null) {
                 val raw = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease))
                 val native = gateway.nativeLibraryOwner(nativeLease)
-                if (native == null) null else raw?.filter { libraryPublicationProofs.owns(lease.accountId, native, it) }
+                if (native == null) null else raw?.mapNotNull { libraryPublicationProofs.published(lease.accountId, native, it) }
             } else null
         }
         if (!isSyncLeaseCurrent(lease)) return null
@@ -1927,12 +1935,17 @@ class VortXSyncManager(context: Context) {
                     deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
                 )?.let { doc.put("settings", it) }
                 val vortx = VortXSyncDoc.buildVortx(store, doc.optJSONObject("vortx"))
+                if (!vortx.has("ownerWatched") || vortx.optJSONObject("ownerWatched") != null) {
+                    val watchedWire = ownerWatchedIntents.wire(lease.accountId, vortx.optJSONObject("ownerWatched"))
+                    if (watchedWire.length() > 0) vortx.put("ownerWatched", watchedWire)
+                }
                 VortXSyncDoc.mergeLocalAddons(
                     vortx = vortx,
                     local = localAddons,
                     removed = addonTombstones.all(),
                 )
-                VortXSyncDoc.mergeLocalOwnerLibrary(vortx, localOwnerLibrary, libraryTombstones.all())
+                VortXSyncDoc.mergeLocalOwnerLibrary(vortx, localOwnerLibrary?.filterNot { it.historyOnly }, libraryTombstones.all())
+                VortXSyncDoc.mergeLocalOwnerHistory(vortx, localOwnerLibrary.orEmpty())
                 doc.put(
                     "vortx",
                     applyAddonTombstonesToVortx(applyLibraryTombstonesToVortx(vortx), addonTombstones),
@@ -2134,6 +2147,12 @@ class VortXSyncManager(context: Context) {
         if (!shouldApplyVersionedPayload) {
             return libraryTombstonesChanged || addonTombstonesChanged
         }
+        if (!syncLeaseAdmission(lease).invoke { ownerWatchedIntents.merge(lease.accountId, doc.optJSONObject("vortx")?.optJSONObject("ownerWatched")) }) return false
+        libraryGateway?.let { gateway ->
+            gateway.captureAccountLibraryLease()?.let { native ->
+                if (!gateway.ownerWatchedChanged(native, syncLeaseAdmission(lease))) return false
+            }
+        }
         versionedPayloadTestObserver?.invoke()
         val resolvedRoster = SettingsBackup.resolveRosterForPull(
             pulledBlob = doc.opt("settings"),
@@ -2278,16 +2297,29 @@ class VortXSyncManager(context: Context) {
 
     /** Restores newer history even for existing identities; native performs a fresh, fenced LWW check. */
     private suspend fun applyRemoteOwnerLibrary(lease: SyncSessionLease, parsed: VortXSyncDoc.Parsed): Boolean {
-        val incoming = parsed.ownerLibrary.orEmpty()
+        val membership = parsed.ownerLibrary.orEmpty()
         val removed = libraryTombstones.all()
-        if (incoming.isEmpty() && removed.isEmpty()) return true
+        val saved = membership.filter { !it.removed && LibraryTombstones.normalize(it.metaId) !in removed }.mapTo(hashSetOf()) { it.identity }
+        if (membership.isEmpty() && parsed.ownerHistory.isEmpty() && removed.isEmpty()) return true
         val gateway = libraryGateway ?: return false
         val nativeLease = gateway.captureAccountLibraryLease() ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
         val local = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
+        val native = gateway.nativeLibraryOwner(nativeLease)
+        if (native != null) local.mapNotNull { libraryPublicationProofs.published(lease.accountId, native, it) }
+            .filter { !it.historyOnly && !it.removed && LibraryTombstones.normalize(it.metaId) !in removed }
+            .forEach { saved.add(it.identity) }
+        val history = parsed.ownerHistory.map { row ->
+            val prior = local.singleOrNull { it.identity == row.identity }?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
+            OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(removed = row.identity !in saved)
+        }
+        val incoming = membership.map { row ->
+            val prior = local.singleOrNull { it.identity == row.identity }?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
+            OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior)
+        } + history
         val eligible = incoming.filter {
-            (LibraryTombstones.normalize(it.metaId) in removed) == it.removed
+            it.historyOnly || (LibraryTombstones.normalize(it.metaId) in removed) == it.removed
         }
         val stamps = libraryTombstones.timestampsForSync()
         // A tombstone-only peer still carries a genuine membership event. Keep the local watch clock
@@ -2302,12 +2334,13 @@ class VortXSyncManager(context: Context) {
         if (candidates.isEmpty()) return isSyncLeaseCurrent(lease)
         val result = gateway.restoreAccountLibraryItems(nativeLease, candidates, syncLeaseAdmission(lease))
         if (!result.accepted || !isSyncLeaseCurrent(lease)) return false
-        val native = gateway.nativeLibraryOwner(nativeLease)
         if (native != null) {
             // Only canonical account document rows can establish ownership. A synthetic membership
             // removal assembled from a resident foreign row must never claim its inherited history.
-            val canonical = result.restored.filter { actual -> eligible.any { OwnerLibraryPublicationProofs.matchesRestored(it, actual) } }
-            if (canonical.isNotEmpty() && !syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grant(lease.accountId, native, canonical) }) return false
+            val canonical = result.restored.mapNotNull { actual ->
+                eligible.firstOrNull { OwnerLibraryPublicationProofs.matchesRestored(it, actual) }?.let { actual to it }
+            }
+            if (canonical.isNotEmpty() && !syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grantProjected(lease.accountId, native, canonical) }) return false
         }
         return isSyncLeaseCurrent(lease)
     }
@@ -2499,7 +2532,16 @@ class VortXSyncManager(context: Context) {
         val nativeLease = gateway.captureAccountLibraryLease() ?: return false
         val native = gateway.nativeLibraryOwner(nativeLease) ?: return false
         val snapshot = gateway.accountLibrarySnapshot(nativeLease, syncLeaseAdmission(lease)) ?: return false
-        if (!syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grant(lease.accountId, native, snapshot) }) return false
+        val imported = snapshot.map { raw ->
+            // Native removed also represents watch-only, not an explicit library-delete intent.
+            val hasPlayback = raw.videoId != null && raw.durationMs > 0 && OwnerLibraryHistoryPolicy.watchClock(raw) != null
+            val outbound = if (hasPlayback) raw.copy(historyOnly = raw.removed) else raw.copy(
+                lastWatched = null, eventEpochMs = null, nativeEventEpochMs = null,
+                videoId = null, timeOffsetMs = 0, durationMs = 0, historyOnly = raw.removed,
+            )
+            raw to outbound
+        }
+        if (!syncLeaseAdmission(lease).invoke { libraryPublicationProofs.grantProjected(lease.accountId, native, imported) }) return false
         val addons = addonGateway
         if (addons != null) {
             val addonLease = addons.captureAccountAddonLease() ?: return false

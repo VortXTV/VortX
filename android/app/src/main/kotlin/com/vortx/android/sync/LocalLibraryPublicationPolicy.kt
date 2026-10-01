@@ -3,7 +3,7 @@ package com.vortx.android.sync
 /** Postconditions for the exact target action, after the lease proved absence or prior full-row ownership. */
 internal object LocalLibraryPublicationPolicy {
     private fun pristine(row: VortXSyncDoc.OwnerLibraryItem): Boolean =
-        row.lastWatched == null && row.timeOffsetMs == 0L && row.durationMs == 0L && row.watched.isNullOrEmpty() &&
+        row.timeOffsetMs == 0L && row.durationMs == 0L && row.watched.isNullOrEmpty() &&
             (row.timesWatched ?: 0) == 0L && row.currentVideoWatched != true && row.wholeTitleWatched != true
 
     fun membershipAdded(before: VortXSyncDoc.OwnerLibraryItem?, after: VortXSyncDoc.OwnerLibraryItem): Boolean =

@@ -3,6 +3,8 @@ package com.vortx.android.engine
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.sync.LibraryTombstones
 import com.vortx.android.sync.OwnerLibraryPublicationLease
+import com.vortx.android.sync.OwnerWatchedIntentLease
+import com.vortx.android.profile.UserProfile
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
 
@@ -13,7 +15,9 @@ internal class OwnerLibraryMutationAdmission private constructor(
     private val admit: ((() -> Boolean) -> Boolean),
     private val tombstones: LibraryTombstones,
     val publication: OwnerLibraryPublicationLease?,
+    capturedWatchedIntents: OwnerWatchedIntentLease?,
 ) {
+    val watchedIntents = capturedWatchedIntents.takeIf { permit.owner.profileId == UserProfile.OWNER_ID && permit.owner.usesEngineHistory }
     fun requireCurrent() {
         check(fence.readIsCurrent(permit) && admit { true }) { "Library owner changed. Try again." }
     }
@@ -33,10 +37,11 @@ internal class OwnerLibraryMutationAdmission private constructor(
             admit: ((() -> Boolean) -> Boolean)?,
             tombstones: () -> LibraryTombstones,
             publication: OwnerLibraryPublicationLease? = null,
+            watchedIntents: OwnerWatchedIntentLease? = null,
         ): OwnerLibraryMutationAdmission {
             val accountAdmission = checkNotNull(admit) { "Library account is unavailable. Try again." }
             val permit = checkNotNull(fence.captureRead()) { "History owner is changing. Try again." }
-            return OwnerLibraryMutationAdmission(fence, permit, accountAdmission, tombstones(), publication).also { it.requireCurrent() }
+            return OwnerLibraryMutationAdmission(fence, permit, accountAdmission, tombstones(), publication, watchedIntents).also { it.requireCurrent() }
         }
     }
 }
