@@ -26,15 +26,13 @@ internal data class OwnerLibraryOperation(
         return when (kind) {
             Kind.REMOVE -> {
                 if (before == null || owned == null || !LocalLibraryPublicationPolicy.removed(before, after)) return null
-                owned.copy(removed = true, historyOnly = true, eventEpochMs = after.nativeEventEpochMs)
+                owned.copy(removed = true, historyOnly = true)
             }
             Kind.MEMBERSHIP -> {
                 if (name == null || after.name != name || after.poster != poster) return null
                 val membershipState = if (before == null) after else after.copy(name = before.name, poster = before.poster)
                 if (!LocalLibraryPublicationPolicy.membershipAdded(before, membershipState)) return null
-                if (owned != null) owned.copy(name = after.name, poster = after.poster, removed = false, historyOnly = false,
-                    eventEpochMs = after.nativeEventEpochMs.takeIf { owned.lastWatched != null || owned.watched != null ||
-                        owned.timesWatched != null || owned.wholeTitleWatched != null || owned.currentVideoWatched != null })
+                if (owned != null) owned.copy(name = after.name, poster = after.poster, removed = false, historyOnly = false)
                 else after.copy(videoId = null, timeOffsetMs = 0, durationMs = 0, lastWatched = null,
                     watched = null, currentVideoWatched = null, timesWatched = null, wholeTitleWatched = null,
                     eventEpochMs = null, nativeEventEpochMs = null, removed = false, historyOnly = false, declaredWatchFields = emptySet())

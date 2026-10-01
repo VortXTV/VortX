@@ -25,13 +25,18 @@ internal class NativeOwnerLibraryGateway(
             val local = parseProjection(read(uid?.let(JSONObject::quote) ?: "null"), uid) ?: return@admit false
             if (!admit { true }) return@admit false
             val candidates = OwnerLibraryHistoryPolicy.newerIncoming(incoming, local)
-            val events = candidates.filter { OwnerLibraryHistoryPolicy.clock(it) != null }
+            val events = candidates.filter { item ->
+                val previous = local.singleOrNull { it.identity == item.identity }
+                (OwnerLibraryHistoryPolicy.clock(item) ?: 0) > maxOf(previous?.nativeEventEpochMs ?: 0,
+                    previous?.let(OwnerLibraryHistoryPolicy::clock) ?: 0)
+            }
             if (events.isNotEmpty()) {
                 val request = JSONObject().put("ownerUid", uid ?: JSONObject.NULL)
                     .put("events", JSONArray(events.map(::restoreEvent)))
                 if (!admit { receiptMatches(restore(request.toString()), uid, events) }) return@admit false
             }
-            for (item in candidates.filter { OwnerLibraryHistoryPolicy.clock(it) == null }) {
+            // A newer membership stamp can re-add a removed title without replaying stale progress.
+            for (item in candidates.filter { candidate -> events.none { it.identity == candidate.identity } }) {
                 if (!admit { add(item); true }) return@admit false
             }
             if (events.isNotEmpty()) {

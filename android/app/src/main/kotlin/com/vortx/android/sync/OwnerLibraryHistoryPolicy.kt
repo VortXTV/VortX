@@ -36,12 +36,14 @@ internal object OwnerLibraryHistoryPolicy {
         return incoming.groupBy { it.identity }.values.map { rows -> rows.maxBy { clock(it) ?: 0 } }.filter { item ->
             val previous = present[item.identity]
             val event = clock(item)
+            val readd = !item.removed && previous?.removed == true && item.membershipAddedAt?.let {
+                it.isFinite() && it > maxOf(previous.nativeEventEpochMs ?: 0, clock(previous) ?: 0).toDouble()
+            } == true
             when {
+                readd -> true
                 event != null -> event > maxOf(previous?.nativeEventEpochMs ?: 0, previous?.let(::clock) ?: 0)
                 item.lastWatched != null || item.removed -> false
-                else -> previous == null || (previous.removed && item.membershipAddedAt?.let {
-                    it.isFinite() && it > maxOf(previous.nativeEventEpochMs ?: 0, clock(previous) ?: 0).toDouble()
-                } == true)
+                else -> previous == null
             }
         }
     }

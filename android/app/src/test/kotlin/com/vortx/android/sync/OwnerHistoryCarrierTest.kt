@@ -37,10 +37,14 @@ class OwnerHistoryCarrierTest {
             val outbound = OwnerLibraryPublicationProofs(persistence).published("B", native, added)!!
             assertFalse(outbound.historyOnly)
             assertFalse(outbound.removed)
-            assertEquals(4000L, outbound.eventEpochMs)
+            assertEquals(before.eventEpochMs, outbound.eventEpochMs)
             assertEquals(before.lastWatched, outbound.lastWatched)
             assertNull(outbound.watched)
             assertEquals(emptySet<String>(), outbound.declaredWatchFields)
+            val peer = publicationRow(epoch = 2500).copy(timeOffsetMs = 2500)
+            val peerArray = JSONArray().put(OwnerLibraryHistoryPolicy.encode(peer, JSONObject()))
+            val merged = OwnerLibraryHistoryPolicy.merge(peerArray, listOf(outbound), emptySet())
+            assertEquals(2500L, VortXSyncDoc.ownerLibraryItem(merged.getJSONObject(0))!!.timeOffsetMs)
         }
     }
 

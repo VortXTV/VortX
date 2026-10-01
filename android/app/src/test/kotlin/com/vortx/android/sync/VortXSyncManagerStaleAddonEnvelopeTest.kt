@@ -448,7 +448,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
     fun `public manager restores existing history and never advances a failed or expired receipt`() = runBlocking {
         Dispatchers.setMain(UnconfinedTestDispatcher())
         try {
-            for (mode in listOf("success", "unsavedHistory", "savedHistory", "sparseApple", "tombstoneOnly", "readded", "metadataReadd", "metadataStaleReadd", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
+            for (mode in listOf("success", "unsavedHistory", "savedHistory", "sparseApple", "tombstoneOnly", "readded", "metadataReadd", "metadataOlderProgress", "metadataStaleReadd", "null", "wrongUid", "afterRead", "beforeDispatch", "afterResponse")) {
                 val context = MemoryContext()
                 val manager = newManager(context)
                 val proofs = OwnerLibraryPublicationProofs(MemoryLibraryProofPersistence())
@@ -481,8 +481,9 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                     doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 2000).put("addedAt", 3000)))
                 }
                 if (mode.startsWith("metadata")) {
-                    for (field in listOf("v", "t", "d", "eventEpochMs", "lastWatched", "watched", "currentVideoWatched", "wholeTitleWatched", "timesWatched")) row.remove(field)
-                    doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 500).put("addedAt", if (mode == "metadataReadd") 3000 else 1000)))
+                    if (mode == "metadataOlderProgress") row.put("eventEpochMs", 500).put("lastWatched", "1970-01-01T00:00:00.500Z")
+                    else for (field in listOf("v", "t", "d", "eventEpochMs", "lastWatched", "watched", "currentVideoWatched", "wholeTitleWatched", "timesWatched")) row.remove(field)
+                    doc.getJSONObject("vortx").put("deletedLibraryTs", JSONObject().put("tt1", JSONObject().put("removedAt", 500).put("addedAt", if (mode == "metadataStaleReadd") 1000 else 3000)))
                 }
                 val envelope = requireNotNull(VortXCrypto.sealDocument(key, doc.toString().toByteArray(), accountA.id, 2L, true))
                 manager.installSyncTestSeam(VortXSyncManager.Session("A-token", accountA, key), 1L,
@@ -524,7 +525,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                             """{"uid":"${if (mode == "wrongUid") "wrong" else "same-native"}","events":[{"id":"tt1","type":"movie","currentVideoId":"tt1","eventEpochMs":2000}]}"""
                     },
                     add = {
-                        assertEquals("metadataReadd", mode)
+                        assertTrue(mode in listOf("metadataReadd", "metadataOlderProgress"))
                         assertEquals(3000.0, it.membershipAddedAt!!, 0.0)
                         metadataAdds++
                     },
@@ -561,7 +562,7 @@ class VortXSyncManagerStaleAddonEnvelopeTest {
                     }
                 } else if (mode.startsWith("metadata")) {
                     assertEquals(0, nativeWrites)
-                    assertEquals(if (mode == "metadataReadd") 1 else 0, metadataAdds)
+                    assertEquals(if (mode == "metadataStaleReadd") 0 else 1, metadataAdds)
                     assertEquals(2L, manager.lastAppliedVersion())
                 } else if (mode == "readded") {
                     assertEquals(0, nativeWrites)

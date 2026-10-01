@@ -2320,7 +2320,7 @@ class VortXSyncManager(context: Context) {
             val prior = raw?.let { if (native != null) libraryPublicationProofs.published(lease.accountId, native, it) else null }
             val stamp = stamps[LibraryTombstones.normalize(row.metaId)]
             val addedAt = stamp?.get("addedAt") ?: 0.0
-            val readd = !row.removed && OwnerLibraryHistoryPolicy.clock(row) == null && raw?.removed == true &&
+            val readd = !row.removed && raw?.removed == true &&
                 addedAt > (stamp?.get("removedAt") ?: 0.0) && addedAt > (raw.nativeEventEpochMs ?: 0).toDouble()
             OwnerLibraryHistoryPolicy.preserveUndeclaredWatchFields(row, prior).copy(membershipAddedAt = addedAt.takeIf { readd })
         } + history

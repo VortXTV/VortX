@@ -10,19 +10,20 @@ import java.time.Instant
 
 class NativeOwnerLibraryGatewayTest {
     @Test fun `metadata readd uses admitted newer membership stamp and never restores zero history`() {
-        for (mode in listOf("good", "missing", "equal", "newerNative", "failedRead", "expired")) {
+        for (mode in listOf("good", "olderProgress", "missing", "equal", "newerNative", "failedRead", "expired")) {
             var adds = 0
             var current = true
             val previous = item(epoch = if (mode == "newerNative") 4000 else 2000).copy(removed = true)
-            val incoming = item().copy(videoId = null, timeOffsetMs = 0, durationMs = 0,
+            val metadata = item().copy(videoId = null, timeOffsetMs = 0, durationMs = 0,
                 lastWatched = null, eventEpochMs = null, watched = null, timesWatched = null,
                 membershipAddedAt = when (mode) { "missing" -> null; "equal" -> 2000.0; else -> 3000.0 })
+            val incoming = if (mode == "olderProgress") item(epoch = 1000).copy(membershipAddedAt = 3000.0) else metadata
             val gateway = NativeOwnerLibraryGateway(read = {
                 if (mode == "expired") current = false
                 if (mode == "failedRead") "null" else projection(listOf(previous))
             }, restore = { error("Metadata re-add must preserve native history via AddToLibrary") }, add = { adds++ })
             gateway.apply("native", listOf(incoming), { current && it() })
-            assertEquals(mode, if (mode == "good") 1 else 0, adds)
+            assertEquals(mode, if (mode in listOf("good", "olderProgress")) 1 else 0, adds)
         }
     }
 
