@@ -19,6 +19,16 @@
       "versions": [
         {
           "version": "0.4.0",
+          "buildVersion": "253",
+          "date": "2026-10-01",
+          "localizedDescription": "Beta 17: resume recovery, binge playback, cancellable skip controls, subtitles, and Android fixes.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.17/VortX-iOS-v0.4.0-beta.17-ci.ipa",
+          "size": 65679291,
+          "sha256": "b01e3ae89a9e3d7b40cb374e1551557be0e367330a23ec2acb460f610b886278",
+          "minOSVersion": "16.0"
+        },
+        {
+          "version": "0.4.0",
           "buildVersion": "252",
           "date": "2026-09-27",
           "localizedDescription": "# 0.4.0 Beta 16 - Dolby Vision buffering, player switches, and next-episode recovery\n\n**Install this over any earlier Apple build.** Beta 16 focuses on playback failures reported in diagnostics 21-24: Dolby Vision production stopping, replacement sources opening on the wrong player surface, stalled next-episode recovery, and Apple TV going idle during a player handoff. Apple build **252**. All Beta 15 changes are retained; these packages are built afresh from the reviewed source, not an older beta executable.\n\nThis is an **Apple-only update** for Apple TV, iPhone, iPad, and Apple Silicon Mac. Android remains on the signed Beta 14 packages linked below.\n\n## What's fixed\n\n**Dolby Vision's local rolling buffer no longer gives the same capacity to both rewind history and forward loading.** Both sides previously budgeted against the entire publication allowance independently. Together with the still-advertised previous playlist, that could fill the physical spool and block the next segment from being published. The allocation is now shared, with room for a segment already being closed. Advertised video and subtitle resources keep their validity deadlines; the fix does not prematurely delete segments AVPlayer is still allowed to request.\n\n**AVPlayer's preferred buffer is coupled to what the DV producer can actually supply.** When bitrate is known, the target uses the forward allocation rather than the whole rolling window. Very high-bitrate sources no longer retain an unconditional minimum that can exceed the affordable lead. Unknown-bitrate sources retain their existing behavior until usable measurements arrive. This repairs an app-side producer/player mismatch, not a supposed TorBox outage.\n\n**Changing source or episode keeps the accepted player and the current stream.** A replacement accepted on VortX Player could previously clear fallback state and rebuild an AVPlayer surface using the original launch episode. Both Apple playback surfaces now retain the accepted engine. An explicit player switch uses the active URL, request headers and content hints, not stale launch values. The original source stays separate from any local proxy URL.\n\n**Apple TV stays awake through playback recovery and engine changes.** Idle prevention now follows your Play/Pause choice rather than temporary native pause notifications while buffering or falling back. An outgoing player view cannot release the incoming view's keep-awake ownership. Callbacks tagged for a retired load cannot overwrite the current load's pause or buffering state. An actual viewer pause still remains a pause.\n\n**An empty next-episode source gets one recovery owner instead of competing retry loops.** A prepared URL that produces no video packets is marked exhausted. Its exact load can accept a late-arriving alternative within the bounded settlement window, while conflicting startup and same-URL retry timers are retired. Duplicate errors or EOF callbacks cannot reopen that dead URL. Source changes, episode changes, cancellation and your pause choice still win. If no usable alternative arrives, the error replaces the reconnecting spinner rather than leaving it spinning indefinitely.\n\n**Resume recovery no longer fights itself or enters the manual-seek cache hold.** The ordinary stall watchdog waits while the exact deferred-resume recovery owns an unconfirmed resume. Recovery nudges use the resume-specific seek path and a confirmed position; they do not arm the separate manual-scrub refill watchdog. A valid Continue Watching persistence floor is retained. This targets the confirmed recovery conflict, not every possible late native seek callback.\n\n**Seek-preview contribution stops rechecking unchanged work on every playback tick.** The overnight diagnostic contained thousands of identical upload-admission checks without any new captured frames. An unchanged title now rechecks when duration first becomes known, when new coverage is captured, or during teardown. New titles keep their own initial check. This removes redundant work and keeps useful playback evidence from being buried in repeated preview messages; it does not claim every source now has previews available.\n\n**Diagnostics distinguish local spool capacity from a source-read stall.** A bounded receipt records physical storage accounting and companion-resource bytes when admission waits. It excludes source URLs, credentials and account identifiers. A read stall alone is not labeled as provider downtime.\n\n## Retained from Beta 15\n\nThe previous repairs remain: fresh-episode opening checks, larger next-episode warm-prefix acceptance, viewer-owned pause during source replacement, paused-DV playlist recovery, early-EOF protection, physical-item completion ownership, seek refill protection, exact Continue Watching detail targets, first-episode-to-season focus, supported native-text subtitle styling and redacted hardware-decoder diagnostics. See the [Beta 15 notes](https://github.com/VortXTV/VortX/releases/tag/v0.4.0-beta.15) for the full preceding change list.\n\n## Android\n\n**There is no new Android APK in Beta 16.** Full/MPV and Play/Media3 remain in [Beta 14](https://github.com/VortXTV/VortX/releases/tag/v0.4.0-beta.14), version code **237**. Both variants include phone and Android TV interfaces. This Apple cut does not claim new Android playback, sync or interface-parity work. The separately recorded rapid-title-selection and update-feed work remains open; use the matching signed Beta 14 APK directly.\n\n## Verification and remaining limits\n\nAll 18,757 lines of diagnostic 24 were read, alongside the previous diagnostics and a retrieved device log. The overnight capture includes roughly 55 minutes of healthy Debridio/VortX Player playback with hardware decoding and zero sampled output/decoder drops. It does not contain the initiating AIOStreams/AVPlayer failure, so it cannot establish that the two add-ons selected identical files or request paths.\n\nRegression checks cover the real spool and retained-resource deadlines, producer/buffer coupling, source and episode ownership, empty-source settlement, resume recovery, idle-owner replacement and preview admission. Independent reviewers inspected the actual changes. The release lane builds fresh packages and checks production engine provenance, simulator launch, package contents and update feeds before publishing.\n\n**These are concrete app-side repairs, not a declaration that every playback issue is gone.** Physical-TV testing of this build is still needed for long-running DV, AIOStreams player switches and next episodes. Unusually large segments can still encounter finite storage admission, and this release does not add an unbounded cache, force software decoding, replace DV with HDR10, or claim sustained NNTP throughput has been solved. The separate sync, phone/Mac redesign and Android parity backlog is not bundled into this playback release.\n\n## Please test\n\n- Play a DV title beyond several rolling-window advances, then pause, resume and seek backward and forward.\n- Switch between AVPlayer and VortX Player on an AIOStreams source. Confirm the same title, episode, position and your Play/Pause choice survive.\n- Start a series from Continue Watching and try both automatic advance and the next-episode button. Include a source that previously opened blank or remained reconnecting.\n- Leave playback running through an AVPlayer-to-VortX recovery beyond the TV's usual screensaver interval. Confirm the TV stays awake while video is playing.\n- If a failure remains, export the diagnostic shortly afterward so the initial cause is retained. Include the source/add-on and whether it followed pause, seek, an engine switch or an episode transition.\n\n## Install\n\n**Apple TV.** Use `VortX-tvOS-v0.4.0-beta.16-ci.ipa` for Full or `VortX-tvOS-lite-v0.4.0-beta.16-ci.ipa` for Lite. Install the same variant you normally use through your signing service.\n\n**iPhone and iPad.** Use `VortX-iOS-v0.4.0-beta.16-ci.ipa`. [Apple sideloading instructions](https://github.com/VortXTV/VortX/wiki/Installing) and the [VortX install feed](https://raw.githubusercontent.com/VortXTV/VortX/main/altstore/source.json) are available for supported installers.\n\n**Mac.** Use `VortX-macOS-v0.4.0-beta.16-ci.dmg`. This is the Apple Silicon package, ad-hoc signed rather than notarized. Follow the [Mac installation guide](https://github.com/VortXTV/VortX/wiki/Install-on-Mac).\n\nCheck `SHA256SUMS-ci.txt`; the immutable tag, source commit and protected build provide provenance for these files. This beta is deliberately promoted to **Latest** with Apple update/install feeds verified during publication.\n\n<!-- vortx-build: 252 -->\n<!-- vortx-platforms: apple -->\n<!-- vortx-channel: latest-beta -->",
@@ -86,16 +96,6 @@
           "size": 65113674,
           "sha256": "f751a9c9a63e55e28e08a3304c4e8dcfb3e8cc0875fd676022661cb75d08c670",
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.4.0",
-          "buildVersion": "235",
-          "date": "2026-09-03",
-          "localizedDescription": "0.4 Beta 1: AVPlayer recovery and remux synchronization, episode focus, debrid refresh, update checks, subtitles and previews. Android TV parity is planned separately.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.1/VortX-iOS-v0.4.0-beta.1-ci.ipa",
-          "size": 65011491,
-          "sha256": "4133383241123add3ebe25cb94947326db1d18459edee7837c09275d4f186ffe",
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -110,6 +110,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.4.0",
+          "buildVersion": "253",
+          "date": "2026-10-01",
+          "localizedDescription": "Beta 17: resume recovery, binge playback, cancellable skip controls, subtitles, and Android fixes.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.17/VortX-tvOS-v0.4.0-beta.17-ci.ipa",
+          "size": 65270673,
+          "sha256": "aba43949b0cb7e5cdf7d94f3a71b49b74b8869eb945a0e740600bc6d4a1a61af",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.4.0",
           "buildVersion": "252",
@@ -178,16 +188,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.2/VortX-tvOS-v0.4.0-beta.2-ci.ipa",
           "size": 64678475,
           "sha256": "b6b202bb2dbf9e29f856d126ee7372b8f591e6b8d2a520d8c57e9a57ee0d0c33",
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.4.0",
-          "buildVersion": "235",
-          "date": "2026-09-03",
-          "localizedDescription": "0.4 Beta 1: AVPlayer recovery and remux synchronization, episode focus, debrid refresh, update checks, subtitles and previews. Android TV parity is planned separately.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.1/VortX-tvOS-v0.4.0-beta.1-ci.ipa",
-          "size": 64593483,
-          "sha256": "82749f93f67210b96f0bb6ab8d4f7c3b09365c2148c6cc84333e059ed21e1dfb",
           "minOSVersion": "18.0"
         }
       ]
