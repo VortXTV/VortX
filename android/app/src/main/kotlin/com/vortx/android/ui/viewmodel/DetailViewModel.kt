@@ -454,6 +454,13 @@ class DetailViewModel(
     private val _selectedEpisodeId = MutableStateFlow<String?>(null)
     val selectedEpisodeId: StateFlow<String?> = _selectedEpisodeId.asStateFlow()
 
+    /**
+     * Viewer intent is separate from the currently rendered target. An owner can temporarily lack an episode
+     * that exists for the original owner, so a fallback target must never overwrite this durable-in-ViewModel
+     * manual choice. It is intentionally not persisted beyond this detail route.
+     */
+    private var explicitManualEpisodeId: String? = null
+
     /// The season the episode list is currently browsing (series only). Seeded once from
     /// [primaryEpisode]'s season on first load (mirrors tvOS `applyPreferredSeason`'s `initialSeason ??
     /// firstUnwatchedSeason ?? …`); a manual tap on a season chip overrides it via [selectSeason] and is
@@ -641,7 +648,7 @@ class DetailViewModel(
             val target = detailEpisodeTargetForRoute(
                 videos = detail.videos,
                 preferredEpisode = initialPreferredEpisode,
-                selectedEpisodeId = _selectedEpisodeId.value,
+                manualEpisodeId = explicitManualEpisodeId,
             ) ?: primaryEpisodeOf(detail)?.first
             if (target != null) {
                 _selectedSeason.value = target.season
@@ -741,6 +748,7 @@ class DetailViewModel(
     /// land, instead of making the viewer pick from the list. The init-time programmatic selection passes
     /// false, so opening a detail page never auto-plays.
     fun selectEpisode(episodeId: String, userTap: Boolean = true) {
+        if (userTap) explicitManualEpisodeId = episodeId
         if (_selectedEpisodeId.value == episodeId) return
         invalidateWarmNextSource()
         _selectedEpisodeId.value = episodeId
@@ -845,13 +853,12 @@ class DetailViewModel(
             if (sourceSticky.currentProfileId() != profileId) return@launch
             _meta.value = loaded.toUiState()
             val detail = loaded.getOrNull()
-            val oldTarget = _selectedEpisodeId.value
             val target = if (type == MediaType.SERIES) {
                 detail?.let {
                     detailEpisodeTargetForRoute(
                         videos = it.videos,
-                        preferredEpisode = null,
-                        selectedEpisodeId = oldTarget,
+                        preferredEpisode = initialPreferredEpisode,
+                        manualEpisodeId = explicitManualEpisodeId,
                     )
                 }
                     ?: detail?.let { primaryEpisodeOf(it)?.first }
@@ -1466,6 +1473,7 @@ class DetailViewModel(
                     commitAccepted = {
                         lastPlayedSource = source
                         resumeRef = null
+                        explicitManualEpisodeId = target.id
                     },
                 )
             }
@@ -2452,15 +2460,15 @@ internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
 
 /**
  * Resolves a route-provided episode only against the metadata for the title currently open.
- * A user-selected episode always wins, while a stale or malformed remote hint deliberately returns null
+ * An explicit user-selected episode always wins, while a stale or malformed remote hint deliberately returns null
  * so the existing primary-episode policy remains the fallback.
  */
 internal fun detailEpisodeTargetForRoute(
     videos: List<Episode>,
     preferredEpisode: PreferredEpisode?,
-    selectedEpisodeId: String?,
+    manualEpisodeId: String?,
 ): Episode? {
-    selectedEpisodeId?.let { selectedId ->
+    manualEpisodeId?.let { selectedId ->
         videos.firstOrNull { it.id == selectedId }?.let { return it }
     }
     val hint = preferredEpisode

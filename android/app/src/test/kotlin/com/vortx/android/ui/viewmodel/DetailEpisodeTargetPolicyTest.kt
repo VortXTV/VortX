@@ -31,7 +31,7 @@ class DetailEpisodeTargetPolicyTest {
         val target = detailEpisodeTargetForRoute(
             videos = episodes,
             preferredEpisode = PreferredEpisode(season = 2, episode = 3),
-            selectedEpisodeId = null,
+            manualEpisodeId = null,
         )
 
         assertEquals("s2e3", target?.id)
@@ -47,7 +47,7 @@ class DetailEpisodeTargetPolicyTest {
         val target = detailEpisodeTargetForRoute(
             videos = episodes,
             preferredEpisode = PreferredEpisode(season = 5, episode = 1, videoIdentity = "new-id"),
-            selectedEpisodeId = null,
+            manualEpisodeId = null,
         )
 
         assertEquals("new-id", target?.id)
@@ -77,10 +77,56 @@ class DetailEpisodeTargetPolicyTest {
         val target = detailEpisodeTargetForRoute(
             videos = episodes,
             preferredEpisode = PreferredEpisode(1, 2),
-            selectedEpisodeId = "s1e1",
+            manualEpisodeId = "s1e1",
         )
 
         assertEquals("s1e1", target?.id)
+    }
+
+    @Test
+    fun `owner return restores original route hint after interim metadata falls back`() {
+        val originalOwnerEpisodes = listOf(
+            Episode("s1e1", "First", season = 1, episode = 1),
+            Episode("s2e3", "Target", season = 2, episode = 3),
+        )
+        val interimOwnerEpisodes = listOf(Episode("s1e1", "First", season = 1, episode = 1))
+        val hint = PreferredEpisode(season = 2, episode = 3)
+
+        assertEquals(
+            "s2e3",
+            detailEpisodeTargetForRoute(originalOwnerEpisodes, hint, manualEpisodeId = null)?.id,
+        )
+        val interimTarget = detailEpisodeTargetForRoute(interimOwnerEpisodes, hint, manualEpisodeId = null)
+            ?: detailEpisodeTargetOrder(interimOwnerEpisodes).first()
+        assertEquals("s1e1", interimTarget.id)
+        assertEquals(
+            "s2e3",
+            detailEpisodeTargetForRoute(originalOwnerEpisodes, hint, manualEpisodeId = null)?.id,
+        )
+    }
+
+    @Test
+    fun `manual choice survives owner metadata that temporarily lacks it`() {
+        val originalOwnerEpisodes = listOf(
+            Episode("s1e1", "First", season = 1, episode = 1),
+            Episode("s2e3", "Trakt target", season = 2, episode = 3),
+            Episode("s3e2", "Manual target", season = 3, episode = 2),
+        )
+        val interimOwnerEpisodes = listOf(Episode("s1e1", "First", season = 1, episode = 1))
+        val hint = PreferredEpisode(season = 2, episode = 3)
+        val manualEpisodeId = "s3e2"
+
+        assertEquals(
+            manualEpisodeId,
+            detailEpisodeTargetForRoute(originalOwnerEpisodes, hint, manualEpisodeId)?.id,
+        )
+        val interimTarget = detailEpisodeTargetForRoute(interimOwnerEpisodes, hint, manualEpisodeId)
+            ?: detailEpisodeTargetOrder(interimOwnerEpisodes).first()
+        assertEquals("s1e1", interimTarget.id)
+        assertEquals(
+            manualEpisodeId,
+            detailEpisodeTargetForRoute(originalOwnerEpisodes, hint, manualEpisodeId)?.id,
+        )
     }
 
     @Test
