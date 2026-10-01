@@ -237,7 +237,7 @@ class VortXSessionOwnerTransitionContractTest {
     }
 
     @Test
-    fun `direct engine remove then reinstall route each changed tombstone through authenticated debounced sync`() {
+    fun `direct engine remove then reinstall sync descriptors even when tombstone already matches`() {
         val engine = readEngineSource()
         val install = engine
             .substringAfter("override suspend fun installAddon(url: String): Result<Unit> = runCatching {")
@@ -256,8 +256,11 @@ class VortXSessionOwnerTransitionContractTest {
             .substringAfter("private fun armPendingSync(")
             .substringBefore("/** Catch-up PULL entry point")
 
-        assertTrue(install.contains("if (addonTombstones.forget(normalized)) requestAddonTombstoneSync()"))
-        assertTrue(remove.contains("if (!addon.isProtected && addonTombstones.tombstone(addon.transportUrl)) requestAddonTombstoneSync()"))
+        assertTrue(install.indexOf("addonTombstones.forget(normalized)") >= 0)
+        assertTrue(install.indexOf("requestAddonTombstoneSync()") > install.indexOf("addonTombstones.forget(normalized)"))
+        assertFalse(install.contains("if (addonTombstones.forget"))
+        assertTrue(remove.contains("if (!addon.isProtected) addonTombstones.tombstone(addon.transportUrl)"))
+        assertTrue(remove.indexOf("requestAddonTombstoneSync()") > remove.indexOf("addonTombstones.tombstone(addon.transportUrl)"))
         assertTrue(requester.contains("(appContext as? VortXApplication)?.syncManager?.requestSyncSoon()"))
         assertTrue(requestSync.contains("val lease = captureSyncLease() ?: return"))
         assertTrue(requestSync.contains("armPendingSync(lease, recordEdit = true)"))

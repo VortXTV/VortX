@@ -1,6 +1,7 @@
 package com.vortx.android.backup
 
 import com.vortx.android.profile.UserProfile
+import org.json.JSONArray
 import org.json.JSONObject
 import java.math.BigDecimal
 import java.math.BigInteger
@@ -342,7 +343,7 @@ object SettingsBackup {
      * per-key manifest, and a typed getter (`getInt`, `getFloat`, ...) throws a ClassCastException if the wrong
      * type is written, so the target type must be known per key rather than guessed from the decoded value.
      */
-    enum class SettingType { BOOL, INT, FLOAT, STRING, STRING_SET }
+    enum class SettingType { BOOL, INT, FLOAT, STRING, STRING_SET, JSON_STRING_ARRAY }
 
     /**
      * The GLOBAL device settings that ride `doc.settings` cross-device, each under Apple/web's EXACT key (the
@@ -401,6 +402,9 @@ object SettingsBackup {
         "stremiox.catalog.landscapeCards" to SettingType.BOOL,
         "stremiox.catalog.hidePosterLabels" to SettingType.BOOL,
         // Home / Discover / detail layout
+        "vortx.home.railOrder" to SettingType.JSON_STRING_ARRAY,
+        "vortx.home.railHidden" to SettingType.STRING_SET,
+        "vortx.home.layout" to SettingType.STRING,
         "vortx.home.showCuratedRails" to SettingType.BOOL,
         "vortx.home.showCollectionsHub" to SettingType.BOOL,
         "vortx.discover.showCollectionsHub" to SettingType.BOOL,
@@ -436,8 +440,9 @@ object SettingsBackup {
                 SettingType.STRING -> raw as? String ?: continue
                 SettingType.STRING_SET -> {
                     val set = raw as? Set<*> ?: continue
-                    set.filterIsInstance<String>().sorted()
+                    strictStrings(set.toList())?.sorted() ?: continue
                 }
+                SettingType.JSON_STRING_ARRAY -> jsonStrings(raw as? String ?: continue) ?: continue
             }
             out[key] = encoded
         }
@@ -470,7 +475,9 @@ object SettingsBackup {
                 }
                 SettingType.STRING -> (value as? String)?.let(BackupValue::Str)
                 SettingType.STRING_SET ->
-                    (value as? List<*>)?.let { BackupValue.StrSet(it.filterIsInstance<String>().toSet()) }
+                    strictStrings(value)?.let { BackupValue.StrSet(it.toSet()) }
+                SettingType.JSON_STRING_ARRAY ->
+                    strictStrings(value)?.let { BackupValue.Str(JSONArray(it).toString()) }
             }
             decoded?.let { out[key] = it }
         }
@@ -522,7 +529,11 @@ object SettingsBackup {
         val types = JSONObject()
         for ((key, raw) in all) {
             if (raw == null || key == BACKUP_TYPES_KEY || !isSyncable(key)) continue
-            val (value, code) = encodeBackupEntry(raw) ?: continue
+            // Apple stores ordered rails as an array; Android's typed getter expects a JSON string.
+            // Carry the native array on the wire without turning it into an unordered string set.
+            val (value, code) = if (SYNCABLE_SETTING_TYPES[key] == SettingType.JSON_STRING_ARRAY) {
+                (jsonStrings(raw as? String ?: continue) ?: continue) to "J"
+            } else encodeBackupEntry(raw) ?: continue
             domain[key] = value
             types.put(key, code)
         }
@@ -544,7 +555,14 @@ object SettingsBackup {
         val out = LinkedHashMap<String, BackupValue>()
         for ((key, value) in domain) {
             if (key == BACKUP_TYPES_KEY || !isSyncable(key)) continue
-            decodeBackupEntry(value, types.optString(key, ""))?.let { out[key] = it }
+            val decoded = if (SYNCABLE_SETTING_TYPES[key] == SettingType.JSON_STRING_ARRAY) {
+                // Accept Apple arrays and pre-adapter Android backups, never partial malformed arrays.
+                val strings = if (value is String) jsonStrings(value) else strictStrings(value)
+                strings?.let { BackupValue.Str(JSONArray(it).toString()) }
+            } else if (SYNCABLE_SETTING_TYPES[key] == SettingType.STRING_SET) {
+                strictStrings(value)?.let { BackupValue.StrSet(it.toSet()) }
+            } else decodeBackupEntry(value, types.optString(key, ""))
+            decoded?.let { out[key] = it }
         }
         return out
     }
@@ -559,6 +577,17 @@ object SettingsBackup {
         is Set<*> -> raw.filterIsInstance<String>() to "S"
         else -> null // an unrepresentable type is skipped, never guessed (fail-soft)
     }
+
+    private fun strictStrings(value: Any?): List<String>? {
+        val list = value as? List<*> ?: return null
+        if (list.any { it !is String }) return null
+        return list.map { it as String }
+    }
+
+    private fun jsonStrings(value: String): List<String>? = runCatching {
+        val array = JSONArray(value)
+        strictStrings(List(array.length()) { array.get(it) })
+    }.getOrNull()
 
     /**
      * Plist-decoded value + its recorded type code -> the exact SharedPreferences type. When the manifest has
