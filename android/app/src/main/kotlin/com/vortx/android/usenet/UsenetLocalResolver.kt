@@ -3,6 +3,7 @@ package com.vortx.android.usenet
 import android.content.Context
 import com.vortx.android.debrid.DebridResolver
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.InternalCoroutinesApi
@@ -14,8 +15,6 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
 import kotlin.coroutines.coroutineContext
 
 /// Turns a bare-NZB source into a LOCAL playable file by driving the native NNTP path (the Android
@@ -48,9 +47,23 @@ internal class UsenetLocalResolver(
         val pick = pickFile(files, fileMustInclude, fileIdx, episode)
             ?: throw ResolveException("no matching file in the NZB")
 
-        // Return a loopback range URL as soon as the producer is scheduled.  The session exposes only
-        // committed ordered bytes, so a media probe can open now but never sees a fictitious complete file.
+        // Scheduling the producer is not enough: authentication or the first BODY can still fail. Accept a
+        // loopback URL only after one ordered prefix is committed; this remains progressive, never a full-file wait.
         val session = startProgressiveAssembly(pick)
+        try {
+            session.awaitUsablePrefix(INITIAL_PREFIX_TIMEOUT_MS)
+        } catch (timeout: TimeoutCancellationException) {
+            session.close()
+            // This is provider readiness exhaustion, not caller cancellation: the sequential policy must
+            // continue to the next saved server (and eventually TorBox) rather than abandon fallback.
+            throw ResolveException("Usenet provider was not ready before the initial prefix deadline")
+        } catch (cancel: CancellationException) {
+            session.close()
+            throw cancel
+        } catch (error: Throwable) {
+            session.close()
+            throw ResolveException("Usenet provider was not ready: ${error.message ?: "initial prefix failed"}")
+        }
         NzbResult(
             file = session.file,
             subject = pick.name,
@@ -73,7 +86,7 @@ internal class UsenetLocalResolver(
             allocation.abandon(); target.delete()
             throw error
         }
-        val producer = CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+        session.launchProducer {
             try {
                 assemble(file, target, session)
                 session.finish()
@@ -84,7 +97,6 @@ internal class UsenetLocalResolver(
                 target.delete()
             }
         }
-        session.attachProducer(producer)
         return session
     }
 
@@ -152,6 +164,12 @@ internal class UsenetLocalResolver(
                             expected += 1
                             if (nextToSchedule < segments.size) jobs.send(nextToSchedule++)
                         }
+                    }
+                    // A short aggregate is not an EOF signal for a player range request. Treat it as a
+                    // terminal provider failure so neither readiness nor the loopback handler can present
+                    // temporarily/malformedly missing bytes as a completed title.
+                    if (assembledBytes != declaredBytes) {
+                        throw ResolveException("NZB decoded size did not match declared title size")
                     }
                 }
                 jobs.close()
@@ -289,6 +307,7 @@ internal class UsenetLocalResolver(
     }
 
     private companion object {
+        const val INITIAL_PREFIX_TIMEOUT_MS = 10_000L
         const val MAX_NZB_REDIRECTS = 3
         const val NZB_TIMEOUT_MS = 20_000
         const val SEGMENT_COPY_BUFFER_BYTES = 64 * 1024

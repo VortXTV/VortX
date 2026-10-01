@@ -17,8 +17,8 @@ class UsenetProgressiveSessionTest {
     @Test
     fun `producer cancellation is rethrown instead of reporting a failed session`() {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/usenet/UsenetLocalResolver.kt")
-        val producer = source.substringAfter("val producer = CoroutineScope")
-            .substringBefore("session.attachProducer(producer)")
+        val producer = source.substringAfter("session.launchProducer {")
+            .substringBefore("return session")
         val cancellation = producer.indexOf("catch (error: CancellationException)")
         val failure = producer.indexOf("catch (error: Throwable)")
 
@@ -26,6 +26,33 @@ class UsenetProgressiveSessionTest {
         assertTrue(failure > cancellation)
         assertTrue(producer.substring(cancellation, failure).contains("throw error"))
         assertFalse(producer.substring(cancellation, failure).contains("session.fail"))
+        val session = readProjectFile("src/main/kotlin/com/vortx/android/usenet/UsenetProgressiveSession.kt")
+        assertTrue(session.contains("private val producerRoot = SupervisorJob()"))
+        assertTrue(session.contains("producerRoot.cancel()"))
+    }
+
+    @Test
+    fun `resolver proves a committed prefix before exposing its loopback result`() {
+        val source = readProjectFile("src/main/kotlin/com/vortx/android/usenet/UsenetLocalResolver.kt")
+        val resolve = source.substringAfter("suspend fun resolve(").substringBefore("private fun startProgressiveAssembly")
+        assertTrue(resolve.contains("session.awaitUsablePrefix(INITIAL_PREFIX_TIMEOUT_MS)"))
+        assertTrue(resolve.contains("session.close()"))
+        assertTrue(resolve.contains("Usenet provider was not ready"))
+        assertTrue(source.contains("assembledBytes != declaredBytes"))
+    }
+
+    @Test
+    fun `failed initial prefix is terminal rather than an empty successful url`() {
+        val home = createTempDirectory("usenet-progressive").toFile()
+        val session = UsenetProgressiveSession(File(home, "title.mkv"), declaredBytes = 4)
+        try {
+            session.fail(IllegalStateException("authentication failed"))
+            val failure = runCatching { kotlinx.coroutines.runBlocking { session.awaitUsablePrefix(100) } }.exceptionOrNull()
+            assertTrue(failure != null)
+        } finally {
+            session.close()
+            home.deleteRecursively()
+        }
     }
 
     @Test

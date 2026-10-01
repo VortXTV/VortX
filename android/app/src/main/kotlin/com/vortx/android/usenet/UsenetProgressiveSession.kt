@@ -11,7 +11,14 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.ArrayBlockingQueue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 /**
  * One ordered, append-only NZB title plus its loopback HTTP representation.  A player may request any
@@ -29,20 +36,27 @@ internal class UsenetProgressiveSession(
     private var availableBytes = 0L
     private var completed = false
     private var failure: Throwable? = null
+    /** Completes after a real ordered prefix is committed, or terminally when that cannot happen. */
+    private val initialPrefix = CompletableDeferred<Unit>()
     @Volatile private var closed = false
     @Volatile private var producer: Job? = null
+    // The long-running producer belongs to this session and is cancelled on every stale/drop/close path.
+    private val producerRoot = SupervisorJob()
     private val id = UUID.randomUUID().toString()
 
     val url: String get() = UsenetProgressiveLoopback.register(id, this)
 
     fun appendCommitted(bytes: Long) = synchronized(monitor) {
         check(!closed) { "progressive session closed" }
+        require(bytes > 0) { "committed prefix must advance" }
         availableBytes += bytes
+        initialPrefix.complete(Unit)
         monitor.notifyAll()
     }
 
     fun finish() = synchronized(monitor) {
         completed = true
+        if (availableBytes == 0L) initialPrefix.completeExceptionally(IOException("Usenet produced no playable bytes"))
         allocation?.complete()
         monitor.notifyAll()
     }
@@ -50,12 +64,23 @@ internal class UsenetProgressiveSession(
     fun fail(error: Throwable) = synchronized(monitor) {
         failure = error
         completed = true
+        initialPrefix.completeExceptionally(error)
         monitor.notifyAll()
         allocation?.abandon()
         UsenetProgressiveLoopback.unregister(id)
     }
 
     internal fun attachProducer(job: Job) { producer = job }
+
+    internal fun launchProducer(block: suspend () -> Unit) {
+        attachProducer(CoroutineScope(producerRoot + Dispatchers.IO).launch(block = block))
+    }
+
+    /** A prefix proves the loopback URL is usable without waiting for the complete title download. */
+    suspend fun awaitUsablePrefix(timeoutMs: Long) {
+        require(timeoutMs > 0) { "timeout must be positive" }
+        withTimeout(timeoutMs) { initialPrefix.await() }
+    }
 
     /** Serve exactly the requested bytes, pausing at the append frontier without preloading title data. */
     internal fun copyRange(start: Long, end: Long, output: java.io.OutputStream) {
@@ -91,6 +116,7 @@ internal class UsenetProgressiveSession(
         val delete = synchronized(monitor) {
             if (closed) return
             closed = true
+            initialPrefix.cancel(CancellationException("Usenet session closed"))
             monitor.notifyAll()
             !completed
         }
@@ -98,6 +124,7 @@ internal class UsenetProgressiveSession(
         // Cancelling the assembly job starts each NNTP transport's cancellation hook, which closes its
         // currently published socket instead of leaving a background download behind after player teardown.
         producer?.cancel()
+        producerRoot.cancel()
         allocation?.abandon()
         if (delete) file.delete()
     }
