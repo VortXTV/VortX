@@ -64,6 +64,7 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.screens.launchDetailShare
 import com.vortx.android.ui.screens.resolvedDetailPlayback
+import com.vortx.android.ui.components.TraktManualCheckInAction
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.DetailNavigationFence
@@ -406,6 +407,14 @@ private fun TvDetailContent(
                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                 ) {
+                    item {
+                        TraktManualCheckInAction(
+                            detail = detail,
+                            primaryEpisode = viewModel.primaryEpisode()?.first,
+                            resolving = playback is Playback.Resolving,
+                            tv = true,
+                        )
+                    }
                     // Trailer: free 1080p from the user's own IP via the client resolver (worker fallback on a
                     // miss). Shown only when the meta carries a YouTube trailer id; plays through the shared
                     // player pipeline (the same [DetailViewModel] playback latch the Watch button uses).

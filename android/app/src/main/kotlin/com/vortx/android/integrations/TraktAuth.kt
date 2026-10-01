@@ -360,14 +360,24 @@ object TraktAuth {
      * One authenticated read fenced to the exact account generation captured before network I/O.
      * A disconnect or a second account completing auth while the request is in flight discards the body.
      */
-    internal suspend fun sessionBoundGet(path: String, expectedEpoch: Long): IntegrationsHttp.Response? {
+    internal suspend fun sessionBoundGet(path: String, expectedEpoch: Long): IntegrationsHttp.Response? =
+        sessionBoundRequest("GET", path, expectedEpoch)
+
+    /** Authenticated request through the refreshing session owner, with account-generation fencing. */
+    internal suspend fun sessionBoundRequest(
+        method: String,
+        path: String,
+        expectedEpoch: Long,
+        body: String? = null,
+    ): IntegrationsHttp.Response? {
         if (!isSessionCurrent(expectedEpoch)) return null
         val token = runCatching { validToken() }.getOrNull() ?: return null
         if (!isSessionCurrent(expectedEpoch)) return null
         val response = IntegrationsHttp.request(
-            method = "GET",
+            method = method,
             urlString = "$API_BASE$path",
             headers = baseHeaders() + mapOf("Authorization" to "Bearer $token"),
+            body = body,
         )
         return response.takeIf { isSessionCurrent(expectedEpoch) }
     }

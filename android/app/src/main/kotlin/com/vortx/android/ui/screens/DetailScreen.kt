@@ -65,6 +65,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.ui.components.FallbackArtwork
+import com.vortx.android.ui.components.TraktManualCheckInAction
 import com.vortx.android.VortXApplication
 import com.vortx.android.catalog.AddonSimilarClient
 import com.vortx.android.catalog.CollectionClient
@@ -1128,6 +1129,12 @@ private fun ActionsCluster(
                     onClick = onTrailer,
                 )
             }
+            TraktManualCheckInAction(
+                detail = m,
+                primaryEpisode = primaryEpisode?.first,
+                resolving = resolving,
+                tv = false,
+            )
             // Movie-level watched toggle (a series marks watched per-episode/season via the
             // SeasonSelector's chips instead, since there's no single "the" episode here).
             if (m.videos.isEmpty()) {
