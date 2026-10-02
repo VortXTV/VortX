@@ -26,4 +26,14 @@ enum TabBarPrefs {
             d.set(true, forKey: hideLive)
         }
     }
+
+    /// Keep phone navigation within five comfortable targets. Overflow is computed only from
+    /// the already visibility-filtered destinations, so More cannot resurrect a hidden route.
+    static func compactLayout<Route: Equatable>(visible: [Route], preferred: [Route],
+                                                maximumItems: Int = 5) -> (primary: [Route], overflow: [Route]) {
+        let capacity = max(2, maximumItems)
+        guard visible.count > capacity else { return (visible, []) }
+        let primary = Array(visible.filter { preferred.contains($0) }.prefix(capacity - 1))
+        return (primary, visible.filter { !primary.contains($0) })
+    }
 }

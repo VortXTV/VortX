@@ -7,6 +7,8 @@ on:
       - "scripts/test-subtitle-source-contracts.sh"
       - "scripts/test-apple-playback-recovery.sh"
       - "scripts/test-apple-parity-contracts.sh"
+      - "scripts/test-apple-player-timeline.sh"
+      - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
@@ -21,6 +23,8 @@ on:
       - "scripts/test-subtitle-source-contracts.sh"
       - "scripts/test-apple-playback-recovery.sh"
       - "scripts/test-apple-parity-contracts.sh"
+      - "scripts/test-apple-player-timeline.sh"
+      - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
@@ -47,6 +51,9 @@ jobs:
       - run: bash scripts/test-subtitle-source-contracts.sh
       - run: bash scripts/test-apple-playback-recovery.sh
       - run: bash scripts/test-apple-parity-contracts.sh
+      - run: bash scripts/test-apple-player-timeline.sh
+      - run: swift app/Tests/MacSettingsShellContractTests.swift
+      - run: swiftc -parse-as-library app/SourcesShared/TabBarPrefs.swift app/Tests/CompactNavigationPolicyTests.swift -o /tmp/compact-navigation-test && /tmp/compact-navigation-test
   web:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

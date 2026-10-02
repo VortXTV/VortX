@@ -50,23 +50,27 @@ require(app.contains("Button(\"Search\")   { MacCommands.go(.search) }.keyboardS
 
 require(!rootView.contains("@Environment(\\.openSettings)"), "root does not use openSettings")
 require(!rootView.contains("SettingsLink"), "root has no SettingsLink")
-require(!rootView.contains("macNavPill"), "floating seven-tab pill is removed on Mac")
-require(!rootView.contains("macTopNavOverlay"), "Mac no longer overlays floating navigation")
-require(!rootView.contains("MacTopChromeHeightKey"), "Mac no longer reserves floating-chrome height")
 require(rootView.contains("private var macDesktopShell: some View"), "root has a dedicated desktop shell")
-require(rootView.contains("macSidebar") && rootView.contains("private func macSidebarItem"),
-        "desktop shell owns persistent sidebar navigation")
-require(rootView.contains("ForEach(visibleTabs, id: \\.rawValue) { item in\n                    macSidebarItem(item)"),
-        "sidebar uses the same visibility-filtered destinations")
+require(!rootView.contains("macSidebar"), "desktop main navigation has no rejected sidebar")
+require(rootView.contains(".safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }"),
+        "desktop shell hosts horizontal TV-inspired top navigation without obscuring forms")
+require(rootView.contains("ForEach(visibleTabs, id: \\.rawValue) { item in\n                        horizontalTabButton(item)"),
+        "horizontal navigation uses the same visibility-filtered destinations")
+require(rootView.contains("ScrollView(.horizontal, showsIndicators: false)") && rootView.contains("proxy.scrollTo(item.rawValue, anchor: .center)"),
+        "narrow desktop navigation scrolls selected routes into view")
+require(rootView.contains("geometry.size.width >= 760") && rootView.contains("UIDevice.current.userInterfaceIdiom == .pad"),
+        "wide iPad uses top navigation while phones and narrow windows retain a bottom bar")
+require(rootView.contains("TabBarPrefs.compactLayout(visible: visibleTabs") && rootView.contains("ForEach(compactTabLayout.overflow"),
+        "compact More menu cannot resurrect hidden destinations")
 require(rootView.contains("private var selectedTabContent: some View"), "one route owner feeds phone and Mac")
 require(rootView.contains("case .addons:\n            AddonsView()"), "Add-ons route renders AddonsView")
 require(rootView.contains("case .settings:\n            iOSSettingsView()"), "Settings route renders the in-window form")
 require(occurrences(of: "iOSSettingsView()", in: rootView) == 1,
         "root owns exactly one Settings form route")
-require(rootView.contains("@FocusState private var tabFocus: MacBrowseFocus?"), "sidebar restores keyboard focus state")
+require(rootView.contains("@FocusState private var tabFocus: MacBrowseFocus?"), "horizontal navigation retains keyboard focus state")
 require(rootView.contains("@State private var macQuery = \"\""), "desktop chrome retains media search state")
-require(rootView.contains(".focused($macSearchFocused)") && rootView.contains("private func submitMacSearch()"),
-        "persistent search remains focusable and routes to the existing search host")
+require(rootView.contains(".focused($macSearchFocused)") && rootView.contains("private func submitMacSearch()") && rootView.contains(".popover(isPresented: $macSearchPresented)"),
+        "Cmd-F search remains focusable and routes to the existing search host")
 require(rootView.contains(".frame(minWidth: 28, minHeight: 28)") && rootView.contains(".accessibilityLabel(\"Clear search\")"),
         "desktop clear-search control has an accessible hit target")
 require(rootView.contains(".onExitCommand") && rootView.contains("tabFocus = .tab(tab.rawValue)"),

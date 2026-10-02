@@ -116,6 +116,170 @@ private struct PlayerBufferedBand: View {
     }
 }
 
+/// A concrete boundary between the seek slider and its decorative overlays. In build 254,
+/// constructing all of these as one GeometryReader expression overflowed the iOS main-thread
+/// stack while resolving Swift generic metadata, before either playback engine could mount.
+/// Keep the transport bindings and callbacks owned by PlayerScreen; only split rendering types.
+private struct PlayerSeekSliderSurface: View {
+    let clock: TimePosClock
+    @Binding var scrubbing: Bool
+    @Binding var scrubTarget: Double
+    let duration: Double
+    let bufferedTime: Double
+    let size: CGSize
+    let chapterFractions: [Double]
+    let accent: Color
+    let onScrubChanged: (Double) -> Void
+    let onEditingChanged: (Bool) -> Void
+    let onHoverPreviewChanged: (Double?) -> Void
+
+    private let sliderInset: CGFloat = 10
+    private var trackWidth: CGFloat { max(1, size.width - sliderInset * 2) }
+
+    var body: some View {
+        PlayerClockSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
+                          duration: duration, onScrubChanged: onScrubChanged,
+                          onEditingChanged: onEditingChanged)
+            .tint(accent)
+            #if os(macOS)
+            .onContinuousHover { phase in
+                guard !scrubbing else { return }
+                switch phase {
+                case .active(let location):
+                    let ratio = min(max(0, (location.x - sliderInset) / trackWidth), 1)
+                    onHoverPreviewChanged(Double(ratio))
+                case .ended:
+                    onHoverPreviewChanged(nil)
+                }
+            }
+            #endif
+            .overlay {
+                if !scrubbing {
+                    PlayerBufferedBand(clock: clock, duration: duration, bufferedTime: bufferedTime,
+                                       trackWidth: trackWidth, sliderInset: sliderInset, height: size.height)
+                }
+            }
+            .overlay {
+                PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
+                                     sliderInset: sliderInset, height: size.height)
+            }
+    }
+}
+
+private struct PlayerChapterMarkers: View {
+    let fractions: [Double]
+    let trackWidth: CGFloat
+    let sliderInset: CGFloat
+    let height: CGFloat
+
+    var body: some View {
+        ForEach(fractions, id: \.self) { fraction in
+            Capsule().fill(.white.opacity(0.55))
+                .frame(width: 2, height: 8)
+                .position(x: sliderInset + CGFloat(fraction) * trackWidth, y: height / 2)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+#if !os(tvOS)
+private struct PlayerSkipTimelineBands: View {
+    let segments: [SkipSegment]
+    let duration: Double
+    let size: CGSize
+
+    var body: some View {
+        if duration > 0 {
+            let trackWidth = max(1, size.width - 20)
+            ForEach(segments) { segment in
+                let start = CGFloat(segment.start / duration)
+                let end = CGFloat(segment.end / duration)
+                let x = 10 + start * trackWidth
+                let width = max(2, (end - start) * trackWidth)
+                Capsule().fill(segment.kind == .intro ? Color.cyan.opacity(0.45)
+                               : segment.kind == .recap ? Color.yellow.opacity(0.45)
+                               : segment.kind == .credits ? Color.purple.opacity(0.45)
+                               : Color.orange.opacity(0.45))
+                    .frame(width: width, height: 5)
+                    .position(x: x + width / 2, y: size.height / 2)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct PlayerEditedSegmentMarkers: View {
+    let visible: Bool
+    let duration: Double
+    let start: Double
+    let end: Double
+    let size: CGSize
+
+    var body: some View {
+        if visible, duration > 0 {
+            let trackWidth = max(1, size.width - 20)
+            let x = 10 + CGFloat(start / duration) * trackWidth
+            let endX = 10 + CGFloat(end / duration) * trackWidth
+            let width = max(2, endX - x)
+            let y = size.height / 2
+            ZStack(alignment: .topLeading) {
+                Rectangle().fill(Color.white.opacity(0.35))
+                    .frame(width: width, height: 6)
+                    .position(x: x + width / 2, y: y)
+                Capsule().fill(Color.white)
+                    .frame(width: 3, height: 14)
+                    .position(x: x, y: y)
+                Capsule().fill(Color.white)
+                    .frame(width: 3, height: 14)
+                    .position(x: endX, y: y)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+}
+#endif
+
+/// GeometryReader returns this named, non-generic view, rather than exposing the complete
+/// slider/buffer/chapter/skip/editor/preview type to the bottom-bar's own generic metadata.
+private struct PlayerSeekTimelineTrack: View {
+    let clock: TimePosClock
+    @Binding var scrubbing: Bool
+    @Binding var scrubTarget: Double
+    let duration: Double
+    let bufferedTime: Double
+    let size: CGSize
+    let chapterFractions: [Double]
+    let accent: Color
+    let skipSegments: [SkipSegment]
+    let showSkipEditor: Bool
+    let skipEditStart: Double
+    let skipEditEnd: Double
+    let hoverPreviewTime: Double?
+    let onScrubChanged: (Double) -> Void
+    let onEditingChanged: (Bool) -> Void
+    let onHoverPreviewChanged: (Double?) -> Void
+    let preview: (Double, CGFloat) -> AnyView
+
+    var body: some View {
+        PlayerSeekSliderSurface(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
+                                duration: duration, bufferedTime: bufferedTime, size: size,
+                                chapterFractions: chapterFractions, accent: accent, onScrubChanged: onScrubChanged,
+                                onEditingChanged: onEditingChanged, onHoverPreviewChanged: onHoverPreviewChanged)
+            #if !os(tvOS)
+            .overlay { PlayerSkipTimelineBands(segments: skipSegments, duration: duration, size: size) }
+            .overlay {
+                PlayerEditedSegmentMarkers(visible: showSkipEditor, duration: duration,
+                                           start: skipEditStart, end: skipEditEnd, size: size)
+            }
+            #endif
+            .overlay(alignment: .bottomLeading) {
+                if scrubbing || hoverPreviewTime != nil {
+                    preview(hoverPreviewTime ?? scrubTarget, size.width)
+                }
+            }
+    }
+}
+
 /// One provider refresh belongs to one native-debrid mount.  A requested engine change joins that refresh
 /// instead of constructing a new surface from the expired signed URL that triggered it.
 private struct NativeDebridFreshLinkRecoveryState: Equatable {
@@ -6944,6 +7108,14 @@ struct PlayerScreen: View {
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
     }
 
+    private var skipEditorTimelineValues: (visible: Bool, start: Double, end: Double) {
+        #if os(tvOS)
+        return (false, 0, 0)
+        #else
+        return (showSkipDBEdit, skipDBEditStart, skipDBEditEnd)
+        #endif
+    }
+
     private var bottomBar: some View {
         VStack(spacing: 14) {
             if isLive {
@@ -6956,16 +7128,20 @@ struct PlayerScreen: View {
                     // Slider is wrapped in a GeometryReader so the trickplay bubble can be positioned
                     // relative to the knob and macOS hover can compute the preview time from cursor x.
                     GeometryReader { geo in
-                        // macOS Slider track is inset by ~half the thumb diameter on each side.
-                        let sliderInset: CGFloat = 10
-                        let trackWidth = max(1, geo.size.width - sliderInset * 2)
-                        // While dragging the thumb follows scrubTarget so an incoming timePos tick
-                        // can't yank it back to the pre-seek position (#32). On release we commit.
-                        PlayerClockSlider(
+                        PlayerSeekTimelineTrack(
                             clock: timePosClock,
                             scrubbing: $scrubbing,
                             scrubTarget: $scrubTarget,
                             duration: duration,
+                            bufferedTime: bufferedTime,
+                            size: geo.size,
+                            chapterFractions: chapterFractions,
+                            accent: Theme.Palette.accent,
+                            skipSegments: skipSegments,
+                            showSkipEditor: skipEditorTimelineValues.visible,
+                            skipEditStart: skipEditorTimelineValues.start,
+                            skipEditEnd: skipEditorTimelineValues.end,
+                            hoverPreviewTime: hoverPreviewTime,
                             onScrubChanged: { scrubThumbnails.show(time: $0) },
                             onEditingChanged: { editing in
                                 scrubbing = editing
@@ -6980,103 +7156,23 @@ struct PlayerScreen: View {
                                     scrubThumbnails.clear()
                                     scheduleHide()
                                 }
+                            },
+                            onHoverPreviewChanged: { ratio in
+                                hoverPreviewRatio = ratio.map { CGFloat($0) }
+                                hoverPreviewTime = ratio.map { $0 * max(duration, 0) }
+                                if let time = hoverPreviewTime {
+                                    scrubThumbnails.show(time: time)
+                                } else {
+                                    scrubThumbnails.clear()
+                                }
+                            },
+                            preview: { time, width in
+                                AnyView(trickplayPopup(time: time)
+                                    .fixedSize()
+                                    .offset(x: trickplayBubbleOffset(sliderWidth: width), y: -28)
+                                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))))
                             }
                         )
-                        .tint(Theme.Palette.accent)
-                        #if os(macOS)
-                        .onContinuousHover { phase in
-                            switch phase {
-                            case .active(let loc):
-                                guard !scrubbing else { return }
-                                let ratio = min(max(0, (loc.x - sliderInset) / trackWidth), 1)
-                                hoverPreviewRatio = ratio
-                                hoverPreviewTime = ratio * max(duration, 0)
-                                scrubThumbnails.show(time: hoverPreviewTime!)
-                            case .ended:
-                                guard !scrubbing else { return }
-                                hoverPreviewTime = nil; hoverPreviewRatio = nil
-                                scrubThumbnails.clear()
-                            }
-                        }
-                        #endif
-                        // YouTube-style buffered-ahead band: a faint grey capsule from the playhead to the
-                        // loaded edge, over the Slider's own track but under the thumb/ticks. Never intercepts
-                        // the drag. Fail-soft: no buffered info (or behind the playhead) → nothing draws.
-                        .overlay {
-                            if !scrubbing {
-                                PlayerBufferedBand(
-                                    clock: timePosClock,
-                                    duration: duration,
-                                    bufferedTime: bufferedTime,
-                                    trackWidth: trackWidth,
-                                    sliderInset: sliderInset,
-                                    height: geo.size.height
-                                )
-                            }
-                        }
-                        // Chapter boundary ticks along the track (purely decorative, never intercept the
-                        // Slider's own drag). Positioned within the same inset the Slider track uses.
-                        .overlay {
-                            ForEach(chapterFractions, id: \.self) { f in
-                                Capsule().fill(.white.opacity(0.55))
-                                    .frame(width: 2, height: 8)
-                                    .position(x: sliderInset + CGFloat(f) * trackWidth, y: geo.size.height / 2)
-                            }
-                            .allowsHitTesting(false)
-                        }
-                        #if !os(tvOS)
-                        // Loaded skip segments: faint coloured bands.
-                        .overlay {
-                            if duration > 0 {
-                                ForEach(skipSegments) { seg in
-                                    let sf = CGFloat(seg.start / duration)
-                                    let ef = CGFloat(seg.end / duration)
-                                    let sx = sliderInset + sf * trackWidth
-                                    let w  = max(2, (ef - sf) * trackWidth)
-                                    Capsule().fill(seg.kind == .intro ? Color.cyan.opacity(0.45)
-                                                   : seg.kind == .recap ? Color.yellow.opacity(0.45)
-                                                   : seg.kind == .credits ? Color.purple.opacity(0.45)
-                                                   : Color.orange.opacity(0.45))
-                                        .frame(width: w, height: 5)
-                                        .position(x: sx + w / 2, y: geo.size.height / 2)
-                                }
-                                .allowsHitTesting(false)
-                            }
-                        }
-                        // Segment being edited: bright band + start/end markers.
-                        .overlay {
-                            if showSkipDBEdit, duration > 0 {
-                                let sf = CGFloat(skipDBEditStart / duration)
-                                let ef = CGFloat(skipDBEditEnd   / duration)
-                                let sx = sliderInset + sf * trackWidth
-                                let ex = sliderInset + ef * trackWidth
-                                let w  = max(2, ex - sx)
-                                let cy = geo.size.height / 2
-                                ZStack(alignment: .topLeading) {
-                                    Rectangle().fill(Color.white.opacity(0.35))
-                                        .frame(width: w, height: 6)
-                                        .position(x: sx + w / 2, y: cy)
-                                    Capsule().fill(Color.white)
-                                        .frame(width: 3, height: 14)
-                                        .position(x: sx, y: cy)
-                                    Capsule().fill(Color.white)
-                                        .frame(width: 3, height: 14)
-                                        .position(x: ex, y: cy)
-                                }
-                                .allowsHitTesting(false)
-                            }
-                        }
-                        #endif
-                        // bottomLeading alignment: popup bottom anchors at slider bottom, grows upward.
-                        // y: -28 lifts it 4 pt above the slider top (slider is 24 pt tall).
-                        .overlay(alignment: .bottomLeading) {
-                            if scrubbing || hoverPreviewTime != nil {
-                                trickplayPopup(time: hoverPreviewTime ?? scrubTarget)
-                                    .fixedSize()
-                                    .offset(x: trickplayBubbleOffset(sliderWidth: geo.size.width), y: -28)
-                                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom)))
-                            }
-                        }
                     }
                     .frame(height: 24)
                     .animation(.easeOut(duration: 0.12), value: scrubThumbnails.image != nil)

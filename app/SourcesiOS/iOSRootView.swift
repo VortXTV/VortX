@@ -5,11 +5,9 @@ import UIKit
 import AppKit
 #endif
 
-/// Native iOS root: a CUSTOM bottom-tab shell over the shared engine. A native `TabView` collapses
-/// the 5th+ tabs into a system "More" tab on iPhone, burying Add-ons and Settings; instead we drive
-/// the visible screen with a `@State` selection and render our own brand-styled bar so all SEVEN tabs
-/// stay visible at once (matching the tvOS pill bar). Surfaces are filled in one at a time during the
-/// 0.3.0 rebase; Home is the first real one (poster rails from CoreBridge).
+/// The Apple TV visual hierarchy adapted to each window: floating horizontal navigation on
+/// Mac/wide iPad and a compact bottom bar on phones/narrow iPad. One route owner still drives
+/// every destination; overflow never creates a second Settings or Add-ons presentation host.
 struct iOSRootView: View {
     let launchReady: Bool
 
@@ -96,9 +94,11 @@ struct iOSRootView: View {
     @FocusState private var tabFocus: MacBrowseFocus?
     /// The persistent desktop search field's text and focus state.
     @State private var macQuery = ""
+    @State private var macSearchPresented = false
     @FocusState private var macSearchFocused: Bool
     #endif
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ScaledMetric(relativeTo: .caption) private var compactLabelSize: CGFloat = 11
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
     /// when a still-newer build ships.
@@ -190,12 +190,7 @@ struct iOSRootView: View {
             #if os(macOS)
             macDesktopShell
             #else
-            ZStack {
-                selectedTabContent
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            bottomTabBarRow
+            mobileCinematicShell
             #endif
         }
         .onChange(of: tab) { newTab in
@@ -328,6 +323,7 @@ struct iOSRootView: View {
             // resolves the merge fold (Discover when merged, else Search) BEFORE the hidden check,
             // so a hidden destination can never resurface with no tab selected in the bar.
             if dest == .search {
+                macSearchPresented = true
                 macSearchFocused = true
                 tab = searchDestination
                 return
@@ -392,48 +388,22 @@ struct iOSRootView: View {
     #endif
 
     #if os(macOS)
-    /// Desktop layout: familiar left navigation, persistent media search, and one real content host.
-    /// It deliberately does not mount a second TabView or a Settings scene, keeping every existing
-    /// destination, profile gate, banner, and route modifier attached to this root.
+    /// TV-inspired desktop navigation, not a sidebar. The transparent safe-area insert keeps
+    /// ordinary forms below the floating chrome; the existing hero's top bleed paints behind it.
     private var macDesktopShell: some View {
-        HStack(spacing: 0) {
-            macSidebar
-            Rectangle()
-                .fill(Theme.Palette.hairline)
-                .frame(width: 1)
-                .accessibilityHidden(true)
-            selectedTabContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .safeAreaInset(edge: .top, spacing: 0) { macContentHeader }
-        }
+        selectedTabContent
+            .safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas)
         .onExitCommand {
             // Escape preserves the content views' own back behavior; when desktop chrome owns focus,
             // it simply returns focus to the active navigation item instead of stranding the cursor.
-            if macSearchFocused || tabFocus != nil {
+            if macSearchPresented || macSearchFocused || tabFocus != nil {
+                macSearchPresented = false
                 macSearchFocused = false
                 tabFocus = .tab(tab.rawValue)
             }
         }
-    }
-
-    private var macContentHeader: some View {
-        HStack(spacing: Theme.Space.md) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tab.title)
-                    .font(Theme.Typography.sectionTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                Text("VortX for Mac")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Theme.Palette.textTertiary)
-            }
-            Spacer(minLength: Theme.Space.md)
-            macTopBar
-        }
-        .padding(.horizontal, Theme.Space.lg)
-        .padding(.vertical, Theme.Space.sm)
-        .background(Theme.Palette.canvas.opacity(0.96))
     }
 
     private var macTopBar: some View {
@@ -485,58 +455,91 @@ struct iOSRootView: View {
         let destination = searchDestination
         if destination != .home { MacSearchBridge.shared.pending = query }
         tab = destination
+        macSearchPresented = false
     }
 
-    private var macSidebar: some View {
-        VStack(alignment: .leading, spacing: Theme.Space.md) {
-            HStack(spacing: Theme.Space.sm) {
-                VortXWordmark(fontSize: 21)
-                Spacer(minLength: 0)
-                Image(systemName: "macbook")
-                    .foregroundStyle(Theme.Palette.textTertiary)
-                    .accessibilityHidden(true)
+    #endif
+
+    #if !os(macOS)
+    private var mobileCinematicShell: some View {
+        GeometryReader { geometry in
+            // Window width, not physical-screen width: Split View/Stage Manager retain the phone
+            // treatment when narrow, and rotating a phone never turns it into a desktop shell.
+            let topNavigation = UIDevice.current.userInterfaceIdiom == .pad && geometry.size.width >= 760
+            selectedTabContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    if topNavigation { cinematicTopBar }
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if !topNavigation { bottomTabBarRow }
+                }
+        }
+    }
+    #endif
+
+    private var cinematicTopBar: some View {
+        HStack(spacing: Theme.Space.sm) {
+            VortXWordmark(fontSize: 22).fixedSize()
+            horizontalTabBar
+            #if os(macOS)
+            Button { macSearchPresented = true } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 17, weight: .semibold))
+                    .frame(width: 44, height: 44)
+                    .vortxGlassDisc()
             }
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.top, Theme.Space.md)
+            .buttonStyle(.plain)
+            .accessibilityLabel("Search movies or series")
+            .help("Search (⌘F)")
+            .popover(isPresented: $macSearchPresented) {
+                macTopBar.padding(Theme.Space.md)
+                    .onAppear { macSearchFocused = true }
+            }
+            #endif
+        }
+        .frame(maxWidth: 1_200)
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.vertical, Theme.Space.sm)
+        .frame(maxWidth: .infinity)
+    }
 
-            Text("BROWSE")
-                .font(.caption2.weight(.bold))
-                .tracking(1.2)
-                .foregroundStyle(Theme.Palette.textTertiary)
-                .padding(.horizontal, Theme.Space.md)
-
-            VStack(spacing: 4) {
-                ForEach(visibleTabs, id: \.rawValue) { item in
-                    macSidebarItem(item)
+    private var horizontalTabBar: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(visibleTabs, id: \.rawValue) { item in
+                        horizontalTabButton(item).id(item.rawValue)
+                    }
+                }
+                .padding(6)
+                #if os(macOS)
+                .focusSection()
+                #endif
+            }
+            .onChange(of: tab) { item in
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                    proxy.scrollTo(item.rawValue, anchor: .center)
                 }
             }
-            .focusSection()
-
-            Spacer(minLength: Theme.Space.md)
-            Text("⌘F to search · ⌘, for settings")
-                .font(.caption2)
-                .foregroundStyle(Theme.Palette.textTertiary)
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.bottom, Theme.Space.md)
         }
-        .frame(minWidth: 188, idealWidth: 216, maxWidth: 240, maxHeight: .infinity, alignment: .leading)
-        .background(Theme.Palette.surface1.opacity(0.72))
+        .fixedSize(horizontal: false, vertical: true)
+        .vortxGlass(in: Capsule())
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Main navigation")
     }
 
-    private func macSidebarItem(_ item: Tab) -> some View {
+    private func selectTab(_ item: Tab) {
+        if tab == item { TabScrollToTop.shared.bump(item.scrollKey) }
+        else { tab = item }
+    }
+
+    private func horizontalTabButton(_ item: Tab) -> some View {
         let selected = tab == item
-        return Button {
-            if selected {
-                TabScrollToTop.shared.bump(item.scrollKey)
-            } else {
-                tab = item
-            }
-        } label: {
-            HStack(spacing: Theme.Space.sm) {
+        let button = Button { selectTab(item) } label: {
+            HStack(spacing: 7) {
                 Image(systemName: selected ? item.icon : item.inactiveIcon)
-                    .frame(width: 20)
+                    .font(.system(size: 16, weight: .semibold))
                     .overlay(alignment: .topTrailing) {
                         if item == .library, activeDownloadCount > 0 {
                             downloadCountBadge(activeDownloadCount)
@@ -546,28 +549,29 @@ struct iOSRootView: View {
                     }
                 Text(item.title)
                     .font(.system(size: 14, weight: selected ? .semibold : .medium))
-                Spacer(minLength: 0)
+                    .fixedSize(horizontal: true, vertical: false)
             }
-            .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
-            .padding(.horizontal, Theme.Space.sm)
-            .frame(minHeight: 36)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+            .padding(.horizontal, 14)
+            .frame(minHeight: 44)
             .background {
-                RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous)
-                    .fill(selected ? VortXGlass.activeFill : .clear)
+                Capsule().fill(selected ? Theme.Palette.accent : .clear)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, Theme.Space.sm)
         .accessibilityLabel(item.title)
         .accessibilityHint("Switches to \(item.title)")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+        #if os(macOS)
+        return button
         .focusable()
         .focused($tabFocus, equals: .tab(item.rawValue))
         .macFocusRing(tabFocus == .tab(item.rawValue), cornerRadius: Theme.Radius.control)
+        #else
+        return button
+        #endif
     }
-    #endif
 
     @ViewBuilder private var bottomTabBarRow: some View {
         #if os(macOS)
@@ -577,9 +581,6 @@ struct iOSRootView: View {
         #endif
     }
 
-    /// Brand-styled bottom bar: seven equal items, each a small SF Symbol over a caption label. The
-    /// selected item is tinted with the app accent; the rest read as tertiary text. A hairline +
-    /// surface fill separates it from the content, and it respects the safe-area bottom inset.
     /// Tabs shown in the bar; any tab the user hid in Settings > Tab bar is dropped (#117).
     private var visibleTabs: [Tab] {
         Tab.allCases.filter {
@@ -603,25 +604,74 @@ struct iOSRootView: View {
 
     private var customTabBar: some View {
         HStack(spacing: 0) {
-            ForEach(visibleTabs, id: \.rawValue) { item in
+            ForEach(compactTabLayout.primary, id: \.rawValue) { item in
                 tabButton(item)
             }
+            if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
         }
         #if os(macOS)
         .focusSection()
         #endif
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tabs")
-        // Floating glass pill (redesign Phase A): the tab items ride VortX's warm liquid-glass material,
-        // inset from the screen edges with a soft drop shadow, so the bar reads as a floating element over
-        // the canvas instead of a solid attached strip. RE-SKIN ONLY: the bar still holds its own row at
-        // the bottom of the shell VStack (content never scrolls under it and is never obscured); only its
-        // appearance floats. Selection, tap wiring, a11y, and the offline/update banners are untouched.
+        // The same floating capsule as TV, with at most five touch targets instead of squeezing
+        // all seven labels into a phone. The safe-area insert keeps scrolling content unobscured.
         .padding(.horizontal, Theme.Space.sm)
         .padding(.vertical, Theme.Space.xs)
         .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .padding(.horizontal, Theme.Space.md)
         .padding(.vertical, Theme.Space.xs)
+    }
+
+    private var compactTabLayout: (primary: [Tab], overflow: [Tab]) {
+        TabBarPrefs.compactLayout(visible: visibleTabs, preferred: [.home, .discover, .library, .search])
+    }
+
+    private var overflowTabMenu: some View {
+        let selected = compactTabLayout.overflow.contains(tab)
+        return Menu {
+            ForEach(compactTabLayout.overflow, id: \.rawValue) { item in
+                Button { selectTab(item) } label: {
+                    Label(item.title, systemImage: tab == item ? "checkmark" : item.inactiveIcon)
+                }
+            }
+        } label: {
+            compactTabLabel(title: selected ? tab.title : String(localized: "More"),
+                            icon: selected ? tab.icon : "ellipsis", selected: selected)
+        }
+        .menuStyle(.borderlessButton)
+        .accessibilityLabel("More destinations")
+        .accessibilityValue(selected ? tab.title : "")
+        .accessibilityHint("Opens Live, Add-ons and Settings when they are not in the main bar")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+
+    private func compactTabLabel(title: String, icon: String, selected: Bool,
+                                 downloadBadge: Bool = false) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(height: 22)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background {
+                    if selected { Capsule().fill(Theme.Palette.accent) }
+                }
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .overlay(alignment: .topTrailing) {
+                    if downloadBadge, activeDownloadCount > 0 {
+                        downloadCountBadge(activeDownloadCount)
+                    }
+                }
+            Text(title)
+                .font(.system(size: compactLabelSize, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
     }
 
     /// Quiet, persistent "You're offline" strip (#120), shown across every tab while the device has no
@@ -729,48 +779,9 @@ struct iOSRootView: View {
 
     private func tabButton(_ item: Tab) -> some View {
         let selected = tab == item
-        let base = Button {
-            // Re-tapping the ALREADY-active tab scrolls that screen to the top (a per-tab signal the
-            // mounted screen observes); tapping an inactive tab just switches to it as before.
-            if selected {
-                TabScrollToTop.shared.bump(item.scrollKey)
-            } else {
-                tab = item
-            }
-        } label: {
-            VStack(spacing: 3) {
-                // Active tab: filled glyph in an accent-soft capsule so the selection reads at a
-                // glance; inactive tabs are an outline glyph with no pill (#22).
-                Image(systemName: selected ? item.icon : item.inactiveIcon)
-                    .font(.system(size: 20, weight: .semibold))
-                    .frame(height: 22)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 2)
-                    // Ember active pill behind the selected glyph, via the shared VortXGlass active token so
-                    // every platform's selected nav item reads identically (redesign Phase A).
-                    .background {
-                        if selected {
-                            Capsule().fill(VortXGlass.activeFill)
-                        }
-                    }
-                    // #30: a small accent count badge on the Library tab while downloads are in flight, so
-                    // the user knows work is running and where to find it. Hidden when zero / on other tabs.
-                    #if !os(tvOS)
-                    .overlay(alignment: .topTrailing) {
-                        if item == .library, activeDownloadCount > 0 {
-                            downloadCountBadge(activeDownloadCount)
-                        }
-                    }
-                    #endif
-                Text(item.title)
-                    .font(.system(size: 11, weight: selected ? .semibold : .medium))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-            .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textTertiary)
-            .frame(maxWidth: .infinity)
-            .padding(.bottom, 2)
-            .contentShape(Rectangle())
+        let base = Button { selectTab(item) } label: {
+            compactTabLabel(title: item.title, icon: selected ? item.icon : item.inactiveIcon,
+                            selected: selected, downloadBadge: item == .library)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(item.title)
