@@ -382,7 +382,10 @@ struct PlayerSeekTimelineConstructionTests {
 final class PlayerBottomBarProbeDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         DispatchQueue.main.async {
-            PlayerBottomBarConstructionProbe.run()
+            // Screenshots can render independently of the large synchronous construction batch.
+            // Normal execution still runs every assertion; visual-only mode makes no test claim.
+            let visualOnly = ProcessInfo.processInfo.environment["PLAYER_PROBE_VISUAL_ONLY"] == "1"
+            if !visualOnly { PlayerBottomBarConstructionProbe.run() }
             if ProcessInfo.processInfo.environment["PLAYER_PROBE_SCREENSHOT"] == "1" {
                 UserDefaults.standard.set("wave", forKey: SeekBarStyle.storageKey)
                 let screen = PlayerScreen()
