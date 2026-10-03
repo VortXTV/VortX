@@ -1384,6 +1384,9 @@ struct PlayerScreen: View {
     @State private var episodeResolutionOwner: EpisodeResolutionOwner?
     @State private var episodeResolutionTargetVideoID: String?
     @State private var episodeResolutionAdmitted = false
+    /// Retain a resolver's target until its player command is accepted. On failure Retry must resolve
+    /// that exact episode, not reload the outgoing episode's URL or offer its stale source list.
+    @State private var failedEpisodeResolutionID: String?
     /// A manual Next/Previous press can arrive while a Continue Watching player still has only a partial
     /// series list. It is consumed once, only by the same physical playback after its inventory is accepted.
     @State private var pendingManualEpisodeNavigation: AppleManualEpisodeNavigationIntent?
@@ -2672,6 +2675,9 @@ struct PlayerScreen: View {
     }
 
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        // A late first-frame/EOF event cannot resurrect a terminal attempt. A deliberate retry or
+        // accepted replacement reopens callbacks; the existing load-token gates still fence old events.
+        guard !loadFailed else { return }
         if let loadToken, loadToken == recoveryPauseOwner,
            loadToken == coordinator.player?.activeLoadToken,
            name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
@@ -4445,6 +4451,14 @@ struct PlayerScreen: View {
     /// (stop-before-dismiss): engine down first, then the surface state change.
     private func presentTerminalLoadFailure() {
         deferredResumeAttempt.invalidate()
+        autoRetryTask?.cancel(); autoRetryTask = nil
+        loadTimeout?.cancel(); loadTimeout = nil
+        recoveryDeadline?.cancel(); recoveryDeadline = nil
+        #if os(iOS) || os(macOS)
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        #endif
+        reconnecting = false
+        buffering = false
         TerminalLoadFailurePolicy.presentTerminal(
             retire: {
                 guard TerminalLoadFailurePolicy.shouldRetireBeforePublish(
@@ -4488,6 +4502,15 @@ struct PlayerScreen: View {
 
     private func retryPlaybackByUser() {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        if let target = failedEpisodeResolutionID {
+            // goToEpisode clears the error only after admitting a resolver. If admission is unavailable,
+            // retain the target and the overlay rather than retrying the finished episode by accident.
+            if !goToEpisode(target) {
+                loadErrorMsg = "The episode's sources are not available. Go back and try again."
+                presentTerminalLoadFailure()
+            }
+            return
+        }
         retryLoad()
     }
 
@@ -6031,6 +6054,8 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        failedEpisodeResolutionID = nil
+        loadFailed = false
         clearCachedAudioOutputTruth()
         #if os(iOS) || os(macOS)
         avToMPVHandoffTask?.cancel()
@@ -6972,6 +6997,7 @@ struct PlayerScreen: View {
             switchingEpisode = false
             reconnecting = false
             buffering = false
+            failedEpisodeResolutionID = owner.videoID
             loadErrorMsg = "No playable source resolved within 30 seconds."
             DiagnosticsLog.log(
                 "binge",
@@ -7015,6 +7041,7 @@ struct PlayerScreen: View {
         autoRetryTask?.cancel()
         pendingAdvance = nil
         supersededAdvance = nil
+        failedEpisodeResolutionID = nil
         switchingEpisode = false
         coordinator.player?.invalidateLoadToken()
         invalidatePreparedEpisode(reason: "player exit")
@@ -7066,6 +7093,7 @@ struct PlayerScreen: View {
         pendingAdvance = superseded.pending
         restoreEpisodeSourceSnapshot(superseded.source, for: superseded.pending)
         supersededAdvance = nil
+        failedEpisodeResolutionID = nil
         switchingEpisode = true
         reconnecting = true
         buffering = true
@@ -7092,6 +7120,7 @@ struct PlayerScreen: View {
         guard !playbackExited, resolverRoute != nil else {
             return false
         }
+        loadFailed = false
         if let pending = pendingAdvance,
            PreparedEpisodeRetentionPolicy.isPendingReentry(
             requestedEpisodeID: videoId,
@@ -7109,6 +7138,9 @@ struct PlayerScreen: View {
             )
             return true
         }
+        // Keep this through nil results, duplicate outgoing files and rejected player commands.
+        // Only an accepted replacement (or a restored healthy pending owner) may clear it.
+        failedEpisodeResolutionID = videoId
         let retainedPreparedEpisode = takePreparedEpisode(for: videoId)
         if let pending = pendingAdvance,
            IssuedPendingEpisodeReentryPolicy.shouldPreserve(
@@ -7239,17 +7271,14 @@ struct PlayerScreen: View {
                     // selection cannot strand E2 metadata beside an E3 URL.
                     switchingEpisode = true
                     reconnecting = true
+                    failedEpisodeResolutionID = nil
                     return
                 }
                 switchingEpisode = false
                 reconnecting = false; buffering = false
-                if autoAdvance {
-                    if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the finished episode's engine (no-op for direct/debrid)
-                    exitPlayerFullScreenIfNeeded()   // item 6: land back in windowed browse, not stranded fullscreen
-                    invalidateEpisodeWorkForExit()
-                    onClose()            // nothing playable on auto-advance: leave, don't hang on a spinner
-                }
-                else { loadErrorMsg = "Couldn't load that episode"; presentTerminalLoadFailure() }   // surface it: render loadErrorOverlay instead of silently continuing the old episode
+                failedEpisodeResolutionID = videoId
+                loadErrorMsg = "Couldn't load that episode. Retry to find its sources again."
+                presentTerminalLoadFailure()
                 return
             }
             guard EpisodePlaybackIdentity.canIssueEpisodeSwitch(
@@ -7270,6 +7299,7 @@ struct PlayerScreen: View {
                 if pendingAdvance != nil {
                     switchingEpisode = true
                     reconnecting = true
+                    failedEpisodeResolutionID = nil
                     return
                 }
                 switchingEpisode = false
@@ -7277,6 +7307,8 @@ struct PlayerScreen: View {
                 if es.meta.videoId != curMeta?.videoId {
                     loadErrorMsg = "That episode resolved to the current episode's file."
                     presentTerminalLoadFailure()
+                } else {
+                    failedEpisodeResolutionID = nil
                 }
                 return
             }
@@ -7425,12 +7457,13 @@ struct PlayerScreen: View {
             Color.black.opacity(0.92).ignoresSafeArea()
             VStack(spacing: 18) {
                 Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 46)).foregroundStyle(.yellow)
-                Text(sourceHops > 0 ? "Tried \(sourceHops + 1) sources, none worked" : "This source didn't load")
+                Text(failedEpisodeResolutionID != nil ? "This episode didn't load"
+                     : sourceHops > 0 ? "Tried \(sourceHops + 1) sources, none worked" : "This source didn't load")
                     .font(.title3.weight(.semibold)).foregroundStyle(.white)
                 Text(loadErrorHint).font(.callout).foregroundStyle(.white.opacity(0.75))
                     .multilineTextAlignment(.center).frame(maxWidth: 480).fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 16) {
-                    if hasAlternateSources {
+                    if failedEpisodeResolutionID == nil, hasAlternateSources {
                         Button { openPanel(.sources) } label: { Label("Other sources", systemImage: "rectangle.stack").padding(6) }
                     }
                     Button { retryPlaybackByUser() } label: { Label("Retry", systemImage: "arrow.clockwise").padding(6) }
@@ -7444,7 +7477,9 @@ struct PlayerScreen: View {
     }
 
     private var loadErrorHint: String {
-        let base = "It may be uncached on your debrid (still downloading), offline, or an unsupported link. Try another source or go back."
+        let base = failedEpisodeResolutionID != nil
+            ? "Retry this episode or go back."
+            : "Retry this source, choose another source, or go back."
         return loadErrorMsg.isEmpty ? base : base + "\n\n(\(loadErrorMsg))"
     }
 
