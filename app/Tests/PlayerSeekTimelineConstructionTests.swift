@@ -116,8 +116,10 @@ enum PlayerBottomBarConstructionProbe {
         host.layoutSubtreeIfNeeded()
         #else
         let controller = UIHostingController(rootView: view)
-        let window = window ?? UIWindow(frame: CGRect(x: 0, y: 0, width: width, height: 400))
+        let frame = CGRect(x: 0, y: 0, width: width, height: height)
+        let window = window ?? UIWindow(frame: frame)
         self.window = window
+        window.frame = frame
         window.rootViewController = controller
         window.makeKeyAndVisible()
         controller.view.frame = CGRect(x: 0, y: 0, width: width, height: height)
