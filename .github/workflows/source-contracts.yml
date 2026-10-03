@@ -41,7 +41,9 @@ concurrency:
   cancel-in-progress: true
 jobs:
   apple-policies:
-    runs-on: macos-15
+    # The production SwiftUI views use SDK 26 glass APIs; exercise them on the same
+    # runner generation as Apple packaging instead of the older default SDK.
+    runs-on: macos-26
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
