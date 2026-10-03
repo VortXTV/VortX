@@ -5,20 +5,56 @@ const { test } = require("node:test");
 const path = require("node:path");
 const source = fs.readFileSync(path.join(__dirname, "../app/Sources/PlayerScreen.swift"), "utf8");
 
-test("bottom-bar geometry returns a concrete rendering boundary", () => {
-    const bottom = source.slice(source.indexOf("private var bottomBar: some View"),
-        source.indexOf("// MARK: - Skip segment edit bar"));
-    const geometry = bottom.slice(bottom.indexOf("GeometryReader { geo in"), bottom.indexOf(".frame(height: 24)"));
-    assert(geometry.includes("PlayerSeekTimelineTrack("));
-    assert(!geometry.includes("PlayerClockSlider("));
-    assert(!geometry.includes(".overlay"), "do not reintroduce the deeply nested metadata tree in GeometryReader");
+test("the entire bottom bar terminates metadata at concrete rendering boundaries", () => {
+    const bottom = source.slice(source.indexOf("private var bottomBar: PlayerBottomBarLayout"),
+        source.indexOf("private var bottomTimeline:"));
+    assert(bottom.includes("PlayerBottomBarLayout("));
+    assert(!bottom.includes("VStack("));
+    const layout = source.slice(source.indexOf("private struct PlayerBottomBarLayout:"),
+        source.indexOf("/// One provider refresh"));
+    for (const leaf of ["PlayerLiveIndicator", "PlayerBottomTimeline", "PlayerSkipEditorLayout?", "PlayerTransportToolbar"]) {
+        assert(layout.includes(leaf), `outer boundary: ${leaf}`);
+    }
+    assert(!layout.includes("-> some View"));
+    const timeline = source.slice(source.indexOf("private struct PlayerBottomTimeline:"),
+        source.indexOf("private struct PlayerSkipEditorSection:"));
+    assert(timeline.includes("let track: (CGSize) -> PlayerSeekTimelineTrack"));
+    assert(timeline.includes("GeometryReader { geo in track(geo.size) }"));
+    const factory = source.slice(source.indexOf("private var bottomTimeline:"),
+        source.indexOf("private var bottomSkipEditor:"));
+    assert(factory.includes("PlayerSeekTimelineTrack("));
+    assert(!factory.includes("PlayerClockSlider("));
+    assert(!factory.includes(".overlay"));
     for (const binding of ["clock: timePosClock", "scrubbing: $scrubbing", "scrubTarget: $scrubTarget",
         "chapterFractions: chapterFractions", "skipSegments: skipSegments", "hoverPreviewTime: hoverPreviewTime"]) {
-        assert(geometry.includes(binding), `retained timeline input: ${binding}`);
+        assert(factory.includes(binding), `retained timeline input: ${binding}`);
     }
     for (const operation of ["issueSeek(to: target, reason: \"scrub\")", "reportSeek(target)",
         "scrubThumbnails.clear()", "scheduleHide()", "trickplayBubbleOffset(sliderWidth: width)"]) {
-        assert(geometry.includes(operation), `retained transport/preview operation: ${operation}`);
+        assert(factory.includes(operation), `retained transport/preview operation: ${operation}`);
+    }
+});
+
+test("toolbar and editor do not expose repeated opaque button or editor-section types", () => {
+    assert(source.includes("action: @escaping () -> Void) -> PlayerControlButton"));
+    const toolbar = source.slice(source.indexOf("private struct PlayerTransportToolbar:"),
+        source.indexOf("private struct PlayerLiveIndicator:"));
+    assert.equal((toolbar.match(/: PlayerControlButton/g) || []).length, 10);
+    const editor = source.slice(source.indexOf("private struct PlayerSkipEditorLayout:"),
+        source.indexOf("private struct PlayerBottomBarLayout:"));
+    assert.equal((editor.match(/let \w+: \(\) -> AnyView/g) || []).length, 3);
+    assert.equal((editor.match(/PlayerSkipEditorSection\(content:/g) || []).length, 3);
+    for (const name of ["skipDBEditTypeControls", "skipDBEditTimeControls", "skipDBEditActions", "skipDBTimeControl"]) {
+        assert(new RegExp(`private func ${name}\\([^\\n]*\\) -> AnyView`).test(source), `${name} must bound its own subtree`);
+    }
+    assert(source.includes("guard showSkipDBEdit, let meta = curMeta else { return nil }"));
+});
+
+test("executable probe extracts production factories and editor bodies with actual glass styling", () => {
+    const runner = fs.readFileSync(path.join(__dirname, "../scripts/test-apple-player-timeline.sh"), "utf8");
+    for (const productionInput of ["private var skipEditorTimelineValues:", "private func skipDBEditBar(",
+        "app/SourcesShared/GlassStyle.swift", "app/SourcesShared/Theme.swift", "app/SourcesShared/ThemeManager.swift"]) {
+        assert(runner.includes(productionInput), `runtime probe must compile ${productionInput}`);
     }
 });
 

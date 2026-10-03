@@ -280,6 +280,170 @@ private struct PlayerSeekTimelineTrack: View {
     }
 }
 
+/// The build-255 failure was in the OUTER bottom-bar metadata, not only the slider.
+/// These non-generic view boundaries keep each toolbar button and optional editor section's
+/// glass/conditional tree out of its parent's metadata. Keep transport ownership in PlayerScreen.
+private struct PlayerControlButton: View {
+    let icon: String
+    let title: String
+    var active = false
+    let action: () -> Void
+
+    var body: some View {
+    Button(action: action) {
+        HStack(spacing: 7) {
+            Image(systemName: icon).font(.system(size: 15, weight: .semibold))
+            // #135: force a single line + allow the font to shrink instead of wrapping mid-word
+            // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
+            // fit at full size so minimumScaleFactor is a no-op there.
+            Text(title).font(.subheadline.weight(.medium))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
+        // when its feature is engaged. Purely visual; the button's action is unchanged.
+        .foregroundStyle(active ? Theme.Palette.accent : .white)
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background { RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(active ? 0 : 0.06)) }
+        .vortxGlassActive(active, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                .strokeBorder(active ? Theme.Palette.accent.opacity(0.4) : .white.opacity(0.14), lineWidth: 1)
+        }
+    }
+    }
+}
+
+private struct PlayerTransportToolbar: View {
+    let speed: PlayerControlButton
+    let subtitles: PlayerControlButton
+    let audio: PlayerControlButton?
+    let aspect: PlayerControlButton
+    let quality: PlayerControlButton?
+    let sources: PlayerControlButton?
+    let episodes: PlayerControlButton?
+    let chapters: PlayerControlButton?
+    let grab: PlayerControlButton
+    let sleep: PlayerControlButton
+
+    var body: some View {
+        HStack(spacing: 0) {
+            speed
+            Spacer()
+            subtitles
+            if let audio { Spacer(); audio }
+            Spacer()
+            aspect
+            if let quality { Spacer(); quality }
+            if let sources { Spacer(); sources }
+            if let episodes { Spacer(); episodes }
+            if let chapters { Spacer(); chapters }
+            Spacer()
+            grab
+            Spacer()
+            sleep
+        }
+        .padding(.horizontal, 8)
+    }
+}
+
+private struct PlayerLiveIndicator: View {
+    let clock: TimePosClock
+
+    var body: some View {
+    HStack(spacing: 10) {
+        HStack(spacing: 7) {
+            Circle().fill(.red).frame(width: 9, height: 9)
+            Text("LIVE").font(.caption.weight(.heavy)).foregroundStyle(.white).tracking(1)
+        }
+        .padding(.horizontal, 11).padding(.vertical, 6)
+        // Live position indicator (in place of the scrubber) on the shared VortX glass pill, upgrading to
+        // Liquid Glass on OS 26. Background only; the red dot stays a plain fill and playback state is unchanged.
+        .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
+        Spacer()
+        PlayerTimeLabel(clock: clock, opacity: 0.85, showWhenPositive: true)
+    }
+    }
+}
+
+private struct PlayerBottomTimeline: View {
+    let clock: TimePosClock
+    let durationText: String
+    let endsAtText: String?
+    let hasThumbnail: Bool
+    let track: (CGSize) -> PlayerSeekTimelineTrack
+
+    var body: some View {
+        HStack(spacing: 12) {
+            PlayerTimeLabel(clock: clock)
+            GeometryReader { geo in track(geo.size) }
+                .frame(height: 24)
+                .animation(.easeOut(duration: 0.12), value: hasThumbnail)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(durationText).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                if let ends = endsAtText {
+                    Text(ends).font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.55))
+                }
+            }
+        }
+    }
+}
+
+/// Delayed, local erasure is restricted to the three skip-editor sections. A closure prevents
+/// constructing a hidden editor, and each section resolves its own metadata independently.
+private struct PlayerSkipEditorSection: View {
+    let content: () -> AnyView
+    var body: some View { content() }
+}
+
+private struct PlayerSkipEditorLayout: View {
+    let typeControls: () -> AnyView
+    let timeControls: () -> AnyView
+    let actions: () -> AnyView
+    let error: String?
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                PlayerSkipEditorSection(content: typeControls)
+                Spacer()
+                PlayerSkipEditorSection(content: timeControls)
+                Spacer()
+                PlayerSkipEditorSection(content: actions)
+            }
+            if let error {
+                Text(error).font(.caption2).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 10, style: .continuous),
+                    fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
+        .padding(.horizontal, 8)
+    }
+}
+
+private struct PlayerBottomBarLayout: View {
+    let isLive: Bool
+    let live: PlayerLiveIndicator
+    let timeline: PlayerBottomTimeline
+    let editor: PlayerSkipEditorLayout?
+    let toolbar: PlayerTransportToolbar
+
+    var body: some View {
+        VStack(spacing: 14) {
+            if isLive { live } else { timeline }
+            if let editor { editor }
+            toolbar
+        }
+        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 12)
+        .vortxGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                    fillAlpha: VortXGlass.barFillAlpha, shadow: .bar)
+        .padding(.horizontal, 16).padding(.bottom, 16)
+    }
+}
+
 /// One provider refresh belongs to one native-debrid mount.  A requested engine change joins that refresh
 /// instead of constructing a new surface from the expired signed URL that triggered it.
 private struct NativeDebridFreshLinkRecoveryState: Equatable {
@@ -7116,119 +7280,89 @@ struct PlayerScreen: View {
         #endif
     }
 
-    private var bottomBar: some View {
-        VStack(spacing: 14) {
-            if isLive {
-                // Live: no seekable scrubber (there's no fixed duration to scrub within), just a LIVE
-                // indicator. The user pauses/resumes; there's nothing to seek to.
-                liveIndicator
-            } else {
-                HStack(spacing: 12) {
-                    PlayerTimeLabel(clock: timePosClock)
-                    // Slider is wrapped in a GeometryReader so the trickplay bubble can be positioned
-                    // relative to the knob and macOS hover can compute the preview time from cursor x.
-                    GeometryReader { geo in
-                        PlayerSeekTimelineTrack(
-                            clock: timePosClock,
-                            scrubbing: $scrubbing,
-                            scrubTarget: $scrubTarget,
-                            duration: duration,
-                            bufferedTime: bufferedTime,
-                            size: geo.size,
-                            chapterFractions: chapterFractions,
-                            accent: Theme.Palette.accent,
-                            skipSegments: skipSegments,
-                            showSkipEditor: skipEditorTimelineValues.visible,
-                            skipEditStart: skipEditorTimelineValues.start,
-                            skipEditEnd: skipEditorTimelineValues.end,
-                            hoverPreviewTime: hoverPreviewTime,
-                            onScrubChanged: { scrubThumbnails.show(time: $0) },
-                            onEditingChanged: { editing in
-                                scrubbing = editing
-                                if editing {
-                                    scrubTarget = currentTime; hideTask?.cancel()
-                                    hoverPreviewTime = nil; hoverPreviewRatio = nil
-                                } else {
-                                    let target = scrubTarget
-                                    currentTime = target
-                                    issueSeek(to: target, reason: "scrub")
-                                    reportSeek(target)
-                                    scrubThumbnails.clear()
-                                    scheduleHide()
-                                }
-                            },
-                            onHoverPreviewChanged: { ratio in
-                                hoverPreviewRatio = ratio.map { CGFloat($0) }
-                                hoverPreviewTime = ratio.map { $0 * max(duration, 0) }
-                                if let time = hoverPreviewTime {
-                                    scrubThumbnails.show(time: time)
-                                } else {
-                                    scrubThumbnails.clear()
-                                }
-                            },
-                            preview: { time, width in
-                                AnyView(trickplayPopup(time: time)
-                                    .fixedSize()
-                                    .offset(x: trickplayBubbleOffset(sliderWidth: width), y: -28)
-                                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))))
-                            }
-                        )
-                    }
-                    .frame(height: 24)
-                    .animation(.easeOut(duration: 0.12), value: scrubThumbnails.image != nil)
-                    VStack(alignment: .trailing, spacing: 1) {
-                        Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
-                        if let ends = endsAtClock {
-                            Text(ends).font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.55))
-                        }
-                    }
-                }
-            }
+    private var bottomBar: PlayerBottomBarLayout {
+        PlayerBottomBarLayout(
+            isLive: isLive,
+            live: PlayerLiveIndicator(clock: timePosClock),
+            timeline: bottomTimeline,
+            editor: bottomSkipEditor,
+            toolbar: bottomTransportToolbar
+        )
+    }
 
-            #if !os(tvOS)
-            if showSkipDBEdit, let m = curMeta { skipDBEditBar(meta: m) }
-            #endif
-
-            HStack(spacing: 0) {
-                controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed), active: speed != 1.0) { openPanel(.speed) }
-                Spacer()
-                controlButton("captions.bubble", "Subtitles") { openPanel(.subtitles) }
-                if !audioTracks.isEmpty {   // parity with tvOS: open the Audio panel for ANY track, not only when >1
-                    Spacer()
-                    controlButton("waveform", "Audio") { openPanel(.audio) }
+    private var bottomTimeline: PlayerBottomTimeline {
+        PlayerBottomTimeline(clock: timePosClock, durationText: timeString(duration),
+                             endsAtText: endsAtClock, hasThumbnail: scrubThumbnails.image != nil) { size in
+            PlayerSeekTimelineTrack(
+                clock: timePosClock,
+                scrubbing: $scrubbing,
+                scrubTarget: $scrubTarget,
+                duration: duration,
+                bufferedTime: bufferedTime,
+                size: size,
+                chapterFractions: chapterFractions,
+                accent: Theme.Palette.accent,
+                skipSegments: skipSegments,
+                showSkipEditor: skipEditorTimelineValues.visible,
+                skipEditStart: skipEditorTimelineValues.start,
+                skipEditEnd: skipEditorTimelineValues.end,
+                hoverPreviewTime: hoverPreviewTime,
+                onScrubChanged: { scrubThumbnails.show(time: $0) },
+                onEditingChanged: { editing in
+                    scrubbing = editing
+                    if editing {
+                        scrubTarget = currentTime; hideTask?.cancel()
+                        hoverPreviewTime = nil; hoverPreviewRatio = nil
+                    } else {
+                        let target = scrubTarget
+                        currentTime = target
+                        issueSeek(to: target, reason: "scrub")
+                        reportSeek(target)
+                        scrubThumbnails.clear()
+                        scheduleHide()
+                    }
+                },
+                onHoverPreviewChanged: { ratio in
+                    hoverPreviewRatio = ratio.map { CGFloat($0) }
+                    hoverPreviewTime = ratio.map { $0 * max(duration, 0) }
+                    if let time = hoverPreviewTime {
+                        scrubThumbnails.show(time: time)
+                    } else {
+                        scrubThumbnails.clear()
+                    }
+                },
+                preview: { time, width in
+                    AnyView(trickplayPopup(time: time)
+                        .fixedSize()
+                        .offset(x: trickplayBubbleOffset(sliderWidth: width), y: -28)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom))))
                 }
-                Spacer()
-                controlButton("aspectratio", "Aspect") { openPanel(.video) }
-                if hasMultipleQualities {
-                    Spacer()
-                    controlButton("4k.tv", "Quality") { openPanel(.quality) }
-                }
-                if hasAlternateSources {
-                    Spacer()
-                    controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
-                }
-                if isEpisodePlaybackContext {
-                    Spacer()
-                    controlButton("list.bullet", "Episodes") { openPanel(.episodes) }
-                }
-                if hasChapters {
-                    Spacer()
-                    controlButton("list.bullet.below.rectangle", "Chapters") { openPanel(.chapters) }
-                }
-                Spacer()
-                controlButton("camera.viewfinder", "Grab") { grabFrame() }
-                Spacer()
-                controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel, active: sleepArmed) { openPanel(.sleep) }
-            }
-            .padding(.horizontal, 8)
+            )
         }
-        // Floating glass control bar (mockup .bottom): the scrubber + control pills ride on one rounded,
-        // inset VortX glass panel that upgrades to Apple Liquid Glass on OS 26. Interior padding shapes the
-        // panel; the outer inset floats it off the screen edges. Contents and wiring are unchanged.
-        .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 12)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous),
-                    fillAlpha: VortXGlass.barFillAlpha, shadow: .bar)
-        .padding(.horizontal, 16).padding(.bottom, 16)
+    }
+
+    private var bottomSkipEditor: PlayerSkipEditorLayout? {
+        #if os(tvOS)
+        return nil
+        #else
+        guard showSkipDBEdit, let meta = curMeta else { return nil }
+        return skipDBEditBar(meta: meta)
+        #endif
+    }
+
+    private var bottomTransportToolbar: PlayerTransportToolbar {
+        PlayerTransportToolbar(
+            speed: controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed), active: speed != 1.0) { openPanel(.speed) },
+            subtitles: controlButton("captions.bubble", "Subtitles") { openPanel(.subtitles) },
+            audio: audioTracks.isEmpty ? nil : controlButton("waveform", "Audio") { openPanel(.audio) },
+            aspect: controlButton("aspectratio", "Aspect") { openPanel(.video) },
+            quality: hasMultipleQualities ? controlButton("4k.tv", "Quality") { openPanel(.quality) } : nil,
+            sources: hasAlternateSources ? controlButton("rectangle.stack", "Sources") { openPanel(.sources) } : nil,
+            episodes: isEpisodePlaybackContext ? controlButton("list.bullet", "Episodes") { openPanel(.episodes) } : nil,
+            chapters: hasChapters ? controlButton("list.bullet.below.rectangle", "Chapters") { openPanel(.chapters) } : nil,
+            grab: controlButton("camera.viewfinder", "Grab") { grabFrame() },
+            sleep: controlButton(sleepArmed ? "moon.zzz.fill" : "moon.zzz", sleepLabel, active: sleepArmed) { openPanel(.sleep) }
+        )
     }
 
     #if !os(tvOS)
@@ -7260,246 +7394,243 @@ struct PlayerScreen: View {
         return secs
     }
 
-    @ViewBuilder private func skipDBEditBar(meta: PlaybackMeta) -> some View {
-        let submittedKey = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
-        let alreadySubmitted = skipDBSubmittedKeys.contains(submittedKey)
-        let segDuration = skipDBEditEnd - skipDBEditStart
-
-        VStack(spacing: 6) {
-            HStack(spacing: 8) {
-                // Left: type picker + chapter nav
-                HStack(spacing: 6) {
-                    Text("Skip")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.45))
-                    Menu {
-                        ForEach(SkipDBSubmitView.SegmentType.allCases) { t in
-                            Button {
-                                skipDBEditType = t
-                                skipDBSubmitResult = nil
-                                skipDBSubmitError = nil
-                                if t == .outro {
-                                    skipDBShowEndTime = false
-                                    skipDBEditEnd = duration > 0 ? duration : skipDBEditEnd
-                                } else {
-                                    skipDBShowEndTime = true
-                                }
-                            } label: {
-                                let k = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(t.rawValue)"
-                                Label(t.label, systemImage: skipDBSubmittedKeys.contains(k) ? "checkmark" : "")
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(skipDBEditType.label).font(.caption.weight(.semibold))
-                            Image(systemName: "chevron.up.chevron.down").font(.caption2)
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(.white.opacity(0.15), in: Capsule())
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-
-                    if hasChapters {
-                        let boundaries = chapterFractions.map { $0 * duration }
-                        let prevCh = boundaries.last(where: { $0 < currentTime - 1.0 })
-                        let nextCh = boundaries.first(where: { $0 > currentTime + 0.5 })
-                        HStack(spacing: 2) {
-                            Button {
-                                if let t = prevCh { coordinator.player?.seek(to: t) }
-                            } label: {
-                                Image(systemName: "backward.end.fill").font(.caption)
-                                    .foregroundStyle(prevCh != nil ? .white : .white.opacity(0.3))
-                                    .padding(4)
-                            }
-                            .buttonStyle(.plain).disabled(prevCh == nil)
-                            .skipDBTooltip("Previous chapter")
-                            Button {
-                                if let t = nextCh { coordinator.player?.seek(to: t) }
-                            } label: {
-                                Image(systemName: "forward.end.fill").font(.caption)
-                                    .foregroundStyle(nextCh != nil ? .white : .white.opacity(0.3))
-                                    .padding(4)
-                            }
-                            .buttonStyle(.plain).disabled(nextCh == nil)
-                            .skipDBTooltip("Next chapter")
-                        }
-                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                    }
-                }
-
-                Spacer()
-
-                // Middle: start / end time controls
-                HStack(spacing: 6) {
-                    skipDBTimeControl(label: "Start", seconds: $skipDBEditStart, isEnd: false)
-
-                    if skipDBEditType == .outro && !skipDBShowEndTime {
-                        Button {
-                            skipDBShowEndTime = true
-                        } label: {
-                            HStack(spacing: 4) {
-                                Text("End").font(.caption2).foregroundStyle(.white.opacity(0.5))
-                                Text("episode end")
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.white.opacity(0.35))
-                                Image(systemName: "plus.circle")
-                                    .font(.caption2)
-                                    .foregroundStyle(.white.opacity(0.55))
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .skipDBTooltip("Add a custom end time")
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
-                    } else {
-                        Text(String(format: "%.1fs", max(0, segDuration)))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.white.opacity(0.4))
-                            .frame(minWidth: 34, alignment: .center)
-
-                        skipDBTimeControl(label: "End", seconds: $skipDBEditEnd, isEnd: true)
-
-                        if skipDBEditType == .outro {
-                            Button {
-                                skipDBShowEndTime = false
-                                skipDBEditEnd = duration > 0 ? duration : skipDBEditEnd
-                            } label: {
-                                Image(systemName: "xmark.circle")
-                                    .font(.caption2)
-                                    .foregroundStyle(.white.opacity(0.5))
-                            }
-                            .buttonStyle(.plain)
-                            .skipDBTooltip("Use episode end instead")
-                        }
-
-                        if skipDBEditType == .intro, let estimateMs = skipDBIntroEstimateMs {
-                            let suggestedEnd = skipDBEditStart + Double(estimateMs) / 1000
-                            if abs(suggestedEnd - skipDBEditEnd) > 3 {
-                                Button {
-                                    skipDBEditEnd = (suggestedEnd * 10).rounded() / 10
-                                } label: {
-                                    HStack(spacing: 3) {
-                                        Image(systemName: "wand.and.stars").font(.caption2)
-                                        Text(skipDBFormatTime(suggestedEnd)).font(.caption2.monospacedDigit())
-                                    }
-                                    .foregroundStyle(.yellow.opacity(0.85))
-                                    .padding(.horizontal, 6).padding(.vertical, 3)
-                                    .background(.yellow.opacity(0.15), in: Capsule())
-                                }
-                                .buttonStyle(.plain)
-                                .skipDBTooltip("Typical intro end for this series (+\(Int(Double(estimateMs) / 1000))s from start)")
-                            }
-                        }
-                    }
-                }
-
-                Spacer()
-
-                // Right: preview + submit + close
-                HStack(spacing: 8) {
-                    Button {
-                        skipDBPreviewing = true
-                        coordinator.player?.seek(to: max(0, skipDBEditStart - 2))
-                        viewerPlay()
-                    } label: {
-                        Image(systemName: skipDBPreviewing ? "stop.circle.fill" : "play.circle")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(skipDBPreviewing ? Color.yellow : .white)
-                            .padding(5)
-                    }
-                    .buttonStyle(.plain)
-                    .skipDBTooltip("Preview: plays 2s before start, jumps to end")
-
-                    if skipDBSubmitting {
-                        ProgressView().controlSize(.small).tint(.white).padding(.horizontal, 4)
-                    } else if skipDBSubmitResult == true {
-                        Label("Submitted!", systemImage: "checkmark.circle.fill")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.green)
-                            .onTapGesture { skipDBSubmitResult = nil }
-                    } else {
-                        Button {
-                            Task { await doSkipDBSubmit(meta: meta) }
-                        } label: {
-                            Text(alreadySubmitted ? "Resubmit" : "Submit")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.black)
-                                .padding(.horizontal, 10).padding(.vertical, 5)
-                                .background(alreadySubmitted ? Color.yellow : Color.white, in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(skipDBEditStart >= skipDBEditEnd)
-                    }
-
-                    Button {
-                        showSkipDBEdit = false
-                        skipDBPreviewing = false
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.6))
-                            .padding(5)
-                    }
-                    .buttonStyle(.plain)
-                    .skipDBTooltip("Close editor")
-                }
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2)
-                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-            }
-
-            if let err = skipDBSubmitError {
-                Text(err).font(.caption2).foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
-        // Skip-editor bar container on the shared VortX glass pill (warm glass + pill shadow), upgrading to
-        // Liquid Glass on OS 26. Its inner control pills keep their plain fills. Background only; editor logic unchanged.
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 10, style: .continuous),
-                    fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
-        .padding(.horizontal, 8)
+    private func skipDBEditBar(meta: PlaybackMeta) -> PlayerSkipEditorLayout {
+        PlayerSkipEditorLayout(
+            typeControls: { skipDBEditTypeControls(meta: meta) },
+            timeControls: { skipDBEditTimeControls() },
+            actions: { skipDBEditActions(meta: meta) },
+            error: skipDBSubmitError
+        )
     }
 
-    @ViewBuilder private func skipDBTimeControl(label: String, seconds: Binding<Double>, isEnd: Bool) -> some View {
-        HStack(spacing: 4) {
-            Button {
-                coordinator.player?.seek(to: seconds.wrappedValue)
-            } label: {
-                Text(label)
-                    .font(.caption2)
-                    .foregroundStyle(.white.opacity(0.55))
-            }
-            .buttonStyle(.plain)
-            .skipDBTooltip(isEnd ? "Jump to end" : "Jump to start")
+    private func skipDBEditTypeControls(meta: PlaybackMeta) -> AnyView {
+        return AnyView(
+            HStack(spacing: 6) {
+                Text("Skip")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.45))
+                Menu {
+                    ForEach(SkipDBSubmitView.SegmentType.allCases) { t in
+                        Button {
+                            skipDBEditType = t
+                            skipDBSubmitResult = nil
+                            skipDBSubmitError = nil
+                            if t == .outro {
+                                skipDBShowEndTime = false
+                                skipDBEditEnd = duration > 0 ? duration : skipDBEditEnd
+                            } else {
+                                skipDBShowEndTime = true
+                            }
+                        } label: {
+                            let k = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(t.rawValue)"
+                            Label(t.label, systemImage: skipDBSubmittedKeys.contains(k) ? "checkmark" : "")
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(skipDBEditType.label).font(.caption.weight(.semibold))
+                        Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(.white.opacity(0.15), in: Capsule())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
 
-            Button {
-                let snapped = (currentTime * 10).rounded() / 10
-                seconds.wrappedValue = max(0, snapped)
-            } label: {
-                Image(systemName: "arrow.down.to.line")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.white.opacity(0.6))
+                if hasChapters {
+                    let boundaries = chapterFractions.map { $0 * duration }
+                    let prevCh = boundaries.last(where: { $0 < currentTime - 1.0 })
+                    let nextCh = boundaries.first(where: { $0 > currentTime + 0.5 })
+                    HStack(spacing: 2) {
+                        Button {
+                            if let t = prevCh { coordinator.player?.seek(to: t) }
+                        } label: {
+                            Image(systemName: "backward.end.fill").font(.caption)
+                                .foregroundStyle(prevCh != nil ? .white : .white.opacity(0.3))
+                                .padding(4)
+                        }
+                        .buttonStyle(.plain).disabled(prevCh == nil)
+                        .skipDBTooltip("Previous chapter")
+                        Button {
+                            if let t = nextCh { coordinator.player?.seek(to: t) }
+                        } label: {
+                            Image(systemName: "forward.end.fill").font(.caption)
+                                .foregroundStyle(nextCh != nil ? .white : .white.opacity(0.3))
+                                .padding(4)
+                        }
+                        .buttonStyle(.plain).disabled(nextCh == nil)
+                        .skipDBTooltip("Next chapter")
+                    }
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                }
             }
-            .buttonStyle(.plain)
-            .skipDBTooltip("Set to playhead")
+        )
+    }
 
-            Text(skipDBFormatTime(seconds.wrappedValue))
-                .font(.caption.monospacedDigit()).foregroundStyle(.white)
-                .frame(minWidth: 44, alignment: .center)
+    private func skipDBEditTimeControls() -> AnyView {
+        let segDuration = skipDBEditEnd - skipDBEditStart
+        return AnyView(
+            HStack(spacing: 6) {
+                skipDBTimeControl(label: "Start", seconds: $skipDBEditStart, isEnd: false)
 
-            HStack(spacing: 2) {
-                skipDBNudgeButton(seconds: seconds, delta: -0.5, label: "−½")
-                skipDBNudgeButton(seconds: seconds, delta: -0.1, label: "−·")
-                skipDBNudgeButton(seconds: seconds, delta: +0.1, label: "+·")
-                skipDBNudgeButton(seconds: seconds, delta: +0.5, label: "+½")
+                if skipDBEditType == .outro && !skipDBShowEndTime {
+                    Button {
+                        skipDBShowEndTime = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("End").font(.caption2).foregroundStyle(.white.opacity(0.5))
+                            Text("episode end")
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.white.opacity(0.35))
+                            Image(systemName: "plus.circle")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.55))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .skipDBTooltip("Add a custom end time")
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                } else {
+                    Text(String(format: "%.1fs", max(0, segDuration)))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.4))
+                        .frame(minWidth: 34, alignment: .center)
+
+                    skipDBTimeControl(label: "End", seconds: $skipDBEditEnd, isEnd: true)
+
+                    if skipDBEditType == .outro {
+                        Button {
+                            skipDBShowEndTime = false
+                            skipDBEditEnd = duration > 0 ? duration : skipDBEditEnd
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                        .buttonStyle(.plain)
+                        .skipDBTooltip("Use episode end instead")
+                    }
+
+                    if skipDBEditType == .intro, let estimateMs = skipDBIntroEstimateMs {
+                        let suggestedEnd = skipDBEditStart + Double(estimateMs) / 1000
+                        if abs(suggestedEnd - skipDBEditEnd) > 3 {
+                            Button {
+                                skipDBEditEnd = (suggestedEnd * 10).rounded() / 10
+                            } label: {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "wand.and.stars").font(.caption2)
+                                    Text(skipDBFormatTime(suggestedEnd)).font(.caption2.monospacedDigit())
+                                }
+                                .foregroundStyle(.yellow.opacity(0.85))
+                                .padding(.horizontal, 6).padding(.vertical, 3)
+                                .background(.yellow.opacity(0.15), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .skipDBTooltip("Typical intro end for this series (+\(Int(Double(estimateMs) / 1000))s from start)")
+                        }
+                    }
+                }
             }
-        }
-        .padding(.horizontal, 7).padding(.vertical, 4)
-        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+        )
+    }
+
+    private func skipDBEditActions(meta: PlaybackMeta) -> AnyView {
+        let submittedKey = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
+        let alreadySubmitted = skipDBSubmittedKeys.contains(submittedKey)
+        return AnyView(
+            HStack(spacing: 8) {
+                Button {
+                    skipDBPreviewing = true
+                    coordinator.player?.seek(to: max(0, skipDBEditStart - 2))
+                    viewerPlay()
+                } label: {
+                    Image(systemName: skipDBPreviewing ? "stop.circle.fill" : "play.circle")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(skipDBPreviewing ? Color.yellow : .white)
+                        .padding(5)
+                }
+                .buttonStyle(.plain)
+                .skipDBTooltip("Preview: plays 2s before start, jumps to end")
+
+                if skipDBSubmitting {
+                    ProgressView().controlSize(.small).tint(.white).padding(.horizontal, 4)
+                } else if skipDBSubmitResult == true {
+                    Label("Submitted!", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                        .onTapGesture { skipDBSubmitResult = nil }
+                } else {
+                    Button {
+                        Task { await doSkipDBSubmit(meta: meta) }
+                    } label: {
+                        Text(alreadySubmitted ? "Resubmit" : "Submit")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(alreadySubmitted ? Color.yellow : Color.white, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(skipDBEditStart >= skipDBEditEnd)
+                }
+
+                Button {
+                    showSkipDBEdit = false
+                    skipDBPreviewing = false
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                        .padding(5)
+                }
+                .buttonStyle(.plain)
+                .skipDBTooltip("Close editor")
+            }
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        )
+    }
+
+    private func skipDBTimeControl(label: String, seconds: Binding<Double>, isEnd: Bool) -> AnyView {
+        AnyView(
+            HStack(spacing: 4) {
+                Button {
+                    coordinator.player?.seek(to: seconds.wrappedValue)
+                } label: {
+                    Text(label)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+                .buttonStyle(.plain)
+                .skipDBTooltip(isEnd ? "Jump to end" : "Jump to start")
+
+                Button {
+                    let snapped = (currentTime * 10).rounded() / 10
+                    seconds.wrappedValue = max(0, snapped)
+                } label: {
+                    Image(systemName: "arrow.down.to.line")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .buttonStyle(.plain)
+                .skipDBTooltip("Set to playhead")
+
+                Text(skipDBFormatTime(seconds.wrappedValue))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    .frame(minWidth: 44, alignment: .center)
+
+                HStack(spacing: 2) {
+                    skipDBNudgeButton(seconds: seconds, delta: -0.5, label: "−½")
+                    skipDBNudgeButton(seconds: seconds, delta: -0.1, label: "−·")
+                    skipDBNudgeButton(seconds: seconds, delta: +0.1, label: "+·")
+                    skipDBNudgeButton(seconds: seconds, delta: +0.5, label: "+½")
+                }
+            }
+            .padding(.horizontal, 7).padding(.vertical, 4)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+        )
     }
 
     @ViewBuilder private func skipDBNudgeButton(seconds: Binding<Double>, delta: Double, label: String) -> some View {
@@ -7584,43 +7715,12 @@ struct PlayerScreen: View {
 
     /// The Live position indicator shown in place of the scrubber: a pulsing red dot + "LIVE", and a
     /// running elapsed timer so the user can still see playback is advancing.
-    private var liveIndicator: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 7) {
-                Circle().fill(.red).frame(width: 9, height: 9)
-                Text("LIVE").font(.caption.weight(.heavy)).foregroundStyle(.white).tracking(1)
-            }
-            .padding(.horizontal, 11).padding(.vertical, 6)
-            // Live position indicator (in place of the scrubber) on the shared VortX glass pill, upgrading to
-            // Liquid Glass on OS 26. Background only; the red dot stays a plain fill and playback state is unchanged.
-            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .pill)
-            Spacer()
-            PlayerTimeLabel(clock: timePosClock, opacity: 0.85, showWhenPositive: true)
-        }
+    private var liveIndicator: PlayerLiveIndicator {
+        PlayerLiveIndicator(clock: timePosClock)
     }
 
-    private func controlButton(_ icon: String, _ title: String, active: Bool = false, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 7) {
-                Image(systemName: icon).font(.system(size: 15, weight: .semibold))
-                // #135: force a single line + allow the font to shrink instead of wrapping mid-word
-                // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
-                // fit at full size so minimumScaleFactor is a no-op there.
-                Text(title).font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-            }
-            // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
-            // when its feature is engaged. Purely visual; the button's action is unchanged.
-            .foregroundStyle(active ? Theme.Palette.accent : .white)
-            .padding(.horizontal, 12).padding(.vertical, 7)
-            .background { RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(active ? 0 : 0.06)) }
-            .vortxGlassActive(active, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .strokeBorder(active ? Theme.Palette.accent.opacity(0.4) : .white.opacity(0.14), lineWidth: 1)
-            }
-        }
+    private func controlButton(_ icon: String, _ title: String, active: Bool = false, action: @escaping () -> Void) -> PlayerControlButton {
+        PlayerControlButton(icon: icon, title: title, active: active, action: action)
     }
 
     private func iconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
