@@ -5,7 +5,7 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.19"
+    static let version = "0.4.0-beta.20"
     static let highlights: [String] = [
         "The immediate iPhone/iPad crash when opening playback is repaired. Smaller player-control components preserve the seek, chapter, preview and skip-editor actions without constructing the overflowing view type.",
         "A cleaner iPhone/iPad player keeps the title, transport and useful controls easy to reach. Secondary actions live in More, including volume, AirPlay, sleep, frame capture, playback settings, lock and the skip editor.",
@@ -15,7 +15,7 @@ enum WhatsNew {
         "Mobile navigation reserves its own layout space, keeping All sources and other detail controls above the bottom bar. Filter chips use one clean edge instead of doubled glass outlines.",
         "The phone/tablet Search field stays at the top of the page instead of behind the bottom navigation. Inline suggestions, clear, keyboard submit and the existing debounced search remain available.",
         "The chosen add-on in All sources has a clear accent fill and checkmark, with a selected accessibility state, while filtering remains bound to the same add-on choice.",
-        "All Beta 18 playback, account, source and Usenet work is retained. This is Apple build 257; Android remains on its existing Beta 18 build. Broader provider playback and full Android visual parity are not newly claimed fixed."
+        "All Beta 18 playback, account, source and Usenet work is retained. This is Apple build 258; Android remains on its existing Beta 18 build. Broader provider playback and full Android visual parity are not newly claimed fixed."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses

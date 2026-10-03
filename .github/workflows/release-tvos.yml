@@ -975,7 +975,7 @@ jobs:
           DMG_STAGE="$(mktemp -d)"
           mv "$MAC_APP" "$DMG_STAGE/"
           ln -s /Applications "$DMG_STAGE/Applications"
-          hdiutil create -volname "VortX" -srcfolder "$DMG_STAGE" -ov -format UDZO out/VortX-macOS-ci.dmg
+          bash scripts/package-macos-dmg.sh "$DMG_STAGE" out/VortX-macOS-ci.dmg
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
 
       # Build the feed from the exact immutable tag checkout while this job still has read-only
