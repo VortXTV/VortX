@@ -776,11 +776,29 @@ for (const asset of ['VortX-tvOS-ci.ipa', 'VortX-tvOS-lite-ci.ipa', 'VortX-iOS-c
 }
 const inputCleanup = publicPackaging.indexOf('rm -rf app/Vendor/MPVKit-DVFEL/artifacts');
 const signCheck = publicPackaging.indexOf('codesign --verify --deep --strict "$MAC_APP"');
-const dmg = publicPackaging.indexOf('\n          hdiutil create');
+const dmg = publicPackaging.indexOf('\n          bash scripts/package-macos-dmg.sh');
 assert(payloadCleanup < inputCleanup && inputCleanup < signCheck && signCheck < dmg);
 assert(!publicPackaging.includes('rm -rf app/build/ci-mac'));
-console.log('ok: public packaging verifies IPAs before cleanup and the retained Mac signature before DMG creation');
+const packager = fs.readFileSync(require('node:path').join(require('node:path').dirname(process.argv[2]), '../../scripts/package-macos-dmg.sh'), 'utf8');
+const measure = packager.indexOf('SOURCE_KIB="$(du -A -l -P -s -k');
+const size = packager.indexOf('DMG_MIB=');
+const free = packager.indexOf('AVAILABLE_KIB="$(df -Pk');
+const create = packager.indexOf('hdiutil create -volname VortX -size "${DMG_MIB}m"');
+assert(measure >= 0 && measure < size && size < free && free < create);
+assert(packager.includes('SOURCE_MIB * 5 + 3') && packager.includes('/ 4 + 1024'));
+assert(packager.includes('"$AVAILABLE_KIB" -ge "$REQUIRED_KIB"'));
+assert(packager.includes('refusing to overwrite an existing disk image'));
+assert(packager.indexOf('hdiutil verify "$OUTPUT"') > create);
+assert(packager.includes('hdiutil attach -readonly -nobrowse -noautoopen'));
+assert(packager.includes('codesign --verify --deep --strict "$MOUNT/VortX.app"'));
+assert(packager.includes('audit-bundle-symlinks.sh" "$MOUNT/VortX.app"'));
+assert(packager.includes('"$MOUNT_HASH" == "$SOURCE_HASH"'));
+assert(packager.includes('hdiutil detach "$MOUNT"') && packager.includes('trap cleanup EXIT'));
+assert(!/rm\s+-r/.test(packager));
+console.log('ok: public packaging verifies IPAs before cleanup and creates an explicitly sized, mounted and signature-verified Mac DMG');
 NODE
+
+bash -n "$REPO_ROOT/scripts/package-macos-dmg.sh"
 
 # Keep the shared settings deployment floor and release-feed commit identity explicit.
 require_grep "shared settings availability fixture runs before app packaging" \

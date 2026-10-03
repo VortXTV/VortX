@@ -4,7 +4,21 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
-## 0.4.0-beta.19 - Working iPhone/iPad playback and cleaner touch controls
+## 0.4.0-beta.20 - Working iPhone/iPad playback and cleaner touch controls
+
+Apple build **258**. Publishes the complete reviewed iPhone/iPad crash repair, cleaner touch player,
+all fourteen real seek-bar styles, pinch Fit/Fill, TV-inspired Mac/iPad navigation, unobscured phone
+detail controls and Search, and explicit selected add-on highlighting described below.
+Beta 19 did not publish: its Mac image ran out of space inside the automatically sized destination
+filesystem even though the build runner had free space. Beta 20 uses fresh packages from a new
+immutable tag. The Mac packager now uses the apparent source size with explicit filesystem headroom,
+checks host free space separately, and mounts the completed image read-only to verify app metadata,
+the matching signature, safe framework links and the Applications install link before release.
+The previously reviewed player and playback-engine code is unchanged by this packaging correction.
+
+See [the full Beta 20 notes](docs/releases/0.4.0-beta.20.md) for all changes, testing and installation.
+
+## 0.4.0-beta.19 - Unpublished candidate: working iPhone/iPad playback and cleaner touch controls
 
 Apple build **257**. Fixes the immediate iPhone/iPad player-startup crash, retains the successful
 private build's smaller view boundaries, and redesigns the touch controls with a simpler header,
