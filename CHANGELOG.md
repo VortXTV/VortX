@@ -4,6 +4,27 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.4.0-beta.19 - Working iPhone/iPad playback and cleaner touch controls
+
+Apple build **257**. Fixes the immediate iPhone/iPad player-startup crash, retains the successful
+private build's smaller view boundaries, and redesigns the touch controls with a simpler header,
+compact transport, reachable episode navigation and secondary actions in More. The selected
+seek-bar style now drives the real draggable timeline, including Wave and all fourteen styles;
+buffer/chapter/skip markers, previews, VoiceOver adjustment and reduced-motion behavior are retained.
+Pinch-out Fill and pinch-in Fit change the existing AVPlayer or VortX Player surface without
+restarting playback, with Fit/Fill/Stretch still available in the aspect selector.
+
+Mac and wide iPad move to TV-inspired horizontal navigation; phone/narrow iPad use at most five
+navigation targets with overflow in More. The wide capsule hugs its labels, mobile chrome reserves
+real space outside detail content, and filter chips avoid doubled glass outlines.
+Touch Search owns a visible top field with inline suggestions instead of a system accessory behind
+the bottom navigation. All sources explicitly highlights the selected add-on with an accent fill,
+checkmark and accessible selected state. All Beta 18
+playback/source/account/Usenet work remains; this is an Apple-only release with no new Android APK
+or claim that every long-running playback/provider issue is resolved.
+
+See [the full Beta 19 notes](docs/releases/0.4.0-beta.19.md) for changes, testing and installation.
+
 ## 0.4.0-beta.18 - Playback settlement, Mac redesign, Android Usenet, and account sync
 
 Published **1 October 2026** as [Latest beta](https://github.com/VortXTV/VortX/releases/tag/v0.4.0-beta.18),

@@ -6143,14 +6143,48 @@ struct iOSSourceList: View {
 
     // MARK: Per-add-on filter chips
 
+    /// Source selection must be unmistakable against both bright heroes and dark source lists.
+    /// Own the selected fill/checkmark here rather than relying on a subtle generic glass tint.
+    private struct AddonFilterChip: View {
+        let title: String
+        let selected: Bool
+        let action: () -> Void
+
+        var body: some View {
+            Button(action: action) {
+                HStack(spacing: 7) {
+                    if selected { Image(systemName: "checkmark") }
+                    Text(title).lineLimit(1)
+                }
+                .font(Theme.Typography.label.weight(.semibold))
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 44)
+                .background {
+                    Capsule().fill(selected ? Theme.Palette.accent : Theme.Palette.surface2)
+                }
+                .overlay {
+                    Capsule().strokeBorder(.white.opacity(selected ? 0 : 0.12), lineWidth: 1)
+                }
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityAddTraits(selected ? [.isSelected] : [])
+        }
+    }
+
     private var filterBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Theme.Space.sm) {
-                Button { sourceFilter = nil } label: { Text("All (\(streamCount))") }
-                    .buttonStyle(ChipButtonStyle(selected: sourceFilter == nil))
+                AddonFilterChip(title: "All (\(streamCount))", selected: sourceFilter == nil) {
+                    sourceFilter = nil
+                }
                 ForEach(groups) { group in
-                    Button { sourceFilter = group.addon } label: { Text("\(group.addon) (\(group.streams.count))") }
-                        .buttonStyle(ChipButtonStyle(selected: sourceFilter == group.addon))
+                    AddonFilterChip(title: "\(group.addon) (\(group.streams.count))",
+                                    selected: sourceFilter == group.addon) {
+                        sourceFilter = group.addon
+                    }
                 }
             }
             .padding(.vertical, Theme.Space.xs)

@@ -466,14 +466,15 @@ struct iOSRootView: View {
             // Window width, not physical-screen width: Split View/Stage Manager retain the phone
             // treatment when narrow, and rotating a phone never turns it into a desktop shell.
             let topNavigation = UIDevice.current.userInterfaceIdiom == .pad && geometry.size.width >= 760
-            selectedTabContent
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    if topNavigation { cinematicTopBar }
-                }
-                .safeAreaInset(edge: .bottom, spacing: 0) {
-                    if !topNavigation { bottomTabBarRow }
-                }
+            // Reserve real layout space, not just a propagated safe-area inset. Nested detail
+            // GeometryReaders/NavigationStacks can otherwise lay controls underneath the floating
+            // chrome. Only hero artwork bleeds; every scrolling control has an unobscured viewport.
+            VStack(spacing: 0) {
+                if topNavigation { cinematicTopBar }
+                selectedTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
+                if !topNavigation { bottomTabBarRow }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
         }
     }
     #endif
@@ -505,17 +506,32 @@ struct iOSRootView: View {
     }
 
     private var horizontalTabBar: some View {
+        ViewThatFits(in: .horizontal) {
+            // A wide iPad/Mac capsule hugs its destinations instead of leaving an empty right tail.
+            horizontalTabItems.fixedSize(horizontal: true, vertical: true)
+            scrollingHorizontalTabBar
+        }
+        .vortxGlass(in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Main navigation")
+    }
+
+    private var horizontalTabItems: some View {
+        HStack(spacing: 4) {
+            ForEach(visibleTabs, id: \.rawValue) { item in
+                horizontalTabButton(item).id(item.rawValue)
+            }
+        }
+        .padding(6)
+        #if os(macOS)
+        .focusSection()
+        #endif
+    }
+
+    private var scrollingHorizontalTabBar: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(visibleTabs, id: \.rawValue) { item in
-                        horizontalTabButton(item).id(item.rawValue)
-                    }
-                }
-                .padding(6)
-                #if os(macOS)
-                .focusSection()
-                #endif
+                horizontalTabItems
             }
             .onChange(of: tab) { item in
                 withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
@@ -524,9 +540,6 @@ struct iOSRootView: View {
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .vortxGlass(in: Capsule())
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Main navigation")
     }
 
     private func selectTab(_ item: Tab) {
@@ -615,7 +628,7 @@ struct iOSRootView: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tabs")
         // The same floating capsule as TV, with at most five touch targets instead of squeezing
-        // all seven labels into a phone. The safe-area insert keeps scrolling content unobscured.
+        // all seven labels into a phone. The shell reserves its real height below scrolling content.
         .padding(.horizontal, Theme.Space.sm)
         .padding(.vertical, Theme.Space.xs)
         .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
@@ -2580,8 +2593,8 @@ struct iOSDownloadsScreen: View {
 
 /// Search across every installed add-on, on the engine (debounced). Mirrors the tvOS `SearchView`:
 /// results are grouped into Movies / Series / Other rail sections (#16) rather than one flat grid, a
-/// "Play a link or magnet" entry sits at the top (the touch/Mac `OpenLinkView`), search suggestions
-/// feed `.searchSuggestions`, and the empty / "No results" state is gated at ≥2 characters (the
+/// "Play a link or magnet" entry sits at the top (the touch/Mac `OpenLinkView`), inline suggestions
+/// reuse the engine's search inventory, and the empty / "No results" state is gated at ≥2 characters (the
 /// engine's `CoreBridge.search` hard-gates at 2 chars, so a single-char query would otherwise read as
 /// a misleading empty state).
 struct iOSSearchView: View {
@@ -2592,6 +2605,10 @@ struct iOSSearchView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile recent searches (#90, ported from tvOS)
     @State private var query = ""
+    #if os(iOS)
+    @FocusState private var searchFocused: Bool
+    @State private var submittedSuggestion: String?
+    #endif
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
     @State private var path: [FeaturedHeroItem] = []
@@ -2618,6 +2635,9 @@ struct iOSSearchView: View {
                     // scroll content (and vanished entirely in merged Discover+Search mode, which drops the
                     // Search tab), so the top bar replaces it and hands the query over via MacSearchBridge.
 
+                    #if os(iOS)
+                    if isTyping && !suggestionTitles.isEmpty { touchSearchSuggestions }
+                    #endif
                     if !history.isEmpty && !isTyping { historySection }
 
                     results
@@ -2626,6 +2646,12 @@ struct iOSSearchView: View {
             }
             // Re-tapping the active Search tab scrolls back to the top.
             .scrollToTopOnBump(TabScrollKeys.search)
+            #if os(iOS)
+            // Own the field's position instead of letting searchable place it in an OS bottom
+            // accessory, where it competes with our custom navigation on newer iOS versions.
+            .safeAreaInset(edge: .top, spacing: 0) { touchSearchField }
+            .scrollDismissesKeyboard(.interactively)
+            #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Search"), isActive: isActive)
             .navigationDestination(for: FeaturedHeroItem.self) { item in
@@ -2634,29 +2660,22 @@ struct iOSSearchView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
-            #if os(iOS)
-            .searchable(text: $query, prompt: "Movies or series")
-            .searchSuggestions {
-                ForEach(suggestionTitles, id: \.self) { title in
-                    Text(title).searchCompletion(title)
-                }
-            }
-            // `.onSubmit(of: .search)` registers search-submit plumbing into the single shared window
-            // toolbar on macOS (the same NSToolbar-insert crash class as the wordmark/.searchable). It is
-            // only meaningful paired with `.searchable` (iOS). The macOS inline TextField above carries its
-            // own `.onSubmit { ... }`, so search-submit stays covered. So this is iOS-only.
-            .onSubmit(of: .search) {
-                searchTask?.cancel()
-                searchDebouncePending = false
-                core.suggestSearch(query)
-                core.search(query)
-            }
-            #endif
             .onAppear {
                 core.loadSearchSuggestions()
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
-            .onChange(of: query) { value in scheduleSearch(value) }   // iOS 16 single-param onChange
+            .onChange(of: query) { value in
+                #if os(iOS)
+                let alreadySubmitted = submittedSuggestion == value
+                submittedSuggestion = nil
+                if alreadySubmitted { return }
+                #endif
+                scheduleSearch(value)
+            }
+            #if os(iOS)
+            .onChange(of: isActive) { active in if !active { searchFocused = false } }
+            .onChange(of: path.count) { count in if count > 0 { searchFocused = false } }
+            #endif
             .onChange(of: profiles.activeID) { _ in
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
@@ -2696,6 +2715,70 @@ struct iOSSearchView: View {
         }
         #endif
     }
+
+    #if os(iOS)
+    private var touchSearchField: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(Theme.Palette.textSecondary)
+            TextField("Movies or series", text: $query)
+                .textFieldStyle(.plain)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .focused($searchFocused)
+                .onSubmit { submitTouchSearch() }
+                .accessibilityLabel("Search movies or series")
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.leading, Theme.Space.md)
+        .padding(.trailing, query.isEmpty ? Theme.Space.md : 4)
+        .frame(minHeight: 52)
+        .vortxGlassField(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.vertical, Theme.Space.xs)
+        .background(Theme.Palette.canvas)
+    }
+
+    private var touchSearchSuggestions: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: Theme.Space.xs) {
+                ForEach(suggestionTitles, id: \.self) { title in
+                    Button {
+                        submittedSuggestion = title == query ? nil : title
+                        query = title
+                        submitTouchSearch(title)
+                    } label: {
+                        Label(title, systemImage: "magnifyingglass").lineLimit(1)
+                    }
+                    .buttonStyle(ChipButtonStyle())
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+            }
+            .padding(.horizontal, Theme.Space.md)
+        }
+    }
+
+    private func submitTouchSearch(_ submittedQuery: String? = nil) {
+        let value = (submittedQuery ?? query).trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+        searchDebouncePending = false
+        core.suggestSearch(value)
+        core.search(value)
+        searchFocused = false
+    }
+    #endif
 
     /// Playback actions live together at the top of Search. The compact phone width stacks them while
     /// iPad and Mac keep Debrid Cloud directly beside Play Link.

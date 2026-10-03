@@ -23,7 +23,7 @@ struct ProbeValue<Value> {
 }
 
 struct PlaybackMeta { var libraryId = "tt-probe"; var season: Int? = 1; var episode: Int? = 2 }
-enum ProbePanel: String { case speed, subtitles, audio, video, quality, sources, episodes, chapters, sleep }
+enum ProbePanel: String { case speed, subtitles, audio, video, quality, sources, episodes, chapters, sleep, playerSettings }
 final class ProbeEffects {
     var events: [String] = []
     var seeks: [Double] = []
@@ -39,18 +39,29 @@ final class ProbeThumbnails {
 }
 
 struct PlayerScreen {
-    let timePosClock = TimePosClock()
+    let timePosClock: TimePosClock = {
+        let clock = TimePosClock()
+        clock.position = 25
+        return clock
+    }()
     let effects = ProbeEffects()
     let scrubThumbnails = ProbeThumbnails()
     var coordinator: ProbeCoordinator { ProbeCoordinator(player: effects) }
     var hideTask: Task<Void, Never>? = nil
     @ProbeValue var isLive = false
+    var isPaused = false
+    var controlsVisible = true
+    var isLocked = false
     @ProbeValue var duration = 2_700.0
-    @ProbeValue var currentTime = 25.0
+    var currentTime: Double {
+        get { timePosClock.position }
+        nonmutating set { timePosClock.position = newValue }
+    }
     @ProbeValue var scrubbing = false
     @ProbeValue var scrubTarget = 30.0
     @ProbeValue var hoverPreviewTime: Double? = nil
     @ProbeValue var hoverPreviewRatio: CGFloat? = nil
+    @ProbeValue var showExternalChooser = false
     var bufferedTime = 60.0
     var chapterFractions = [0.1, 0.5, 0.9]
     var skipSegments = [SkipSegment(kind: .intro, start: 0, end: 60),
@@ -84,6 +95,9 @@ struct PlayerScreen {
     func openPanel(_ panel: ProbePanel) { effects.events.append(panel.rawValue) }
     func grabFrame() { effects.events.append("grab") }
     func viewerPlay() { effects.events.append("play") }
+    func restartFromBeginning() { effects.events.append("restart") }
+    func seedSkipDBEditor() { effects.events.append("seed-editor") }
+    func engageLock() { effects.events.append("lock") }
     func doSkipDBSubmit(meta: PlaybackMeta) async { effects.events.append("submit") }
     func trickplayPopup(time: Double) -> some View { Text("\(time)") }
     func trickplayBubbleOffset(sliderWidth: CGFloat) -> CGFloat { 0 }
@@ -95,10 +109,10 @@ enum PlayerBottomBarConstructionProbe {
     static var window: UIWindow?
     #endif
 
-    static func host<V: View>(_ view: V, width: CGFloat = 720) {
+    static func host<V: View>(_ view: V, width: CGFloat = 720, height: CGFloat = 260) {
         #if os(macOS)
         let host = NSHostingView(rootView: view)
-        host.frame = CGRect(x: 0, y: 0, width: width, height: 260)
+        host.frame = CGRect(x: 0, y: 0, width: width, height: height)
         host.layoutSubtreeIfNeeded()
         #else
         let controller = UIHostingController(rootView: view)
@@ -106,7 +120,7 @@ enum PlayerBottomBarConstructionProbe {
         self.window = window
         window.rootViewController = controller
         window.makeKeyAndVisible()
-        controller.view.frame = CGRect(x: 0, y: 0, width: width, height: 260)
+        controller.view.frame = CGRect(x: 0, y: 0, width: width, height: height)
         controller.view.setNeedsLayout()
         controller.view.layoutIfNeeded()
         #endif
@@ -143,7 +157,9 @@ enum PlayerBottomBarConstructionProbe {
                             precondition((bar.toolbar.sources != nil) == optionalPanels)
                             precondition((bar.toolbar.episodes != nil) == optionalPanels)
                             precondition((bar.toolbar.chapters != nil) == optionalPanels)
-                            host(bar, width: optionalPanels ? 1_024 : 390)
+                            for width: CGFloat in [320, 390, 844, 1_024] {
+                                host(bar, width: width)
+                            }
                             screen.timePosClock.position = 25
                             host(screen.bottomBar)
                             cases += 1
@@ -172,9 +188,112 @@ enum PlayerBottomBarConstructionProbe {
             }
         }
         verifyCallbacks()
+        verifySeekStylesAndAdjustment()
+        verifyPinchPolicy()
+        verifyOptionsAndTouchLayouts()
         print("PASS \(cases) production full bottom-bar/editor constructions and layouts on main thread")
         print("PASS production toolbar routing, seek/scrub/hover callbacks and nominal metadata boundaries")
+        print("PASS all 14 real seek styles, live preference changes, adjustable seek, touch layouts and pinch policy")
         print("LIMIT: service fixtures do not test media playback; runtime coverage is only this executable's OS")
+    }
+
+    static func verifySeekStylesAndAdjustment() {
+        let saved = UserDefaults.standard.object(forKey: SeekBarStyle.storageKey)
+        defer {
+            if let saved { UserDefaults.standard.set(saved, forKey: SeekBarStyle.storageKey) }
+            else { UserDefaults.standard.removeObject(forKey: SeekBarStyle.storageKey) }
+        }
+        let screen = PlayerScreen()
+        func slider(width: CGFloat = 320, animated: Bool = true) -> PlayerStyledSeekSlider {
+            let track = screen.bottomTimeline.track(CGSize(width: width, height: 44))
+            return PlayerStyledSeekSlider(clock: screen.timePosClock,
+                scrubbing: track.$scrubbing, scrubTarget: track.$scrubTarget,
+                duration: track.duration, bufferedTime: track.bufferedTime,
+                width: width, accent: track.accent, animated: animated,
+                onScrubChanged: track.onScrubChanged, onEditingChanged: track.onEditingChanged)
+        }
+        precondition(SeekBarStyle.allCases.count == 14)
+        for style in SeekBarStyle.allCases {
+            UserDefaults.standard.set(style.rawValue, forKey: SeekBarStyle.storageKey)
+            for width: CGFloat in [320, 390, 1_024] {
+                let seek = slider(width: width)
+                precondition(seek.selectedStyle == style && seek.artwork.style == style)
+                host(seek, width: width, height: 44)
+                let paused = slider(width: width, animated: false)
+                precondition(!paused.artwork.animated)
+                host(paused, width: width, height: 44)
+            }
+        }
+        UserDefaults.standard.set("wave", forKey: SeekBarStyle.storageKey)
+        let livePreference = slider()
+        precondition(livePreference.selectedStyle == .wave)
+        UserDefaults.standard.set("minimal", forKey: SeekBarStyle.storageKey)
+        precondition(livePreference.selectedStyle == .minimal, "live seek preference was cached")
+        UserDefaults.standard.set("unknown-style", forKey: SeekBarStyle.storageKey)
+        precondition(slider().selectedStyle == .classic)
+        screen.timePosClock.position = 100
+        let seek = slider()
+        seek.adjust(forward: true)
+        seek.adjust(forward: false)
+        precondition(screen.effects.seeks == [110, 100])
+        precondition(screen.effects.events == ["scrub", "report:110.0", "hide", "scrub", "report:100.0", "hide"])
+        precondition(screen.scrubThumbnails.shown == [110, 100])
+        precondition(!screen.scrubbing)
+        precondition(PlayerSeekInteractionPolicy.target(x: -40, width: 320, duration: 100) == 0)
+        precondition(PlayerSeekInteractionPolicy.target(x: 160, width: 320, duration: 100) == 50)
+        precondition(PlayerSeekInteractionPolicy.target(x: 400, width: 320, duration: 100) == 100)
+        precondition(PlayerSeekInteractionPolicy.target(x: .nan, width: 320, duration: 100) == nil)
+        precondition(PlayerSeekInteractionPolicy.target(x: 10, width: 20, duration: 100) == nil)
+        for duration in [0, -1, Double.nan, Double.infinity] {
+            precondition(PlayerSeekInteractionPolicy.target(x: 10, width: 320, duration: duration) == nil)
+            precondition(PlayerSeekInteractionPolicy.adjusted(20, duration: duration, forward: true) == nil)
+        }
+        precondition(PlayerSeekInteractionPolicy.adjusted(5, duration: 100, forward: false) == 0)
+        precondition(PlayerSeekInteractionPolicy.adjusted(95, duration: 100, forward: true) == 100)
+        precondition(PlayerSeekInteractionPolicy.animates(requested: true, scrubbing: false, reduceMotion: false))
+        precondition(!PlayerSeekInteractionPolicy.animates(requested: true, scrubbing: false, reduceMotion: true))
+        precondition(!PlayerSeekInteractionPolicy.animates(requested: true, scrubbing: true, reduceMotion: false))
+        precondition(!PlayerSeekInteractionPolicy.animates(requested: false, scrubbing: false, reduceMotion: false))
+    }
+
+    static func verifyPinchPolicy() {
+        for current in ["original", "fill", "stretch"] {
+            for scale: CGFloat in [0.7, 0.92, 1, 1.08, 1.4, .nan, .infinity, -1] {
+                for enabled in [false, true] {
+                    for locked in [false, true] {
+                        for panelOpen in [false, true] {
+                            let mode = PlayerVideoSizeGesturePolicy.mode(scale: scale, current: current,
+                                enabled: enabled, locked: locked, panelOpen: panelOpen)
+                            if !enabled || locked || panelOpen || !scale.isFinite || scale <= 0 || scale == 1 {
+                                precondition(mode == nil)
+                            } else if scale > 1 {
+                                precondition(mode == (current == "fill" ? nil : "fill"))
+                            } else {
+                                precondition(mode == (current == "original" ? nil : "original"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static func verifyOptionsAndTouchLayouts() {
+        var screen = PlayerScreen()
+        screen.curMeta = PlaybackMeta(libraryId: "tt1234567", season: 1, episode: 2)
+        let options = screen.touchOptionsActions
+        precondition(options.map(\.id) == ["restart", "aspect", "sleep", "grab", "editor", "lock", "settings", "external"])
+        options.forEach { $0.action() }
+        precondition(screen.effects.events == ["restart", "video", "sleep", "grab", "seed-editor", "lock", "playerSettings"])
+        precondition(screen.showSkipDBEdit && screen.showExternalChooser)
+        screen.isLive = true
+        precondition(!screen.touchOptionsActions.contains { ["restart", "editor"].contains($0.id) })
+        screen.isLive = false
+        screen.showSkipDBEdit = false
+        for width: CGFloat in [320, 390, 844, 1_024] {
+            host(ProbeTouchChrome(screen: screen), width: width, height: width > 500 ? 390 : 700)
+        }
+        host(ProbeTouchChrome.options(screen: screen), width: 300, height: 380)
     }
 
     static func verifyCallbacks() {
@@ -215,6 +334,40 @@ enum PlayerBottomBarConstructionProbe {
     }
 }
 
+/// Screenshot/layout fixture: all interactive child views are the exact production declarations.
+/// Only the background and external-service callbacks are fixtures.
+struct ProbeTouchChrome: View {
+    let screen: PlayerScreen
+    static func options(screen: PlayerScreen) -> PlayerTouchOptionsPanel {
+        PlayerTouchOptionsPanel(actions: screen.touchOptionsActions,
+            volume: { AnyView(Slider(value: .constant(0.7)).frame(minHeight: 44)) },
+            routePicker: { AnyView(Label("AirPlay", systemImage: "airplay.video").frame(height: 44)) },
+            dismiss: {})
+    }
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.12, green: 0.16, blue: 0.19), .black],
+                startPoint: .topLeading, endPoint: .bottomTrailing).ignoresSafeArea()
+            VStack(spacing: 0) {
+                PlayerTouchHeader(title: "A Long Movie Title · Episode 2", metadata: "4K  ·  HDR  ·  EAC3 6ch",
+                    close: PlayerTouchIconButton(icon: "chevron.down", label: "Close player", action: {}),
+                    pictureInPicture: { AnyView(PlayerTouchIconButton(icon: "pip.enter", label: "Picture in Picture", action: {})) },
+                    aspect: PlayerTouchAspectButton(mode: "original", toggle: {}, select: { _ in }),
+                    fullscreen: PlayerTouchIconButton(icon: "arrow.up.left.and.arrow.down.right", label: "Fullscreen", action: {}),
+                    options: PlayerTouchOptionsButton(presented: .constant(false),
+                        content: { Self.options(screen: screen) }, onVisibilityChanged: { _ in }))
+                Spacer()
+                PlayerTouchTransport(paused: false, live: false, seekStep: "10",
+                    previous: PlayerTouchIconButton(icon: "backward.end.fill", label: "Previous episode", action: {}),
+                    next: PlayerTouchIconButton(icon: "forward.end.fill", label: "Next episode", action: {}),
+                    backward: {}, forward: {}, toggle: {})
+                Spacer()
+                screen.bottomBar
+            }
+        }
+    }
+}
+
 #if os(macOS)
 @main
 struct PlayerSeekTimelineConstructionTests {
@@ -228,7 +381,15 @@ final class PlayerBottomBarProbeDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         DispatchQueue.main.async {
             PlayerBottomBarConstructionProbe.run()
-            exit(0)
+            if ProcessInfo.processInfo.environment["PLAYER_PROBE_SCREENSHOT"] == "1" {
+                UserDefaults.standard.set("wave", forKey: SeekBarStyle.storageKey)
+                let screen = PlayerScreen()
+                screen.timePosClock.position = 900
+                PlayerBottomBarConstructionProbe.host(ProbeTouchChrome(screen: screen),
+                    width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
+            } else {
+                exit(0)
+            }
         }
         return true
     }

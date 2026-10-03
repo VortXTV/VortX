@@ -5,16 +5,17 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.18"
+    static let version = "0.4.0-beta.19"
     static let highlights: [String] = [
-        "AVPlayer recovery belongs to the current item and seek. Accepted landings settle once; retired callbacks cannot restart a replacement or override Pause. Explicit subtitle choices and Off supersede late restoration.",
-        "Mac has a native seven-destination sidebar and in-window categorized Settings, with search, keyboard navigation and Reduce Motion. The iPhone episode Watch action overlaps the large hero without collapsing long labels; iPad and Mac keep their source-list Play control.",
-        "Android supports direct Newznab indexers and multiple prioritized NNTP servers. Encrypted account/profile configuration, decoded yEnc coverage, provider fallback and cancellation fences protect source and next-episode preparation.",
-        "Optional Android Trakt Continue Watching carries typed episode intent and resolves artwork. Session and toggle changes invalidate old results. Manual detail check-in offers an explicit conflict action without marking anything watched.",
-        "Android phone and TV share Library segments. TV add-on ordering has remote move controls; Home rail order interoperates with Apple account documents and backups.",
-        "Account-owned viewing history and manual watched intent interoperate across Apple and Android without changing Saved membership. Exact persisted proof, captured operations and separate viewing clocks protect deferred remove/re-add and newer peer resumes from metadata-only timestamps.",
-        "VortX Player cache maintenance no longer resets playback before its seek executes. Owned low-level seek evidence, bounded settlement and exact paused-reopen admission address the observed false EOF, restart and lost-resume paths without changing the memory limits.",
-        "Beta 17 playback, automatic-skip, source-owned suggestions, subtitle metadata and artwork repairs are retained. Apple build 254 and Android version code 239; sustained DV/NNTP, frame pacing, physical remote journeys and complete Android visual parity are not claimed verified."
+        "The immediate iPhone/iPad crash when opening playback is repaired. Smaller player-control components preserve the seek, chapter, preview and skip-editor actions without constructing the overflowing view type.",
+        "A cleaner iPhone/iPad player keeps the title, transport and useful controls easy to reach. Secondary actions live in More, including volume, AirPlay, sleep, frame capture, playback settings, lock and the skip editor.",
+        "Your chosen seek-bar style now appears in the phone/tablet player, including Wave and all fourteen styles. The real draggable track supports buffered progress, chapter/skip markers and VoiceOver; paused playback and Reduce Motion stop its animation.",
+        "Pinch out to Fill and pinch in to Fit on iPhone/iPad. Sizing changes the current AVPlayer or VortX Player surface without restarting playback. The aspect selector retains Fit, Fill and Stretch.",
+        "Mac and wide iPad use cinematic horizontal navigation instead of the Mac sidebar. Phone and narrow-iPad navigation stays compact, with other destinations in More. The iPad capsule hugs its labels and keeps a scrolling fallback.",
+        "Mobile navigation reserves its own layout space, keeping All sources and other detail controls above the bottom bar. Filter chips use one clean edge instead of doubled glass outlines.",
+        "The phone/tablet Search field stays at the top of the page instead of behind the bottom navigation. Inline suggestions, clear, keyboard submit and the existing debounced search remain available.",
+        "The chosen add-on in All sources has a clear accent fill and checkmark, with a selected accessibility state, while filtering remains bound to the same add-on choice.",
+        "All Beta 18 playback, account, source and Usenet work is retained. This is Apple build 257; Android remains on its existing Beta 18 build. Broader provider playback and full Android visual parity are not newly claimed fixed."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses
