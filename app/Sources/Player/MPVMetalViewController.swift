@@ -4637,7 +4637,7 @@ final class MPVMetalViewController: PlatformViewController {
                             #endif
                             let msg = String(cString: mpv_error_string(ef.error))
                             self.mpvLog.error("end-file error: \(msg, privacy: .public)")
-                            VXProbe.event(self.probeChannel, "endfile error \(msg)")
+                            VXProbe.event(self.probeChannel, "endfile error \(msg) code=\(ef.error)")
                             self.emit(MPVProperty.endFileError, msg, loadToken: loadToken)
                         } else if ef.reason == MPV_END_FILE_REASON_EOF {
                             DispatchQueue.main.async { [weak self] in
